@@ -1,0 +1,55 @@
+{
+  "name": "@silo/client",
+  "version": "0.1.0",
+  "description": "TypeScript gRPC client for Silo job queue",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "require": "./dist/src/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "proto:generate": "pnpm exec protoc --ts_out=src/pb --ts_opt=long_type_bigint --ts_opt=generate_dependencies --proto_path=../proto ../proto/silo.proto",
+    "build": "pnpm run proto:generate && tsc",
+    "test": "vitest run",
+    "lint": "oxlint --type-aware",
+    "lint:fix": "oxfmt && oxlint --type-aware --fix",
+    "format": "oxfmt",
+    "test:watch": "vitest",
+    "prepublishOnly": "pnpm run build",
+    "typecheck": "tsc --noEmit",
+    "prerelease": "gitpkg publish"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.12.2",
+    "@protobuf-ts/grpc-transport": "^2.9.4",
+    "@protobuf-ts/runtime": "^2.9.4",
+    "@protobuf-ts/runtime-rpc": "^2.9.4",
+    "msgpackr": "^1.11.2",
+    "p-queue": "6.6.2",
+    "serialize-error": "7.0.1"
+  },
+  "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.2",
+    "@protobuf-ts/plugin": "^2.9.4",
+    "execa": "^5.1.1",
+    "gitpkg": "github:airhorns/gitpkg#gitpkg-v1.0.0-beta.4-gitpkg-82083c3",
+    "oxfmt": "^0.16.0",
+    "oxlint": "^1.31.0",
+    "oxlint-tsgolint": "^0.8.3",
+    "toxiproxy-node-client": "^4.0.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.14"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "packageManager": "pnpm@10.0.0",
+  "license": "MIT"
+}
