@@ -1,0 +1,27 @@
+/// Construct the SlateDB key for a given job id.
+pub fn job_info_key(id: &str) -> String {
+    format!("jobs/{}", id)
+}
+
+/// Construct the key for a task, ordered by start time.
+pub fn task_key(start_time_ms: i64, priority: u8, job_id: &str, attempt: u32) -> String {
+    // Zero-pad time to 20 digits and priority to 2 digits; 00 is highest, 99 lowest
+    // Lexicographic order: time asc, then priority asc (so higher priority first)
+    format!(
+        "tasks/{:020}/{:02}/{}/{}",
+        start_time_ms.max(0) as u64,
+        priority,
+        job_id,
+        attempt
+    )
+}
+
+/// Construct the key for a leased task by task id
+pub fn leased_task_key(task_id: &str) -> String {
+    format!("lease/{}", task_id)
+}
+
+/// Construct the key for an attempt record
+pub fn attempt_key(job_id: &str, attempt: u32) -> String {
+    format!("attempts/{}/{}", job_id, attempt)
+}

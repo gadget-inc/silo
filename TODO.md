@@ -1,0 +1,14 @@
+- [x] task dequeuing
+- [x] task leases, heartbeats
+- [ ] attempt failure/success reporting
+- [ ] lease expiry
+- [ ] deleting a job deletes the tasks for it (should this be a scan or another index?)
+- [ ] GRPC layer for invoking functions
+- [ ] limits on payload, error, result size
+- [ ] cancel api
+- [ ] get job info api
+- [ ] list jobs api
+- [ ] clustering
+- [ ] webui / operator tooling
+- [ ] investigate how we might do schema evolution
+- [ ] secondary indexes for filtering

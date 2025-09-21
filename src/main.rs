@@ -3,6 +3,10 @@ use std::path::PathBuf;
 
 mod settings;
 mod storage;
+mod shard;
+mod factory;
+mod keys;
+mod retry;
 
 #[derive(Parser, Debug)]
 #[clap(author = "Harry Brundage", version, about)]
@@ -27,12 +31,12 @@ async fn main() -> anyhow::Result<()> {
     // Load configuration
     let cfg = settings::AppConfig::load(args.config.as_deref())?;
 
-    // Initialize all configured SlateDB instances (no globals)
-    let mut db_factory = storage::DbFactory::new();
+    // Initialize all configured Shard instances (no globals)
+    let mut shard_factory = factory::ShardFactory::new();
     for db in &cfg.databases {
-        let _handle = db_factory.open(db).await?;
+        let _handle = shard_factory.open(db).await?;
         if args.verbose {
-            println!("opened db '{}' at '{}' via '{}'", db.name, db.path, db.backend);
+            println!("opened shard '{}' at '{}' via '{:?}'", db.name, db.path, db.backend);
         }
     }
 
