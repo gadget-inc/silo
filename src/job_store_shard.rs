@@ -9,7 +9,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::keys::{attempt_key, job_info_key, leased_task_key, task_key};
-use crate::retry::{next_retry_time_ms, RetryPolicy};
+use crate::retry::RetryPolicy;
 use crate::settings::DatabaseConfig;
 use crate::storage::{resolve_object_store, StorageError};
 
@@ -37,13 +37,12 @@ pub enum ShardError {
         expected: String,
         got: String,
     },
+    #[error("job already exists with id {0}")]
+    JobAlreadyExists(String),
 }
 
 /// Default lease duration for dequeued tasks (milliseconds)
 const DEFAULT_LEASE_MS: i64 = 10_000;
-
-/// Retry policy for a job's attempts
-// RetryPolicy moved to crate::retry
 
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
 #[archive(check_bytes)]
@@ -73,7 +72,7 @@ pub enum Task {
 #[derive(Debug, Clone)]
 pub enum AttemptOutcome {
     Success { result: Vec<u8> },
-    Error { error: Vec<u8> },
+    Error { error_code: String, error: Vec<u8> },
 }
 
 /// Attempt state lifecycle for a job attempt
@@ -89,6 +88,7 @@ pub enum AttemptState {
     },
     Failed {
         finished_at_ms: i64,
+        error_code: String,
         error: Vec<u8>,
     },
 }
@@ -101,6 +101,61 @@ pub struct JobAttempt {
     pub attempt_number: u32,
     pub task_id: String,
     pub state: AttemptState,
+}
+
+/// Zero-copy view over an archived `JobAttempt`
+pub struct JobAttemptView {
+    bytes: Bytes,
+}
+
+impl JobAttemptView {
+    pub fn new(bytes: Bytes) -> Result<Self, ShardError> {
+        #[cfg(debug_assertions)]
+        {
+            let _ = rkyv::check_archived_root::<JobAttempt>(&bytes)
+                .map_err(|e| ShardError::Rkyv(e.to_string()))?;
+        }
+        Ok(Self { bytes })
+    }
+
+    fn archived(&self) -> &<JobAttempt as Archive>::Archived {
+        unsafe { rkyv::archived_root::<JobAttempt>(&self.bytes) }
+    }
+
+    pub fn job_id(&self) -> &str {
+        self.archived().job_id.as_str()
+    }
+    pub fn attempt_number(&self) -> u32 {
+        self.archived().attempt_number
+    }
+    pub fn task_id(&self) -> &str {
+        self.archived().task_id.as_str()
+    }
+
+    pub fn state(&self) -> AttemptState {
+        type ArchivedAttemptState = <AttemptState as Archive>::Archived;
+        match &self.archived().state {
+            ArchivedAttemptState::Running { started_at_ms } => AttemptState::Running {
+                started_at_ms: *started_at_ms,
+            },
+            ArchivedAttemptState::Succeeded {
+                finished_at_ms,
+                result,
+            } => AttemptState::Succeeded {
+                finished_at_ms: *finished_at_ms,
+                result: result.to_vec(),
+            },
+            ArchivedAttemptState::Failed {
+                finished_at_ms,
+                error_code,
+                error,
+            } => AttemptState::Failed {
+                finished_at_ms: *finished_at_ms,
+                error_code: error_code.as_str().to_string(),
+                error: error.to_vec(),
+            },
+        }
+    }
 }
 
 /// Stored representation for a lease record. Value at `lease/<expiry>/<task-id>`
@@ -158,6 +213,22 @@ impl JobView {
         // Safe because we validated in new() and bytes are owned by self
         unsafe { rkyv::archived_root::<JobInfo>(&self.info_bytes) }
     }
+
+    /// Return the job's retry policy as a runtime struct, if present, by copying
+    /// primitive fields from the archived view.
+    pub fn retry_policy(&self) -> Option<RetryPolicy> {
+        let a = self.archived();
+        let Some(pol) = a.retry_policy.as_ref() else {
+            return None;
+        };
+        Some(RetryPolicy {
+            retry_count: pol.retry_count,
+            initial_interval_ms: pol.initial_interval_ms,
+            max_interval_ms: pol.max_interval_ms,
+            randomize_interval: pol.randomize_interval,
+            backoff_factor: pol.backoff_factor,
+        })
+    }
 }
 
 impl Shard {
@@ -187,6 +258,15 @@ impl Shard {
         payload: JsonValue,
     ) -> Result<String, ShardError> {
         let job_id = id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        // If caller provided an id, ensure it doesn't already exist
+        if self
+            .db
+            .get(job_info_key(&job_id).as_bytes())
+            .await?
+            .is_some()
+        {
+            return Err(ShardError::JobAlreadyExists(job_id));
+        }
         let payload_bytes = serde_json::to_vec(&payload)?;
         let job = JobInfo {
             id: job_id.clone(),
@@ -235,6 +315,21 @@ impl Shard {
         let maybe_raw = self.db.get(key.as_bytes()).await?;
         if let Some(raw) = maybe_raw {
             Ok(Some(JobView::new(raw)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Fetch a job attempt by job id and attempt number.
+    pub async fn get_job_attempt(
+        &self,
+        job_id: &str,
+        attempt_number: u32,
+    ) -> Result<Option<JobAttemptView>, ShardError> {
+        let key = attempt_key(job_id, attempt_number);
+        let maybe_raw = self.db.get(key.as_bytes()).await?;
+        if let Some(raw) = maybe_raw {
+            Ok(Some(JobAttemptView::new(raw)?))
         } else {
             Ok(None)
         }
@@ -423,14 +518,15 @@ impl Shard {
         };
 
         let now_ms = now_epoch_ms();
-        let state = match outcome {
+        let state = match &outcome {
             AttemptOutcome::Success { result } => AttemptState::Succeeded {
                 finished_at_ms: now_ms,
-                result,
+                result: result.clone(),
             },
-            AttemptOutcome::Error { error } => AttemptState::Failed {
+            AttemptOutcome::Error { error_code, error } => AttemptState::Failed {
                 finished_at_ms: now_ms,
-                error,
+                error_code: error_code.clone(),
+                error: error.clone(),
             },
         };
         let attempt = JobAttempt {
@@ -443,12 +539,86 @@ impl Shard {
             .map_err(|e| ShardError::Rkyv(e.to_string()))?;
         let akey = attempt_key(&job_id, attempt_number);
 
-        // Atomically update attempt and remove lease
+        // Atomically update attempt and remove lease; if error, maybe enqueue next attempt
         let mut batch = WriteBatch::new();
         batch.put(akey.as_bytes(), &attempt_val);
         batch.delete(key.as_bytes());
+
+        if let AttemptOutcome::Error { .. } = outcome {
+            // Load job info to get priority and retry policy
+            let jkey = job_info_key(&job_id);
+            if let Some(jbytes) = self.db.get(jkey.as_bytes()).await? {
+                let view = JobView::new(jbytes)?;
+                let priority = view.priority();
+                let failures_so_far = attempt_number;
+                if let Some(policy_rt) = view.retry_policy() {
+                    if let Some(next_time) =
+                        crate::retry::next_retry_time_ms(now_ms, failures_so_far, &policy_rt)
+                    {
+                        let next_task = Task::RunAttempt {
+                            id: Uuid::new_v4().to_string(),
+                            job_id: job_id.clone(),
+                            attempt_number: attempt_number + 1,
+                        };
+                        let next_bytes: AlignedVec = rkyv::to_bytes::<Task, 256>(&next_task)
+                            .map_err(|e| ShardError::Rkyv(e.to_string()))?;
+                        let tkey = task_key(next_time, priority, &job_id, attempt_number + 1);
+                        batch.put(tkey.as_bytes(), &next_bytes);
+                    }
+                }
+            }
+        }
+
         self.db.write(batch).await?;
         self.db.flush().await?;
         Ok(())
+    }
+
+    /// Scan all held leases and mark any expired ones as failed with a WORKER_CRASHED error code.
+    /// Returns the number of expired leases reaped.
+    pub async fn reap_expired_leases(&self) -> Result<usize, ShardError> {
+        let start: Vec<u8> = b"lease/".to_vec();
+        let mut end: Vec<u8> = b"lease/".to_vec();
+        end.push(0xFF);
+        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..=end).await?;
+
+        let now_ms = now_epoch_ms();
+        let mut reaped: usize = 0;
+        loop {
+            let maybe = iter.next().await?;
+            let Some(kv) = maybe else { break };
+
+            type ArchivedLease = <LeaseRecord as Archive>::Archived;
+            type ArchivedTask = <Task as Archive>::Archived;
+            let lease: &ArchivedLease = unsafe { rkyv::archived_root::<LeaseRecord>(&kv.value) };
+            if lease.expiry_ms > now_ms {
+                continue;
+            }
+
+            // Determine the task id from the archived task
+            let task_id = match &lease.task {
+                ArchivedTask::RunAttempt { id, .. } => id.as_str().to_string(),
+            };
+
+            // Report as worker crashed; ignore LeaseNotFound in case of concurrent cleanup
+            let _ = self
+                .report_attempt_outcome(
+                    &task_id,
+                    AttemptOutcome::Error {
+                        error_code: "WORKER_CRASHED".to_string(),
+                        error: format!(
+                            "lease expired at {} (now {}), worker={}",
+                            lease.expiry_ms,
+                            now_ms,
+                            lease.worker_id.as_str()
+                        )
+                        .into_bytes(),
+                    },
+                )
+                .await;
+            reaped += 1;
+        }
+
+        Ok(reaped)
     }
 }

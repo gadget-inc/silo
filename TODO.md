@@ -1,8 +1,9 @@
 - [x] task dequeuing
 - [x] task leases, heartbeats
-- [ ] attempt failure/success reporting
+- [x] attempt failure/success reporting
 - [ ] lease expiry
 - [ ] deleting a job deletes the tasks for it (should this be a scan or another index?)
+- [ ] performance improvement to add attempt view, task view, so we're not deserializing into structs
 - [ ] GRPC layer for invoking functions
 - [ ] limits on payload, error, result size
 - [ ] cancel api
@@ -10,5 +11,9 @@
 - [ ] list jobs api
 - [ ] clustering
 - [ ] webui / operator tooling
+- [ ] /healthz endpoint
+- [ ] /metrics prometheus endpoint
+- [ ] opentelemetry support
 - [ ] investigate how we might do schema evolution
 - [ ] secondary indexes for filtering
+- [ ] once transaction support, make enqueue idempotency not a read-then-write but some sort of conditional write

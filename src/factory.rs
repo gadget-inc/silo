@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
+use crate::job_store_shard::Shard;
+use crate::job_store_shard::ShardError;
 use crate::settings::DatabaseConfig;
-use crate::shard::Shard;
-use crate::shard::ShardError;
 
 /// Factory for opening and holding `Shard` instances by name.
 pub struct ShardFactory {
@@ -11,7 +11,9 @@ pub struct ShardFactory {
 
 impl ShardFactory {
     pub fn new() -> Self {
-        Self { instances: HashMap::new() }
+        Self {
+            instances: HashMap::new(),
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<&Shard> {
@@ -24,5 +26,3 @@ impl ShardFactory {
         Ok(self.instances.get(&cfg.name).expect("inserted"))
     }
 }
-
-

@@ -4,11 +4,11 @@ use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
 #[archive(check_bytes)]
 pub struct RetryPolicy {
-    pub retry_count: Option<u32>,
-    pub initial_interval_ms: Option<i64>,
-    pub max_interval_ms: Option<i64>,
-    pub randomize_interval: Option<bool>,
-    pub backoff_factor: Option<f64>,
+    pub retry_count: u32,
+    pub initial_interval_ms: i64,
+    pub max_interval_ms: i64,
+    pub randomize_interval: bool,
+    pub backoff_factor: f64,
 }
 
 impl RetryPolicy {
@@ -33,21 +33,16 @@ pub fn next_retry_time_ms(
     failures_so_far: u32,
     policy: &RetryPolicy,
 ) -> Option<i64> {
-    let retries_allowed = policy.retry_count.unwrap_or(0);
-    if failures_so_far >= retries_allowed {
+    let retries_allowed = policy.retry_count;
+    // If failures so far exceed allowed retries, stop. Allow while failures_so_far <= retries_allowed
+    if failures_so_far > retries_allowed {
         return None;
     }
 
-    let initial = policy
-        .initial_interval_ms
-        .unwrap_or_else(RetryPolicy::default_initial_interval_ms);
-    let factor = policy
-        .backoff_factor
-        .unwrap_or_else(RetryPolicy::default_backoff_factor);
-    let max_interval = policy.max_interval_ms.unwrap_or(i64::MAX);
-    let randomize = policy
-        .randomize_interval
-        .unwrap_or_else(RetryPolicy::default_randomize);
+    let initial = policy.initial_interval_ms;
+    let factor = policy.backoff_factor;
+    let max_interval = policy.max_interval_ms;
+    let randomize = policy.randomize_interval;
 
     // Exponential backoff similar to npm `retry`: delay_n = initial * factor^n
     // where n = failures_so_far (0-based)

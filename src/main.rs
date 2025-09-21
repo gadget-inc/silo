@@ -1,12 +1,8 @@
 use clap::Parser;
 use std::path::PathBuf;
 
-mod settings;
-mod storage;
-mod shard;
-mod factory;
-mod keys;
-mod retry;
+use silo::factory::ShardFactory;
+use silo::settings;
 
 #[derive(Parser, Debug)]
 #[clap(author = "Harry Brundage", version, about)]
@@ -32,11 +28,14 @@ async fn main() -> anyhow::Result<()> {
     let cfg = settings::AppConfig::load(args.config.as_deref())?;
 
     // Initialize all configured Shard instances (no globals)
-    let mut shard_factory = factory::ShardFactory::new();
+    let mut shard_factory = ShardFactory::new();
     for db in &cfg.databases {
         let _handle = shard_factory.open(db).await?;
         if args.verbose {
-            println!("opened shard '{}' at '{}' via '{:?}'", db.name, db.path, db.backend);
+            println!(
+                "opened shard '{}' at '{}' via '{:?}'",
+                db.name, db.path, db.backend
+            );
         }
     }
 

@@ -1,25 +1,25 @@
-use silo::retry::{RetryPolicy, next_retry_time_ms};
+use silo::retry::{next_retry_time_ms, RetryPolicy};
 
 #[test]
 fn next_retry_no_retries_returns_none() {
     let policy = RetryPolicy {
-        retry_count: Some(0),
-        initial_interval_ms: Some(1000),
-        max_interval_ms: None,
-        randomize_interval: None,
-        backoff_factor: None,
+        retry_count: 0,
+        initial_interval_ms: 1000,
+        max_interval_ms: i64::MAX,
+        randomize_interval: false,
+        backoff_factor: 2.0,
     };
-    assert_eq!(next_retry_time_ms(1_000_000, 0, &policy), None);
+    assert_eq!(next_retry_time_ms(1_000_000, 1, &policy), None);
 }
 
 #[test]
 fn next_retry_basic_exponential() {
     let policy = RetryPolicy {
-        retry_count: Some(5),
-        initial_interval_ms: Some(1000),
-        max_interval_ms: None,
-        randomize_interval: Some(false),
-        backoff_factor: Some(2.0),
+        retry_count: 5,
+        initial_interval_ms: 1000,
+        max_interval_ms: i64::MAX,
+        randomize_interval: false,
+        backoff_factor: 2.0,
     };
     // first failure (n=0) -> +1000ms
     assert_eq!(next_retry_time_ms(1_000_000, 0, &policy), Some(1_001_000));
@@ -32,14 +32,29 @@ fn next_retry_basic_exponential() {
 #[test]
 fn next_retry_caps_at_max_interval() {
     let policy = RetryPolicy {
-        retry_count: Some(10),
-        initial_interval_ms: Some(1_000),
-        max_interval_ms: Some(2_000),
-        randomize_interval: Some(false),
-        backoff_factor: Some(10.0),
+        retry_count: 10,
+        initial_interval_ms: 1_000,
+        max_interval_ms: 2_000,
+        randomize_interval: false,
+        backoff_factor: 10.0,
     };
     // n=1 would be 10_000ms but capped at 2_000ms
     assert_eq!(next_retry_time_ms(100, 1, &policy), Some(2_100));
 }
 
-
+#[test]
+fn next_retry_randomized_is_deterministic_for_given_inputs() {
+    let policy = RetryPolicy {
+        retry_count: 5,
+        initial_interval_ms: 10,
+        max_interval_ms: 1_000_000,
+        randomize_interval: true,
+        backoff_factor: 2.0,
+    };
+    let a = next_retry_time_ms(1_234_567, 1, &policy);
+    let b = next_retry_time_ms(1_234_567, 1, &policy);
+    assert_eq!(
+        a, b,
+        "randomized next time should be deterministic for same inputs"
+    );
+}
