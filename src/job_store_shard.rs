@@ -42,7 +42,7 @@ pub enum ShardError {
 }
 
 /// Default lease duration for dequeued tasks (milliseconds)
-const DEFAULT_LEASE_MS: i64 = 10_000;
+pub const DEFAULT_LEASE_MS: i64 = 10_000;
 
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
 #[archive(check_bytes)]
@@ -239,6 +239,11 @@ impl Shard {
             name: cfg.name.clone(),
             db,
         })
+    }
+
+    /// Close the underlying SlateDB instance gracefully.
+    pub async fn close(&self) -> Result<(), ShardError> {
+        self.db.close().await.map_err(ShardError::from)
     }
 
     pub fn name(&self) -> &str {

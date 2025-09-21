@@ -21,6 +21,16 @@ uuid = { version = "1.9", features = ["v4", "fast-rng", "serde"] }
 rkyv = { version = "0.7", features = ["validation"] }
 bytecheck = "0.6"
 bytes = "1"
+tonic = { version = "0.12", features = ["transport"] }
+prost = "0.13"
+prost-types = "0.13"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio-stream = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+
+[build-dependencies]
+tonic-build = "0.12"
+protoc-bin-vendored = "3.0"

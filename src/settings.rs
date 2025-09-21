@@ -4,7 +4,26 @@ use std::path::Path;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
-    pub databases: Vec<DatabaseConfig>,
+    #[serde(default)]
+    pub server: ServerConfig,
+    pub database: DatabaseTemplate,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct DatabaseTemplate {
+    pub backend: Backend,
+    /// May contain "%shard%" placeholder that will be replaced with the shard number
+    pub path: String,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ServerConfig {
+    #[serde(default = "default_grpc_addr")]
+    pub grpc_addr: String, // e.g. 127.0.0.1:50051
+}
+
+fn default_grpc_addr() -> String {
+    "127.0.0.1:50051".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -26,11 +45,13 @@ pub enum Backend {
 impl AppConfig {
     pub fn load(path: Option<&Path>) -> anyhow::Result<Self> {
         let default = Self {
-            databases: vec![DatabaseConfig {
-                name: "default".to_string(),
+            server: ServerConfig {
+                grpc_addr: default_grpc_addr(),
+            },
+            database: DatabaseTemplate {
                 backend: Backend::Fs,
-                path: "./.silo/default".to_string(),
-            }],
+                path: "/tmp/silo-%shard%".to_string(),
+            },
         };
 
         match path {
@@ -43,5 +64,3 @@ impl AppConfig {
         }
     }
 }
-
-

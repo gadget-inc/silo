@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+package silo.v1;
+
+// Core job messages
+message JsonValueBytes {
+  bytes data = 1; // raw JSON bytes
+}
+
+message RetryPolicy {
+  uint32 retry_count = 1;
+  int64 initial_interval_ms = 2;
+  int64 max_interval_ms = 3;
+  bool randomize_interval = 4;
+  double backoff_factor = 5;
+}
+
+message EnqueueRequest {
+  string shard = 1; // shard name
+  string id = 2; // optional
+  uint32 priority = 3; // 0..99, 0 highest
+  int64 start_at_ms = 4; // epoch ms
+  optional RetryPolicy retry_policy = 5; // optional
+  JsonValueBytes payload = 6; // JSON
+}
+
+message EnqueueResponse {
+  string id = 1;
+}
+
+message GetJobRequest { string shard = 1; string id = 2; }
+message GetJobResponse {
+  string id = 1;
+  uint32 priority = 2;
+  int64 enqueue_time_ms = 3;
+  JsonValueBytes payload = 4;
+  optional RetryPolicy retry_policy = 5; // presence indicates some policy
+}
+
+message DeleteJobRequest { string shard = 1; string id = 2; }
+message DeleteJobResponse {}
+
+message LeaseTasksRequest { string shard = 1; string worker_id = 2; uint32 max_tasks = 3; }
+message Task {
+  string id = 1; // task id
+  string job_id = 2;
+  uint32 attempt_number = 3;
+  int64 lease_ms = 4; // how long to heartbeat in ms
+  JsonValueBytes payload = 5; // job payload for convenience
+  uint32 priority = 6;
+}
+message LeaseTasksResponse { repeated Task tasks = 1; }
+
+message ReportOutcomeRequest {
+  string shard = 1;
+  string task_id = 2;
+  oneof outcome {
+    JsonValueBytes success = 3;
+    Failure failure = 4;
+  }
+}
+message Failure { string code = 1; bytes data = 2; }
+message ReportOutcomeResponse {}
+
+message HeartbeatRequest { string shard = 1; string worker_id = 2; string task_id = 3; }
+message HeartbeatResponse {}
+
+service Silo {
+  rpc Enqueue(EnqueueRequest) returns (EnqueueResponse);
+  rpc GetJob(GetJobRequest) returns (GetJobResponse);
+  rpc DeleteJob(DeleteJobRequest) returns (DeleteJobResponse);
+  rpc LeaseTasks(LeaseTasksRequest) returns (LeaseTasksResponse);
+  rpc ReportOutcome(ReportOutcomeRequest) returns (ReportOutcomeResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+
