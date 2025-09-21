@@ -8,9 +8,7 @@ use tonic::{Request, Response, Status};
 use tracing::info;
 
 use crate::factory::{CloseAllError, ShardFactory};
-use crate::job_store_shard::{
-    AttemptOutcome, Shard, ShardError, Task as InternalTask, DEFAULT_LEASE_MS,
-};
+use crate::job_store_shard::{AttemptOutcome, Shard, ShardError, DEFAULT_LEASE_MS};
 use crate::pb::silo_server::{Silo, SiloServer};
 use crate::pb::*;
 
@@ -121,29 +119,19 @@ impl Silo for SiloService {
             .await
             .map_err(map_err)?;
         let mut out = Vec::with_capacity(tasks.len());
-        for t in tasks {
-            match t {
-                InternalTask::RunAttempt {
-                    id,
-                    job_id,
-                    attempt_number,
-                } => {
-                    // Pull a zero-copy view for job info
-                    let Some(view) = shard.get_job(&job_id).await.map_err(map_err)? else {
-                        continue;
-                    };
-                    out.push(Task {
-                        id,
-                        job_id,
-                        attempt_number,
-                        lease_ms: DEFAULT_LEASE_MS,
-                        payload: Some(JsonValueBytes {
-                            data: view.payload_bytes().to_vec(),
-                        }),
-                        priority: view.priority() as u32,
-                    });
-                }
-            }
+        for lt in tasks {
+            let job = lt.job();
+            let attempt = lt.attempt();
+            out.push(Task {
+                id: attempt.task_id().to_string(),
+                job_id: job.id().to_string(),
+                attempt_number: attempt.attempt_number(),
+                lease_ms: DEFAULT_LEASE_MS,
+                payload: Some(JsonValueBytes {
+                    data: job.payload_bytes().to_vec(),
+                }),
+                priority: job.priority() as u32,
+            });
         }
         Ok(Response::new(LeaseTasksResponse { tasks: out }))
     }

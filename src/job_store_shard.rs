@@ -44,6 +44,25 @@ pub enum ShardError {
 /// Default lease duration for dequeued tasks (milliseconds)
 pub const DEFAULT_LEASE_MS: i64 = 10_000;
 
+/// Zero-copy view alias over an archived `JobAttempt` backed by owned bytes.
+pub type AttemptView = JobAttemptView;
+
+/// Represents a leased task with the associated job metadata necessary to execute it.
+#[derive(Debug, Clone)]
+pub struct LeasedTask {
+    job: JobView,
+    attempt: AttemptView,
+}
+
+impl LeasedTask {
+    pub fn job(&self) -> &JobView {
+        &self.job
+    }
+    pub fn attempt(&self) -> &AttemptView {
+        &self.attempt
+    }
+}
+
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
 #[archive(check_bytes)]
 pub struct JobInfo {
@@ -104,6 +123,7 @@ pub struct JobAttempt {
 }
 
 /// Zero-copy view over an archived `JobAttempt`
+#[derive(Clone, Debug)]
 pub struct JobAttemptView {
     bytes: Bytes,
 }
@@ -176,6 +196,7 @@ fn now_epoch_ms() -> i64 {
 }
 
 /// Zero-copy view over an archived `JobInfo` backed by owned bytes.
+#[derive(Clone, Debug)]
 pub struct JobView {
     info_bytes: Bytes,
 }
@@ -351,7 +372,7 @@ impl Shard {
         &self,
         worker_id: &str,
         max_tasks: usize,
-    ) -> Result<Vec<Task>, ShardError> {
+    ) -> Result<Vec<LeasedTask>, ShardError> {
         let (tasks, to_delete) = self.scan_ready_tasks(max_tasks).await?;
         if tasks.is_empty() {
             return Ok(Vec::new());
@@ -361,11 +382,29 @@ impl Shard {
         let expiry_ms = now_ms + DEFAULT_LEASE_MS;
 
         let mut batch = WriteBatch::new();
+        let mut out: Vec<LeasedTask> = Vec::new();
+        let mut pending_attempts: Vec<(JobView, String, u32)> = Vec::new();
         for (task, orig_key) in tasks.iter().zip(to_delete.iter()) {
-            let task_id = match task {
-                Task::RunAttempt { id, .. } => id,
+            // Only RunAttempt exists currently
+            let (task_id, job_id, attempt_number) = match task {
+                Task::RunAttempt {
+                    id,
+                    job_id,
+                    attempt_number,
+                } => (id.clone(), job_id.clone(), *attempt_number),
             };
-            let leased_key = leased_task_key(task_id);
+
+            // Look up job info; if missing, delete the task and skip
+            let jkey = job_info_key(&job_id);
+            let maybe_job = self.db.get(jkey.as_bytes()).await?;
+            let Some(job_bytes) = maybe_job else {
+                batch.delete(orig_key);
+                continue;
+            };
+            let view = JobView::new(job_bytes)?;
+
+            // Create lease record
+            let leased_key = leased_task_key(&task_id);
             let record = LeaseRecord {
                 worker_id: worker_id.to_string(),
                 task: task.clone(),
@@ -377,28 +416,37 @@ impl Shard {
             batch.delete(orig_key);
 
             // Also mark attempt as running
-            let Task::RunAttempt {
-                id,
-                job_id,
-                attempt_number,
-            } = task;
             let attempt = JobAttempt {
                 job_id: job_id.clone(),
-                attempt_number: *attempt_number,
-                task_id: id.clone(),
+                attempt_number,
+                task_id: task_id.clone(),
                 state: AttemptState::Running {
                     started_at_ms: now_ms,
                 },
             };
             let attempt_val: AlignedVec = rkyv::to_bytes::<JobAttempt, 256>(&attempt)
                 .map_err(|e| ShardError::Rkyv(e.to_string()))?;
-            let akey = attempt_key(job_id, *attempt_number);
+            let akey = attempt_key(&job_id, attempt_number);
             batch.put(akey.as_bytes(), &attempt_val);
+
+            // Defer constructing AttemptView; fetch from DB after batch is written
+            pending_attempts.push((view, job_id.clone(), attempt_number));
         }
         self.db.write(batch).await?;
         self.db.flush().await?;
 
-        Ok(tasks)
+        for (job_view, job_id, attempt_number) in pending_attempts.into_iter() {
+            let attempt_view = self
+                .get_job_attempt(&job_id, attempt_number)
+                .await?
+                .ok_or_else(|| ShardError::Rkyv("attempt not found after dequeue".to_string()))?;
+            out.push(LeasedTask {
+                job: job_view,
+                attempt: attempt_view,
+            });
+        }
+
+        Ok(out)
     }
 
     /// Internal: scan up to `max_tasks` ready tasks and return them with their keys.

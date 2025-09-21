@@ -198,17 +198,15 @@ async fn dequeue_moves_tasks_to_leased_with_uuid() {
 
     let tasks = shard.dequeue("worker-1", 1).await.expect("dequeue");
     assert_eq!(tasks.len(), 1);
-    let leased_task_id = match &tasks[0] {
-        Task::RunAttempt {
-            id,
-            job_id: jid,
-            attempt_number,
-        } => {
-            assert_eq!(jid, &job_id);
-            assert_eq!(*attempt_number, 1);
-            assert!(uuid::Uuid::parse_str(id).is_ok(), "task id is UUID");
-            id.clone()
-        }
+    let leased_task_id = {
+        let t = &tasks[0];
+        assert_eq!(t.job().id(), job_id);
+        assert_eq!(t.attempt().attempt_number(), 1);
+        assert!(
+            uuid::Uuid::parse_str(t.attempt().task_id()).is_ok(),
+            "task id is UUID"
+        );
+        t.attempt().task_id().to_string()
     };
 
     // Verify a leased entry exists, and includes worker id
@@ -255,9 +253,7 @@ async fn heartbeat_renews_lease_when_worker_matches() {
 
     let tasks = shard.dequeue("worker-1", 1).await.expect("dequeue");
     assert_eq!(tasks.len(), 1);
-    let task_id = match &tasks[0] {
-        Task::RunAttempt { id, .. } => id.clone(),
-    };
+    let task_id = tasks[0].attempt().task_id().to_string();
 
     // Read current lease key and expiry
     let first = first_kv_with_prefix(shard.db(), "lease/")
@@ -305,9 +301,7 @@ async fn heartbeat_rejects_mismatched_worker() {
 
     let tasks = shard.dequeue("worker-1", 1).await.expect("dequeue");
     assert_eq!(tasks.len(), 1);
-    let task_id = match &tasks[0] {
-        Task::RunAttempt { id, .. } => id.clone(),
-    };
+    let task_id = tasks[0].attempt().task_id().to_string();
 
     let err = shard
         .heartbeat_task("worker-2", &task_id)
@@ -343,9 +337,7 @@ async fn reporting_attempt_outcome_updates_attempt_and_deletes_lease() {
 
     let tasks = shard.dequeue("worker-1", 1).await.expect("dequeue");
     assert_eq!(tasks.len(), 1);
-    let task_id = match &tasks[0] {
-        Task::RunAttempt { id, .. } => id.clone(),
-    };
+    let task_id = tasks[0].attempt().task_id().to_string();
 
     // Outcome: success
     shard
@@ -401,9 +393,7 @@ async fn error_with_no_retries_does_not_enqueue_next_attempt() {
         .expect("enqueue");
 
     let tasks = shard.dequeue("w", 1).await.expect("dequeue");
-    let task_id = match &tasks[0] {
-        Task::RunAttempt { id, .. } => id.clone(),
-    };
+    let task_id = tasks[0].attempt().task_id().to_string();
 
     shard
         .report_attempt_outcome(
@@ -444,9 +434,7 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
 
     // Run attempt 1 and error
     let tasks = shard.dequeue("w", 1).await.expect("dequeue");
-    let t1 = match &tasks[0] {
-        Task::RunAttempt { id, .. } => id.clone(),
-    };
+    let t1 = tasks[0].attempt().task_id().to_string();
     shard
         .report_attempt_outcome(
             &t1,
@@ -471,9 +459,7 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
 
     // Dequeue attempt 2 and error again
     let tasks2 = shard.dequeue("w", 1).await.expect("dequeue2");
-    let t2 = match &tasks2[0] {
-        Task::RunAttempt { id, .. } => id.clone(),
-    };
+    let t2 = tasks2[0].attempt().task_id().to_string();
     shard
         .report_attempt_outcome(
             &t2,
@@ -497,9 +483,7 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
 
     // Dequeue attempt 3 and error again — but no further tasks since retries exhausted
     let tasks3 = shard.dequeue("w", 1).await.expect("dequeue3");
-    let t3 = match &tasks3[0] {
-        Task::RunAttempt { id, .. } => id.clone(),
-    };
+    let t3 = tasks3[0].attempt().task_id().to_string();
     shard
         .report_attempt_outcome(
             &t3,
@@ -529,9 +513,7 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_success() {
 
     let tasks = shard.dequeue("worker-1", 1).await.expect("dequeue");
     assert_eq!(tasks.len(), 1);
-    let task_id = match &tasks[0] {
-        Task::RunAttempt { id, .. } => id.clone(),
-    };
+    let task_id = tasks[0].attempt().task_id().to_string();
 
     // First report: success
     shard
@@ -599,9 +581,7 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_error() {
 
     let tasks = shard.dequeue("worker-1", 1).await.expect("dequeue");
     assert_eq!(tasks.len(), 1);
-    let task_id = match &tasks[0] {
-        Task::RunAttempt { id, .. } => id.clone(),
-    };
+    let task_id = tasks[0].attempt().task_id().to_string();
 
     // First report: success
     shard
@@ -715,9 +695,7 @@ async fn retry_count_one_boundary_enqueues_attempt2_then_stops_on_second_error()
 
     // Attempt 1 fails -> attempt 2 should be enqueued
     let tasks = shard.dequeue("w", 1).await.expect("dequeue1");
-    let t1 = match &tasks[0] {
-        Task::RunAttempt { id, .. } => id.clone(),
-    };
+    let t1 = tasks[0].attempt().task_id().to_string();
     shard
         .report_attempt_outcome(
             &t1,
@@ -742,9 +720,7 @@ async fn retry_count_one_boundary_enqueues_attempt2_then_stops_on_second_error()
 
     // Run attempt 2 and fail -> no attempt 3
     let tasks2 = shard.dequeue("w", 1).await.expect("dequeue2");
-    let t2 = match &tasks2[0] {
-        Task::RunAttempt { id, .. } => id.clone(),
-    };
+    let t2 = tasks2[0].attempt().task_id().to_string();
     shard
         .report_attempt_outcome(
             &t2,
@@ -790,9 +766,7 @@ async fn next_retry_time_matches_scheduled_time_smoke() {
         .expect("enqueue");
 
     let tasks = shard.dequeue("w", 1).await.expect("dequeue");
-    let t1 = match &tasks[0] {
-        Task::RunAttempt { id, .. } => id.clone(),
-    };
+    let t1 = tasks[0].attempt().task_id().to_string();
     shard
         .report_attempt_outcome(
             &t1,
@@ -844,9 +818,7 @@ async fn duplicate_reporting_error_then_error_is_rejected_and_no_extra_tasks() {
         .expect("enqueue");
 
     let tasks = shard.dequeue("w", 1).await.expect("dequeue");
-    let t1 = match &tasks[0] {
-        Task::RunAttempt { id, .. } => id.clone(),
-    };
+    let t1 = tasks[0].attempt().task_id().to_string();
     shard
         .report_attempt_outcome(
             &t1,
@@ -891,9 +863,7 @@ async fn duplicate_reporting_error_then_success_is_rejected_and_state_persists()
         .expect("enqueue");
 
     let tasks = shard.dequeue("w", 1).await.expect("dequeue");
-    let t1 = match &tasks[0] {
-        Task::RunAttempt { id, .. } => id.clone(),
-    };
+    let t1 = tasks[0].attempt().task_id().to_string();
     shard
         .report_attempt_outcome(
             &t1,
@@ -940,9 +910,7 @@ async fn heartbeat_after_outcome_returns_lease_not_found() {
         .await
         .expect("enqueue");
     let tasks = shard.dequeue("worker-1", 1).await.expect("dequeue");
-    let task_id = match &tasks[0] {
-        Task::RunAttempt { id, .. } => id.clone(),
-    };
+    let task_id = tasks[0].attempt().task_id().to_string();
     shard
         .report_attempt_outcome(
             &task_id,
@@ -973,9 +941,7 @@ async fn job_deletion_race_before_success_outcome() {
         .await
         .expect("enqueue");
     let tasks = shard.dequeue("w", 1).await.expect("dequeue");
-    let task_id = match &tasks[0] {
-        Task::RunAttempt { id, .. } => id.clone(),
-    };
+    let task_id = tasks[0].attempt().task_id().to_string();
     shard.delete_job(&job_id).await.expect("delete");
     shard
         .report_attempt_outcome(
@@ -1005,9 +971,7 @@ async fn job_deletion_race_before_error_outcome_no_followup_task() {
         .await
         .expect("enqueue");
     let tasks = shard.dequeue("w", 1).await.expect("dequeue");
-    let task_id = match &tasks[0] {
-        Task::RunAttempt { id, .. } => id.clone(),
-    };
+    let task_id = tasks[0].attempt().task_id().to_string();
     shard.delete_job(&job_id).await.expect("delete");
     shard
         .report_attempt_outcome(
@@ -1045,9 +1009,7 @@ async fn attempt_records_exist_across_retries_and_task_ids_distinct() {
         .expect("enqueue");
 
     let tasks1 = shard.dequeue("w", 1).await.expect("dequeue1");
-    let t1 = match &tasks1[0] {
-        Task::RunAttempt { id, .. } => id.clone(),
-    };
+    let t1 = tasks1[0].attempt().task_id().to_string();
     shard
         .report_attempt_outcome(
             &t1,
@@ -1062,9 +1024,7 @@ async fn attempt_records_exist_across_retries_and_task_ids_distinct() {
         .await
         .expect("task2");
     let tasks2 = shard.dequeue("w", 1).await.expect("dequeue2");
-    let t2 = match &tasks2[0] {
-        Task::RunAttempt { id, .. } => id.clone(),
-    };
+    let t2 = tasks2[0].attempt().task_id().to_string();
     assert_ne!(t1, t2, "task ids should be distinct across attempts");
     shard
         .report_attempt_outcome(
@@ -1108,9 +1068,7 @@ async fn outcome_payload_edge_cases_empty_vectors_round_trip() {
         .await
         .expect("enqueue");
     let tasks = shard.dequeue("w", 1).await.expect("dequeue");
-    let task_id = match &tasks[0] {
-        Task::RunAttempt { id, .. } => id.clone(),
-    };
+    let task_id = tasks[0].attempt().task_id().to_string();
     shard
         .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: Vec::new() })
         .await
@@ -1133,9 +1091,7 @@ async fn outcome_payload_edge_cases_empty_vectors_round_trip() {
         .await
         .expect("enqueue2");
     let tasks2 = shard.dequeue("w", 1).await.expect("dequeue2");
-    let task2 = match &tasks2[0] {
-        Task::RunAttempt { id, .. } => id.clone(),
-    };
+    let task2 = tasks2[0].attempt().task_id().to_string();
     shard
         .report_attempt_outcome(
             &task2,
@@ -1168,9 +1124,7 @@ async fn large_outcome_payloads_round_trip() {
         .await
         .expect("enqueue");
     let tasks = shard.dequeue("w", 1).await.expect("dequeue");
-    let task_id = match &tasks[0] {
-        Task::RunAttempt { id, .. } => id.clone(),
-    };
+    let task_id = tasks[0].attempt().task_id().to_string();
     let big_ok = vec![1u8; 2_000_000];
     shard
         .report_attempt_outcome(
@@ -1198,9 +1152,7 @@ async fn large_outcome_payloads_round_trip() {
         .await
         .expect("enqueue2");
     let tasks2 = shard.dequeue("w", 1).await.expect("dequeue2");
-    let task2 = match &tasks2[0] {
-        Task::RunAttempt { id, .. } => id.clone(),
-    };
+    let task2 = tasks2[0].attempt().task_id().to_string();
     let big_err = vec![2u8; 2_000_000];
     shard
         .report_attempt_outcome(
@@ -1255,25 +1207,12 @@ async fn priority_ordering_when_start_times_equal() {
     // Dequeue two tasks; with equal times, lower priority number should come first
     let tasks = shard.dequeue("w", 2).await.expect("dequeue");
     assert_eq!(tasks.len(), 2);
-    match (&tasks[0], &tasks[1]) {
-        (
-            Task::RunAttempt {
-                job_id: j1,
-                attempt_number: a1,
-                ..
-            },
-            Task::RunAttempt {
-                job_id: j2,
-                attempt_number: a2,
-                ..
-            },
-        ) => {
-            assert_eq!(j1, &job_hi);
-            assert_eq!(j2, &job_lo);
-            assert_eq!(*a1, 1);
-            assert_eq!(*a2, 1);
-        }
-    }
+    let t1 = &tasks[0];
+    let t2 = &tasks[1];
+    assert_eq!(t1.job().id(), job_hi);
+    assert_eq!(t2.job().id(), job_lo);
+    assert_eq!(t1.attempt().attempt_number(), 1);
+    assert_eq!(t2.attempt().attempt_number(), 1);
 }
 
 #[tokio::test]
@@ -1295,9 +1234,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         .expect("enqueue");
 
     let tasks = shard.dequeue("w", 1).await.expect("dequeue");
-    let _leased_task_id = match &tasks[0] {
-        Task::RunAttempt { id, .. } => id.clone(),
-    };
+    let _leased_task_id = tasks[0].attempt().task_id().to_string();
 
     // Find the lease and rewrite expiry to the past
     let (lease_key, lease_value) = first_kv_with_prefix(shard.db(), "lease/")
@@ -1378,9 +1315,7 @@ async fn reap_ignores_unexpired_leases() {
         .expect("enqueue");
 
     let tasks = shard.dequeue("w", 1).await.expect("dequeue");
-    let _task_id = match &tasks[0] {
-        Task::RunAttempt { id, .. } => id.clone(),
-    };
+    let _task_id = tasks[0].attempt().task_id().to_string();
 
     // Do not mutate the lease; it should not be reaped
     let (lease_key, _lease_value) = first_kv_with_prefix(shard.db(), "lease/")
@@ -1408,4 +1343,43 @@ async fn reap_ignores_unexpired_leases() {
         silo::job_store_shard::AttemptState::Running { .. } => {}
         other => panic!("expected Running, got {:?}", other),
     }
+}
+
+#[tokio::test]
+async fn delete_job_before_dequeue_skips_task_and_no_lease_created() {
+    let (_tmp, shard) = open_temp_shard().await;
+
+    let payload = serde_json::json!({"k": "v"});
+    let priority = 10u8;
+    let now_ms = now_ms();
+
+    let job_id = shard
+        .enqueue(None, priority, now_ms, None, payload)
+        .await
+        .expect("enqueue");
+
+    // Verify a task exists in the ready queue
+    let peek = shard.peek_tasks(10).await.expect("peek");
+    assert_eq!(peek.len(), 1);
+
+    // Delete the job before dequeue
+    shard.delete_job(&job_id).await.expect("delete job");
+
+    // Dequeue should skip the task (since job missing) and return nothing
+    let tasks = shard.dequeue("w", 1).await.expect("dequeue");
+    assert!(
+        tasks.is_empty(),
+        "no tasks should be returned when job missing"
+    );
+
+    // Ensure original task key was deleted (since we skipped it)
+    let none_left = first_kv_with_prefix(shard.db(), "tasks/").await;
+    assert!(none_left.is_none(), "no tasks should remain after skip");
+
+    // Ensure no lease was created
+    let lease_any = first_kv_with_prefix(shard.db(), "lease/").await;
+    assert!(
+        lease_any.is_none(),
+        "no lease should be created for skipped task"
+    );
 }

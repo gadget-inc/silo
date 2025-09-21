@@ -1,10 +1,10 @@
 - [x] task dequeuing
 - [x] task leases, heartbeats
 - [x] attempt failure/success reporting
-- [ ] lease expiry
+- [x] lease expiry
 - [ ] deleting a job deletes the tasks for it (should this be a scan or another index?)
 - [ ] performance improvement to add attempt view, task view, so we're not deserializing into structs
-- [ ] GRPC layer for invoking functions
+- [x] GRPC layer for invoking functions
 - [ ] limits on payload, error, result size
 - [ ] cancel api
 - [ ] get job info api
