@@ -1,191 +1,47 @@
 use std::sync::Arc;
 
+// use prost::Message;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::{Request, Response, Status};
 use tracing::info;
 
 use crate::factory::{CloseAllError, ShardFactory};
-use crate::job_store_shard::{AttemptOutcome, Shard, ShardError, DEFAULT_LEASE_MS};
-use crate::pb::silo_server::{Silo, SiloServer};
-use crate::pb::*;
-
-fn map_err(e: ShardError) -> Status {
-    Status::internal(e.to_string())
-}
-
-/// gRPC service implementation backed by a `ShardFactory`.
-#[derive(Clone)]
-pub struct SiloService {
-    factory: Arc<ShardFactory>,
-}
-
-impl SiloService {
-    pub fn new(factory: Arc<ShardFactory>) -> Self {
-        Self { factory }
-    }
-
-    fn shard(&self, name: &str) -> Result<&Shard, Status> {
-        self.factory
-            .get(name)
-            .ok_or_else(|| Status::not_found("shard not found"))
-    }
-}
-
-#[tonic::async_trait]
-impl Silo for SiloService {
-    async fn enqueue(
-        &self,
-        req: Request<EnqueueRequest>,
-    ) -> Result<Response<EnqueueResponse>, Status> {
-        let r = req.into_inner();
-        let shard = self.shard(&r.shard)?;
-        let payload_bytes = r
-            .payload
-            .as_ref()
-            .map(|p| p.data.clone())
-            .unwrap_or_default();
-        let payload = serde_json::from_slice::<serde_json::Value>(&payload_bytes)
-            .unwrap_or(serde_json::Value::Null);
-        let retry = r.retry_policy.map(|rp| crate::retry::RetryPolicy {
-            retry_count: rp.retry_count as u32,
-            initial_interval_ms: rp.initial_interval_ms,
-            max_interval_ms: rp.max_interval_ms,
-            randomize_interval: rp.randomize_interval,
-            backoff_factor: rp.backoff_factor,
-        });
-        let id = shard
-            .enqueue(
-                if r.id.is_empty() { None } else { Some(r.id) },
-                r.priority as u8,
-                r.start_at_ms,
-                retry,
-                payload,
-            )
-            .await
-            .map_err(map_err)?;
-        Ok(Response::new(EnqueueResponse { id }))
-    }
-
-    async fn get_job(
-        &self,
-        req: Request<GetJobRequest>,
-    ) -> Result<Response<GetJobResponse>, Status> {
-        let r = req.into_inner();
-        let shard = self.shard(&r.shard)?;
-        let Some(view) = shard.get_job(&r.id).await.map_err(map_err)? else {
-            return Err(Status::not_found("job not found"));
-        };
-        let retry = view.retry_policy();
-        let retry_policy = retry.map(|p| RetryPolicy {
-            retry_count: p.retry_count,
-            initial_interval_ms: p.initial_interval_ms,
-            max_interval_ms: p.max_interval_ms,
-            randomize_interval: p.randomize_interval,
-            backoff_factor: p.backoff_factor,
-        });
-        let resp = GetJobResponse {
-            id: view.id().to_string(),
-            priority: view.priority() as u32,
-            enqueue_time_ms: view.enqueue_time_ms(),
-            payload: Some(JsonValueBytes {
-                data: view.payload_bytes().to_vec(),
-            }),
-            retry_policy,
-        };
-        Ok(Response::new(resp))
-    }
-
-    async fn delete_job(
-        &self,
-        req: Request<DeleteJobRequest>,
-    ) -> Result<Response<DeleteJobResponse>, Status> {
-        let r = req.into_inner();
-        let shard = self.shard(&r.shard)?;
-        shard.delete_job(&r.id).await.map_err(map_err)?;
-        Ok(Response::new(DeleteJobResponse {}))
-    }
-
-    async fn lease_tasks(
-        &self,
-        req: Request<LeaseTasksRequest>,
-    ) -> Result<Response<LeaseTasksResponse>, Status> {
-        let r = req.into_inner();
-        let shard = self.shard(&r.shard)?;
-        let tasks = shard
-            .dequeue(&r.worker_id, r.max_tasks as usize)
-            .await
-            .map_err(map_err)?;
-        let mut out = Vec::with_capacity(tasks.len());
-        for lt in tasks {
-            let job = lt.job();
-            let attempt = lt.attempt();
-            out.push(Task {
-                id: attempt.task_id().to_string(),
-                job_id: job.id().to_string(),
-                attempt_number: attempt.attempt_number(),
-                lease_ms: DEFAULT_LEASE_MS,
-                payload: Some(JsonValueBytes {
-                    data: job.payload_bytes().to_vec(),
-                }),
-                priority: job.priority() as u32,
-            });
-        }
-        Ok(Response::new(LeaseTasksResponse { tasks: out }))
-    }
-
-    async fn report_outcome(
-        &self,
-        req: Request<ReportOutcomeRequest>,
-    ) -> Result<Response<ReportOutcomeResponse>, Status> {
-        let r = req.into_inner();
-        let shard = self.shard(&r.shard)?;
-        let outcome = match r
-            .outcome
-            .ok_or_else(|| Status::invalid_argument("missing outcome"))?
-        {
-            report_outcome_request::Outcome::Success(s) => {
-                AttemptOutcome::Success { result: s.data }
-            }
-            report_outcome_request::Outcome::Failure(f) => AttemptOutcome::Error {
-                error_code: f.code,
-                error: f.data,
-            },
-        };
-        shard
-            .report_attempt_outcome(&r.task_id, outcome)
-            .await
-            .map_err(map_err)?;
-        Ok(Response::new(ReportOutcomeResponse {}))
-    }
-
-    async fn heartbeat(
-        &self,
-        req: Request<HeartbeatRequest>,
-    ) -> Result<Response<HeartbeatResponse>, Status> {
-        let r = req.into_inner();
-        let shard = self.shard(&r.shard)?;
-        shard
-            .heartbeat_task(&r.worker_id, &r.task_id)
-            .await
-            .map_err(map_err)?;
-        Ok(Response::new(HeartbeatResponse {}))
-    }
-}
+use crate::grpc::membership_service::MembershipServiceImpl;
+use crate::grpc::silo_service::SiloService;
+use crate::pb::silo_server::SiloServer;
 
 /// Run the gRPC server and a periodic reaper task together until shutdown.
 pub async fn run_grpc_with_reaper(
     listener: TcpListener,
     factory: Arc<ShardFactory>,
     mut shutdown: broadcast::Receiver<()>,
+    my_node_id: u32,
+    shard_count: u32,
+    raft: Option<crate::membership::Raft>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let svc = SiloService::new(factory.clone());
+    // Provide initial voters from shard_count if Raft metrics are not yet ready.
+    let initial_voters: Vec<u64> = (1..=3).collect();
+    let svc = SiloService::new(
+        factory.clone(),
+        my_node_id,
+        shard_count,
+        raft.clone(),
+        initial_voters,
+    );
+
     let server = SiloServer::new(svc);
+
+    // If provided, mount membership gRPC alongside main service
+    let raft_server = raft.map(|raft_inst| {
+        let membership_svc = MembershipServiceImpl::new(raft_inst);
+        crate::membershippb::membership_service_server::MembershipServiceServer::new(membership_svc)
+    });
 
     // Periodic reaper that iterates all shards every second
     let (tick_tx, mut tick_rx) = broadcast::channel::<()>(1);
+    let (ctrl_tx, mut ctrl_rx) = broadcast::channel::<()>(1);
     let reaper_factory = factory.clone();
     let reaper: JoinHandle<()> = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -204,6 +60,19 @@ pub async fn run_grpc_with_reaper(
         }
     });
 
+    // Background shard map controller (disabled until OpenRaft is wired)
+    let ctrl_handle: JoinHandle<()> = {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => { /* No-op until OpenRaft is wired */ }
+                    _ = ctrl_rx.recv() => { break; }
+                }
+            }
+        })
+    };
+
     let local_addr = listener.local_addr()?;
     // Log after successful bind (listener provided by main)
     tracing::info!(addr = %local_addr, "server started and listening");
@@ -211,13 +80,17 @@ pub async fn run_grpc_with_reaper(
     let incoming = TcpListenerStream::new(listener);
 
     // Serve with graceful shutdown
-    let serve = tonic::transport::Server::builder()
-        .add_service(server)
-        .serve_with_incoming_shutdown(incoming, async move {
-            let _ = shutdown.recv().await;
-            info!("graceful shutdown signal received");
-            let _ = tick_tx.send(());
-        });
+    let mut builder = tonic::transport::Server::builder().add_service(server);
+    if let Some(raft_srv) = raft_server {
+        builder = builder.add_service(raft_srv);
+    }
+
+    let serve = builder.serve_with_incoming_shutdown(incoming, async move {
+        let _ = shutdown.recv().await;
+        info!("graceful shutdown signal received");
+        let _ = tick_tx.send(());
+        let _ = ctrl_tx.send(());
+    });
 
     serve.await?;
     info!("all connections drained, shutting down services");
@@ -231,5 +104,6 @@ pub async fn run_grpc_with_reaper(
         }
     }
     reaper.await.ok();
+    ctrl_handle.await.ok();
     Ok(())
 }

@@ -10,6 +10,13 @@
 - [ ] get job info api
 - [ ] list jobs api
 - [ ] clustering
+  - [ ] raft cluster membership for atomic changes
+  - [ ] initial peer discovery via config files or headless DNS service or something like that
+  - [ ] get the shard count from the config
+  - [ ] make it easy to pass a unique node id down (use hostname:listenport as default if not set?)
+  - [ ] minimize error logging when follower is offline https://docs.rs/openraft/latest/openraft/docs/faq/index.html#how-to-minimize-error-logging-when-a-follower-is-offline
+  - [ ] add tests for graceful node shutdown
+  - [ ] run openraft tests that ensure our implementations pass their conformance suites https://docs.rs/openraft/latest/openraft/docs/getting_started/index.html#ensure-the-storage-implementation-is-correct
 - [ ] webui / operator tooling
 - [ ] /healthz endpoint
 - [ ] /metrics prometheus endpoint

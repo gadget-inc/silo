@@ -44,6 +44,7 @@ async fn main() -> anyhow::Result<()> {
     // Start gRPC server and 1s reaper together
     let addr: SocketAddr = cfg.server.grpc_addr.parse()?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+    let (graceful_tx, _graceful_rx) = tokio::sync::watch::channel(());
 
     // Bind first so we can fail fast if the port is unavailable
     let listener = match TcpListener::bind(addr).await {
@@ -59,12 +60,22 @@ async fn main() -> anyhow::Result<()> {
 
     let factory = Arc::new(shard_factory);
 
-    // Spawn server task with pre-bound listener
-    let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), shutdown_rx));
+    // Spawn Silo gRPC server task with pre-bound listener
+    let my_node_id = cfg.raft.as_ref().map(|c| c.node_id as u32).unwrap_or(0);
+    let shard_count = 128u32;
+    let server = tokio::spawn(run_grpc_with_reaper(
+        listener,
+        factory.clone(),
+        shutdown_rx,
+        my_node_id,
+        shard_count,
+        None,
+    ));
 
-    // Wait for Ctrl+C, then signal shutdown and wait for server
+    // Wait for Ctrl+C, then signal shutdown and wait for servers
     tokio::signal::ctrl_c().await?;
     let _ = shutdown_tx.send(());
+    drop(graceful_tx);
     let _ = server.await?;
     Ok(())
 }

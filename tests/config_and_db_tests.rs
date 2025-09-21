@@ -11,6 +11,7 @@ async fn open_fs_db_from_config() {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
         },
+        raft: None,
     };
 
     let mut factory = ShardFactory::new(cfg.database.clone());

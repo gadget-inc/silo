@@ -65,6 +65,22 @@ message ReportOutcomeResponse {}
 message HeartbeatRequest { string shard = 1; string worker_id = 2; string task_id = 3; }
 message HeartbeatResponse {}
 
+message GetShardOwnershipRequest {}
+
+message GetShardOwnershipResponse {
+  repeated uint32 shards = 1;
+  uint32 shard_count = 2;
+  uint32 node_id = 3;
+}
+
+// Replicated shard map stored in the Raft state machine under key "silo/shard_map"
+message ShardAssignment { uint32 shard_id = 1; uint32 node_id = 2; }
+message ShardMap {
+  uint32 shard_count = 1;
+  repeated ShardAssignment assignments = 2;
+  uint64 version = 3; // monotonically increasing
+}
+
 service Silo {
   rpc Enqueue(EnqueueRequest) returns (EnqueueResponse);
   rpc GetJob(GetJobRequest) returns (GetJobResponse);
@@ -72,6 +88,7 @@ service Silo {
   rpc LeaseTasks(LeaseTasksRequest) returns (LeaseTasksResponse);
   rpc ReportOutcome(ReportOutcomeRequest) returns (ReportOutcomeResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc GetShardOwnership(GetShardOwnershipRequest) returns (GetShardOwnershipResponse);
 }
 
 

@@ -1,0 +1,18 @@
+[server]
+grpc_addr = "127.0.0.1:50054"
+single_node = false
+
+[database]
+backend = "fs"
+path = "/tmp/silo-node4-{shard}"
+
+[raft]
+node_id = 4
+listen_address = "127.0.0.1:19084"
+db_root_dir = "/tmp/openraft-silo-4"
+log_dir = "/tmp/openraft-logs-4"
+initial_cluster = [
+  { id = 1, address = "127.0.0.1:19081" },
+  { id = 2, address = "127.0.0.1:19082" },
+  { id = 3, address = "127.0.0.1:19083" },
+]
