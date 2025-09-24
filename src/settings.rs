@@ -6,6 +6,8 @@ use std::path::Path;
 pub struct AppConfig {
     #[serde(default)]
     pub server: ServerConfig,
+    #[serde(default)]
+    pub coordination: CoordinationConfig,
     pub database: DatabaseTemplate,
 }
 
@@ -20,6 +22,25 @@ pub struct DatabaseTemplate {
 pub struct ServerConfig {
     #[serde(default = "default_grpc_addr")]
     pub grpc_addr: String, // e.g. 127.0.0.1:50051
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CoordinationConfig {
+    /// List of etcd endpoints, e.g. ["http://127.0.0.1:2379"]
+    #[serde(default = "default_etcd_endpoints")]
+    pub etcd_endpoints: Vec<String>,
+}
+
+impl Default for CoordinationConfig {
+    fn default() -> Self {
+        Self {
+            etcd_endpoints: default_etcd_endpoints(),
+        }
+    }
+}
+
+fn default_etcd_endpoints() -> Vec<String> {
+    vec!["http://127.0.0.1:2379".to_string()]
 }
 
 fn default_grpc_addr() -> String {
@@ -47,6 +68,9 @@ impl AppConfig {
         let default = Self {
             server: ServerConfig {
                 grpc_addr: default_grpc_addr(),
+            },
+            coordination: CoordinationConfig {
+                etcd_endpoints: default_etcd_endpoints(),
             },
             database: DatabaseTemplate {
                 backend: Backend::Fs,

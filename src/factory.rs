@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 
-use crate::job_store_shard::Shard;
-use crate::job_store_shard::ShardError;
+use crate::job_store_shard::JobStoreShard;
+use crate::job_store_shard::JobStoreShardError;
 use crate::settings::{DatabaseConfig, DatabaseTemplate};
 use thiserror::Error;
 
 /// Factory for opening and holding `Shard` instances by name.
 pub struct ShardFactory {
-    instances: HashMap<String, Shard>,
+    instances: HashMap<String, JobStoreShard>,
     template: DatabaseTemplate,
 }
 
@@ -19,12 +19,15 @@ impl ShardFactory {
         }
     }
 
-    pub fn get(&self, name: &str) -> Option<&Shard> {
+    pub fn get(&self, name: &str) -> Option<&JobStoreShard> {
         self.instances.get(name)
     }
 
     /// Open a shard using the shared database template.
-    pub async fn open(&mut self, shard_number: usize) -> Result<&Shard, ShardError> {
+    pub async fn open(
+        &mut self,
+        shard_number: usize,
+    ) -> Result<&JobStoreShard, JobStoreShardError> {
         let name = shard_number.to_string();
         let path = self
             .template
@@ -36,18 +39,18 @@ impl ShardFactory {
             backend: self.template.backend.clone(),
             path,
         };
-        let shard = Shard::open(&cfg).await?;
+        let shard = JobStoreShard::open(&cfg).await?;
         self.instances.insert(cfg.name.clone(), shard);
         Ok(self.instances.get(&cfg.name).expect("inserted"))
     }
 
-    pub fn instances(&self) -> &HashMap<String, Shard> {
+    pub fn instances(&self) -> &HashMap<String, JobStoreShard> {
         &self.instances
     }
 
     /// Close all shards gracefully. Returns all errors if any shards fail to close.
     pub async fn close_all(&self) -> Result<(), CloseAllError> {
-        let mut errors: Vec<(String, ShardError)> = Vec::new();
+        let mut errors: Vec<(String, JobStoreShardError)> = Vec::new();
         for (name, shard) in self.instances.iter() {
             if let Err(e) = shard.close().await {
                 errors.push((name.clone(), e));
@@ -63,7 +66,7 @@ impl ShardFactory {
 
 #[derive(Debug, Error)]
 pub struct CloseAllError {
-    pub errors: Vec<(String, ShardError)>,
+    pub errors: Vec<(String, JobStoreShardError)>,
 }
 
 impl std::fmt::Display for CloseAllError {

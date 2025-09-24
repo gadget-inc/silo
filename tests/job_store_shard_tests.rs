@@ -1,5 +1,5 @@
 use rkyv::Archive;
-use silo::job_store_shard::{AttemptOutcome, LeaseRecord, Shard, ShardError, Task};
+use silo::job_store_shard::{AttemptOutcome, JobStoreShard, LeaseRecord, JobStoreShardError, Task};
 use silo::retry::{next_retry_time_ms, RetryPolicy};
 use silo::settings::{Backend, DatabaseConfig};
 use slatedb::{Db, DbIterator};
@@ -13,14 +13,14 @@ fn parse_time_from_task_key(key: &str) -> Option<u64> {
     parts[1].parse::<u64>().ok()
 }
 
-async fn open_temp_shard() -> (tempfile::TempDir, Shard) {
+async fn open_temp_shard() -> (tempfile::TempDir, JobStoreShard) {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = DatabaseConfig {
         name: "test".to_string(),
         backend: Backend::Fs,
         path: tmp.path().to_string_lossy().to_string(),
     };
-    let shard = Shard::open(&cfg).await.expect("open shard");
+    let shard = JobStoreShard::open(&cfg).await.expect("open shard");
     (tmp, shard)
 }
 
@@ -309,7 +309,7 @@ async fn heartbeat_rejects_mismatched_worker() {
         .expect_err("heartbeat should fail");
 
     match err {
-        ShardError::LeaseOwnerMismatch {
+        JobStoreShardError::LeaseOwnerMismatch {
             task_id: tid,
             expected,
             got,
@@ -537,7 +537,7 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_success() {
         .await
         .expect_err("second report should error with LeaseNotFound");
     match err {
-        ShardError::LeaseNotFound(t) => assert_eq!(t, task_id),
+        JobStoreShardError::LeaseNotFound(t) => assert_eq!(t, task_id),
         other => panic!("unexpected error: {other:?}"),
     }
 
@@ -606,7 +606,7 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_error() {
         .await
         .expect_err("second report should error with LeaseNotFound");
     match err {
-        ShardError::LeaseNotFound(t) => assert_eq!(t, task_id),
+        JobStoreShardError::LeaseNotFound(t) => assert_eq!(t, task_id),
         other => panic!("unexpected error: {other:?}"),
     }
 
@@ -656,7 +656,7 @@ async fn enqueue_fails_when_id_already_exists_and_db_unchanged() {
         .expect_err("duplicate enqueue should fail");
 
     match err {
-        ShardError::JobAlreadyExists(got) => assert_eq!(got, id),
+        JobStoreShardError::JobAlreadyExists(got) => assert_eq!(got, id),
         other => panic!("unexpected error: {other:?}"),
     }
 
@@ -842,7 +842,7 @@ async fn duplicate_reporting_error_then_error_is_rejected_and_no_extra_tasks() {
         .await
         .expect_err("dup should fail");
     match err {
-        ShardError::LeaseNotFound(t) => assert_eq!(t, t1),
+        JobStoreShardError::LeaseNotFound(t) => assert_eq!(t, t1),
         other => panic!("unexpected error: {other:?}"),
     }
 
@@ -884,7 +884,7 @@ async fn duplicate_reporting_error_then_success_is_rejected_and_state_persists()
         .await
         .expect_err("dup");
     match err {
-        ShardError::LeaseNotFound(t) => assert_eq!(t, t1),
+        JobStoreShardError::LeaseNotFound(t) => assert_eq!(t, t1),
         other => panic!("unexpected error: {other:?}"),
     }
 
@@ -925,7 +925,7 @@ async fn heartbeat_after_outcome_returns_lease_not_found() {
         .await
         .expect_err("hb should fail");
     match err {
-        ShardError::LeaseNotFound(t) => assert_eq!(t, task_id),
+        JobStoreShardError::LeaseNotFound(t) => assert_eq!(t, task_id),
         other => panic!("unexpected error: {other:?}"),
     }
 }

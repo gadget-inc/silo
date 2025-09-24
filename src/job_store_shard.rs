@@ -14,13 +14,13 @@ use crate::settings::DatabaseConfig;
 use crate::storage::{resolve_object_store, StorageError};
 
 /// Represents a single shard of the system. Owns the SlateDB instance.
-pub struct Shard {
+pub struct JobStoreShard {
     name: String,
     db: Db,
 }
 
 #[derive(Debug, Error)]
-pub enum ShardError {
+pub enum JobStoreShardError {
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -129,11 +129,11 @@ pub struct JobAttemptView {
 }
 
 impl JobAttemptView {
-    pub fn new(bytes: Bytes) -> Result<Self, ShardError> {
+    pub fn new(bytes: Bytes) -> Result<Self, JobStoreShardError> {
         #[cfg(debug_assertions)]
         {
             let _ = rkyv::check_archived_root::<JobAttempt>(&bytes)
-                .map_err(|e| ShardError::Rkyv(e.to_string()))?;
+                .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
         }
         Ok(Self { bytes })
     }
@@ -203,12 +203,12 @@ pub struct JobView {
 
 impl JobView {
     /// Validate bytes and construct a zero-copy view.
-    pub fn new(bytes: Bytes) -> Result<Self, ShardError> {
+    pub fn new(bytes: Bytes) -> Result<Self, JobStoreShardError> {
         // Validate once up front in debug builds; skip in release for performance.
         #[cfg(debug_assertions)]
         {
             let _ = rkyv::check_archived_root::<JobInfo>(&bytes)
-                .map_err(|e| ShardError::Rkyv(e.to_string()))?;
+                .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
         }
         Ok(Self { info_bytes: bytes })
     }
@@ -239,9 +239,7 @@ impl JobView {
     /// primitive fields from the archived view.
     pub fn retry_policy(&self) -> Option<RetryPolicy> {
         let a = self.archived();
-        let Some(pol) = a.retry_policy.as_ref() else {
-            return None;
-        };
+        let pol = a.retry_policy.as_ref()?;
         Some(RetryPolicy {
             retry_count: pol.retry_count,
             initial_interval_ms: pol.initial_interval_ms,
@@ -252,8 +250,8 @@ impl JobView {
     }
 }
 
-impl Shard {
-    pub async fn open(cfg: &DatabaseConfig) -> Result<Self, ShardError> {
+impl JobStoreShard {
+    pub async fn open(cfg: &DatabaseConfig) -> Result<Self, JobStoreShardError> {
         let object_store = resolve_object_store(&cfg.backend, &cfg.path)?;
         let db = Db::open(cfg.path.as_str(), object_store).await?;
         Ok(Self {
@@ -263,8 +261,8 @@ impl Shard {
     }
 
     /// Close the underlying SlateDB instance gracefully.
-    pub async fn close(&self) -> Result<(), ShardError> {
-        self.db.close().await.map_err(ShardError::from)
+    pub async fn close(&self) -> Result<(), JobStoreShardError> {
+        self.db.close().await.map_err(JobStoreShardError::from)
     }
 
     pub fn name(&self) -> &str {
@@ -282,7 +280,7 @@ impl Shard {
         start_at_ms: i64,
         retry_policy: Option<RetryPolicy>,
         payload: JsonValue,
-    ) -> Result<String, ShardError> {
+    ) -> Result<String, JobStoreShardError> {
         let job_id = id.unwrap_or_else(|| Uuid::new_v4().to_string());
         // If caller provided an id, ensure it doesn't already exist
         if self
@@ -291,7 +289,7 @@ impl Shard {
             .await?
             .is_some()
         {
-            return Err(ShardError::JobAlreadyExists(job_id));
+            return Err(JobStoreShardError::JobAlreadyExists(job_id));
         }
         let payload_bytes = serde_json::to_vec(&payload)?;
         let job = JobInfo {
@@ -301,8 +299,8 @@ impl Shard {
             payload: payload_bytes,
             retry_policy,
         };
-        let job_value: AlignedVec =
-            rkyv::to_bytes::<JobInfo, 256>(&job).map_err(|e| ShardError::Rkyv(e.to_string()))?;
+        let job_value: AlignedVec = rkyv::to_bytes::<JobInfo, 256>(&job)
+            .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
 
         let first_task = Task::RunAttempt {
             id: Uuid::new_v4().to_string(),
@@ -310,7 +308,7 @@ impl Shard {
             attempt_number: 1,
         };
         let task_value: AlignedVec = rkyv::to_bytes::<Task, 256>(&first_task)
-            .map_err(|e| ShardError::Rkyv(e.to_string()))?;
+            .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
 
         // Atomically write both job info and the first task
         let mut batch = WriteBatch::new();
@@ -326,7 +324,7 @@ impl Shard {
     }
 
     /// Delete a job by id.
-    pub async fn delete_job(&self, id: &str) -> Result<(), ShardError> {
+    pub async fn delete_job(&self, id: &str) -> Result<(), JobStoreShardError> {
         let key = job_info_key(id);
         let mut batch = WriteBatch::new();
         batch.delete(key.as_bytes());
@@ -336,7 +334,7 @@ impl Shard {
     }
 
     /// Fetch a job by id as a zero-copy archived view.
-    pub async fn get_job(&self, id: &str) -> Result<Option<JobView>, ShardError> {
+    pub async fn get_job(&self, id: &str) -> Result<Option<JobView>, JobStoreShardError> {
         let key = job_info_key(id);
         let maybe_raw = self.db.get(key.as_bytes()).await?;
         if let Some(raw) = maybe_raw {
@@ -351,7 +349,7 @@ impl Shard {
         &self,
         job_id: &str,
         attempt_number: u32,
-    ) -> Result<Option<JobAttemptView>, ShardError> {
+    ) -> Result<Option<JobAttemptView>, JobStoreShardError> {
         let key = attempt_key(job_id, attempt_number);
         let maybe_raw = self.db.get(key.as_bytes()).await?;
         if let Some(raw) = maybe_raw {
@@ -362,7 +360,7 @@ impl Shard {
     }
 
     /// Peek up to `max_tasks` available tasks (time <= now), without deleting them.
-    pub async fn peek_tasks(&self, max_tasks: usize) -> Result<Vec<Task>, ShardError> {
+    pub async fn peek_tasks(&self, max_tasks: usize) -> Result<Vec<Task>, JobStoreShardError> {
         let (tasks, _keys) = self.scan_ready_tasks(max_tasks).await?;
         Ok(tasks)
     }
@@ -372,7 +370,7 @@ impl Shard {
         &self,
         worker_id: &str,
         max_tasks: usize,
-    ) -> Result<Vec<LeasedTask>, ShardError> {
+    ) -> Result<Vec<LeasedTask>, JobStoreShardError> {
         let (tasks, to_delete) = self.scan_ready_tasks(max_tasks).await?;
         if tasks.is_empty() {
             return Ok(Vec::new());
@@ -411,7 +409,7 @@ impl Shard {
                 expiry_ms,
             };
             let leased_value: AlignedVec = rkyv::to_bytes::<LeaseRecord, 256>(&record)
-                .map_err(|e| ShardError::Rkyv(e.to_string()))?;
+                .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
             batch.put(leased_key.as_bytes(), &leased_value);
             batch.delete(orig_key);
 
@@ -425,7 +423,7 @@ impl Shard {
                 },
             };
             let attempt_val: AlignedVec = rkyv::to_bytes::<JobAttempt, 256>(&attempt)
-                .map_err(|e| ShardError::Rkyv(e.to_string()))?;
+                .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
             let akey = attempt_key(&job_id, attempt_number);
             batch.put(akey.as_bytes(), &attempt_val);
 
@@ -439,7 +437,9 @@ impl Shard {
             let attempt_view = self
                 .get_job_attempt(&job_id, attempt_number)
                 .await?
-                .ok_or_else(|| ShardError::Rkyv("attempt not found after dequeue".to_string()))?;
+                .ok_or_else(|| {
+                    JobStoreShardError::Rkyv("attempt not found after dequeue".to_string())
+                })?;
             out.push(LeasedTask {
                 job: job_view,
                 attempt: attempt_view,
@@ -453,7 +453,7 @@ impl Shard {
     async fn scan_ready_tasks(
         &self,
         max_tasks: usize,
-    ) -> Result<(Vec<Task>, Vec<Vec<u8>>), ShardError> {
+    ) -> Result<(Vec<Task>, Vec<Vec<u8>>), JobStoreShardError> {
         if max_tasks == 0 {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -494,12 +494,16 @@ impl Shard {
     }
 
     /// Heartbeat a lease to renew it if the worker id matches. Bumps expiry by DEFAULT_LEASE_MS
-    pub async fn heartbeat_task(&self, worker_id: &str, task_id: &str) -> Result<(), ShardError> {
+    pub async fn heartbeat_task(
+        &self,
+        worker_id: &str,
+        task_id: &str,
+    ) -> Result<(), JobStoreShardError> {
         // Directly read the lease for this task id
         let key = leased_task_key(task_id);
         let maybe_raw = self.db.get(key.as_bytes()).await?;
         let Some(value_bytes) = maybe_raw else {
-            return Err(ShardError::LeaseNotFound(task_id.to_string()));
+            return Err(JobStoreShardError::LeaseNotFound(task_id.to_string()));
         };
 
         type ArchivedLease = <LeaseRecord as Archive>::Archived;
@@ -507,7 +511,7 @@ impl Shard {
         let archived: &ArchivedLease = unsafe { rkyv::archived_root::<LeaseRecord>(&value_bytes) };
         let current_owner = archived.worker_id.as_str();
         if current_owner != worker_id {
-            return Err(ShardError::LeaseOwnerMismatch {
+            return Err(JobStoreShardError::LeaseOwnerMismatch {
                 task_id: task_id.to_string(),
                 expected: current_owner.to_string(),
                 got: worker_id.to_string(),
@@ -536,7 +540,7 @@ impl Shard {
             expiry_ms: new_expiry,
         };
         let value: AlignedVec = rkyv::to_bytes::<LeaseRecord, 256>(&record)
-            .map_err(|e| ShardError::Rkyv(e.to_string()))?;
+            .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
 
         let mut batch = WriteBatch::new();
         batch.put(key.as_bytes(), &value);
@@ -551,12 +555,12 @@ impl Shard {
         &self,
         task_id: &str,
         outcome: AttemptOutcome,
-    ) -> Result<(), ShardError> {
+    ) -> Result<(), JobStoreShardError> {
         // Load lease; must exist
         let key = leased_task_key(task_id);
         let maybe_raw = self.db.get(key.as_bytes()).await?;
         let Some(value_bytes) = maybe_raw else {
-            return Err(ShardError::LeaseNotFound(task_id.to_string()));
+            return Err(JobStoreShardError::LeaseNotFound(task_id.to_string()));
         };
 
         type ArchivedLease = <LeaseRecord as Archive>::Archived;
@@ -589,7 +593,7 @@ impl Shard {
             state,
         };
         let attempt_val: AlignedVec = rkyv::to_bytes::<JobAttempt, 256>(&attempt)
-            .map_err(|e| ShardError::Rkyv(e.to_string()))?;
+            .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
         let akey = attempt_key(&job_id, attempt_number);
 
         // Atomically update attempt and remove lease; if error, maybe enqueue next attempt
@@ -614,7 +618,7 @@ impl Shard {
                             attempt_number: attempt_number + 1,
                         };
                         let next_bytes: AlignedVec = rkyv::to_bytes::<Task, 256>(&next_task)
-                            .map_err(|e| ShardError::Rkyv(e.to_string()))?;
+                            .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
                         let tkey = task_key(next_time, priority, &job_id, attempt_number + 1);
                         batch.put(tkey.as_bytes(), &next_bytes);
                     }
@@ -629,7 +633,7 @@ impl Shard {
 
     /// Scan all held leases and mark any expired ones as failed with a WORKER_CRASHED error code.
     /// Returns the number of expired leases reaped.
-    pub async fn reap_expired_leases(&self) -> Result<usize, ShardError> {
+    pub async fn reap_expired_leases(&self) -> Result<usize, JobStoreShardError> {
         let start: Vec<u8> = b"lease/".to_vec();
         let mut end: Vec<u8> = b"lease/".to_vec();
         end.push(0xFF);

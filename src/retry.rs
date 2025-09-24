@@ -27,6 +27,7 @@ impl RetryPolicy {
 /// - `failure_time_ms`: time the last attempt failed
 /// - `failures_so_far`: number of failed attempts so far (0 for first failure)
 /// - `policy`: retry configuration
+///
 /// Returns Some(next_time_ms) or None if no more retries should be attempted.
 pub fn next_retry_time_ms(
     failure_time_ms: i64,

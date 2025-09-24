@@ -10,6 +10,7 @@
         just
         nixd # Nix language server
         bacon
+        etcd
       ];
     };
   };

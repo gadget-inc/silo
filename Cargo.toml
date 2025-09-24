@@ -1,9 +1,8 @@
 [package]
 authors = ["Harry Brundage <harry@gadget.dev>"]
 edition = "2021"
-# If you change the name here, you must also do it in flake.nix (and run `cargo generate-lockfile` afterwards)
 name = "silo"
-description = "A simple Rust project using Nix"
+description = "A background job server on top of object storage"
 version = "0.1.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -26,7 +25,15 @@ prost = "0.13"
 prost-types = "0.13"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-perfetto = "0.1"
+silo-macros = { path = "silo-macros" }
 tokio-stream = "0.1"
+etcd-client = { version = "0.13", default-features = false, features = ["tls"] }
+tracing-opentelemetry = "0.27"
+opentelemetry = { version = "0.26" }
+opentelemetry_sdk = { version = "0.26", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.26", features = ["http-json", "trace"] }
+usdt = "0.6.0"
 
 [dev-dependencies]
 tempfile = "3"
@@ -34,3 +41,7 @@ tempfile = "3"
 [build-dependencies]
 tonic-build = "0.12"
 protoc-bin-vendored = "3.0"
+
+[profile.release]
+debug = 1     # debug info with line tables only for profiling
+strip = false # do not strip symbols for profiling

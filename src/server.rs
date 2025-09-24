@@ -8,11 +8,11 @@ use tonic::{Request, Response, Status};
 use tracing::info;
 
 use crate::factory::{CloseAllError, ShardFactory};
-use crate::job_store_shard::{AttemptOutcome, Shard, ShardError, DEFAULT_LEASE_MS};
+use crate::job_store_shard::{AttemptOutcome, JobStoreShard, JobStoreShardError, DEFAULT_LEASE_MS};
 use crate::pb::silo_server::{Silo, SiloServer};
 use crate::pb::*;
 
-fn map_err(e: ShardError) -> Status {
+fn map_err(e: JobStoreShardError) -> Status {
     Status::internal(e.to_string())
 }
 
@@ -27,7 +27,7 @@ impl SiloService {
         Self { factory }
     }
 
-    fn shard(&self, name: &str) -> Result<&Shard, Status> {
+    fn shard(&self, name: &str) -> Result<&JobStoreShard, Status> {
         self.factory
             .get(name)
             .ok_or_else(|| Status::not_found("shard not found"))
@@ -50,7 +50,7 @@ impl Silo for SiloService {
         let payload = serde_json::from_slice::<serde_json::Value>(&payload_bytes)
             .unwrap_or(serde_json::Value::Null);
         let retry = r.retry_policy.map(|rp| crate::retry::RetryPolicy {
-            retry_count: rp.retry_count as u32,
+            retry_count: rp.retry_count,
             initial_interval_ms: rp.initial_interval_ms,
             max_interval_ms: rp.max_interval_ms,
             randomize_interval: rp.randomize_interval,

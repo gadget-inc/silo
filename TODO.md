@@ -9,7 +9,11 @@
 - [ ] cancel api
 - [ ] get job info api
 - [ ] list jobs api
-- [ ] clustering
+- [x] clustering
+  - [x] etcd leasing
+  - [x] integration tests of some sort
+  - [x] only run one reconcile loop at once
+  - [ ] think through if failing open when control plane is down is ok with write fencing
 - [ ] webui / operator tooling
 - [ ] /healthz endpoint
 - [ ] /metrics prometheus endpoint

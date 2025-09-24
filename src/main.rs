@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::error;
 
+use silo::coordination::Coordination;
 use silo::factory::ShardFactory;
 use silo::server::run_grpc_with_reaper;
 use silo::settings;
@@ -26,22 +27,19 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // Initialize tracing subscriber to log to stdout. Respect RUST_LOG if set, else default to info.
-    let env_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_target(true)
-        .with_level(true)
-        .compact()
-        .init();
+    // Initialize tracing via shared helper (Perfetto or OTLP based on env)
+    silo::trace::init_from_env()?;
 
     // Load configuration
     let cfg = settings::AppConfig::load(args.config.as_deref())?;
 
-    // Initialize shard factory with the template, defer opening shards until after server bind
+    // Initialize coordination client (etcd). Fail fast if it cannot connect.
+    let _coord = Coordination::connect(&cfg.coordination).await?;
+    tracing::info!(endpoints = ?cfg.coordination.etcd_endpoints, "connected to etcd");
+
     let mut shard_factory = ShardFactory::new(cfg.database.clone());
 
-    // Start gRPC server and 1s reaper together
+    // Start gRPC server and scheduled reaper together
     let addr: SocketAddr = cfg.server.grpc_addr.parse()?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
 
@@ -54,17 +52,17 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Now that the port is bound, open shards using the single template
     let _handle = shard_factory.open(0).await?;
 
     let factory = Arc::new(shard_factory);
 
-    // Spawn server task with pre-bound listener
     let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), shutdown_rx));
 
     // Wait for Ctrl+C, then signal shutdown and wait for server
     tokio::signal::ctrl_c().await?;
     let _ = shutdown_tx.send(());
     let _ = server.await?;
+    // Ensure all spans are flushed before process exit
+    silo::trace::shutdown();
     Ok(())
 }
