@@ -19,24 +19,24 @@ fn build_env_filter() -> EnvFilter {
 pub fn init_from_env() -> anyhow::Result<()> {
     let mut init_result: Option<anyhow::Result<()>> = None;
     INIT.call_once(|| {
-        let result = (|| -> anyhow::Result<()> {
-            let env_filter = build_env_filter();
-            let fmt_layer = tracing_subscriber::fmt::layer()
-                .with_target(true)
-                .with_level(true)
-                .compact()
-                .with_filter(env_filter);
+        let result =
+            (|| -> anyhow::Result<()> {
+                let env_filter = build_env_filter();
+                let fmt_layer = tracing_subscriber::fmt::layer()
+                    .with_target(true)
+                    .with_level(true)
+                    .compact()
+                    .with_filter(env_filter);
 
-            let base = tracing_subscriber::registry().with(fmt_layer);
+                let base = tracing_subscriber::registry().with(fmt_layer);
 
-            if let Some(path) = std::env::var_os("SILO_PERFETTO") {
-                let file = std::fs::File::create(path)?;
-                let perfetto_layer = tracing_perfetto::PerfettoLayer::new(Mutex::new(file))
-                    .with_filter(LevelFilter::DEBUG);
-                base.with(perfetto_layer).init();
-            } else if let Ok(endpoint) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
-                let provider =
-                    opentelemetry_otlp::new_pipeline()
+                if let Some(path) = std::env::var_os("SILO_PERFETTO") {
+                    let file = std::fs::File::create(path)?;
+                    let perfetto_layer = tracing_perfetto::PerfettoLayer::new(Mutex::new(file))
+                        .with_filter(LevelFilter::DEBUG);
+                    base.with(perfetto_layer).init();
+                } else if let Ok(endpoint) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
+                    match opentelemetry_otlp::new_pipeline()
                         .tracing()
                         .with_exporter(
                             opentelemetry_otlp::new_exporter()
@@ -46,15 +46,23 @@ pub fn init_from_env() -> anyhow::Result<()> {
                         .with_trace_config(sdktrace::Config::default().with_resource(
                             Resource::new(vec![KeyValue::new("service.name", "silo")]),
                         ))
-                        .install_batch(runtime::Tokio)?;
-                let tracer = provider.tracer("silo");
-                let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-                base.with(otel_layer).init();
-            } else {
-                base.init();
-            }
-            Ok(())
-        })();
+                        .install_batch(runtime::Tokio)
+                    {
+                        Ok(provider) => {
+                            let tracer = provider.tracer("silo");
+                            let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+                            base.with(otel_layer).init();
+                        }
+                        Err(err) => {
+                            eprintln!("otlp init failed, falling back to fmt: {err}");
+                            base.init();
+                        }
+                    }
+                } else {
+                    base.init();
+                }
+                Ok(())
+            })();
         init_result = Some(result);
     });
     if let Some(res) = init_result {

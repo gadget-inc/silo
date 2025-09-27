@@ -12,10 +12,10 @@ pub enum AttemptOutcome {
     Error { error_code: String, error: Vec<u8> },
 }
 
-/// Attempt state lifecycle for a job attempt
+/// Attempt status lifecycle
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
 #[archive(check_bytes)]
-pub enum AttemptState {
+pub enum AttemptStatus {
     Running {
         started_at_ms: i64,
     },
@@ -37,7 +37,7 @@ pub struct JobAttempt {
     pub job_id: String,
     pub attempt_number: u32,
     pub task_id: String,
-    pub state: AttemptState,
+    pub status: AttemptStatus,
 }
 
 /// Zero-copy view alias over an archived `JobAttempt` backed by owned bytes.
@@ -70,16 +70,16 @@ impl JobAttemptView {
         self.archived().task_id.as_str()
     }
 
-    pub fn state(&self) -> AttemptState {
-        pub(crate) type ArchivedAttemptState = <AttemptState as Archive>::Archived;
-        match &self.archived().state {
-            ArchivedAttemptState::Running { started_at_ms } => AttemptState::Running {
+    pub fn state(&self) -> AttemptStatus {
+        pub(crate) type ArchivedAttemptState = <AttemptStatus as Archive>::Archived;
+        match &self.archived().status {
+            ArchivedAttemptState::Running { started_at_ms } => AttemptStatus::Running {
                 started_at_ms: *started_at_ms,
             },
             ArchivedAttemptState::Succeeded {
                 finished_at_ms,
                 result,
-            } => AttemptState::Succeeded {
+            } => AttemptStatus::Succeeded {
                 finished_at_ms: *finished_at_ms,
                 result: result.to_vec(),
             },
@@ -87,7 +87,7 @@ impl JobAttemptView {
                 finished_at_ms,
                 error_code,
                 error,
-            } => AttemptState::Failed {
+            } => AttemptStatus::Failed {
                 finished_at_ms: *finished_at_ms,
                 error_code: error_code.as_str().to_string(),
                 error: error.to_vec(),

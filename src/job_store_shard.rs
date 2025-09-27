@@ -40,6 +40,8 @@ pub enum JobStoreShardError {
     },
     #[error("job already exists with id {0}")]
     JobAlreadyExists(String),
+    #[error("job not found with id {0}")]
+    JobNotFound(String),
 }
 
 /// Default lease duration for dequeued tasks (milliseconds)
@@ -82,14 +84,6 @@ pub struct LeaseRecord {
     pub worker_id: String,
     pub task: Task,
     pub expiry_ms: i64,
-}
-
-fn now_epoch_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    now.as_millis() as i64
 }
 
 impl JobStoreShard {
@@ -140,6 +134,7 @@ impl JobStoreShard {
             enqueue_time_ms: start_at_ms,
             payload: payload_bytes,
             retry_policy,
+            concurrency_limits,
         };
         let job_value: AlignedVec = rkyv::to_bytes::<JobInfo, 256>(&job)
             .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
@@ -152,13 +147,17 @@ impl JobStoreShard {
         let task_value: AlignedVec = rkyv::to_bytes::<Task, 256>(&first_task)
             .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
 
-        // Atomically write both job info and the first task
+        let job_status = JobStatus::Scheduled {};
+
+        // Atomically write job info, job status, and the first task
         let mut batch = WriteBatch::new();
         batch.put(job_info_key(&job_id).as_bytes(), &job_value);
         batch.put(
             task_key(start_at_ms, priority, &job_id, 1).as_bytes(),
             &task_value,
         );
+        put_job_status(&mut batch, &job_id, &job_status)?;
+
         self.db.write(batch).await?;
         self.db.flush().await?;
 
@@ -167,9 +166,11 @@ impl JobStoreShard {
 
     /// Delete a job by id.
     pub async fn delete_job(&self, id: &str) -> Result<(), JobStoreShardError> {
-        let key = job_info_key(id);
+        let job_info_key: String = job_info_key(id);
+        let job_status_key: String = job_status_key(id);
         let mut batch = WriteBatch::new();
-        batch.delete(key.as_bytes());
+        batch.delete(job_info_key.as_bytes());
+        batch.delete(job_status_key.as_bytes());
         self.db.write(batch).await?;
         self.db.flush().await?;
         Ok(())
@@ -184,6 +185,28 @@ impl JobStoreShard {
         } else {
             Ok(None)
         }
+    }
+
+    /// Fetch a job by id as a zero-copy archived view.
+    pub async fn get_job_status(&self, id: &str) -> Result<Option<JobStatus>, JobStoreShardError> {
+        let key = job_status_key(id);
+        let maybe_raw = self.db.get(key.as_bytes()).await?;
+        let Some(raw) = maybe_raw else {
+            return Ok(None);
+        };
+
+        #[cfg(debug_assertions)]
+        {
+            let _ = rkyv::check_archived_root::<JobStatus>(&raw)
+                .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
+        }
+
+        type ArchivedStatus = <JobStatus as Archive>::Archived;
+        let archived: &ArchivedStatus = unsafe { rkyv::archived_root::<JobStatus>(&raw) };
+        let mut des = rkyv::Infallible;
+        let status: JobStatus = RkyvDeserialize::deserialize(archived, &mut des)
+            .unwrap_or_else(|_| unreachable!("infallible deserialization for JobStatus"));
+        Ok(Some(status))
     }
 
     /// Fetch a job attempt by job id and attempt number.
@@ -224,7 +247,7 @@ impl JobStoreShard {
         let mut batch = WriteBatch::new();
         let mut out: Vec<LeasedTask> = Vec::new();
         let mut pending_attempts: Vec<(JobView, String, u32)> = Vec::new();
-        for (task, orig_key) in tasks.iter().zip(to_delete.iter()) {
+        for (task, task_key) in tasks.iter().zip(to_delete.iter()) {
             // Only RunAttempt exists currently
             let (task_id, job_id, attempt_number) = match task {
                 Task::RunAttempt {
@@ -235,16 +258,16 @@ impl JobStoreShard {
             };
 
             // Look up job info; if missing, delete the task and skip
-            let jkey = job_info_key(&job_id);
-            let maybe_job = self.db.get(jkey.as_bytes()).await?;
+            let job_key = job_info_key(&job_id);
+            let maybe_job = self.db.get(job_key.as_bytes()).await?;
             let Some(job_bytes) = maybe_job else {
-                batch.delete(orig_key);
+                batch.delete(task_key);
                 continue;
             };
             let view = JobView::new(job_bytes)?;
 
-            // Create lease record
-            let leased_key = leased_task_key(&task_id);
+            // Create lease record and delete task from task queue
+            let lease_key = leased_task_key(&task_id);
             let record = LeaseRecord {
                 worker_id: worker_id.to_string(),
                 task: task.clone(),
@@ -252,15 +275,20 @@ impl JobStoreShard {
             };
             let leased_value: AlignedVec = rkyv::to_bytes::<LeaseRecord, 256>(&record)
                 .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
-            batch.put(leased_key.as_bytes(), &leased_value);
-            batch.delete(orig_key);
+
+            batch.put(lease_key.as_bytes(), &leased_value);
+            batch.delete(task_key);
+
+            // Mark job as running
+            let job_status = JobStatus::Running {};
+            put_job_status(&mut batch, &job_id, &job_status)?;
 
             // Also mark attempt as running
             let attempt = JobAttempt {
                 job_id: job_id.clone(),
                 attempt_number,
                 task_id: task_id.clone(),
-                state: AttemptState::Running {
+                status: AttemptStatus::Running {
                     started_at_ms: now_ms,
                 },
             };
@@ -399,8 +427,8 @@ impl JobStoreShard {
         outcome: AttemptOutcome,
     ) -> Result<(), JobStoreShardError> {
         // Load lease; must exist
-        let key = leased_task_key(task_id);
-        let maybe_raw = self.db.get(key.as_bytes()).await?;
+        let leased_task_key = leased_task_key(task_id);
+        let maybe_raw = self.db.get(leased_task_key.as_bytes()).await?;
         let Some(value_bytes) = maybe_raw else {
             return Err(JobStoreShardError::LeaseNotFound(task_id.to_string()));
         };
@@ -417,12 +445,12 @@ impl JobStoreShard {
         };
 
         let now_ms = now_epoch_ms();
-        let state = match &outcome {
-            AttemptOutcome::Success { result } => AttemptState::Succeeded {
+        let attempt_status = match &outcome {
+            AttemptOutcome::Success { result } => AttemptStatus::Succeeded {
                 finished_at_ms: now_ms,
                 result: result.clone(),
             },
-            AttemptOutcome::Error { error_code, error } => AttemptState::Failed {
+            AttemptOutcome::Error { error_code, error } => AttemptStatus::Failed {
                 finished_at_ms: now_ms,
                 error_code: error_code.clone(),
                 error: error.clone(),
@@ -432,44 +460,75 @@ impl JobStoreShard {
             job_id: job_id.clone(),
             attempt_number,
             task_id: task_id.to_string(),
-            state,
+            status: attempt_status,
         };
         let attempt_val: AlignedVec = rkyv::to_bytes::<JobAttempt, 256>(&attempt)
             .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
-        let akey = attempt_key(&job_id, attempt_number);
+        let attempt_key = attempt_key(&job_id, attempt_number);
 
-        // Atomically update attempt and remove lease; if error, maybe enqueue next attempt
+        // Atomically update attempt and remove lease
         let mut batch = WriteBatch::new();
-        batch.put(akey.as_bytes(), &attempt_val);
-        batch.delete(key.as_bytes());
+        batch.put(attempt_key.as_bytes(), &attempt_val);
+        batch.delete(leased_task_key.as_bytes());
 
-        if let AttemptOutcome::Error { .. } = outcome {
-            // Load job info to get priority and retry policy
-            let jkey = job_info_key(&job_id);
-            if let Some(jbytes) = self.db.get(jkey.as_bytes()).await? {
-                let view = JobView::new(jbytes)?;
-                let priority = view.priority();
-                let failures_so_far = attempt_number;
-                if let Some(policy_rt) = view.retry_policy() {
-                    if let Some(next_time) =
-                        crate::retry::next_retry_time_ms(now_ms, failures_so_far, &policy_rt)
-                    {
-                        let next_task = Task::RunAttempt {
-                            id: Uuid::new_v4().to_string(),
-                            job_id: job_id.clone(),
-                            attempt_number: attempt_number + 1,
-                        };
-                        let next_bytes: AlignedVec = rkyv::to_bytes::<Task, 256>(&next_task)
-                            .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
-                        let tkey = task_key(next_time, priority, &job_id, attempt_number + 1);
-                        batch.put(tkey.as_bytes(), &next_bytes);
+        let mut job_missing_error: Option<JobStoreShardError> = None;
+
+        // If success: mark job succeeded now.
+        if let AttemptOutcome::Success { .. } = outcome {
+            let job_status = JobStatus::Succeeded {};
+            put_job_status(&mut batch, &job_id, &job_status)?;
+        } else {
+            // if error, maybe enqueue next attempt; otherwise mark job failed
+            let mut scheduled_followup: bool = false;
+
+            if let AttemptOutcome::Error { .. } = outcome {
+                // Load job info to get priority and retry policy
+                let job_info_key = job_info_key(&job_id);
+                let maybe_job = self.db.get(job_info_key.as_bytes()).await?;
+                if let Some(jbytes) = maybe_job {
+                    let view = JobView::new(jbytes)?;
+                    let priority = view.priority();
+                    let failures_so_far = attempt_number;
+                    if let Some(policy_rt) = view.retry_policy() {
+                        if let Some(next_time) =
+                            crate::retry::next_retry_time_ms(now_ms, failures_so_far, &policy_rt)
+                        {
+                            let next_attempt_number = attempt_number + 1;
+                            let next_task = Task::RunAttempt {
+                                id: Uuid::new_v4().to_string(),
+                                job_id: job_id.clone(),
+                                attempt_number: next_attempt_number,
+                            };
+                            let next_bytes: AlignedVec = rkyv::to_bytes::<Task, 256>(&next_task)
+                                .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
+
+                            batch.put(
+                                task_key(next_time, priority, &job_id, next_attempt_number)
+                                    .as_bytes(),
+                                &next_bytes,
+                            );
+
+                            let job_status = JobStatus::Scheduled {};
+                            put_job_status(&mut batch, &job_id, &job_status)?;
+                            scheduled_followup = true;
+                        }
                     }
+                    // If no follow-up scheduled, mark job as failed
+                    if !scheduled_followup {
+                        let job_status = JobStatus::Failed {};
+                        put_job_status(&mut batch, &job_id, &job_status)?;
+                    }
+                } else {
+                    job_missing_error = Some(JobStoreShardError::JobNotFound(job_id.clone()));
                 }
             }
         }
 
         self.db.write(batch).await?;
         self.db.flush().await?;
+        if let Some(err) = job_missing_error {
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -520,4 +579,23 @@ impl JobStoreShard {
 
         Ok(reaped)
     }
+}
+
+fn now_epoch_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    now.as_millis() as i64
+}
+
+fn put_job_status(
+    batch: &mut WriteBatch,
+    job_id: &str,
+    status: &JobStatus,
+) -> Result<(), JobStoreShardError> {
+    let job_status_value: AlignedVec = rkyv::to_bytes::<JobStatus, 256>(status)
+        .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
+    batch.put(job_status_key(job_id).as_bytes(), &job_status_value);
+    Ok(())
 }

@@ -14,7 +14,10 @@ use crate::pb::silo_server::{Silo, SiloServer};
 use crate::pb::*;
 
 fn map_err(e: JobStoreShardError) -> Status {
-    Status::internal(e.to_string())
+    match e {
+        JobStoreShardError::JobNotFound(_) => Status::not_found("job not found"),
+        other => Status::internal(other.to_string()),
+    }
 }
 
 /// gRPC service implementation backed by a `ShardFactory`.

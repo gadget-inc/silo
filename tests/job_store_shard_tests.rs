@@ -79,6 +79,17 @@ async fn enqueue_round_trip_with_explicit_id() {
         .expect("enqueue");
     assert_eq!(got_id, id);
 
+    // Job status should be Scheduled after enqueue
+    let status = shard
+        .get_job_status(&id)
+        .await
+        .expect("get status")
+        .expect("exists");
+    match status {
+        JobStatus::Scheduled {} => {}
+        other => panic!("expected Scheduled, got {:?}", other),
+    }
+
     let view = shard.get_job(&id).await.expect("get_job").expect("exists");
     assert_eq!(view.id(), id);
     assert_eq!(view.priority(), priority);
@@ -200,6 +211,16 @@ async fn dequeue_moves_tasks_to_leased_with_uuid() {
 
     let tasks = shard.dequeue("worker-1", 1).await.expect("dequeue");
     assert_eq!(tasks.len(), 1);
+    // Job status should transition to Running after dequeue
+    let status = shard
+        .get_job_status(&job_id)
+        .await
+        .expect("get status")
+        .expect("exists");
+    match status {
+        JobStatus::Running {} => {}
+        other => panic!("expected Running, got {:?}", other),
+    }
     let leased_task_id = {
         let t = &tasks[0];
         assert_eq!(t.job().id(), job_id);
@@ -368,7 +389,7 @@ async fn reporting_attempt_outcome_updates_attempt_and_deletes_lease() {
         .expect("get attempt view")
         .expect("attempt exists");
     match attempt_view.state() {
-        AttemptState::Succeeded { .. } => {}
+        AttemptStatus::Succeeded { .. } => {}
         _ => panic!("expected Succeeded"),
     }
 }
@@ -559,7 +580,7 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_success() {
         .expect("get attempt view")
         .expect("attempt exists");
     match attempt_view.state() {
-        AttemptState::Succeeded { .. } => {}
+        AttemptStatus::Succeeded { .. } => {}
         _ => panic!("expected Succeeded"),
     }
 
@@ -619,7 +640,7 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_error() {
         .expect("get attempt view")
         .expect("attempt exists");
     match attempt_view.state() {
-        AttemptState::Succeeded { .. } => {}
+        AttemptStatus::Succeeded { .. } => {}
         _ => panic!("expected Succeeded"),
     }
 
@@ -975,7 +996,7 @@ async fn job_deletion_race_before_error_outcome_no_followup_task() {
     let tasks = shard.dequeue("w", 1).await.expect("dequeue");
     let task_id = tasks[0].attempt().task_id().to_string();
     shard.delete_job(&job_id).await.expect("delete");
-    shard
+    let err = shard
         .report_attempt_outcome(
             &task_id,
             AttemptOutcome::Error {
@@ -984,7 +1005,11 @@ async fn job_deletion_race_before_error_outcome_no_followup_task() {
             },
         )
         .await
-        .expect("report ok");
+        .expect_err("report should return JobNotFound when job is missing");
+    match err {
+        JobStoreShardError::JobNotFound(jid) => assert_eq!(jid, job_id),
+        other => panic!("unexpected error: {other:?}"),
+    }
     let none_left = first_kv_with_prefix(shard.db(), "tasks/").await;
     assert!(
         none_left.is_none(),
@@ -1050,11 +1075,11 @@ async fn attempt_records_exist_across_retries_and_task_ids_distinct() {
         .expect("get a2")
         .expect("a2 exists");
     match a1.state() {
-        AttemptState::Failed { .. } => {}
+        AttemptStatus::Failed { .. } => {}
         _ => panic!("a1 should be Failed"),
     }
     match a2.state() {
-        AttemptState::Failed { .. } => {}
+        AttemptStatus::Failed { .. } => {}
         _ => panic!("a2 should be Failed"),
     }
 }
@@ -1081,7 +1106,7 @@ async fn outcome_payload_edge_cases_empty_vectors_round_trip() {
         .expect("get")
         .expect("exists");
     match a1.state() {
-        AttemptState::Succeeded { result, .. } => {
+        AttemptStatus::Succeeded { result, .. } => {
             assert_eq!(result.len(), 0)
         }
         _ => panic!("expected Succeeded"),
@@ -1110,7 +1135,7 @@ async fn outcome_payload_edge_cases_empty_vectors_round_trip() {
         .expect("get2")
         .expect("exists2");
     match a_err.state() {
-        AttemptState::Failed { error, .. } => {
+        AttemptStatus::Failed { error, .. } => {
             assert_eq!(error.len(), 0)
         }
         _ => panic!("expected Failed"),
@@ -1145,7 +1170,7 @@ async fn large_outcome_payloads_round_trip() {
         .expect("get")
         .expect("exists");
     match a1.state() {
-        AttemptState::Succeeded { result, .. } => {
+        AttemptStatus::Succeeded { result, .. } => {
             assert_eq!(result.len(), big_ok.len())
         }
         _ => panic!("expected Succeeded"),
@@ -1174,7 +1199,7 @@ async fn large_outcome_payloads_round_trip() {
         .expect("get2")
         .expect("exists2");
     match a2.state() {
-        AttemptState::Failed { error, .. } => {
+        AttemptStatus::Failed { error, .. } => {
             assert_eq!(error.len(), big_err.len())
         }
         _ => panic!("expected Failed"),
@@ -1344,7 +1369,7 @@ async fn reap_ignores_unexpired_leases() {
         .expect("get a1")
         .expect("a1 exists");
     match a1.state() {
-        AttemptState::Running { .. } => {}
+        AttemptStatus::Running { .. } => {}
         other => panic!("expected Running, got {:?}", other),
     }
 }

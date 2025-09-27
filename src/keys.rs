@@ -1,6 +1,11 @@
-/// Construct the SlateDB key for a given job id.
+/// The KV store key for a given job's info by id
 pub fn job_info_key(id: &str) -> String {
     format!("jobs/{}", id)
+}
+
+/// The KV store key for a given job's status
+pub fn job_status_key(id: &str) -> String {
+    format!("job_status/{}", id)
 }
 
 /// Construct the key for a task, ordered by start time.
