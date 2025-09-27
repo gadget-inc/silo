@@ -30,3 +30,23 @@ pub fn leased_task_key(task_id: &str) -> String {
 pub fn attempt_key(job_id: &str, attempt: u32) -> String {
     format!("attempts/{}/{}", job_id, attempt)
 }
+
+/// Concurrency request queue: requests/<queue-name>/<request_time_ms>/<request_id>
+pub fn concurrency_request_key(queue: &str, request_time_ms: i64, request_id: &str) -> String {
+    format!(
+        "requests/{}/{:020}/{}",
+        queue,
+        request_time_ms.max(0) as u64,
+        request_id
+    )
+}
+
+/// Concurrency holders set: holders/<queue-name>/<task-id>
+pub fn concurrency_holder_key(queue: &str, task_id: &str) -> String {
+    format!("holders/{}/{}", queue, task_id)
+}
+
+/// Optional per-queue dynamic concurrency limit: limits/<queue-name>
+pub fn concurrency_limit_key(queue: &str) -> String {
+    format!("limits/{}", queue)
+}

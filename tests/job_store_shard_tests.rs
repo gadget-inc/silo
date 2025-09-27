@@ -3,6 +3,7 @@ use silo::job::JobStatus;
 use silo::job_attempt::{AttemptOutcome, AttemptStatus};
 
 use silo::job_store_shard::{JobStoreShard, JobStoreShardError, LeaseRecord, Task};
+use silo::keys::concurrency_holder_key;
 use silo::retry::{next_retry_time_ms, RetryPolicy};
 use silo::settings::{Backend, DatabaseConfig};
 use slatedb::{Db, DbIterator};
@@ -81,6 +82,14 @@ async fn count_with_prefix(db: &Db, prefix: &str) -> usize {
         count += 1;
     }
     count
+}
+
+async fn count_holders_for(db: &Db, queue: &str) -> usize {
+    count_with_prefix(db, &format!("holders/{}/", queue)).await
+}
+
+async fn count_requests_for(db: &Db, queue: &str) -> usize {
+    count_with_prefix(db, &format!("requests/{}/", queue)).await
 }
 
 #[tokio::test]
@@ -275,6 +284,7 @@ async fn dequeue_moves_tasks_to_leased_with_uuid() {
             id,
             job_id: jid,
             attempt_number,
+            ..
         } => {
             assert_eq!(id.as_str(), leased_task_id);
             assert_eq!(jid.as_str(), job_id);
@@ -1451,6 +1461,273 @@ async fn priority_ordering_when_start_times_equal() {
 }
 
 #[tokio::test]
+async fn concurrency_immediate_grant_enqueues_task_and_writes_holder() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let payload = serde_json::json!({"k": "v"});
+    let queue = "q1".to_string();
+    // enqueue with limit 1
+    let job_id = shard
+        .enqueue(
+            None,
+            10u8,
+            now,
+            None,
+            payload,
+            vec![silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            }],
+        )
+        .await
+        .expect("enqueue");
+
+    // Task should be ready immediately
+    let tasks = shard.dequeue("w", 1).await.expect("dequeue");
+    assert_eq!(tasks.len(), 1);
+    let t = &tasks[0];
+    assert_eq!(t.job().id(), job_id);
+
+    // Holder should exist for this task id
+    let holder = shard
+        .db()
+        .get(concurrency_holder_key(&queue, t.attempt().task_id()).as_bytes())
+        .await
+        .expect("get holder");
+    assert!(
+        holder.is_some(),
+        "holder should be written for granted ticket"
+    );
+}
+
+#[tokio::test]
+async fn concurrency_queues_when_full_and_grants_on_release() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let queue = "q2".to_string();
+
+    // First job takes the single slot
+    let _j1 = shard
+        .enqueue(
+            None,
+            10u8,
+            now,
+            None,
+            serde_json::json!({"j": 1}),
+            vec![silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            }],
+        )
+        .await
+        .expect("enqueue1");
+    let tasks1 = shard.dequeue("w1", 1).await.expect("deq1");
+    assert_eq!(tasks1.len(), 1);
+    let t1 = tasks1[0].attempt().task_id().to_string();
+
+    // Second job should queue a request (no immediate task visible)
+    let _j2 = shard
+        .enqueue(
+            None,
+            10u8,
+            now,
+            None,
+            serde_json::json!({"j": 2}),
+            vec![silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            }],
+        )
+        .await
+        .expect("enqueue2");
+    // No new tasks yet
+    let none = first_kv_with_prefix(shard.db(), "tasks/").await;
+    assert!(none.is_none(), "no new task while holder is occupied");
+
+    // Complete first task; this should release and grant next request, enqueuing its task
+    shard
+        .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report1");
+
+    // Now there should be a new task for the queued request
+    let some = first_kv_with_prefix(shard.db(), "tasks/").await;
+    assert!(some.is_some(), "task should be enqueued for next requester");
+}
+
+#[tokio::test]
+async fn concurrency_held_queues_propagate_across_retries_and_release_on_finish() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let queue = "q3".to_string();
+
+    let _job = shard
+        .enqueue(
+            None,
+            10u8,
+            now,
+            Some(silo::retry::RetryPolicy {
+                retry_count: 1,
+                initial_interval_ms: 1,
+                max_interval_ms: i64::MAX,
+                randomize_interval: false,
+                backoff_factor: 1.0,
+            }),
+            serde_json::json!({"j": 3}),
+            vec![silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            }],
+        )
+        .await
+        .expect("enqueue");
+
+    let t1 = shard.dequeue("w", 1).await.expect("deq")[0]
+        .attempt()
+        .task_id()
+        .to_string();
+
+    // Fail attempt 1, should schedule attempt 2 carrying held_queues
+    shard
+        .report_attempt_outcome(
+            &t1,
+            AttemptOutcome::Error {
+                error_code: "E".to_string(),
+                error: vec![],
+            },
+        )
+        .await
+        .expect("report err");
+
+    // Attempt 2 should be present
+    let t2 = shard.dequeue("w", 1).await.expect("deq2")[0]
+        .attempt()
+        .task_id()
+        .to_string();
+
+    // Finish attempt 2, which should release holder
+    shard
+        .report_attempt_outcome(&t2, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report2");
+
+    // Holder should be gone for t2
+    let holder2 = shard
+        .db()
+        .get(concurrency_holder_key(&queue, &t2).as_bytes())
+        .await
+        .expect("get holder2");
+    assert!(holder2.is_none(), "holder removed after success");
+}
+
+#[tokio::test]
+async fn stress_single_queue_no_double_grant() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let queue = "stress-q".to_string();
+
+    // Enqueue many jobs concurrently into the same queue with limit 1
+    let total = 50usize;
+    for i in 0..total {
+        let _ = shard
+            .enqueue(
+                None,
+                (i % 10) as u8,
+                now,
+                None,
+                serde_json::json!({"i": i}),
+                vec![silo::job::ConcurrencyLimit {
+                    key: queue.clone(),
+                    max_concurrency: 1,
+                }],
+            )
+            .await
+            .expect("enqueue");
+    }
+
+    let mut processed = 0usize;
+    loop {
+        let tasks = shard.dequeue("w-stress", 1).await.expect("deq");
+        if tasks.is_empty() {
+            if processed >= total {
+                break;
+            } else {
+                tokio::task::yield_now().await;
+                continue;
+            }
+        }
+        // Holders should never exceed 1
+        let holders = count_holders_for(shard.db(), &queue).await;
+        assert!(holders <= 1, "holders must be <= 1, got {}", holders);
+        let tid = tasks[0].attempt().task_id().to_string();
+        shard
+            .report_attempt_outcome(&tid, AttemptOutcome::Success { result: vec![] })
+            .await
+            .expect("report");
+        processed += 1;
+    }
+
+    assert_eq!(processed, total);
+    assert_eq!(count_holders_for(shard.db(), &queue).await, 0);
+    assert_eq!(count_requests_for(shard.db(), &queue).await, 0);
+}
+
+#[tokio::test]
+async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let queue = "hold-q".to_string();
+
+    // Take the only slot
+    let _ = shard
+        .enqueue(
+            None,
+            10u8,
+            now,
+            None,
+            serde_json::json!({"first": true}),
+            vec![silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            }],
+        )
+        .await
+        .expect("enqueue1");
+    let tasks1 = shard.dequeue("w-hold", 1).await.expect("deq1");
+    assert_eq!(tasks1.len(), 1);
+    let t1 = tasks1[0].attempt().task_id().to_string();
+
+    // Concurrently enqueue more jobs; they should queue as requests
+    let add = 10usize;
+    for i in 0..add {
+        let _ = shard
+            .enqueue(
+                None,
+                (i % 5) as u8,
+                now,
+                None,
+                serde_json::json!({"i": i}),
+                vec![silo::job::ConcurrencyLimit {
+                    key: queue.clone(),
+                    max_concurrency: 1,
+                }],
+            )
+            .await
+            .expect("enqueue add");
+    }
+    // There should be no ready tasks until we release
+    assert!(first_kv_with_prefix(shard.db(), "tasks/").await.is_none());
+
+    // Release first; only one new task should appear immediately
+    shard
+        .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report1");
+    let after = first_kv_with_prefix(shard.db(), "tasks/").await;
+    assert!(after.is_some(), "one task should be enqueued after release");
+}
+
+#[tokio::test]
 async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
     let (_tmp, shard) = open_temp_shard().await;
 
@@ -1483,10 +1760,12 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
             id,
             job_id,
             attempt_number,
+            held_queues: _,
         } => Task::RunAttempt {
             id: id.as_str().to_string(),
             job_id: job_id.as_str().to_string(),
             attempt_number: *attempt_number,
+            held_queues: Vec::new(),
         },
     };
     let expired_ms = now_ms() - 1;

@@ -10,7 +10,10 @@ use uuid::Uuid;
 
 use crate::job::{ConcurrencyLimit, JobInfo, JobStatus, JobView};
 use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt, JobAttemptView};
-use crate::keys::{attempt_key, job_info_key, job_status_key, leased_task_key, task_key};
+use crate::keys::{
+    attempt_key, concurrency_holder_key, concurrency_request_key, job_info_key, job_status_key,
+    leased_task_key, task_key,
+};
 use crate::retry::RetryPolicy;
 use crate::settings::DatabaseConfig;
 use crate::storage::{resolve_object_store, StorageError};
@@ -77,6 +80,7 @@ pub enum Task {
         id: String,
         job_id: String,
         attempt_number: u32,
+        held_queues: Vec<String>,
     },
 }
 
@@ -87,6 +91,26 @@ pub struct LeaseRecord {
     pub worker_id: String,
     pub task: Task,
     pub expiry_ms: i64,
+}
+
+/// Stored representation for a concurrency holder record: value at holders/<queue>/<task-id>
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+#[archive(check_bytes)]
+pub struct HolderRecord {
+    pub granted_at_ms: i64,
+}
+
+/// Action stored at requests/<queue>/<time>/<request-id>
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+#[archive(check_bytes)]
+pub enum ConcurrencyAction {
+    /// When ticket is granted, enqueue the specified task
+    EnqueueTask {
+        start_time_ms: i64,
+        priority: u8,
+        job_id: String,
+        attempt_number: u32,
+    },
 }
 
 impl JobStoreShard {
@@ -101,6 +125,75 @@ impl JobStoreShard {
             db,
             broker,
         })
+    }
+
+    /// Release tickets for the given queues and grant next requests atomically into the batch
+    async fn release_and_grant_next(
+        &self,
+        batch: &mut WriteBatch,
+        queues: &Vec<String>,
+        finished_task_id: &str,
+    ) -> Result<(), JobStoreShardError> {
+        let now_ms = now_epoch_ms();
+        for queue in queues.iter() {
+            // Remove holder for this finished task id in the same batch
+            batch.delete(concurrency_holder_key(queue, finished_task_id).as_bytes());
+            // Update in-memory broker after commit; we cannot mutate yet here
+            // Find one request to grant if capacity allows
+            // Load limit if exists (future enhancement). We grant one per release to keep steady-state.
+            // Scan first request
+            let start = format!("requests/{}/", queue).into_bytes();
+            let mut end: Vec<u8> = format!("requests/{}/", queue).into_bytes();
+            end.push(0xFF);
+            let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..=end).await?;
+            let maybe_req = iter.next().await?;
+            if let Some(kv) = maybe_req {
+                // Decode action
+                type ArchivedAction = <ConcurrencyAction as Archive>::Archived;
+                let a: &ArchivedAction =
+                    unsafe { rkyv::archived_root::<ConcurrencyAction>(&kv.value) };
+                match a {
+                    ArchivedAction::EnqueueTask {
+                        start_time_ms,
+                        priority,
+                        job_id,
+                        attempt_number,
+                    } => {
+                        // Grant: write holder for a synthetic task id equal to request id, and enqueue task
+                        let req_key_str = String::from_utf8_lossy(&kv.key).to_string();
+                        let request_id = req_key_str.split('/').last().unwrap_or("").to_string();
+                        let holder = HolderRecord {
+                            granted_at_ms: now_ms,
+                        };
+                        let holder_val: AlignedVec =
+                            rkyv::to_bytes::<HolderRecord, 256>(&holder)
+                                .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
+                        batch.put(
+                            concurrency_holder_key(queue, &request_id).as_bytes(),
+                            &holder_val,
+                        );
+                        // Build task with held queue
+                        let task = Task::RunAttempt {
+                            id: request_id.clone(),
+                            job_id: job_id.as_str().to_string(),
+                            attempt_number: *attempt_number,
+                            held_queues: vec![queue.clone()],
+                        };
+                        let task_value: AlignedVec = rkyv::to_bytes::<Task, 256>(&task)
+                            .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
+                        batch.put(
+                            task_key(*start_time_ms, *priority, job_id.as_str(), *attempt_number)
+                                .as_bytes(),
+                            &task_value,
+                        );
+                        // Remove request
+                        batch.delete(&kv.key);
+                        // Note: after commit, we'll increment in-memory grant count when the task is dequeued and work begins
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Close the underlying SlateDB instance gracefully.
@@ -137,6 +230,8 @@ impl JobStoreShard {
             return Err(JobStoreShardError::JobAlreadyExists(job_id));
         }
         let payload_bytes = serde_json::to_vec(&payload)?;
+        // Capture the first concurrency limit (if any) before moving the vector into JobInfo
+        let first_limit_opt: Option<ConcurrencyLimit> = concurrency_limits.get(0).cloned();
         let job = JobInfo {
             id: job_id.clone(),
             priority,
@@ -148,27 +243,86 @@ impl JobStoreShard {
         let job_value: AlignedVec = rkyv::to_bytes::<JobInfo, 256>(&job)
             .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
 
-        let first_task = Task::RunAttempt {
-            id: Uuid::new_v4().to_string(),
-            job_id: job_id.clone(),
-            attempt_number: 1,
-        };
-        let task_value: AlignedVec = rkyv::to_bytes::<Task, 256>(&first_task)
-            .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
+        let first_task_id = Uuid::new_v4().to_string();
 
         let job_status = JobStatus::Scheduled {};
 
         // Atomically write job info, job status, and the first task
         let mut batch = WriteBatch::new();
         batch.put(job_info_key(&job_id).as_bytes(), &job_value);
-        batch.put(
-            task_key(start_at_ms, priority, &job_id, 1).as_bytes(),
-            &task_value,
-        );
         put_job_status(&mut batch, &job_id, &job_status)?;
+
+        // Concurrency gating: if limits present, try to grant immediately (in-memory); else write a request
+        if let Some(limit) = first_limit_opt.as_ref() {
+            let now_ms = now_epoch_ms();
+            let queue = &limit.key;
+            let max_allowed = limit.max_concurrency as usize;
+            if self.broker.concurrency_can_grant(queue, max_allowed) {
+                // Grant immediately: write holder and the task
+                let holder = HolderRecord {
+                    granted_at_ms: now_ms,
+                };
+                let holder_val: AlignedVec = rkyv::to_bytes::<HolderRecord, 256>(&holder)
+                    .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
+                batch.put(
+                    concurrency_holder_key(queue, &first_task_id).as_bytes(),
+                    &holder_val,
+                );
+                let first_task = Task::RunAttempt {
+                    id: first_task_id.clone(),
+                    job_id: job_id.clone(),
+                    attempt_number: 1,
+                    held_queues: vec![queue.clone()],
+                };
+                let task_value: AlignedVec = rkyv::to_bytes::<Task, 256>(&first_task)
+                    .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
+                batch.put(
+                    task_key(start_at_ms, priority, &job_id, 1).as_bytes(),
+                    &task_value,
+                );
+            } else {
+                // Persist a request: when granted, enqueue the task
+                let action = ConcurrencyAction::EnqueueTask {
+                    start_time_ms: start_at_ms,
+                    priority,
+                    job_id: job_id.clone(),
+                    attempt_number: 1,
+                };
+                let action_val: AlignedVec = rkyv::to_bytes::<ConcurrencyAction, 256>(&action)
+                    .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
+                let req_key = concurrency_request_key(queue, now_ms, &Uuid::new_v4().to_string());
+                batch.put(req_key.as_bytes(), &action_val);
+            }
+        } else {
+            // No concurrency limits; write task directly
+            let first_task = Task::RunAttempt {
+                id: first_task_id.clone(),
+                job_id: job_id.clone(),
+                attempt_number: 1,
+                held_queues: Vec::new(),
+            };
+            let task_value: AlignedVec = rkyv::to_bytes::<Task, 256>(&first_task)
+                .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
+            batch.put(
+                task_key(start_at_ms, priority, &job_id, 1).as_bytes(),
+                &task_value,
+            );
+        }
 
         self.db.write(batch).await?;
         self.db.flush().await?;
+        // Update in-memory concurrency count after durability if we granted immediately and wrote holder
+        if let Some(limit) = first_limit_opt.as_ref() {
+            let queue = &limit.key;
+            if self
+                .db
+                .get(concurrency_holder_key(queue, &first_task_id).as_bytes())
+                .await?
+                .is_some()
+            {
+                self.broker.concurrency_record_grant(queue, &first_task_id);
+            }
+        }
 
         // If ready now, wake the scanner to refill promptly
         if start_at_ms <= now_epoch_ms() {
@@ -269,12 +423,18 @@ impl JobStoreShard {
         for entry in &claimed {
             let task = &entry.task;
             // Only RunAttempt exists currently
-            let (task_id, job_id, attempt_number) = match task {
+            let (task_id, job_id, attempt_number, held_queues) = match task {
                 Task::RunAttempt {
                     id,
                     job_id,
                     attempt_number,
-                } => (id.clone(), job_id.to_string(), *attempt_number),
+                    held_queues,
+                } => (
+                    id.clone(),
+                    job_id.to_string(),
+                    *attempt_number,
+                    held_queues.clone(),
+                ),
             };
 
             // Look up job info; if missing, delete the task and skip
@@ -385,11 +545,16 @@ impl JobStoreShard {
                     id,
                     job_id,
                     attempt_number,
+                    held_queues,
                 } => {
                     tasks.push(Task::RunAttempt {
                         id: id.as_str().to_string(),
                         job_id: job_id.as_str().to_string(),
                         attempt_number: *attempt_number,
+                        held_queues: held_queues
+                            .iter()
+                            .map(|s| s.as_str().to_string())
+                            .collect::<Vec<String>>(),
                     });
                 }
             }
@@ -434,10 +599,15 @@ impl JobStoreShard {
                 id,
                 job_id,
                 attempt_number,
+                held_queues,
             } => Task::RunAttempt {
                 id: id.as_str().to_string(),
                 job_id: job_id.as_str().to_string(),
                 attempt_number: *attempt_number,
+                held_queues: held_queues
+                    .iter()
+                    .map(|s| s.as_str().to_string())
+                    .collect::<Vec<String>>(),
             },
         };
         let record = LeaseRecord {
@@ -472,12 +642,21 @@ impl JobStoreShard {
         type ArchivedLease = <LeaseRecord as Archive>::Archived;
         type ArchivedTask = <Task as Archive>::Archived;
         let archived: &ArchivedLease = unsafe { rkyv::archived_root::<LeaseRecord>(&value_bytes) };
-        let (job_id, attempt_number) = match &archived.task {
+        let (job_id, attempt_number, held_queues): (String, u32, Vec<String>) = match &archived.task
+        {
             ArchivedTask::RunAttempt {
                 id: _tid,
                 job_id,
                 attempt_number,
-            } => (job_id.as_str().to_string(), *attempt_number),
+                held_queues,
+            } => (
+                job_id.as_str().to_string(),
+                *attempt_number,
+                held_queues
+                    .iter()
+                    .map(|s| s.as_str().to_string())
+                    .collect::<Vec<String>>(),
+            ),
         };
 
         let now_ms = now_epoch_ms();
@@ -535,6 +714,8 @@ impl JobStoreShard {
                                 id: Uuid::new_v4().to_string(),
                                 job_id: job_id.clone(),
                                 attempt_number: next_attempt_number,
+                                // Retain held tickets across retries until completion
+                                held_queues: held_queues.clone(),
                             };
                             let next_bytes: AlignedVec = rkyv::to_bytes::<Task, 256>(&next_task)
                                 .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
@@ -562,8 +743,20 @@ impl JobStoreShard {
             }
         }
 
+        // If job finished (success or no follow-up), release any held concurrency tickets
+        if !(matches!(outcome, AttemptOutcome::Error { .. }) && followup_next_time.is_some()) {
+            self.release_and_grant_next(&mut batch, &held_queues, task_id)
+                .await?;
+        }
+
         self.db.write(batch).await?;
         self.db.flush().await?;
+        // Update in-memory broker counts after durable release/grant
+        if !(matches!(outcome, AttemptOutcome::Error { .. }) && followup_next_time.is_some()) {
+            for q in held_queues.iter() {
+                self.broker.concurrency_record_release(q, task_id);
+            }
+        }
         // If we scheduled a follow-up that is ready now, wake the scanner
         if let Some(nt) = followup_next_time {
             if nt <= now_epoch_ms() {
