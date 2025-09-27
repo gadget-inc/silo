@@ -1,5 +1,7 @@
 use rkyv::Archive;
-use silo::job_store_shard::{AttemptOutcome, JobStoreShard, LeaseRecord, JobStoreShardError, Task};
+use silo::job_attempt::{AttemptOutcome, AttemptState};
+
+use silo::job_store_shard::{JobStoreShard, JobStoreShardError, LeaseRecord, Task};
 use silo::retry::{next_retry_time_ms, RetryPolicy};
 use silo::settings::{Backend, DatabaseConfig};
 use slatedb::{Db, DbIterator};
@@ -366,7 +368,7 @@ async fn reporting_attempt_outcome_updates_attempt_and_deletes_lease() {
         .expect("get attempt view")
         .expect("attempt exists");
     match attempt_view.state() {
-        silo::job_store_shard::AttemptState::Succeeded { .. } => {}
+        AttemptState::Succeeded { .. } => {}
         _ => panic!("expected Succeeded"),
     }
 }
@@ -557,7 +559,7 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_success() {
         .expect("get attempt view")
         .expect("attempt exists");
     match attempt_view.state() {
-        silo::job_store_shard::AttemptState::Succeeded { .. } => {}
+        AttemptState::Succeeded { .. } => {}
         _ => panic!("expected Succeeded"),
     }
 
@@ -617,7 +619,7 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_error() {
         .expect("get attempt view")
         .expect("attempt exists");
     match attempt_view.state() {
-        silo::job_store_shard::AttemptState::Succeeded { .. } => {}
+        AttemptState::Succeeded { .. } => {}
         _ => panic!("expected Succeeded"),
     }
 
@@ -742,7 +744,7 @@ async fn retry_count_one_boundary_enqueues_attempt2_then_stops_on_second_error()
         .expect("get attempt2 view")
         .expect("attempt2 exists");
     match a2_view.state() {
-        silo::job_store_shard::AttemptState::Failed { .. } => {}
+        AttemptState::Failed { .. } => {}
         _ => panic!("expected Failed"),
     }
 }
@@ -785,7 +787,7 @@ async fn next_retry_time_matches_scheduled_time_smoke() {
         .expect("get a1")
         .expect("a1 exists");
     let finished_at = match attempt1.state() {
-        silo::job_store_shard::AttemptState::Failed { finished_at_ms, .. } => finished_at_ms,
+        AttemptState::Failed { finished_at_ms, .. } => finished_at_ms,
         _ => panic!("expected Failed"),
     };
     let (k2, _v2) = first_kv_with_prefix(shard.db(), "tasks/")
@@ -894,7 +896,7 @@ async fn duplicate_reporting_error_then_success_is_rejected_and_state_persists()
         .expect("get a1")
         .expect("exists");
     match a1.state() {
-        silo::job_store_shard::AttemptState::Failed { .. } => {}
+        AttemptState::Failed { .. } => {}
         _ => panic!("a1 should remain Failed"),
     }
 }
@@ -1048,11 +1050,11 @@ async fn attempt_records_exist_across_retries_and_task_ids_distinct() {
         .expect("get a2")
         .expect("a2 exists");
     match a1.state() {
-        silo::job_store_shard::AttemptState::Failed { .. } => {}
+        AttemptState::Failed { .. } => {}
         _ => panic!("a1 should be Failed"),
     }
     match a2.state() {
-        silo::job_store_shard::AttemptState::Failed { .. } => {}
+        AttemptState::Failed { .. } => {}
         _ => panic!("a2 should be Failed"),
     }
 }
@@ -1079,7 +1081,7 @@ async fn outcome_payload_edge_cases_empty_vectors_round_trip() {
         .expect("get")
         .expect("exists");
     match a1.state() {
-        silo::job_store_shard::AttemptState::Succeeded { result, .. } => {
+        AttemptState::Succeeded { result, .. } => {
             assert_eq!(result.len(), 0)
         }
         _ => panic!("expected Succeeded"),
@@ -1108,7 +1110,9 @@ async fn outcome_payload_edge_cases_empty_vectors_round_trip() {
         .expect("get2")
         .expect("exists2");
     match a_err.state() {
-        silo::job_store_shard::AttemptState::Failed { error, .. } => assert_eq!(error.len(), 0),
+        AttemptState::Failed { error, .. } => {
+            assert_eq!(error.len(), 0)
+        }
         _ => panic!("expected Failed"),
     }
 }
@@ -1141,7 +1145,7 @@ async fn large_outcome_payloads_round_trip() {
         .expect("get")
         .expect("exists");
     match a1.state() {
-        silo::job_store_shard::AttemptState::Succeeded { result, .. } => {
+        AttemptState::Succeeded { result, .. } => {
             assert_eq!(result.len(), big_ok.len())
         }
         _ => panic!("expected Succeeded"),
@@ -1170,7 +1174,7 @@ async fn large_outcome_payloads_round_trip() {
         .expect("get2")
         .expect("exists2");
     match a2.state() {
-        silo::job_store_shard::AttemptState::Failed { error, .. } => {
+        AttemptState::Failed { error, .. } => {
             assert_eq!(error.len(), big_err.len())
         }
         _ => panic!("expected Failed"),
@@ -1286,7 +1290,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         .expect("get a1")
         .expect("a1 exists");
     match a1.state() {
-        silo::job_store_shard::AttemptState::Failed { error_code, .. } => {
+        AttemptState::Failed { error_code, .. } => {
             assert_eq!(error_code, "WORKER_CRASHED")
         }
         _ => panic!("expected Failed"),
@@ -1340,7 +1344,7 @@ async fn reap_ignores_unexpired_leases() {
         .expect("get a1")
         .expect("a1 exists");
     match a1.state() {
-        silo::job_store_shard::AttemptState::Running { .. } => {}
+        AttemptState::Running { .. } => {}
         other => panic!("expected Running, got {:?}", other),
     }
 }

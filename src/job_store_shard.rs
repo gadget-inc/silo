@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use rkyv::AlignedVec;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde_json::Value as JsonValue;
@@ -8,6 +7,8 @@ use slatedb::WriteBatch;
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::job::{JobInfo, JobView};
+use crate::job_attempt::{AttemptOutcome, AttemptState, JobAttempt, JobAttemptView};
 use crate::keys::{attempt_key, job_info_key, leased_task_key, task_key};
 use crate::retry::RetryPolicy;
 use crate::settings::DatabaseConfig;
@@ -44,33 +45,20 @@ pub enum JobStoreShardError {
 /// Default lease duration for dequeued tasks (milliseconds)
 pub const DEFAULT_LEASE_MS: i64 = 10_000;
 
-/// Zero-copy view alias over an archived `JobAttempt` backed by owned bytes.
-pub type AttemptView = JobAttemptView;
-
 /// Represents a leased task with the associated job metadata necessary to execute it.
 #[derive(Debug, Clone)]
 pub struct LeasedTask {
     job: JobView,
-    attempt: AttemptView,
+    attempt: JobAttemptView,
 }
 
 impl LeasedTask {
     pub fn job(&self) -> &JobView {
         &self.job
     }
-    pub fn attempt(&self) -> &AttemptView {
+    pub fn attempt(&self) -> &JobAttemptView {
         &self.attempt
     }
-}
-
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
-pub struct JobInfo {
-    pub id: String,
-    pub priority: u8,         // 0..=99, 0 is highest priority and will run first
-    pub enqueue_time_ms: i64, // epoch millis
-    pub payload: Vec<u8>,     // JSON bytes for now (opaque to rkyv)
-    pub retry_policy: Option<RetryPolicy>,
 }
 
 // key builders moved to crate::keys
@@ -85,97 +73,6 @@ pub enum Task {
         job_id: String,
         attempt_number: u32,
     },
-}
-
-/// Outcome passed by callers when reporting an attempt's completion.
-#[derive(Debug, Clone)]
-pub enum AttemptOutcome {
-    Success { result: Vec<u8> },
-    Error { error_code: String, error: Vec<u8> },
-}
-
-/// Attempt state lifecycle for a job attempt
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
-pub enum AttemptState {
-    Running {
-        started_at_ms: i64,
-    },
-    Succeeded {
-        finished_at_ms: i64,
-        result: Vec<u8>,
-    },
-    Failed {
-        finished_at_ms: i64,
-        error_code: String,
-        error: Vec<u8>,
-    },
-}
-
-/// Stored representation of a job attempt
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
-pub struct JobAttempt {
-    pub job_id: String,
-    pub attempt_number: u32,
-    pub task_id: String,
-    pub state: AttemptState,
-}
-
-/// Zero-copy view over an archived `JobAttempt`
-#[derive(Clone, Debug)]
-pub struct JobAttemptView {
-    bytes: Bytes,
-}
-
-impl JobAttemptView {
-    pub fn new(bytes: Bytes) -> Result<Self, JobStoreShardError> {
-        #[cfg(debug_assertions)]
-        {
-            let _ = rkyv::check_archived_root::<JobAttempt>(&bytes)
-                .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
-        }
-        Ok(Self { bytes })
-    }
-
-    fn archived(&self) -> &<JobAttempt as Archive>::Archived {
-        unsafe { rkyv::archived_root::<JobAttempt>(&self.bytes) }
-    }
-
-    pub fn job_id(&self) -> &str {
-        self.archived().job_id.as_str()
-    }
-    pub fn attempt_number(&self) -> u32 {
-        self.archived().attempt_number
-    }
-    pub fn task_id(&self) -> &str {
-        self.archived().task_id.as_str()
-    }
-
-    pub fn state(&self) -> AttemptState {
-        type ArchivedAttemptState = <AttemptState as Archive>::Archived;
-        match &self.archived().state {
-            ArchivedAttemptState::Running { started_at_ms } => AttemptState::Running {
-                started_at_ms: *started_at_ms,
-            },
-            ArchivedAttemptState::Succeeded {
-                finished_at_ms,
-                result,
-            } => AttemptState::Succeeded {
-                finished_at_ms: *finished_at_ms,
-                result: result.to_vec(),
-            },
-            ArchivedAttemptState::Failed {
-                finished_at_ms,
-                error_code,
-                error,
-            } => AttemptState::Failed {
-                finished_at_ms: *finished_at_ms,
-                error_code: error_code.as_str().to_string(),
-                error: error.to_vec(),
-            },
-        }
-    }
 }
 
 /// Stored representation for a lease record. Value at `lease/<expiry>/<task-id>`
@@ -193,61 +90,6 @@ fn now_epoch_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     now.as_millis() as i64
-}
-
-/// Zero-copy view over an archived `JobInfo` backed by owned bytes.
-#[derive(Clone, Debug)]
-pub struct JobView {
-    info_bytes: Bytes,
-}
-
-impl JobView {
-    /// Validate bytes and construct a zero-copy view.
-    pub fn new(bytes: Bytes) -> Result<Self, JobStoreShardError> {
-        // Validate once up front in debug builds; skip in release for performance.
-        #[cfg(debug_assertions)]
-        {
-            let _ = rkyv::check_archived_root::<JobInfo>(&bytes)
-                .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
-        }
-        Ok(Self { info_bytes: bytes })
-    }
-
-    pub fn id(&self) -> &str {
-        self.archived().id.as_str()
-    }
-    pub fn priority(&self) -> u8 {
-        self.archived().priority
-    }
-    pub fn enqueue_time_ms(&self) -> i64 {
-        self.archived().enqueue_time_ms
-    }
-    pub fn payload_bytes(&self) -> &[u8] {
-        self.archived().payload.as_ref()
-    }
-    pub fn payload_json(&self) -> serde_json::Result<serde_json::Value> {
-        serde_json::from_slice(self.payload_bytes())
-    }
-
-    /// Unsafe-free accessor to the archived root (validated at construction).
-    fn archived(&self) -> &<JobInfo as Archive>::Archived {
-        // Safe because we validated in new() and bytes are owned by self
-        unsafe { rkyv::archived_root::<JobInfo>(&self.info_bytes) }
-    }
-
-    /// Return the job's retry policy as a runtime struct, if present, by copying
-    /// primitive fields from the archived view.
-    pub fn retry_policy(&self) -> Option<RetryPolicy> {
-        let a = self.archived();
-        let pol = a.retry_policy.as_ref()?;
-        Some(RetryPolicy {
-            retry_count: pol.retry_count,
-            initial_interval_ms: pol.initial_interval_ms,
-            max_interval_ms: pol.max_interval_ms,
-            randomize_interval: pol.randomize_interval,
-            backoff_factor: pol.backoff_factor,
-        })
-    }
 }
 
 impl JobStoreShard {

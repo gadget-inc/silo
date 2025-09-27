@@ -8,7 +8,8 @@ use tonic::{Request, Response, Status};
 use tracing::info;
 
 use crate::factory::{CloseAllError, ShardFactory};
-use crate::job_store_shard::{AttemptOutcome, JobStoreShard, JobStoreShardError, DEFAULT_LEASE_MS};
+use crate::job_attempt::AttemptOutcome;
+use crate::job_store_shard::{JobStoreShard, JobStoreShardError, DEFAULT_LEASE_MS};
 use crate::pb::silo_server::{Silo, SiloServer};
 use crate::pb::*;
 

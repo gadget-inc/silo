@@ -1,5 +1,7 @@
 pub mod coordination;
 pub mod factory;
+pub mod job;
+pub mod job_attempt;
 pub mod job_store_shard;
 pub mod keys;
 pub mod retry;
