@@ -4,6 +4,7 @@ use serde_json::Value as JsonValue;
 use slatedb::Db;
 use slatedb::DbIterator;
 use slatedb::WriteBatch;
+use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -13,11 +14,13 @@ use crate::keys::{attempt_key, job_info_key, job_status_key, leased_task_key, ta
 use crate::retry::RetryPolicy;
 use crate::settings::DatabaseConfig;
 use crate::storage::{resolve_object_store, StorageError};
+use crate::task_broker::{BrokerTask, TaskBroker};
 
 /// Represents a single shard of the system. Owns the SlateDB instance.
 pub struct JobStoreShard {
     name: String,
-    db: Db,
+    db: Arc<Db>,
+    broker: Arc<TaskBroker>,
 }
 
 #[derive(Debug, Error)]
@@ -90,14 +93,19 @@ impl JobStoreShard {
     pub async fn open(cfg: &DatabaseConfig) -> Result<Self, JobStoreShardError> {
         let object_store = resolve_object_store(&cfg.backend, &cfg.path)?;
         let db = Db::open(cfg.path.as_str(), object_store).await?;
+        let db = Arc::new(db);
+        let broker = TaskBroker::new(Arc::clone(&db));
+        broker.start();
         Ok(Self {
             name: cfg.name.clone(),
             db,
+            broker,
         })
     }
 
     /// Close the underlying SlateDB instance gracefully.
     pub async fn close(&self) -> Result<(), JobStoreShardError> {
+        self.broker.stop();
         self.db.close().await.map_err(JobStoreShardError::from)
     }
 
@@ -105,7 +113,7 @@ impl JobStoreShard {
         &self.name
     }
     pub fn db(&self) -> &Db {
-        &self.db
+        &*self.db
     }
 
     /// Enqueue a new job with optional concurrency limits.
@@ -161,6 +169,11 @@ impl JobStoreShard {
 
         self.db.write(batch).await?;
         self.db.flush().await?;
+
+        // If ready now, wake the scanner to refill promptly
+        if start_at_ms <= now_epoch_ms() {
+            self.broker.wakeup();
+        }
 
         Ok(job_id)
     }
@@ -237,8 +250,11 @@ impl JobStoreShard {
         worker_id: &str,
         max_tasks: usize,
     ) -> Result<Vec<LeasedTask>, JobStoreShardError> {
-        let (tasks, to_delete) = self.scan_ready_tasks(max_tasks).await?;
-        if tasks.is_empty() {
+        if max_tasks == 0 {
+            return Ok(Vec::new());
+        }
+        let claimed: Vec<BrokerTask> = self.broker.claim_ready_or_nudge(max_tasks).await;
+        if claimed.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -248,61 +264,80 @@ impl JobStoreShard {
         let mut batch = WriteBatch::new();
         let mut out: Vec<LeasedTask> = Vec::new();
         let mut pending_attempts: Vec<(JobView, String, u32)> = Vec::new();
-        for (task, task_key) in tasks.iter().zip(to_delete.iter()) {
+        let mut ack_keys: Vec<String> = Vec::with_capacity(claimed.len());
+
+        for entry in &claimed {
+            let task = &entry.task;
             // Only RunAttempt exists currently
             let (task_id, job_id, attempt_number) = match task {
                 Task::RunAttempt {
                     id,
                     job_id,
                     attempt_number,
-                } => (id.clone(), job_id.clone(), *attempt_number),
+                } => (id.clone(), job_id.to_string(), *attempt_number),
             };
 
             // Look up job info; if missing, delete the task and skip
             let job_key = job_info_key(&job_id);
             let maybe_job = self.db.get(job_key.as_bytes()).await?;
-            let Some(job_bytes) = maybe_job else {
-                batch.delete(task_key);
-                continue;
-            };
-            let view = JobView::new(job_bytes)?;
+            if let Some(job_bytes) = maybe_job {
+                let view = JobView::new(job_bytes)?;
 
-            // Create lease record and delete task from task queue
-            let lease_key = leased_task_key(&task_id);
-            let record = LeaseRecord {
-                worker_id: worker_id.to_string(),
-                task: task.clone(),
-                expiry_ms,
-            };
-            let leased_value: AlignedVec = rkyv::to_bytes::<LeaseRecord, 256>(&record)
-                .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
+                // Create lease record and delete task from task queue
+                let lease_key = leased_task_key(&task_id);
+                let record = LeaseRecord {
+                    worker_id: worker_id.to_string(),
+                    task: task.clone(),
+                    expiry_ms,
+                };
+                let leased_value: AlignedVec = rkyv::to_bytes::<LeaseRecord, 256>(&record)
+                    .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
 
-            batch.put(lease_key.as_bytes(), &leased_value);
-            batch.delete(task_key);
+                batch.put(lease_key.as_bytes(), &leased_value);
+                batch.delete(entry.key.as_bytes());
 
-            // Mark job as running
-            let job_status = JobStatus::Running {};
-            put_job_status(&mut batch, &job_id, &job_status)?;
+                // Mark job as running
+                let job_status = JobStatus::Running {};
+                put_job_status(&mut batch, &job_id, &job_status)?;
 
-            // Also mark attempt as running
-            let attempt = JobAttempt {
-                job_id: job_id.clone(),
-                attempt_number,
-                task_id: task_id.clone(),
-                status: AttemptStatus::Running {
-                    started_at_ms: now_ms,
-                },
-            };
-            let attempt_val: AlignedVec = rkyv::to_bytes::<JobAttempt, 256>(&attempt)
-                .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
-            let akey = attempt_key(&job_id, attempt_number);
-            batch.put(akey.as_bytes(), &attempt_val);
+                // Also mark attempt as running
+                let attempt = JobAttempt {
+                    job_id: job_id.clone(),
+                    attempt_number,
+                    task_id: task_id.clone(),
+                    status: AttemptStatus::Running {
+                        started_at_ms: now_ms,
+                    },
+                };
+                let attempt_val: AlignedVec = rkyv::to_bytes::<JobAttempt, 256>(&attempt)
+                    .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
+                let akey = attempt_key(&job_id, attempt_number);
+                batch.put(akey.as_bytes(), &attempt_val);
 
-            // Defer constructing AttemptView; fetch from DB after batch is written
-            pending_attempts.push((view, job_id.clone(), attempt_number));
+                // Defer constructing AttemptView; fetch from DB after batch is written
+                pending_attempts.push((view, job_id.clone(), attempt_number));
+                ack_keys.push(entry.key.clone());
+            } else {
+                // If job missing, delete task key to clean up
+                batch.delete(entry.key.as_bytes());
+                ack_keys.push(entry.key.clone());
+            }
         }
-        self.db.write(batch).await?;
-        self.db.flush().await?;
+
+        // Try to commit durable state. On failure, requeue the tasks and return error.
+        if let Err(e) = self.db.write(batch).await {
+            // Put back all claimed entries since we didn't lease them durably
+            self.broker.requeue(claimed);
+            return Err(JobStoreShardError::Slate(e));
+        }
+        if let Err(e) = self.db.flush().await {
+            self.broker.requeue(claimed);
+            return Err(JobStoreShardError::Slate(e));
+        }
+
+        // Ack durable and evict from buffer; we no longer use TTL tombstones.
+        self.broker.ack_durable(&ack_keys);
+        self.broker.evict_keys(&ack_keys);
 
         for (job_view, job_id, attempt_number) in pending_attempts.into_iter() {
             let attempt_view = self
@@ -473,6 +508,7 @@ impl JobStoreShard {
         batch.delete(leased_task_key.as_bytes());
 
         let mut job_missing_error: Option<JobStoreShardError> = None;
+        let mut followup_next_time: Option<i64> = None;
 
         // If success: mark job succeeded now.
         if let AttemptOutcome::Success { .. } = outcome {
@@ -512,6 +548,7 @@ impl JobStoreShard {
                             let job_status = JobStatus::Scheduled {};
                             put_job_status(&mut batch, &job_id, &job_status)?;
                             scheduled_followup = true;
+                            followup_next_time = Some(next_time);
                         }
                     }
                     // If no follow-up scheduled, mark job as failed
@@ -527,6 +564,12 @@ impl JobStoreShard {
 
         self.db.write(batch).await?;
         self.db.flush().await?;
+        // If we scheduled a follow-up that is ready now, wake the scanner
+        if let Some(nt) = followup_next_time {
+            if nt <= now_epoch_ms() {
+                self.broker.wakeup();
+            }
+        }
         if let Some(err) = job_missing_error {
             return Err(err);
         }
@@ -582,7 +625,7 @@ impl JobStoreShard {
     }
 }
 
-fn now_epoch_ms() -> i64 {
+pub(crate) fn now_epoch_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -6,6 +6,11 @@ use silo::job_store_shard::{JobStoreShard, JobStoreShardError, LeaseRecord, Task
 use silo::retry::{next_retry_time_ms, RetryPolicy};
 use silo::settings::{Backend, DatabaseConfig};
 use slatedb::{Db, DbIterator};
+use std::collections::HashSet;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 
 fn parse_time_from_task_key(key: &str) -> Option<u64> {
     // Format: tasks/{:020}/{:02}/{job_id}/{attempt}
@@ -41,6 +46,25 @@ async fn first_kv_with_prefix(db: &Db, prefix: &str) -> Option<(String, bytes::B
     let mut iter: DbIterator = db.scan::<Vec<u8>, _>(start..=end).await.ok()?;
     let first = iter.next().await.ok()?;
     first.map(|kv| (String::from_utf8_lossy(&kv.key).to_string(), kv.value))
+}
+
+async fn count_tasks_before(db: &Db, cutoff_ms: i64) -> usize {
+    let start: Vec<u8> = b"tasks/".to_vec();
+    let mut end: Vec<u8> = b"tasks/".to_vec();
+    end.push(0xFF);
+    let mut iter: DbIterator = db.scan::<Vec<u8>, _>(start..=end).await.unwrap();
+    let mut count = 0usize;
+    loop {
+        let maybe = iter.next().await.unwrap();
+        let Some(kv) = maybe else { break };
+        let key_str = String::from_utf8_lossy(&kv.key).to_string();
+        if let Some(ts) = parse_time_from_task_key(&key_str) {
+            if (ts as i64) < cutoff_ms {
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 async fn count_with_prefix(db: &Db, prefix: &str) -> usize {
@@ -1170,6 +1194,149 @@ async fn outcome_payload_edge_cases_empty_vectors_round_trip() {
         }
         _ => panic!("expected Failed"),
     }
+}
+
+#[tokio::test]
+async fn concurrent_dequeue_many_workers_no_duplicates() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let shard = Arc::new(shard);
+
+    let total_jobs: usize = 200;
+    let workers: usize = 8;
+    let now = now_ms();
+
+    // Enqueue many ready jobs
+    for i in 0..total_jobs {
+        let payload = serde_json::json!({"i": i});
+        shard
+            .enqueue(None, (i % 50) as u8, now, None, payload, vec![])
+            .await
+            .expect("enqueue");
+    }
+
+    // Shared trackers
+    let seen: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let processed = Arc::new(AtomicUsize::new(0));
+
+    // Spawn workers
+    let mut handles = Vec::new();
+    for wi in 0..workers {
+        let shard_cl = Arc::clone(&shard);
+        let seen_cl = Arc::clone(&seen);
+        let processed_cl = Arc::clone(&processed);
+        let worker_id = format!("w-{wi}");
+        handles.push(tokio::spawn(async move {
+            loop {
+                let tasks = shard_cl.dequeue(&worker_id, 1).await.expect("dequeue");
+                if tasks.is_empty() {
+                    if processed_cl.load(Ordering::Relaxed) >= total_jobs {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                let t = &tasks[0];
+                let tid = t.attempt().task_id().to_string();
+                // Validate uniqueness
+                {
+                    let mut g = seen_cl.lock().unwrap();
+                    assert!(g.insert(tid.clone()), "duplicate task id dequeued: {tid}");
+                }
+                shard_cl
+                    .report_attempt_outcome(&tid, AttemptOutcome::Success { result: Vec::new() })
+                    .await
+                    .expect("report ok");
+                processed_cl.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    assert_eq!(processed.load(Ordering::Relaxed), total_jobs);
+    // No remaining tasks or leases
+    assert_eq!(count_with_prefix(shard.db(), "tasks/").await, 0);
+    assert_eq!(count_with_prefix(shard.db(), "lease/").await, 0);
+}
+
+#[tokio::test]
+async fn future_tasks_are_not_dequeued_under_concurrency() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let shard = Arc::new(shard);
+
+    let ready_jobs: usize = 100;
+    let future_jobs: usize = 100;
+    let now = now_ms();
+    let future = now + 60_000; // 60s in the future to avoid becoming ready during the test
+
+    // Enqueue ready tasks
+    for i in 0..ready_jobs {
+        shard
+            .enqueue(
+                None,
+                (i % 10) as u8,
+                now,
+                None,
+                serde_json::json!({"r": i}),
+                vec![],
+            )
+            .await
+            .expect("enqueue ready");
+    }
+    // Enqueue future tasks
+    for i in 0..future_jobs {
+        shard
+            .enqueue(
+                None,
+                (i % 10) as u8,
+                future,
+                None,
+                serde_json::json!({"f": i}),
+                vec![],
+            )
+            .await
+            .expect("enqueue future");
+    }
+
+    // Concurrently drain ready tasks
+    let processed = Arc::new(AtomicUsize::new(0));
+    let workers = 6usize;
+    let mut handles = Vec::new();
+    for wi in 0..workers {
+        let shard_cl = Arc::clone(&shard);
+        let processed_cl = Arc::clone(&processed);
+        let worker_id = format!("wf-{wi}");
+        handles.push(tokio::spawn(async move {
+            loop {
+                let tasks = shard_cl.dequeue(&worker_id, 4).await.expect("dequeue");
+                if tasks.is_empty() {
+                    if processed_cl.load(Ordering::Relaxed) >= ready_jobs {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                for t in tasks {
+                    let tid = t.attempt().task_id().to_string();
+                    shard_cl
+                        .report_attempt_outcome(&tid, AttemptOutcome::Success { result: vec![] })
+                        .await
+                        .expect("report ok");
+                    processed_cl.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    // Only future tasks should remain in the queue
+    // Ensure no ready tasks remain; any tasks left must be scheduled at or after `future`
+    let ready_remaining = count_tasks_before(shard.db(), future).await;
+    assert_eq!(ready_remaining, 0, "no ready tasks should remain");
 }
 
 #[tokio::test]

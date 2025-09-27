@@ -3213,6 +3213,7 @@ dependencies = [
  "bytecheck",
  "bytes",
  "clap",
+ "crossbeam-skiplist",
  "etcd-client",
  "opentelemetry",
  "opentelemetry-otlp",
