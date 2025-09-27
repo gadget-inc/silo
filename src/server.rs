@@ -60,6 +60,14 @@ impl Silo for SiloService {
             randomize_interval: rp.randomize_interval,
             backoff_factor: rp.backoff_factor,
         });
+        let limits = r
+            .concurrency_limits
+            .into_iter()
+            .map(|l| crate::job::ConcurrencyLimit {
+                key: l.key,
+                max_concurrency: l.max_concurrency,
+            })
+            .collect();
         let id = shard
             .enqueue(
                 if r.id.is_empty() { None } else { Some(r.id) },
@@ -67,6 +75,7 @@ impl Silo for SiloService {
                 r.start_at_ms,
                 retry,
                 payload,
+                limits,
             )
             .await
             .map_err(map_err)?;
@@ -98,6 +107,14 @@ impl Silo for SiloService {
                 data: view.payload_bytes().to_vec(),
             }),
             retry_policy,
+            concurrency_limits: view
+                .concurrency_limits()
+                .into_iter()
+                .map(|l| ConcurrencyLimit {
+                    key: l.key,
+                    max_concurrency: l.max_concurrency,
+                })
+                .collect(),
         };
         Ok(Response::new(resp))
     }

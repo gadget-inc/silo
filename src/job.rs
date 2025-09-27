@@ -4,6 +4,25 @@ use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use crate::job_store_shard::JobStoreShardError;
 use crate::retry::RetryPolicy;
 
+/// Per-job concurrency limit declaration
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+#[archive(check_bytes)]
+pub struct ConcurrencyLimit {
+    pub key: String,
+    pub max_concurrency: u32,
+}
+
+/// Job status lifecycle
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+#[archive(check_bytes)]
+pub enum JobStatus {
+    Scheduled {},
+    Running {},
+    Failed {},
+    Cancelled {},
+    Succeeded {},
+}
+
 /// Zero-copy view over an archived `JobInfo` backed by owned bytes.
 #[derive(Clone, Debug)]
 pub struct JobView {
@@ -18,6 +37,7 @@ pub struct JobInfo {
     pub enqueue_time_ms: i64, // epoch millis
     pub payload: Vec<u8>,     // JSON bytes for now (opaque to rkyv)
     pub retry_policy: Option<RetryPolicy>,
+    pub concurrency_limits: Vec<ConcurrencyLimit>,
 }
 
 impl JobView {
@@ -66,5 +86,18 @@ impl JobView {
             randomize_interval: pol.randomize_interval,
             backoff_factor: pol.backoff_factor,
         })
+    }
+
+    /// Return declared concurrency limits as owned runtime structs by copying fields
+    pub fn concurrency_limits(&self) -> Vec<ConcurrencyLimit> {
+        let a = self.archived();
+        let mut out = Vec::with_capacity(a.concurrency_limits.len());
+        for lim in a.concurrency_limits.iter() {
+            out.push(ConcurrencyLimit {
+                key: lim.key.as_str().to_string(),
+                max_concurrency: lim.max_concurrency,
+            });
+        }
+        out
     }
 }

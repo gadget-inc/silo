@@ -1,5 +1,6 @@
 use rkyv::Archive;
-use silo::job_attempt::{AttemptOutcome, AttemptState};
+use silo::job::JobStatus;
+use silo::job_attempt::{AttemptOutcome, AttemptStatus};
 
 use silo::job_store_shard::{JobStoreShard, JobStoreShardError, LeaseRecord, Task};
 use silo::retry::{next_retry_time_ms, RetryPolicy};
@@ -74,6 +75,7 @@ async fn enqueue_round_trip_with_explicit_id() {
             start_time_ms,
             None,
             payload.clone(),
+            vec![],
         )
         .await
         .expect("enqueue");
@@ -114,7 +116,7 @@ async fn enqueue_generates_uuid_when_none_provided() {
     let start_time_ms = 12345i64;
 
     let got_id = shard
-        .enqueue(None, priority, start_time_ms, None, payload.clone())
+        .enqueue(None, priority, start_time_ms, None, payload.clone(), vec![])
         .await
         .expect("enqueue");
     assert!(!got_id.is_empty());
@@ -156,6 +158,7 @@ async fn delete_job_removes_key_and_is_idempotent() {
             start_time_ms,
             None,
             payload.clone(),
+            vec![],
         )
         .await
         .expect("enqueue");
@@ -187,7 +190,7 @@ async fn peek_omits_future_scheduled_tasks() {
     let future_ms = now_ms + 60_000;
 
     let _ = shard
-        .enqueue(None, priority, future_ms, None, payload)
+        .enqueue(None, priority, future_ms, None, payload, vec![])
         .await
         .expect("enqueue");
 
@@ -205,10 +208,9 @@ async fn dequeue_moves_tasks_to_leased_with_uuid() {
     let now_ms = now_ms();
 
     let job_id = shard
-        .enqueue(None, priority, now_ms, None, payload)
+        .enqueue(None, priority, now_ms, None, payload, vec![])
         .await
         .expect("enqueue");
-
     let tasks = shard.dequeue("worker-1", 1).await.expect("dequeue");
     assert_eq!(tasks.len(), 1);
     // Job status should transition to Running after dequeue
@@ -270,7 +272,7 @@ async fn heartbeat_renews_lease_when_worker_matches() {
     let now_ms = now_ms();
 
     let _job_id = shard
-        .enqueue(None, priority, now_ms, None, payload)
+        .enqueue(None, priority, now_ms, None, payload, vec![])
         .await
         .expect("enqueue");
 
@@ -318,7 +320,7 @@ async fn heartbeat_rejects_mismatched_worker() {
     let now_ms = now_ms();
 
     let _job_id = shard
-        .enqueue(None, priority, now_ms, None, payload)
+        .enqueue(None, priority, now_ms, None, payload, vec![])
         .await
         .expect("enqueue");
 
@@ -354,7 +356,7 @@ async fn reporting_attempt_outcome_updates_attempt_and_deletes_lease() {
     let now_ms = now_ms();
 
     let job_id = shard
-        .enqueue(None, priority, now_ms, None, payload)
+        .enqueue(None, priority, now_ms, None, payload, vec![])
         .await
         .expect("enqueue");
 
@@ -411,7 +413,7 @@ async fn error_with_no_retries_does_not_enqueue_next_attempt() {
         backoff_factor: 2.0,
     };
     let _job_id = shard
-        .enqueue(None, priority, now, Some(policy), payload)
+        .enqueue(None, priority, now, Some(policy), payload, vec![])
         .await
         .expect("enqueue");
 
@@ -451,7 +453,7 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
         backoff_factor: 1.0,
     };
     let _job_id = shard
-        .enqueue(None, priority, now, Some(policy), payload)
+        .enqueue(None, priority, now, Some(policy), payload, vec![])
         .await
         .expect("enqueue");
 
@@ -530,7 +532,7 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_success() {
     let now_ms = now_ms();
 
     let job_id = shard
-        .enqueue(None, priority, now_ms, None, payload)
+        .enqueue(None, priority, now_ms, None, payload, vec![])
         .await
         .expect("enqueue");
 
@@ -598,7 +600,7 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_error() {
     let now_ms = now_ms();
 
     let job_id = shard
-        .enqueue(None, priority, now_ms, None, payload)
+        .enqueue(None, priority, now_ms, None, payload, vec![])
         .await
         .expect("enqueue");
 
@@ -659,7 +661,14 @@ async fn enqueue_fails_when_id_already_exists_and_db_unchanged() {
     let start1 = 1_700_000_123_000i64;
 
     let got_id = shard
-        .enqueue(Some(id.clone()), priority1, start1, None, payload1.clone())
+        .enqueue(
+            Some(id.clone()),
+            priority1,
+            start1,
+            None,
+            payload1.clone(),
+            vec![],
+        )
         .await
         .expect("first enqueue ok");
     assert_eq!(got_id, id);
@@ -674,7 +683,14 @@ async fn enqueue_fails_when_id_already_exists_and_db_unchanged() {
     let start2 = start1 + 999_000;
 
     let err = shard
-        .enqueue(Some(id.clone()), priority2, start2, None, payload2.clone())
+        .enqueue(
+            Some(id.clone()),
+            priority2,
+            start2,
+            None,
+            payload2.clone(),
+            vec![],
+        )
         .await
         .expect_err("duplicate enqueue should fail");
 
@@ -712,7 +728,7 @@ async fn retry_count_one_boundary_enqueues_attempt2_then_stops_on_second_error()
         backoff_factor: 1.0,
     };
     let job_id = shard
-        .enqueue(None, priority, now, Some(policy.clone()), payload)
+        .enqueue(None, priority, now, Some(policy.clone()), payload, vec![])
         .await
         .expect("enqueue");
 
@@ -765,7 +781,7 @@ async fn retry_count_one_boundary_enqueues_attempt2_then_stops_on_second_error()
         .expect("get attempt2 view")
         .expect("attempt2 exists");
     match a2_view.state() {
-        AttemptState::Failed { .. } => {}
+        AttemptStatus::Failed { .. } => {}
         _ => panic!("expected Failed"),
     }
 }
@@ -784,7 +800,14 @@ async fn next_retry_time_matches_scheduled_time_smoke() {
         backoff_factor: 2.0,
     };
     let job_id = shard
-        .enqueue(None, priority, now, Some(policy.clone()), payload.clone())
+        .enqueue(
+            None,
+            priority,
+            now,
+            Some(policy.clone()),
+            payload.clone(),
+            vec![],
+        )
         .await
         .expect("enqueue");
 
@@ -808,7 +831,7 @@ async fn next_retry_time_matches_scheduled_time_smoke() {
         .expect("get a1")
         .expect("a1 exists");
     let finished_at = match attempt1.state() {
-        AttemptState::Failed { finished_at_ms, .. } => finished_at_ms,
+        AttemptStatus::Failed { finished_at_ms, .. } => finished_at_ms,
         _ => panic!("expected Failed"),
     };
     let (k2, _v2) = first_kv_with_prefix(shard.db(), "tasks/")
@@ -836,7 +859,7 @@ async fn duplicate_reporting_error_then_error_is_rejected_and_no_extra_tasks() {
         backoff_factor: 1.0,
     };
     let _job_id = shard
-        .enqueue(None, priority, now, Some(policy), payload)
+        .enqueue(None, priority, now, Some(policy), payload, vec![])
         .await
         .expect("enqueue");
 
@@ -881,7 +904,7 @@ async fn duplicate_reporting_error_then_success_is_rejected_and_state_persists()
     let priority = 10u8;
     let now = now_ms();
     let job_id = shard
-        .enqueue(None, priority, now, None, payload)
+        .enqueue(None, priority, now, None, payload, vec![])
         .await
         .expect("enqueue");
 
@@ -917,7 +940,7 @@ async fn duplicate_reporting_error_then_success_is_rejected_and_state_persists()
         .expect("get a1")
         .expect("exists");
     match a1.state() {
-        AttemptState::Failed { .. } => {}
+        AttemptStatus::Failed { .. } => {}
         _ => panic!("a1 should remain Failed"),
     }
 }
@@ -929,7 +952,7 @@ async fn heartbeat_after_outcome_returns_lease_not_found() {
     let priority = 10u8;
     let now = now_ms();
     let _job_id = shard
-        .enqueue(None, priority, now, None, payload)
+        .enqueue(None, priority, now, None, payload, vec![])
         .await
         .expect("enqueue");
     let tasks = shard.dequeue("worker-1", 1).await.expect("dequeue");
@@ -960,7 +983,7 @@ async fn job_deletion_race_before_success_outcome() {
     let priority = 10u8;
     let now = now_ms();
     let job_id = shard
-        .enqueue(None, priority, now, None, payload)
+        .enqueue(None, priority, now, None, payload, vec![])
         .await
         .expect("enqueue");
     let tasks = shard.dequeue("w", 1).await.expect("dequeue");
@@ -990,7 +1013,7 @@ async fn job_deletion_race_before_error_outcome_no_followup_task() {
     let priority = 10u8;
     let now = now_ms();
     let job_id = shard
-        .enqueue(None, priority, now, None, payload)
+        .enqueue(None, priority, now, None, payload, vec![])
         .await
         .expect("enqueue");
     let tasks = shard.dequeue("w", 1).await.expect("dequeue");
@@ -1031,7 +1054,7 @@ async fn attempt_records_exist_across_retries_and_task_ids_distinct() {
         backoff_factor: 1.0,
     };
     let job_id = shard
-        .enqueue(None, priority, now, Some(policy), payload)
+        .enqueue(None, priority, now, Some(policy), payload, vec![])
         .await
         .expect("enqueue");
 
@@ -1091,7 +1114,7 @@ async fn outcome_payload_edge_cases_empty_vectors_round_trip() {
     let priority = 10u8;
     let now = now_ms();
     let job_id = shard
-        .enqueue(None, priority, now, None, payload)
+        .enqueue(None, priority, now, None, payload, vec![])
         .await
         .expect("enqueue");
     let tasks = shard.dequeue("w", 1).await.expect("dequeue");
@@ -1114,7 +1137,14 @@ async fn outcome_payload_edge_cases_empty_vectors_round_trip() {
 
     // Re-enqueue a new job for error case
     let job_id2 = shard
-        .enqueue(None, priority, now, None, serde_json::json!({"k": "v2"}))
+        .enqueue(
+            None,
+            priority,
+            now,
+            None,
+            serde_json::json!({"k": "v2"}),
+            vec![],
+        )
         .await
         .expect("enqueue2");
     let tasks2 = shard.dequeue("w", 1).await.expect("dequeue2");
@@ -1149,7 +1179,7 @@ async fn large_outcome_payloads_round_trip() {
     let priority = 10u8;
     let now = now_ms();
     let job_id = shard
-        .enqueue(None, priority, now, None, payload)
+        .enqueue(None, priority, now, None, payload, vec![])
         .await
         .expect("enqueue");
     let tasks = shard.dequeue("w", 1).await.expect("dequeue");
@@ -1177,7 +1207,14 @@ async fn large_outcome_payloads_round_trip() {
     }
 
     let job_id2 = shard
-        .enqueue(None, priority, now, None, serde_json::json!({"k": "v2"}))
+        .enqueue(
+            None,
+            priority,
+            now,
+            None,
+            serde_json::json!({"k": "v2"}),
+            vec![],
+        )
         .await
         .expect("enqueue2");
     let tasks2 = shard.dequeue("w", 1).await.expect("dequeue2");
@@ -1219,6 +1256,7 @@ async fn priority_ordering_when_start_times_equal() {
             now,
             None,
             serde_json::json!({"j": "hi"}),
+            vec![],
         )
         .await
         .expect("enqueue hi");
@@ -1229,6 +1267,7 @@ async fn priority_ordering_when_start_times_equal() {
             now,
             None,
             serde_json::json!({"j": "lo"}),
+            vec![],
         )
         .await
         .expect("enqueue lo");
@@ -1258,7 +1297,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         backoff_factor: 1.0,
     };
     let job_id = shard
-        .enqueue(None, 10u8, now, Some(policy), payload)
+        .enqueue(None, 10u8, now, Some(policy), payload, vec![])
         .await
         .expect("enqueue");
 
@@ -1315,7 +1354,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         .expect("get a1")
         .expect("a1 exists");
     match a1.state() {
-        AttemptState::Failed { error_code, .. } => {
+        AttemptStatus::Failed { error_code, .. } => {
             assert_eq!(error_code, "WORKER_CRASHED")
         }
         _ => panic!("expected Failed"),
@@ -1339,7 +1378,7 @@ async fn reap_ignores_unexpired_leases() {
     let payload = serde_json::json!({"k": "v"});
     let now = now_ms();
     let job_id = shard
-        .enqueue(None, 10u8, now, None, payload)
+        .enqueue(None, 10u8, now, None, payload, vec![])
         .await
         .expect("enqueue");
 
@@ -1383,7 +1422,7 @@ async fn delete_job_before_dequeue_skips_task_and_no_lease_created() {
     let now_ms = now_ms();
 
     let job_id = shard
-        .enqueue(None, priority, now_ms, None, payload)
+        .enqueue(None, priority, now_ms, None, payload, vec![])
         .await
         .expect("enqueue");
 

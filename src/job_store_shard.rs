@@ -7,9 +7,9 @@ use slatedb::WriteBatch;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::job::{JobInfo, JobView};
-use crate::job_attempt::{AttemptOutcome, AttemptState, JobAttempt, JobAttemptView};
-use crate::keys::{attempt_key, job_info_key, leased_task_key, task_key};
+use crate::job::{ConcurrencyLimit, JobInfo, JobStatus, JobView};
+use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt, JobAttemptView};
+use crate::keys::{attempt_key, job_info_key, job_status_key, leased_task_key, task_key};
 use crate::retry::RetryPolicy;
 use crate::settings::DatabaseConfig;
 use crate::storage::{resolve_object_store, StorageError};
@@ -108,7 +108,7 @@ impl JobStoreShard {
         &self.db
     }
 
-    /// Enqueue a new job.
+    /// Enqueue a new job with optional concurrency limits.
     pub async fn enqueue(
         &self,
         id: Option<String>,
@@ -116,6 +116,7 @@ impl JobStoreShard {
         start_at_ms: i64,
         retry_policy: Option<RetryPolicy>,
         payload: JsonValue,
+        concurrency_limits: Vec<ConcurrencyLimit>,
     ) -> Result<String, JobStoreShardError> {
         let job_id = id.unwrap_or_else(|| Uuid::new_v4().to_string());
         // If caller provided an id, ensure it doesn't already exist

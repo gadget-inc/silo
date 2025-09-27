@@ -15,6 +15,12 @@ message RetryPolicy {
   double backoff_factor = 5;
 }
 
+// Per-job concurrency limit declaration
+message ConcurrencyLimit {
+  string key = 1;             // grouping key; jobs with same key share a limit
+  uint32 max_concurrency = 2; // maximum concurrent running jobs for this key
+}
+
 message EnqueueRequest {
   string shard = 1; // shard name
   string id = 2; // optional
@@ -22,6 +28,7 @@ message EnqueueRequest {
   int64 start_at_ms = 4; // epoch ms
   optional RetryPolicy retry_policy = 5; // optional
   JsonValueBytes payload = 6; // JSON
+  repeated ConcurrencyLimit concurrency_limits = 7; // zero or more limits
 }
 
 message EnqueueResponse {
@@ -35,6 +42,7 @@ message GetJobResponse {
   int64 enqueue_time_ms = 3;
   JsonValueBytes payload = 4;
   optional RetryPolicy retry_policy = 5; // presence indicates some policy
+  repeated ConcurrencyLimit concurrency_limits = 6; // declared limits
 }
 
 message DeleteJobRequest { string shard = 1; string id = 2; }

@@ -10,7 +10,7 @@ Status: crappy experiment
 - low cost at scale by using object storage as the source of truth
 - high-cardinality, cheap multitenancy built in
 - future scheduling
-- concurrency limits
+- concurrency limits for limiting throughput of various jobs (with high cardinality and limit change support)
 - compute/storage separation for elastic compute scaling
 - tracks job results
 - tracks job and attempt history for operators
