@@ -7,13 +7,14 @@ use std::sync::{
 use std::time::Duration;
 
 use crossbeam_skiplist::SkipMap;
-use rkyv::Archive;
 use slatedb::Db;
 use tokio::sync::Notify;
 
+use crate::codec::decode_task;
+use crate::concurrency::ConcurrencyCounts;
 use crate::job_store_shard::Task;
 use crate::keys::leased_task_key;
-use std::collections::VecDeque;
+use tracing::{debug, info_span};
 
 /// A task entry stored in the in-memory broker buffer
 #[derive(Debug, Clone)]
@@ -34,8 +35,8 @@ pub struct TaskBroker {
     running: Arc<AtomicBool>,
     notify: Arc<Notify>,
     scan_requested: Arc<AtomicBool>,
-    // Concurrency: in-memory broker for tickets
-    concurrency: Arc<ConcurrencyBroker>,
+    // Concurrency: in-memory counts for tickets
+    concurrency: Arc<ConcurrencyCounts>,
     target_buffer: usize,
     scan_batch: usize,
 }
@@ -49,7 +50,7 @@ impl TaskBroker {
             running: Arc::new(AtomicBool::new(false)),
             notify: Arc::new(Notify::new()),
             scan_requested: Arc::new(AtomicBool::new(false)),
-            concurrency: ConcurrencyBroker::new(),
+            concurrency: Arc::new(ConcurrencyCounts::new()),
             target_buffer: 4096,
             scan_batch: 1024,
         })
@@ -125,26 +126,9 @@ impl TaskBroker {
                     }
 
                     // Decode the task from value bytes
-                    type ArchivedTask = <Task as Archive>::Archived;
-                    let archived: &ArchivedTask = unsafe { rkyv::archived_root::<Task>(&kv.value) };
-                    let (task_id, task) = match archived {
-                        ArchivedTask::RunAttempt {
-                            id,
-                            job_id,
-                            attempt_number,
-                            held_queues,
-                        } => (
-                            id.as_str().to_string(),
-                            Task::RunAttempt {
-                                id: id.as_str().to_string(),
-                                job_id: job_id.as_str().to_string(),
-                                attempt_number: *attempt_number,
-                                held_queues: held_queues
-                                    .iter()
-                                    .map(|s| s.as_str().to_string())
-                                    .collect::<Vec<String>>(),
-                            },
-                        ),
+                    let task = decode_task(&kv.value);
+                    let task_id = match &task {
+                        Task::RunAttempt { id, .. } => id.clone(),
                     };
 
                     // If a lease exists for this task id, skip to avoid double-brokering
@@ -160,7 +144,11 @@ impl TaskBroker {
 
                     // Insert into buffer if absent (idempotent)
                     if broker.buffer.get(&entry.key).is_none() {
-                        let _ = broker.buffer.insert(entry.key.clone(), entry);
+                        let _ = broker.buffer.insert(entry.key.clone(), entry.clone());
+                        // lightweight event for scan insert
+                        let span = info_span!("broker.scan_insert", key = %entry.key);
+                        let _g = span.enter();
+                        debug!("inserted ready task into buffer");
                         inserted += 1;
                     }
                 }
@@ -282,76 +270,5 @@ impl TaskBroker {
 impl Drop for TaskBroker {
     fn drop(&mut self) {
         self.stop();
-    }
-}
-
-/// In-memory concurrency broker that manages ticket requests and grants.
-/// Durable state is persisted by the caller via WriteBatch; this struct only
-/// computes grants and tracks transient locks to avoid races.
-pub struct ConcurrencyBroker {
-    // per queue current holders (task ids)
-    holders: Mutex<std::collections::HashMap<String, HashSet<String>>>,
-    // per queue waiting request ids (ordered by request time)
-    waiters: Mutex<std::collections::HashMap<String, VecDeque<String>>>,
-}
-
-impl ConcurrencyBroker {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            holders: Mutex::new(std::collections::HashMap::new()),
-            waiters: Mutex::new(std::collections::HashMap::new()),
-        })
-    }
-
-    /// Returns number of currently held tickets for a queue (in-memory view)
-    pub fn held_count(&self, queue: &str) -> usize {
-        self.holders
-            .lock()
-            .unwrap()
-            .get(queue)
-            .map(|s| s.len())
-            .unwrap_or(0)
-    }
-
-    pub fn can_grant(&self, queue: &str, limit: usize) -> bool {
-        self.held_count(queue) < limit
-    }
-
-    pub fn record_grant(&self, queue: &str, task_id: &str) {
-        let mut h = self.holders.lock().unwrap();
-        let set = h.entry(queue.to_string()).or_insert_with(HashSet::new);
-        set.insert(task_id.to_string());
-    }
-
-    pub fn record_release(&self, queue: &str, task_id: &str) {
-        let mut h = self.holders.lock().unwrap();
-        if let Some(set) = h.get_mut(queue) {
-            set.remove(task_id);
-        }
-    }
-
-    pub async fn hydrate(&self, db: &Db) -> Result<(), slatedb::Error> {
-        // Populate holders from durable keys
-        let start: Vec<u8> = b"holders/".to_vec();
-        let mut end: Vec<u8> = b"holders/".to_vec();
-        end.push(0xFF);
-        let mut iter = db.scan::<Vec<u8>, _>(start..=end).await?;
-        loop {
-            let maybe = iter.next().await?;
-            let Some(kv) = maybe else { break };
-            if let Ok(s) = std::str::from_utf8(&kv.key) {
-                // holders/<queue>/<task-id>
-                let mut parts = s.splitn(3, '/');
-                let _ = parts.next();
-                let q = parts.next().unwrap_or("");
-                let tid = parts.next().unwrap_or("");
-                if !q.is_empty() && !tid.is_empty() {
-                    let mut h = self.holders.lock().unwrap();
-                    let set = h.entry(q.to_string()).or_insert_with(HashSet::new);
-                    set.insert(tid.to_string());
-                }
-            }
-        }
-        Ok(())
     }
 }

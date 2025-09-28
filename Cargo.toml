@@ -35,9 +35,9 @@ opentelemetry = { version = "0.26" }
 opentelemetry_sdk = { version = "0.26", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.26", features = ["http-json", "trace"] }
 usdt = "0.6.0"
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 
 [build-dependencies]
 tonic-build = "0.12"
