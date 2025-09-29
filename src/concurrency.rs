@@ -5,6 +5,7 @@ use rkyv::AlignedVec;
 use slatedb::{Db, DbIterator, WriteBatch};
 
 use crate::codec::encode_task;
+use crate::job::{ConcurrencyLimit, JobView};
 use crate::job_store_shard::{HolderRecord, Task};
 use crate::keys::{concurrency_holder_key, concurrency_request_key, task_key};
 
@@ -14,19 +15,30 @@ pub enum MemoryEvent {
     Released { queue: String, task_id: String },
 }
 
-#[derive(Debug, Clone)]
-pub struct DurableEdits {
-    pub batch: WriteBatch,
-    pub events: Vec<MemoryEvent>,
+/// Result of attempting to enqueue a job with concurrency limits
+#[derive(Debug)]
+pub enum RequestTicketOutcome {
+    /// Concurrency tocket granted immediately - RunAttempt task created
+    GrantedImmediately {
+        task_id: String,
+        queue: String,
+        events: Vec<MemoryEvent>,
+    },
+    /// Ticket queued as a request record (for immediate start time but no capacity)
+    TicketRequested { queue: String },
+    /// Job queued as a RequestTicket task (for future start time)
+    FutureRequestTaskWritten { queue: String, task_id: String },
 }
 
-impl DurableEdits {
-    pub fn new() -> Self {
-        Self {
-            batch: WriteBatch::new(),
-            events: Vec::new(),
-        }
-    }
+/// Result of processing a RequestTicket task
+#[derive(Debug)]
+pub enum RequestTicketTaskOutcome {
+    /// Ticket granted - RunAttempt lease created
+    Granted { request_id: String, queue: String },
+    /// Ticket not available right now, but request has been durably stored
+    Requested,
+    /// Job missing
+    JobMissing,
 }
 
 /// In-memory counts for concurrency holders
@@ -88,153 +100,151 @@ impl ConcurrencyCounts {
     }
 }
 
-/// Build edits to grant immediately (holder + task)
-pub fn build_grant_edits(
-    now_ms: i64,
-    queue: &str,
-    task_id: &str,
-    start_time_ms: i64,
-    priority: u8,
-    job_id: &str,
-    attempt_number: u32,
-) -> Result<DurableEdits, String> {
-    let mut out = DurableEdits::new();
-    let holder = crate::job_store_shard::HolderRecord {
-        granted_at_ms: now_ms,
-    };
-    let holder_val: AlignedVec =
-        rkyv::to_bytes::<HolderRecord, 256>(&holder).map_err(|e| e.to_string())?;
-    out.batch.put(
-        concurrency_holder_key(queue, task_id).as_bytes(),
-        &holder_val,
-    );
-
-    let task = Task::RunAttempt {
-        id: task_id.to_string(),
-        job_id: job_id.to_string(),
-        attempt_number,
-        held_queues: vec![queue.to_string()],
-    };
-    let task_value = encode_task(&task)?;
-    out.batch.put(
-        task_key(start_time_ms, priority, job_id, attempt_number).as_bytes(),
-        &task_value,
-    );
-    out.events.push(MemoryEvent::Granted {
-        queue: queue.to_string(),
-        task_id: task_id.to_string(),
-    });
-    Ok(out)
+/// High-level concurrency manager
+pub struct ConcurrencyManager {
+    counts: ConcurrencyCounts,
 }
 
-/// Build edits to enqueue a concurrency request
-pub fn build_request_edits(
-    queue: &str,
-    now_ms: i64,
-    start_time_ms: i64,
-    priority: u8,
-    job_id: &str,
-    attempt_number: u32,
-) -> Result<DurableEdits, String> {
-    let mut out = DurableEdits::new();
-    let action = crate::job_store_shard::ConcurrencyAction::EnqueueTask {
-        start_time_ms,
-        priority,
-        job_id: job_id.to_string(),
-        attempt_number,
-    };
-    let action_val: AlignedVec =
-        rkyv::to_bytes::<crate::job_store_shard::ConcurrencyAction, 256>(&action)
-            .map_err(|e| e.to_string())?;
-    let req_key = concurrency_request_key(queue, now_ms, &uuid::Uuid::new_v4().to_string());
-    out.batch.put(req_key.as_bytes(), &action_val);
-    Ok(out)
-}
-
-/// Build edits to release holders for finished task id and maybe grant one request per queue
-pub async fn build_release_and_grant_edits(
-    db: &Db,
-    queues: &[String],
-    finished_task_id: &str,
-    now_ms: i64,
-) -> Result<DurableEdits, String> {
-    let mut out = DurableEdits::new();
-    for queue in queues {
-        // delete holder
-        out.batch
-            .delete(concurrency_holder_key(queue, finished_task_id).as_bytes());
-        out.events.push(MemoryEvent::Released {
-            queue: queue.clone(),
-            task_id: finished_task_id.to_string(),
-        });
-
-        // grant next request if any
-        let start = format!("requests/{}/", queue).into_bytes();
-        let mut end: Vec<u8> = format!("requests/{}/", queue).into_bytes();
-        end.push(0xFF);
-        let mut iter: DbIterator = db
-            .scan::<Vec<u8>, _>(start..=end)
-            .await
-            .map_err(|e| e.to_string())?;
-        if let Some(kv) = iter.next().await.map_err(|e| e.to_string())? {
-            type ArchivedAction =
-                <crate::job_store_shard::ConcurrencyAction as rkyv::Archive>::Archived;
-            let a: &ArchivedAction = unsafe {
-                rkyv::archived_root::<crate::job_store_shard::ConcurrencyAction>(&kv.value)
-            };
-            match a {
-                ArchivedAction::EnqueueTask {
-                    start_time_ms,
-                    priority,
-                    job_id,
-                    attempt_number,
-                } => {
-                    let req_key_str = String::from_utf8_lossy(&kv.key).to_string();
-                    let request_id = req_key_str.split('/').last().unwrap_or("").to_string();
-                    // Only grant if ready to run
-                    if *start_time_ms > now_ms {
-                        // not ready yet; leave request in place
-                    } else {
-                        let holder = HolderRecord {
-                            granted_at_ms: now_ms,
-                        };
-                        let holder_val: AlignedVec = rkyv::to_bytes::<HolderRecord, 256>(&holder)
-                            .map_err(|e| e.to_string())?;
-                        // Holder identity is the new task id (request id)
-                        out.batch.put(
-                            concurrency_holder_key(queue, &request_id).as_bytes(),
-                            &holder_val,
-                        );
-
-                        let task = Task::RunAttempt {
-                            id: request_id.clone(),
-                            job_id: job_id.as_str().to_string(),
-                            attempt_number: *attempt_number,
-                            held_queues: vec![queue.clone()],
-                        };
-                        let tval = encode_task(&task)?;
-                        out.batch.put(
-                            task_key(*start_time_ms, *priority, job_id.as_str(), *attempt_number)
-                                .as_bytes(),
-                            &tval,
-                        );
-
-                        out.batch.delete(&kv.key);
-                        // Memory event carries holder identity (task id / request id)
-                        out.events.push(MemoryEvent::Granted {
-                            queue: queue.clone(),
-                            task_id: request_id,
-                        });
-                    }
-                }
-            }
+impl ConcurrencyManager {
+    pub fn new() -> Self {
+        Self {
+            counts: ConcurrencyCounts::new(),
         }
     }
-    Ok(out)
+
+    pub fn counts(&self) -> &ConcurrencyCounts {
+        &self.counts
+    }
+
+    /// Handle concurrency for a new job enqueue
+    pub fn handle_enqueue(
+        &self,
+        batch: &mut WriteBatch,
+        task_id: &str,
+        job_id: &str,
+        priority: u8,
+        start_at_ms: i64,
+        now_ms: i64,
+        limits: &[ConcurrencyLimit],
+    ) -> Result<Option<RequestTicketOutcome>, String> {
+        // Only gate on the first limit (if any)
+        let Some(limit) = limits.get(0) else {
+            return Ok(None); // No limits
+        };
+
+        let queue = &limit.key;
+        let max_allowed = limit.max_concurrency as usize;
+
+        if self.counts.can_grant(queue, max_allowed) {
+            // Grant immediately
+            let events = append_grant_edits(
+                batch,
+                now_ms,
+                queue,
+                task_id,
+                start_at_ms,
+                priority,
+                job_id,
+                1,
+            )?;
+            Ok(Some(RequestTicketOutcome::GrantedImmediately {
+                task_id: task_id.to_string(),
+                queue: queue.clone(),
+                events,
+            }))
+        } else if start_at_ms <= now_ms {
+            // Job should start now but no capacity: queue as request
+            append_request_edits(batch, queue, now_ms, start_at_ms, priority, job_id, 1)?;
+            Ok(Some(RequestTicketOutcome::TicketRequested {
+                queue: queue.clone(),
+            }))
+        } else {
+            // Job scheduled for future: queue as RequestTicket task
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let ticket = Task::RequestTicket {
+                queue: queue.clone(),
+                start_time_ms: start_at_ms,
+                priority,
+                job_id: job_id.to_string(),
+                attempt_number: 1,
+                request_id: request_id.clone(),
+            };
+            let ticket_value: AlignedVec =
+                rkyv::to_bytes::<Task, 256>(&ticket).map_err(|e| e.to_string())?;
+            batch.put(
+                task_key(start_at_ms, priority, job_id, 1).as_bytes(),
+                &ticket_value,
+            );
+            Ok(Some(RequestTicketOutcome::FutureRequestTaskWritten {
+                queue: queue.clone(),
+                task_id: request_id,
+            }))
+        }
+    }
+
+    /// Process a RequestTicket task during dequeue
+    pub fn process_ticket_request_task(
+        &self,
+        batch: &mut WriteBatch,
+        task_key: &str,
+        queue: &str,
+        request_id: &str,
+        _job_id: &str,
+        _attempt_number: u32,
+        now_ms: i64,
+        job_view: Option<&JobView>,
+    ) -> Result<RequestTicketTaskOutcome, String> {
+        // Check if job exists
+        let Some(view) = job_view else {
+            batch.delete(task_key.as_bytes());
+            return Ok(RequestTicketTaskOutcome::JobMissing);
+        };
+
+        // Determine max concurrency for this queue
+        let mut max_allowed: usize = 1;
+        for lim in view.concurrency_limits() {
+            if lim.key == queue {
+                max_allowed = lim.max_concurrency as usize;
+                break;
+            }
+        }
+
+        // Check if can grant
+        if !self.counts.can_grant(queue, max_allowed) {
+            return Ok(RequestTicketTaskOutcome::Requested);
+        }
+
+        // Grant: create holder, delete ticket
+        let holder = HolderRecord {
+            granted_at_ms: now_ms,
+        };
+        let hval: AlignedVec =
+            rkyv::to_bytes::<HolderRecord, 256>(&holder).map_err(|e| e.to_string())?;
+        batch.put(concurrency_holder_key(queue, request_id).as_bytes(), &hval);
+        batch.delete(task_key.as_bytes());
+
+        Ok(RequestTicketTaskOutcome::Granted {
+            request_id: request_id.to_string(),
+            queue: queue.to_string(),
+        })
+    }
+
+    /// Release holders and grant next requests
+    pub async fn release_and_grant_next(
+        &self,
+        db: &Db,
+        batch: &mut WriteBatch,
+        queues: &[String],
+        finished_task_id: &str,
+        now_ms: i64,
+    ) -> Result<Vec<MemoryEvent>, String> {
+        append_release_and_grant_next(db, batch, queues, finished_task_id, now_ms).await
+    }
 }
 
-// Append-style helpers for composing single durable batch
-pub fn append_grant_edits(
+// Internal helper functions
+
+fn append_grant_edits(
     batch: &mut WriteBatch,
     now_ms: i64,
     queue: &str,
@@ -244,12 +254,11 @@ pub fn append_grant_edits(
     job_id: &str,
     attempt_number: u32,
 ) -> Result<Vec<MemoryEvent>, String> {
-    let holder = crate::job_store_shard::HolderRecord {
+    let holder = HolderRecord {
         granted_at_ms: now_ms,
     };
     let holder_val: AlignedVec =
         rkyv::to_bytes::<HolderRecord, 256>(&holder).map_err(|e| e.to_string())?;
-    // Use per-attempt task id as holder identity
     batch.put(
         concurrency_holder_key(queue, task_id).as_bytes(),
         &holder_val,
@@ -266,17 +275,17 @@ pub fn append_grant_edits(
         task_key(start_time_ms, priority, job_id, attempt_number).as_bytes(),
         &task_value,
     );
-    // Memory event carries holder identity (task_id)
+
     Ok(vec![MemoryEvent::Granted {
         queue: queue.to_string(),
         task_id: task_id.to_string(),
     }])
 }
 
-pub fn append_request_edits(
+fn append_request_edits(
     batch: &mut WriteBatch,
     queue: &str,
-    now_ms: i64,
+    _now_ms: i64,
     start_time_ms: i64,
     priority: u8,
     job_id: &str,
@@ -291,12 +300,17 @@ pub fn append_request_edits(
     let action_val: AlignedVec =
         rkyv::to_bytes::<crate::job_store_shard::ConcurrencyAction, 256>(&action)
             .map_err(|e| e.to_string())?;
-    let req_key = concurrency_request_key(queue, now_ms, &uuid::Uuid::new_v4().to_string());
+    let req_key = concurrency_request_key(
+        queue,
+        start_time_ms,
+        priority,
+        &uuid::Uuid::new_v4().to_string(),
+    );
     batch.put(req_key.as_bytes(), &action_val);
     Ok(())
 }
 
-pub async fn append_release_and_grant_next(
+async fn append_release_and_grant_next(
     db: &Db,
     batch: &mut WriteBatch,
     queues: &[String],
@@ -342,7 +356,6 @@ pub async fn append_release_and_grant_next(
                         };
                         let holder_val: AlignedVec = rkyv::to_bytes::<HolderRecord, 256>(&holder)
                             .map_err(|e| e.to_string())?;
-                        // Holder identity is the new task id (request id)
                         batch.put(
                             concurrency_holder_key(queue, &request_id).as_bytes(),
                             &holder_val,

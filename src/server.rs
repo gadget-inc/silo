@@ -209,7 +209,7 @@ pub async fn run_grpc_with_reaper(
     let (tick_tx, mut tick_rx) = broadcast::channel::<()>(1);
     let reaper_factory = factory.clone();
     let reaper: JoinHandle<()> = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -243,6 +243,64 @@ pub async fn run_grpc_with_reaper(
     serve.await?;
     info!("all connections drained, shutting down services");
     // After server has stopped accepting connections, close all shards
+    match factory.close_all().await {
+        Ok(()) => info!("closed all shards"),
+        Err(CloseAllError { errors }) => {
+            for (name, err) in errors {
+                tracing::error!(shard = %name, error = %err, "failed to close shard");
+            }
+        }
+    }
+    reaper.await.ok();
+    Ok(())
+}
+
+/// Generic variant that accepts any incoming stream of IOs (e.g., Turmoil TcpListener) and runs the server
+/// with a periodic reaper. Use this in simulations to inject custom accept loops.
+pub async fn run_grpc_with_reaper_incoming<S, IO>(
+    incoming: S,
+    factory: Arc<ShardFactory>,
+    mut shutdown: broadcast::Receiver<()>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: tokio_stream::Stream<Item = Result<IO, std::io::Error>> + Send + 'static,
+    IO: tokio::io::AsyncRead
+        + tokio::io::AsyncWrite
+        + Unpin
+        + Send
+        + 'static
+        + tonic::transport::server::Connected,
+{
+    let svc = SiloService::new(factory.clone());
+    let server = SiloServer::new(svc);
+
+    // Periodic reaper that iterates all shards every second
+    let (tick_tx, mut tick_rx) = broadcast::channel::<()>(1);
+    let reaper_factory = factory.clone();
+    let reaper: JoinHandle<()> = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    for shard in reaper_factory.instances().values() {
+                        let _ = shard.reap_expired_leases().await;
+                    }
+                }
+                _ = tick_rx.recv() => { break; }
+            }
+        }
+    });
+
+    let serve = tonic::transport::Server::builder()
+        .add_service(server)
+        .serve_with_incoming_shutdown(incoming, async move {
+            let _ = shutdown.recv().await;
+            info!("graceful shutdown signal received");
+            let _ = tick_tx.send(());
+        });
+
+    serve.await?;
+    info!("all connections drained, shutting down services");
     match factory.close_all().await {
         Ok(()) => info!("closed all shards"),
         Err(CloseAllError { errors }) => {

@@ -27,6 +27,21 @@ pub fn decode_task(bytes: &[u8]) -> Task {
                 .map(|s| s.as_str().to_string())
                 .collect::<Vec<String>>(),
         },
+        ArchivedTask::RequestTicket {
+            queue,
+            start_time_ms,
+            priority,
+            job_id,
+            attempt_number,
+            request_id,
+        } => Task::RequestTicket {
+            queue: queue.as_str().to_string(),
+            start_time_ms: *start_time_ms,
+            priority: *priority,
+            job_id: job_id.as_str().to_string(),
+            attempt_number: *attempt_number,
+            request_id: request_id.as_str().to_string(),
+        },
     }
 }
 

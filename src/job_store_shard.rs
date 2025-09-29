@@ -8,9 +8,9 @@ use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::codec::{encode_attempt, encode_lease, encode_task};
+use crate::codec::{encode_attempt, encode_lease};
 use crate::concurrency::{
-    append_grant_edits, append_release_and_grant_next, append_request_edits, MemoryEvent,
+    ConcurrencyManager, MemoryEvent, RequestTicketOutcome, RequestTicketTaskOutcome,
 };
 use crate::job::{ConcurrencyLimit, JobInfo, JobStatus, JobView};
 use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt, JobAttemptView};
@@ -26,6 +26,7 @@ pub struct JobStoreShard {
     name: String,
     db: Arc<Db>,
     broker: Arc<TaskBroker>,
+    concurrency: Arc<ConcurrencyManager>,
 }
 
 #[derive(Debug, Error)]
@@ -50,6 +51,8 @@ pub enum JobStoreShardError {
     JobAlreadyExists(String),
     #[error("job not found with id {0}")]
     JobNotFound(String),
+    #[error("cannot delete job {0}: job is currently running or has pending requests")]
+    JobInProgress(String),
 }
 
 /// Default lease duration for dequeued tasks (milliseconds)
@@ -83,6 +86,15 @@ pub enum Task {
         job_id: String,
         attempt_number: u32,
         held_queues: Vec<String>,
+    },
+    /// Internal: request a concurrency ticket for a queue at or after a specific time
+    RequestTicket {
+        queue: String,
+        start_time_ms: i64,
+        priority: u8,
+        job_id: String,
+        attempt_number: u32,
+        request_id: String,
     },
 }
 
@@ -118,14 +130,26 @@ pub enum ConcurrencyAction {
 impl JobStoreShard {
     pub async fn open(cfg: &DatabaseConfig) -> Result<Self, JobStoreShardError> {
         let object_store = resolve_object_store(&cfg.backend, &cfg.path)?;
-        let db = Db::open(cfg.path.as_str(), object_store).await?;
+
+        let mut db_builder = slatedb::DbBuilder::new(cfg.path.as_str(), object_store);
+
+        // Apply custom flush interval if specified
+        if let Some(flush_ms) = cfg.flush_interval_ms {
+            let mut settings = slatedb::config::Settings::default();
+            settings.flush_interval = Some(std::time::Duration::from_millis(flush_ms));
+            db_builder = db_builder.with_settings(settings);
+        }
+
+        let db = db_builder.build().await?;
         let db = Arc::new(db);
-        let broker = TaskBroker::new(Arc::clone(&db));
+        let concurrency = Arc::new(ConcurrencyManager::new());
+        let broker = TaskBroker::new(Arc::clone(&db), Arc::clone(&concurrency));
         broker.start();
         Ok(Self {
             name: cfg.name.clone(),
             db,
             broker,
+            concurrency,
         })
     }
 
@@ -163,57 +187,41 @@ impl JobStoreShard {
             return Err(JobStoreShardError::JobAlreadyExists(job_id));
         }
         let payload_bytes = serde_json::to_vec(&payload)?;
-        // Capture the first concurrency limit (if any) before moving the vector into JobInfo
-        let first_limit_opt: Option<ConcurrencyLimit> = concurrency_limits.get(0).cloned();
         let job = JobInfo {
             id: job_id.clone(),
             priority,
             enqueue_time_ms: start_at_ms,
             payload: payload_bytes,
             retry_policy,
-            concurrency_limits,
+            concurrency_limits: concurrency_limits.clone(),
         };
         let job_value: AlignedVec = rkyv::to_bytes::<JobInfo, 256>(&job)
             .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
 
         let first_task_id = Uuid::new_v4().to_string();
-
         let job_status = JobStatus::Scheduled {};
 
-        // Atomically write job info, job status, and the first task
+        // Atomically write job info, job status, and handle concurrency
         let mut batch = WriteBatch::new();
         batch.put(job_info_key(&job_id).as_bytes(), &job_value);
         put_job_status(&mut batch, &job_id, &job_status)?;
 
-        // Concurrency gating: if limits present, try to grant immediately (in-memory); else write a request
-        let mut mem_events: Vec<MemoryEvent> = Vec::new();
-        let mut enqueued_request: Option<String> = None;
-        if let Some(limit) = first_limit_opt.as_ref() {
-            let now_ms = now_epoch_ms();
-            let queue = &limit.key;
-            let max_allowed = limit.max_concurrency as usize;
-            if self.broker.concurrency_can_grant(queue, max_allowed) {
-                // Grant immediately: append holder + task
-                let events = append_grant_edits(
-                    &mut batch,
-                    now_ms,
-                    queue,
-                    &first_task_id,
-                    start_at_ms,
-                    priority,
-                    &job_id,
-                    1,
-                )
-                .map_err(|e| JobStoreShardError::Rkyv(e))?;
-                mem_events.extend(events);
-            } else {
-                // Persist a request: when granted, enqueue the task
-                append_request_edits(&mut batch, queue, now_ms, start_at_ms, priority, &job_id, 1)
-                    .map_err(|e| JobStoreShardError::Rkyv(e))?;
-                enqueued_request = Some(queue.clone());
-            }
-        } else {
-            // No concurrency limits; write task directly
+        let now_ms = now_epoch_ms();
+        let outcome = self
+            .concurrency
+            .handle_enqueue(
+                &mut batch,
+                &first_task_id,
+                &job_id,
+                priority,
+                start_at_ms,
+                now_ms,
+                &concurrency_limits,
+            )
+            .map_err(|e| JobStoreShardError::Rkyv(e))?;
+
+        // If no concurrency limits, write task directly
+        if outcome.is_none() {
             let first_task = Task::RunAttempt {
                 id: first_task_id.clone(),
                 job_id: job_id.clone(),
@@ -221,7 +229,7 @@ impl JobStoreShard {
                 held_queues: Vec::new(),
             };
             let task_value: AlignedVec =
-                encode_task(&first_task).map_err(|e| JobStoreShardError::Rkyv(e))?;
+                crate::codec::encode_task(&first_task).map_err(|e| JobStoreShardError::Rkyv(e))?;
             batch.put(
                 task_key(start_at_ms, priority, &job_id, 1).as_bytes(),
                 &task_value,
@@ -230,24 +238,35 @@ impl JobStoreShard {
 
         self.db.write(batch).await?;
         self.db.flush().await?;
-        // Apply memory events after durable commit
-        for ev in mem_events.into_iter() {
-            match ev {
-                MemoryEvent::Granted { queue, task_id } => {
-                    // short-lived span for grant
-                    let span = info_span!("concurrency.grant", queue = %queue, task_id = %task_id, job_id = %job_id, attempt = 1u32, source = "immediate");
-                    let _g = span.enter();
-                    info!("granted ticket and enqueued first task");
-                    self.broker.concurrency_record_grant(&queue, &task_id);
+
+        // Apply memory events and log after durable commit
+        if let Some(outcome) = outcome {
+            match outcome {
+                RequestTicketOutcome::GrantedImmediately {
+                    task_id,
+                    queue: _,
+                    events,
+                } => {
+                    for ev in events {
+                        if let MemoryEvent::Granted { queue, task_id } = ev {
+                            let span = info_span!("concurrency.grant", queue = %queue, task_id = %task_id, job_id = %job_id, attempt = 1u32, source = "immediate");
+                            let _g = span.enter();
+                            info!("granted ticket and enqueued first task");
+                            self.concurrency.counts().record_grant(&queue, &task_id);
+                        }
+                    }
                 }
-                MemoryEvent::Released { .. } => {}
+                RequestTicketOutcome::TicketRequested { queue } => {
+                    let span = info_span!("concurrency.request", queue = %queue, job_id = %job_id, attempt = 1u32, start_at_ms = start_at_ms, priority = priority);
+                    let _g = span.enter();
+                    info!("enqueued concurrency request");
+                }
+                RequestTicketOutcome::FutureRequestTaskWritten { queue, .. } => {
+                    let span = info_span!("concurrency.ticket", queue = %queue, job_id = %job_id, attempt = 1u32, start_at_ms = start_at_ms, priority = priority);
+                    let _g = span.enter();
+                    info!("enqueued RequestTicket for future start");
+                }
             }
-        }
-        if let Some(q) = enqueued_request.take() {
-            // short-lived span for request enqueue (no wait time covered)
-            let span = info_span!("concurrency.request", queue = %q, job_id = %job_id, attempt = 1u32, start_at_ms = start_at_ms, priority = priority);
-            let _g = span.enter();
-            info!("enqueued concurrency request");
         }
 
         // If ready now, wake the scanner to refill promptly
@@ -259,7 +278,23 @@ impl JobStoreShard {
     }
 
     /// Delete a job by id.
+    ///
+    /// Returns an error if the job is currently running (has active leases/holders)
+    /// or has pending tasks/requests. Jobs must finish or permanently fail before deletion.
     pub async fn delete_job(&self, id: &str) -> Result<(), JobStoreShardError> {
+        // Check if job is running or has pending state
+        let status = self.get_job_status(id).await?;
+        if let Some(status) = status {
+            match status {
+                JobStatus::Running {} | JobStatus::Scheduled {} => {
+                    return Err(JobStoreShardError::JobInProgress(id.to_string()));
+                }
+                JobStatus::Succeeded {} | JobStatus::Failed {} | JobStatus::Cancelled {} => {
+                    // OK to delete terminal states
+                }
+            }
+        }
+
         let job_info_key: String = job_info_key(id);
         let job_status_key: String = job_status_key(id);
         let mut batch = WriteBatch::new();
@@ -330,25 +365,121 @@ impl JobStoreShard {
         worker_id: &str,
         max_tasks: usize,
     ) -> Result<Vec<LeasedTask>, JobStoreShardError> {
+        let _ts_enter = now_epoch_ms();
         if max_tasks == 0 {
             return Ok(Vec::new());
         }
+        // Broker-only leasing: no fallback DB scan
+
+        // debug: before_claim suppressed
+        // Claim from the broker buffer; RequestTickets are internal and processed here
         let claimed: Vec<BrokerTask> = self.broker.claim_ready_or_nudge(max_tasks).await;
+        // debug: claimed_from_broker suppressed
         if claimed.is_empty() {
+            eprintln!(
+                "dequeue: fallback none_ready ts={} worker={}",
+                now_epoch_ms(),
+                worker_id
+            );
             return Ok(Vec::new());
         }
 
         let now_ms = now_epoch_ms();
         let expiry_ms = now_ms + DEFAULT_LEASE_MS;
-
         let mut batch = WriteBatch::new();
         let mut out: Vec<LeasedTask> = Vec::new();
         let mut pending_attempts: Vec<(JobView, String, u32)> = Vec::new();
         let mut ack_keys: Vec<String> = Vec::with_capacity(claimed.len());
+        let mut planned_leases: usize = 0;
 
         for entry in &claimed {
             let task = &entry.task;
-            // Only RunAttempt exists currently
+            // Internal tasks are processed inside the store and not leased
+            match task {
+                Task::RequestTicket {
+                    queue,
+                    start_time_ms: _,
+                    priority: _priority,
+                    job_id,
+                    attempt_number,
+                    request_id,
+                } => {
+                    // Load job info
+                    let job_key = job_info_key(job_id);
+                    let maybe_job = self.db.get(job_key.as_bytes()).await?;
+                    let job_view = maybe_job
+                        .as_ref()
+                        .and_then(|bytes| JobView::new(bytes.clone()).ok());
+
+                    // Process ticket via concurrency manager
+                    let outcome = self
+                        .concurrency
+                        .process_ticket_request_task(
+                            &mut batch,
+                            &entry.key,
+                            queue,
+                            request_id,
+                            job_id,
+                            *attempt_number,
+                            now_ms,
+                            job_view.as_ref(),
+                        )
+                        .map_err(|e| JobStoreShardError::Rkyv(e))?;
+
+                    match outcome {
+                        RequestTicketTaskOutcome::Granted { request_id, queue } => {
+                            // Create lease and attempt records
+                            let run = Task::RunAttempt {
+                                id: request_id.clone(),
+                                job_id: job_id.clone(),
+                                attempt_number: *attempt_number,
+                                held_queues: vec![queue.clone()],
+                            };
+                            let lease_key = leased_task_key(&request_id);
+                            let record = LeaseRecord {
+                                worker_id: worker_id.to_string(),
+                                task: run,
+                                expiry_ms,
+                            };
+                            let leased_value: AlignedVec =
+                                encode_lease(&record).map_err(|e| JobStoreShardError::Rkyv(e))?;
+                            batch.put(lease_key.as_bytes(), &leased_value);
+
+                            // Mark job as running
+                            let job_status = JobStatus::Running {};
+                            put_job_status(&mut batch, job_id, &job_status)?;
+
+                            // Attempt record
+                            let attempt = JobAttempt {
+                                job_id: job_id.clone(),
+                                attempt_number: *attempt_number,
+                                task_id: request_id.clone(),
+                                status: AttemptStatus::Running {
+                                    started_at_ms: now_ms,
+                                },
+                            };
+                            let attempt_val: AlignedVec = encode_attempt(&attempt)
+                                .map_err(|e| JobStoreShardError::Rkyv(e))?;
+                            let akey = attempt_key(job_id, *attempt_number);
+                            batch.put(akey.as_bytes(), &attempt_val);
+
+                            // Track for response and in-memory counts
+                            let view = job_view.unwrap();
+                            pending_attempts.push((view, job_id.clone(), *attempt_number));
+                            ack_keys.push(entry.key.clone());
+                            self.concurrency.counts().record_grant(&queue, &request_id);
+                            planned_leases += 1;
+                        }
+                        RequestTicketTaskOutcome::Requested
+                        | RequestTicketTaskOutcome::JobMissing => {
+                            // Release inflight, task will be picked up later or cleaned up
+                            ack_keys.push(entry.key.clone());
+                        }
+                    }
+                    continue;
+                }
+                Task::RunAttempt { .. } => {}
+            }
             let (task_id, job_id, attempt_number) = match task {
                 Task::RunAttempt {
                     id,
@@ -356,6 +487,7 @@ impl JobStoreShard {
                     attempt_number,
                     ..
                 } => (id.clone(), job_id.to_string(), *attempt_number),
+                Task::RequestTicket { .. } => unreachable!(),
             };
 
             // Look up job info; if missing, delete the task and skip
@@ -398,6 +530,7 @@ impl JobStoreShard {
                 // Defer constructing AttemptView; fetch from DB after batch is written
                 pending_attempts.push((view, job_id.clone(), attempt_number));
                 ack_keys.push(entry.key.clone());
+                planned_leases += 1;
             } else {
                 // If job missing, delete task key to clean up
                 batch.delete(entry.key.as_bytes());
@@ -419,6 +552,13 @@ impl JobStoreShard {
         // Ack durable and evict from buffer; we no longer use TTL tombstones.
         self.broker.ack_durable(&ack_keys);
         self.broker.evict_keys(&ack_keys);
+        eprintln!(
+            "dequeue: ack_keys={} out_pending={} buf={} inflight={}",
+            ack_keys.len(),
+            pending_attempts.len(),
+            self.broker.buffer_len(),
+            self.broker.inflight_len()
+        );
 
         for (job_view, job_id, attempt_number) in pending_attempts.into_iter() {
             let attempt_view = self
@@ -432,7 +572,13 @@ impl JobStoreShard {
                 attempt: attempt_view,
             });
         }
-
+        let ts_exit = now_epoch_ms();
+        eprintln!(
+            "dequeue: exit ts={} worker={} returned={}",
+            ts_exit,
+            worker_id,
+            out.len()
+        );
         Ok(out)
     }
 
@@ -476,6 +622,23 @@ impl JobStoreShard {
                             .iter()
                             .map(|s| s.as_str().to_string())
                             .collect::<Vec<String>>(),
+                    });
+                }
+                ArchivedTask::RequestTicket {
+                    queue,
+                    start_time_ms,
+                    priority,
+                    job_id,
+                    attempt_number,
+                    request_id,
+                } => {
+                    tasks.push(Task::RequestTicket {
+                        queue: queue.as_str().to_string(),
+                        start_time_ms: *start_time_ms,
+                        priority: *priority,
+                        job_id: job_id.as_str().to_string(),
+                        attempt_number: *attempt_number,
+                        request_id: request_id.as_str().to_string(),
                     });
                 }
             }
@@ -530,6 +693,21 @@ impl JobStoreShard {
                     .map(|s| s.as_str().to_string())
                     .collect::<Vec<String>>(),
             },
+            ArchivedTask::RequestTicket {
+                queue,
+                start_time_ms,
+                priority,
+                job_id,
+                attempt_number,
+                request_id,
+            } => Task::RequestTicket {
+                queue: queue.as_str().to_string(),
+                start_time_ms: *start_time_ms,
+                priority: *priority,
+                job_id: job_id.as_str().to_string(),
+                attempt_number: *attempt_number,
+                request_id: request_id.as_str().to_string(),
+            },
         };
         let record = LeaseRecord {
             worker_id: current_owner.to_string(),
@@ -577,6 +755,9 @@ impl JobStoreShard {
                         .map(|s| s.as_str().to_string())
                         .collect::<Vec<String>>(),
                 ),
+                ArchivedTask::RequestTicket { .. } => {
+                    unreachable!("leases only exist for RunAttempt")
+                }
             };
 
         let now_ms = now_epoch_ms();
@@ -663,17 +844,12 @@ impl JobStoreShard {
             }
         }
 
-        // If job finished (success or no follow-up), release any held concurrency tickets
-        // Always release concurrency tickets after an attempt finishes, regardless of follow-up
-        let release_events: Vec<MemoryEvent> = append_release_and_grant_next(
-            &self.db,
-            &mut batch,
-            &held_queues_local,
-            task_id,
-            now_ms,
-        )
-        .await
-        .map_err(|e| JobStoreShardError::Rkyv(e))?;
+        // Release any held concurrency tickets
+        let release_events: Vec<MemoryEvent> = self
+            .concurrency
+            .release_and_grant_next(&self.db, &mut batch, &held_queues_local, task_id, now_ms)
+            .await
+            .map_err(|e| JobStoreShardError::Rkyv(e))?;
 
         self.db.write(batch).await?;
         self.db.flush().await?;
@@ -688,11 +864,13 @@ impl JobStoreShard {
                         info_span!("concurrency.release", queue = %queue, finished_task_id = %tid);
                     let _g = span.enter();
                     info!("released ticket for finished task");
-                    self.broker.concurrency_record_release(&queue, &tid);
+                    self.concurrency.counts().record_release(&queue, &tid);
+                    // Wake broker; durable grant-from-release already enqueues run task if ready
+                    self.broker.wakeup();
                 }
                 MemoryEvent::Granted { queue, task_id } => {
                     // We granted on release: bump in-memory counts now and wake the broker to scan promptly.
-                    self.broker.concurrency_record_grant(&queue, &task_id);
+                    self.concurrency.counts().record_grant(&queue, &task_id);
                     let span = info_span!("task.enqueue_from_grant", queue = %queue, task_id = %task_id, cause = "release");
                     let _g = span.enter();
                     info!("enqueued task for next requester after release");
@@ -709,6 +887,7 @@ impl JobStoreShard {
         if let Some(err) = job_missing_error {
             return Err(err);
         }
+        eprintln!("report_attempt_outcome: finished task_id={}", task_id);
         Ok(())
     }
 
@@ -736,6 +915,7 @@ impl JobStoreShard {
             // Determine the task id from the archived task
             let task_id = match &lease.task {
                 ArchivedTask::RunAttempt { id, .. } => id.as_str().to_string(),
+                ArchivedTask::RequestTicket { .. } => unreachable!("leases only for RunAttempt"),
             };
 
             // Report as worker crashed; ignore LeaseNotFound in case of concurrent cleanup

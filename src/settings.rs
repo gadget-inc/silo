@@ -52,6 +52,9 @@ pub struct DatabaseConfig {
     pub name: String,
     pub backend: Backend,
     pub path: String,
+    /// Optional flush interval for SlateDB. If None, uses SlateDB's default.
+    #[serde(default)]
+    pub flush_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -38,6 +38,7 @@ impl ShardFactory {
             name: name.clone(),
             backend: self.template.backend.clone(),
             path,
+            flush_interval_ms: None, // Use SlateDB's default in production
         };
         let shard = JobStoreShard::open(&cfg).await?;
         self.instances.insert(cfg.name.clone(), shard);

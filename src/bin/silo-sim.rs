@@ -89,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
                 .join(format!("{}", s))
                 .to_string_lossy()
                 .to_string(),
+            flush_interval_ms: Some(10), // Fast flushes for simulation
         };
         let shard = JobStoreShard::open(&cfg).await?;
         shards.push(Arc::new(shard));

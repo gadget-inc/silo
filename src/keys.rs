@@ -31,12 +31,19 @@ pub fn attempt_key(job_id: &str, attempt: u32) -> String {
     format!("attempts/{}/{}", job_id, attempt)
 }
 
-/// Concurrency request queue: requests/<queue-name>/<request_time_ms>/<request_id>
-pub fn concurrency_request_key(queue: &str, request_time_ms: i64, request_id: &str) -> String {
+/// Concurrency request queue: requests/<queue-name>/<start_time_ms>/<priority>/<request_id>
+/// Ordered by start time (when job should run), then priority (lower = higher), then request ID
+pub fn concurrency_request_key(
+    queue: &str,
+    start_time_ms: i64,
+    priority: u8,
+    request_id: &str,
+) -> String {
     format!(
-        "requests/{}/{:020}/{}",
+        "requests/{}/{:020}/{:02}/{}",
         queue,
-        request_time_ms.max(0) as u64,
+        start_time_ms.max(0) as u64,
+        priority,
         request_id
     )
 }

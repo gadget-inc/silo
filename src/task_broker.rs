@@ -11,10 +11,9 @@ use slatedb::Db;
 use tokio::sync::Notify;
 
 use crate::codec::decode_task;
-use crate::concurrency::ConcurrencyCounts;
+use crate::concurrency::ConcurrencyManager;
 use crate::job_store_shard::Task;
-use crate::keys::leased_task_key;
-use tracing::{debug, info_span};
+use tracing::debug;
 
 /// A task entry stored in the in-memory broker buffer
 #[derive(Debug, Clone)]
@@ -30,19 +29,18 @@ pub struct BrokerTask {
 /// - Ensures tasks claimed but not yet durably leased are tracked as in-flight and not reinserted.
 pub struct TaskBroker {
     db: Arc<Db>,
-    buffer: Arc<SkipMap<String, BrokerTask>>, // key is the full task key
+    buffer: Arc<SkipMap<String, BrokerTask>>,
     inflight: Arc<Mutex<HashSet<String>>>,
     running: Arc<AtomicBool>,
     notify: Arc<Notify>,
     scan_requested: Arc<AtomicBool>,
-    // Concurrency: in-memory counts for tickets
-    concurrency: Arc<ConcurrencyCounts>,
+    concurrency: Arc<ConcurrencyManager>,
     target_buffer: usize,
     scan_batch: usize,
 }
 
 impl TaskBroker {
-    pub fn new(db: Arc<Db>) -> Arc<Self> {
+    pub fn new(db: Arc<Db>, concurrency: Arc<ConcurrencyManager>) -> Arc<Self> {
         Arc::new(Self {
             db,
             buffer: Arc::new(SkipMap::new()),
@@ -50,14 +48,77 @@ impl TaskBroker {
             running: Arc::new(AtomicBool::new(false)),
             notify: Arc::new(Notify::new()),
             scan_requested: Arc::new(AtomicBool::new(false)),
-            concurrency: Arc::new(ConcurrencyCounts::new()),
+            concurrency,
             target_buffer: 4096,
             scan_batch: 1024,
         })
     }
 
-    pub fn len(&self) -> usize {
+    pub fn buffer_len(&self) -> usize {
         self.buffer.len()
+    }
+
+    pub fn inflight_len(&self) -> usize {
+        self.inflight.lock().unwrap().len()
+    }
+
+    /// Scan tasks from DB and insert into buffer, skipping future tasks and inflight ones.
+    async fn scan_tasks(&self, now_ms: i64) -> usize {
+        let start: Vec<u8> = b"tasks/".to_vec();
+        let mut end: Vec<u8> = b"tasks/".to_vec();
+        end.push(0xFF);
+
+        let Ok(mut iter) = self.db.scan::<Vec<u8>, _>(start..=end).await else {
+            return 0;
+        };
+
+        let mut inserted = 0;
+        while inserted < self.scan_batch && self.buffer.len() < self.target_buffer {
+            let Ok(Some(kv)) = iter.next().await else {
+                break;
+            };
+
+            let Ok(key_str) = str::from_utf8(&kv.key) else {
+                continue;
+            };
+
+            // Filter out future tasks by parsing timestamp from key
+            // Format: tasks/<ts>/<pri>/<job_id>/<attempt>
+            if let Some(ts_part) = key_str
+                .strip_prefix("tasks/")
+                .and_then(|rest| rest.split('/').next())
+            {
+                if let Ok(ts_val) = ts_part.parse::<u64>() {
+                    if ts_val > now_ms as u64 {
+                        continue;
+                    }
+                }
+            }
+
+            // Skip inflight tasks
+            if self.inflight.lock().unwrap().contains(key_str) {
+                continue;
+            }
+
+            let task = decode_task(&kv.value);
+            let entry = BrokerTask {
+                key: key_str.to_string(),
+                task,
+            };
+
+            // Insert into buffer if not already present
+            if self.buffer.get(&entry.key).is_none() {
+                self.buffer.insert(entry.key.clone(), entry);
+                inserted += 1;
+
+                // Yield periodically to avoid starving other tasks
+                if inserted % 16 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+
+        inserted
     }
 
     /// Start the background scanning loop.
@@ -68,109 +129,51 @@ impl TaskBroker {
 
         let broker = Arc::clone(self);
         tokio::spawn(async move {
-            // Hydrate concurrency holders from durable state on startup (best effort)
-            let _ = broker.concurrency.hydrate(&broker.db).await;
-            let mut sleep_ms: u64 = 20;
-            let min_sleep_ms: u64 = 20;
-            let max_sleep_ms: u64 = 1000;
-            let _tombstone_ttl = Duration::from_millis(2_000);
+            // Hydrate concurrency holders from durable state on startup
+            let _ = broker.concurrency.counts().hydrate(&broker.db).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            let min_sleep_ms = 5;
+            let max_sleep_ms = 1000;
+            let mut sleep_ms = min_sleep_ms;
 
             loop {
                 if !broker.running.load(Ordering::SeqCst) {
                     break;
                 }
 
-                // Avoid overfilling the buffer
+                // Wait if buffer is full
                 if broker.buffer.len() >= broker.target_buffer {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 }
 
-                // Scan ready tasks up to now
+                // Scan for ready tasks
                 let now_ms = crate::job_store_shard::now_epoch_ms();
-                let start: Vec<u8> = b"tasks/".to_vec();
-                let end_prefix = crate::keys::task_key(now_ms, 99, "~", u32::MAX);
-                let mut end: Vec<u8> = end_prefix.into_bytes();
-                end.push(0xFF);
+                let inserted = broker.scan_tasks(now_ms).await;
 
-                let mut inserted: usize = 0;
-
-                // Each scan call creates an iterator snapshot
-                let scan_res = broker.db.scan::<Vec<u8>, _>(start..=end).await;
-                let mut iter = match scan_res {
-                    Ok(it) => it,
-                    Err(_) => {
-                        // On scan error, backoff briefly
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        continue;
-                    }
-                };
-
-                while inserted < broker.scan_batch && broker.buffer.len() < broker.target_buffer {
-                    let maybe_kv = match iter.next().await {
-                        Ok(v) => v,
-                        Err(_) => None,
-                    };
-                    let Some(kv) = maybe_kv else { break };
-
-                    // Convert key to &str
-                    let key_str = match str::from_utf8(&kv.key) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-
-                    // If key is inflight, ensure it's not in the buffer and skip
-                    if broker.inflight.lock().unwrap().contains(key_str) {
-                        let _ = broker.buffer.remove(key_str);
-                        continue;
-                    }
-
-                    // Decode the task from value bytes
-                    let task = decode_task(&kv.value);
-                    let task_id = match &task {
-                        Task::RunAttempt { id, .. } => id.clone(),
-                    };
-
-                    // If a lease exists for this task id, skip to avoid double-brokering
-                    let lkey = leased_task_key(&task_id);
-                    if let Ok(Some(_lease)) = broker.db.get(lkey.as_bytes()).await {
-                        continue;
-                    }
-
-                    let entry = BrokerTask {
-                        key: key_str.to_string(),
-                        task,
-                    };
-
-                    // Insert into buffer if absent (idempotent)
-                    if broker.buffer.get(&entry.key).is_none() {
-                        let _ = broker.buffer.insert(entry.key.clone(), entry.clone());
-                        // lightweight event for scan insert
-                        let span = info_span!("broker.scan_insert", key = %entry.key);
-                        let _g = span.enter();
-                        debug!("inserted ready task into buffer");
-                        inserted += 1;
-                    }
-                }
-
-                // Adjust backoff based on whether we found anything
-                if inserted == 0 {
-                    sleep_ms = (sleep_ms.saturating_mul(2)).min(max_sleep_ms);
+                // Adjust backoff: stay aggressive when buffer needs filling
+                if broker.buffer.len() < broker.target_buffer / 2 {
+                    sleep_ms = min_sleep_ms;
+                } else if inserted == 0 {
+                    sleep_ms = (sleep_ms * 2).min(max_sleep_ms);
                 } else {
                     sleep_ms = min_sleep_ms;
                 }
-                // If a scan was explicitly requested, skip sleeping and loop immediately
+
+                // Handle explicit scan requests with minimal sleep
                 if broker.scan_requested.swap(false, Ordering::SeqCst) {
-                    sleep_ms = min_sleep_ms;
+                    tokio::time::sleep(Duration::from_millis(1)).await;
                     continue;
                 }
+
+                // Sleep with early wakeup support
                 let delay = tokio::time::sleep(Duration::from_millis(sleep_ms));
                 tokio::pin!(delay);
                 tokio::select! {
                     _ = &mut delay => {},
                     _ = broker.notify.notified() => {
-                        // Wake early and reset backoff for prompt refill
-                        sleep_ms = min_sleep_ms;
+                        debug!("broker woken by notification");
                     }
                 }
             }
@@ -184,53 +187,70 @@ impl TaskBroker {
 
     /// Claim up to `max` ready tasks from the head of the buffer.
     pub fn claim_ready(&self, max: usize) -> Vec<BrokerTask> {
-        let mut claimed: Vec<BrokerTask> = Vec::with_capacity(max);
-        for _ in 0..max {
-            let Some(front) = self.buffer.front() else {
-                break;
-            };
-            let key = front.key().clone();
-            // Reserve in inflight first to close scanner race
-            {
-                let mut inflight = self.inflight.lock().unwrap();
-                if !inflight.insert(key.clone()) {
-                    // already inflight; remove stray buffer entry and continue
-                    let _ = self.buffer.remove(&key);
-                    continue;
+        let mut claimed = Vec::with_capacity(max);
+
+        while claimed.len() < max {
+            // Find the first claimable entry
+            let candidate_key = self.buffer.iter().find_map(|entry| {
+                let key = entry.key();
+
+                // Skip if inflight
+                if self.inflight.lock().unwrap().contains(key) {
+                    return None;
                 }
+
+                // Let RequestTickets through to dequeue where max_concurrency will be checked properly
+                // (we can't check here because we don't know the max_concurrency without loading the job)
+
+                Some(key.clone())
+            });
+
+            let Some(key) = candidate_key else { break };
+
+            // Reserve as inflight
+            if !self.inflight.lock().unwrap().insert(key.clone()) {
+                continue; // Lost race, try again
             }
-            match self.buffer.remove(&key) {
-                Some(entry) => {
-                    claimed.push(entry.value().clone());
-                }
-                None => {
-                    // couldn't remove; clear inflight reservation and continue
-                    self.inflight.lock().unwrap().remove(&key);
-                    continue;
-                }
+
+            // Remove from buffer
+            if let Some(entry) = self.buffer.remove(&key) {
+                claimed.push(entry.value().clone());
+            } else {
+                // Removal failed, clear inflight reservation
+                self.inflight.lock().unwrap().remove(&key);
             }
         }
+
         claimed
     }
 
-    /// Try to claim up to `max` tasks. If none available, nudge scanner and
-    /// yield once before retrying the claim. Avoids DB hits in dequeuers.
+    /// Try to claim tasks. If none available, wait briefly for scanner to populate.
     pub async fn claim_ready_or_nudge(&self, max: usize) -> Vec<BrokerTask> {
-        let mut claimed = self.claim_ready(max);
-        if claimed.is_empty() {
-            self.wakeup();
-            tokio::task::yield_now().await;
-            claimed = self.claim_ready(max);
+        // Try fast path first
+        let claimed = self.claim_ready(max);
+        if !claimed.is_empty() {
+            return claimed;
         }
-        claimed
+
+        // Wake scanner and wait briefly
+        self.wakeup();
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let claimed = self.claim_ready(max);
+            if !claimed.is_empty() {
+                return claimed;
+            }
+        }
+
+        Vec::new()
     }
 
     /// Requeue tasks back into the buffer after a failed durable write.
     pub fn requeue(&self, tasks: Vec<BrokerTask>) {
         let mut inflight = self.inflight.lock().unwrap();
-        for entry in tasks.into_iter() {
+        for entry in tasks {
             inflight.remove(&entry.key);
-            let _ = self.buffer.insert(entry.key.clone(), entry);
+            self.buffer.insert(entry.key.clone(), entry);
         }
     }
 
@@ -245,25 +265,14 @@ impl TaskBroker {
     /// Remove any buffered entries that match the provided keys.
     pub fn evict_keys(&self, keys: &[String]) {
         for k in keys {
-            let _ = self.buffer.remove(k);
+            self.buffer.remove(k);
         }
     }
 
-    /// Wake the scanner to refill promptly (e.g., after enqueuing a ready task).
+    /// Wake the scanner to refill promptly.
     pub fn wakeup(&self) {
         self.scan_requested.store(true, Ordering::SeqCst);
         self.notify.notify_one();
-    }
-
-    // Concurrency helpers (in-memory decisions)
-    pub fn concurrency_can_grant(&self, queue: &str, limit: usize) -> bool {
-        self.concurrency.can_grant(queue, limit)
-    }
-    pub fn concurrency_record_grant(&self, queue: &str, task_id: &str) {
-        self.concurrency.record_grant(queue, task_id)
-    }
-    pub fn concurrency_record_release(&self, queue: &str, task_id: &str) {
-        self.concurrency.record_release(queue, task_id)
     }
 }
 
