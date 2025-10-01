@@ -38,6 +38,14 @@ usdt = "0.6.0"
 tempfile = "3"
 
 [dev-dependencies]
+turmoil = { path = "/Users/airhorns/Code/turmoil" }
+rand = "0.8"
+rand_chacha = "0.3"
+async-stream = "0.3"
+hyper-util = "0.1"
+hyper = "1"
+tower = "0.4"
+criterion = { version = "0.5", features = ["async_tokio"] }
 
 [build-dependencies]
 tonic-build = "0.12"
@@ -46,3 +54,7 @@ protoc-bin-vendored = "3.0"
 [profile.release]
 debug = 1     # debug info with line tables only for profiling
 strip = false # do not strip symbols for profiling
+
+[[bench]]
+name = "job_shard_throughput"
+harness = false

@@ -376,11 +376,7 @@ impl JobStoreShard {
         let claimed: Vec<BrokerTask> = self.broker.claim_ready_or_nudge(max_tasks).await;
         // debug: claimed_from_broker suppressed
         if claimed.is_empty() {
-            eprintln!(
-                "dequeue: fallback none_ready ts={} worker={}",
-                now_epoch_ms(),
-                worker_id
-            );
+            tracing::debug!(worker_id = %worker_id, "dequeue: no ready tasks");
             return Ok(Vec::new());
         }
 
@@ -552,12 +548,12 @@ impl JobStoreShard {
         // Ack durable and evict from buffer; we no longer use TTL tombstones.
         self.broker.ack_durable(&ack_keys);
         self.broker.evict_keys(&ack_keys);
-        eprintln!(
-            "dequeue: ack_keys={} out_pending={} buf={} inflight={}",
-            ack_keys.len(),
-            pending_attempts.len(),
-            self.broker.buffer_len(),
-            self.broker.inflight_len()
+        tracing::debug!(
+            ack_keys = ack_keys.len(),
+            pending_attempts = pending_attempts.len(),
+            buffer_size = self.broker.buffer_len(),
+            inflight = self.broker.inflight_len(),
+            "dequeue: acked and evicted keys"
         );
 
         for (job_view, job_id, attempt_number) in pending_attempts.into_iter() {
@@ -572,13 +568,7 @@ impl JobStoreShard {
                 attempt: attempt_view,
             });
         }
-        let ts_exit = now_epoch_ms();
-        eprintln!(
-            "dequeue: exit ts={} worker={} returned={}",
-            ts_exit,
-            worker_id,
-            out.len()
-        );
+        tracing::debug!(worker_id = %worker_id, returned = out.len(), "dequeue: completed");
         Ok(out)
     }
 
@@ -887,7 +877,7 @@ impl JobStoreShard {
         if let Some(err) = job_missing_error {
             return Err(err);
         }
-        eprintln!("report_attempt_outcome: finished task_id={}", task_id);
+        tracing::debug!(task_id = %task_id, "report_attempt_outcome: completed");
         Ok(())
     }
 

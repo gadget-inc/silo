@@ -1229,14 +1229,12 @@ async fn concurrent_dequeue_many_workers_no_duplicates() {
 
         // Spawn workers
         let mut handles = Vec::new();
-        // eprintln!("test.spawning_workers: {}", workers);
         for wi in 0..workers {
             let shard_cl = Arc::clone(&shard);
             let seen_cl = Arc::clone(&seen);
             let processed_cl = Arc::clone(&processed);
             let worker_id = format!("w-{wi}");
             handles.push(tokio::spawn(async move {
-                // eprintln!("test.worker_start: {}", worker_id);
                 loop {
                     // debug: before_dequeue suppressed
                     let tasks = shard_cl.dequeue(&worker_id, 1).await.expect("dequeue");
@@ -1275,7 +1273,6 @@ async fn concurrent_dequeue_many_workers_no_duplicates() {
 
         // Enqueue producer task (avoid blocking the runtime)
         let shard_prod = Arc::clone(&shard);
-        // eprintln!("test.begin_enqueues total_jobs={}", total_jobs);
         let producer = tokio::spawn(async move {
             for i in 0..total_jobs {
                 let payload = serde_json::json!({"i": i});

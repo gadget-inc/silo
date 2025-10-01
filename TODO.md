@@ -21,4 +21,9 @@
 - [ ] opentelemetry support
 - [ ] investigate how we might do schema evolution
 - [ ] secondary indexes for filtering
+  - requirements: 
+     - cursor based pagination
+     - optional filter on job id 
+     - optional filter on job state
+     - optional filter on new metadata key/values
 - [ ] once transaction support, make enqueue idempotency not a read-then-write but some sort of conditional write
