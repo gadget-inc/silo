@@ -64,6 +64,7 @@ impl TaskBroker {
 
     /// Scan tasks from DB and insert into buffer, skipping future tasks and inflight ones.
     async fn scan_tasks(&self, now_ms: i64) -> usize {
+        // Tasks live under tasks/<ts>/<pri>/<job_id>/<attempt>
         let start: Vec<u8> = b"tasks/".to_vec();
         let mut end: Vec<u8> = b"tasks/".to_vec();
         end.push(0xFF);
@@ -84,14 +85,17 @@ impl TaskBroker {
 
             // Filter out future tasks by parsing timestamp from key
             // Format: tasks/<ts>/<pri>/<job_id>/<attempt>
-            if let Some(ts_part) = key_str
-                .strip_prefix("tasks/")
-                .and_then(|rest| rest.split('/').next())
-            {
-                if let Ok(ts_val) = ts_part.parse::<u64>() {
-                    if ts_val > now_ms as u64 {
-                        continue;
-                    }
+            let mut parts = key_str.split('/');
+            if parts.next() != Some("tasks") {
+                continue;
+            }
+            let ts_part = match parts.next() {
+                Some(x) => x,
+                None => continue,
+            };
+            if let Ok(ts_val) = ts_part.parse::<u64>() {
+                if ts_val > now_ms as u64 {
+                    continue;
                 }
             }
 
@@ -243,6 +247,16 @@ impl TaskBroker {
         }
 
         Vec::new()
+    }
+
+    /// Try to claim up to `max` ready tasks for a specific tenant. If none, nudge scanner.
+    pub async fn claim_ready_for_tenant_or_nudge(
+        &self,
+        tenant: &str,
+        max: usize,
+    ) -> Vec<BrokerTask> {
+        let _ = tenant; // tasks are tenant-agnostic; claim globally
+        self.claim_ready_or_nudge(max).await
     }
 
     /// Requeue tasks back into the buffer after a failed durable write.

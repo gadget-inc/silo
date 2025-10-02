@@ -43,6 +43,7 @@ pub enum RequestTicketTaskOutcome {
 
 /// In-memory counts for concurrency holders
 pub struct ConcurrencyCounts {
+    // Composite key: "<tenant>|<queue>" -> set of task ids holding tickets
     holders: Mutex<HashMap<String, HashSet<String>>>,
 }
 
@@ -54,6 +55,7 @@ impl ConcurrencyCounts {
     }
 
     pub async fn hydrate(&self, db: &Db) -> Result<(), slatedb::Error> {
+        // Scan holders under holders/<tenant>/<queue>/<task-id>
         let start: Vec<u8> = b"holders/".to_vec();
         let mut end: Vec<u8> = b"holders/".to_vec();
         end.push(0xFF);
@@ -62,39 +64,55 @@ impl ConcurrencyCounts {
             let maybe = iter.next().await?;
             let Some(kv) = maybe else { break };
             if let Ok(s) = std::str::from_utf8(&kv.key) {
-                let mut parts = s.splitn(3, '/');
-                let _ = parts.next();
-                let q = parts.next().unwrap_or("");
-                let tid = parts.next().unwrap_or("");
-                if !q.is_empty() && !tid.is_empty() {
-                    let mut h = self.holders.lock().unwrap();
-                    let set = h.entry(q.to_string()).or_insert_with(HashSet::new);
-                    set.insert(tid.to_string());
+                // Expect: holders/<tenant>/<queue>/<task-id>
+                let mut parts = s.split('/');
+                if parts.next() != Some("holders") {
+                    continue;
                 }
+                let tenant = match parts.next() {
+                    Some(t) => t,
+                    None => continue,
+                };
+                let queue = match parts.next() {
+                    Some(q) => q,
+                    None => continue,
+                };
+                let task = match parts.next() {
+                    Some(x) => x,
+                    None => continue,
+                };
+                let key = format!("{}|{}", tenant, queue);
+                let mut h = self.holders.lock().unwrap();
+                let set = h.entry(key).or_insert_with(HashSet::new);
+                set.insert(task.to_string());
             }
         }
         Ok(())
     }
 
-    pub fn can_grant(&self, queue: &str, limit: usize) -> bool {
+    pub fn can_grant(&self, tenant: &str, queue: &str, limit: usize) -> bool {
+        let key = format!("{}|{}", tenant, queue);
         self.holders
             .lock()
             .unwrap()
-            .get(queue)
+            .get(&key)
             .map(|s| s.len())
             .unwrap_or(0)
             < limit
     }
 
-    pub fn record_grant(&self, queue: &str, task_id: &str) {
+    pub fn record_grant(&self, tenant: &str, queue: &str, task_id: &str) {
         let mut h = self.holders.lock().unwrap();
-        let set = h.entry(queue.to_string()).or_insert_with(HashSet::new);
+        let set = h
+            .entry(format!("{}|{}", tenant, queue))
+            .or_insert_with(HashSet::new);
         set.insert(task_id.to_string());
     }
 
-    pub fn record_release(&self, queue: &str, task_id: &str) {
+    pub fn record_release(&self, tenant: &str, queue: &str, task_id: &str) {
         let mut h = self.holders.lock().unwrap();
-        if let Some(set) = h.get_mut(queue) {
+        let key = format!("{}|{}", tenant, queue);
+        if let Some(set) = h.get_mut(&key) {
             set.remove(task_id);
         }
     }
@@ -120,6 +138,7 @@ impl ConcurrencyManager {
     pub fn handle_enqueue(
         &self,
         batch: &mut WriteBatch,
+        tenant: &str,
         task_id: &str,
         job_id: &str,
         priority: u8,
@@ -135,11 +154,12 @@ impl ConcurrencyManager {
         let queue = &limit.key;
         let max_allowed = limit.max_concurrency as usize;
 
-        if self.counts.can_grant(queue, max_allowed) {
+        if self.counts.can_grant(tenant, queue, max_allowed) {
             // Grant immediately
             let events = append_grant_edits(
                 batch,
                 now_ms,
+                tenant,
                 queue,
                 task_id,
                 start_at_ms,
@@ -154,7 +174,16 @@ impl ConcurrencyManager {
             }))
         } else if start_at_ms <= now_ms {
             // Job should start now but no capacity: queue as request
-            append_request_edits(batch, queue, now_ms, start_at_ms, priority, job_id, 1)?;
+            append_request_edits(
+                batch,
+                tenant,
+                queue,
+                now_ms,
+                start_at_ms,
+                priority,
+                job_id,
+                1,
+            )?;
             Ok(Some(RequestTicketOutcome::TicketRequested {
                 queue: queue.clone(),
             }))
@@ -187,6 +216,7 @@ impl ConcurrencyManager {
         &self,
         batch: &mut WriteBatch,
         task_key: &str,
+        tenant: &str,
         queue: &str,
         request_id: &str,
         _job_id: &str,
@@ -210,7 +240,7 @@ impl ConcurrencyManager {
         }
 
         // Check if can grant
-        if !self.counts.can_grant(queue, max_allowed) {
+        if !self.counts.can_grant(tenant, queue, max_allowed) {
             return Ok(RequestTicketTaskOutcome::Requested);
         }
 
@@ -220,7 +250,10 @@ impl ConcurrencyManager {
         };
         let hval: AlignedVec =
             rkyv::to_bytes::<HolderRecord, 256>(&holder).map_err(|e| e.to_string())?;
-        batch.put(concurrency_holder_key(queue, request_id).as_bytes(), &hval);
+        batch.put(
+            concurrency_holder_key(tenant, queue, request_id).as_bytes(),
+            &hval,
+        );
         batch.delete(task_key.as_bytes());
 
         Ok(RequestTicketTaskOutcome::Granted {
@@ -234,11 +267,12 @@ impl ConcurrencyManager {
         &self,
         db: &Db,
         batch: &mut WriteBatch,
+        tenant: &str,
         queues: &[String],
         finished_task_id: &str,
         now_ms: i64,
     ) -> Result<Vec<MemoryEvent>, String> {
-        append_release_and_grant_next(db, batch, queues, finished_task_id, now_ms).await
+        append_release_and_grant_next(db, batch, tenant, queues, finished_task_id, now_ms).await
     }
 }
 
@@ -247,6 +281,7 @@ impl ConcurrencyManager {
 fn append_grant_edits(
     batch: &mut WriteBatch,
     now_ms: i64,
+    tenant: &str,
     queue: &str,
     task_id: &str,
     start_time_ms: i64,
@@ -260,7 +295,7 @@ fn append_grant_edits(
     let holder_val: AlignedVec =
         rkyv::to_bytes::<HolderRecord, 256>(&holder).map_err(|e| e.to_string())?;
     batch.put(
-        concurrency_holder_key(queue, task_id).as_bytes(),
+        concurrency_holder_key(tenant, queue, task_id).as_bytes(),
         &holder_val,
     );
 
@@ -284,6 +319,7 @@ fn append_grant_edits(
 
 fn append_request_edits(
     batch: &mut WriteBatch,
+    tenant: &str,
     queue: &str,
     _now_ms: i64,
     start_time_ms: i64,
@@ -301,6 +337,7 @@ fn append_request_edits(
         rkyv::to_bytes::<crate::job_store_shard::ConcurrencyAction, 256>(&action)
             .map_err(|e| e.to_string())?;
     let req_key = concurrency_request_key(
+        tenant,
         queue,
         start_time_ms,
         priority,
@@ -313,21 +350,22 @@ fn append_request_edits(
 async fn append_release_and_grant_next(
     db: &Db,
     batch: &mut WriteBatch,
+    tenant: &str,
     queues: &[String],
     finished_task_id: &str,
     now_ms: i64,
 ) -> Result<Vec<MemoryEvent>, String> {
     let mut events: Vec<MemoryEvent> = Vec::new();
     for queue in queues {
-        batch.delete(concurrency_holder_key(queue, finished_task_id).as_bytes());
+        batch.delete(concurrency_holder_key(tenant, queue, finished_task_id).as_bytes());
         events.push(MemoryEvent::Released {
             queue: queue.clone(),
             task_id: finished_task_id.to_string(),
         });
 
-        // grant next
-        let start = format!("requests/{}/", queue).into_bytes();
-        let mut end: Vec<u8> = format!("requests/{}/", queue).into_bytes();
+        // grant next: requests/<tenant>/<queue>/...
+        let start = format!("requests/{}/{}/", tenant, queue).into_bytes();
+        let mut end: Vec<u8> = format!("requests/{}/{}/", tenant, queue).into_bytes();
         end.push(0xFF);
         let mut iter: DbIterator = db
             .scan::<Vec<u8>, _>(start..=end)
@@ -357,7 +395,7 @@ async fn append_release_and_grant_next(
                         let holder_val: AlignedVec = rkyv::to_bytes::<HolderRecord, 256>(&holder)
                             .map_err(|e| e.to_string())?;
                         batch.put(
-                            concurrency_holder_key(queue, &request_id).as_bytes(),
+                            concurrency_holder_key(tenant, queue, &request_id).as_bytes(),
                             &holder_val,
                         );
 

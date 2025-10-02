@@ -13,12 +13,15 @@ macro_rules! with_timeout {
 }
 
 pub fn parse_time_from_task_key(key: &str) -> Option<u64> {
-    // Format: tasks/{:020}/{:02}/{job_id}/{attempt}
-    let parts: Vec<&str> = key.split('/').collect();
-    if parts.len() < 5 || parts[0] != "tasks" {
-        return None;
+    // Accept both legacy and tenant-aware formats:
+    // - tasks/{:020}/{:02}/{job_id}/{attempt}
+    // - t/<tenant>/tasks/{:020}/{:02}/{job_id}/{attempt}
+    if let Some(pos) = key.find("tasks/") {
+        let after = &key[pos + "tasks/".len()..];
+        let ts_str = after.split('/').next().unwrap_or("");
+        return ts_str.parse::<u64>().ok();
     }
-    parts[1].parse::<u64>().ok()
+    None
 }
 
 pub async fn open_temp_shard() -> (tempfile::TempDir, JobStoreShard) {

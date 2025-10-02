@@ -17,6 +17,7 @@ async fn concurrency_immediate_grant_enqueues_task_and_writes_holder() {
     // enqueue with limit 1
     let job_id = shard
         .enqueue(
+            "-",
             None,
             10u8,
             now,
@@ -31,7 +32,7 @@ async fn concurrency_immediate_grant_enqueues_task_and_writes_holder() {
         .expect("enqueue");
 
     // Task should be ready immediately
-    let tasks = shard.dequeue("w", 1).await.expect("dequeue");
+    let tasks = shard.dequeue("-", "w", 1).await.expect("dequeue");
     assert_eq!(tasks.len(), 1);
     let t = &tasks[0];
     assert_eq!(t.job().id(), job_id);
@@ -39,7 +40,7 @@ async fn concurrency_immediate_grant_enqueues_task_and_writes_holder() {
     // Holder should exist for this attempt's task id (holder is per-attempt)
     let holder = shard
         .db()
-        .get(concurrency_holder_key(&queue, t.attempt().task_id()).as_bytes())
+        .get(concurrency_holder_key("-", &queue, t.attempt().task_id()).as_bytes())
         .await
         .expect("get holder");
     assert!(
@@ -57,6 +58,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
     // First job takes the single slot
     let _j1 = shard
         .enqueue(
+            "-",
             None,
             10u8,
             now,
@@ -69,13 +71,14 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
         )
         .await
         .expect("enqueue1");
-    let tasks1 = shard.dequeue("w1", 1).await.expect("deq1");
+    let tasks1 = shard.dequeue("-", "w1", 1).await.expect("deq1");
     assert_eq!(tasks1.len(), 1);
     let t1 = tasks1[0].attempt().task_id().to_string();
 
     // Second job should queue a request (no immediate task visible)
     let _j2 = shard
         .enqueue(
+            "-",
             None,
             10u8,
             now,
@@ -103,7 +106,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
 
     // Complete first task; this should release and grant next request, enqueuing its task
     shard
-        .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome("-", &t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report1");
 
@@ -120,6 +123,7 @@ async fn concurrency_held_queues_propagate_across_retries_and_release_on_finish(
 
     let _job = shard
         .enqueue(
+            "-",
             None,
             10u8,
             now,
@@ -139,7 +143,7 @@ async fn concurrency_held_queues_propagate_across_retries_and_release_on_finish(
         .await
         .expect("enqueue");
 
-    let t1 = shard.dequeue("w", 1).await.expect("deq")[0]
+    let t1 = shard.dequeue("-", "w", 1).await.expect("deq")[0]
         .attempt()
         .task_id()
         .to_string();
@@ -147,6 +151,7 @@ async fn concurrency_held_queues_propagate_across_retries_and_release_on_finish(
     // Fail attempt 1, should schedule attempt 2 carrying held_queues
     shard
         .report_attempt_outcome(
+            "-",
             &t1,
             AttemptOutcome::Error {
                 error_code: "E".to_string(),
@@ -157,19 +162,68 @@ async fn concurrency_held_queues_propagate_across_retries_and_release_on_finish(
         .expect("report err");
 
     // Attempt 2 should be present
-    let t2 = shard.dequeue("w", 1).await.expect("deq2")[0]
+    let t2 = shard.dequeue("-", "w", 1).await.expect("deq2")[0]
         .attempt()
         .task_id()
         .to_string();
 
     // Finish attempt 2, which should release holder
     shard
-        .report_attempt_outcome(&t2, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome("-", &t2, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report2");
 
     // No holders should remain after success of follow-up attempt (released after each attempt)
     assert_eq!(count_with_prefix(shard.db(), "holders/").await, 0);
+}
+
+#[tokio::test]
+async fn concurrency_tickets_are_tenant_scoped() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let queue = "shared-queue".to_string();
+
+    // Tenant A consumes its single slot
+    let _ja = shard
+        .enqueue(
+            "tenantA",
+            None,
+            10u8,
+            now,
+            None,
+            serde_json::json!({"t": "A"}),
+            vec![silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            }],
+        )
+        .await
+        .expect("enqueue A");
+    let tasks_a = shard.dequeue("tenantA", "wA", 1).await.expect("deq A");
+    assert_eq!(tasks_a.len(), 1);
+
+    // Tenant B should be able to get its own slot independently
+    let _jb = shard
+        .enqueue(
+            "tenantB",
+            None,
+            10u8,
+            now,
+            None,
+            serde_json::json!({"t": "B"}),
+            vec![silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            }],
+        )
+        .await
+        .expect("enqueue B");
+    let tasks_b = shard.dequeue("tenantB", "wB", 1).await.expect("deq B");
+    assert_eq!(
+        tasks_b.len(),
+        1,
+        "tenant B should not be blocked by tenant A"
+    );
 }
 
 #[tokio::test]
@@ -181,6 +235,7 @@ async fn concurrency_retry_releases_original_holder() {
     // Enqueue with a retry policy so we get a second attempt
     let _job_id = shard
         .enqueue(
+            "-",
             None,
             10u8,
             now,
@@ -201,12 +256,13 @@ async fn concurrency_retry_releases_original_holder() {
         .expect("enqueue");
 
     // Attempt 1 fails -> attempt 2 scheduled
-    let t1 = shard.dequeue("w", 1).await.expect("deq1")[0]
+    let t1 = shard.dequeue("-", "w", 1).await.expect("deq1")[0]
         .attempt()
         .task_id()
         .to_string();
     shard
         .report_attempt_outcome(
+            "-",
             &t1,
             AttemptOutcome::Error {
                 error_code: "E".to_string(),
@@ -215,14 +271,14 @@ async fn concurrency_retry_releases_original_holder() {
         )
         .await
         .expect("report err");
-    let t2 = shard.dequeue("w", 1).await.expect("deq2")[0]
+    let t2 = shard.dequeue("-", "w", 1).await.expect("deq2")[0]
         .attempt()
         .task_id()
         .to_string();
 
     // Finish attempt 2
     shard
-        .report_attempt_outcome(&t2, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome("-", &t2, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report2");
 
@@ -243,6 +299,7 @@ async fn concurrency_no_overgrant_after_release() {
     // A occupies the single slot
     let _a = shard
         .enqueue(
+            "-",
             None,
             10u8,
             now,
@@ -255,13 +312,14 @@ async fn concurrency_no_overgrant_after_release() {
         )
         .await
         .expect("enqueue a");
-    let a_task = shard.dequeue("wa", 1).await.expect("deq a");
+    let a_task = shard.dequeue("-", "wa", 1).await.expect("deq a");
     assert_eq!(a_task.len(), 1);
     let a_tid = a_task[0].attempt().task_id().to_string();
 
     // B queues as a request
     let _b = shard
         .enqueue(
+            "-",
             None,
             10u8,
             now,
@@ -277,7 +335,7 @@ async fn concurrency_no_overgrant_after_release() {
 
     // Complete A -> should grant B (durably create one holder)
     shard
-        .report_attempt_outcome(&a_tid, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome("-", &a_tid, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report a success");
 
@@ -285,6 +343,7 @@ async fn concurrency_no_overgrant_after_release() {
     // implementation wrongly grants immediately, yielding 2 holders.
     let _c = shard
         .enqueue(
+            "-",
             None,
             10u8,
             now,
@@ -318,6 +377,7 @@ async fn stress_single_queue_no_double_grant() {
     for i in 0..total {
         let _ = shard
             .enqueue(
+                "-",
                 None,
                 (i % 10) as u8,
                 now,
@@ -334,7 +394,7 @@ async fn stress_single_queue_no_double_grant() {
 
     let mut processed = 0usize;
     loop {
-        let tasks = shard.dequeue("w-stress", 1).await.expect("deq");
+        let tasks = shard.dequeue("-", "w-stress", 1).await.expect("deq");
         if tasks.is_empty() {
             if processed >= total {
                 break;
@@ -346,7 +406,7 @@ async fn stress_single_queue_no_double_grant() {
         // Capacity is enforced via durable holders + in-memory gating; no double-grant observed via uniqueness assertions above
         let tid = tasks[0].attempt().task_id().to_string();
         shard
-            .report_attempt_outcome(&tid, AttemptOutcome::Success { result: vec![] })
+            .report_attempt_outcome("-", &tid, AttemptOutcome::Success { result: vec![] })
             .await
             .expect("report");
         processed += 1;
@@ -367,6 +427,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
     // Take the only slot
     let _ = shard
         .enqueue(
+            "-",
             None,
             10u8,
             now,
@@ -379,7 +440,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
         )
         .await
         .expect("enqueue1");
-    let tasks1 = shard.dequeue("w-hold", 1).await.expect("deq1");
+    let tasks1 = shard.dequeue("-", "w-hold", 1).await.expect("deq1");
     assert_eq!(tasks1.len(), 1);
     let t1 = tasks1[0].attempt().task_id().to_string();
 
@@ -388,6 +449,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
     for i in 0..add {
         let _ = shard
             .enqueue(
+                "-",
                 None,
                 (i % 5) as u8,
                 now,
@@ -413,7 +475,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
 
     // Release first; only one new task should appear immediately
     shard
-        .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome("-", &t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report1");
     let after = first_kv_with_prefix(shard.db(), "tasks/").await;
@@ -434,11 +496,11 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         backoff_factor: 1.0,
     };
     let job_id = shard
-        .enqueue(None, 10u8, now, Some(policy), payload, vec![])
+        .enqueue("-", None, 10u8, now, Some(policy), payload, vec![])
         .await
         .expect("enqueue");
 
-    let tasks = shard.dequeue("w", 1).await.expect("dequeue");
+    let tasks = shard.dequeue("-", "w", 1).await.expect("dequeue");
     let _leased_task_id = tasks[0].attempt().task_id().to_string();
 
     // Find the lease and rewrite expiry to the past
@@ -489,7 +551,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
 
     // Attempt 1 marked failed with WORKER_CRASHED
     let a1 = shard
-        .get_job_attempt(&job_id, 1)
+        .get_job_attempt("-", &job_id, 1)
         .await
         .expect("get a1")
         .expect("a1 exists");
@@ -521,11 +583,11 @@ async fn reap_ignores_unexpired_leases() {
     let payload = serde_json::json!({"k": "v"});
     let now = now_ms();
     let job_id = shard
-        .enqueue(None, 10u8, now, None, payload, vec![])
+        .enqueue("-", None, 10u8, now, None, payload, vec![])
         .await
         .expect("enqueue");
 
-    let tasks = shard.dequeue("w", 1).await.expect("dequeue");
+    let tasks = shard.dequeue("-", "w", 1).await.expect("dequeue");
     let _task_id = tasks[0].attempt().task_id().to_string();
 
     // Do not mutate the lease; it should not be reaped
@@ -546,7 +608,7 @@ async fn reap_ignores_unexpired_leases() {
 
     // Attempt state remains Running
     let a1 = shard
-        .get_job_attempt(&job_id, 1)
+        .get_job_attempt("-", &job_id, 1)
         .await
         .expect("get a1")
         .expect("a1 exists");
@@ -567,6 +629,7 @@ async fn concurrency_multiple_holders_max_greater_than_one() {
     for i in 0..5 {
         let jid = shard
             .enqueue(
+                "-",
                 None,
                 10u8,
                 now,
@@ -583,7 +646,7 @@ async fn concurrency_multiple_holders_max_greater_than_one() {
     }
 
     // First 3 should be granted immediately and dequeue-able
-    let tasks = shard.dequeue("w1", 3).await.expect("deq");
+    let tasks = shard.dequeue("-", "w1", 3).await.expect("deq");
     assert_eq!(tasks.len(), 3, "should get 3 tasks with limit 3");
     let t1 = tasks[0].attempt().task_id().to_string();
     let t2 = tasks[1].attempt().task_id().to_string();
@@ -599,7 +662,7 @@ async fn concurrency_multiple_holders_max_greater_than_one() {
 
     // Complete one task -> should grant next
     shard
-        .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome("-", &t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report1");
 
@@ -609,18 +672,18 @@ async fn concurrency_multiple_holders_max_greater_than_one() {
 
     // Complete all
     shard
-        .report_attempt_outcome(&t2, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome("-", &t2, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report2");
     shard
-        .report_attempt_outcome(&t3, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome("-", &t3, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report3");
 
     // Drain remaining
     let mut processed = 3;
     while processed < 5 {
-        let tasks = shard.dequeue("w2", 5).await.expect("deq remaining");
+        let tasks = shard.dequeue("-", "w2", 5).await.expect("deq remaining");
         if tasks.is_empty() {
             tokio::task::yield_now().await;
             continue;
@@ -628,6 +691,7 @@ async fn concurrency_multiple_holders_max_greater_than_one() {
         for t in tasks {
             shard
                 .report_attempt_outcome(
+                    "-",
                     t.attempt().task_id(),
                     AttemptOutcome::Success { result: vec![] },
                 )
@@ -652,6 +716,7 @@ async fn concurrency_multiple_queues_per_job() {
     // Job requires both api and db tickets
     let job_id = shard
         .enqueue(
+            "-",
             None,
             10u8,
             now,
@@ -672,14 +737,14 @@ async fn concurrency_multiple_queues_per_job() {
         .expect("enqueue");
 
     // Should get ticket for first queue immediately (api)
-    let tasks = shard.dequeue("w", 1).await.expect("deq");
+    let tasks = shard.dequeue("-", "w", 1).await.expect("deq");
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].job().id(), job_id);
 
     // Should have holder for api queue only (first limit)
     let api_holder = shard
         .db()
-        .get(concurrency_holder_key(&q1, tasks[0].attempt().task_id()).as_bytes())
+        .get(concurrency_holder_key("-", &q1, tasks[0].attempt().task_id()).as_bytes())
         .await
         .expect("get api holder");
     assert!(api_holder.is_some(), "should have api holder");
@@ -687,7 +752,7 @@ async fn concurrency_multiple_queues_per_job() {
     // Should NOT have db holder yet (only first limit is gated)
     let db_holder = shard
         .db()
-        .get(concurrency_holder_key(&q2, tasks[0].attempt().task_id()).as_bytes())
+        .get(concurrency_holder_key("-", &q2, tasks[0].attempt().task_id()).as_bytes())
         .await
         .expect("get db holder");
     assert!(
@@ -698,6 +763,7 @@ async fn concurrency_multiple_queues_per_job() {
     // Complete job -> should release api holder
     shard
         .report_attempt_outcome(
+            "-",
             tasks[0].attempt().task_id(),
             AttemptOutcome::Success { result: vec![] },
         )
@@ -718,6 +784,7 @@ async fn concurrency_future_request_waits_until_ready() {
     // Job 1 takes the slot
     let _j1 = shard
         .enqueue(
+            "-",
             None,
             10u8,
             now,
@@ -730,12 +797,13 @@ async fn concurrency_future_request_waits_until_ready() {
         )
         .await
         .expect("enqueue1");
-    let t1_vec = shard.dequeue("w", 1).await.expect("deq1");
+    let t1_vec = shard.dequeue("-", "w", 1).await.expect("deq1");
     let t1 = t1_vec[0].attempt().task_id().to_string();
 
     // Job 2 scheduled for future, creates RequestTicket task
     let _j2 = shard
         .enqueue(
+            "-",
             None,
             10u8,
             future,
@@ -755,7 +823,7 @@ async fn concurrency_future_request_waits_until_ready() {
 
     // Complete job 1 BEFORE job 2 is ready -> should NOT grant yet
     shard
-        .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome("-", &t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report1");
 
@@ -791,6 +859,7 @@ async fn concurrency_request_priority_ordering() {
     // Job 1 takes the slot
     let _j1 = shard
         .enqueue(
+            "-",
             None,
             10u8,
             now,
@@ -803,12 +872,13 @@ async fn concurrency_request_priority_ordering() {
         )
         .await
         .expect("enqueue1");
-    let t1_vec = shard.dequeue("w", 1).await.expect("deq1");
+    let t1_vec = shard.dequeue("-", "w", 1).await.expect("deq1");
     let t1 = t1_vec[0].attempt().task_id().to_string();
 
     // Enqueue low priority job 2
     let j2 = shard
         .enqueue(
+            "-",
             None,
             50u8, // low priority
             now,
@@ -825,6 +895,7 @@ async fn concurrency_request_priority_ordering() {
     // Enqueue high priority job 3
     let j3 = shard
         .enqueue(
+            "-",
             None,
             1u8, // high priority
             now,
@@ -840,12 +911,12 @@ async fn concurrency_request_priority_ordering() {
 
     // Complete job 1 -> should grant job 3 (high priority) not job 2
     shard
-        .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome("-", &t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report1");
 
     // Dequeue next task -> should be job 3
-    let t2_vec = shard.dequeue("w", 1).await.expect("deq2");
+    let t2_vec = shard.dequeue("-", "w", 1).await.expect("deq2");
     assert_eq!(t2_vec.len(), 1);
     // Note: We can't directly check job ID from task without more scanning,
     // but we verify via process of elimination
@@ -857,13 +928,14 @@ async fn concurrency_request_priority_ordering() {
     // Complete and verify job 2 comes last
     shard
         .report_attempt_outcome(
+            "-",
             t2_vec[0].attempt().task_id(),
             AttemptOutcome::Success { result: vec![] },
         )
         .await
         .expect("report2");
 
-    let t3_vec = shard.dequeue("w", 1).await.expect("deq3");
+    let t3_vec = shard.dequeue("-", "w", 1).await.expect("deq3");
     assert_eq!(t3_vec.len(), 1);
     assert_eq!(t3_vec[0].job().id(), j2, "low priority job comes last");
 }
@@ -877,6 +949,7 @@ async fn concurrency_permanent_failure_releases_holder() {
     // Job 1 gets holder, no retries
     let _j1 = shard
         .enqueue(
+            "-",
             None,
             10u8,
             now,
@@ -889,12 +962,13 @@ async fn concurrency_permanent_failure_releases_holder() {
         )
         .await
         .expect("enqueue1");
-    let t1_vec = shard.dequeue("w", 1).await.expect("deq1");
+    let t1_vec = shard.dequeue("-", "w", 1).await.expect("deq1");
     let t1 = t1_vec[0].attempt().task_id().to_string();
 
     // Job 2 queues as request
     let _j2 = shard
         .enqueue(
+            "-",
             None,
             10u8,
             now,
@@ -911,6 +985,7 @@ async fn concurrency_permanent_failure_releases_holder() {
     // Fail job 1 permanently (no retry policy) -> should release holder
     shard
         .report_attempt_outcome(
+            "-",
             &t1,
             AttemptOutcome::Error {
                 error_code: "FAIL".to_string(),
@@ -918,15 +993,16 @@ async fn concurrency_permanent_failure_releases_holder() {
             },
         )
         .await
-        .expect("report1");
+        .expect("report");
 
     // Job 2 should now be granted
-    let t2_vec = shard.dequeue("w", 1).await.expect("deq2");
+    let t2_vec = shard.dequeue("-", "w", 1).await.expect("deq2");
     assert_eq!(t2_vec.len(), 1, "job 2 should be granted after failure");
 
     // Complete job 2
     shard
         .report_attempt_outcome(
+            "-",
             t2_vec[0].attempt().task_id(),
             AttemptOutcome::Success { result: vec![] },
         )
@@ -946,6 +1022,7 @@ async fn concurrency_reap_expired_lease_releases_holder() {
     // Job 1 gets holder
     let j1 = shard
         .enqueue(
+            "-",
             None,
             10u8,
             now,
@@ -964,12 +1041,13 @@ async fn concurrency_reap_expired_lease_releases_holder() {
         )
         .await
         .expect("enqueue1");
-    let t1_vec = shard.dequeue("w", 1).await.expect("deq1");
+    let t1_vec = shard.dequeue("-", "w", 1).await.expect("deq1");
     let t1 = t1_vec[0].attempt().task_id().to_string();
 
     // Job 2 queues as request
     let _j2 = shard
         .enqueue(
+            "-",
             None,
             10u8,
             now,
@@ -1022,11 +1100,14 @@ async fn concurrency_reap_expired_lease_releases_holder() {
     assert_eq!(reaped, 1);
 
     // Job 2 should now be granted (holder released from job 1)
-    let t2_vec = shard.dequeue("w", 1).await.expect("deq2");
+    let t2_vec = shard.dequeue("-", "w", 1).await.expect("deq2");
     assert_eq!(t2_vec.len(), 1, "job 2 should be granted after reap");
 
     // Job 1 retry should also be scheduled
-    let j1_attempt2 = shard.get_job_attempt(&j1, 2).await.expect("get attempt 2");
+    let j1_attempt2 = shard
+        .get_job_attempt("-", &j1, 2)
+        .await
+        .expect("get attempt 2");
     assert!(
         j1_attempt2.is_none(),
         "attempt 2 not created yet (only task scheduled)"
@@ -1035,6 +1116,7 @@ async fn concurrency_reap_expired_lease_releases_holder() {
     // Cleanup
     shard
         .report_attempt_outcome(
+            "-",
             t2_vec[0].attempt().task_id(),
             AttemptOutcome::Success { result: vec![] },
         )
@@ -1052,6 +1134,7 @@ async fn concurrency_future_request_granted_after_time_passes() {
     // Job 1 takes the slot immediately
     let _j1 = shard
         .enqueue(
+            "-",
             None,
             10u8,
             now,
@@ -1064,13 +1147,14 @@ async fn concurrency_future_request_granted_after_time_passes() {
         )
         .await
         .expect("enqueue1");
-    let t1_vec = shard.dequeue("w", 1).await.expect("deq1");
+    let t1_vec = shard.dequeue("-", "w", 1).await.expect("deq1");
     assert_eq!(t1_vec.len(), 1);
     let t1 = t1_vec[0].attempt().task_id().to_string();
 
     // Job 2 scheduled for future while slot is held -> creates RequestTicket task
     let _j2 = shard
         .enqueue(
+            "-",
             None,
             10u8,
             future,
@@ -1094,7 +1178,7 @@ async fn concurrency_future_request_granted_after_time_passes() {
 
     // Complete Job 1 BEFORE Job 2's start time -> releases holder but Job 2 not ready yet
     shard
-        .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome("-", &t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report1");
 
@@ -1114,7 +1198,7 @@ async fn concurrency_future_request_granted_after_time_passes() {
     // and dequeue should convert it to a lease for Job 2
     let mut t2_vec = Vec::new();
     for _ in 0..10 {
-        t2_vec = shard.dequeue("w", 1).await.expect("deq2");
+        t2_vec = shard.dequeue("-", "w", 1).await.expect("deq2");
         if !t2_vec.is_empty() {
             break;
         }
@@ -1137,6 +1221,7 @@ async fn cannot_delete_job_with_future_request_ticket() {
     // Job 1 occupies the slot
     let _j1 = shard
         .enqueue(
+            "-",
             None,
             10u8,
             now,
@@ -1149,12 +1234,13 @@ async fn cannot_delete_job_with_future_request_ticket() {
         )
         .await
         .expect("enqueue1");
-    let t1_vec = shard.dequeue("w", 1).await.expect("deq1");
+    let t1_vec = shard.dequeue("-", "w", 1).await.expect("deq1");
     let t1 = t1_vec[0].attempt().task_id().to_string();
 
     // Job 2 scheduled for future while slot is held -> creates RequestTicket task (status: Scheduled)
     let j2 = shard
         .enqueue(
+            "-",
             None,
             10u8,
             future,
@@ -1173,14 +1259,17 @@ async fn cannot_delete_job_with_future_request_ticket() {
     assert_eq!(tasks_before, 1, "should have 1 RequestTicket task");
 
     let status = shard
-        .get_job_status(&j2)
+        .get_job_status("-", &j2)
         .await
         .expect("get status")
         .expect("exists");
     assert!(matches!(status, silo::job::JobStatus::Scheduled {}));
 
     // Attempt to delete job 2 while it's scheduled - should fail
-    let err = shard.delete_job(&j2).await.expect_err("delete should fail");
+    let err = shard
+        .delete_job("-", &j2)
+        .await
+        .expect_err("delete should fail");
     match err {
         silo::job_store_shard::JobStoreShardError::JobInProgress(jid) => {
             assert_eq!(jid, j2);
@@ -1189,7 +1278,7 @@ async fn cannot_delete_job_with_future_request_ticket() {
     }
 
     // Job still exists (can't delete while scheduled)
-    let job2 = shard.get_job(&j2).await.expect("get job2");
+    let job2 = shard.get_job("-", &j2).await.expect("get job2");
     assert!(
         job2.is_some(),
         "job 2 should still exist (can't delete while scheduled)"
@@ -1197,7 +1286,7 @@ async fn cannot_delete_job_with_future_request_ticket() {
 
     // Complete job 1, which will eventually allow job 2 to run
     shard
-        .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome("-", &t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report1");
 }
@@ -1211,6 +1300,7 @@ async fn cannot_delete_job_with_pending_request() {
     // Job 1 takes the slot
     let _j1 = shard
         .enqueue(
+            "-",
             None,
             10u8,
             now,
@@ -1223,12 +1313,13 @@ async fn cannot_delete_job_with_pending_request() {
         )
         .await
         .expect("enqueue1");
-    let t1_vec = shard.dequeue("w", 1).await.expect("deq1");
+    let t1_vec = shard.dequeue("-", "w", 1).await.expect("deq1");
     let t1 = t1_vec[0].attempt().task_id().to_string();
 
     // Job 2 queued as request (status: Scheduled)
     let j2 = shard
         .enqueue(
+            "-",
             None,
             10u8,
             now,
@@ -1247,7 +1338,10 @@ async fn cannot_delete_job_with_pending_request() {
     assert_eq!(requests, 1, "should have 1 queued request");
 
     // Attempt to delete job 2 while it's scheduled (has pending request) - should fail
-    let err = shard.delete_job(&j2).await.expect_err("delete should fail");
+    let err = shard
+        .delete_job("-", &j2)
+        .await
+        .expect_err("delete should fail");
     match err {
         silo::job_store_shard::JobStoreShardError::JobInProgress(jid) => {
             assert_eq!(jid, j2);
@@ -1256,7 +1350,7 @@ async fn cannot_delete_job_with_pending_request() {
     }
 
     // Job 2 should still exist
-    let job2 = shard.get_job(&j2).await.expect("get job2");
+    let job2 = shard.get_job("-", &j2).await.expect("get job2");
     assert!(
         job2.is_some(),
         "job 2 should still exist (can't delete while scheduled)"
@@ -1264,17 +1358,17 @@ async fn cannot_delete_job_with_pending_request() {
 
     // Complete job 1 to allow job 2 to run
     shard
-        .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome("-", &t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report1");
 
     // Job 2 should now be granted
-    let t2_vec = shard.dequeue("w", 1).await.expect("deq2");
+    let t2_vec = shard.dequeue("-", "w", 1).await.expect("deq2");
     assert_eq!(t2_vec.len(), 1);
 
     // Attempt to delete while running - should still fail
     let err2 = shard
-        .delete_job(&j2)
+        .delete_job("-", &j2)
         .await
         .expect_err("delete should fail while running");
     match err2 {
@@ -1287,6 +1381,7 @@ async fn cannot_delete_job_with_pending_request() {
     // Complete job 2
     shard
         .report_attempt_outcome(
+            "-",
             t2_vec[0].attempt().task_id(),
             AttemptOutcome::Success { result: vec![] },
         )
@@ -1295,11 +1390,11 @@ async fn cannot_delete_job_with_pending_request() {
 
     // Now delete should succeed (job is in Succeeded state)
     shard
-        .delete_job(&j2)
+        .delete_job("-", &j2)
         .await
         .expect("delete should succeed now");
 
     // Job should be gone
-    let job2_final = shard.get_job(&j2).await.expect("get job2");
+    let job2_final = shard.get_job("-", &j2).await.expect("get job2");
     assert!(job2_final.is_none(), "job 2 should be deleted");
 }

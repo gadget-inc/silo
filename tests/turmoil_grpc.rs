@@ -47,6 +47,7 @@ fn grpc_end_to_end_under_turmoil() {
                 grpc_addr: "0.0.0.0:9999".to_string(),
             },
             coordination: silo::settings::CoordinationConfig::default(),
+            tenancy: silo::settings::TenancyConfig { enabled: false },
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
@@ -131,6 +132,7 @@ fn grpc_end_to_end_under_turmoil() {
                 data: serde_json::to_vec(&serde_json::json!({"hello": "world"})).unwrap(),
             }),
             concurrency_limits: vec![],
+            tenant: None,
         };
         let resp = client.enqueue(tonic::Request::new(req)).await?.into_inner();
         let job_id = resp.id;
@@ -141,6 +143,7 @@ fn grpc_end_to_end_under_turmoil() {
                 shard: "0".into(),
                 worker_id: "w".into(),
                 max_tasks: 1,
+                tenant: None,
             }))
             .await?
             .into_inner();
@@ -152,6 +155,7 @@ fn grpc_end_to_end_under_turmoil() {
             .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                 shard: "0".into(),
                 task_id: task_id.clone(),
+                tenant: None,
                 outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
                     data: b"ok".to_vec(),
                 })),
@@ -163,6 +167,7 @@ fn grpc_end_to_end_under_turmoil() {
             .get_job(tonic::Request::new(GetJobRequest {
                 shard: "0".into(),
                 id: job_id.clone(),
+                tenant: None,
             }))
             .await?
             .into_inner();
@@ -190,6 +195,7 @@ fn grpc_fault_injection_with_partition() {
                 grpc_addr: "0.0.0.0:9998".to_string(),
             },
             coordination: silo::settings::CoordinationConfig::default(),
+            tenancy: silo::settings::TenancyConfig { enabled: false },
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
@@ -277,6 +283,7 @@ fn grpc_fault_injection_with_partition() {
                 data: serde_json::to_vec(&serde_json::json!({"hello": "faults"})).unwrap(),
             }),
             concurrency_limits: vec![],
+            tenant: None,
         };
 
         let job_id = client
@@ -298,6 +305,7 @@ fn grpc_fault_injection_with_partition() {
                     shard: "0".into(),
                     worker_id: "w".into(),
                     max_tasks: 1,
+                    tenant: None,
                 }))
                 .await
             {
@@ -323,6 +331,7 @@ fn grpc_fault_injection_with_partition() {
             .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                 shard: "0".into(),
                 task_id: task_id.clone(),
+                tenant: None,
                 outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
                     data: b"ok".to_vec(),
                 })),
@@ -334,6 +343,7 @@ fn grpc_fault_injection_with_partition() {
             .get_job(tonic::Request::new(GetJobRequest {
                 shard: "0".into(),
                 id: job_id.clone(),
+                tenant: None,
             }))
             .await?
             .into_inner();
@@ -345,6 +355,7 @@ fn grpc_fault_injection_with_partition() {
                 shard: "0".into(),
                 worker_id: "w".into(),
                 max_tasks: 1,
+                tenant: None,
             }))
             .await?
             .into_inner();
@@ -374,6 +385,7 @@ fn stress_multiple_workers_with_partitions() {
                 grpc_addr: "0.0.0.0:9997".to_string(),
             },
             coordination: silo::settings::CoordinationConfig::default(),
+            tenancy: silo::settings::TenancyConfig { enabled: false },
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
@@ -474,6 +486,7 @@ fn stress_multiple_workers_with_partitions() {
                     data: serde_json::to_vec(&serde_json::json!({"job": i})).unwrap(),
                 }),
                 concurrency_limits: vec![],
+                tenant: None,
             };
 
             // Retry on failure
@@ -506,6 +519,7 @@ fn stress_multiple_workers_with_partitions() {
                     shard: "0".into(),
                     worker_id: "w1".into(),
                     max_tasks: 2,
+                    tenant: None,
                 }))
                 .await
             {
@@ -528,6 +542,7 @@ fn stress_multiple_workers_with_partitions() {
                                 .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                                     shard: "0".into(),
                                     task_id: task.id.clone(),
+                                    tenant: None,
                                     outcome: Some(report_outcome_request::Outcome::Success(
                                         JsonValueBytes {
                                             data: b"ok".to_vec(),
@@ -570,6 +585,7 @@ fn stress_multiple_workers_with_partitions() {
                     shard: "0".into(),
                     worker_id: "w2".into(),
                     max_tasks: 2,
+                    tenant: None,
                 }))
                 .await
             {
@@ -590,6 +606,7 @@ fn stress_multiple_workers_with_partitions() {
                                 .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                                     shard: "0".into(),
                                     task_id: task.id.clone(),
+                                    tenant: None,
                                     outcome: Some(report_outcome_request::Outcome::Success(
                                         JsonValueBytes {
                                             data: b"ok".to_vec(),
@@ -637,6 +654,7 @@ fn stress_duplicate_completion_idempotency() {
                 grpc_addr: "0.0.0.0:9995".to_string(),
             },
             coordination: silo::settings::CoordinationConfig::default(),
+            tenancy: silo::settings::TenancyConfig { enabled: false },
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
@@ -724,6 +742,7 @@ fn stress_duplicate_completion_idempotency() {
                     data: b"test".to_vec(),
                 }),
                 concurrency_limits: vec![],
+                tenant: None,
             }))
             .await?
             .into_inner()
@@ -735,6 +754,7 @@ fn stress_duplicate_completion_idempotency() {
                 shard: "0".into(),
                 worker_id: "w".into(),
                 max_tasks: 1,
+                tenant: None,
             }))
             .await?
             .into_inner();
@@ -748,6 +768,7 @@ fn stress_duplicate_completion_idempotency() {
                 .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                     shard: "0".into(),
                     task_id: task_id.clone(),
+                    tenant: None,
                     outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
                         data: format!("attempt-{}", i).into_bytes(),
                     })),
@@ -770,6 +791,7 @@ fn stress_duplicate_completion_idempotency() {
                 shard: "0".into(),
                 worker_id: "w".into(),
                 max_tasks: 10,
+                tenant: None,
             }))
             .await?
             .into_inner();
@@ -785,6 +807,7 @@ fn stress_duplicate_completion_idempotency() {
             .get_job(tonic::Request::new(GetJobRequest {
                 shard: "0".into(),
                 id: job_id,
+                tenant: None,
             }))
             .await?
             .into_inner();
@@ -810,6 +833,7 @@ fn stress_lease_expiry_during_partition() {
                 grpc_addr: "0.0.0.0:9994".to_string(),
             },
             coordination: silo::settings::CoordinationConfig::default(),
+            tenancy: silo::settings::TenancyConfig { enabled: false },
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
@@ -897,6 +921,7 @@ fn stress_lease_expiry_during_partition() {
                     data: b"test".to_vec(),
                 }),
                 concurrency_limits: vec![],
+                tenant: None,
             }))
             .await?;
 
@@ -905,6 +930,7 @@ fn stress_lease_expiry_during_partition() {
                 shard: "0".into(),
                 worker_id: "w1".into(),
                 max_tasks: 1,
+                tenant: None,
             }))
             .await?
             .into_inner();
@@ -922,6 +948,7 @@ fn stress_lease_expiry_during_partition() {
             .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                 shard: "0".into(),
                 task_id: task_id.clone(),
+                tenant: None,
                 outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
                     data: b"late".to_vec(),
                 })),
@@ -951,6 +978,7 @@ fn stress_lease_expiry_during_partition() {
                     shard: "0".into(),
                     worker_id: "w2".into(),
                     max_tasks: 1,
+                    tenant: None,
                 }))
                 .await
             {
@@ -964,6 +992,7 @@ fn stress_lease_expiry_during_partition() {
                             .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                                 shard: "0".into(),
                                 task_id: task_id.clone(),
+                                tenant: None,
                                 outcome: Some(report_outcome_request::Outcome::Success(
                                     JsonValueBytes {
                                         data: b"recovered".to_vec(),
@@ -1001,6 +1030,7 @@ fn stress_high_message_loss() {
                 grpc_addr: "0.0.0.0:9993".to_string(),
             },
             coordination: silo::settings::CoordinationConfig::default(),
+            tenancy: silo::settings::TenancyConfig { enabled: false },
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
@@ -1089,6 +1119,7 @@ fn stress_high_message_loss() {
                     data: serde_json::to_vec(&serde_json::json!({"id": i})).unwrap(),
                 }),
                 concurrency_limits: vec![],
+                tenant: None,
             };
 
             for attempt in 0..20 {
@@ -1116,6 +1147,7 @@ fn stress_high_message_loss() {
                     shard: "0".into(),
                     worker_id: "resilient".into(),
                     max_tasks: 5,
+                    tenant: None,
                 }))
                 .await
             {
@@ -1142,6 +1174,7 @@ fn stress_high_message_loss() {
                                 .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                                     shard: "0".into(),
                                     task_id: task.id.clone(),
+                                    tenant: None,
                                     outcome: Some(report_outcome_request::Outcome::Success(
                                         JsonValueBytes {
                                             data: b"done".to_vec(),
@@ -1202,6 +1235,7 @@ fn concurrency_request_ready_without_release_fails() {
                 grpc_addr: "0.0.0.0:9996".to_string(),
             },
             coordination: silo::settings::CoordinationConfig::default(),
+            tenancy: silo::settings::TenancyConfig { enabled: false },
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
@@ -1254,6 +1288,7 @@ fn concurrency_request_ready_without_release_fails() {
                     data: b"p".to_vec(),
                 }),
                 concurrency_limits: conc,
+                tenant: None,
             }))
             .await?
             .into_inner()
@@ -1264,6 +1299,7 @@ fn concurrency_request_ready_without_release_fails() {
                 shard: "0".into(),
                 worker_id: "w".into(),
                 max_tasks: 1,
+                tenant: None,
             }))
             .await?
             .into_inner();
@@ -1289,6 +1325,7 @@ fn concurrency_request_ready_without_release_fails() {
                     data: b"p2".to_vec(),
                 }),
                 concurrency_limits: conc2,
+                tenant: None,
             }))
             .await?
             .into_inner()
@@ -1299,6 +1336,7 @@ fn concurrency_request_ready_without_release_fails() {
             .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                 shard: "0".into(),
                 task_id: t1.clone(),
+                tenant: None,
                 outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
                     data: b"ok".to_vec(),
                 })),
@@ -1314,6 +1352,7 @@ fn concurrency_request_ready_without_release_fails() {
                     shard: "0".into(),
                     worker_id: "w".into(),
                     max_tasks: 1,
+                    tenant: None,
                 }))
                 .await?
                 .into_inner();

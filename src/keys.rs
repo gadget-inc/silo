@@ -1,11 +1,30 @@
+fn escape_tenant(tenant: &str) -> String {
+    // Minimal escaping to avoid "/" in path segments and preserve arbitrary strings
+    tenant.replace('%', "%25").replace('/', "%2F")
+}
+
+fn validate_tenant_len(tenant: &str) {
+    // Enforced by callers; keep panic-free here for perf in hot paths
+    debug_assert!(tenant.chars().count() <= 64, "tenant id exceeds 64 chars");
+}
+
+fn validate_id_len(id: &str) {
+    // Enforced by callers; keep panic-free here for perf in hot paths
+    debug_assert!(id.chars().count() <= 64, "id exceeds 64 chars");
+}
+
 /// The KV store key for a given job's info by id
-pub fn job_info_key(id: &str) -> String {
-    format!("jobs/{}", id)
+pub fn job_info_key(tenant: &str, id: &str) -> String {
+    validate_tenant_len(tenant);
+    validate_id_len(id);
+    format!("jobs/{}/{}", escape_tenant(tenant), id)
 }
 
 /// The KV store key for a given job's status
-pub fn job_status_key(id: &str) -> String {
-    format!("job_status/{}", id)
+pub fn job_status_key(tenant: &str, id: &str) -> String {
+    validate_tenant_len(tenant);
+    validate_id_len(id);
+    format!("job_status/{}/{}", escape_tenant(tenant), id)
 }
 
 /// Construct the key for a task, ordered by start time.
@@ -27,20 +46,27 @@ pub fn leased_task_key(task_id: &str) -> String {
 }
 
 /// Construct the key for an attempt record
-pub fn attempt_key(job_id: &str, attempt: u32) -> String {
-    format!("attempts/{}/{}", job_id, attempt)
+/// attempts/<tenant>/<job-id>/<attempt-number>
+pub fn attempt_key(tenant: &str, job_id: &str, attempt: u32) -> String {
+    validate_tenant_len(tenant);
+    validate_id_len(job_id);
+    format!("attempts/{}/{}/{}", escape_tenant(tenant), job_id, attempt)
 }
 
-/// Concurrency request queue: requests/<queue-name>/<start_time_ms>/<priority>/<request_id>
+/// Concurrency request queue: requests/<tenant>/<queue-name>/<start_time_ms>/<priority>/<request_id>
 /// Ordered by start time (when job should run), then priority (lower = higher), then request ID
 pub fn concurrency_request_key(
+    tenant: &str,
     queue: &str,
     start_time_ms: i64,
     priority: u8,
     request_id: &str,
 ) -> String {
+    validate_tenant_len(tenant);
+    validate_id_len(queue);
     format!(
-        "requests/{}/{:020}/{:02}/{}",
+        "requests/{}/{}/{:020}/{:02}/{}",
+        escape_tenant(tenant),
         queue,
         start_time_ms.max(0) as u64,
         priority,
@@ -48,12 +74,8 @@ pub fn concurrency_request_key(
     )
 }
 
-/// Concurrency holders set: holders/<queue-name>/<task-id>
-pub fn concurrency_holder_key(queue: &str, task_id: &str) -> String {
-    format!("holders/{}/{}", queue, task_id)
-}
-
-/// Optional per-queue dynamic concurrency limit: limits/<queue-name>
-pub fn concurrency_limit_key(queue: &str) -> String {
-    format!("limits/{}", queue)
+/// Concurrency holders set: holders/<tenant>/<queue-name>/<task-id>
+pub fn concurrency_holder_key(tenant: &str, queue: &str, task_id: &str) -> String {
+    validate_tenant_len(tenant);
+    format!("holders/{}/{}/{}", escape_tenant(tenant), queue, task_id)
 }

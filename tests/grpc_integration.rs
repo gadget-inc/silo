@@ -55,6 +55,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
                 data: payload_bytes.clone(),
             }),
             concurrency_limits: vec![],
+            tenant: None,
         };
         let enq_resp = client.enqueue(enq).await?.into_inner();
         let job_id = enq_resp.id;
@@ -65,6 +66,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
                 shard: "0".to_string(),
                 worker_id: "w1".to_string(),
                 max_tasks: 1,
+                tenant: None,
             })
             .await?
             .into_inner();
@@ -81,6 +83,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
             .report_outcome(ReportOutcomeRequest {
                 shard: "0".to_string(),
                 task_id: task.id.clone(),
+                tenant: None,
                 outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
                     data: b"{}".to_vec(),
                 })),
@@ -93,6 +96,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
             .get_job(GetJobRequest {
                 shard: "0".to_string(),
                 id: job_id.clone(),
+                tenant: None,
             })
             .await?;
         // Now delete it
@@ -100,6 +104,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
             .delete_job(DeleteJobRequest {
                 shard: "0".to_string(),
                 id: job_id.clone(),
+                tenant: None,
             })
             .await?;
 

@@ -166,9 +166,10 @@ impl JobStoreShard {
         &*self.db
     }
 
-    /// Enqueue a new job with optional concurrency limits.
+    /// Enqueue a new job with optional concurrency limits for a specific tenant.
     pub async fn enqueue(
         &self,
+        tenant: &str,
         id: Option<String>,
         priority: u8,
         start_at_ms: i64,
@@ -180,7 +181,7 @@ impl JobStoreShard {
         // If caller provided an id, ensure it doesn't already exist
         if self
             .db
-            .get(job_info_key(&job_id).as_bytes())
+            .get(job_info_key(tenant, &job_id).as_bytes())
             .await?
             .is_some()
         {
@@ -203,14 +204,15 @@ impl JobStoreShard {
 
         // Atomically write job info, job status, and handle concurrency
         let mut batch = WriteBatch::new();
-        batch.put(job_info_key(&job_id).as_bytes(), &job_value);
-        put_job_status(&mut batch, &job_id, &job_status)?;
+        batch.put(job_info_key(tenant, &job_id).as_bytes(), &job_value);
+        put_job_status(&mut batch, tenant, &job_id, &job_status)?;
 
         let now_ms = now_epoch_ms();
         let outcome = self
             .concurrency
             .handle_enqueue(
                 &mut batch,
+                tenant,
                 &first_task_id,
                 &job_id,
                 priority,
@@ -242,17 +244,15 @@ impl JobStoreShard {
         // Apply memory events and log after durable commit
         if let Some(outcome) = outcome {
             match outcome {
-                RequestTicketOutcome::GrantedImmediately {
-                    task_id,
-                    queue: _,
-                    events,
-                } => {
+                RequestTicketOutcome::GrantedImmediately { events, .. } => {
                     for ev in events {
                         if let MemoryEvent::Granted { queue, task_id } = ev {
                             let span = info_span!("concurrency.grant", queue = %queue, task_id = %task_id, job_id = %job_id, attempt = 1u32, source = "immediate");
                             let _g = span.enter();
                             info!("granted ticket and enqueued first task");
-                            self.concurrency.counts().record_grant(&queue, &task_id);
+                            self.concurrency
+                                .counts()
+                                .record_grant(tenant, &queue, &task_id);
                         }
                     }
                 }
@@ -281,9 +281,9 @@ impl JobStoreShard {
     ///
     /// Returns an error if the job is currently running (has active leases/holders)
     /// or has pending tasks/requests. Jobs must finish or permanently fail before deletion.
-    pub async fn delete_job(&self, id: &str) -> Result<(), JobStoreShardError> {
+    pub async fn delete_job(&self, tenant: &str, id: &str) -> Result<(), JobStoreShardError> {
         // Check if job is running or has pending state
-        let status = self.get_job_status(id).await?;
+        let status = self.get_job_status(tenant, id).await?;
         if let Some(status) = status {
             match status {
                 JobStatus::Running {} | JobStatus::Scheduled {} => {
@@ -295,8 +295,8 @@ impl JobStoreShard {
             }
         }
 
-        let job_info_key: String = job_info_key(id);
-        let job_status_key: String = job_status_key(id);
+        let job_info_key: String = job_info_key(tenant, id);
+        let job_status_key: String = job_status_key(tenant, id);
         let mut batch = WriteBatch::new();
         batch.delete(job_info_key.as_bytes());
         batch.delete(job_status_key.as_bytes());
@@ -306,8 +306,12 @@ impl JobStoreShard {
     }
 
     /// Fetch a job by id as a zero-copy archived view.
-    pub async fn get_job(&self, id: &str) -> Result<Option<JobView>, JobStoreShardError> {
-        let key = job_info_key(id);
+    pub async fn get_job(
+        &self,
+        tenant: &str,
+        id: &str,
+    ) -> Result<Option<JobView>, JobStoreShardError> {
+        let key = job_info_key(tenant, id);
         let maybe_raw = self.db.get(key.as_bytes()).await?;
         if let Some(raw) = maybe_raw {
             Ok(Some(JobView::new(raw)?))
@@ -317,8 +321,12 @@ impl JobStoreShard {
     }
 
     /// Fetch a job by id as a zero-copy archived view.
-    pub async fn get_job_status(&self, id: &str) -> Result<Option<JobStatus>, JobStoreShardError> {
-        let key = job_status_key(id);
+    pub async fn get_job_status(
+        &self,
+        tenant: &str,
+        id: &str,
+    ) -> Result<Option<JobStatus>, JobStoreShardError> {
+        let key = job_status_key(tenant, id);
         let maybe_raw = self.db.get(key.as_bytes()).await?;
         let Some(raw) = maybe_raw else {
             return Ok(None);
@@ -341,10 +349,11 @@ impl JobStoreShard {
     /// Fetch a job attempt by job id and attempt number.
     pub async fn get_job_attempt(
         &self,
+        tenant: &str,
         job_id: &str,
         attempt_number: u32,
     ) -> Result<Option<JobAttemptView>, JobStoreShardError> {
-        let key = attempt_key(job_id, attempt_number);
+        let key = attempt_key(tenant, job_id, attempt_number);
         let maybe_raw = self.db.get(key.as_bytes()).await?;
         if let Some(raw) = maybe_raw {
             Ok(Some(JobAttemptView::new(raw)?))
@@ -362,6 +371,7 @@ impl JobStoreShard {
     /// Dequeue up to `max_tasks` tasks available now, ordered by time then priority.
     pub async fn dequeue(
         &self,
+        tenant: &str,
         worker_id: &str,
         max_tasks: usize,
     ) -> Result<Vec<LeasedTask>, JobStoreShardError> {
@@ -372,8 +382,11 @@ impl JobStoreShard {
         // Broker-only leasing: no fallback DB scan
 
         // debug: before_claim suppressed
-        // Claim from the broker buffer; RequestTickets are internal and processed here
-        let claimed: Vec<BrokerTask> = self.broker.claim_ready_or_nudge(max_tasks).await;
+        // Claim from the broker buffer for this tenant; RequestTickets are internal and processed here
+        let claimed: Vec<BrokerTask> = self
+            .broker
+            .claim_ready_for_tenant_or_nudge(tenant, max_tasks)
+            .await;
         // debug: claimed_from_broker suppressed
         if claimed.is_empty() {
             tracing::debug!(worker_id = %worker_id, "dequeue: no ready tasks");
@@ -384,9 +397,9 @@ impl JobStoreShard {
         let expiry_ms = now_ms + DEFAULT_LEASE_MS;
         let mut batch = WriteBatch::new();
         let mut out: Vec<LeasedTask> = Vec::new();
-        let mut pending_attempts: Vec<(JobView, String, u32)> = Vec::new();
+        let mut pending_attempts: Vec<(String, JobView, String, u32)> = Vec::new();
         let mut ack_keys: Vec<String> = Vec::with_capacity(claimed.len());
-        let mut planned_leases: usize = 0;
+        let mut _planned_leases: usize = 0;
 
         for entry in &claimed {
             let task = &entry.task;
@@ -400,8 +413,10 @@ impl JobStoreShard {
                     attempt_number,
                     request_id,
                 } => {
+                    // Use provided tenant for this dequeue operation
+                    let tenant = tenant.to_string();
                     // Load job info
-                    let job_key = job_info_key(job_id);
+                    let job_key = job_info_key(&tenant, job_id);
                     let maybe_job = self.db.get(job_key.as_bytes()).await?;
                     let job_view = maybe_job
                         .as_ref()
@@ -413,6 +428,7 @@ impl JobStoreShard {
                         .process_ticket_request_task(
                             &mut batch,
                             &entry.key,
+                            &tenant,
                             queue,
                             request_id,
                             job_id,
@@ -443,7 +459,7 @@ impl JobStoreShard {
 
                             // Mark job as running
                             let job_status = JobStatus::Running {};
-                            put_job_status(&mut batch, job_id, &job_status)?;
+                            put_job_status(&mut batch, &tenant, job_id, &job_status)?;
 
                             // Attempt record
                             let attempt = JobAttempt {
@@ -456,15 +472,22 @@ impl JobStoreShard {
                             };
                             let attempt_val: AlignedVec = encode_attempt(&attempt)
                                 .map_err(|e| JobStoreShardError::Rkyv(e))?;
-                            let akey = attempt_key(job_id, *attempt_number);
+                            let akey = attempt_key(&tenant, job_id, *attempt_number);
                             batch.put(akey.as_bytes(), &attempt_val);
 
                             // Track for response and in-memory counts
                             let view = job_view.unwrap();
-                            pending_attempts.push((view, job_id.clone(), *attempt_number));
+                            pending_attempts.push((
+                                tenant.clone(),
+                                view,
+                                job_id.clone(),
+                                *attempt_number,
+                            ));
                             ack_keys.push(entry.key.clone());
-                            self.concurrency.counts().record_grant(&queue, &request_id);
-                            planned_leases += 1;
+                            self.concurrency
+                                .counts()
+                                .record_grant(&tenant, &queue, &request_id);
+                            _planned_leases += 1;
                         }
                         RequestTicketTaskOutcome::Requested
                         | RequestTicketTaskOutcome::JobMissing => {
@@ -486,8 +509,9 @@ impl JobStoreShard {
                 Task::RequestTicket { .. } => unreachable!(),
             };
 
-            // Look up job info; if missing, delete the task and skip
-            let job_key = job_info_key(&job_id);
+            // Determine tenant from key and look up job info; if missing, delete the task and skip
+            let tenant = tenant.to_string();
+            let job_key = job_info_key(&tenant, &job_id);
             let maybe_job = self.db.get(job_key.as_bytes()).await?;
             if let Some(job_bytes) = maybe_job {
                 let view = JobView::new(job_bytes)?;
@@ -507,7 +531,7 @@ impl JobStoreShard {
 
                 // Mark job as running
                 let job_status = JobStatus::Running {};
-                put_job_status(&mut batch, &job_id, &job_status)?;
+                put_job_status(&mut batch, &tenant, &job_id, &job_status)?;
 
                 // Also mark attempt as running
                 let attempt = JobAttempt {
@@ -520,13 +544,13 @@ impl JobStoreShard {
                 };
                 let attempt_val: AlignedVec =
                     encode_attempt(&attempt).map_err(|e| JobStoreShardError::Rkyv(e))?;
-                let akey = attempt_key(&job_id, attempt_number);
+                let akey = attempt_key(&tenant, &job_id, attempt_number);
                 batch.put(akey.as_bytes(), &attempt_val);
 
                 // Defer constructing AttemptView; fetch from DB after batch is written
-                pending_attempts.push((view, job_id.clone(), attempt_number));
+                pending_attempts.push((tenant.clone(), view, job_id.clone(), attempt_number));
                 ack_keys.push(entry.key.clone());
-                planned_leases += 1;
+                _planned_leases += 1;
             } else {
                 // If job missing, delete task key to clean up
                 batch.delete(entry.key.as_bytes());
@@ -556,9 +580,9 @@ impl JobStoreShard {
             "dequeue: acked and evicted keys"
         );
 
-        for (job_view, job_id, attempt_number) in pending_attempts.into_iter() {
+        for (tenant, job_view, job_id, attempt_number) in pending_attempts.into_iter() {
             let attempt_view = self
-                .get_job_attempt(&job_id, attempt_number)
+                .get_job_attempt(&tenant.as_str(), &job_id, attempt_number)
                 .await?
                 .ok_or_else(|| {
                     JobStoreShardError::Rkyv("attempt not found after dequeue".to_string())
@@ -581,19 +605,41 @@ impl JobStoreShard {
             return Ok((Vec::new(), Vec::new()));
         }
 
+        // Scan tasks under tasks/
         let start: Vec<u8> = b"tasks/".to_vec();
-        let end_prefix = task_key(now_epoch_ms(), 99, "~", u32::MAX);
-        let mut end: Vec<u8> = end_prefix.into_bytes();
+        let mut end: Vec<u8> = b"tasks/".to_vec();
         end.push(0xFF);
         let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..=end).await?;
 
         let mut tasks: Vec<Task> = Vec::with_capacity(max_tasks);
         let mut keys: Vec<Vec<u8>> = Vec::with_capacity(max_tasks);
+        let now_ms = now_epoch_ms();
         while tasks.len() < max_tasks {
             let maybe_kv = iter.next().await?;
             let Some(kv) = maybe_kv else {
                 break;
             };
+
+            // Only process task keys: tasks/...
+            let key_str = String::from_utf8_lossy(&kv.key);
+            if !key_str.starts_with("tasks/") {
+                continue;
+            }
+            // Enforce time cutoff: only keys with ts <= now_ms
+            // Format: tasks/<ts>/...
+            let mut parts = key_str.split('/');
+            if parts.next() != Some("tasks") {
+                continue;
+            }
+            let ts_part = match parts.next() {
+                Some(v) => v,
+                None => continue,
+            };
+            if let Ok(ts) = ts_part.parse::<u64>() {
+                if ts > now_ms as u64 {
+                    continue;
+                }
+            }
 
             type ArchivedTask = <Task as Archive>::Archived;
             let archived: &ArchivedTask = unsafe { rkyv::archived_root::<Task>(&kv.value) };
@@ -717,6 +763,7 @@ impl JobStoreShard {
     /// Removes the lease and finalizes the attempt state.
     pub async fn report_attempt_outcome(
         &self,
+        tenant: &str,
         task_id: &str,
         outcome: AttemptOutcome,
     ) -> Result<(), JobStoreShardError> {
@@ -770,7 +817,7 @@ impl JobStoreShard {
         };
         let attempt_val: AlignedVec =
             encode_attempt(&attempt).map_err(|e| JobStoreShardError::Rkyv(e))?;
-        let attempt_key = attempt_key(&job_id, attempt_number);
+        let attempt_key = attempt_key(tenant, &job_id, attempt_number);
 
         // Atomically update attempt and remove lease
         let mut batch = WriteBatch::new();
@@ -783,14 +830,14 @@ impl JobStoreShard {
         // If success: mark job succeeded now.
         if let AttemptOutcome::Success { .. } = outcome {
             let job_status = JobStatus::Succeeded {};
-            put_job_status(&mut batch, &job_id, &job_status)?;
+            put_job_status(&mut batch, tenant, &job_id, &job_status)?;
         } else {
             // if error, maybe enqueue next attempt; otherwise mark job failed
             let mut scheduled_followup: bool = false;
 
             if let AttemptOutcome::Error { .. } = outcome {
                 // Load job info to get priority and retry policy
-                let job_info_key = job_info_key(&job_id);
+                let job_info_key = job_info_key(tenant, &job_id);
                 let maybe_job = self.db.get(job_info_key.as_bytes()).await?;
                 if let Some(jbytes) = maybe_job {
                     let view = JobView::new(jbytes)?;
@@ -818,7 +865,7 @@ impl JobStoreShard {
                             );
 
                             let job_status = JobStatus::Scheduled {};
-                            put_job_status(&mut batch, &job_id, &job_status)?;
+                            put_job_status(&mut batch, tenant, &job_id, &job_status)?;
                             scheduled_followup = true;
                             followup_next_time = Some(next_time);
                         }
@@ -826,7 +873,7 @@ impl JobStoreShard {
                     // If no follow-up scheduled, mark job as failed
                     if !scheduled_followup {
                         let job_status = JobStatus::Failed {};
-                        put_job_status(&mut batch, &job_id, &job_status)?;
+                        put_job_status(&mut batch, tenant, &job_id, &job_status)?;
                     }
                 } else {
                     job_missing_error = Some(JobStoreShardError::JobNotFound(job_id.clone()));
@@ -837,7 +884,14 @@ impl JobStoreShard {
         // Release any held concurrency tickets
         let release_events: Vec<MemoryEvent> = self
             .concurrency
-            .release_and_grant_next(&self.db, &mut batch, &held_queues_local, task_id, now_ms)
+            .release_and_grant_next(
+                &self.db,
+                &mut batch,
+                tenant,
+                &held_queues_local,
+                task_id,
+                now_ms,
+            )
             .await
             .map_err(|e| JobStoreShardError::Rkyv(e))?;
 
@@ -854,13 +908,17 @@ impl JobStoreShard {
                         info_span!("concurrency.release", queue = %queue, finished_task_id = %tid);
                     let _g = span.enter();
                     info!("released ticket for finished task");
-                    self.concurrency.counts().record_release(&queue, &tid);
+                    self.concurrency
+                        .counts()
+                        .record_release(tenant, &queue, &tid);
                     // Wake broker; durable grant-from-release already enqueues run task if ready
                     self.broker.wakeup();
                 }
                 MemoryEvent::Granted { queue, task_id } => {
                     // We granted on release: bump in-memory counts now and wake the broker to scan promptly.
-                    self.concurrency.counts().record_grant(&queue, &task_id);
+                    self.concurrency
+                        .counts()
+                        .record_grant(tenant, &queue, &task_id);
                     let span = info_span!("task.enqueue_from_grant", queue = %queue, task_id = %task_id, cause = "release");
                     let _g = span.enter();
                     info!("enqueued task for next requester after release");
@@ -884,6 +942,7 @@ impl JobStoreShard {
     /// Scan all held leases and mark any expired ones as failed with a WORKER_CRASHED error code.
     /// Returns the number of expired leases reaped.
     pub async fn reap_expired_leases(&self) -> Result<usize, JobStoreShardError> {
+        // Scan leases under lease/
         let start: Vec<u8> = b"lease/".to_vec();
         let mut end: Vec<u8> = b"lease/".to_vec();
         end.push(0xFF);
@@ -895,6 +954,11 @@ impl JobStoreShard {
             let maybe = iter.next().await?;
             let Some(kv) = maybe else { break };
 
+            // Only process lease keys: lease/...
+            let key_str = String::from_utf8_lossy(&kv.key);
+            if !key_str.starts_with("lease/") {
+                continue;
+            }
             type ArchivedLease = <LeaseRecord as Archive>::Archived;
             type ArchivedTask = <Task as Archive>::Archived;
             let lease: &ArchivedLease = unsafe { rkyv::archived_root::<LeaseRecord>(&kv.value) };
@@ -909,8 +973,11 @@ impl JobStoreShard {
             };
 
             // Report as worker crashed; ignore LeaseNotFound in case of concurrent cleanup
+            // Without tenant in the lease key, assume default tenant for now
+            let tenant = "-".to_string();
             let _ = self
                 .report_attempt_outcome(
+                    &tenant,
                     &task_id,
                     AttemptOutcome::Error {
                         error_code: "WORKER_CRASHED".to_string(),
@@ -941,11 +1008,12 @@ pub(crate) fn now_epoch_ms() -> i64 {
 
 fn put_job_status(
     batch: &mut WriteBatch,
+    tenant: &str,
     job_id: &str,
     status: &JobStatus,
 ) -> Result<(), JobStoreShardError> {
     let job_status_value: AlignedVec = rkyv::to_bytes::<JobStatus, 256>(status)
         .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
-    batch.put(job_status_key(job_id).as_bytes(), &job_status_value);
+    batch.put(job_status_key(tenant, job_id).as_bytes(), &job_status_value);
     Ok(())
 }

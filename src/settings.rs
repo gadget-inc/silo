@@ -8,6 +8,8 @@ pub struct AppConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub coordination: CoordinationConfig,
+    #[serde(default)]
+    pub tenancy: TenancyConfig,
     pub database: DatabaseTemplate,
 }
 
@@ -36,6 +38,18 @@ impl Default for CoordinationConfig {
         Self {
             etcd_endpoints: default_etcd_endpoints(),
         }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct TenancyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl Default for TenancyConfig {
+    fn default() -> Self {
+        Self { enabled: false }
     }
 }
 
@@ -75,6 +89,7 @@ impl AppConfig {
             coordination: CoordinationConfig {
                 etcd_endpoints: default_etcd_endpoints(),
             },
+            tenancy: TenancyConfig { enabled: false },
             database: DatabaseTemplate {
                 backend: Backend::Fs,
                 path: "/tmp/silo-%shard%".to_string(),

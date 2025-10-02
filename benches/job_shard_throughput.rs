@@ -44,7 +44,7 @@ async fn measure_enqueue_throughput(
             for i in 0..jobs_per_producer {
                 let payload = json!({"producer": producer_id, "i": i});
                 shard
-                    .enqueue(None, 50, now_ms, None, payload, vec![])
+                    .enqueue("-", None, 50, now_ms, None, payload, vec![])
                     .await
                     .expect("enqueue");
             }
@@ -79,7 +79,7 @@ async fn measure_dequeue_throughput(
     for i in 0..total_jobs {
         let payload = json!({"i": i});
         shard
-            .enqueue(None, 50, now_ms, None, payload, vec![])
+            .enqueue("-", None, 50, now_ms, None, payload, vec![])
             .await
             .expect("enqueue");
     }
@@ -100,7 +100,7 @@ async fn measure_dequeue_throughput(
                     break;
                 }
 
-                let tasks = shard.dequeue(&worker_id, batch).await.expect("dequeue");
+                let tasks = shard.dequeue("-", &worker_id, batch).await.expect("dequeue");
                 if tasks.is_empty() {
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                     continue;
@@ -111,6 +111,7 @@ async fn measure_dequeue_throughput(
                     let tid = t.attempt().task_id().to_string();
                     shard
                         .report_attempt_outcome(
+                            "-",
                             &tid,
                             silo::job_attempt::AttemptOutcome::Success { result: Vec::new() },
                         )

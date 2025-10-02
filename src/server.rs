@@ -12,6 +12,7 @@ use crate::job_attempt::AttemptOutcome;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError, DEFAULT_LEASE_MS};
 use crate::pb::silo_server::{Silo, SiloServer};
 use crate::pb::*;
+use crate::settings::AppConfig;
 
 fn map_err(e: JobStoreShardError) -> Status {
     match e {
@@ -24,17 +25,34 @@ fn map_err(e: JobStoreShardError) -> Status {
 #[derive(Clone)]
 pub struct SiloService {
     factory: Arc<ShardFactory>,
+    cfg: AppConfig,
 }
 
 impl SiloService {
-    pub fn new(factory: Arc<ShardFactory>) -> Self {
-        Self { factory }
+    pub fn new(factory: Arc<ShardFactory>, cfg: AppConfig) -> Self {
+        Self { factory, cfg }
     }
 
     fn shard(&self, name: &str) -> Result<&JobStoreShard, Status> {
         self.factory
             .get(name)
             .ok_or_else(|| Status::not_found("shard not found"))
+    }
+
+    fn validate_tenant(&self, tenant: Option<&str>) -> Result<String, Status> {
+        let enabled = self.cfg.tenancy.enabled;
+        let present = tenant.and_then(|t| if t.is_empty() { None } else { Some(t) });
+        match (enabled, present) {
+            (true, Some(t)) => {
+                if t.chars().count() > 64 {
+                    return Err(Status::invalid_argument("invalid tenant id"));
+                }
+                Ok(t.to_string())
+            }
+            (true, None) => Err(Status::invalid_argument("tenant id required")),
+            (false, Some(_)) => Err(Status::invalid_argument("tenant id not accepted")),
+            (false, None) => Ok("-".to_string()),
+        }
     }
 }
 
@@ -46,6 +64,7 @@ impl Silo for SiloService {
     ) -> Result<Response<EnqueueResponse>, Status> {
         let r = req.into_inner();
         let shard = self.shard(&r.shard)?;
+        let tenant = self.validate_tenant(r.tenant.as_deref())?;
         let payload_bytes = r
             .payload
             .as_ref()
@@ -70,6 +89,7 @@ impl Silo for SiloService {
             .collect();
         let id = shard
             .enqueue(
+                &tenant,
                 if r.id.is_empty() { None } else { Some(r.id) },
                 r.priority as u8,
                 r.start_at_ms,
@@ -88,7 +108,8 @@ impl Silo for SiloService {
     ) -> Result<Response<GetJobResponse>, Status> {
         let r = req.into_inner();
         let shard = self.shard(&r.shard)?;
-        let Some(view) = shard.get_job(&r.id).await.map_err(map_err)? else {
+        let tenant = self.validate_tenant(r.tenant.as_deref())?;
+        let Some(view) = shard.get_job(&tenant, &r.id).await.map_err(map_err)? else {
             return Err(Status::not_found("job not found"));
         };
         let retry = view.retry_policy();
@@ -125,7 +146,8 @@ impl Silo for SiloService {
     ) -> Result<Response<DeleteJobResponse>, Status> {
         let r = req.into_inner();
         let shard = self.shard(&r.shard)?;
-        shard.delete_job(&r.id).await.map_err(map_err)?;
+        let tenant = self.validate_tenant(r.tenant.as_deref())?;
+        shard.delete_job(&tenant, &r.id).await.map_err(map_err)?;
         Ok(Response::new(DeleteJobResponse {}))
     }
 
@@ -135,8 +157,9 @@ impl Silo for SiloService {
     ) -> Result<Response<LeaseTasksResponse>, Status> {
         let r = req.into_inner();
         let shard = self.shard(&r.shard)?;
+        let tenant = self.validate_tenant(r.tenant.as_deref())?;
         let tasks = shard
-            .dequeue(&r.worker_id, r.max_tasks as usize)
+            .dequeue(&tenant, &r.worker_id, r.max_tasks as usize)
             .await
             .map_err(map_err)?;
         let mut out = Vec::with_capacity(tasks.len());
@@ -163,6 +186,7 @@ impl Silo for SiloService {
     ) -> Result<Response<ReportOutcomeResponse>, Status> {
         let r = req.into_inner();
         let shard = self.shard(&r.shard)?;
+        let tenant = self.validate_tenant(r.tenant.as_deref())?;
         let outcome = match r
             .outcome
             .ok_or_else(|| Status::invalid_argument("missing outcome"))?
@@ -176,7 +200,7 @@ impl Silo for SiloService {
             },
         };
         shard
-            .report_attempt_outcome(&r.task_id, outcome)
+            .report_attempt_outcome(&tenant, &r.task_id, outcome)
             .await
             .map_err(map_err)?;
         Ok(Response::new(ReportOutcomeResponse {}))
@@ -188,6 +212,7 @@ impl Silo for SiloService {
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let r = req.into_inner();
         let shard = self.shard(&r.shard)?;
+        let tenant = self.validate_tenant(r.tenant.as_deref())?;
         shard
             .heartbeat_task(&r.worker_id, &r.task_id)
             .await
@@ -202,7 +227,10 @@ pub async fn run_grpc_with_reaper(
     factory: Arc<ShardFactory>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let svc = SiloService::new(factory.clone());
+    // Load app config to pass tenancy flag; use defaults when not provided here
+    let cfg = crate::settings::AppConfig::load(None)
+        .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?;
+    let svc = SiloService::new(factory.clone(), cfg);
     let server = SiloServer::new(svc);
 
     // Periodic reaper that iterates all shards every second
@@ -271,7 +299,9 @@ where
         + 'static
         + tonic::transport::server::Connected,
 {
-    let svc = SiloService::new(factory.clone());
+    let cfg = crate::settings::AppConfig::load(None)
+        .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?;
+    let svc = SiloService::new(factory.clone(), cfg);
     let server = SiloServer::new(svc);
 
     // Periodic reaper that iterates all shards every second

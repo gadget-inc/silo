@@ -8,6 +8,7 @@ async fn open_fs_db_from_config() {
     let cfg = AppConfig {
         server: Default::default(),
         coordination: Default::default(),
+        tenancy: silo::settings::TenancyConfig { enabled: false },
         database: DatabaseTemplate {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),

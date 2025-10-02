@@ -29,13 +29,14 @@ message EnqueueRequest {
   optional RetryPolicy retry_policy = 5; // optional
   JsonValueBytes payload = 6; // JSON
   repeated ConcurrencyLimit concurrency_limits = 7; // zero or more limits
+  optional string tenant = 8; // optional tenant id when tenancy is enabled
 }
 
 message EnqueueResponse {
   string id = 1;
 }
 
-message GetJobRequest { string shard = 1; string id = 2; }
+message GetJobRequest { string shard = 1; string id = 2; optional string tenant = 3; }
 message GetJobResponse {
   string id = 1;
   uint32 priority = 2;
@@ -45,10 +46,10 @@ message GetJobResponse {
   repeated ConcurrencyLimit concurrency_limits = 6; // declared limits
 }
 
-message DeleteJobRequest { string shard = 1; string id = 2; }
+message DeleteJobRequest { string shard = 1; string id = 2; optional string tenant = 3; }
 message DeleteJobResponse {}
 
-message LeaseTasksRequest { string shard = 1; string worker_id = 2; uint32 max_tasks = 3; }
+message LeaseTasksRequest { string shard = 1; string worker_id = 2; uint32 max_tasks = 3; optional string tenant = 4; }
 message Task {
   string id = 1; // task id
   string job_id = 2;
@@ -62,6 +63,7 @@ message LeaseTasksResponse { repeated Task tasks = 1; }
 message ReportOutcomeRequest {
   string shard = 1;
   string task_id = 2;
+  optional string tenant = 5;
   oneof outcome {
     JsonValueBytes success = 3;
     Failure failure = 4;
@@ -70,7 +72,7 @@ message ReportOutcomeRequest {
 message Failure { string code = 1; bytes data = 2; }
 message ReportOutcomeResponse {}
 
-message HeartbeatRequest { string shard = 1; string worker_id = 2; string task_id = 3; }
+message HeartbeatRequest { string shard = 1; string worker_id = 2; string task_id = 3; optional string tenant = 4; }
 message HeartbeatResponse {}
 
 service Silo {

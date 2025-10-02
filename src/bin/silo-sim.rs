@@ -131,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
                 let payload = serde_json::json!({"i": i, "queue": q_name});
                 let _ = shard
                     .enqueue(
+                        "-",
                         None,
                         (i % 100) as u8,
                         now_ms().await,
@@ -163,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
                 if !workers_running.load(Ordering::SeqCst) {
                     break;
                 }
-                let tasks = shard.dequeue(&wid, 4).await.unwrap_or_default();
+                let tasks = shard.dequeue("-", &wid, 4).await.unwrap_or_default();
                 if tasks.is_empty() {
                     tokio::task::yield_now().await;
                     continue;
@@ -180,6 +181,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     let _ = shard
                         .report_attempt_outcome(
+                            "-",
                             &tid,
                             AttemptOutcome::Success { result: Vec::new() },
                         )
