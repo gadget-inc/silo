@@ -17,7 +17,7 @@ Status: crappy experiment
 - allows searching for jobs with a few different filters
 - brokers work for userland workers in any language that communicate with the broker via RPCs
 
-It's like Sidekiq, BullMQ or similar, but durable.
+It's like Sidekiq, BullMQ, Temporal, Restate or similar, but durable.
 
 ## RPCs
 

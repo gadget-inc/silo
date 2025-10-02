@@ -44,7 +44,7 @@ async fn enqueue_round_trip_with_explicit_id() {
         .expect("get status")
         .expect("exists");
     match status {
-        JobStatus::Scheduled {} => {}
+        JobStatus::Scheduled { .. } => {}
         other => panic!("expected Scheduled, got {:?}", other),
     }
 
@@ -202,7 +202,7 @@ async fn dequeue_moves_tasks_to_leased_with_uuid() {
             .expect("get status")
             .expect("exists");
         match status {
-            JobStatus::Running {} => {}
+            JobStatus::Running { .. } => {}
             other => panic!("expected Running, got {:?}", other),
         }
         let leased_task_id = {
@@ -1092,7 +1092,7 @@ async fn cannot_delete_scheduled_job() {
             .await
             .expect("get status")
             .expect("exists");
-        assert!(matches!(status, JobStatus::Scheduled {}));
+        assert!(matches!(status, JobStatus::Scheduled { .. }));
 
         // Attempt to delete - should fail
         let err = shard

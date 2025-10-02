@@ -20,16 +20,20 @@ One item that a worker needs to pickup and action to move the system forward. Is
 
 One task that has been leased by a worker. Upon leasing, a task is moved from the task queue into the task leases. A worker must complete the task or heartbeat for it before the lease expired, or else the system will assume the worker has crashed.
 
+## Tenancy
+
+All of Silo is built to house job data for multiple tenants, if necessary. Storage is oriented to group all of one tenant's data together for fast scanning. An individual tenant's data _can't_ be split across shards.
+
 ## Key/value layout
 
-- `jobs/<job-id>` - stores job payloads
-- `attempts/<job-id>/<attempt-number>` - stores attempt details
+- `jobs/<tenant-id>/<job-id>` - stores job payloads
+- `attempts/<tenant-id>/<job-id>/<attempt-number>` - stores attempt details
 - `tasks/<start-time>/<priority>/<job-id>/<attempt-number>` - stores the work items that need accomplishing in task order. Each stored task has a system-generated UUID.
 - `lease/<task-id>` - during leasing, dequeued tasks are written here keyed by task id. The value stores a LeaseRecord `{ worker_id, task, expiry_ms }`. Workers must heartbeat/complete before expiry to retain ownership. Expired lease detection scans this prefix and inspects `expiry_ms`.
 
-TODO: indexes and stuff
+Secondary indexes are also mapped as ordered keys in the k/v store:
 
-- `idx/`
+- `idx/status_ts/<tenant>/<status>/<inv_ts:020>/<job-id>` stores a secondary index for all jobs, by status, ordered by the time of the last transition
 
 ## Clustering approach
 

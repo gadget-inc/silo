@@ -12,9 +12,12 @@ use crate::codec::{encode_attempt, encode_lease};
 use crate::concurrency::{
     ConcurrencyManager, MemoryEvent, RequestTicketOutcome, RequestTicketTaskOutcome,
 };
-use crate::job::{ConcurrencyLimit, JobInfo, JobStatus, JobView};
+use crate::job::{ConcurrencyLimit, JobInfo, JobStatus, JobStatusKind, JobView};
 use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt, JobAttemptView};
-use crate::keys::{attempt_key, job_info_key, job_status_key, leased_task_key, task_key};
+use crate::keys::{
+    attempt_key, idx_status_membership_key, idx_status_time_key, job_info_key, job_status_key,
+    leased_task_key, task_key,
+};
 use crate::retry::RetryPolicy;
 use crate::settings::DatabaseConfig;
 use crate::storage::{resolve_object_store, StorageError};
@@ -200,14 +203,18 @@ impl JobStoreShard {
             .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
 
         let first_task_id = Uuid::new_v4().to_string();
-        let job_status = JobStatus::Scheduled {};
+        let now_ms = now_epoch_ms();
+        let job_status = JobStatus::Scheduled {
+            changed_at_ms: now_ms,
+        };
 
         // Atomically write job info, job status, and handle concurrency
         let mut batch = WriteBatch::new();
         batch.put(job_info_key(tenant, &job_id).as_bytes(), &job_value);
-        put_job_status(&mut batch, tenant, &job_id, &job_status)?;
+        self.set_job_status_with_index(&mut batch, tenant, &job_id, job_status)
+            .await?;
 
-        let now_ms = now_epoch_ms();
+        let now_ms = now_ms;
         let outcome = self
             .concurrency
             .handle_enqueue(
@@ -286,10 +293,12 @@ impl JobStoreShard {
         let status = self.get_job_status(tenant, id).await?;
         if let Some(status) = status {
             match status {
-                JobStatus::Running {} | JobStatus::Scheduled {} => {
+                JobStatus::Running { .. } | JobStatus::Scheduled { .. } => {
                     return Err(JobStoreShardError::JobInProgress(id.to_string()));
                 }
-                JobStatus::Succeeded {} | JobStatus::Failed {} | JobStatus::Cancelled {} => {
+                JobStatus::Succeeded { .. }
+                | JobStatus::Failed { .. }
+                | JobStatus::Cancelled { .. } => {
                     // OK to delete terminal states
                 }
             }
@@ -298,6 +307,36 @@ impl JobStoreShard {
         let job_info_key: String = job_info_key(tenant, id);
         let job_status_key: String = job_status_key(tenant, id);
         let mut batch = WriteBatch::new();
+        // Clean up secondary index entries if present
+        if let Some(status) = self.get_job_status(tenant, id).await? {
+            let kind = status.kind();
+            let changed = status.changed_at_ms();
+            let mem = idx_status_membership_key(
+                tenant,
+                match kind {
+                    JobStatusKind::Scheduled => "Scheduled",
+                    JobStatusKind::Running => "Running",
+                    JobStatusKind::Failed => "Failed",
+                    JobStatusKind::Cancelled => "Cancelled",
+                    JobStatusKind::Succeeded => "Succeeded",
+                },
+                id,
+            );
+            let timek = idx_status_time_key(
+                tenant,
+                match kind {
+                    JobStatusKind::Scheduled => "Scheduled",
+                    JobStatusKind::Running => "Running",
+                    JobStatusKind::Failed => "Failed",
+                    JobStatusKind::Cancelled => "Cancelled",
+                    JobStatusKind::Succeeded => "Succeeded",
+                },
+                changed,
+                id,
+            );
+            batch.delete(mem.as_bytes());
+            batch.delete(timek.as_bytes());
+        }
         batch.delete(job_info_key.as_bytes());
         batch.delete(job_status_key.as_bytes());
         self.db.write(batch).await?;
@@ -458,8 +497,11 @@ impl JobStoreShard {
                             batch.put(lease_key.as_bytes(), &leased_value);
 
                             // Mark job as running
-                            let job_status = JobStatus::Running {};
-                            put_job_status(&mut batch, &tenant, job_id, &job_status)?;
+                            let job_status = JobStatus::Running {
+                                changed_at_ms: now_ms,
+                            };
+                            self.set_job_status_with_index(&mut batch, &tenant, job_id, job_status)
+                                .await?;
 
                             // Attempt record
                             let attempt = JobAttempt {
@@ -530,8 +572,11 @@ impl JobStoreShard {
                 batch.delete(entry.key.as_bytes());
 
                 // Mark job as running
-                let job_status = JobStatus::Running {};
-                put_job_status(&mut batch, &tenant, &job_id, &job_status)?;
+                let job_status = JobStatus::Running {
+                    changed_at_ms: now_ms,
+                };
+                self.set_job_status_with_index(&mut batch, &tenant, &job_id, job_status)
+                    .await?;
 
                 // Also mark attempt as running
                 let attempt = JobAttempt {
@@ -828,8 +873,11 @@ impl JobStoreShard {
 
         // If success: mark job succeeded now.
         if let AttemptOutcome::Success { .. } = outcome {
-            let job_status = JobStatus::Succeeded {};
-            put_job_status(&mut batch, tenant, &job_id, &job_status)?;
+            let job_status = JobStatus::Succeeded {
+                changed_at_ms: now_ms,
+            };
+            self.set_job_status_with_index(&mut batch, tenant, &job_id, job_status)
+                .await?;
         } else {
             // if error, maybe enqueue next attempt; otherwise mark job failed
             let mut scheduled_followup: bool = false;
@@ -863,16 +911,22 @@ impl JobStoreShard {
                                 &next_bytes,
                             );
 
-                            let job_status = JobStatus::Scheduled {};
-                            put_job_status(&mut batch, tenant, &job_id, &job_status)?;
+                            let job_status = JobStatus::Scheduled {
+                                changed_at_ms: now_ms,
+                            };
+                            self.set_job_status_with_index(&mut batch, tenant, &job_id, job_status)
+                                .await?;
                             scheduled_followup = true;
                             followup_next_time = Some(next_time);
                         }
                     }
                     // If no follow-up scheduled, mark job as failed
                     if !scheduled_followup {
-                        let job_status = JobStatus::Failed {};
-                        put_job_status(&mut batch, tenant, &job_id, &job_status)?;
+                        let job_status = JobStatus::Failed {
+                            changed_at_ms: now_ms,
+                        };
+                        self.set_job_status_with_index(&mut batch, tenant, &job_id, job_status)
+                            .await?;
                     }
                 } else {
                     job_missing_error = Some(JobStoreShardError::JobNotFound(job_id.clone()));
@@ -1015,4 +1069,83 @@ fn put_job_status(
         .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
     batch.put(job_status_key(tenant, job_id).as_bytes(), &job_status_value);
     Ok(())
+}
+
+fn status_kind_str(kind: JobStatusKind) -> &'static str {
+    match kind {
+        JobStatusKind::Scheduled => "Scheduled",
+        JobStatusKind::Running => "Running",
+        JobStatusKind::Failed => "Failed",
+        JobStatusKind::Cancelled => "Cancelled",
+        JobStatusKind::Succeeded => "Succeeded",
+    }
+}
+
+impl JobStoreShard {
+    /// Update job status and maintain secondary indexes in the same write batch.
+    async fn set_job_status_with_index(
+        &self,
+        batch: &mut WriteBatch,
+        tenant: &str,
+        job_id: &str,
+        new_status: JobStatus,
+    ) -> Result<(), JobStoreShardError> {
+        // Delete old index entries if present
+        if let Some(old) = self.get_job_status(tenant, job_id).await? {
+            let old_kind = old.kind();
+            let old_changed = old.changed_at_ms();
+            let old_mem = idx_status_membership_key(tenant, status_kind_str(old_kind), job_id);
+            let old_time =
+                idx_status_time_key(tenant, status_kind_str(old_kind), old_changed, job_id);
+            batch.delete(old_mem.as_bytes());
+            batch.delete(old_time.as_bytes());
+        }
+
+        // Write new status value
+        put_job_status(batch, tenant, job_id, &new_status)?;
+
+        // Insert new index entries
+        let new_kind = new_status.kind();
+        let changed = new_status.changed_at_ms();
+        let mem = idx_status_membership_key(tenant, status_kind_str(new_kind), job_id);
+        let timek = idx_status_time_key(tenant, status_kind_str(new_kind), changed, job_id);
+        batch.put(mem.as_bytes(), &[]);
+        batch.put(timek.as_bytes(), &[]);
+        Ok(())
+    }
+
+    /// Scan newest-first job IDs by status using the time-ordered index.
+    pub async fn scan_jobs_by_status(
+        &self,
+        tenant: &str,
+        status: JobStatusKind,
+        limit: usize,
+    ) -> Result<Vec<String>, JobStoreShardError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let tenant_enc = crate::keys::job_info_key(tenant, "")
+            .trim_start_matches("jobs/")
+            .trim_end_matches('/')
+            .to_string();
+        let prefix = format!("idx/status_ts/{}/{}/", tenant_enc, status_kind_str(status));
+        // Build range [prefix, prefix + 0xFF]
+        let start = prefix.as_bytes().to_vec();
+        let mut end = start.clone();
+        end.push(0xFF);
+        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..=end).await?;
+        let mut out: Vec<String> = Vec::with_capacity(limit);
+        while out.len() < limit {
+            let maybe = iter.next().await?;
+            let Some(kv) = maybe else { break };
+            let key_str = String::from_utf8_lossy(&kv.key);
+            // key format: idx/status_ts/<tenant>/<status>/<inv_ts>/<job-id>
+            if let Some(job_id) = key_str.rsplit('/').next() {
+                if !job_id.is_empty() {
+                    out.push(job_id.to_string());
+                }
+            }
+        }
+        Ok(out)
+    }
 }

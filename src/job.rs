@@ -12,15 +12,58 @@ pub struct ConcurrencyLimit {
     pub max_concurrency: u32,
 }
 
-/// Job status lifecycle
+/// Discriminant for job status kinds, independent of timestamps
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize, PartialEq, Eq, Copy)]
+#[archive(check_bytes)]
+pub enum JobStatusKind {
+    Scheduled,
+    Running,
+    Failed,
+    Cancelled,
+    Succeeded,
+}
+
+/// Job status lifecycle with the last change time for secondary indexing
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
 #[archive(check_bytes)]
 pub enum JobStatus {
-    Scheduled {},
-    Running {},
-    Failed {},
-    Cancelled {},
-    Succeeded {},
+    Scheduled { changed_at_ms: i64 },
+    Running { changed_at_ms: i64 },
+    Failed { changed_at_ms: i64 },
+    Cancelled { changed_at_ms: i64 },
+    Succeeded { changed_at_ms: i64 },
+}
+
+impl JobStatus {
+    pub fn changed_at_ms(&self) -> i64 {
+        match self {
+            JobStatus::Scheduled { changed_at_ms }
+            | JobStatus::Running { changed_at_ms }
+            | JobStatus::Failed { changed_at_ms }
+            | JobStatus::Cancelled { changed_at_ms }
+            | JobStatus::Succeeded { changed_at_ms } => *changed_at_ms,
+        }
+    }
+
+    pub fn kind(&self) -> JobStatusKind {
+        match self {
+            JobStatus::Scheduled { .. } => JobStatusKind::Scheduled,
+            JobStatus::Running { .. } => JobStatusKind::Running,
+            JobStatus::Failed { .. } => JobStatusKind::Failed,
+            JobStatus::Cancelled { .. } => JobStatusKind::Cancelled,
+            JobStatus::Succeeded { .. } => JobStatusKind::Succeeded,
+        }
+    }
+
+    pub fn from_kind(kind: JobStatusKind, changed_at_ms: i64) -> Self {
+        match kind {
+            JobStatusKind::Scheduled => JobStatus::Scheduled { changed_at_ms },
+            JobStatusKind::Running => JobStatus::Running { changed_at_ms },
+            JobStatusKind::Failed => JobStatus::Failed { changed_at_ms },
+            JobStatusKind::Cancelled => JobStatus::Cancelled { changed_at_ms },
+            JobStatusKind::Succeeded => JobStatus::Succeeded { changed_at_ms },
+        }
+    }
 }
 
 /// Zero-copy view over an archived `JobInfo` backed by owned bytes.

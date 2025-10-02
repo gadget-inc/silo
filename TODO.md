@@ -1,5 +1,5 @@
 - [x] task dequeuing
-  - [ ] in-memory task broker checks if the task is already leased before brokering it
+  - [x] in-memory task broker checks if the task is already leased before brokering it
 - [x] task leases, heartbeats
 - [x] attempt failure/success reporting
 - [x] lease expiry
