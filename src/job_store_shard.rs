@@ -15,8 +15,7 @@ use crate::concurrency::{
 use crate::job::{ConcurrencyLimit, JobInfo, JobStatus, JobStatusKind, JobView};
 use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt, JobAttemptView};
 use crate::keys::{
-    attempt_key, idx_status_membership_key, idx_status_time_key, job_info_key, job_status_key,
-    leased_task_key, task_key,
+    attempt_key, idx_status_time_key, job_info_key, job_status_key, leased_task_key, task_key,
 };
 use crate::retry::RetryPolicy;
 use crate::settings::DatabaseConfig;
@@ -138,8 +137,10 @@ impl JobStoreShard {
 
         // Apply custom flush interval if specified
         if let Some(flush_ms) = cfg.flush_interval_ms {
-            let mut settings = slatedb::config::Settings::default();
-            settings.flush_interval = Some(std::time::Duration::from_millis(flush_ms));
+            let settings = slatedb::config::Settings {
+                flush_interval: Some(std::time::Duration::from_millis(flush_ms)),
+                ..Default::default()
+            };
             db_builder = db_builder.with_settings(settings);
         }
 
@@ -170,6 +171,7 @@ impl JobStoreShard {
     }
 
     /// Enqueue a new job with optional concurrency limits for a specific tenant.
+    #[allow(clippy::too_many_arguments)]
     pub async fn enqueue(
         &self,
         tenant: &str,
@@ -213,8 +215,6 @@ impl JobStoreShard {
         batch.put(job_info_key(tenant, &job_id).as_bytes(), &job_value);
         self.set_job_status_with_index(&mut batch, tenant, &job_id, job_status)
             .await?;
-
-        let now_ms = now_ms;
         let outcome = self
             .concurrency
             .handle_enqueue(
@@ -311,17 +311,6 @@ impl JobStoreShard {
         if let Some(status) = self.get_job_status(tenant, id).await? {
             let kind = status.kind();
             let changed = status.changed_at_ms();
-            let mem = idx_status_membership_key(
-                tenant,
-                match kind {
-                    JobStatusKind::Scheduled => "Scheduled",
-                    JobStatusKind::Running => "Running",
-                    JobStatusKind::Failed => "Failed",
-                    JobStatusKind::Cancelled => "Cancelled",
-                    JobStatusKind::Succeeded => "Succeeded",
-                },
-                id,
-            );
             let timek = idx_status_time_key(
                 tenant,
                 match kind {
@@ -334,7 +323,6 @@ impl JobStoreShard {
                 changed,
                 id,
             );
-            batch.delete(mem.as_bytes());
             batch.delete(timek.as_bytes());
         }
         batch.delete(job_info_key.as_bytes());
@@ -1094,10 +1082,8 @@ impl JobStoreShard {
         if let Some(old) = self.get_job_status(tenant, job_id).await? {
             let old_kind = old.kind();
             let old_changed = old.changed_at_ms();
-            let old_mem = idx_status_membership_key(tenant, status_kind_str(old_kind), job_id);
             let old_time =
                 idx_status_time_key(tenant, status_kind_str(old_kind), old_changed, job_id);
-            batch.delete(old_mem.as_bytes());
             batch.delete(old_time.as_bytes());
         }
 
@@ -1107,10 +1093,8 @@ impl JobStoreShard {
         // Insert new index entries
         let new_kind = new_status.kind();
         let changed = new_status.changed_at_ms();
-        let mem = idx_status_membership_key(tenant, status_kind_str(new_kind), job_id);
         let timek = idx_status_time_key(tenant, status_kind_str(new_kind), changed, job_id);
-        batch.put(mem.as_bytes(), &[]);
-        batch.put(timek.as_bytes(), &[]);
+        batch.put(timek.as_bytes(), []);
         Ok(())
     }
 

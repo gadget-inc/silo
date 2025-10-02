@@ -145,6 +145,7 @@ impl ConcurrencyManager {
     }
 
     /// Handle concurrency for a new job enqueue
+    #[allow(clippy::too_many_arguments)]
     pub fn handle_enqueue(
         &self,
         batch: &mut WriteBatch,
@@ -222,6 +223,7 @@ impl ConcurrencyManager {
     }
 
     /// Process a RequestTicket task during dequeue
+    #[allow(clippy::too_many_arguments)]
     pub fn process_ticket_request_task(
         &self,
         batch: &mut WriteBatch,
@@ -288,6 +290,7 @@ impl ConcurrencyManager {
 
 // Internal helper functions
 
+#[allow(clippy::too_many_arguments)]
 fn append_grant_edits(
     batch: &mut WriteBatch,
     now_ms: i64,
@@ -327,6 +330,7 @@ fn append_grant_edits(
     }])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_request_edits(
     batch: &mut WriteBatch,
     tenant: &str,

@@ -33,12 +33,14 @@ impl SiloService {
         Self { factory, cfg }
     }
 
+    #[allow(clippy::result_large_err)]
     fn shard(&self, name: &str) -> Result<&JobStoreShard, Status> {
         self.factory
             .get(name)
             .ok_or_else(|| Status::not_found("shard not found"))
     }
 
+    #[allow(clippy::result_large_err)]
     fn validate_tenant(&self, tenant: Option<&str>) -> Result<String, Status> {
         let enabled = self.cfg.tenancy.enabled;
         let present = tenant.and_then(|t| if t.is_empty() { None } else { Some(t) });
@@ -212,7 +214,6 @@ impl Silo for SiloService {
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let r = req.into_inner();
         let shard = self.shard(&r.shard)?;
-        let tenant = self.validate_tenant(r.tenant.as_deref())?;
         shard
             .heartbeat_task(&r.worker_id, &r.task_id)
             .await

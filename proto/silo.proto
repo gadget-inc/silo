@@ -72,7 +72,7 @@ message ReportOutcomeRequest {
 message Failure { string code = 1; bytes data = 2; }
 message ReportOutcomeResponse {}
 
-message HeartbeatRequest { string shard = 1; string worker_id = 2; string task_id = 3; optional string tenant = 4; }
+message HeartbeatRequest { string shard = 1; string worker_id = 2; string task_id = 3; }
 message HeartbeatResponse {}
 
 service Silo {
