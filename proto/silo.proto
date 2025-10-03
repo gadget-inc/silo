@@ -30,6 +30,7 @@ message EnqueueRequest {
   JsonValueBytes payload = 6; // JSON
   repeated ConcurrencyLimit concurrency_limits = 7; // zero or more limits
   optional string tenant = 8; // optional tenant id when tenancy is enabled
+  map<string, string> metadata = 9; // arbitrary key/value metadata stored with the job
 }
 
 message EnqueueResponse {
@@ -44,6 +45,7 @@ message GetJobResponse {
   JsonValueBytes payload = 4;
   optional RetryPolicy retry_policy = 5; // presence indicates some policy
   repeated ConcurrencyLimit concurrency_limits = 6; // declared limits
+  map<string, string> metadata = 7; // arbitrary key/value metadata stored with the job
 }
 
 message DeleteJobRequest { string shard = 1; string id = 2; optional string tenant = 3; }

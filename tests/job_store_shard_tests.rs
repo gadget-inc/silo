@@ -68,6 +68,50 @@ async fn enqueue_round_trip_with_explicit_id() {
 }
 
 #[tokio::test]
+async fn enqueue_with_metadata_round_trips_in_job_view() {
+    let (_tmp, shard) = open_temp_shard().await;
+
+    let payload = serde_json::json!({"m": true});
+    let priority = 5u8;
+    let start_at_ms = 123i64;
+    let md: Vec<(String, String)> = vec![
+        ("a".to_string(), "1".to_string()),
+        ("b".to_string(), "two".to_string()),
+    ];
+
+    let job_id = shard
+        .enqueue_with_metadata(
+            "-",
+            None,
+            priority,
+            start_at_ms,
+            None,
+            payload.clone(),
+            vec![],
+            Some(md.clone()),
+        )
+        .await
+        .expect("enqueue_with_metadata");
+
+    let view = shard
+        .get_job("-", &job_id)
+        .await
+        .expect("get_job")
+        .expect("exists");
+    let got_md = view.metadata();
+    // Convert to map for easy comparison
+    let mut map: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for (k, v) in got_md {
+        map.insert(k, v);
+    }
+    let mut exp: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for (k, v) in md {
+        exp.insert(k, v);
+    }
+    assert_eq!(map, exp, "metadata should roundtrip in JobView");
+}
+
+#[tokio::test]
 async fn enqueue_generates_uuid_when_none_provided() {
     let (_tmp, shard) = open_temp_shard().await;
 

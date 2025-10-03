@@ -15,7 +15,8 @@ use crate::concurrency::{
 use crate::job::{ConcurrencyLimit, JobInfo, JobStatus, JobStatusKind, JobView};
 use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt, JobAttemptView};
 use crate::keys::{
-    attempt_key, idx_status_time_key, job_info_key, job_status_key, leased_task_key, task_key,
+    attempt_key, idx_metadata_key, idx_metadata_prefix, idx_status_time_key, job_info_key,
+    job_status_key, leased_task_key, task_key,
 };
 use crate::retry::RetryPolicy;
 use crate::settings::DatabaseConfig;
@@ -182,6 +183,32 @@ impl JobStoreShard {
         payload: JsonValue,
         concurrency_limits: Vec<ConcurrencyLimit>,
     ) -> Result<String, JobStoreShardError> {
+        self.enqueue_with_metadata(
+            tenant,
+            id,
+            priority,
+            start_at_ms,
+            retry_policy,
+            payload,
+            concurrency_limits,
+            None,
+        )
+        .await
+    }
+
+    /// Enqueue a new job including arbitrary metadata key/value pairs.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enqueue_with_metadata(
+        &self,
+        tenant: &str,
+        id: Option<String>,
+        priority: u8,
+        start_at_ms: i64,
+        retry_policy: Option<RetryPolicy>,
+        payload: JsonValue,
+        concurrency_limits: Vec<ConcurrencyLimit>,
+        metadata: Option<Vec<(String, String)>>,
+    ) -> Result<String, JobStoreShardError> {
         let job_id = id.unwrap_or_else(|| Uuid::new_v4().to_string());
         // If caller provided an id, ensure it doesn't already exist
         if self
@@ -200,6 +227,7 @@ impl JobStoreShard {
             payload: payload_bytes,
             retry_policy,
             concurrency_limits: concurrency_limits.clone(),
+            metadata: metadata.unwrap_or_default(),
         };
         let job_value: AlignedVec = rkyv::to_bytes::<JobInfo, 256>(&job)
             .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
@@ -213,6 +241,11 @@ impl JobStoreShard {
         // Atomically write job info, job status, and handle concurrency
         let mut batch = WriteBatch::new();
         batch.put(job_info_key(tenant, &job_id).as_bytes(), &job_value);
+        // Maintain metadata secondary index (metadata is immutable post-enqueue)
+        for (mk, mv) in &job.metadata {
+            let mkey = idx_metadata_key(tenant, mk, mv, &job_id);
+            batch.put(mkey.as_bytes(), []);
+        }
         self.set_job_status_with_index(&mut batch, tenant, &job_id, job_status)
             .await?;
         let outcome = self
@@ -324,6 +357,14 @@ impl JobStoreShard {
                 id,
             );
             batch.delete(timek.as_bytes());
+        }
+        // Clean up metadata index entries (load job info to enumerate metadata)
+        if let Some(raw) = self.db.get(job_info_key.as_bytes()).await? {
+            let view = JobView::new(raw)?;
+            for (mk, mv) in view.metadata().into_iter() {
+                let mkey = idx_metadata_key(tenant, &mk, &mv, id);
+                batch.delete(mkey.as_bytes());
+            }
         }
         batch.delete(job_info_key.as_bytes());
         batch.delete(job_status_key.as_bytes());
@@ -1124,6 +1165,37 @@ impl JobStoreShard {
             let Some(kv) = maybe else { break };
             let key_str = String::from_utf8_lossy(&kv.key);
             // key format: idx/status_ts/<tenant>/<status>/<inv_ts>/<job-id>
+            if let Some(job_id) = key_str.rsplit('/').next() {
+                if !job_id.is_empty() {
+                    out.push(job_id.to_string());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Scan jobs by metadata key/value. Order is not specified.
+    pub async fn scan_jobs_by_metadata(
+        &self,
+        tenant: &str,
+        key: &str,
+        value: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, JobStoreShardError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let prefix = idx_metadata_prefix(tenant, key, value);
+        let start = prefix.as_bytes().to_vec();
+        let mut end = start.clone();
+        end.push(0xFF);
+        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..=end).await?;
+        let mut out: Vec<String> = Vec::with_capacity(limit);
+        while out.len() < limit {
+            let maybe = iter.next().await?;
+            let Some(kv) = maybe else { break };
+            let key_str = String::from_utf8_lossy(&kv.key);
+            // key format: idx/meta/<tenant>/<key>/<value>/<job-id>
             if let Some(job_id) = key_str.rsplit('/').next() {
                 if !job_id.is_empty() {
                     out.push(job_id.to_string());

@@ -3,6 +3,11 @@ fn escape_tenant(tenant: &str) -> String {
     tenant.replace('%', "%25").replace('/', "%2F")
 }
 
+fn escape_segment(segment: &str) -> String {
+    // Apply the same escaping used for tenants to arbitrary path segments
+    segment.replace('%', "%25").replace('/', "%2F")
+}
+
 fn validate_tenant_len(tenant: &str) {
     // Enforced by callers; keep panic-free here for perf in hot paths
     debug_assert!(tenant.chars().count() <= 64, "tenant id exceeds 64 chars");
@@ -39,6 +44,32 @@ pub fn idx_status_time_key(tenant: &str, status: &str, changed_at_ms: i64, job_i
         status,
         inv,
         job_id
+    )
+}
+
+/// Index: jobs by metadata key/value (unsorted)
+/// Key format: idx/meta/<tenant>/<key>/<value>/<job-id>
+pub fn idx_metadata_key(tenant: &str, key: &str, value: &str, job_id: &str) -> String {
+    validate_tenant_len(tenant);
+    validate_id_len(job_id);
+    format!(
+        "idx/meta/{}/{}/{}/{}",
+        escape_tenant(tenant),
+        escape_segment(key),
+        escape_segment(value),
+        job_id
+    )
+}
+
+/// Prefix for scanning jobs by metadata key/value
+/// Prefix format: idx/meta/<tenant>/<key>/<value>/
+pub fn idx_metadata_prefix(tenant: &str, key: &str, value: &str) -> String {
+    validate_tenant_len(tenant);
+    format!(
+        "idx/meta/{}/{}/{}/",
+        escape_tenant(tenant),
+        escape_segment(key),
+        escape_segment(value)
     )
 }
 

@@ -133,6 +133,7 @@ fn grpc_end_to_end_under_turmoil() {
             }),
             concurrency_limits: vec![],
             tenant: None,
+            metadata: std::collections::HashMap::new(),
         };
         let resp = client.enqueue(tonic::Request::new(req)).await?.into_inner();
         let job_id = resp.id;
@@ -284,6 +285,7 @@ fn grpc_fault_injection_with_partition() {
             }),
             concurrency_limits: vec![],
             tenant: None,
+            metadata: std::collections::HashMap::new(),
         };
 
         let job_id = client
@@ -487,6 +489,7 @@ fn stress_multiple_workers_with_partitions() {
                 }),
                 concurrency_limits: vec![],
                 tenant: None,
+                metadata: std::collections::HashMap::new(),
             };
 
             // Retry on failure
@@ -743,6 +746,7 @@ fn stress_duplicate_completion_idempotency() {
                 }),
                 concurrency_limits: vec![],
                 tenant: None,
+                metadata: std::collections::HashMap::new(),
             }))
             .await?
             .into_inner()
@@ -922,6 +926,7 @@ fn stress_lease_expiry_during_partition() {
                 }),
                 concurrency_limits: vec![],
                 tenant: None,
+                metadata: std::collections::HashMap::new(),
             }))
             .await?;
 
@@ -1120,6 +1125,7 @@ fn stress_high_message_loss() {
                 }),
                 concurrency_limits: vec![],
                 tenant: None,
+                metadata: std::collections::HashMap::new(),
             };
 
             for attempt in 0..20 {
@@ -1289,6 +1295,7 @@ fn concurrency_request_ready_without_release_fails() {
                 }),
                 concurrency_limits: conc,
                 tenant: None,
+                metadata: std::collections::HashMap::new(),
             }))
             .await?
             .into_inner()
@@ -1326,6 +1333,7 @@ fn concurrency_request_ready_without_release_fails() {
                 }),
                 concurrency_limits: conc2,
                 tenant: None,
+                metadata: std::collections::HashMap::new(),
             }))
             .await?
             .into_inner()

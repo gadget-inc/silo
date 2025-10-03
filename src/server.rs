@@ -89,8 +89,31 @@ impl Silo for SiloService {
                 max_concurrency: l.max_concurrency,
             })
             .collect();
+        // Validate metadata constraints: <=16 entries, key < 64 chars, value < u16::MAX
+        if r.metadata.len() > 16 {
+            return Err(Status::invalid_argument(
+                "metadata has too many entries (max 16)",
+            ));
+        }
+        for (k, v) in &r.metadata {
+            if k.chars().count() >= 64 {
+                return Err(Status::invalid_argument(
+                    "metadata key too long (must be < 64 chars)",
+                ));
+            }
+            if v.len() as u128 >= (u16::MAX as u128) {
+                return Err(Status::invalid_argument(
+                    "metadata value too long (must be < u16::MAX bytes)",
+                ));
+            }
+        }
+        let metadata: Option<Vec<(String, String)>> = if r.metadata.is_empty() {
+            None
+        } else {
+            Some(r.metadata.into_iter().collect())
+        };
         let id = shard
-            .enqueue(
+            .enqueue_with_metadata(
                 &tenant,
                 if r.id.is_empty() { None } else { Some(r.id) },
                 r.priority as u8,
@@ -98,6 +121,7 @@ impl Silo for SiloService {
                 retry,
                 payload,
                 limits,
+                metadata,
             )
             .await
             .map_err(map_err)?;
@@ -138,6 +162,7 @@ impl Silo for SiloService {
                     max_concurrency: l.max_concurrency,
                 })
                 .collect(),
+            metadata: view.metadata().into_iter().collect(),
         };
         Ok(Response::new(resp))
     }

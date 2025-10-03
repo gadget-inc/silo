@@ -477,3 +477,143 @@ async fn future_enqueue_is_in_scheduled_scan() {
         .unwrap();
     assert!(scheduled.contains(&id));
 }
+
+#[tokio::test]
+async fn metadata_index_basic_and_delete_cleanup() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    // Enqueue three jobs with overlapping metadata
+    let a = shard
+        .enqueue_with_metadata(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            serde_json::json!({"a":1}),
+            vec![],
+            Some(vec![
+                ("k".to_string(), "v".to_string()),
+                ("x".to_string(), "y".to_string()),
+            ]),
+        )
+        .await
+        .expect("enqueue a");
+    let b = shard
+        .enqueue_with_metadata(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            serde_json::json!({"b":2}),
+            vec![],
+            Some(vec![("k".to_string(), "v".to_string())]),
+        )
+        .await
+        .expect("enqueue b");
+    let c = shard
+        .enqueue_with_metadata(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            serde_json::json!({"c":3}),
+            vec![],
+            Some(vec![("k".to_string(), "w".to_string())]),
+        )
+        .await
+        .expect("enqueue c");
+
+    // Scan by (k=v) should include A and B (order unspecified)
+    let kv = shard
+        .scan_jobs_by_metadata("-", "k", "v", 10)
+        .await
+        .expect("scan k=v");
+    assert_eq!(kv.len(), 2);
+    assert!(kv.contains(&a));
+    assert!(kv.contains(&b));
+
+    // Scan by (x=y) should include only A
+    let xy = shard
+        .scan_jobs_by_metadata("-", "x", "y", 10)
+        .await
+        .expect("scan x=y");
+    assert_eq!(xy, vec![a.clone()]);
+
+    // Scan by (k=w) should include only C
+    let kw = shard
+        .scan_jobs_by_metadata("-", "k", "w", 10)
+        .await
+        .expect("scan k=w");
+    assert_eq!(kw, vec![c.clone()]);
+
+    // Complete A so it reaches a terminal state, then delete and verify cleanup
+    let tasks = shard.dequeue("-", "w", 3).await.expect("dequeue");
+    let a_tid = tasks
+        .iter()
+        .find(|t| t.job().id() == a)
+        .map(|t| t.attempt().task_id().to_string())
+        .expect("leased task for A");
+    shard
+        .report_attempt_outcome("-", &a_tid, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("complete A");
+    shard.delete_job("-", &a).await.expect("delete a");
+    let kv2 = shard
+        .scan_jobs_by_metadata("-", "k", "v", 10)
+        .await
+        .expect("scan k=v after delete");
+    assert_eq!(kv2, vec![b]);
+}
+
+#[tokio::test]
+async fn metadata_scan_cross_tenant_isolation() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    let a = shard
+        .enqueue_with_metadata(
+            "tenantA",
+            None,
+            10u8,
+            now,
+            None,
+            serde_json::json!({"t":"A"}),
+            vec![],
+            Some(vec![("k".to_string(), "v".to_string())]),
+        )
+        .await
+        .unwrap();
+    let _b = shard
+        .enqueue_with_metadata(
+            "tenantB",
+            None,
+            10u8,
+            now,
+            None,
+            serde_json::json!({"t":"B"}),
+            vec![],
+            Some(vec![("k".to_string(), "v".to_string())]),
+        )
+        .await
+        .unwrap();
+
+    let list_a = shard
+        .scan_jobs_by_metadata("tenantA", "k", "v", 10)
+        .await
+        .unwrap();
+    assert_eq!(list_a, vec![a]);
+
+    // tenantA scan should not include tenantB job
+    assert_eq!(list_a.len(), 1);
+}
+
+#[tokio::test]
+async fn metadata_scan_limit_zero_returns_empty() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let empty = shard.scan_jobs_by_metadata("-", "k", "v", 0).await.unwrap();
+    assert!(empty.is_empty());
+}

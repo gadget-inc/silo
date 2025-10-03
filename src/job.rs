@@ -81,6 +81,7 @@ pub struct JobInfo {
     pub payload: Vec<u8>,     // JSON bytes for now (opaque to rkyv)
     pub retry_policy: Option<RetryPolicy>,
     pub concurrency_limits: Vec<ConcurrencyLimit>,
+    pub metadata: Vec<(String, String)>,
 }
 
 impl JobView {
@@ -140,6 +141,17 @@ impl JobView {
                 key: lim.key.as_str().to_string(),
                 max_concurrency: lim.max_concurrency,
             });
+        }
+        out
+    }
+
+    /// Return metadata as owned key/value string pairs
+    pub fn metadata(&self) -> Vec<(String, String)> {
+        let a = self.archived();
+        let mut out: Vec<(String, String)> = Vec::with_capacity(a.metadata.len());
+        for pair in a.metadata.iter() {
+            let (k, v) = pair;
+            out.push((k.as_str().to_string(), v.as_str().to_string()));
         }
         out
     }
