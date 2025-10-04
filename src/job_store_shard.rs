@@ -4,7 +4,7 @@ use serde_json::Value as JsonValue;
 use slatedb::Db;
 use slatedb::DbIterator;
 use slatedb::WriteBatch;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -18,6 +18,7 @@ use crate::keys::{
     attempt_key, idx_metadata_key, idx_metadata_prefix, idx_status_time_key, job_info_key,
     job_status_key, leased_task_key, task_key,
 };
+use crate::query::JobSql;
 use crate::retry::RetryPolicy;
 use crate::settings::DatabaseConfig;
 use crate::storage::{resolve_object_store, StorageError};
@@ -30,6 +31,7 @@ pub struct JobStoreShard {
     db: Arc<Db>,
     broker: Arc<TaskBroker>,
     concurrency: Arc<ConcurrencyManager>,
+    query_engine: OnceLock<JobSql>,
 }
 
 #[derive(Debug, Error)]
@@ -131,7 +133,7 @@ pub enum ConcurrencyAction {
 }
 
 impl JobStoreShard {
-    pub async fn open(cfg: &DatabaseConfig) -> Result<Self, JobStoreShardError> {
+    pub async fn open(cfg: &DatabaseConfig) -> Result<Arc<Self>, JobStoreShardError> {
         let object_store = resolve_object_store(&cfg.backend, &cfg.path)?;
 
         let mut db_builder = slatedb::DbBuilder::new(cfg.path.as_str(), object_store);
@@ -150,11 +152,22 @@ impl JobStoreShard {
         let concurrency = Arc::new(ConcurrencyManager::new());
         let broker = TaskBroker::new(Arc::clone(&db), Arc::clone(&concurrency));
         broker.start();
-        Ok(Self {
+
+        let shard = Arc::new(Self {
             name: cfg.name.clone(),
             db,
             broker,
             concurrency,
+            query_engine: OnceLock::new(),
+        });
+
+        Ok(shard)
+    }
+
+    /// Get the query engine for this shard, lazily initializing it on first access.
+    pub fn query_engine(self: &Arc<Self>) -> &JobSql {
+        self.query_engine.get_or_init(|| {
+            JobSql::new(Arc::clone(self), "jobs").expect("Failed to create query engine")
         })
     }
 
@@ -388,6 +401,48 @@ impl JobStoreShard {
         }
     }
 
+    /// Fetch multiple jobs by id concurrently. Returns a map of job_id -> JobView.
+    /// Jobs that don't exist will not be present in the result map.
+    pub async fn get_jobs_batch(
+        &self,
+        tenant: &str,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, JobView>, JobStoreShardError> {
+        use std::collections::HashMap;
+
+        let mut handles = Vec::new();
+        for id in ids {
+            let db = Arc::clone(&self.db);
+            let key = job_info_key(tenant, id);
+            let id_clone = id.clone();
+            let handle = tokio::spawn(async move {
+                let maybe_raw = db.get(key.as_bytes()).await?;
+                if let Some(raw) = maybe_raw {
+                    let view = JobView::new(raw)?;
+                    Ok::<_, JobStoreShardError>(Some((id_clone, view)))
+                } else {
+                    Ok(None)
+                }
+            });
+            handles.push(handle);
+        }
+
+        let mut result = HashMap::with_capacity(ids.len());
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(Some((id, view)))) => {
+                    result.insert(id, view);
+                }
+                Ok(Ok(None)) => {
+                    // Job doesn't exist, skip
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(e) => return Err(JobStoreShardError::Rkyv(format!("Task join error: {}", e))),
+            }
+        }
+        Ok(result)
+    }
+
     /// Fetch a job by id as a zero-copy archived view.
     pub async fn get_job_status(
         &self,
@@ -412,6 +467,58 @@ impl JobStoreShard {
         let status: JobStatus = RkyvDeserialize::deserialize(archived, &mut des)
             .unwrap_or_else(|_| unreachable!("infallible deserialization for JobStatus"));
         Ok(Some(status))
+    }
+
+    /// Fetch multiple job statuses by id concurrently. Returns a map of job_id -> JobStatus.
+    /// Jobs that don't exist will not be present in the result map.
+    pub async fn get_jobs_status_batch(
+        &self,
+        tenant: &str,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, JobStatus>, JobStoreShardError> {
+        use std::collections::HashMap;
+
+        let mut handles = Vec::new();
+        for id in ids {
+            let db = Arc::clone(&self.db);
+            let key = job_status_key(tenant, id);
+            let id_clone = id.clone();
+            let handle = tokio::spawn(async move {
+                let maybe_raw = db.get(key.as_bytes()).await?;
+                let Some(raw) = maybe_raw else {
+                    return Ok::<_, JobStoreShardError>(None);
+                };
+
+                #[cfg(debug_assertions)]
+                {
+                    let _ = rkyv::check_archived_root::<JobStatus>(&raw)
+                        .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
+                }
+
+                type ArchivedStatus = <JobStatus as Archive>::Archived;
+                let archived: &ArchivedStatus = unsafe { rkyv::archived_root::<JobStatus>(&raw) };
+                let mut des = rkyv::Infallible;
+                let status: JobStatus = RkyvDeserialize::deserialize(archived, &mut des)
+                    .unwrap_or_else(|_| unreachable!("infallible deserialization for JobStatus"));
+                Ok(Some((id_clone, status)))
+            });
+            handles.push(handle);
+        }
+
+        let mut result = HashMap::with_capacity(ids.len());
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(Some((id, status)))) => {
+                    result.insert(id, status);
+                }
+                Ok(Ok(None)) => {
+                    // Status doesn't exist, skip
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(e) => return Err(JobStoreShardError::Rkyv(format!("Task join error: {}", e))),
+            }
+        }
+        Ok(result)
     }
 
     /// Fetch a job attempt by job id and attempt number.
@@ -1078,39 +1185,7 @@ impl JobStoreShard {
 
         Ok(reaped)
     }
-}
 
-pub(crate) fn now_epoch_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    now.as_millis() as i64
-}
-
-fn put_job_status(
-    batch: &mut WriteBatch,
-    tenant: &str,
-    job_id: &str,
-    status: &JobStatus,
-) -> Result<(), JobStoreShardError> {
-    let job_status_value: AlignedVec = rkyv::to_bytes::<JobStatus, 256>(status)
-        .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
-    batch.put(job_status_key(tenant, job_id).as_bytes(), &job_status_value);
-    Ok(())
-}
-
-fn status_kind_str(kind: JobStatusKind) -> &'static str {
-    match kind {
-        JobStatusKind::Scheduled => "Scheduled",
-        JobStatusKind::Running => "Running",
-        JobStatusKind::Failed => "Failed",
-        JobStatusKind::Cancelled => "Cancelled",
-        JobStatusKind::Succeeded => "Succeeded",
-    }
-}
-
-impl JobStoreShard {
     /// Update job status and maintain secondary indexes in the same write batch.
     async fn set_job_status_with_index(
         &self,
@@ -1137,6 +1212,36 @@ impl JobStoreShard {
         let timek = idx_status_time_key(tenant, status_kind_str(new_kind), changed, job_id);
         batch.put(timek.as_bytes(), []);
         Ok(())
+    }
+
+    /// Scan all jobs for a tenant ordered by job id (lexicographic), unfiltered.
+    pub async fn scan_jobs(
+        &self,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, JobStoreShardError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        // Prefix: jobs/<tenant>/
+        let prefix = crate::keys::job_info_key(tenant, "");
+        let start = prefix.as_bytes().to_vec();
+        let mut end = start.clone();
+        end.push(0xFF);
+        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..=end).await?;
+        let mut out: Vec<String> = Vec::with_capacity(limit);
+        while out.len() < limit {
+            let maybe = iter.next().await?;
+            let Some(kv) = maybe else { break };
+            let key_str = String::from_utf8_lossy(&kv.key);
+            // key format: jobs/<tenant>/<job-id>
+            if let Some(job_id) = key_str.rsplit('/').next() {
+                if !job_id.is_empty() {
+                    out.push(job_id.to_string());
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Scan newest-first job IDs by status using the time-ordered index.
@@ -1203,5 +1308,35 @@ impl JobStoreShard {
             }
         }
         Ok(out)
+    }
+}
+
+pub(crate) fn now_epoch_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    now.as_millis() as i64
+}
+
+fn put_job_status(
+    batch: &mut WriteBatch,
+    tenant: &str,
+    job_id: &str,
+    status: &JobStatus,
+) -> Result<(), JobStoreShardError> {
+    let job_status_value: AlignedVec = rkyv::to_bytes::<JobStatus, 256>(status)
+        .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
+    batch.put(job_status_key(tenant, job_id).as_bytes(), &job_status_value);
+    Ok(())
+}
+
+fn status_kind_str(kind: JobStatusKind) -> &'static str {
+    match kind {
+        JobStatusKind::Scheduled => "Scheduled",
+        JobStatusKind::Running => "Running",
+        JobStatusKind::Failed => "Failed",
+        JobStatusKind::Cancelled => "Cancelled",
+        JobStatusKind::Succeeded => "Succeeded",
     }
 }

@@ -92,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
             flush_interval_ms: Some(10), // Fast flushes for simulation
         };
         let shard = JobStoreShard::open(&cfg).await?;
-        shards.push(Arc::new(shard));
+        shards.push(shard);
     }
 
     let seen_attempt_ids: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));

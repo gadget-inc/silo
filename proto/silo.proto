@@ -77,6 +77,26 @@ message ReportOutcomeResponse {}
 message HeartbeatRequest { string shard = 1; string worker_id = 2; string task_id = 3; }
 message HeartbeatResponse {}
 
+// Execute SQL query against shard data
+message QueryRequest { 
+  string shard = 1; 
+  string sql = 2; 
+  optional string tenant = 3; 
+}
+
+// Column metadata for the result schema
+message ColumnInfo {
+  string name = 1;
+  string data_type = 2; // Arrow/DataFusion type as string (e.g. "Utf8", "Int64", "UInt8")
+}
+
+// Query result row as JSON object
+message QueryResponse {
+  repeated ColumnInfo columns = 1; // Schema information
+  repeated JsonValueBytes rows = 2; // Each row is a JSON object
+  int32 row_count = 3; // Number of rows returned
+}
+
 service Silo {
   rpc Enqueue(EnqueueRequest) returns (EnqueueResponse);
   rpc GetJob(GetJobRequest) returns (GetJobResponse);
@@ -84,6 +104,7 @@ service Silo {
   rpc LeaseTasks(LeaseTasksRequest) returns (LeaseTasksResponse);
   rpc ReportOutcome(ReportOutcomeRequest) returns (ReportOutcomeResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc Query(QueryRequest) returns (QueryResponse);
 }
 
 

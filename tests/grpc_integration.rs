@@ -268,3 +268,405 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
     .expect("test timed out")?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_server_query_basic() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let tmp = tempfile::tempdir()?;
+        let template = DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+        };
+        let mut factory = ShardFactory::new(template);
+        let _ = factory.open(0).await?;
+        let factory = Arc::new(factory);
+
+        let listener =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+        let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), shutdown_rx));
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint.clone())?
+            .connect()
+            .await?;
+        let mut client = SiloClient::new(channel);
+
+        // Enqueue a few jobs with metadata
+        for i in 0..3 {
+            let payload = serde_json::json!({ "index": i });
+            let payload_bytes = serde_json::to_vec(&payload)?;
+            let mut md = std::collections::HashMap::new();
+            md.insert("env".to_string(), "test".to_string());
+            md.insert("batch".to_string(), "batch1".to_string());
+            let enq = EnqueueRequest {
+                shard: "0".to_string(),
+                id: format!("job{}", i),
+                priority: (10 + i) as u32,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(JsonValueBytes {
+                    data: payload_bytes,
+                }),
+                concurrency_limits: vec![],
+                tenant: None,
+                metadata: md,
+            };
+            let _ = client.enqueue(enq).await?;
+        }
+
+        // Test 1: Basic SELECT query
+        let query_resp = client
+            .query(QueryRequest {
+                shard: "0".to_string(),
+                sql: "SELECT * FROM jobs".to_string(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+
+        assert_eq!(query_resp.row_count, 3, "expected 3 rows");
+        assert!(
+            query_resp.columns.iter().any(|c| c.name == "id"),
+            "expected id column"
+        );
+        assert!(
+            query_resp.columns.iter().any(|c| c.name == "priority"),
+            "expected priority column"
+        );
+
+        // Verify rows are returned as JSON
+        let first_row: serde_json::Value = serde_json::from_slice(&query_resp.rows[0].data)?;
+        assert!(first_row.get("id").is_some(), "row should have id field");
+
+        // Test 2: Query with WHERE clause
+        let query_resp = client
+            .query(QueryRequest {
+                shard: "0".to_string(),
+                sql: "SELECT id FROM jobs WHERE priority >= 10".to_string(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+
+        assert_eq!(
+            query_resp.row_count, 3,
+            "expected 3 rows with priority >= 10"
+        );
+
+        // Test 3: Aggregation query
+        let query_resp = client
+            .query(QueryRequest {
+                shard: "0".to_string(),
+                sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+
+        assert_eq!(query_resp.row_count, 1, "aggregation should return 1 row");
+        let count_row: serde_json::Value = serde_json::from_slice(&query_resp.rows[0].data)?;
+        assert_eq!(count_row["count"], 3, "count should be 3");
+
+        let _ = shutdown_tx.send(());
+        let join_result = server.await;
+        match join_result {
+            Ok(inner) => {
+                if let Err(e) = inner {
+                    return Err(anyhow::anyhow!(e.to_string()));
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        }
+        Ok(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_server_query_errors() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let tmp = tempfile::tempdir()?;
+        let template = DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+        };
+        let mut factory = ShardFactory::new(template);
+        let _ = factory.open(0).await?;
+        let factory = Arc::new(factory);
+
+        let listener =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+        let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), shutdown_rx));
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint.clone())?
+            .connect()
+            .await?;
+        let mut client = SiloClient::new(channel);
+
+        // Test 1: SQL syntax error
+        let res = client
+            .query(QueryRequest {
+                shard: "0".to_string(),
+                sql: "SELECT FROM WHERE".to_string(),
+                tenant: None,
+            })
+            .await;
+
+        match res {
+            Ok(_) => panic!("expected SQL error"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::InvalidArgument);
+                assert!(
+                    status.message().contains("SQL error"),
+                    "error message should mention SQL error: {}",
+                    status.message()
+                );
+            }
+        }
+
+        // Test 2: Invalid column name
+        let res = client
+            .query(QueryRequest {
+                shard: "0".to_string(),
+                sql: "SELECT nonexistent_column FROM jobs".to_string(),
+                tenant: None,
+            })
+            .await;
+
+        match res {
+            Ok(_) => panic!("expected column error"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::InvalidArgument);
+            }
+        }
+
+        // Test 3: Shard not found
+        let res = client
+            .query(QueryRequest {
+                shard: "999".to_string(),
+                sql: "SELECT * FROM jobs".to_string(),
+                tenant: None,
+            })
+            .await;
+
+        match res {
+            Ok(_) => panic!("expected shard not found error"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::NotFound);
+            }
+        }
+
+        let _ = shutdown_tx.send(());
+        let join_result = server.await;
+        match join_result {
+            Ok(inner) => {
+                if let Err(e) = inner {
+                    return Err(anyhow::anyhow!(e.to_string()));
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        }
+        Ok(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let tmp = tempfile::tempdir()?;
+        let template = DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+        };
+        let mut factory = ShardFactory::new(template);
+        let _ = factory.open(0).await?;
+        let factory = Arc::new(factory);
+
+        let listener =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+        let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), shutdown_rx));
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint.clone())?
+            .connect()
+            .await?;
+        let mut client = SiloClient::new(channel);
+
+        // Query on empty shard
+        let query_resp = client
+            .query(QueryRequest {
+                shard: "0".to_string(),
+                sql: "SELECT * FROM jobs".to_string(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+
+        assert_eq!(query_resp.row_count, 0, "expected 0 rows on empty shard");
+        assert!(!query_resp.columns.is_empty(), "should still have schema");
+        assert!(query_resp.rows.is_empty(), "should have no rows");
+
+        // Add a job, then query with WHERE that matches nothing
+        let payload = serde_json::json!({ "test": "data" });
+        let payload_bytes = serde_json::to_vec(&payload)?;
+        let enq = EnqueueRequest {
+            shard: "0".to_string(),
+            id: "test_job".to_string(),
+            priority: 10,
+            start_at_ms: 0,
+            retry_policy: None,
+            payload: Some(JsonValueBytes {
+                data: payload_bytes,
+            }),
+            concurrency_limits: vec![],
+            tenant: None,
+            metadata: std::collections::HashMap::new(),
+        };
+        let _ = client.enqueue(enq).await?;
+
+        // Query that doesn't match
+        let query_resp = client
+            .query(QueryRequest {
+                shard: "0".to_string(),
+                sql: "SELECT * FROM jobs WHERE id = 'nonexistent'".to_string(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+
+        assert_eq!(
+            query_resp.row_count, 0,
+            "expected 0 rows for nonexistent id"
+        );
+        assert!(!query_resp.columns.is_empty(), "should still have schema");
+
+        let _ = shutdown_tx.send(());
+        let join_result = server.await;
+        match join_result {
+            Ok(inner) => {
+                if let Err(e) = inner {
+                    return Err(anyhow::anyhow!(e.to_string()));
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        }
+        Ok(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let tmp = tempfile::tempdir()?;
+        let template = DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+        };
+        let mut factory = ShardFactory::new(template);
+        let _ = factory.open(0).await?;
+        let factory = Arc::new(factory);
+
+        let listener =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+        let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), shutdown_rx));
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint.clone())?
+            .connect()
+            .await?;
+        let mut client = SiloClient::new(channel);
+
+        // Enqueue a job with complex metadata
+        let payload = serde_json::json!({
+            "task": "process",
+            "nested": { "field": "value" }
+        });
+        let payload_bytes = serde_json::to_vec(&payload)?;
+        let mut md = std::collections::HashMap::new();
+        md.insert("user_id".to_string(), "12345".to_string());
+        md.insert("region".to_string(), "us-west".to_string());
+
+        let enq = EnqueueRequest {
+            shard: "0".to_string(),
+            id: "complex_job".to_string(),
+            priority: 5,
+            start_at_ms: 1234567890,
+            retry_policy: None,
+            payload: Some(JsonValueBytes {
+                data: payload_bytes,
+            }),
+            concurrency_limits: vec![],
+            tenant: None,
+            metadata: md,
+        };
+        let _ = client.enqueue(enq).await?;
+
+        // Query with multiple columns to verify schema
+        let query_resp = client
+            .query(QueryRequest {
+                shard: "0".to_string(),
+                sql: "SELECT id, priority, enqueue_time_ms, payload FROM jobs".to_string(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+
+        // Verify schema includes data types (helpful for TypeScript codegen)
+        assert!(query_resp
+            .columns
+            .iter()
+            .any(|c| c.name == "id" && c.data_type.contains("Utf8")));
+        assert!(query_resp
+            .columns
+            .iter()
+            .any(|c| c.name == "priority" && c.data_type.contains("UInt8")));
+        assert!(query_resp
+            .columns
+            .iter()
+            .any(|c| c.name == "enqueue_time_ms" && c.data_type.contains("Int64")));
+
+        // Verify row is valid JSON that TypeScript can deserialize
+        let row: serde_json::Value = serde_json::from_slice(&query_resp.rows[0].data)?;
+        assert_eq!(row["id"], "complex_job");
+        assert_eq!(row["priority"], 5);
+        assert_eq!(row["enqueue_time_ms"], 1234567890);
+
+        // Verify payload is a JSON string that can be parsed again
+        let payload_str = row["payload"].as_str().expect("payload should be string");
+        let parsed_payload: serde_json::Value = serde_json::from_str(payload_str)?;
+        assert_eq!(parsed_payload["task"], "process");
+        assert_eq!(parsed_payload["nested"]["field"], "value");
+
+        let _ = shutdown_tx.send(());
+        let join_result = server.await;
+        match join_result {
+            Ok(inner) => {
+                if let Err(e) = inner {
+                    return Err(anyhow::anyhow!(e.to_string()));
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        }
+        Ok(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}

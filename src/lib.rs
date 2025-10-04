@@ -6,6 +6,7 @@ pub mod job;
 pub mod job_attempt;
 pub mod job_store_shard;
 pub mod keys;
+pub mod query;
 pub mod retry;
 pub mod settings;
 pub mod shard_guard;

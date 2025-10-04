@@ -36,6 +36,13 @@ opentelemetry_sdk = { version = "0.26", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.26", features = ["http-json", "trace"] }
 usdt = "0.6.0"
 tempfile = "3"
+async-trait = "0.1"
+datafusion = { version = "50", features = [
+    "nested_expressions",
+    "datetime_expressions",
+    "regex_expressions",
+    "recursive_protection",
+] }
 
 [dev-dependencies]
 turmoil = { git = "https://github.com/tokio-rs/turmoil", rev = "dd7c0b1515537e639e045fe1034b6287dc026440" }

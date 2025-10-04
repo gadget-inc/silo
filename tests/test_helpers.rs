@@ -24,7 +24,7 @@ pub fn parse_time_from_task_key(key: &str) -> Option<u64> {
     None
 }
 
-pub async fn open_temp_shard() -> (tempfile::TempDir, JobStoreShard) {
+pub async fn open_temp_shard() -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>) {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = DatabaseConfig {
         name: "test".to_string(),

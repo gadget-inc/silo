@@ -617,3 +617,84 @@ async fn metadata_scan_limit_zero_returns_empty() {
     let empty = shard.scan_jobs_by_metadata("-", "k", "v", 0).await.unwrap();
     assert!(empty.is_empty());
 }
+
+#[tokio::test]
+async fn scan_jobs_unfiltered_basic_and_ordering() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    // Enqueue jobs with deterministic ids
+    let ids = vec!["a1", "a2", "b1", "b2"];
+    for id in &ids {
+        let _ = shard
+            .enqueue(
+                "-",
+                Some(id.to_string()),
+                10u8,
+                now,
+                None,
+                serde_json::json!({}),
+                vec![],
+            )
+            .await
+            .expect("enqueue");
+    }
+    // Scan with limit
+    let first_three = shard.scan_jobs("-", 3).await.expect("scan jobs");
+    assert_eq!(first_three.len(), 3);
+    // Lexicographic order of job ids
+    assert_eq!(
+        first_three,
+        vec!["a1".to_string(), "a2".to_string(), "b1".to_string()]
+    );
+
+    // Full scan should include all ids in order
+    let all = shard.scan_jobs("-", 10).await.expect("scan all");
+    assert_eq!(
+        all,
+        vec![
+            "a1".to_string(),
+            "a2".to_string(),
+            "b1".to_string(),
+            "b2".to_string()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn scan_jobs_is_tenant_isolated_and_limit_zero_empty() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    // Create jobs in two tenants
+    let a = shard
+        .enqueue(
+            "tenantA",
+            Some("x1".to_string()),
+            10u8,
+            now,
+            None,
+            serde_json::json!({}),
+            vec![],
+        )
+        .await
+        .unwrap();
+    let _b = shard
+        .enqueue(
+            "tenantB",
+            Some("x2".to_string()),
+            10u8,
+            now,
+            None,
+            serde_json::json!({}),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    // Limit zero
+    let empty = shard.scan_jobs("tenantA", 0).await.unwrap();
+    assert!(empty.is_empty());
+
+    // Tenant isolation: only tenantA job is returned
+    let list_a = shard.scan_jobs("tenantA", 10).await.unwrap();
+    assert_eq!(list_a, vec![a]);
+}

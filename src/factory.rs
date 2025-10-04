@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::job_store_shard::JobStoreShard;
 use crate::job_store_shard::JobStoreShardError;
@@ -7,7 +8,7 @@ use thiserror::Error;
 
 /// Factory for opening and holding `Shard` instances by name.
 pub struct ShardFactory {
-    instances: HashMap<String, JobStoreShard>,
+    instances: HashMap<String, Arc<JobStoreShard>>,
     template: DatabaseTemplate,
 }
 
@@ -19,15 +20,15 @@ impl ShardFactory {
         }
     }
 
-    pub fn get(&self, name: &str) -> Option<&JobStoreShard> {
-        self.instances.get(name)
+    pub fn get(&self, name: &str) -> Option<Arc<JobStoreShard>> {
+        self.instances.get(name).map(Arc::clone)
     }
 
     /// Open a shard using the shared database template.
     pub async fn open(
         &mut self,
         shard_number: usize,
-    ) -> Result<&JobStoreShard, JobStoreShardError> {
+    ) -> Result<Arc<JobStoreShard>, JobStoreShardError> {
         let name = shard_number.to_string();
         let path = self
             .template
@@ -40,12 +41,13 @@ impl ShardFactory {
             path,
             flush_interval_ms: None, // Use SlateDB's default in production
         };
-        let shard = JobStoreShard::open(&cfg).await?;
-        self.instances.insert(cfg.name.clone(), shard);
-        Ok(self.instances.get(&cfg.name).expect("inserted"))
+        let shard_arc = JobStoreShard::open(&cfg).await?;
+        self.instances
+            .insert(cfg.name.clone(), Arc::clone(&shard_arc));
+        Ok(shard_arc)
     }
 
-    pub fn instances(&self) -> &HashMap<String, JobStoreShard> {
+    pub fn instances(&self) -> &HashMap<String, Arc<JobStoreShard>> {
         &self.instances
     }
 

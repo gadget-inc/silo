@@ -34,7 +34,7 @@ impl SiloService {
     }
 
     #[allow(clippy::result_large_err)]
-    fn shard(&self, name: &str) -> Result<&JobStoreShard, Status> {
+    fn shard(&self, name: &str) -> Result<Arc<JobStoreShard>, Status> {
         self.factory
             .get(name)
             .ok_or_else(|| Status::not_found("shard not found"))
@@ -244,6 +244,78 @@ impl Silo for SiloService {
             .await
             .map_err(map_err)?;
         Ok(Response::new(HeartbeatResponse {}))
+    }
+
+    async fn query(&self, req: Request<QueryRequest>) -> Result<Response<QueryResponse>, Status> {
+        let r = req.into_inner();
+        let shard = self.shard(&r.shard)?;
+        let _tenant = self.validate_tenant(r.tenant.as_deref())?;
+
+        // Get the cached query engine for this shard
+        let query_engine = shard.query_engine();
+
+        // Execute query
+        let dataframe = query_engine
+            .sql(&r.sql)
+            .await
+            .map_err(|e| Status::invalid_argument(format!("SQL error: {}", e)))?;
+
+        // Get schema before consuming dataframe
+        let schema = Arc::new(dataframe.schema().as_arrow().clone());
+
+        // Collect results
+        let batches = dataframe
+            .collect()
+            .await
+            .map_err(|e| Status::internal(format!("Query execution failed: {}", e)))?;
+
+        // Use schema from dataframe or first batch
+        let schema = if let Some(batch) = batches.first() {
+            batch.schema()
+        } else {
+            schema
+        };
+
+        let columns: Vec<ColumnInfo> = schema
+            .fields()
+            .iter()
+            .map(|f| ColumnInfo {
+                name: f.name().to_string(),
+                data_type: format!("{:?}", f.data_type()),
+            })
+            .collect();
+
+        // Convert batches to JSON rows
+        let mut rows = Vec::new();
+        for batch in batches {
+            // Convert each batch to JSON using Arrow's built-in JSON writer
+            let mut buf = Vec::new();
+            let mut writer = datafusion::arrow::json::ArrayWriter::new(&mut buf);
+            writer
+                .write(&batch)
+                .map_err(|e| Status::internal(format!("Failed to serialize results: {}", e)))?;
+            writer
+                .finish()
+                .map_err(|e| Status::internal(format!("Failed to finish serialization: {}", e)))?;
+
+            // Parse the JSON array into individual row objects
+            let json_array: Vec<serde_json::Value> = serde_json::from_slice(&buf)
+                .map_err(|e| Status::internal(format!("Failed to parse JSON: {}", e)))?;
+
+            for row_value in json_array {
+                let row_bytes = serde_json::to_vec(&row_value)
+                    .map_err(|e| Status::internal(format!("Failed to serialize row: {}", e)))?;
+                rows.push(JsonValueBytes { data: row_bytes });
+            }
+        }
+
+        let row_count = rows.len() as i32;
+
+        Ok(Response::new(QueryResponse {
+            columns,
+            rows,
+            row_count,
+        }))
     }
 }
 
