@@ -4205,6 +4205,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "turmoil"
 version = "0.6.6"
+source = "git+https://github.com/tokio-rs/turmoil?rev=dd7c0b1515537e639e045fe1034b6287dc026440#dd7c0b1515537e639e045fe1034b6287dc026440"
 dependencies = [
  "bytes",
  "indexmap 2.11.4",
