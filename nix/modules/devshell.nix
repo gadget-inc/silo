@@ -11,6 +11,7 @@
         nixd # Nix language server
         bacon
         etcd
+        protobuf # provides protoc binary
       ];
     };
   };
