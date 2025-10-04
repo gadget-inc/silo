@@ -41,16 +41,10 @@ impl Default for CoordinationConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct TenancyConfig {
     #[serde(default)]
     pub enabled: bool,
-}
-
-impl Default for TenancyConfig {
-    fn default() -> Self {
-        Self { enabled: false }
-    }
 }
 
 fn default_etcd_endpoints() -> Vec<String> {

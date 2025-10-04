@@ -100,7 +100,10 @@ async fn measure_dequeue_throughput(
                     break;
                 }
 
-                let tasks = shard.dequeue("-", &worker_id, batch).await.expect("dequeue");
+                let tasks = shard
+                    .dequeue("-", &worker_id, batch)
+                    .await
+                    .expect("dequeue");
                 if tasks.is_empty() {
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                     continue;

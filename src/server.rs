@@ -229,7 +229,7 @@ pub async fn run_grpc_with_reaper(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Load app config to pass tenancy flag; use defaults when not provided here
     let cfg = crate::settings::AppConfig::load(None)
-        .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?;
+        .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
     let svc = SiloService::new(factory.clone(), cfg);
     let server = SiloServer::new(svc);
 
@@ -300,7 +300,7 @@ where
         + tonic::transport::server::Connected,
 {
     let cfg = crate::settings::AppConfig::load(None)
-        .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?;
+        .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
     let svc = SiloService::new(factory.clone(), cfg);
     let server = SiloServer::new(svc);
 

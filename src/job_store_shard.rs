@@ -163,7 +163,7 @@ impl JobStoreShard {
         &self.name
     }
     pub fn db(&self) -> &Db {
-        &*self.db
+        &self.db
     }
 
     /// Enqueue a new job with optional concurrency limits for a specific tenant.
@@ -220,7 +220,7 @@ impl JobStoreShard {
                 now_ms,
                 &concurrency_limits,
             )
-            .map_err(|e| JobStoreShardError::Rkyv(e))?;
+            .map_err(JobStoreShardError::Rkyv)?;
 
         // If no concurrency limits, write task directly
         if outcome.is_none() {
@@ -231,7 +231,7 @@ impl JobStoreShard {
                 held_queues: Vec::new(),
             };
             let task_value: AlignedVec =
-                crate::codec::encode_task(&first_task).map_err(|e| JobStoreShardError::Rkyv(e))?;
+                crate::codec::encode_task(&first_task).map_err(JobStoreShardError::Rkyv)?;
             batch.put(
                 task_key(start_at_ms, priority, &job_id, 1).as_bytes(),
                 &task_value,
@@ -436,7 +436,7 @@ impl JobStoreShard {
                             now_ms,
                             job_view.as_ref(),
                         )
-                        .map_err(|e| JobStoreShardError::Rkyv(e))?;
+                        .map_err(JobStoreShardError::Rkyv)?;
 
                     match outcome {
                         RequestTicketTaskOutcome::Granted { request_id, queue } => {
@@ -454,7 +454,7 @@ impl JobStoreShard {
                                 expiry_ms,
                             };
                             let leased_value: AlignedVec =
-                                encode_lease(&record).map_err(|e| JobStoreShardError::Rkyv(e))?;
+                                encode_lease(&record).map_err(JobStoreShardError::Rkyv)?;
                             batch.put(lease_key.as_bytes(), &leased_value);
 
                             // Mark job as running
@@ -470,8 +470,8 @@ impl JobStoreShard {
                                     started_at_ms: now_ms,
                                 },
                             };
-                            let attempt_val: AlignedVec = encode_attempt(&attempt)
-                                .map_err(|e| JobStoreShardError::Rkyv(e))?;
+                            let attempt_val: AlignedVec =
+                                encode_attempt(&attempt).map_err(JobStoreShardError::Rkyv)?;
                             let akey = attempt_key(&tenant, job_id, *attempt_number);
                             batch.put(akey.as_bytes(), &attempt_val);
 
@@ -524,7 +524,7 @@ impl JobStoreShard {
                     expiry_ms,
                 };
                 let leased_value: AlignedVec =
-                    encode_lease(&record).map_err(|e| JobStoreShardError::Rkyv(e))?;
+                    encode_lease(&record).map_err(JobStoreShardError::Rkyv)?;
 
                 batch.put(lease_key.as_bytes(), &leased_value);
                 batch.delete(entry.key.as_bytes());
@@ -543,7 +543,7 @@ impl JobStoreShard {
                     },
                 };
                 let attempt_val: AlignedVec =
-                    encode_attempt(&attempt).map_err(|e| JobStoreShardError::Rkyv(e))?;
+                    encode_attempt(&attempt).map_err(JobStoreShardError::Rkyv)?;
                 let akey = attempt_key(&tenant, &job_id, attempt_number);
                 batch.put(akey.as_bytes(), &attempt_val);
 
@@ -582,7 +582,7 @@ impl JobStoreShard {
 
         for (tenant, job_view, job_id, attempt_number) in pending_attempts.into_iter() {
             let attempt_view = self
-                .get_job_attempt(&tenant.as_str(), &job_id, attempt_number)
+                .get_job_attempt(tenant.as_str(), &job_id, attempt_number)
                 .await?
                 .ok_or_else(|| {
                     JobStoreShardError::Rkyv("attempt not found after dequeue".to_string())
@@ -750,7 +750,7 @@ impl JobStoreShard {
             task,
             expiry_ms: new_expiry,
         };
-        let value: AlignedVec = encode_lease(&record).map_err(|e| JobStoreShardError::Rkyv(e))?;
+        let value: AlignedVec = encode_lease(&record).map_err(JobStoreShardError::Rkyv)?;
 
         let mut batch = WriteBatch::new();
         batch.put(key.as_bytes(), &value);
@@ -815,8 +815,7 @@ impl JobStoreShard {
             task_id: task_id.to_string(),
             status: attempt_status,
         };
-        let attempt_val: AlignedVec =
-            encode_attempt(&attempt).map_err(|e| JobStoreShardError::Rkyv(e))?;
+        let attempt_val: AlignedVec = encode_attempt(&attempt).map_err(JobStoreShardError::Rkyv)?;
         let attempt_key = attempt_key(tenant, &job_id, attempt_number);
 
         // Atomically update attempt and remove lease
@@ -893,7 +892,7 @@ impl JobStoreShard {
                 now_ms,
             )
             .await
-            .map_err(|e| JobStoreShardError::Rkyv(e))?;
+            .map_err(JobStoreShardError::Rkyv)?;
 
         self.db.write(batch).await?;
         self.db.flush().await?;

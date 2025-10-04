@@ -47,6 +47,12 @@ pub struct ConcurrencyCounts {
     holders: Mutex<HashMap<String, HashSet<String>>>,
 }
 
+impl Default for ConcurrencyCounts {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConcurrencyCounts {
     pub fn new() -> Self {
         Self {
@@ -83,7 +89,7 @@ impl ConcurrencyCounts {
                 };
                 let key = format!("{}|{}", tenant, queue);
                 let mut h = self.holders.lock().unwrap();
-                let set = h.entry(key).or_insert_with(HashSet::new);
+                let set = h.entry(key).or_default();
                 set.insert(task.to_string());
             }
         }
@@ -103,9 +109,7 @@ impl ConcurrencyCounts {
 
     pub fn record_grant(&self, tenant: &str, queue: &str, task_id: &str) {
         let mut h = self.holders.lock().unwrap();
-        let set = h
-            .entry(format!("{}|{}", tenant, queue))
-            .or_insert_with(HashSet::new);
+        let set = h.entry(format!("{}|{}", tenant, queue)).or_default();
         set.insert(task_id.to_string());
     }
 
@@ -121,6 +125,12 @@ impl ConcurrencyCounts {
 /// High-level concurrency manager
 pub struct ConcurrencyManager {
     counts: ConcurrencyCounts,
+}
+
+impl Default for ConcurrencyManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ConcurrencyManager {
@@ -147,7 +157,7 @@ impl ConcurrencyManager {
         limits: &[ConcurrencyLimit],
     ) -> Result<Option<RequestTicketOutcome>, String> {
         // Only gate on the first limit (if any)
-        let Some(limit) = limits.get(0) else {
+        let Some(limit) = limits.first() else {
             return Ok(None); // No limits
         };
 
@@ -385,7 +395,7 @@ async fn append_release_and_grant_next(
                     attempt_number,
                 } => {
                     let req_key_str = String::from_utf8_lossy(&kv.key).to_string();
-                    let request_id = req_key_str.split('/').last().unwrap_or("").to_string();
+                    let request_id = req_key_str.split('/').next_back().unwrap_or("").to_string();
                     if *start_time_ms > now_ms {
                         // Not ready yet; leave request for later
                     } else {

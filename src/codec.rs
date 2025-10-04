@@ -51,7 +51,7 @@ pub fn encode_lease(record: &LeaseRecord) -> Result<AlignedVec, String> {
 }
 
 #[inline]
-pub fn decode_lease<'a>(bytes: &'a [u8]) -> &'a <LeaseRecord as Archive>::Archived {
+pub fn decode_lease(bytes: &[u8]) -> &<LeaseRecord as Archive>::Archived {
     unsafe { rkyv::archived_root::<LeaseRecord>(bytes) }
 }
 

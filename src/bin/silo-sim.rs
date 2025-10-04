@@ -260,9 +260,9 @@ async fn main() -> anyhow::Result<()> {
     c1.shutdown().await?;
     c2.shutdown().await?;
     c3.shutdown().await?;
-    let _ = h1.abort();
-    let _ = h2.abort();
-    let _ = h3.abort();
+    h1.abort();
+    h2.abort();
+    h3.abort();
 
     println!(
         "processed_total={}",
