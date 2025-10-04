@@ -1,0 +1,33 @@
+{
+  "name": "@gadgetinc/silo-grpc",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "src/generated"
+  ],
+  "scripts": {
+    "codegen": "protoc --experimental_allow_proto3_optional --plugin=./node_modules/.bin/protoc-gen-ts_proto --ts_proto_out=src/generated --ts_proto_opt=esModuleInterop=true,env=node,outputServices=grpc-js,useExactTypes=false,outputJsonMethods=false,oneof=unions --proto_path=../../proto ../../proto/silo.proto",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepare": "npm run codegen && npm run build",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.11.1",
+    "long": "^5.2.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.5",
+    "ts-proto": "^1.170.0",
+    "tslib": "^2.7.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
