@@ -15,15 +15,17 @@
   - [x] integration tests of some sort
   - [x] only run one reconcile loop at once
   - [ ] think through if failing open when control plane is down is ok with write fencing
+  - [ ] add new coordination mode for persistent disk wal storage and k8s restarts
+    - if using persistent disk for the wal, the wal only exists there, and we dont have full compute/storage separation. instead, let's expect any crashed nodes to come back, and rely on cloud provider persistent disk implementations to make that disk available elsewhere. the lease must thusly _not_ expire when a pod goes away, and instead must be explicitly released when it is ready to release it.
 - [ ] webui / operator tooling
 - [ ] /healthz endpoint
 - [ ] /metrics prometheus endpoint
 - [ ] opentelemetry support
 - [ ] investigate how we might do schema evolution
 - [ ] secondary indexes for filtering
-  - requirements: 
-     - cursor based pagination
-     - optional filter on job id 
-     - optional filter on job state
-     - optional filter on new metadata key/values
+  - requirements:
+    - cursor based pagination
+    - optional filter on job id
+    - optional filter on job state
+    - optional filter on new metadata key/values
 - [ ] once transaction support, make enqueue idempotency not a read-then-write but some sort of conditional write
