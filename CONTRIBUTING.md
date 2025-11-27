@@ -1,3 +1,17 @@
+# silo development
+
+You can run silo locally to make requests to a test instance. Running locally requires a running `etcd` instance. You can run one with:
+
+```shell
+just etcd
+```
+
+Then you can run tests with:
+
+```shell
+cargo test
+```
+
 ### Perfetto traces for debugging
 
 We support exporting `tracing` spans to a Perfetto trace you can open in the Perfetto UI.

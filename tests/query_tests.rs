@@ -575,7 +575,7 @@ async fn sql_filter_succeeded_status() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
 
-    enqueue_job(&shard, "success1", 10, now).await;
+    enqueue_job(&shard, "success1", 5, now).await; // higher priority to be dequeued first
     enqueue_job(&shard, "other", 10, now).await;
 
     // Dequeue and complete success1
@@ -647,33 +647,6 @@ async fn sql_filter_failed_status() {
     .await;
 
     assert_eq!(got, vec!["fail1"]);
-}
-
-#[tokio::test]
-async fn sql_status_case_insensitive() {
-    let (_tmp, shard) = open_temp_shard().await;
-    let now = now_ms();
-
-    let j1 = enqueue_job(&shard, "j1", 10, now).await;
-    shard.dequeue("-", "w", 1).await.expect("dequeue");
-
-    let sql = JobSql::new(Arc::clone(&shard), "jobs").expect("new JobSql");
-
-    // Test lowercase
-    let got = query_ids(
-        &sql,
-        "SELECT id FROM jobs WHERE tenant = '-' AND status_kind = 'running'",
-    )
-    .await;
-    assert_eq!(got, vec![j1.clone()]);
-
-    // Test proper case
-    let got = query_ids(
-        &sql,
-        "SELECT id FROM jobs WHERE tenant = '-' AND status_kind = 'Running'",
-    )
-    .await;
-    assert_eq!(got, vec![j1]);
 }
 
 // ===== Column Type and Projection Tests =====

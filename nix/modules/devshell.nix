@@ -12,6 +12,7 @@
         bacon
         etcd
         protobuf # provides protoc binary
+        bzip2 # required by slatedb dependencies for compression
       ];
     };
   };
