@@ -87,12 +87,9 @@ pub struct JobInfo {
 impl JobView {
     /// Validate bytes and construct a zero-copy view.
     pub fn new(bytes: Bytes) -> Result<Self, JobStoreShardError> {
-        // Validate once up front in debug builds; skip in release for performance.
-        #[cfg(debug_assertions)]
-        {
-            let _ = rkyv::check_archived_root::<JobInfo>(&bytes)
-                .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
-        }
+        // Validate once up front; reject invalid data early.
+        let _ = rkyv::check_archived_root::<JobInfo>(&bytes)
+            .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
         Ok(Self { info_bytes: bytes })
     }
 
@@ -112,10 +109,11 @@ impl JobView {
         serde_json::from_slice(self.payload_bytes())
     }
 
-    /// Unsafe-free accessor to the archived root (validated at construction).
+    /// Accessor to the archived root (validated at construction).
     fn archived(&self) -> &<JobInfo as Archive>::Archived {
-        // Safe because we validated in new() and bytes are owned by self
-        unsafe { rkyv::archived_root::<JobInfo>(&self.info_bytes) }
+        // Safe: bytes were validated in new() and are immutable
+        rkyv::check_archived_root::<JobInfo>(&self.info_bytes)
+            .expect("JobView bytes were validated at construction")
     }
 
     /// Return the job's retry policy as a runtime struct, if present, by copying

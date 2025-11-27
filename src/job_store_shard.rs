@@ -455,14 +455,9 @@ impl JobStoreShard {
             return Ok(None);
         };
 
-        #[cfg(debug_assertions)]
-        {
-            let _ = rkyv::check_archived_root::<JobStatus>(&raw)
-                .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
-        }
-
         type ArchivedStatus = <JobStatus as Archive>::Archived;
-        let archived: &ArchivedStatus = unsafe { rkyv::archived_root::<JobStatus>(&raw) };
+        let archived: &ArchivedStatus = rkyv::check_archived_root::<JobStatus>(&raw)
+            .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
         let mut des = rkyv::Infallible;
         let status: JobStatus = RkyvDeserialize::deserialize(archived, &mut des)
             .unwrap_or_else(|_| unreachable!("infallible deserialization for JobStatus"));
@@ -489,14 +484,9 @@ impl JobStoreShard {
                     return Ok::<_, JobStoreShardError>(None);
                 };
 
-                #[cfg(debug_assertions)]
-                {
-                    let _ = rkyv::check_archived_root::<JobStatus>(&raw)
-                        .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
-                }
-
                 type ArchivedStatus = <JobStatus as Archive>::Archived;
-                let archived: &ArchivedStatus = unsafe { rkyv::archived_root::<JobStatus>(&raw) };
+                let archived: &ArchivedStatus = rkyv::check_archived_root::<JobStatus>(&raw)
+                    .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
                 let mut des = rkyv::Infallible;
                 let status: JobStatus = RkyvDeserialize::deserialize(archived, &mut des)
                     .unwrap_or_else(|_| unreachable!("infallible deserialization for JobStatus"));
@@ -823,7 +813,10 @@ impl JobStoreShard {
             }
 
             type ArchivedTask = <Task as Archive>::Archived;
-            let archived: &ArchivedTask = unsafe { rkyv::archived_root::<Task>(&kv.value) };
+            let archived: &ArchivedTask = match rkyv::check_archived_root::<Task>(&kv.value) {
+                Ok(a) => a,
+                Err(_) => continue, // Skip malformed tasks
+            };
             match archived {
                 ArchivedTask::RunAttempt {
                     id,
@@ -880,7 +873,8 @@ impl JobStoreShard {
 
         type ArchivedLease = <LeaseRecord as Archive>::Archived;
         type ArchivedTask = <Task as Archive>::Archived;
-        let archived: &ArchivedLease = unsafe { rkyv::archived_root::<LeaseRecord>(&value_bytes) };
+        let archived: &ArchivedLease = rkyv::check_archived_root::<LeaseRecord>(&value_bytes)
+            .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
         let current_owner = archived.worker_id.as_str();
         if current_owner != worker_id {
             return Err(JobStoreShardError::LeaseOwnerMismatch {
@@ -957,7 +951,8 @@ impl JobStoreShard {
 
         type ArchivedLease = <LeaseRecord as Archive>::Archived;
         type ArchivedTask = <Task as Archive>::Archived;
-        let archived: &ArchivedLease = unsafe { rkyv::archived_root::<LeaseRecord>(&value_bytes) };
+        let archived: &ArchivedLease = rkyv::check_archived_root::<LeaseRecord>(&value_bytes)
+            .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
         let (job_id, attempt_number, held_queues_local): (String, u32, Vec<String>) =
             match &archived.task {
                 ArchivedTask::RunAttempt {
@@ -1150,7 +1145,10 @@ impl JobStoreShard {
             }
             type ArchivedLease = <LeaseRecord as Archive>::Archived;
             type ArchivedTask = <Task as Archive>::Archived;
-            let lease: &ArchivedLease = unsafe { rkyv::archived_root::<LeaseRecord>(&kv.value) };
+            let lease: &ArchivedLease = match rkyv::check_archived_root::<LeaseRecord>(&kv.value) {
+                Ok(l) => l,
+                Err(_) => continue, // Skip malformed lease records
+            };
             if lease.expiry_ms > now_ms {
                 continue;
             }

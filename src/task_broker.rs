@@ -104,7 +104,10 @@ impl TaskBroker {
                 continue;
             }
 
-            let task = decode_task(&kv.value);
+            let task = match decode_task(&kv.value) {
+                Ok(t) => t,
+                Err(_) => continue, // Skip malformed tasks
+            };
             let entry = BrokerTask {
                 key: key_str.to_string(),
                 task,

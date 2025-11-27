@@ -9,10 +9,11 @@ pub fn encode_task(task: &Task) -> Result<AlignedVec, String> {
 }
 
 #[inline]
-pub fn decode_task(bytes: &[u8]) -> Task {
+pub fn decode_task(bytes: &[u8]) -> Result<Task, String> {
     type ArchivedTask = <Task as Archive>::Archived;
-    let archived: &ArchivedTask = unsafe { rkyv::archived_root::<Task>(bytes) };
-    match archived {
+    let archived: &ArchivedTask =
+        rkyv::check_archived_root::<Task>(bytes).map_err(|e| e.to_string())?;
+    Ok(match archived {
         ArchivedTask::RunAttempt {
             id,
             job_id,
@@ -42,7 +43,7 @@ pub fn decode_task(bytes: &[u8]) -> Task {
             attempt_number: *attempt_number,
             request_id: request_id.as_str().to_string(),
         },
-    }
+    })
 }
 
 #[inline]
@@ -51,8 +52,8 @@ pub fn encode_lease(record: &LeaseRecord) -> Result<AlignedVec, String> {
 }
 
 #[inline]
-pub fn decode_lease(bytes: &[u8]) -> &<LeaseRecord as Archive>::Archived {
-    unsafe { rkyv::archived_root::<LeaseRecord>(bytes) }
+pub fn decode_lease(bytes: &[u8]) -> Result<&<LeaseRecord as Archive>::Archived, String> {
+    rkyv::check_archived_root::<LeaseRecord>(bytes).map_err(|e| e.to_string())
 }
 
 #[inline]

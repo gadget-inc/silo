@@ -388,9 +388,9 @@ async fn append_release_and_grant_next(
         if let Some(kv) = iter.next().await.map_err(|e| e.to_string())? {
             type ArchivedAction =
                 <crate::job_store_shard::ConcurrencyAction as rkyv::Archive>::Archived;
-            let a: &ArchivedAction = unsafe {
-                rkyv::archived_root::<crate::job_store_shard::ConcurrencyAction>(&kv.value)
-            };
+            let a: &ArchivedAction =
+                rkyv::check_archived_root::<crate::job_store_shard::ConcurrencyAction>(&kv.value)
+                    .map_err(|e| e.to_string())?;
             match a {
                 ArchivedAction::EnqueueTask {
                     start_time_ms,

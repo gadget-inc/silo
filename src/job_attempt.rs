@@ -48,16 +48,16 @@ pub struct JobAttemptView {
 
 impl JobAttemptView {
     pub fn new(bytes: Bytes) -> Result<Self, JobStoreShardError> {
-        #[cfg(debug_assertions)]
-        {
-            let _ = rkyv::check_archived_root::<JobAttempt>(&bytes)
-                .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
-        }
+        // Validate once up front; reject invalid data early.
+        let _ = rkyv::check_archived_root::<JobAttempt>(&bytes)
+            .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
         Ok(Self { bytes })
     }
 
     pub(crate) fn archived(&self) -> &<JobAttempt as Archive>::Archived {
-        unsafe { rkyv::archived_root::<JobAttempt>(&self.bytes) }
+        // Safe: bytes were validated in new() and are immutable
+        rkyv::check_archived_root::<JobAttempt>(&self.bytes)
+            .expect("JobAttemptView bytes were validated at construction")
     }
 
     pub fn job_id(&self) -> &str {
