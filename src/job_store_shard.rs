@@ -1,4 +1,3 @@
-use rkyv::AlignedVec;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde_json::Value as JsonValue;
 use slatedb::Db;
@@ -8,7 +7,10 @@ use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::codec::{encode_attempt, encode_lease};
+use crate::codec::{
+    decode_job_status, decode_lease, decode_task, encode_attempt, encode_job_info,
+    encode_job_status, encode_lease, encode_task, CodecError,
+};
 use crate::concurrency::{
     ConcurrencyManager, MemoryEvent, RequestTicketOutcome, RequestTicketTaskOutcome,
 };
@@ -242,8 +244,7 @@ impl JobStoreShard {
             concurrency_limits: concurrency_limits.clone(),
             metadata: metadata.unwrap_or_default(),
         };
-        let job_value: AlignedVec = rkyv::to_bytes::<JobInfo, 256>(&job)
-            .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
+        let job_value = encode_job_info(&job).map_err(codec_error_to_shard_error)?;
 
         let first_task_id = Uuid::new_v4().to_string();
         let now_ms = now_epoch_ms();
@@ -281,8 +282,7 @@ impl JobStoreShard {
                 attempt_number: 1,
                 held_queues: Vec::new(),
             };
-            let task_value: AlignedVec =
-                crate::codec::encode_task(&first_task).map_err(JobStoreShardError::Rkyv)?;
+            let task_value = encode_task(&first_task).map_err(codec_error_to_shard_error)?;
             batch.put(
                 task_key(start_at_ms, priority, &job_id, 1).as_bytes(),
                 &task_value,
@@ -446,11 +446,9 @@ impl JobStoreShard {
             return Ok(None);
         };
 
-        type ArchivedStatus = <JobStatus as Archive>::Archived;
-        let archived: &ArchivedStatus = rkyv::check_archived_root::<JobStatus>(&raw)
-            .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
+        let decoded = decode_job_status(&raw).map_err(codec_error_to_shard_error)?;
         let mut des = rkyv::Infallible;
-        let status: JobStatus = RkyvDeserialize::deserialize(archived, &mut des)
+        let status: JobStatus = RkyvDeserialize::deserialize(decoded.archived(), &mut des)
             .unwrap_or_else(|_| unreachable!("infallible deserialization for JobStatus"));
         Ok(Some(status))
     }
@@ -475,11 +473,10 @@ impl JobStoreShard {
                     return Ok::<_, JobStoreShardError>(None);
                 };
 
-                type ArchivedStatus = <JobStatus as Archive>::Archived;
-                let archived: &ArchivedStatus = rkyv::check_archived_root::<JobStatus>(&raw)
-                    .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
+                let decoded =
+                    decode_job_status(&raw).map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
                 let mut des = rkyv::Infallible;
-                let status: JobStatus = RkyvDeserialize::deserialize(archived, &mut des)
+                let status: JobStatus = RkyvDeserialize::deserialize(decoded.archived(), &mut des)
                     .unwrap_or_else(|_| unreachable!("infallible deserialization for JobStatus"));
                 Ok(Some((id_clone, status)))
             });
@@ -609,8 +606,8 @@ impl JobStoreShard {
                                 task: run,
                                 expiry_ms,
                             };
-                            let leased_value: AlignedVec =
-                                encode_lease(&record).map_err(JobStoreShardError::Rkyv)?;
+                            let leased_value =
+                                encode_lease(&record).map_err(codec_error_to_shard_error)?;
                             batch.put(lease_key.as_bytes(), &leased_value);
 
                             // Mark job as running
@@ -627,8 +624,8 @@ impl JobStoreShard {
                                     started_at_ms: now_ms,
                                 },
                             };
-                            let attempt_val: AlignedVec =
-                                encode_attempt(&attempt).map_err(JobStoreShardError::Rkyv)?;
+                            let attempt_val =
+                                encode_attempt(&attempt).map_err(codec_error_to_shard_error)?;
                             let akey = attempt_key(&tenant, job_id, *attempt_number);
                             batch.put(akey.as_bytes(), &attempt_val);
 
@@ -680,8 +677,7 @@ impl JobStoreShard {
                     task: task.clone(),
                     expiry_ms,
                 };
-                let leased_value: AlignedVec =
-                    encode_lease(&record).map_err(JobStoreShardError::Rkyv)?;
+                let leased_value = encode_lease(&record).map_err(codec_error_to_shard_error)?;
 
                 batch.put(lease_key.as_bytes(), &leased_value);
                 batch.delete(entry.key.as_bytes());
@@ -700,8 +696,7 @@ impl JobStoreShard {
                         started_at_ms: now_ms,
                     },
                 };
-                let attempt_val: AlignedVec =
-                    encode_attempt(&attempt).map_err(JobStoreShardError::Rkyv)?;
+                let attempt_val = encode_attempt(&attempt).map_err(codec_error_to_shard_error)?;
                 let akey = attempt_key(&tenant, &job_id, attempt_number);
                 batch.put(akey.as_bytes(), &attempt_val);
 
@@ -799,46 +794,11 @@ impl JobStoreShard {
                 }
             }
 
-            type ArchivedTask = <Task as Archive>::Archived;
-            let archived: &ArchivedTask = match rkyv::check_archived_root::<Task>(&kv.value) {
-                Ok(a) => a,
+            let task = match decode_task(&kv.value) {
+                Ok(t) => t,
                 Err(_) => continue, // Skip malformed tasks
             };
-            match archived {
-                ArchivedTask::RunAttempt {
-                    id,
-                    job_id,
-                    attempt_number,
-                    held_queues,
-                } => {
-                    tasks.push(Task::RunAttempt {
-                        id: id.as_str().to_string(),
-                        job_id: job_id.as_str().to_string(),
-                        attempt_number: *attempt_number,
-                        held_queues: held_queues
-                            .iter()
-                            .map(|s| s.as_str().to_string())
-                            .collect::<Vec<String>>(),
-                    });
-                }
-                ArchivedTask::RequestTicket {
-                    queue,
-                    start_time_ms,
-                    priority,
-                    job_id,
-                    attempt_number,
-                    request_id,
-                } => {
-                    tasks.push(Task::RequestTicket {
-                        queue: queue.as_str().to_string(),
-                        start_time_ms: *start_time_ms,
-                        priority: *priority,
-                        job_id: job_id.as_str().to_string(),
-                        attempt_number: *attempt_number,
-                        request_id: request_id.as_str().to_string(),
-                    });
-                }
-            }
+            tasks.push(task);
             keys.push(kv.key.to_vec());
         }
 
@@ -858,10 +818,9 @@ impl JobStoreShard {
             return Err(JobStoreShardError::LeaseNotFound(task_id.to_string()));
         };
 
-        type ArchivedLease = <LeaseRecord as Archive>::Archived;
         type ArchivedTask = <Task as Archive>::Archived;
-        let archived: &ArchivedLease = rkyv::check_archived_root::<LeaseRecord>(&value_bytes)
-            .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
+        let decoded = decode_lease(&value_bytes).map_err(codec_error_to_shard_error)?;
+        let archived = decoded.archived();
         let current_owner = archived.worker_id.as_str();
         if current_owner != worker_id {
             return Err(JobStoreShardError::LeaseOwnerMismatch {
@@ -912,7 +871,7 @@ impl JobStoreShard {
             task,
             expiry_ms: new_expiry,
         };
-        let value: AlignedVec = encode_lease(&record).map_err(JobStoreShardError::Rkyv)?;
+        let value = encode_lease(&record).map_err(codec_error_to_shard_error)?;
 
         let mut batch = WriteBatch::new();
         batch.put(key.as_bytes(), &value);
@@ -936,10 +895,9 @@ impl JobStoreShard {
             return Err(JobStoreShardError::LeaseNotFound(task_id.to_string()));
         };
 
-        type ArchivedLease = <LeaseRecord as Archive>::Archived;
         type ArchivedTask = <Task as Archive>::Archived;
-        let archived: &ArchivedLease = rkyv::check_archived_root::<LeaseRecord>(&value_bytes)
-            .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
+        let decoded = decode_lease(&value_bytes).map_err(codec_error_to_shard_error)?;
+        let archived = decoded.archived();
         let (job_id, attempt_number, held_queues_local): (String, u32, Vec<String>) =
             match &archived.task {
                 ArchivedTask::RunAttempt {
@@ -978,7 +936,7 @@ impl JobStoreShard {
             task_id: task_id.to_string(),
             status: attempt_status,
         };
-        let attempt_val: AlignedVec = encode_attempt(&attempt).map_err(JobStoreShardError::Rkyv)?;
+        let attempt_val = encode_attempt(&attempt).map_err(codec_error_to_shard_error)?;
         let attempt_key = attempt_key(tenant, &job_id, attempt_number);
 
         // Atomically update attempt and remove lease
@@ -1018,8 +976,8 @@ impl JobStoreShard {
                                 // Retain held tickets across retries until completion
                                 held_queues: held_queues_local.clone(),
                             };
-                            let next_bytes: AlignedVec = rkyv::to_bytes::<Task, 256>(&next_task)
-                                .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
+                            let next_bytes =
+                                encode_task(&next_task).map_err(codec_error_to_shard_error)?;
 
                             batch.put(
                                 task_key(next_time, priority, &job_id, next_attempt_number)
@@ -1124,12 +1082,12 @@ impl JobStoreShard {
             if !key_str.starts_with("lease/") {
                 continue;
             }
-            type ArchivedLease = <LeaseRecord as Archive>::Archived;
             type ArchivedTask = <Task as Archive>::Archived;
-            let lease: &ArchivedLease = match rkyv::check_archived_root::<LeaseRecord>(&kv.value) {
+            let decoded = match decode_lease(&kv.value) {
                 Ok(l) => l,
                 Err(_) => continue, // Skip malformed lease records
             };
+            let lease = decoded.archived();
             if lease.expiry_ms > now_ms {
                 continue;
             }
@@ -1304,8 +1262,7 @@ fn put_job_status(
     job_id: &str,
     status: &JobStatus,
 ) -> Result<(), JobStoreShardError> {
-    let job_status_value: AlignedVec = rkyv::to_bytes::<JobStatus, 256>(status)
-        .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
+    let job_status_value = encode_job_status(status).map_err(codec_error_to_shard_error)?;
     batch.put(job_status_key(tenant, job_id).as_bytes(), &job_status_value);
     Ok(())
 }
@@ -1318,4 +1275,8 @@ fn status_kind_str(kind: JobStatusKind) -> &'static str {
         JobStatusKind::Cancelled => "Cancelled",
         JobStatusKind::Succeeded => "Succeeded",
     }
+}
+
+fn codec_error_to_shard_error(e: CodecError) -> JobStoreShardError {
+    JobStoreShardError::Rkyv(e.to_string())
 }

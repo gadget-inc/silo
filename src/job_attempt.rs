@@ -1,9 +1,13 @@
-use bytes::Bytes;
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
 
+use crate::codec::{decode_attempt, CodecError, DecodedAttempt};
 use crate::job_store_shard::JobStoreShardError;
+
+fn codec_error_to_shard_error(e: CodecError) -> JobStoreShardError {
+    JobStoreShardError::Rkyv(e.to_string())
+}
 
 /// Outcome passed by callers when reporting an attempt's completion.
 #[derive(Debug, Clone)]
@@ -40,24 +44,31 @@ pub struct JobAttempt {
     pub status: AttemptStatus,
 }
 
-/// Zero-copy view alias over an archived `JobAttempt` backed by owned bytes.
-#[derive(Clone, Debug)]
+/// Zero-copy view alias over an archived `JobAttempt` backed by owned aligned data.
+#[derive(Clone)]
 pub struct JobAttemptView {
-    pub(crate) bytes: Bytes,
+    decoded: DecodedAttempt,
+}
+
+impl std::fmt::Debug for JobAttemptView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobAttemptView")
+            .field("job_id", &self.job_id())
+            .field("attempt_number", &self.attempt_number())
+            .field("task_id", &self.task_id())
+            .finish()
+    }
 }
 
 impl JobAttemptView {
-    pub fn new(bytes: Bytes) -> Result<Self, JobStoreShardError> {
-        // Validate once up front; reject invalid data early.
-        let _ = rkyv::check_archived_root::<JobAttempt>(&bytes)
-            .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
-        Ok(Self { bytes })
+    pub fn new(bytes: impl AsRef<[u8]>) -> Result<Self, JobStoreShardError> {
+        // Validate and decode up front; reject invalid data early.
+        let decoded = decode_attempt(bytes.as_ref()).map_err(codec_error_to_shard_error)?;
+        Ok(Self { decoded })
     }
 
     pub(crate) fn archived(&self) -> &<JobAttempt as Archive>::Archived {
-        // Safe: bytes were validated in new() and are immutable
-        rkyv::check_archived_root::<JobAttempt>(&self.bytes)
-            .expect("JobAttemptView bytes were validated at construction")
+        self.decoded.archived()
     }
 
     pub fn job_id(&self) -> &str {

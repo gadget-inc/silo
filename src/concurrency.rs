@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-use rkyv::AlignedVec;
 use slatedb::{Db, DbIterator, WriteBatch};
 
-use crate::codec::encode_task;
+use crate::codec::{
+    decode_concurrency_action, encode_concurrency_action, encode_holder, encode_task,
+};
 use crate::job::{ConcurrencyLimit, JobView};
 use crate::job_store_shard::{HolderRecord, Task};
 use crate::keys::{concurrency_holder_key, concurrency_request_key, task_key};
@@ -209,8 +210,7 @@ impl ConcurrencyManager {
                 attempt_number: 1,
                 request_id: request_id.clone(),
             };
-            let ticket_value: AlignedVec =
-                rkyv::to_bytes::<Task, 256>(&ticket).map_err(|e| e.to_string())?;
+            let ticket_value = encode_task(&ticket)?;
             batch.put(
                 task_key(start_at_ms, priority, job_id, 1).as_bytes(),
                 &ticket_value,
@@ -260,8 +260,7 @@ impl ConcurrencyManager {
         let holder = HolderRecord {
             granted_at_ms: now_ms,
         };
-        let hval: AlignedVec =
-            rkyv::to_bytes::<HolderRecord, 256>(&holder).map_err(|e| e.to_string())?;
+        let hval = encode_holder(&holder)?;
         batch.put(
             concurrency_holder_key(tenant, queue, request_id).as_bytes(),
             &hval,
@@ -305,8 +304,7 @@ fn append_grant_edits(
     let holder = HolderRecord {
         granted_at_ms: now_ms,
     };
-    let holder_val: AlignedVec =
-        rkyv::to_bytes::<HolderRecord, 256>(&holder).map_err(|e| e.to_string())?;
+    let holder_val = encode_holder(&holder)?;
     batch.put(
         concurrency_holder_key(tenant, queue, task_id).as_bytes(),
         &holder_val,
@@ -347,9 +345,7 @@ fn append_request_edits(
         job_id: job_id.to_string(),
         attempt_number,
     };
-    let action_val: AlignedVec =
-        rkyv::to_bytes::<crate::job_store_shard::ConcurrencyAction, 256>(&action)
-            .map_err(|e| e.to_string())?;
+    let action_val = encode_concurrency_action(&action)?;
     let req_key = concurrency_request_key(
         tenant,
         queue,
@@ -388,9 +384,8 @@ async fn append_release_and_grant_next(
         if let Some(kv) = iter.next().await.map_err(|e| e.to_string())? {
             type ArchivedAction =
                 <crate::job_store_shard::ConcurrencyAction as rkyv::Archive>::Archived;
-            let a: &ArchivedAction =
-                rkyv::check_archived_root::<crate::job_store_shard::ConcurrencyAction>(&kv.value)
-                    .map_err(|e| e.to_string())?;
+            let decoded = decode_concurrency_action(&kv.value)?;
+            let a: &ArchivedAction = decoded.archived();
             match a {
                 ArchivedAction::EnqueueTask {
                     start_time_ms,
@@ -406,8 +401,7 @@ async fn append_release_and_grant_next(
                         let holder = HolderRecord {
                             granted_at_ms: now_ms,
                         };
-                        let holder_val: AlignedVec = rkyv::to_bytes::<HolderRecord, 256>(&holder)
-                            .map_err(|e| e.to_string())?;
+                        let holder_val = encode_holder(&holder)?;
                         batch.put(
                             concurrency_holder_key(tenant, queue, &request_id).as_bytes(),
                             &holder_val,

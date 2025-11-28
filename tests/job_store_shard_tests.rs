@@ -1,6 +1,8 @@
 mod test_helpers;
 
 use rkyv::Archive;
+use silo::codec::{decode_lease, encode_lease};
+use silo::job::JobStatus;
 use silo::job::JobStatusKind;
 use silo::job_attempt::{AttemptOutcome, AttemptStatus};
 use silo::job_store_shard::{JobStoreShardError, LeaseRecord, Task};
@@ -262,9 +264,9 @@ async fn dequeue_moves_tasks_to_leased_with_uuid() {
         let kv_value = first.1;
         assert!(key_str.starts_with("lease/"));
 
-        type ArchivedLease = <LeaseRecord as Archive>::Archived;
         type ArchivedTask = <Task as Archive>::Archived;
-        let archived: &ArchivedLease = unsafe { rkyv::archived_root::<LeaseRecord>(&kv_value) };
+        let decoded = decode_lease(&kv_value).expect("decode lease");
+        let archived = decoded.archived();
         assert_eq!(archived.worker_id.as_str(), "worker-1");
         match &archived.task {
             ArchivedTask::RunAttempt {
@@ -310,10 +312,8 @@ async fn heartbeat_renews_lease_when_worker_matches() {
             .expect("scan lease");
         let old_key = first.0;
         assert!(old_key.ends_with(&task_id));
-        type ArchivedLease = <LeaseRecord as Archive>::Archived;
-        let archived_lease: &ArchivedLease =
-            unsafe { rkyv::archived_root::<LeaseRecord>(&first.1) };
-        let old_expiry = archived_lease.expiry_ms as u64;
+        let decoded_first = decode_lease(&first.1).expect("decode lease");
+        let old_expiry = decoded_first.archived().expiry_ms as u64;
 
         // Heartbeat to renew
         shard
@@ -327,14 +327,12 @@ async fn heartbeat_renews_lease_when_worker_matches() {
             .expect("scan lease 2");
         let new_key = second.0;
         assert!(new_key.ends_with(&task_id));
-        let archived_lease2: &ArchivedLease =
-            unsafe { rkyv::archived_root::<LeaseRecord>(&second.1) };
-        let new_expiry = archived_lease2.expiry_ms as u64;
+        let decoded_second = decode_lease(&second.1).expect("decode lease 2");
+        let new_expiry = decoded_second.archived().expiry_ms as u64;
         assert!(new_expiry > old_expiry, "new expiry should be greater");
 
         // Validate owner remains the same
-        let archived: &ArchivedLease = unsafe { rkyv::archived_root::<LeaseRecord>(&second.1) };
-        assert_eq!(archived.worker_id.as_str(), "worker-1");
+        assert_eq!(decoded_second.archived().worker_id.as_str(), "worker-1");
     });
 }
 
@@ -2051,9 +2049,9 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
     let (lease_key, lease_value) = first_kv_with_prefix(shard.db(), "lease/")
         .await
         .expect("lease present");
-    type ArchivedLease = <LeaseRecord as Archive>::Archived;
     type ArchivedTask = <Task as Archive>::Archived;
-    let archived: &ArchivedLease = unsafe { rkyv::archived_root::<LeaseRecord>(&lease_value) };
+    let decoded = decode_lease(&lease_value).expect("decode lease");
+    let archived = decoded.archived();
     let task = match &archived.task {
         ArchivedTask::RunAttempt {
             id,
@@ -2074,7 +2072,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         task,
         expiry_ms: expired_ms,
     };
-    let new_val = rkyv::to_bytes::<LeaseRecord, 256>(&new_record).unwrap();
+    let new_val = encode_lease(&new_record).unwrap();
     shard
         .db()
         .put(lease_key.as_bytes(), &new_val)

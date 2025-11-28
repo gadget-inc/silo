@@ -1,8 +1,12 @@
-use bytes::Bytes;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 
+use crate::codec::{decode_job_info, CodecError, DecodedJobInfo};
 use crate::job_store_shard::JobStoreShardError;
 use crate::retry::RetryPolicy;
+
+fn codec_error_to_shard_error(e: CodecError) -> JobStoreShardError {
+    JobStoreShardError::Rkyv(e.to_string())
+}
 
 /// Per-job concurrency limit declaration
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
@@ -67,10 +71,20 @@ impl JobStatus {
     }
 }
 
-/// Zero-copy view over an archived `JobInfo` backed by owned bytes.
-#[derive(Clone, Debug)]
+/// Zero-copy view over an archived `JobInfo` backed by owned aligned data.
+#[derive(Clone)]
 pub struct JobView {
-    info_bytes: Bytes,
+    decoded: DecodedJobInfo,
+}
+
+impl std::fmt::Debug for JobView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobView")
+            .field("id", &self.id())
+            .field("priority", &self.priority())
+            .field("enqueue_time_ms", &self.enqueue_time_ms())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
@@ -87,11 +101,10 @@ pub struct JobInfo {
 
 impl JobView {
     /// Validate bytes and construct a zero-copy view.
-    pub fn new(bytes: Bytes) -> Result<Self, JobStoreShardError> {
-        // Validate once up front; reject invalid data early.
-        let _ = rkyv::check_archived_root::<JobInfo>(&bytes)
-            .map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
-        Ok(Self { info_bytes: bytes })
+    pub fn new(bytes: impl AsRef<[u8]>) -> Result<Self, JobStoreShardError> {
+        // Validate and decode up front; reject invalid data early.
+        let decoded = decode_job_info(bytes.as_ref()).map_err(codec_error_to_shard_error)?;
+        Ok(Self { decoded })
     }
 
     pub fn id(&self) -> &str {
@@ -112,9 +125,7 @@ impl JobView {
 
     /// Accessor to the archived root (validated at construction).
     fn archived(&self) -> &<JobInfo as Archive>::Archived {
-        // Safe: bytes were validated in new() and are immutable
-        rkyv::check_archived_root::<JobInfo>(&self.info_bytes)
-            .expect("JobView bytes were validated at construction")
+        self.decoded.archived()
     }
 
     /// Return the job's retry policy as a runtime struct, if present, by copying
