@@ -1,7 +1,7 @@
 mod test_helpers;
 
 use rkyv::Archive;
-use silo::job::JobStatus;
+use silo::job::JobStatusKind;
 use silo::job_attempt::{AttemptOutcome, AttemptStatus};
 use silo::job_store_shard::{JobStoreShardError, LeaseRecord, Task};
 use silo::keys::concurrency_holder_key;
@@ -43,10 +43,7 @@ async fn enqueue_round_trip_with_explicit_id() {
         .await
         .expect("get status")
         .expect("exists");
-    match status {
-        JobStatus::Scheduled { .. } => {}
-        other => panic!("expected Scheduled, got {:?}", other),
-    }
+    assert_eq!(status.kind, JobStatusKind::Scheduled);
 
     let view = shard
         .get_job("-", &id)
@@ -245,10 +242,7 @@ async fn dequeue_moves_tasks_to_leased_with_uuid() {
             .await
             .expect("get status")
             .expect("exists");
-        match status {
-            JobStatus::Running { .. } => {}
-            other => panic!("expected Running, got {:?}", other),
-        }
+        assert_eq!(status.kind, JobStatusKind::Running);
         let leased_task_id = {
             let t = &tasks[0];
             assert_eq!(t.job().id(), job_id);
@@ -1136,7 +1130,7 @@ async fn cannot_delete_scheduled_job() {
             .await
             .expect("get status")
             .expect("exists");
-        assert!(matches!(status, JobStatus::Scheduled { .. }));
+        assert_eq!(status.kind, JobStatusKind::Scheduled);
 
         // Attempt to delete - should fail
         let err = shard

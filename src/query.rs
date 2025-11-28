@@ -535,10 +535,10 @@ impl Scan for JobsScanner {
                             for id in &existing_ids {
                                 if let Some(status) = status_map.get(*id) {
                                     if need_kind {
-                                        kinds.push(Some(format!("{:?}", status.kind())));
+                                        kinds.push(Some(format!("{:?}", status.kind)));
                                     }
                                     if need_changed {
-                                        changed.push(Some(status.changed_at_ms()));
+                                        changed.push(Some(status.changed_at_ms));
                                     }
                                 } else {
                                     if need_kind {

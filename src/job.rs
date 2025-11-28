@@ -12,7 +12,7 @@ pub struct ConcurrencyLimit {
     pub max_concurrency: u32,
 }
 
-/// Discriminant for job status kinds, independent of timestamps
+/// Discriminant for job status kinds
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize, PartialEq, Eq, Copy)]
 #[archive(check_bytes)]
 pub enum JobStatusKind {
@@ -23,46 +23,47 @@ pub enum JobStatusKind {
     Succeeded,
 }
 
-/// Job status lifecycle with the last change time for secondary indexing
+/// Job status with the last change time for secondary indexing
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
 #[archive(check_bytes)]
-pub enum JobStatus {
-    Scheduled { changed_at_ms: i64 },
-    Running { changed_at_ms: i64 },
-    Failed { changed_at_ms: i64 },
-    Cancelled { changed_at_ms: i64 },
-    Succeeded { changed_at_ms: i64 },
+pub struct JobStatus {
+    pub kind: JobStatusKind,
+    pub changed_at_ms: i64,
 }
 
 impl JobStatus {
-    pub fn changed_at_ms(&self) -> i64 {
-        match self {
-            JobStatus::Scheduled { changed_at_ms }
-            | JobStatus::Running { changed_at_ms }
-            | JobStatus::Failed { changed_at_ms }
-            | JobStatus::Cancelled { changed_at_ms }
-            | JobStatus::Succeeded { changed_at_ms } => *changed_at_ms,
+    pub fn new(kind: JobStatusKind, changed_at_ms: i64) -> Self {
+        Self {
+            kind,
+            changed_at_ms,
         }
     }
 
-    pub fn kind(&self) -> JobStatusKind {
-        match self {
-            JobStatus::Scheduled { .. } => JobStatusKind::Scheduled,
-            JobStatus::Running { .. } => JobStatusKind::Running,
-            JobStatus::Failed { .. } => JobStatusKind::Failed,
-            JobStatus::Cancelled { .. } => JobStatusKind::Cancelled,
-            JobStatus::Succeeded { .. } => JobStatusKind::Succeeded,
-        }
+    pub fn scheduled(changed_at_ms: i64) -> Self {
+        Self::new(JobStatusKind::Scheduled, changed_at_ms)
     }
 
-    pub fn from_kind(kind: JobStatusKind, changed_at_ms: i64) -> Self {
-        match kind {
-            JobStatusKind::Scheduled => JobStatus::Scheduled { changed_at_ms },
-            JobStatusKind::Running => JobStatus::Running { changed_at_ms },
-            JobStatusKind::Failed => JobStatus::Failed { changed_at_ms },
-            JobStatusKind::Cancelled => JobStatus::Cancelled { changed_at_ms },
-            JobStatusKind::Succeeded => JobStatus::Succeeded { changed_at_ms },
-        }
+    pub fn running(changed_at_ms: i64) -> Self {
+        Self::new(JobStatusKind::Running, changed_at_ms)
+    }
+
+    pub fn failed(changed_at_ms: i64) -> Self {
+        Self::new(JobStatusKind::Failed, changed_at_ms)
+    }
+
+    pub fn cancelled(changed_at_ms: i64) -> Self {
+        Self::new(JobStatusKind::Cancelled, changed_at_ms)
+    }
+
+    pub fn succeeded(changed_at_ms: i64) -> Self {
+        Self::new(JobStatusKind::Succeeded, changed_at_ms)
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.kind,
+            JobStatusKind::Succeeded | JobStatusKind::Failed | JobStatusKind::Cancelled
+        )
     }
 }
 

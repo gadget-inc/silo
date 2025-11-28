@@ -247,9 +247,7 @@ impl JobStoreShard {
 
         let first_task_id = Uuid::new_v4().to_string();
         let now_ms = now_epoch_ms();
-        let job_status = JobStatus::Scheduled {
-            changed_at_ms: now_ms,
-        };
+        let job_status = JobStatus::scheduled(now_ms);
 
         // Atomically write job info, job status, and handle concurrency
         let mut batch = WriteBatch::new();
@@ -338,15 +336,8 @@ impl JobStoreShard {
         // Check if job is running or has pending state
         let status = self.get_job_status(tenant, id).await?;
         if let Some(status) = status {
-            match status {
-                JobStatus::Running { .. } | JobStatus::Scheduled { .. } => {
-                    return Err(JobStoreShardError::JobInProgress(id.to_string()));
-                }
-                JobStatus::Succeeded { .. }
-                | JobStatus::Failed { .. }
-                | JobStatus::Cancelled { .. } => {
-                    // OK to delete terminal states
-                }
+            if !status.is_terminal() {
+                return Err(JobStoreShardError::JobInProgress(id.to_string()));
             }
         }
 
@@ -355,8 +346,8 @@ impl JobStoreShard {
         let mut batch = WriteBatch::new();
         // Clean up secondary index entries if present
         if let Some(status) = self.get_job_status(tenant, id).await? {
-            let kind = status.kind();
-            let changed = status.changed_at_ms();
+            let kind = status.kind;
+            let changed = status.changed_at_ms;
             let timek = idx_status_time_key(
                 tenant,
                 match kind {
@@ -623,9 +614,7 @@ impl JobStoreShard {
                             batch.put(lease_key.as_bytes(), &leased_value);
 
                             // Mark job as running
-                            let job_status = JobStatus::Running {
-                                changed_at_ms: now_ms,
-                            };
+                            let job_status = JobStatus::running(now_ms);
                             self.set_job_status_with_index(&mut batch, &tenant, job_id, job_status)
                                 .await?;
 
@@ -698,9 +687,7 @@ impl JobStoreShard {
                 batch.delete(entry.key.as_bytes());
 
                 // Mark job as running
-                let job_status = JobStatus::Running {
-                    changed_at_ms: now_ms,
-                };
+                let job_status = JobStatus::running(now_ms);
                 self.set_job_status_with_index(&mut batch, &tenant, &job_id, job_status)
                     .await?;
 
@@ -1004,9 +991,7 @@ impl JobStoreShard {
 
         // If success: mark job succeeded now.
         if let AttemptOutcome::Success { .. } = outcome {
-            let job_status = JobStatus::Succeeded {
-                changed_at_ms: now_ms,
-            };
+            let job_status = JobStatus::succeeded(now_ms);
             self.set_job_status_with_index(&mut batch, tenant, &job_id, job_status)
                 .await?;
         } else {
@@ -1042,9 +1027,7 @@ impl JobStoreShard {
                                 &next_bytes,
                             );
 
-                            let job_status = JobStatus::Scheduled {
-                                changed_at_ms: now_ms,
-                            };
+                            let job_status = JobStatus::scheduled(now_ms);
                             self.set_job_status_with_index(&mut batch, tenant, &job_id, job_status)
                                 .await?;
                             scheduled_followup = true;
@@ -1053,9 +1036,7 @@ impl JobStoreShard {
                     }
                     // If no follow-up scheduled, mark job as failed
                     if !scheduled_followup {
-                        let job_status = JobStatus::Failed {
-                            changed_at_ms: now_ms,
-                        };
+                        let job_status = JobStatus::failed(now_ms);
                         self.set_job_status_with_index(&mut batch, tenant, &job_id, job_status)
                             .await?;
                     }
@@ -1194,8 +1175,8 @@ impl JobStoreShard {
     ) -> Result<(), JobStoreShardError> {
         // Delete old index entries if present
         if let Some(old) = self.get_job_status(tenant, job_id).await? {
-            let old_kind = old.kind();
-            let old_changed = old.changed_at_ms();
+            let old_kind = old.kind;
+            let old_changed = old.changed_at_ms;
             let old_time =
                 idx_status_time_key(tenant, status_kind_str(old_kind), old_changed, job_id);
             batch.delete(old_time.as_bytes());
@@ -1205,8 +1186,8 @@ impl JobStoreShard {
         put_job_status(batch, tenant, job_id, &new_status)?;
 
         // Insert new index entries
-        let new_kind = new_status.kind();
-        let changed = new_status.changed_at_ms();
+        let new_kind = new_status.kind;
+        let changed = new_status.changed_at_ms;
         let timek = idx_status_time_key(tenant, status_kind_str(new_kind), changed, job_id);
         batch.put(timek.as_bytes(), []);
         Ok(())

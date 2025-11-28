@@ -1263,7 +1263,7 @@ async fn cannot_delete_job_with_future_request_ticket() {
         .await
         .expect("get status")
         .expect("exists");
-    assert!(matches!(status, silo::job::JobStatus::Scheduled { .. }));
+    assert_eq!(status.kind, silo::job::JobStatusKind::Scheduled);
 
     // Attempt to delete job 2 while it's scheduled - should fail
     let err = shard
