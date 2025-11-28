@@ -1,5 +1,7 @@
 mod test_helpers;
 
+use rkyv::Archive;
+use silo::codec::{decode_lease, encode_lease};
 use silo::job::JobStatusKind;
 use silo::job_attempt::AttemptOutcome;
 use test_helpers::*;
@@ -231,10 +233,9 @@ async fn reaper_without_retries_marks_failed_in_index() {
     let (lease_key, lease_value) = first_kv_with_prefix(shard.db(), "lease/")
         .await
         .expect("lease present");
-    type ArchivedLease = <silo::job_store_shard::LeaseRecord as rkyv::Archive>::Archived;
-    type ArchivedTask = <silo::job_store_shard::Task as rkyv::Archive>::Archived;
-    let archived: &ArchivedLease =
-        unsafe { rkyv::archived_root::<silo::job_store_shard::LeaseRecord>(&lease_value) };
+    type ArchivedTask = <silo::job_store_shard::Task as Archive>::Archived;
+    let decoded = decode_lease(&lease_value).expect("decode lease");
+    let archived = decoded.archived();
     let task = match &archived.task {
         ArchivedTask::RunAttempt {
             id,
@@ -254,7 +255,7 @@ async fn reaper_without_retries_marks_failed_in_index() {
         task,
         expiry_ms: now_ms() - 1,
     };
-    let new_val = rkyv::to_bytes::<silo::job_store_shard::LeaseRecord, 256>(&expired).unwrap();
+    let new_val = encode_lease(&expired).unwrap();
     shard
         .db()
         .put(lease_key.as_bytes(), &new_val)
@@ -302,10 +303,9 @@ async fn reaper_with_retries_moves_to_scheduled_in_index() {
     let (lease_key, lease_value) = first_kv_with_prefix(shard.db(), "lease/")
         .await
         .expect("lease present");
-    type ArchivedLease = <silo::job_store_shard::LeaseRecord as rkyv::Archive>::Archived;
-    type ArchivedTask = <silo::job_store_shard::Task as rkyv::Archive>::Archived;
-    let archived: &ArchivedLease =
-        unsafe { rkyv::archived_root::<silo::job_store_shard::LeaseRecord>(&lease_value) };
+    type ArchivedTask = <silo::job_store_shard::Task as Archive>::Archived;
+    let decoded = decode_lease(&lease_value).expect("decode lease");
+    let archived = decoded.archived();
     let task = match &archived.task {
         ArchivedTask::RunAttempt {
             id,
@@ -325,7 +325,7 @@ async fn reaper_with_retries_moves_to_scheduled_in_index() {
         task,
         expiry_ms: now_ms() - 1,
     };
-    let new_val = rkyv::to_bytes::<silo::job_store_shard::LeaseRecord, 256>(&expired).unwrap();
+    let new_val = encode_lease(&expired).unwrap();
     shard
         .db()
         .put(lease_key.as_bytes(), &new_val)

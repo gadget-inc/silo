@@ -1,6 +1,7 @@
 mod test_helpers;
 
 use rkyv::Archive;
+use silo::codec::{decode_lease, encode_lease};
 use silo::job_attempt::{AttemptOutcome, AttemptStatus};
 use silo::job_store_shard::{LeaseRecord, Task};
 use silo::keys::concurrency_holder_key;
@@ -507,9 +508,9 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
     let (lease_key, lease_value) = first_kv_with_prefix(shard.db(), "lease/")
         .await
         .expect("lease present");
-    type ArchivedLease = <LeaseRecord as Archive>::Archived;
     type ArchivedTask = <Task as Archive>::Archived;
-    let archived: &ArchivedLease = unsafe { rkyv::archived_root::<LeaseRecord>(&lease_value) };
+    let decoded = decode_lease(&lease_value).expect("decode lease");
+    let archived = decoded.archived();
     let task = match &archived.task {
         ArchivedTask::RunAttempt {
             id,
@@ -530,7 +531,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         task,
         expiry_ms: expired_ms,
     };
-    let new_val = rkyv::to_bytes::<LeaseRecord, 256>(&new_record).unwrap();
+    let new_val = encode_lease(&new_record).unwrap();
     shard
         .db()
         .put(lease_key.as_bytes(), &new_val)
@@ -1065,9 +1066,9 @@ async fn concurrency_reap_expired_lease_releases_holder() {
     let (lease_key, lease_value) = first_kv_with_prefix(shard.db(), "lease/")
         .await
         .expect("lease");
-    type ArchivedLease = <LeaseRecord as Archive>::Archived;
     type ArchivedTask = <Task as Archive>::Archived;
-    let archived: &ArchivedLease = unsafe { rkyv::archived_root::<LeaseRecord>(&lease_value) };
+    let decoded = decode_lease(&lease_value).expect("decode lease");
+    let archived = decoded.archived();
     let task = match &archived.task {
         ArchivedTask::RunAttempt {
             id,
@@ -1087,7 +1088,7 @@ async fn concurrency_reap_expired_lease_releases_holder() {
         task,
         expiry_ms: now_ms() - 1,
     };
-    let expired_val = rkyv::to_bytes::<LeaseRecord, 256>(&expired_record).unwrap();
+    let expired_val = encode_lease(&expired_record).unwrap();
     shard
         .db()
         .put(lease_key.as_bytes(), &expired_val)
