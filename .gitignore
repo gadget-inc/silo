@@ -2,5 +2,6 @@
 /result
 /result-lib
 .direnv
-default.etcd
+/default.etcd
 /tmp
+/specs/output
