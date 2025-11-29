@@ -1,0 +1,5 @@
+---
+alwaysApply: true
+---
+
+The silo repo uses nix, nix flakes and direnv to manage the development environment. If you are finding that commands are missing from your development environment, reload the shell with `direnv reload`.

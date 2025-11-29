@@ -13,6 +13,7 @@
         etcd
         protobuf # provides protoc binary
         bzip2 # required by slatedb dependencies for compression
+        alloy6 # Alloy verification language for formal specs
       ];
     };
   };
