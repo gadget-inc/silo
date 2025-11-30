@@ -18,9 +18,19 @@ sig Worker {}
 sig TaskId {}
 sig Attempt {}
 
-/** Job status */
+/** Job status (NOT including Cancelled - that's tracked separately) */
 abstract sig JobStatus {}
-one sig Scheduled, Running, Succeeded, Failed, Cancelled extends JobStatus {}
+one sig Scheduled, Running, Succeeded, Failed extends JobStatus {}
+
+/** 
+ * Cancellation is tracked separately from status.
+ * This allows dequeue to blindly write Running without losing cancellation info.
+ * Once cancelled, always cancelled (monotonic).
+ */
+sig JobCancelled {
+    cancelled_job: one Job,
+    cancelled_time: one Time
+}
 
 /** Attempt status */
 abstract sig AttemptStatus {}
@@ -130,6 +140,17 @@ fact wellFormed {
     -- When stutter preserves a lease, the expiry stays the same but ltime advances,
     -- so at the expiry time we have expiry = ltime (which means expired)
     all l: Lease | gte[l.lexpiresAt, l.ltime]
+    
+    -- Cancellation is monotonic: once cancelled at time t, cancelled at all future times
+    all j: Job, t: Time - last | isCancelledAt[j, t] implies isCancelledAt[j, t.next]
+    
+    -- At most one cancellation record per job per time
+    all j: Job, t: Time | lone c: JobCancelled | c.cancelled_job = j and c.cancelled_time = t
+}
+
+/** Check if a job is cancelled at time t */
+pred isCancelledAt[j: Job, t: Time] {
+    some c: JobCancelled | c.cancelled_job = j and c.cancelled_time = t
 }
 
 fun statusAt[j: Job, t: Time]: JobStatus {
@@ -180,8 +201,9 @@ pred leaseUnchanged[taskid: TaskId, t: Time, tnext: Time] {
     leaseExpiresAt[taskid, tnext] = leaseExpiresAt[taskid, t]
 }
 
+/** Terminal status - Cancelled is now separate and orthogonal */
 pred isTerminal[s: JobStatus] {
-    s in (Succeeded + Failed + Cancelled)
+    s in (Succeeded + Failed)
 }
 
 pred isTerminalAttempt[s: AttemptStatus] {
@@ -219,9 +241,10 @@ pred enqueue[tid: TaskId, j: Job, t: Time, tnext: Time] {
     no bufferedAt[tid, t]
     no leaseAt[tid, t]
     
-    -- Post: job now exists with status Scheduled
+    -- Post: job now exists with status Scheduled, NOT cancelled
     jobExistsAt[tnext] = jobExistsAt[t] + j
     statusAt[j, tnext] = Scheduled
+    not isCancelledAt[j, tnext]
     
     -- Post: first task added to DB queue
     one qt: DbQueuedTask | qt.db_qtask = tid and qt.db_qjob = j and qt.db_qtime = tnext
@@ -229,8 +252,9 @@ pred enqueue[tid: TaskId, j: Job, t: Time, tnext: Time] {
     -- Buffer unchanged (Broker must scan later)
     all tid2: TaskId | bufferedAt[tid2, tnext] = bufferedAt[tid2, t]
     
-    -- Frame: other existing jobs unchanged
+    -- Frame: other existing jobs unchanged (status and cancellation)
     all j2: Job | j2 in jobExistsAt[t] implies statusAt[j2, tnext] = statusAt[j2, t]
+    all j2: Job | j2 in jobExistsAt[t] implies (isCancelledAt[j2, tnext] iff isCancelledAt[j2, t])
     
     -- Frame: attempts unchanged
     attemptExistsAt[tnext] = attemptExistsAt[t]
@@ -267,7 +291,7 @@ pred brokerScan[t: Time, tnext: Time] {
     -- Ensure at least one task is added (progress)
     some tid: TaskId | no bufferedAt[tid, t] and some bufferedAt[tid, tnext]
     
-    -- Frame: DB, Leases, Job Status, Attempts unchanged
+    -- Frame: DB, Leases, Job Status, Cancellation, Attempts unchanged
     all tid: TaskId | dbQueuedAt[tid, tnext] = dbQueuedAt[tid, t]
     all tid: TaskId | {
         leaseAt[tid, tnext] = leaseAt[tid, t]
@@ -275,13 +299,16 @@ pred brokerScan[t: Time, tnext: Time] {
         leaseAttemptAt[tid, tnext] = leaseAttemptAt[tid, t]
     }
     all j: Job | statusAt[j, tnext] = statusAt[j, t]
+    all j: Job | isCancelledAt[j, tnext] iff isCancelledAt[j, t]
     attemptExistsAt[tnext] = attemptExistsAt[t]
     all a: attemptExistsAt[t] | attemptStatusAt[a, tnext] = attemptStatusAt[a, t]
     jobExistsAt[tnext] = jobExistsAt[t]
 }
 
 -- Transition: DEQUEUE - Worker claims task from Buffer
--- Critical: This checks DB consistency at moment of claim
+-- Note: We intentionally DO NOT check job status here for performance.
+-- If the job was cancelled while in the buffer, the worker will discover
+-- this on their next heartbeat or when they try to complete.
 pred dequeue[tid: TaskId, w: Worker, a: Attempt, t: Time, tnext: Time] {
     -- Pre: Task is in BUFFER
     some bufferedAt[tid, t]
@@ -291,7 +318,7 @@ pred dequeue[tid: TaskId, w: Worker, a: Attempt, t: Time, tnext: Time] {
         -- Pre: Job must exist (Rust checks maybe_job.is_some())
         j in jobExistsAt[t]
         
-        -- Pre: Attempt `a` does not exist yet (needed for active case)
+        -- Pre: Attempt `a` does not exist yet
         a not in attemptExistsAt[t]
         attemptJob[a] = j 
         
@@ -299,29 +326,25 @@ pred dequeue[tid: TaskId, w: Worker, a: Attempt, t: Time, tnext: Time] {
         no dbQueuedAt[tid, tnext]
         no bufferedAt[tid, tnext]
         
-        -- Branch: If job is active, create lease and mark running
-        --         If job is terminal, just clean up (no lease)
-        (not isTerminal[statusAt[j, t]]) implies {
-            -- Active job: create lease with expiry, mark running, create attempt
-            -- Lease expires at some future time (must heartbeat before then)
-            one l: Lease | l.ltask = tid and l.lworker = w and l.ljob = j and l.lattempt = a 
-                and l.ltime = tnext and gt[l.lexpiresAt, tnext]
-            statusAt[j, tnext] = Running
-            attemptExistsAt[tnext] = attemptExistsAt[t] + a
-            attemptStatusAt[a, tnext] = AttemptRunning
-            -- Frame: other existing jobs unchanged
-            all j2: Job | j2 in jobExistsAt[t] and j2 != j implies statusAt[j2, tnext] = statusAt[j2, t]
-        }
+        -- Always: Create lease with expiry, create attempt
+        -- Note: We create the lease even for cancelled jobs - worker discovers on heartbeat
+        one l: Lease | l.ltask = tid and l.lworker = w and l.ljob = j and l.lattempt = a 
+            and l.ltime = tnext and gt[l.lexpiresAt, tnext]
+        attemptExistsAt[tnext] = attemptExistsAt[t] + a
+        attemptStatusAt[a, tnext] = AttemptRunning
         
-        isTerminal[statusAt[j, t]] implies {
-            -- Terminal job: just clean up, no lease created
-            no l: Lease | l.ltask = tid and l.ltime = tnext
-            -- Frame: all job statuses unchanged
-            all j2: Job | j2 in jobExistsAt[t] implies statusAt[j2, tnext] = statusAt[j2, t]
-            -- Frame: attempts unchanged
-            attemptExistsAt[tnext] = attemptExistsAt[t]
-            all a2: attemptExistsAt[t] | attemptStatusAt[a2, tnext] = attemptStatusAt[a2, t]
-        }
+        -- Job status: unconditionally set to Running (pure write, no status read)
+        -- Cancellation is preserved separately, so this doesn't lose cancel info
+        statusAt[j, tnext] = Running
+        
+        -- Frame: other existing jobs unchanged
+        all j2: Job | j2 in jobExistsAt[t] and j2 != j implies statusAt[j2, tnext] = statusAt[j2, t]
+        
+        -- Frame: cancellation preserved (key property!)
+        all j2: Job | isCancelledAt[j2, tnext] iff isCancelledAt[j2, t]
+        
+        -- Frame: existing attempts unchanged
+        all a2: attemptExistsAt[t] | attemptStatusAt[a2, tnext] = attemptStatusAt[a2, t]
     }
     
     -- Frame: jobs existence unchanged
@@ -335,14 +358,11 @@ pred dequeue[tid: TaskId, w: Worker, a: Attempt, t: Time, tnext: Time] {
         leaseJobAt[tid2, tnext] = leaseJobAt[tid2, t]
         leaseAttemptAt[tid2, tnext] = leaseAttemptAt[tid2, t]
     }
-    
-    -- Frame for active case: existing attempts unchanged
-    (not isTerminal[statusAt[bufferedAt[tid, t], t]]) implies {
-        all a2: attemptExistsAt[t] | attemptStatusAt[a2, tnext] = attemptStatusAt[a2, t]
-    }
 }
 
 -- Transition: COMPLETE_SUCCESS
+-- Note: Worker's result ALWAYS takes precedence.
+-- This is a pure WRITE operation - no status read needed for performance.
 pred completeSuccess[tid: TaskId, w: Worker, t: Time, tnext: Time] {
     -- Pre: worker holds lease
     leaseAt[tid, t] = w
@@ -352,10 +372,9 @@ pred completeSuccess[tid: TaskId, w: Worker, t: Time, tnext: Time] {
     let j = leaseJobAt[tid, t], a = leaseAttemptAt[tid, t] | {
         one j
         one a
-        statusAt[j, t] = Running
         attemptStatusAt[a, t] = AttemptRunning
         
-        -- Post: lease released, job succeeded, attempt succeeded
+        -- Post: release lease, mark success (overwrites ANY previous status)
         no leaseAt[tid, tnext]
         statusAt[j, tnext] = Succeeded
         attemptStatusAt[a, tnext] = AttemptSucceeded
@@ -367,8 +386,9 @@ pred completeSuccess[tid: TaskId, w: Worker, t: Time, tnext: Time] {
         attemptExistsAt[tnext] = attemptExistsAt[t]
         all a2: attemptExistsAt[t] - a | attemptStatusAt[a2, tnext] = attemptStatusAt[a2, t]
     }
-    -- Frame: job existence unchanged
+    -- Frame: job existence, cancellation unchanged
     jobExistsAt[tnext] = jobExistsAt[t]
+    all j: Job | isCancelledAt[j, tnext] iff isCancelledAt[j, t]
     
     -- Frame: other tasks and queue unchanged
     all tid2: TaskId | tid2 != tid implies {
@@ -381,6 +401,7 @@ pred completeSuccess[tid: TaskId, w: Worker, t: Time, tnext: Time] {
 }
 
 -- Transition: COMPLETE_FAILURE_PERMANENT
+-- Note: Worker's result ALWAYS takes precedence (pure write, no status read).
 pred completeFailurePermanent[tid: TaskId, w: Worker, t: Time, tnext: Time] {
     leaseAt[tid, t] = w
     some leaseJobAt[tid, t]
@@ -389,9 +410,9 @@ pred completeFailurePermanent[tid: TaskId, w: Worker, t: Time, tnext: Time] {
     let j = leaseJobAt[tid, t], a = leaseAttemptAt[tid, t] | {
         one j
         one a
-        statusAt[j, t] = Running
         attemptStatusAt[a, t] = AttemptRunning
         
+        -- Post: release lease, mark failed (overwrites ANY previous status)
         no leaseAt[tid, tnext]
         statusAt[j, tnext] = Failed
         attemptStatusAt[a, tnext] = AttemptFailed
@@ -400,8 +421,9 @@ pred completeFailurePermanent[tid: TaskId, w: Worker, t: Time, tnext: Time] {
         attemptExistsAt[tnext] = attemptExistsAt[t]
         all a2: attemptExistsAt[t] - a | attemptStatusAt[a2, tnext] = attemptStatusAt[a2, t]
     }
-    -- Frame: job existence unchanged
+    -- Frame: job existence, cancellation unchanged
     jobExistsAt[tnext] = jobExistsAt[t]
+    all j: Job | isCancelledAt[j, tnext] iff isCancelledAt[j, t]
     
     all tid2: TaskId | tid2 != tid implies {
         leaseAt[tid2, tnext] = leaseAt[tid2, t]
@@ -413,6 +435,8 @@ pred completeFailurePermanent[tid: TaskId, w: Worker, t: Time, tnext: Time] {
 }
 
 -- Transition: COMPLETE_FAILURE_RETRY
+-- Note: Worker's result ALWAYS takes precedence (pure write, no status read).
+-- Always enqueues retry task regardless of previous status.
 pred completeFailureRetry[tid: TaskId, w: Worker, newTid: TaskId, t: Time, tnext: Time] {
     leaseAt[tid, t] = w
     some leaseJobAt[tid, t]
@@ -426,21 +450,21 @@ pred completeFailureRetry[tid: TaskId, w: Worker, newTid: TaskId, t: Time, tnext
     let j = leaseJobAt[tid, t], a = leaseAttemptAt[tid, t] | {
         one j
         one a
-        statusAt[j, t] = Running
         attemptStatusAt[a, t] = AttemptRunning
         
+        -- Post: release lease, fail attempt, enqueue retry (overwrites ANY previous status)
         no leaseAt[tid, tnext]
-        -- Enqueue new task in DB (not buffer yet)
+        attemptStatusAt[a, tnext] = AttemptFailed
         one qt: DbQueuedTask | qt.db_qtask = newTid and qt.db_qjob = j and qt.db_qtime = tnext
         statusAt[j, tnext] = Scheduled
-        attemptStatusAt[a, tnext] = AttemptFailed
         
         all j2: Job | j2 in jobExistsAt[t] and j2 != j implies statusAt[j2, tnext] = statusAt[j2, t]
         attemptExistsAt[tnext] = attemptExistsAt[t]
         all a2: attemptExistsAt[t] - a | attemptStatusAt[a2, tnext] = attemptStatusAt[a2, t]
     }
-    -- Frame: job existence unchanged
+    -- Frame: job existence, cancellation unchanged
     jobExistsAt[tnext] = jobExistsAt[t]
+    all j: Job | isCancelledAt[j, tnext] iff isCancelledAt[j, t]
     
     all tid2: TaskId | tid2 != tid implies {
         leaseAt[tid2, tnext] = leaseAt[tid2, t]
@@ -451,41 +475,51 @@ pred completeFailureRetry[tid: TaskId, w: Worker, newTid: TaskId, t: Time, tnext
     all tid2: TaskId | bufferedAt[tid2, tnext] = bufferedAt[tid2, t]
 }
 
--- Transition: CANCEL - cancel a scheduled job
+-- Transition: CANCEL - mark job as cancelled
+-- Note: Does NOT change status. Status and cancellation are orthogonal.
+-- This allows dequeue to blindly write Running without losing cancellation info.
 pred cancelJob[j: Job, t: Time, tnext: Time] {
-    -- Pre: job exists and is scheduled
+    -- Pre: job exists and not already cancelled
     j in jobExistsAt[t]
-    statusAt[j, t] = Scheduled
-    no tid: TaskId | leaseJobAt[tid, t] = j
+    not isCancelledAt[j, t]
     
-    statusAt[j, tnext] = Cancelled
+    -- Post: Mark job as cancelled (add cancellation record)
+    one c: JobCancelled | c.cancelled_job = j and c.cancelled_time = tnext
     
-    -- Remove from DB queue
+    -- Post: Status stays the same (cancellation is orthogonal to status)
+    statusAt[j, tnext] = statusAt[j, t]
+    
+    -- Remove from DB queue (prevent new dequeues of new tasks)
     no qt: DbQueuedTask | qt.db_qjob = j and qt.db_qtime = tnext
     
+    -- Frame: other DB queue entries unchanged
+    all tid: TaskId | dbQueuedAt[tid, t] != j implies dbQueuedAt[tid, tnext] = dbQueuedAt[tid, t]
+    
     -- NOTE: Does NOT remove from buffer immediately (stale buffer possible)
-    -- Stale entries are handled at dequeue time when the job check fails
     all tid: TaskId | bufferedAt[tid, tnext] = bufferedAt[tid, t]
     
-    all j2: Job | j2 in jobExistsAt[t] and j2 != j implies statusAt[j2, tnext] = statusAt[j2, t]
+    -- NOTE: Does NOT remove lease - worker will discover cancellation on heartbeat
     all tid: TaskId | {
         leaseAt[tid, tnext] = leaseAt[tid, t]
         leaseJobAt[tid, tnext] = leaseJobAt[tid, t]
         leaseAttemptAt[tid, tnext] = leaseAttemptAt[tid, t]
     }
-    all tid: TaskId | dbQueuedAt[tid, t] != j implies dbQueuedAt[tid, tnext] = dbQueuedAt[tid, t]
     
-    -- Frame: job existence unchanged
+    -- Frame: other jobs, job existence, attempts unchanged
+    all j2: Job | j2 in jobExistsAt[t] and j2 != j implies statusAt[j2, tnext] = statusAt[j2, t]
+    -- Frame: cancellation for other jobs unchanged
+    all j2: Job | j2 != j implies (isCancelledAt[j2, tnext] iff isCancelledAt[j2, t])
     jobExistsAt[tnext] = jobExistsAt[t]
     attemptExistsAt[tnext] = attemptExistsAt[t]
     all a: attemptExistsAt[t] | attemptStatusAt[a, tnext] = attemptStatusAt[a, t]
 }
 
 -- Transition: HEARTBEAT - Worker extends lease expiry
+-- Note: Heartbeat ALWAYS renews the lease, even for cancelled jobs.
+-- The worker discovers cancellation from the heartbeat RESPONSE, but can keep
+-- heartbeating while gracefully winding down. Lease is only released on completion.
 pred heartbeat[tid: TaskId, w: Worker, t: Time, tnext: Time] {
-    -- Pre: Worker holds this lease (existence check only - matches Rust implementation)
-    -- Note: Rust does NOT check expiry on heartbeat - only that lease exists and worker matches
-    -- This means heartbeat can "save" an expired lease if it runs before the reaper
+    -- Pre: Worker holds this lease (existence check only)
     leaseAt[tid, t] = w
     some leaseJobAt[tid, t]
     some leaseAttemptAt[tid, t]
@@ -494,18 +528,20 @@ pred heartbeat[tid: TaskId, w: Worker, t: Time, tnext: Time] {
         one j
         one a
         
-        -- Post: Lease renewed with new expiry in the future
+        -- Always renew lease (worker can keep heartbeating during graceful shutdown)
+        -- Worker discovers cancellation from heartbeat RESPONSE (isCancelledAt check)
         one l: Lease | l.ltask = tid and l.lworker = w and l.ljob = j and l.lattempt = a 
             and l.ltime = tnext and gt[l.lexpiresAt, tnext]
         
-        -- Frame: job status unchanged
+        -- Frame: job and attempt statuses unchanged
         all j2: Job | j2 in jobExistsAt[t] implies statusAt[j2, tnext] = statusAt[j2, t]
+        all a2: attemptExistsAt[t] | attemptStatusAt[a2, tnext] = attemptStatusAt[a2, t]
     }
     
     -- Frame: everything else unchanged
     jobExistsAt[tnext] = jobExistsAt[t]
     attemptExistsAt[tnext] = attemptExistsAt[t]
-    all a: attemptExistsAt[t] | attemptStatusAt[a, tnext] = attemptStatusAt[a, t]
+    all j: Job | isCancelledAt[j, tnext] iff isCancelledAt[j, t]
     all tid2: TaskId | dbQueuedAt[tid2, tnext] = dbQueuedAt[tid2, t]
     all tid2: TaskId | bufferedAt[tid2, tnext] = bufferedAt[tid2, t]
     all tid2: TaskId | tid2 != tid implies {
@@ -517,6 +553,7 @@ pred heartbeat[tid: TaskId, w: Worker, t: Time, tnext: Time] {
 
 -- Transition: REAP_EXPIRED_LEASE - System reclaims expired lease (worker crashed)
 -- Similar to completeFailurePermanent but triggered by expiry, not worker report
+-- Note: Pure write - overwrites any status including Cancelled
 pred reapExpiredLease[tid: TaskId, t: Time, tnext: Time] {
     -- Pre: Lease exists and has expired
     some leaseAt[tid, t]
@@ -525,10 +562,9 @@ pred reapExpiredLease[tid: TaskId, t: Time, tnext: Time] {
     let j = leaseJobAt[tid, t], a = leaseAttemptAt[tid, t] | {
         one j
         one a
-        statusAt[j, t] = Running
         attemptStatusAt[a, t] = AttemptRunning
         
-        -- Post: Lease removed, job and attempt marked failed (worker crashed)
+        -- Post: Lease removed, job and attempt marked failed (overwrites ANY previous status)
         no leaseAt[tid, tnext]
         statusAt[j, tnext] = Failed
         attemptStatusAt[a, tnext] = AttemptFailed
@@ -539,8 +575,9 @@ pred reapExpiredLease[tid: TaskId, t: Time, tnext: Time] {
         all a2: attemptExistsAt[t] - a | attemptStatusAt[a2, tnext] = attemptStatusAt[a2, t]
     }
     
-    -- Frame: job existence unchanged
+    -- Frame: job existence and cancellation unchanged
     jobExistsAt[tnext] = jobExistsAt[t]
+    all j: Job | isCancelledAt[j, tnext] iff isCancelledAt[j, t]
     
     -- Frame: other tasks unchanged
     all tid2: TaskId | tid2 != tid implies {
@@ -554,8 +591,9 @@ pred reapExpiredLease[tid: TaskId, t: Time, tnext: Time] {
 
 -- Transition: STUTTER
 pred stutter[t: Time, tnext: Time] {
-    -- All existing jobs unchanged
+    -- All existing jobs unchanged (status and cancellation)
     all j: Job | j in jobExistsAt[t] implies statusAt[j, tnext] = statusAt[j, t]
+    all j: Job | isCancelledAt[j, tnext] iff isCancelledAt[j, t]
     all tid: TaskId | dbQueuedAt[tid, tnext] = dbQueuedAt[tid, t]
     all tid: TaskId | bufferedAt[tid, tnext] = bufferedAt[tid, t]
     all tid: TaskId | {
@@ -599,7 +637,12 @@ assert oneLeasePerJob {
 }
 
 /** Only Running jobs have leases */
-assert onlyRunningHasLease {
+/** 
+ * Leases can only exist for Running jobs (status-wise).
+ * The job may also be cancelled (orthogonal flag), but status must be Running.
+ * Succeeded/Failed jobs cannot have leases because they're set when lease is released.
+ */
+assert leaseJobMustBeRunning {
     all t: Time, tid: TaskId | some leaseAt[tid, t] implies 
         statusAt[leaseJobAt[tid, t], t] = Running
 }
@@ -617,20 +660,29 @@ assert attemptTerminalIsForever {
         attemptStatusAt[a, t.next] = attemptStatusAt[a, t]
 }
 
-/** Valid transitions only (for existing jobs) */
+/**
+ * Valid job status transitions.
+ * Note: Cancellation is a separate flag, not a status.
+ * Status is just: Scheduled, Running, Succeeded, Failed
+ */
 assert validTransitions {
     all t: Time - last, j: Job | j in jobExistsAt[t] implies {
-        statusAt[j, t] = Scheduled implies statusAt[j, t.next] in (Scheduled + Running + Cancelled)
+        statusAt[j, t] = Scheduled implies statusAt[j, t.next] in (Scheduled + Running)
         statusAt[j, t] = Running implies statusAt[j, t.next] in (Running + Succeeded + Failed + Scheduled)
-        isTerminal[statusAt[j, t]] implies statusAt[j, t.next] = statusAt[j, t]
+        -- Succeeded and Failed are truly terminal
+        statusAt[j, t] = Succeeded implies statusAt[j, t.next] = Succeeded
+        statusAt[j, t] = Failed implies statusAt[j, t.next] = Failed
     }
 }
 
-/** No "Zombie" Attempts: If job is Cancelled, it should not have running attempts */
+/** 
+ * No "Zombie" Attempts for terminal jobs (Succeeded/Failed).
+ * If job is Succeeded/Failed, its attempts can't be AttemptRunning.
+ */
 assert noZombieAttempts {
     all t: Time, att: attemptExistsAt[t] | 
         let j = attemptJob[att] | 
-        (statusAt[j, t] = Cancelled implies attemptStatusAt[att, t] != AttemptRunning)
+        (isTerminal[statusAt[j, t]] implies attemptStatusAt[att, t] != AttemptRunning)
 }
 
 /** Queue Consistency: Terminal jobs have no DB queued tasks */
@@ -640,20 +692,22 @@ assert noQueuedTasksForTerminal {
 }
 
 /** Lease Consistency: Terminal jobs have no active leases */
+/**
+ * Succeeded/Failed jobs never have leases.
+ * These states are only set when the lease is released (completion/reap).
+ */
 assert noLeasesForTerminal {
     all t: Time, j: Job | (j in jobExistsAt[t] and isTerminal[statusAt[j, t]]) implies 
         no l: Lease | l.ljob = j and l.ltime = t
 }
 
-/** 
- * Buffer can be stale (contain cancelled job tasks), but we should never
- * successfully dequeue a cancelled job's task into a lease.
- * This is caught by noLeasesForTerminal, but this check makes the intent explicit.
+/**
+ * Cancellation is monotonic: once cancelled, always cancelled.
+ * This is enforced by wellFormed, but we verify it here.
  */
-assert noDequeueCancelledJob {
-    all t: Time - last, tid: TaskId, j: Job |
-        (some bufferedAt[tid, t] and bufferedAt[tid, t] = j and statusAt[j, t] = Cancelled)
-        implies not (some l: Lease | l.ltask = tid and l.ljob = j and l.ltime = t.next)
+assert cancellationIsMonotonic {
+    all j: Job, t: Time - last | 
+        isCancelledAt[j, t] implies isCancelledAt[j, t.next]
 }
 
 
@@ -673,27 +727,108 @@ pred examplePermanentFailureWithRetry {
 /** 
  * Scenario: Stale Buffer
  * Job is cancelled while task is in buffer.
- * Verify we don't execute it.
  */
 pred exampleStaleBuffer {
     some tid: TaskId, j: Job, t: Time | {
         bufferedAt[tid, t] = j
-        statusAt[j, t] = Cancelled
-        -- And we reach end of time without violating safety
+        isCancelledAt[j, t]
     }
 }
 
 /**
- * TEST: Can we even produce the bad scenario?
- * If this is UNSAT, the model structurally prevents cancelled jobs from being dequeued.
+ * Scenario: Early cancellation prevents execution
+ * Job is cancelled BEFORE its task enters the buffer.
+ * Task is removed from DB queue, never enters buffer, job never runs.
+ * This is the ideal cancellation path - no wasted work.
+ */
+pred exampleEarlyCancellationPreventsRun {
+    some tid: TaskId, j: Job, t1, t2, t3: Time | {
+        lt[t1, t2] and lt[t2, t3]
+        -- t1: job scheduled, task in DB queue, NOT in buffer yet, NOT cancelled
+        j in jobExistsAt[t1]
+        statusAt[j, t1] = Scheduled
+        not isCancelledAt[j, t1]
+        some dbQueuedAt[tid, t1]
+        dbQueuedAt[tid, t1] = j
+        no bufferedAt[tid, t1]  -- Not yet in buffer
+        -- t2: job cancelled, task removed from DB queue
+        isCancelledAt[j, t2]
+        no dbQueuedAt[tid, t2]  -- Removed by cancelJob
+        no bufferedAt[tid, t2]  -- Never entered buffer
+        -- t3: job stays cancelled, never got a lease, never ran
+        isCancelledAt[j, t3]
+        statusAt[j, t3] = Scheduled  -- Status never changed to Running
+        no l: Lease | l.ljob = j and l.ltime = t3  -- No lease ever created
+    }
+}
+
+/**
+ * Scenario: Job cancelled while task in buffer, worker dequeues stale task
+ * Worker gets a lease for a cancelled job (allowed now for performance).
+ * This demonstrates that dequeue doesn't check cancellation status, which allows cancelled jobs to be dequeued which isn't great, but it means we can avoid an extra read on every dequeue.
  */
 pred exampleCancelThenDequeue {
     some tid: TaskId, j: Job, t: Time - last | {
         -- At time t: job is cancelled but task is in buffer
         bufferedAt[tid, t] = j
-        statusAt[j, t] = Cancelled
+        isCancelledAt[j, t]
         -- At time t.next: a lease was created for this task/job
         some l: Lease | l.ltask = tid and l.ljob = j and l.ltime = t.next
+    }
+}
+
+/**
+ * GOOD EXAMPLE: Cancellation preserved during stale buffer dequeue
+ * This demonstrates the fix where:
+ * 1. Job scheduled, task in buffer
+ * 2. Cancel arrives - job gets cancelled flag
+ * 3. Worker dequeues stale task - job status becomes Running BUT cancellation preserved!
+ * 4. Worker discovers cancellation on heartbeat
+ */
+pred exampleCancellationPreservedOnDequeue {
+    some tid: TaskId, j: Job, t1, t2, t3, t4: Time | {
+        lt[t1, t2] and lt[t2, t3] and lt[t3, t4]
+        -- t1: job scheduled, task in buffer, NOT cancelled
+        j in jobExistsAt[t1]
+        statusAt[j, t1] = Scheduled
+        not isCancelledAt[j, t1]
+        some bufferedAt[tid, t1]
+        bufferedAt[tid, t1] = j
+        -- t2: job cancelled while task still in buffer (status unchanged, flag set)
+        isCancelledAt[j, t2]
+        some bufferedAt[tid, t2]  -- still in buffer (stale)
+        -- t3: worker dequeues - status becomes Running BUT cancellation flag preserved!
+        some leaseAt[tid, t3]
+        statusAt[j, t3] = Running  -- Status is Running (pure write)
+        isCancelledAt[j, t3]       -- But cancellation flag is preserved!
+        -- t4: worker still has lease, still sees cancellation
+        some leaseAt[tid, t4]
+        isCancelledAt[j, t4]  -- Worker sees cancellation via heartbeat response
+    }
+}
+
+/**
+ * Scenario: Worker discovers cancellation on heartbeat but continues gracefully
+ * Job is dequeued (creating lease), cancelled while worker runs,
+ * worker heartbeats (discovering cancellation but keeping lease),
+ * worker eventually completes (releasing lease).
+ */
+pred exampleCancellationDiscoveryOnHeartbeat {
+    some tid: TaskId, j: Job, t1, t2, t3: Time | {
+        lt[t1, t2] and lt[t2, t3]
+        -- t1: job running with lease, not yet cancelled
+        some leaseAt[tid, t1]
+        leaseJobAt[tid, t1] = j
+        statusAt[j, t1] = Running
+        not isCancelledAt[j, t1]
+        -- t2: job cancelled but lease still exists (worker discovers on heartbeat)
+        some leaseAt[tid, t2]
+        statusAt[j, t2] = Running  -- Status is still Running
+        isCancelledAt[j, t2]       -- But cancellation flag is set
+        -- t3: worker completes successfully (releases lease, status becomes Succeeded)
+        no leaseAt[tid, t3]
+        statusAt[j, t3] = Succeeded  -- Worker success takes precedence
+        isCancelledAt[j, t3]         -- But cancellation flag is preserved!
     }
 }
 
@@ -733,47 +868,55 @@ pred exampleLeaseExpiry {
 
 -- Note: JobState count = Jobs × Times where job exists (not all times)
 -- AttemptExists and JobExists need 1 per Time
+-- JobCancelled: needs entries for times when job is cancelled
 run exampleSuccess for 3 but exactly 1 Job, 1 Worker, 2 TaskId, 2 Attempt, 6 Time,
-    6 JobState, 6 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 2 Lease, 6 AttemptExists, 6 JobExists, 2 JobAttemptRelation
+    6 JobState, 6 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 2 Lease, 6 AttemptExists, 6 JobExists, 2 JobAttemptRelation, 6 JobCancelled
     
 run exampleRetry for 3 but exactly 1 Job, 1 Worker, 3 TaskId, 2 Attempt, 10 Time,
-    10 JobState, 10 AttemptState, 5 DbQueuedTask, 5 BufferedTask, 4 Lease, 10 AttemptExists, 10 JobExists, 2 JobAttemptRelation
+    10 JobState, 10 AttemptState, 5 DbQueuedTask, 5 BufferedTask, 4 Lease, 10 AttemptExists, 10 JobExists, 2 JobAttemptRelation, 10 JobCancelled
 
 run examplePermanentFailureWithRetry for 3 but exactly 1 Job, 1 Worker, 3 TaskId, 3 Attempt, 10 Time,
-    10 JobState, 10 AttemptState, 5 DbQueuedTask, 5 BufferedTask, 4 Lease, 10 AttemptExists, 10 JobExists, 3 JobAttemptRelation
+    10 JobState, 10 AttemptState, 5 DbQueuedTask, 5 BufferedTask, 4 Lease, 10 AttemptExists, 10 JobExists, 3 JobAttemptRelation, 10 JobCancelled
 
 run exampleStaleBuffer for 3 but exactly 1 Job, 1 Worker, 2 TaskId, 1 Attempt, 6 Time,
-    6 JobState, 6 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 2 Lease, 6 AttemptExists, 6 JobExists, 1 JobAttemptRelation
+    6 JobState, 6 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 2 Lease, 6 AttemptExists, 6 JobExists, 1 JobAttemptRelation, 6 JobCancelled
+run exampleEarlyCancellationPreventsRun for 3 but exactly 1 Job, 1 Worker, 2 TaskId, 1 Attempt, 6 Time,
+    6 JobState, 6 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 2 Lease, 6 AttemptExists, 6 JobExists, 1 JobAttemptRelation, 6 JobCancelled
 
 run exampleCancelThenDequeue for 3 but exactly 1 Job, 1 Worker, 2 TaskId, 2 Attempt, 8 Time,
-    8 JobState, 8 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 2 Lease, 8 AttemptExists, 8 JobExists, 2 JobAttemptRelation
+    8 JobState, 8 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 2 Lease, 8 AttemptExists, 8 JobExists, 2 JobAttemptRelation, 8 JobCancelled
+run exampleCancellationPreservedOnDequeue for 3 but exactly 1 Job, 1 Worker, 2 TaskId, 2 Attempt, 8 Time,
+    8 JobState, 8 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 2 Lease, 8 AttemptExists, 8 JobExists, 2 JobAttemptRelation, 8 JobCancelled
+run exampleCancellationDiscoveryOnHeartbeat for 3 but exactly 1 Job, 1 Worker, 2 TaskId, 2 Attempt, 8 Time,
+    8 JobState, 8 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 2 Lease, 8 AttemptExists, 8 JobExists, 2 JobAttemptRelation, 8 JobCancelled
 
 run exampleHeartbeat for 3 but exactly 1 Job, 1 Worker, 2 TaskId, 2 Attempt, 8 Time,
-    8 JobState, 8 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 2 JobAttemptRelation
+    8 JobState, 8 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 2 JobAttemptRelation, 8 JobCancelled
 
 run exampleLeaseExpiry for 3 but exactly 1 Job, 1 Worker, 2 TaskId, 2 Attempt, 8 Time,
-    8 JobState, 8 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 2 JobAttemptRelation
+    8 JobState, 8 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 2 JobAttemptRelation, 8 JobCancelled
 
 -- Bounds: Jobs may not exist at all times, so JobState <= Jobs × Times
 -- AttemptExists and JobExists = 1 per Time
+-- JobCancelled: at most 1 per job (once cancelled, always cancelled)
 check noDoubleLease for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
-    16 JobState, 24 AttemptState, 8 DbQueuedTask, 8 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation
+    16 JobState, 24 AttemptState, 8 DbQueuedTask, 8 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 16 JobCancelled
 check oneLeasePerJob for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
-    16 JobState, 24 AttemptState, 8 DbQueuedTask, 8 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation
-check onlyRunningHasLease for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
-    16 JobState, 24 AttemptState, 8 DbQueuedTask, 8 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation
+    16 JobState, 24 AttemptState, 8 DbQueuedTask, 8 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 16 JobCancelled
+check leaseJobMustBeRunning for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
+    16 JobState, 24 AttemptState, 8 DbQueuedTask, 8 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 16 JobCancelled
 check runningJobHasRunningAttempt for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
-    16 JobState, 24 AttemptState, 8 DbQueuedTask, 8 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation
+    16 JobState, 24 AttemptState, 8 DbQueuedTask, 8 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 16 JobCancelled
 check attemptTerminalIsForever for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
-    16 JobState, 24 AttemptState, 8 DbQueuedTask, 8 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation
+    16 JobState, 24 AttemptState, 8 DbQueuedTask, 8 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 16 JobCancelled
 check validTransitions for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
-    16 JobState, 24 AttemptState, 8 DbQueuedTask, 8 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation
+    16 JobState, 24 AttemptState, 8 DbQueuedTask, 8 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 16 JobCancelled
 check noZombieAttempts for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
-    16 JobState, 24 AttemptState, 8 DbQueuedTask, 8 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation
+    16 JobState, 24 AttemptState, 8 DbQueuedTask, 8 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 16 JobCancelled
 check noQueuedTasksForTerminal for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
-    16 JobState, 24 AttemptState, 8 DbQueuedTask, 8 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation
+    16 JobState, 24 AttemptState, 8 DbQueuedTask, 8 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 16 JobCancelled
 check noLeasesForTerminal for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
-    16 JobState, 24 AttemptState, 8 DbQueuedTask, 8 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation
-check noDequeueCancelledJob for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
-    16 JobState, 24 AttemptState, 8 DbQueuedTask, 8 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation
+    16 JobState, 24 AttemptState, 8 DbQueuedTask, 8 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 16 JobCancelled
+check cancellationIsMonotonic for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
+    16 JobState, 24 AttemptState, 8 DbQueuedTask, 8 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 16 JobCancelled
 
