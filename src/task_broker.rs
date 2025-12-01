@@ -64,7 +64,7 @@ impl TaskBroker {
 
     /// Scan tasks from DB and insert into buffer, skipping future tasks and inflight ones.
     async fn scan_tasks(&self, now_ms: i64) -> usize {
-        // Tasks live under tasks/<ts>/<pri>/<job_id>/<attempt>
+        // [SILO-SCAN-1] Tasks live under tasks/<ts>/<pri>/<job_id>/<attempt>
         let start: Vec<u8> = b"tasks/".to_vec();
         let mut end: Vec<u8> = b"tasks/".to_vec();
         end.push(0xFF);
@@ -99,7 +99,7 @@ impl TaskBroker {
                 }
             }
 
-            // Skip inflight tasks
+            // [SILO-SCAN-3] Skip inflight tasks
             if self.inflight.lock().unwrap().contains(key_str) {
                 continue;
             }
@@ -113,7 +113,7 @@ impl TaskBroker {
                 task,
             };
 
-            // Insert into buffer if not already present
+            // [SILO-SCAN-2] Insert into buffer if not already present
             if self.buffer.get(&entry.key).is_none() {
                 self.buffer.insert(entry.key.clone(), entry);
                 inserted += 1;

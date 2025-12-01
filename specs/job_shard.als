@@ -231,22 +231,22 @@ pred init[t: Time] {
 }
 
 -- Transition: ENQUEUE - Create a new job with its first task
--- (Matches Rust: enqueue creates job_info, job_status, AND first task atomically)
+-- See: job_store_shard.rs::enqueue_with_metadata
 pred enqueue[tid: TaskId, j: Job, t: Time, tnext: Time] {
-    -- Pre: job does NOT exist yet (this is job creation)
+    -- [SILO-ENQ-1] Pre: job does NOT exist yet (we're creating a new job)
     j not in jobExistsAt[t]
     
-    -- Pre: task not already used
+    -- Pre: task is not already in use (not in DB, buffer, or leased)
     no dbQueuedAt[tid, t]
     no bufferedAt[tid, t]
     no leaseAt[tid, t]
     
-    -- Post: job now exists with status Scheduled, NOT cancelled
+    -- [SILO-ENQ-2] Post: job now exists with status Scheduled, NOT cancelled
     jobExistsAt[tnext] = jobExistsAt[t] + j
     statusAt[j, tnext] = Scheduled
     not isCancelledAt[j, tnext]
     
-    -- Post: first task added to DB queue
+    -- [SILO-ENQ-3] Post: first task added to DB queue
     one qt: DbQueuedTask | qt.db_qtask = tid and qt.db_qjob = j and qt.db_qtime = tnext
     
     -- Buffer unchanged (Broker must scan later)
@@ -272,13 +272,12 @@ pred enqueue[tid: TaskId, j: Job, t: Time, tnext: Time] {
 }
 
 -- Transition: BROKER_SCAN - Read from DB to Buffer
--- The broker picks up tasks from DB and puts them in memory.
+-- See: task_broker.rs::scan_tasks
 pred brokerScan[t: Time, tnext: Time] {
-    -- Pre: There are tasks in DB that are NOT in buffer
+    -- [SILO-SCAN-1] Pre: There are tasks in DB that are NOT in buffer
     some tid: TaskId | some dbQueuedAt[tid, t] and no bufferedAt[tid, t]
     
-    -- Effect: Copy (some) tasks from DB to Buffer
-    -- We define this broadly: Buffer set grows to include subset of DB tasks
+    -- [SILO-SCAN-2] Effect: Copy (some) tasks from DB to Buffer
     -- The key invariant: Only tasks in DB can be added to buffer
     all tid: TaskId | {
         -- If it was already buffered, it stays buffered
@@ -290,6 +289,8 @@ pred brokerScan[t: Time, tnext: Time] {
     }
     -- Ensure at least one task is added (progress)
     some tid: TaskId | no bufferedAt[tid, t] and some bufferedAt[tid, tnext]
+    
+    -- [SILO-SCAN-3] Skip inflight tasks (modeled implicitly by buffer only accepting non-leased tasks)
     
     -- Frame: DB, Leases, Job Status, Cancellation, Attempts unchanged
     all tid: TaskId | dbQueuedAt[tid, tnext] = dbQueuedAt[tid, t]
@@ -310,30 +311,32 @@ pred brokerScan[t: Time, tnext: Time] {
 -- If the job was cancelled while in the buffer, the worker will discover
 -- this on their next heartbeat or when they try to complete.
 pred dequeue[tid: TaskId, w: Worker, a: Attempt, t: Time, tnext: Time] {
-    -- Pre: Task is in BUFFER
+    -- [SILO-DEQ-1] Pre: Task is in BUFFER
     some bufferedAt[tid, t]
     let j = bufferedAt[tid, t] | {
         one j
         
-        -- Pre: Job must exist (Rust checks maybe_job.is_some())
+        -- [SILO-DEQ-2] Pre: Job must exist
         j in jobExistsAt[t]
         
         -- Pre: Attempt `a` does not exist yet
         a not in attemptExistsAt[t]
         attemptJob[a] = j 
         
-        -- Always: Remove task from DB and buffer
+        -- [SILO-DEQ-3] Always: Remove task from DB and buffer
         no dbQueuedAt[tid, tnext]
         no bufferedAt[tid, tnext]
         
-        -- Always: Create lease with expiry, create attempt
+        -- [SILO-DEQ-4] Always: Create lease with expiry
         -- Note: We create the lease even for cancelled jobs - worker discovers on heartbeat
         one l: Lease | l.ltask = tid and l.lworker = w and l.ljob = j and l.lattempt = a 
             and l.ltime = tnext and gt[l.lexpiresAt, tnext]
+        
+        -- [SILO-DEQ-5] Always: Create attempt with AttemptRunning status
         attemptExistsAt[tnext] = attemptExistsAt[t] + a
         attemptStatusAt[a, tnext] = AttemptRunning
         
-        -- Job status: unconditionally set to Running (pure write, no status read)
+        -- [SILO-DEQ-6] Job status: unconditionally set to Running (pure write, no status read)
         -- Cancellation is preserved separately, so this doesn't lose cancel info
         statusAt[j, tnext] = Running
         
@@ -364,7 +367,7 @@ pred dequeue[tid: TaskId, w: Worker, a: Attempt, t: Time, tnext: Time] {
 -- Note: Worker's result ALWAYS takes precedence.
 -- This is a pure WRITE operation - no status read needed for performance.
 pred completeSuccess[tid: TaskId, w: Worker, t: Time, tnext: Time] {
-    -- Pre: worker holds lease
+    -- [SILO-SUCC-1] Pre: worker holds lease
     leaseAt[tid, t] = w
     some leaseJobAt[tid, t]
     some leaseAttemptAt[tid, t]
@@ -374,9 +377,13 @@ pred completeSuccess[tid: TaskId, w: Worker, t: Time, tnext: Time] {
         one a
         attemptStatusAt[a, t] = AttemptRunning
         
-        -- Post: release lease, mark success (overwrites ANY previous status)
+        -- [SILO-SUCC-2] Post: release lease
         no leaseAt[tid, tnext]
+        
+        -- [SILO-SUCC-3] Post: set job status to Succeeded (pure write, overwrites ANY previous status)
         statusAt[j, tnext] = Succeeded
+        
+        -- [SILO-SUCC-4] Post: set attempt status to AttemptSucceeded
         attemptStatusAt[a, tnext] = AttemptSucceeded
         
         -- Frame: other existing jobs unchanged
@@ -401,8 +408,9 @@ pred completeSuccess[tid: TaskId, w: Worker, t: Time, tnext: Time] {
 }
 
 -- Transition: COMPLETE_FAILURE_PERMANENT
--- Note: Worker's result ALWAYS takes precedence (pure write, no status read).
+-- Note: Worker's result takes precedence over any previously reported results
 pred completeFailurePermanent[tid: TaskId, w: Worker, t: Time, tnext: Time] {
+    -- [SILO-FAIL-1] Pre: worker holds lease
     leaseAt[tid, t] = w
     some leaseJobAt[tid, t]
     some leaseAttemptAt[tid, t]
@@ -412,9 +420,13 @@ pred completeFailurePermanent[tid: TaskId, w: Worker, t: Time, tnext: Time] {
         one a
         attemptStatusAt[a, t] = AttemptRunning
         
-        -- Post: release lease, mark failed (overwrites ANY previous status)
+        -- [SILO-FAIL-2] Post: release lease
         no leaseAt[tid, tnext]
+        
+        -- [SILO-FAIL-3] Post: set job status to Failed (pure write, overwrites ANY previous status)
         statusAt[j, tnext] = Failed
+        
+        -- [SILO-FAIL-4] Post: set attempt status to AttemptFailed
         attemptStatusAt[a, tnext] = AttemptFailed
         
         all j2: Job | j2 in jobExistsAt[t] and j2 != j implies statusAt[j2, tnext] = statusAt[j2, t]
@@ -435,9 +447,9 @@ pred completeFailurePermanent[tid: TaskId, w: Worker, t: Time, tnext: Time] {
 }
 
 -- Transition: COMPLETE_FAILURE_RETRY
--- Note: Worker's result ALWAYS takes precedence (pure write, no status read).
--- Always enqueues retry task regardless of previous status.
+-- Note: Worker's result takes precedence over any previously reported results, so this always enqueues a retry task regardless of previous status
 pred completeFailureRetry[tid: TaskId, w: Worker, newTid: TaskId, t: Time, tnext: Time] {
+    -- [SILO-RETRY-1] Pre: worker holds lease
     leaseAt[tid, t] = w
     some leaseJobAt[tid, t]
     some leaseAttemptAt[tid, t]
@@ -452,10 +464,16 @@ pred completeFailureRetry[tid: TaskId, w: Worker, newTid: TaskId, t: Time, tnext
         one a
         attemptStatusAt[a, t] = AttemptRunning
         
-        -- Post: release lease, fail attempt, enqueue retry (overwrites ANY previous status)
+        -- [SILO-RETRY-2] Post: release lease
         no leaseAt[tid, tnext]
+        
+        -- [SILO-RETRY-4] Post: set attempt status to AttemptFailed
         attemptStatusAt[a, tnext] = AttemptFailed
+        
+        -- [SILO-RETRY-5] Post: enqueue new task to DB queue
         one qt: DbQueuedTask | qt.db_qtask = newTid and qt.db_qjob = j and qt.db_qtime = tnext
+        
+        -- [SILO-RETRY-3] Post: set job status to Scheduled (pure write, overwrites ANY previous status)
         statusAt[j, tnext] = Scheduled
         
         all j2: Job | j2 in jobExistsAt[t] and j2 != j implies statusAt[j2, tnext] = statusAt[j2, t]
@@ -476,20 +494,18 @@ pred completeFailureRetry[tid: TaskId, w: Worker, newTid: TaskId, t: Time, tnext
 }
 
 -- Transition: CANCEL - mark job as cancelled
--- Note: Does NOT change status. Status and cancellation are orthogonal.
--- This allows dequeue to blindly write Running without losing cancellation info.
 pred cancelJob[j: Job, t: Time, tnext: Time] {
-    -- Pre: job exists and not already cancelled
+    -- [SILO-CXL-1] Pre: job exists and not already cancelled
     j in jobExistsAt[t]
     not isCancelledAt[j, t]
     
-    -- Post: Mark job as cancelled (add cancellation record)
+    -- [SILO-CXL-2] Post: Mark job as cancelled (add cancellation record)
     one c: JobCancelled | c.cancelled_job = j and c.cancelled_time = tnext
     
     -- Post: Status stays the same (cancellation is orthogonal to status)
     statusAt[j, tnext] = statusAt[j, t]
     
-    -- Remove from DB queue (prevent new dequeues of new tasks)
+    -- [SILO-CXL-3] Remove from DB queue (prevent new dequeues of new tasks)
     no qt: DbQueuedTask | qt.db_qjob = j and qt.db_qtime = tnext
     
     -- Frame: other DB queue entries unchanged
@@ -516,11 +532,12 @@ pred cancelJob[j: Job, t: Time, tnext: Time] {
 
 -- Transition: HEARTBEAT - Worker extends lease expiry
 -- Note: Heartbeat ALWAYS renews the lease, even for cancelled jobs.
--- The worker discovers cancellation from the heartbeat RESPONSE, but can keep
--- heartbeating while gracefully winding down. Lease is only released on completion.
+-- The worker discovers cancellation from the heartbeat RESPONSE, but can keep heartbeating while gracefully winding down. Lease is only released on completion.
 pred heartbeat[tid: TaskId, w: Worker, t: Time, tnext: Time] {
-    -- Pre: Worker holds this lease (existence check only)
+    -- [SILO-HB-1] Pre: Worker holds this lease (check worker_id matches)
     leaseAt[tid, t] = w
+    
+    -- [SILO-HB-2] Pre: Lease exists
     some leaseJobAt[tid, t]
     some leaseAttemptAt[tid, t]
     
@@ -528,7 +545,7 @@ pred heartbeat[tid: TaskId, w: Worker, t: Time, tnext: Time] {
         one j
         one a
         
-        -- Always renew lease (worker can keep heartbeating during graceful shutdown)
+        -- [SILO-HB-3] Always renew lease (worker can keep heartbeating during graceful shutdown)
         -- Worker discovers cancellation from heartbeat RESPONSE (isCancelledAt check)
         one l: Lease | l.ltask = tid and l.lworker = w and l.ljob = j and l.lattempt = a 
             and l.ltime = tnext and gt[l.lexpiresAt, tnext]
@@ -553,9 +570,8 @@ pred heartbeat[tid: TaskId, w: Worker, t: Time, tnext: Time] {
 
 -- Transition: REAP_EXPIRED_LEASE - System reclaims expired lease (worker crashed)
 -- Similar to completeFailurePermanent but triggered by expiry, not worker report
--- Note: Pure write - overwrites any status including Cancelled
 pred reapExpiredLease[tid: TaskId, t: Time, tnext: Time] {
-    -- Pre: Lease exists and has expired
+    -- [SILO-REAP-1] Pre: Lease exists and has expired
     some leaseAt[tid, t]
     leaseExpired[tid, t]
     
@@ -564,9 +580,13 @@ pred reapExpiredLease[tid: TaskId, t: Time, tnext: Time] {
         one a
         attemptStatusAt[a, t] = AttemptRunning
         
-        -- Post: Lease removed, job and attempt marked failed (overwrites ANY previous status)
+        -- [SILO-REAP-2] Post: Lease removed
         no leaseAt[tid, tnext]
+        
+        -- [SILO-REAP-3] Post: Set job status to Failed (pure write, overwrites ANY previous status)
         statusAt[j, tnext] = Failed
+        
+        -- [SILO-REAP-4] Post: Set attempt status to AttemptFailed
         attemptStatusAt[a, tnext] = AttemptFailed
         
         -- Frame: other existing jobs unchanged
@@ -590,6 +610,7 @@ pred reapExpiredLease[tid: TaskId, t: Time, tnext: Time] {
 }
 
 -- Transition: STUTTER
+-- Necessary for alloy to make arbitrary time steps forward without changing any state
 pred stutter[t: Time, tnext: Time] {
     -- All existing jobs unchanged (status and cancellation)
     all j: Job | j in jobExistsAt[t] implies statusAt[j, tnext] = statusAt[j, t]
@@ -636,7 +657,6 @@ assert oneLeasePerJob {
     all t: Time, j: Job | lone tid: TaskId | leaseJobAt[tid, t] = j
 }
 
-/** Only Running jobs have leases */
 /** 
  * Leases can only exist for Running jobs (status-wise).
  * The job may also be cancelled (orthogonal flag), but status must be Running.
@@ -662,7 +682,7 @@ assert attemptTerminalIsForever {
 
 /**
  * Valid job status transitions.
- * Note: Cancellation is a separate flag, not a status.
+ * Note: Cancellation is a separate flag, not a status in alloy, so that we can blindly write status without having to check cancellation always.
  * Status is just: Scheduled, Running, Succeeded, Failed
  */
 assert validTransitions {
@@ -691,7 +711,6 @@ assert noQueuedTasksForTerminal {
         no qt: DbQueuedTask | qt.db_qjob = j and qt.db_qtime = t
 }
 
-/** Lease Consistency: Terminal jobs have no active leases */
 /**
  * Succeeded/Failed jobs never have leases.
  * These states are only set when the lease is released (completion/reap).
