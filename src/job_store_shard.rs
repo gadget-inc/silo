@@ -225,7 +225,7 @@ impl JobStoreShard {
         metadata: Option<Vec<(String, String)>>,
     ) -> Result<String, JobStoreShardError> {
         let job_id = id.unwrap_or_else(|| Uuid::new_v4().to_string());
-        // If caller provided an id, ensure it doesn't already exist
+        // [SILO-ENQ-1] If caller provided an id, ensure it doesn't already exist
         if self
             .db
             .get(job_info_key(tenant, &job_id).as_bytes())
@@ -248,6 +248,7 @@ impl JobStoreShard {
 
         let first_task_id = Uuid::new_v4().to_string();
         let now_ms = now_epoch_ms();
+        // [SILO-ENQ-2] Create job with status Scheduled
         let job_status = JobStatus::scheduled(now_ms);
 
         // Atomically write job info, job status, and handle concurrency
@@ -274,7 +275,7 @@ impl JobStoreShard {
             )
             .map_err(JobStoreShardError::Rkyv)?;
 
-        // If no concurrency limits, write task directly
+        // [SILO-ENQ-3] If no concurrency limits, write first task directly to DB queue
         if outcome.is_none() {
             let first_task = Task::RunAttempt {
                 id: first_task_id.clone(),
@@ -535,7 +536,7 @@ impl JobStoreShard {
         // Broker-only leasing: no fallback DB scan
 
         // debug: before_claim suppressed
-        // Claim from the broker buffer for this tenant; RequestTickets are internal and processed here
+        // [SILO-DEQ-1] Claim from the broker buffer for this tenant; RequestTickets are internal and processed here
         let claimed: Vec<BrokerTask> = self
             .broker
             .claim_ready_for_tenant_or_nudge(tenant, max_tasks)
@@ -663,14 +664,14 @@ impl JobStoreShard {
                 Task::RequestTicket { .. } => unreachable!(),
             };
 
-            // Determine tenant from key and look up job info; if missing, delete the task and skip
+            // [SILO-DEQ-2] Determine tenant from key and look up job info; if missing, delete the task and skip
             let tenant = tenant.to_string();
             let job_key = job_info_key(&tenant, &job_id);
             let maybe_job = self.db.get(job_key.as_bytes()).await?;
             if let Some(job_bytes) = maybe_job {
                 let view = JobView::new(job_bytes)?;
 
-                // Create lease record and delete task from task queue
+                // [SILO-DEQ-4] Create lease record
                 let lease_key = leased_task_key(&task_id);
                 let record = LeaseRecord {
                     worker_id: worker_id.to_string(),
@@ -680,14 +681,15 @@ impl JobStoreShard {
                 let leased_value = encode_lease(&record).map_err(codec_error_to_shard_error)?;
 
                 batch.put(lease_key.as_bytes(), &leased_value);
+                // [SILO-DEQ-3] Delete task from task queue
                 batch.delete(entry.key.as_bytes());
 
-                // Mark job as running
+                // [SILO-DEQ-6] Mark job as running (pure write, no status read)
                 let job_status = JobStatus::running(now_ms);
                 self.set_job_status_with_index(&mut batch, &tenant, &job_id, job_status)
                     .await?;
 
-                // Also mark attempt as running
+                // [SILO-DEQ-5] Also mark attempt as running
                 let attempt = JobAttempt {
                     job_id: job_id.clone(),
                     attempt_number,
@@ -722,7 +724,7 @@ impl JobStoreShard {
             return Err(JobStoreShardError::Slate(e));
         }
 
-        // Ack durable and evict from buffer; we no longer use TTL tombstones.
+        // [SILO-DEQ-3] Ack durable and evict from buffer; we no longer use TTL tombstones.
         self.broker.ack_durable(&ack_keys);
         self.broker.evict_keys(&ack_keys);
         tracing::debug!(
@@ -811,7 +813,7 @@ impl JobStoreShard {
         worker_id: &str,
         task_id: &str,
     ) -> Result<(), JobStoreShardError> {
-        // Directly read the lease for this task id
+        // [SILO-HB-2] Directly read the lease for this task id
         let key = leased_task_key(task_id);
         let maybe_raw = self.db.get(key.as_bytes()).await?;
         let Some(value_bytes) = maybe_raw else {
@@ -821,6 +823,7 @@ impl JobStoreShard {
         type ArchivedTask = <Task as Archive>::Archived;
         let decoded = decode_lease(&value_bytes).map_err(codec_error_to_shard_error)?;
         let archived = decoded.archived();
+        // [SILO-HB-1] Check worker id matches
         let current_owner = archived.worker_id.as_str();
         if current_owner != worker_id {
             return Err(JobStoreShardError::LeaseOwnerMismatch {
@@ -830,7 +833,7 @@ impl JobStoreShard {
             });
         }
 
-        // Renew by updating value with a new expiry
+        // [SILO-HB-3] Renew by updating value with a new expiry
         let now_ms = now_epoch_ms();
         let new_expiry = now_ms + DEFAULT_LEASE_MS;
 
@@ -888,7 +891,7 @@ impl JobStoreShard {
         task_id: &str,
         outcome: AttemptOutcome,
     ) -> Result<(), JobStoreShardError> {
-        // Load lease; must exist
+        // [SILO-SUCC-1][SILO-FAIL-1][SILO-RETRY-1] Load lease; must exist
         let leased_task_key = leased_task_key(task_id);
         let maybe_raw = self.db.get(leased_task_key.as_bytes()).await?;
         let Some(value_bytes) = maybe_raw else {
@@ -941,13 +944,15 @@ impl JobStoreShard {
 
         // Atomically update attempt and remove lease
         let mut batch = WriteBatch::new();
+        // [SILO-SUCC-4][SILO-FAIL-4][SILO-RETRY-4] Update attempt status
         batch.put(attempt_key.as_bytes(), &attempt_val);
+        // [SILO-SUCC-2][SILO-FAIL-2][SILO-RETRY-2] Release lease
         batch.delete(leased_task_key.as_bytes());
 
         let mut job_missing_error: Option<JobStoreShardError> = None;
         let mut followup_next_time: Option<i64> = None;
 
-        // If success: mark job succeeded now.
+        // [SILO-SUCC-3] If success: mark job succeeded now (pure write)
         if let AttemptOutcome::Success { .. } = outcome {
             let job_status = JobStatus::succeeded(now_ms);
             self.set_job_status_with_index(&mut batch, tenant, &job_id, job_status)
@@ -968,6 +973,7 @@ impl JobStoreShard {
                         if let Some(next_time) =
                             crate::retry::next_retry_time_ms(now_ms, failures_so_far, &policy_rt)
                         {
+                            // [SILO-RETRY-5] Enqueue new task to DB queue for retry
                             let next_attempt_number = attempt_number + 1;
                             let next_task = Task::RunAttempt {
                                 id: Uuid::new_v4().to_string(),
@@ -985,6 +991,7 @@ impl JobStoreShard {
                                 &next_bytes,
                             );
 
+                            // [SILO-RETRY-3] Set job status to Scheduled (pure write)
                             let job_status = JobStatus::scheduled(now_ms);
                             self.set_job_status_with_index(&mut batch, tenant, &job_id, job_status)
                                 .await?;
@@ -992,7 +999,7 @@ impl JobStoreShard {
                             followup_next_time = Some(next_time);
                         }
                     }
-                    // If no follow-up scheduled, mark job as failed
+                    // [SILO-FAIL-3] If no follow-up scheduled, mark job as failed (pure write)
                     if !scheduled_followup {
                         let job_status = JobStatus::failed(now_ms);
                         self.set_job_status_with_index(&mut batch, tenant, &job_id, job_status)
@@ -1088,6 +1095,7 @@ impl JobStoreShard {
                 Err(_) => continue, // Skip malformed lease records
             };
             let lease = decoded.archived();
+            // [SILO-REAP-1] Check if lease has expired
             if lease.expiry_ms > now_ms {
                 continue;
             }
@@ -1098,7 +1106,7 @@ impl JobStoreShard {
                 ArchivedTask::RequestTicket { .. } => unreachable!("leases only for RunAttempt"),
             };
 
-            // Report as worker crashed; ignore LeaseNotFound in case of concurrent cleanup
+            // [SILO-REAP-2][SILO-REAP-3][SILO-REAP-4] Report as worker crashed (removes lease, marks job/attempt failed)
             // Without tenant in the lease key, assume default tenant for now
             let tenant = "-".to_string();
             let _ = self
