@@ -1,7 +1,7 @@
 mod test_helpers;
 
 use rkyv::Archive;
-use silo::codec::{decode_lease, encode_lease};
+use silo::codec::{decode_lease, decode_task, encode_lease};
 use silo::job::JobStatus;
 use silo::job::JobStatusKind;
 use silo::job_attempt::{AttemptOutcome, AttemptStatus};
@@ -510,11 +510,10 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
         let (_k2, v2) = first_kv_with_prefix(shard.db(), "tasks/")
             .await
             .expect("task2");
-        type ArchivedTask = <Task as Archive>::Archived;
-        let a2: &ArchivedTask = unsafe { rkyv::archived_root::<Task>(&v2) };
-        let attempt = match a2 {
-            ArchivedTask::RunAttempt { attempt_number, .. } => *attempt_number,
-            ArchivedTask::RequestTicket { .. } => {
+        let task2 = decode_task(&v2).expect("decode task");
+        let attempt = match task2 {
+            Task::RunAttempt { attempt_number, .. } => attempt_number,
+            Task::RequestTicket { .. } => {
                 panic!("unexpected RequestTicket in tasks/ for this test")
             }
         };
@@ -539,10 +538,10 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
         let (_k3, v3) = first_kv_with_prefix(shard.db(), "tasks/")
             .await
             .expect("task3");
-        let a3: &ArchivedTask = unsafe { rkyv::archived_root::<Task>(&v3) };
-        let attempt3 = match a3 {
-            ArchivedTask::RunAttempt { attempt_number, .. } => *attempt_number,
-            ArchivedTask::RequestTicket { .. } => {
+        let task3 = decode_task(&v3).expect("decode task");
+        let attempt3 = match task3 {
+            Task::RunAttempt { attempt_number, .. } => attempt_number,
+            Task::RequestTicket { .. } => {
                 panic!("unexpected RequestTicket in tasks/ for this test")
             }
         };
@@ -817,11 +816,10 @@ async fn retry_count_one_boundary_enqueues_attempt2_then_stops_on_second_error()
     let (_k2, v2) = first_kv_with_prefix(shard.db(), "tasks/")
         .await
         .expect("task2");
-    type ArchivedTask = <Task as Archive>::Archived;
-    let a2: &ArchivedTask = unsafe { rkyv::archived_root::<Task>(&v2) };
-    let attempt2 = match a2 {
-        ArchivedTask::RunAttempt { attempt_number, .. } => *attempt_number,
-        ArchivedTask::RequestTicket { .. } => {
+    let task2 = decode_task(&v2).expect("decode task");
+    let attempt2 = match task2 {
+        Task::RunAttempt { attempt_number, .. } => attempt_number,
+        Task::RequestTicket { .. } => {
             panic!("unexpected RequestTicket in tasks/ for this test")
         }
     };
@@ -1685,13 +1683,12 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
     // No runnable RunAttempt should be visible yet (RequestTicket entries are expected)
     let maybe = first_kv_with_prefix(shard.db(), "tasks/").await;
     if let Some((_k, v)) = maybe {
-        type ArchivedTask = <Task as Archive>::Archived;
-        let a: &ArchivedTask = unsafe { rkyv::archived_root::<Task>(&v) };
-        match a {
-            ArchivedTask::RunAttempt { .. } => {
+        let task = decode_task(&v).expect("decode task");
+        match task {
+            Task::RunAttempt { .. } => {
                 panic!("unexpected RunAttempt while holder is occupied")
             }
-            ArchivedTask::RequestTicket { .. } => {}
+            Task::RequestTicket { .. } => {}
         }
     }
 
@@ -2007,11 +2004,10 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
     }
     // There should be no runnable RunAttempt until we release (RequestTicket may exist)
     if let Some((_k, v)) = first_kv_with_prefix(shard.db(), "tasks/").await {
-        type ArchivedTask = <Task as Archive>::Archived;
-        let a: &ArchivedTask = unsafe { rkyv::archived_root::<Task>(&v) };
-        match a {
-            ArchivedTask::RunAttempt { .. } => panic!("unexpected RunAttempt before release"),
-            ArchivedTask::RequestTicket { .. } => {}
+        let task = decode_task(&v).expect("decode task");
+        match task {
+            Task::RunAttempt { .. } => panic!("unexpected RunAttempt before release"),
+            Task::RequestTicket { .. } => {}
         }
     }
 
@@ -2108,10 +2104,10 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
     let (_k2, v2) = first_kv_with_prefix(shard.db(), "tasks/")
         .await
         .expect("attempt2 task exists");
-    let a2_arch: &ArchivedTask = unsafe { rkyv::archived_root::<Task>(&v2) };
-    let attempt2 = match a2_arch {
-        ArchivedTask::RunAttempt { attempt_number, .. } => *attempt_number,
-        ArchivedTask::RequestTicket { .. } => {
+    let task2 = decode_task(&v2).expect("decode task");
+    let attempt2 = match task2 {
+        Task::RunAttempt { attempt_number, .. } => attempt_number,
+        Task::RequestTicket { .. } => {
             panic!("unexpected RequestTicket in tasks/ for this test")
         }
     };

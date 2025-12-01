@@ -1,11 +1,11 @@
-use rkyv::Archive;
+use rkyv::Deserialize as RkyvDeserialize;
 use silo::codec::{
     decode_attempt, decode_concurrency_action, decode_holder, decode_job_status, decode_lease,
     decode_task, encode_attempt, encode_concurrency_action, encode_holder, encode_job_status,
     encode_lease, encode_task, CodecError, CONCURRENCY_ACTION_VERSION, HOLDER_RECORD_VERSION,
     JOB_ATTEMPT_VERSION, JOB_STATUS_VERSION, LEASE_RECORD_VERSION, TASK_VERSION,
 };
-use silo::job::JobStatus;
+use silo::job::{JobStatus, JobStatusKind};
 use silo::job_attempt::{AttemptStatus, JobAttempt};
 use silo::job_store_shard::{ConcurrencyAction, HolderRecord, LeaseRecord, Task};
 
@@ -102,19 +102,17 @@ fn test_job_attempt_roundtrip() {
 
 #[test]
 fn test_job_status_roundtrip() {
-    let status = JobStatus::Running {
-        changed_at_ms: 5000,
-    };
+    let status = JobStatus::running(5000);
     let encoded = encode_job_status(&status).unwrap();
     assert_eq!(encoded[0], JOB_STATUS_VERSION);
     let decoded = decode_job_status(&encoded).unwrap();
-    type ArchivedJobStatus = <JobStatus as Archive>::Archived;
-    match decoded.archived() {
-        ArchivedJobStatus::Running { changed_at_ms } => {
-            assert_eq!(*changed_at_ms, 5000i64);
-        }
-        _ => panic!("unexpected status variant"),
-    }
+    let archived = decoded.archived();
+    // Use deserialize to get back the original type for comparison
+    let mut des = rkyv::Infallible;
+    let deserialized: JobStatus = RkyvDeserialize::deserialize(archived, &mut des)
+        .unwrap_or_else(|_| unreachable!("infallible deserialization for JobStatus"));
+    assert_eq!(deserialized.kind, JobStatusKind::Running);
+    assert_eq!(deserialized.changed_at_ms, 5000i64);
 }
 
 #[test]
