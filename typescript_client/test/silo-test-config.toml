@@ -1,0 +1,13 @@
+[server]
+grpc_addr = "127.0.0.1:50051"
+
+[coordination]
+etcd_endpoints = ["http://127.0.0.1:2379"]
+
+[tenancy]
+enabled = false
+
+[database]
+backend = "memory"
+path = "test-%shard%"
+

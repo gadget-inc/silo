@@ -66,3 +66,45 @@ jobs:
       - name: Validate SILO tags synchronized
         shell: bash
         run: node scripts/validate-silo-tags.js
+
+  typescript-client:
+    name: TypeScript client test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: ./.github/actions/setup-test-env
+      - name: Install dependencies
+        shell: bash
+        working-directory: typescript_client
+        run: pnpm install --frozen-lockfile
+      - name: Generate proto code
+        shell: bash
+        working-directory: typescript_client
+        run: pnpm run generate
+      - name: Build TypeScript client
+        shell: bash
+        working-directory: typescript_client
+        run: pnpm run build
+      - name: Lint
+        shell: bash
+        working-directory: typescript_client
+        run: pnpm run lint
+      - name: Build silo server
+        shell: bash
+        run: cargo build --release
+      - name: Start etcd
+        shell: bash
+        run: |
+          just etcd &
+          sleep 3
+      - name: Start silo server
+        shell: bash
+        run: |
+          ./target/release/silo -c typescript_client/test/silo-test-config.toml &
+          sleep 2
+      - name: Run tests
+        shell: bash
+        working-directory: typescript_client
+        env:
+          CI: "true"
+        run: pnpm test

@@ -47,6 +47,7 @@
           self'.devShells.rust
         ];
         packages = with pkgs; [
+          git
           just
           nixd # Nix language server
           bacon
@@ -58,6 +59,7 @@
           gubernator
           devScript
           nodejs_24 # For validation scripts
+          pnpm # Package manager for TypeScript client
         ];
 
         # Set the project root for the dev script
