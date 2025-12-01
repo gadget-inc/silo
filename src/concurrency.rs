@@ -7,7 +7,7 @@ use crate::codec::{
     decode_concurrency_action, encode_concurrency_action, encode_holder, encode_task,
 };
 use crate::job::{ConcurrencyLimit, JobView};
-use crate::keys::{concurrency_holder_key, concurrency_request_key, task_key};
+use crate::keys::{concurrency_holder_key, concurrency_request_key, job_cancelled_key, task_key};
 use crate::task::{ConcurrencyAction, HolderRecord, Task};
 
 #[derive(Debug, Clone)]
@@ -374,6 +374,7 @@ async fn append_release_and_grant_next(
         });
 
         // grant next: requests/<tenant>/<queue>/...
+        // Loop through requests to find the first non-cancelled, ready request
         let start = format!("requests/{}/{}/", tenant, queue).into_bytes();
         let mut end: Vec<u8> = format!("requests/{}/{}/", tenant, queue).into_bytes();
         end.push(0xFF);
@@ -381,7 +382,8 @@ async fn append_release_and_grant_next(
             .scan::<Vec<u8>, _>(start..=end)
             .await
             .map_err(|e| e.to_string())?;
-        if let Some(kv) = iter.next().await.map_err(|e| e.to_string())? {
+
+        while let Some(kv) = iter.next().await.map_err(|e| e.to_string())? {
             type ArchivedAction = <ConcurrencyAction as rkyv::Archive>::Archived;
             let decoded = decode_concurrency_action(&kv.value)?;
             let a: &ArchivedAction = decoded.archived();
@@ -392,38 +394,65 @@ async fn append_release_and_grant_next(
                     job_id,
                     attempt_number,
                 } => {
+                    let job_id_str = job_id.as_str();
+
+                    // [SILO-GRANT-CXL] Check if job is cancelled - if so, delete request and continue
+                    let cancelled_key = job_cancelled_key(tenant, job_id_str);
+                    let is_cancelled = db
+                        .get(cancelled_key.as_bytes())
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .is_some();
+
+                    if is_cancelled {
+                        // Delete the cancelled request and continue to next candidate
+                        batch.delete(&kv.key);
+                        tracing::debug!(
+                            job_id = %job_id_str,
+                            queue = %queue,
+                            "grant_next: skipping cancelled job request"
+                        );
+                        continue;
+                    }
+
                     let req_key_str = String::from_utf8_lossy(&kv.key).to_string();
                     let request_id = req_key_str.split('/').next_back().unwrap_or("").to_string();
-                    if *start_time_ms > now_ms {
-                        // Not ready yet; leave request for later
-                    } else {
-                        let holder = HolderRecord {
-                            granted_at_ms: now_ms,
-                        };
-                        let holder_val = encode_holder(&holder)?;
-                        batch.put(
-                            concurrency_holder_key(tenant, queue, &request_id).as_bytes(),
-                            &holder_val,
-                        );
 
-                        let task = Task::RunAttempt {
-                            id: request_id.clone(),
-                            job_id: job_id.as_str().to_string(),
-                            attempt_number: *attempt_number,
-                            held_queues: vec![queue.clone()],
-                        };
-                        let tval = encode_task(&task)?;
-                        batch.put(
-                            task_key(*start_time_ms, *priority, job_id.as_str(), *attempt_number)
-                                .as_bytes(),
-                            &tval,
-                        );
-                        batch.delete(&kv.key);
-                        events.push(MemoryEvent::Granted {
-                            queue: queue.clone(),
-                            task_id: request_id,
-                        });
+                    if *start_time_ms > now_ms {
+                        // Not ready yet; leave request for later and stop searching
+                        // (requests are ordered by time, so subsequent ones are also not ready)
+                        break;
                     }
+
+                    // Grant this request
+                    let holder = HolderRecord {
+                        granted_at_ms: now_ms,
+                    };
+                    let holder_val = encode_holder(&holder)?;
+                    batch.put(
+                        concurrency_holder_key(tenant, queue, &request_id).as_bytes(),
+                        &holder_val,
+                    );
+
+                    let task = Task::RunAttempt {
+                        id: request_id.clone(),
+                        job_id: job_id_str.to_string(),
+                        attempt_number: *attempt_number,
+                        held_queues: vec![queue.clone()],
+                    };
+                    let tval = encode_task(&task)?;
+                    batch.put(
+                        task_key(*start_time_ms, *priority, job_id_str, *attempt_number).as_bytes(),
+                        &tval,
+                    );
+                    batch.delete(&kv.key);
+                    events.push(MemoryEvent::Granted {
+                        queue: queue.clone(),
+                        task_id: request_id,
+                    });
+
+                    // Only grant one request per release
+                    break;
                 }
             }
         }

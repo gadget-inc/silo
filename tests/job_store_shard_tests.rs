@@ -2360,11 +2360,26 @@ async fn cancel_scheduled_job_sets_cancelled_and_removes_task() {
             "job should be marked as cancelled"
         );
 
-        // Verify task is removed from queue
+        // Task is still in DB queue (lazy cleanup), but will be cleaned up on dequeue
+        // The broker buffer might have it, so dequeue will skip and delete it
+        let task_still_in_db = first_kv_with_prefix(shard.db(), "tasks/").await;
+        assert!(
+            task_still_in_db.is_some(),
+            "task should still be in DB (lazy cleanup)"
+        );
+
+        // Dequeue should skip the cancelled task and clean it up
+        let dequeued = shard.dequeue("-", "w1", 10).await.expect("dequeue");
+        assert!(
+            dequeued.is_empty(),
+            "dequeue should return empty for cancelled job"
+        );
+
+        // Now task should be removed from queue
         let none_left = first_kv_with_prefix(shard.db(), "tasks/").await;
         assert!(
             none_left.is_none(),
-            "task should be removed from queue after cancel"
+            "task should be removed from queue after dequeue"
         );
     });
 }
@@ -2935,6 +2950,399 @@ async fn cancel_scheduled_job_with_concurrency_removes_request() {
         assert!(
             tasks2.is_empty(),
             "cancelled job's request should not be granted"
+        );
+    });
+}
+
+/// Test that dequeue skips cancelled jobs and cleans up their tasks
+/// This specifically tests the RunAttempt task path
+#[tokio::test]
+async fn dequeue_skips_cancelled_run_attempt_tasks() {
+    with_timeout!(20000, {
+        let (_tmp, shard) = open_temp_shard().await;
+
+        let now = now_ms();
+
+        // Enqueue two jobs
+        let j1 = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now,
+                None,
+                serde_json::json!({"j": 1}),
+                vec![],
+                None,
+            )
+            .await
+            .expect("enqueue j1");
+
+        let j2 = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now + 1, // Slightly later so j1 comes first
+                None,
+                serde_json::json!({"j": 2}),
+                vec![],
+                None,
+            )
+            .await
+            .expect("enqueue j2");
+
+        // Cancel j1
+        shard.cancel_job("-", &j1).await.expect("cancel j1");
+
+        // Dequeue should skip j1 and return j2
+        let tasks = shard.dequeue("-", "w1", 10).await.expect("dequeue");
+        assert_eq!(tasks.len(), 1, "should return one task");
+        assert_eq!(
+            tasks[0].job().id(),
+            j2,
+            "should return j2, not cancelled j1"
+        );
+
+        // j1's task should have been cleaned up from the DB
+        // Check that no task keys contain j1's id
+        let task_for_j1 = first_kv_with_prefix(shard.db(), "tasks/").await;
+        // If there's a task, it shouldn't be for j1 (j2 was already dequeued so should be leased)
+        if let Some((key_str, _value)) = task_for_j1 {
+            assert!(
+                !key_str.contains(&j1),
+                "j1's task should be cleaned up, found: {}",
+                key_str
+            );
+        }
+    });
+}
+
+/// Test that dequeue skips cancelled RequestTicket tasks
+#[tokio::test]
+async fn dequeue_skips_cancelled_request_ticket_tasks() {
+    with_timeout!(20000, {
+        let (_tmp, shard) = open_temp_shard().await;
+
+        let now = now_ms();
+        let queue = "q-skip-req".to_string();
+
+        // j1 takes the concurrency slot
+        let _j1 = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now,
+                None,
+                serde_json::json!({"j": 1}),
+                vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue.clone(),
+                    max_concurrency: 1,
+                })],
+                None,
+            )
+            .await
+            .expect("enqueue j1");
+
+        // Dequeue j1 to take the slot
+        let t1 = shard.dequeue("-", "w1", 1).await.expect("deq1");
+        assert_eq!(t1.len(), 1);
+
+        // j2 and j3 enqueue requests (future time so they become RequestTicket tasks)
+        let j2 = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now + 100,
+                None,
+                serde_json::json!({"j": 2}),
+                vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue.clone(),
+                    max_concurrency: 1,
+                })],
+                None,
+            )
+            .await
+            .expect("enqueue j2");
+
+        let j3 = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now + 101,
+                None,
+                serde_json::json!({"j": 3}),
+                vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue.clone(),
+                    max_concurrency: 1,
+                })],
+                None,
+            )
+            .await
+            .expect("enqueue j3");
+
+        // Cancel j2
+        shard.cancel_job("-", &j2).await.expect("cancel j2");
+
+        // Complete j1 to release the slot
+        let t1_id = t1[0].attempt().task_id().to_string();
+        shard
+            .report_attempt_outcome("-", &t1_id, AttemptOutcome::Success { result: vec![] })
+            .await
+            .expect("report j1 success");
+
+        // Wait for the future time to pass
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // Dequeue should skip j2's RequestTicket and process j3's
+        let tasks = shard.dequeue("-", "w2", 10).await.expect("dequeue");
+
+        // We should get j3, not j2
+        if !tasks.is_empty() {
+            assert_eq!(tasks[0].job().id(), j3, "should get j3, not cancelled j2");
+        }
+    });
+}
+
+/// Test that grant-on-release skips multiple cancelled requests to find a valid one
+#[tokio::test]
+async fn grant_on_release_skips_multiple_cancelled_requests() {
+    with_timeout!(20000, {
+        let (_tmp, shard) = open_temp_shard().await;
+
+        let now = now_ms();
+        let queue = "q-multi-cancel".to_string();
+
+        // j1 takes the slot
+        let _j1 = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now,
+                None,
+                serde_json::json!({"j": 1}),
+                vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue.clone(),
+                    max_concurrency: 1,
+                })],
+                None,
+            )
+            .await
+            .expect("enqueue j1");
+
+        let t1 = shard.dequeue("-", "w1", 1).await.expect("deq1");
+        assert_eq!(t1.len(), 1);
+
+        // j2, j3, j4 queue requests (j2 and j3 will be cancelled)
+        let j2 = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now,
+                None,
+                serde_json::json!({"j": 2}),
+                vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue.clone(),
+                    max_concurrency: 1,
+                })],
+                None,
+            )
+            .await
+            .expect("enqueue j2");
+
+        let j3 = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now,
+                None,
+                serde_json::json!({"j": 3}),
+                vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue.clone(),
+                    max_concurrency: 1,
+                })],
+                None,
+            )
+            .await
+            .expect("enqueue j3");
+
+        let j4 = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now,
+                None,
+                serde_json::json!({"j": 4}),
+                vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue.clone(),
+                    max_concurrency: 1,
+                })],
+                None,
+            )
+            .await
+            .expect("enqueue j4");
+
+        // Cancel j2 and j3
+        shard.cancel_job("-", &j2).await.expect("cancel j2");
+        shard.cancel_job("-", &j3).await.expect("cancel j3");
+
+        // Complete j1 - should skip j2 and j3, grant to j4
+        let t1_id = t1[0].attempt().task_id().to_string();
+        shard
+            .report_attempt_outcome("-", &t1_id, AttemptOutcome::Success { result: vec![] })
+            .await
+            .expect("report j1 success");
+
+        // Give broker time to pick up the granted task
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Dequeue should return j4
+        let tasks = shard.dequeue("-", "w2", 10).await.expect("dequeue");
+        assert_eq!(tasks.len(), 1, "should return one task");
+        assert_eq!(tasks[0].job().id(), j4, "should return j4");
+
+        // j2 and j3 should remain Cancelled, not be granted
+        let j2_status = shard
+            .get_job_status("-", &j2)
+            .await
+            .expect("get j2 status")
+            .expect("j2 exists");
+        assert_eq!(j2_status.kind, JobStatusKind::Cancelled);
+
+        let j3_status = shard
+            .get_job_status("-", &j3)
+            .await
+            .expect("get j3 status")
+            .expect("j3 exists");
+        assert_eq!(j3_status.kind, JobStatusKind::Cancelled);
+    });
+}
+
+/// Test that cancellation check on dequeue doesn't interfere with normal operation
+#[tokio::test]
+async fn dequeue_works_normally_without_cancellation() {
+    with_timeout!(20000, {
+        let (_tmp, shard) = open_temp_shard().await;
+
+        let now = now_ms();
+
+        // Enqueue several jobs
+        let mut job_ids = vec![];
+        for i in 0..5 {
+            let j = shard
+                .enqueue(
+                    "-",
+                    None,
+                    10u8,
+                    now + i,
+                    None,
+                    serde_json::json!({"j": i}),
+                    vec![],
+                    None,
+                )
+                .await
+                .expect("enqueue");
+            job_ids.push(j);
+        }
+
+        // Dequeue all - should work normally
+        let tasks = shard.dequeue("-", "w1", 10).await.expect("dequeue");
+        assert_eq!(tasks.len(), 5, "should return all 5 tasks");
+
+        // Verify order matches enqueue order (by start time)
+        for (i, task) in tasks.iter().enumerate() {
+            assert_eq!(
+                task.job().id(),
+                job_ids[i],
+                "task {} should match job {}",
+                i,
+                i
+            );
+        }
+    });
+}
+
+/// Test that cancelled requests are cleaned up from the request queue
+#[tokio::test]
+async fn cancelled_requests_are_cleaned_up_on_grant() {
+    with_timeout!(20000, {
+        let (_tmp, shard) = open_temp_shard().await;
+
+        let now = now_ms();
+        let queue = "q-cleanup".to_string();
+
+        // j1 takes the slot
+        let _j1 = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now,
+                None,
+                serde_json::json!({"j": 1}),
+                vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue.clone(),
+                    max_concurrency: 1,
+                })],
+                None,
+            )
+            .await
+            .expect("enqueue j1");
+
+        let t1 = shard.dequeue("-", "w1", 1).await.expect("deq1");
+        assert_eq!(t1.len(), 1);
+
+        // j2 queues a request
+        let j2 = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now,
+                None,
+                serde_json::json!({"j": 2}),
+                vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue.clone(),
+                    max_concurrency: 1,
+                })],
+                None,
+            )
+            .await
+            .expect("enqueue j2");
+
+        // Verify request exists
+        let requests_before = first_kv_with_prefix(shard.db(), "requests/").await;
+        assert!(requests_before.is_some(), "request should exist");
+
+        // Cancel j2
+        shard.cancel_job("-", &j2).await.expect("cancel j2");
+
+        // Request still exists (lazy cleanup)
+        let requests_after_cancel = first_kv_with_prefix(shard.db(), "requests/").await;
+        assert!(
+            requests_after_cancel.is_some(),
+            "request should still exist before release"
+        );
+
+        // Complete j1 to trigger grant-next (which should skip and delete j2's request)
+        let t1_id = t1[0].attempt().task_id().to_string();
+        shard
+            .report_attempt_outcome("-", &t1_id, AttemptOutcome::Success { result: vec![] })
+            .await
+            .expect("report j1 success");
+
+        // Now request should be cleaned up
+        let requests_after_release = first_kv_with_prefix(shard.db(), "requests/").await;
+        assert!(
+            requests_after_release.is_none(),
+            "cancelled request should be cleaned up after release"
         );
     });
 }

@@ -309,10 +309,8 @@ pred brokerScan[t: Time, tnext: Time] {
     jobExistsAt[tnext] = jobExistsAt[t]
 }
 
--- Transition: DEQUEUE - Worker claims task from Buffer
--- Note: We intentionally DO NOT check job status here for performance.
--- If the job was cancelled while in the buffer, the worker will discover
--- this on their next heartbeat or when they try to complete.
+-- Transition: DEQUEUE - Worker claims task from Buffer (non-cancelled job)
+-- See: job_store_shard.rs::dequeue
 pred dequeue[tid: TaskId, w: Worker, a: Attempt, t: Time, tnext: Time] {
     -- [SILO-DEQ-1] Pre: Task is in BUFFER
     some bufferedAt[tid, t]
@@ -322,31 +320,32 @@ pred dequeue[tid: TaskId, w: Worker, a: Attempt, t: Time, tnext: Time] {
         -- [SILO-DEQ-2] Pre: Job must exist
         j in jobExistsAt[t]
         
+        -- [SILO-DEQ-CXL] Pre: Job is NOT cancelled (checked on dequeue for lazy cleanup)
+        not isCancelledAt[j, t]
+        
         -- Pre: Attempt `a` does not exist yet
         a not in attemptExistsAt[t]
         attemptJob[a] = j 
         
-        -- [SILO-DEQ-3] Always: Remove task from DB and buffer
+        -- [SILO-DEQ-3] Post: Remove task from DB and buffer
         no dbQueuedAt[tid, tnext]
         no bufferedAt[tid, tnext]
         
-        -- [SILO-DEQ-4] Always: Create lease with expiry
-        -- Note: We create the lease even for cancelled jobs - worker discovers on heartbeat
+        -- [SILO-DEQ-4] Post: Create lease with expiry
         one l: Lease | l.ltask = tid and l.lworker = w and l.ljob = j and l.lattempt = a 
             and l.ltime = tnext and gt[l.lexpiresAt, tnext]
         
-        -- [SILO-DEQ-5] Always: Create attempt with AttemptRunning status
+        -- [SILO-DEQ-5] Post: Create attempt with AttemptRunning status
         attemptExistsAt[tnext] = attemptExistsAt[t] + a
         attemptStatusAt[a, tnext] = AttemptRunning
         
-        -- [SILO-DEQ-6] Job status: unconditionally set to Running (pure write, no status read)
-        -- Cancellation is preserved separately, so this doesn't lose cancel info
+        -- [SILO-DEQ-6] Post: Set job status to Running (pure write)
         statusAt[j, tnext] = Running
         
         -- Frame: other existing jobs unchanged
         all j2: Job | j2 in jobExistsAt[t] and j2 != j implies statusAt[j2, tnext] = statusAt[j2, t]
         
-        -- Frame: cancellation preserved (key property!)
+        -- Frame: cancellation preserved
         all j2: Job | isCancelledAt[j2, tnext] iff isCancelledAt[j2, t]
         
         -- Frame: existing attempts unchanged
@@ -364,6 +363,57 @@ pred dequeue[tid: TaskId, w: Worker, a: Attempt, t: Time, tnext: Time] {
         leaseJobAt[tid2, tnext] = leaseJobAt[tid2, t]
         leaseAttemptAt[tid2, tnext] = leaseAttemptAt[tid2, t]
     }
+}
+
+-- Transition: DEQUEUE_CLEANUP_CANCELLED - Clean up cancelled job's task during dequeue
+-- When dequeue encounters a cancelled job's task, it removes the task without creating a lease.
+-- See: job_store_shard.rs::dequeue (cancellation check)
+pred dequeueCleanupCancelled[tid: TaskId, t: Time, tnext: Time] {
+    -- Pre: Task is in BUFFER
+    some bufferedAt[tid, t]
+    let j = bufferedAt[tid, t] | {
+        one j
+        
+        -- Pre: Job must exist
+        j in jobExistsAt[t]
+        
+        -- Pre: Job IS cancelled (this is the cleanup path)
+        isCancelledAt[j, t]
+        
+        -- Post: Remove task from DB and buffer (cleanup)
+        no dbQueuedAt[tid, tnext]
+        no bufferedAt[tid, tnext]
+        
+        -- Post: NO lease created (task is just cleaned up)
+        no l: Lease | l.ltask = tid and l.ltime = tnext
+        
+        -- Post: NO attempt created
+        attemptExistsAt[tnext] = attemptExistsAt[t]
+        
+        -- Frame: Job status unchanged (already Cancelled in Rust terms, or Scheduled in Alloy)
+        all j2: Job | j2 in jobExistsAt[t] implies statusAt[j2, tnext] = statusAt[j2, t]
+        
+        -- Frame: cancellation preserved
+        all j2: Job | isCancelledAt[j2, tnext] iff isCancelledAt[j2, t]
+        
+        -- Frame: existing attempts unchanged
+        all a: attemptExistsAt[t] | attemptStatusAt[a, tnext] = attemptStatusAt[a, t]
+    }
+    
+    -- Frame: jobs existence unchanged
+    jobExistsAt[tnext] = jobExistsAt[t]
+    
+    -- Frame: other tasks unchanged
+    all tid2: TaskId | tid2 != tid implies {
+        dbQueuedAt[tid2, tnext] = dbQueuedAt[tid2, t]
+        bufferedAt[tid2, tnext] = bufferedAt[tid2, t]
+        leaseAt[tid2, tnext] = leaseAt[tid2, t]
+        leaseJobAt[tid2, tnext] = leaseJobAt[tid2, t]
+        leaseAttemptAt[tid2, tnext] = leaseAttemptAt[tid2, t]
+    }
+    
+    -- Frame: other leases unchanged
+    all tid2: TaskId | tid2 != tid implies leaseUnchanged[tid2, t, tnext]
 }
 
 -- Transition: COMPLETE_SUCCESS
@@ -497,6 +547,8 @@ pred completeFailureRetry[tid: TaskId, w: Worker, newTid: TaskId, t: Time, tnext
 }
 
 -- Transition: CANCEL - mark job as cancelled
+-- Note: Tasks are NOT removed from DB queue here (lazy cleanup).
+-- Tasks will be cleaned up when dequeue encounters them.
 pred cancelJob[j: Job, t: Time, tnext: Time] {
     -- [SILO-CXL-1] Pre: job exists and not already cancelled
     j in jobExistsAt[t]
@@ -508,16 +560,14 @@ pred cancelJob[j: Job, t: Time, tnext: Time] {
     -- Post: Status stays the same (cancellation is orthogonal to status)
     statusAt[j, tnext] = statusAt[j, t]
     
-    -- [SILO-CXL-3] Remove from DB queue (prevent new dequeues of new tasks)
-    no qt: DbQueuedTask | qt.db_qjob = j and qt.db_qtime = tnext
+    -- [SILO-CXL-3] Tasks are NOT removed here - lazy cleanup on dequeue
+    -- DB queue unchanged (tasks cleaned up when dequeue checks cancellation)
+    all tid: TaskId | dbQueuedAt[tid, tnext] = dbQueuedAt[tid, t]
     
-    -- Frame: other DB queue entries unchanged
-    all tid: TaskId | dbQueuedAt[tid, t] != j implies dbQueuedAt[tid, tnext] = dbQueuedAt[tid, t]
-    
-    -- NOTE: Does NOT remove from buffer immediately (stale buffer possible)
+    -- Buffer unchanged (stale buffer possible, cleaned on dequeue)
     all tid: TaskId | bufferedAt[tid, tnext] = bufferedAt[tid, t]
     
-    -- NOTE: Does NOT remove lease - worker will discover cancellation on heartbeat
+    -- Leases unchanged - worker will discover cancellation on heartbeat
     all tid: TaskId | {
         leaseAt[tid, tnext] = leaseAt[tid, t]
         leaseJobAt[tid, tnext] = leaseJobAt[tid, t]
@@ -635,6 +685,7 @@ pred step[t: Time, tnext: Time] {
     (some tid: TaskId, j: Job | enqueue[tid, j, t, tnext])
     or (brokerScan[t, tnext])
     or (some tid: TaskId, w: Worker, a: Attempt | dequeue[tid, w, a, t, tnext])
+    or (some tid: TaskId | dequeueCleanupCancelled[tid, t, tnext])
     or (some tid: TaskId, w: Worker | heartbeat[tid, w, t, tnext])
     or (some tid: TaskId | reapExpiredLease[tid, t, tnext])
     or (some tid: TaskId, w: Worker | completeSuccess[tid, w, t, tnext])
@@ -758,74 +809,49 @@ pred exampleStaleBuffer {
 }
 
 /**
- * Scenario: Early cancellation prevents execution
- * Job is cancelled BEFORE its task enters the buffer.
- * Task is removed from DB queue, never enters buffer, job never runs.
- * This is the ideal cancellation path - no wasted work.
+ * Scenario: Cancellation with lazy cleanup on dequeue
+ * Job is cancelled, task stays in DB/buffer, cleaned up when dequeue encounters it.
+ * This is the lazy cleanup path - task is removed without creating a lease.
  */
-pred exampleEarlyCancellationPreventsRun {
-    some tid: TaskId, j: Job, t1, t2, t3: Time | {
-        lt[t1, t2] and lt[t2, t3]
-        -- t1: job scheduled, task in DB queue, NOT in buffer yet, NOT cancelled
+pred exampleCancellationLazyCleanup {
+    some tid: TaskId, j: Job, t1, t2, t3, t4: Time | {
+        lt[t1, t2] and lt[t2, t3] and lt[t3, t4]
+        -- t1: job scheduled, task in DB queue, NOT cancelled
         j in jobExistsAt[t1]
         statusAt[j, t1] = Scheduled
         not isCancelledAt[j, t1]
         some dbQueuedAt[tid, t1]
         dbQueuedAt[tid, t1] = j
-        no bufferedAt[tid, t1]  -- Not yet in buffer
-        -- t2: job cancelled, task removed from DB queue
+        -- t2: job cancelled, task STILL in DB queue (lazy cleanup)
         isCancelledAt[j, t2]
-        no dbQueuedAt[tid, t2]  -- Removed by cancelJob
-        no bufferedAt[tid, t2]  -- Never entered buffer
-        -- t3: job stays cancelled, never got a lease, never ran
+        some dbQueuedAt[tid, t2]  -- Still in DB queue (not immediately removed)
+        -- t3: task enters buffer via broker scan
         isCancelledAt[j, t3]
-        statusAt[j, t3] = Scheduled  -- Status never changed to Running
-        no l: Lease | l.ljob = j and l.ltime = t3  -- No lease ever created
+        some bufferedAt[tid, t3]  -- Now in buffer (stale)
+        -- t4: dequeueCleanupCancelled removes task without creating lease
+        isCancelledAt[j, t4]
+        no dbQueuedAt[tid, t4]    -- Cleaned up
+        no bufferedAt[tid, t4]    -- Cleaned up
+        no l: Lease | l.ljob = j and l.ltime = t4  -- No lease created
+        statusAt[j, t4] = Scheduled  -- Status never changed to Running
     }
 }
 
 /**
- * Scenario: Job cancelled while task in buffer, worker dequeues stale task
- * Worker gets a lease for a cancelled job (allowed now for performance).
- * This demonstrates that dequeue doesn't check cancellation status, which allows cancelled jobs to be dequeued which isn't great, but it means we can avoid an extra read on every dequeue.
+ * Scenario: Dequeue skips cancelled task and cleans it up
+ * When dequeue encounters a cancelled job's task, it removes the task
+ * without creating a lease. Job never enters Running state.
  */
-pred exampleCancelThenDequeue {
+pred exampleDequeueSkipsCancelledTask {
     some tid: TaskId, j: Job, t: Time - last | {
-        -- At time t: job is cancelled but task is in buffer
+        -- At time t: job is cancelled, task is in buffer
         bufferedAt[tid, t] = j
         isCancelledAt[j, t]
-        -- At time t.next: a lease was created for this task/job
-        some l: Lease | l.ltask = tid and l.ljob = j and l.ltime = t.next
-    }
-}
-
-/**
- * GOOD EXAMPLE: Cancellation preserved during stale buffer dequeue
- * This demonstrates the fix where:
- * 1. Job scheduled, task in buffer
- * 2. Cancel arrives - job gets cancelled flag
- * 3. Worker dequeues stale task - job status becomes Running BUT cancellation preserved!
- * 4. Worker discovers cancellation on heartbeat
- */
-pred exampleCancellationPreservedOnDequeue {
-    some tid: TaskId, j: Job, t1, t2, t3, t4: Time | {
-        lt[t1, t2] and lt[t2, t3] and lt[t3, t4]
-        -- t1: job scheduled, task in buffer, NOT cancelled
-        j in jobExistsAt[t1]
-        statusAt[j, t1] = Scheduled
-        not isCancelledAt[j, t1]
-        some bufferedAt[tid, t1]
-        bufferedAt[tid, t1] = j
-        -- t2: job cancelled while task still in buffer (status unchanged, flag set)
-        isCancelledAt[j, t2]
-        some bufferedAt[tid, t2]  -- still in buffer (stale)
-        -- t3: worker dequeues - status becomes Running BUT cancellation flag preserved!
-        some leaseAt[tid, t3]
-        statusAt[j, t3] = Running  -- Status is Running (pure write)
-        isCancelledAt[j, t3]       -- But cancellation flag is preserved!
-        -- t4: worker still has lease, still sees cancellation
-        some leaseAt[tid, t4]
-        isCancelledAt[j, t4]  -- Worker sees cancellation via heartbeat response
+        -- At time t.next: task was cleaned up, NO lease created
+        no bufferedAt[tid, t.next]
+        no dbQueuedAt[tid, t.next]
+        no l: Lease | l.ltask = tid and l.ltime = t.next  -- No lease!
+        statusAt[j, t.next] = Scheduled  -- Job status unchanged (still Scheduled in Alloy)
     }
 }
 
@@ -902,12 +928,10 @@ run examplePermanentFailureWithRetry for 3 but exactly 1 Job, 1 Worker, 3 TaskId
 
 run exampleStaleBuffer for 3 but exactly 1 Job, 1 Worker, 2 TaskId, 1 Attempt, 6 Time,
     6 JobState, 6 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 2 Lease, 6 AttemptExists, 6 JobExists, 1 JobAttemptRelation, 6 JobCancelled
-run exampleEarlyCancellationPreventsRun for 3 but exactly 1 Job, 1 Worker, 2 TaskId, 1 Attempt, 6 Time,
-    6 JobState, 6 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 2 Lease, 6 AttemptExists, 6 JobExists, 1 JobAttemptRelation, 6 JobCancelled
+run exampleCancellationLazyCleanup for 3 but exactly 1 Job, 1 Worker, 2 TaskId, 1 Attempt, 8 Time,
+    8 JobState, 8 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 2 Lease, 8 AttemptExists, 8 JobExists, 1 JobAttemptRelation, 8 JobCancelled
 
-run exampleCancelThenDequeue for 3 but exactly 1 Job, 1 Worker, 2 TaskId, 2 Attempt, 8 Time,
-    8 JobState, 8 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 2 Lease, 8 AttemptExists, 8 JobExists, 2 JobAttemptRelation, 8 JobCancelled
-run exampleCancellationPreservedOnDequeue for 3 but exactly 1 Job, 1 Worker, 2 TaskId, 2 Attempt, 8 Time,
+run exampleDequeueSkipsCancelledTask for 3 but exactly 1 Job, 1 Worker, 2 TaskId, 2 Attempt, 8 Time,
     8 JobState, 8 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 2 Lease, 8 AttemptExists, 8 JobExists, 2 JobAttemptRelation, 8 JobCancelled
 run exampleCancellationDiscoveryOnHeartbeat for 3 but exactly 1 Job, 1 Worker, 2 TaskId, 2 Attempt, 8 Time,
     8 JobState, 8 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 2 Lease, 8 AttemptExists, 8 JobExists, 2 JobAttemptRelation, 8 JobCancelled

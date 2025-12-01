@@ -1,4 +1,4 @@
-use rkyv::{Archive, Deserialize as RkyvDeserialize};
+use rkyv::Deserialize as RkyvDeserialize;
 use serde_json::Value as JsonValue;
 use slatedb::Db;
 use slatedb::DbIterator;
@@ -459,6 +459,11 @@ impl JobStoreShard {
     /// Inner implementation of cancel_job that runs within a single transaction attempt.
     /// All business logic checks are performed within the transaction so they are re-evaluated
     /// on retry if the transaction conflicts.
+    ///
+    /// Note: We do NOT scan/delete tasks or requests here. Instead:
+    /// - Tasks are cleaned up lazily when dequeued (we check cancellation flag)
+    /// - Requests are skipped when granting (we check cancellation flag)
+    /// This avoids O(n) scans on the tasks/requests namespaces.
     async fn cancel_job_inner(&self, tenant: &str, id: &str) -> Result<(), JobStoreShardError> {
         let now_ms = now_epoch_ms();
 
@@ -502,44 +507,12 @@ impl JobStoreShard {
             encode_job_cancellation(&cancellation).map_err(codec_error_to_shard_error)?;
         txn.put(cancelled_key.as_bytes(), &cancellation_value)?;
 
-        // [SILO-CXL-3] If job is Scheduled (not yet Running), remove from DB queue and set Cancelled status immediately
-        // For Running jobs, we leave status as Running - worker discovers cancellation on heartbeat
+        // [SILO-CXL-3] For Scheduled jobs, update status to Cancelled immediately
+        // Tasks/requests are NOT deleted here - they will be cleaned up lazily:
+        // - On dequeue: cancelled tasks are skipped and deleted
+        // - On grant: cancelled requests are skipped and deleted
+        // For Running jobs, status stays Running - worker discovers on heartbeat
         if status.kind == JobStatusKind::Scheduled {
-            // Remove tasks from DB queue for this job
-            // Scan tasks/<time>/<priority>/<job_id>/<attempt> and delete matching job_id
-            let task_prefix = "tasks/".as_bytes();
-            let mut task_end = task_prefix.to_vec();
-            task_end.push(0xFF);
-            let mut iter = txn.scan(task_prefix.to_vec()..=task_end).await?;
-            while let Some(kv) = iter.next().await? {
-                let key_str = String::from_utf8_lossy(&kv.key);
-                // Parse job_id from key: tasks/<time>/<priority>/<job_id>/<attempt>
-                let parts: Vec<&str> = key_str.split('/').collect();
-                if parts.len() >= 4 && parts[3] == id {
-                    txn.delete(&kv.key)?;
-                }
-            }
-
-            // Also remove any concurrency requests for this job
-            type ArchivedConcurrencyAction = <ConcurrencyAction as Archive>::Archived;
-            let req_prefix = format!("requests/{}/", tenant);
-            let mut req_end = req_prefix.as_bytes().to_vec();
-            req_end.push(0xFF);
-            let mut req_iter = txn.scan(req_prefix.as_bytes().to_vec()..=req_end).await?;
-            while let Some(kv) = req_iter.next().await? {
-                // Request key contains job_id in the ConcurrencyAction value
-                // For simplicity, decode and check; alternatively we could encode job_id in key
-                if let Ok(decoded) = crate::codec::decode_concurrency_action(&kv.value) {
-                    let archived = decoded.archived();
-                    let req_job_id = match archived {
-                        ArchivedConcurrencyAction::EnqueueTask { job_id, .. } => job_id.as_str(),
-                    };
-                    if req_job_id == id {
-                        txn.delete(&kv.key)?;
-                    }
-                }
-            }
-
             // Delete old status index entry
             let old_time =
                 idx_status_time_key(tenant, status.kind.as_str(), status.changed_at_ms, id);
@@ -560,14 +533,9 @@ impl JobStoreShard {
             );
             txn.put(new_time.as_bytes(), &[])?;
         }
-        // Note: For Running jobs, status stays Running
-        // Worker discovers cancellation on heartbeat and reports Cancelled outcome
 
         // Commit the transaction - this will detect conflicts with concurrent modifications
         txn.commit().await?;
-
-        // Wake broker to potentially evict cancelled tasks from buffer
-        self.broker.wakeup();
 
         Ok(())
     }
@@ -801,6 +769,15 @@ impl JobStoreShard {
                         // Process ticket request internally
                         processed_internal = true;
                         let tenant = tenant.to_string();
+
+                        // [SILO-DEQ-CXL] Check if job is cancelled - if so, skip and clean up task
+                        if self.is_job_cancelled(&tenant, job_id).await? {
+                            batch.delete(entry.key.as_bytes());
+                            ack_keys.push(entry.key.clone());
+                            tracing::debug!(job_id = %job_id, "dequeue: skipping cancelled job RequestTicket");
+                            continue;
+                        }
+
                         // Load job info
                         let job_key = job_info_key(&tenant, job_id);
                         let maybe_job = self.db.get(job_key.as_bytes()).await?;
@@ -1002,6 +979,14 @@ impl JobStoreShard {
                 let job_key = job_info_key(&tenant, &job_id);
                 let maybe_job = self.db.get(job_key.as_bytes()).await?;
                 if let Some(job_bytes) = maybe_job {
+                    // [SILO-DEQ-CXL] Check if job is cancelled - if so, skip and clean up task
+                    if self.is_job_cancelled(&tenant, &job_id).await? {
+                        batch.delete(entry.key.as_bytes());
+                        ack_keys.push(entry.key.clone());
+                        tracing::debug!(job_id = %job_id, "dequeue: skipping cancelled job task");
+                        continue;
+                    }
+
                     let view = JobView::new(job_bytes)?;
 
                     // [SILO-DEQ-4] Create lease record
