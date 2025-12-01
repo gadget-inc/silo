@@ -245,6 +245,17 @@ impl Silo for SiloService {
         Ok(Response::new(DeleteJobResponse {}))
     }
 
+    async fn cancel_job(
+        &self,
+        req: Request<CancelJobRequest>,
+    ) -> Result<Response<CancelJobResponse>, Status> {
+        let r = req.into_inner();
+        let shard = self.shard(&r.shard)?;
+        let tenant = self.validate_tenant(r.tenant.as_deref())?;
+        shard.cancel_job(&tenant, &r.id).await.map_err(map_err)?;
+        Ok(Response::new(CancelJobResponse {}))
+    }
+
     async fn lease_tasks(
         &self,
         req: Request<LeaseTasksRequest>,
@@ -292,6 +303,7 @@ impl Silo for SiloService {
                 error_code: f.code,
                 error: f.data,
             },
+            report_outcome_request::Outcome::Cancelled(_) => AttemptOutcome::Cancelled,
         };
         shard
             .report_attempt_outcome(&tenant, &r.task_id, outcome)
@@ -306,11 +318,15 @@ impl Silo for SiloService {
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let r = req.into_inner();
         let shard = self.shard(&r.shard)?;
-        shard
-            .heartbeat_task(&r.worker_id, &r.task_id)
+        let tenant = self.validate_tenant(r.tenant.as_deref())?;
+        let result = shard
+            .heartbeat_task(&tenant, &r.worker_id, &r.task_id)
             .await
             .map_err(map_err)?;
-        Ok(Response::new(HeartbeatResponse {}))
+        Ok(Response::new(HeartbeatResponse {
+            cancelled: result.cancelled,
+            cancelled_at_ms: result.cancelled_at_ms,
+        }))
     }
 
     async fn query(&self, req: Request<QueryRequest>) -> Result<Response<QueryResponse>, Status> {
@@ -406,9 +422,9 @@ pub async fn run_grpc_with_reaper(
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    // Iterate shards and reap
+                    // Iterate shards and reap (use default tenant "-" for system-level reaping)
                     for shard in reaper_factory.instances().values() {
-                        let _ = shard.reap_expired_leases().await;
+                        let _ = shard.reap_expired_leases("-").await;
                     }
                 }
                 _ = tick_rx.recv() => {
@@ -477,8 +493,9 @@ where
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    // Use default tenant "-" for system-level reaping
                     for shard in reaper_factory.instances().values() {
-                        let _ = shard.reap_expired_leases().await;
+                        let _ = shard.reap_expired_leases("-").await;
                     }
                 }
                 _ = tick_rx.recv() => { break; }

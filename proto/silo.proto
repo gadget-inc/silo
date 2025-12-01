@@ -95,6 +95,9 @@ message GetJobResponse {
 message DeleteJobRequest { string shard = 1; string id = 2; optional string tenant = 3; }
 message DeleteJobResponse {}
 
+message CancelJobRequest { string shard = 1; string id = 2; optional string tenant = 3; }
+message CancelJobResponse {}
+
 message LeaseTasksRequest { string shard = 1; string worker_id = 2; uint32 max_tasks = 3; optional string tenant = 4; }
 message Task {
   string id = 1; // task id
@@ -113,13 +116,25 @@ message ReportOutcomeRequest {
   oneof outcome {
     JsonValueBytes success = 3;
     Failure failure = 4;
+    Cancelled cancelled = 6; // Worker acknowledges cancellation
   }
 }
 message Failure { string code = 1; bytes data = 2; }
+message Cancelled {} // Empty marker for cancelled outcome
 message ReportOutcomeResponse {}
 
-message HeartbeatRequest { string shard = 1; string worker_id = 2; string task_id = 3; }
-message HeartbeatResponse {}
+message HeartbeatRequest { 
+  string shard = 1; 
+  string worker_id = 2; 
+  string task_id = 3; 
+  optional string tenant = 4;
+}
+message HeartbeatResponse {
+  // True if the job has been cancelled. Worker should stop work and report Cancelled outcome.
+  bool cancelled = 1;
+  // Timestamp (epoch ms) when cancellation was requested, if cancelled
+  optional int64 cancelled_at_ms = 2;
+}
 
 // Execute SQL query against shard data
 message QueryRequest { 
@@ -145,6 +160,7 @@ service Silo {
   rpc Enqueue(EnqueueRequest) returns (EnqueueResponse);
   rpc GetJob(GetJobRequest) returns (GetJobResponse);
   rpc DeleteJob(DeleteJobRequest) returns (DeleteJobResponse);
+  rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
   rpc LeaseTasks(LeaseTasksRequest) returns (LeaseTasksResponse);
   rpc ReportOutcome(ReportOutcomeRequest) returns (ReportOutcomeResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);

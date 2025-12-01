@@ -18,7 +18,10 @@ sig Worker {}
 sig TaskId {}
 sig Attempt {}
 
-/** Job status (NOT including Cancelled - that's tracked separately) */
+/** 
+ * Job status 
+ * Doesn't include Cancelled, we track cancellation separately for performance reasons in the implementation
+ */
 abstract sig JobStatus {}
 one sig Scheduled, Running, Succeeded, Failed extends JobStatus {}
 

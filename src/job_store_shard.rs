@@ -1,25 +1,28 @@
-use rkyv::Deserialize as RkyvDeserialize;
+use rkyv::{Archive, Deserialize as RkyvDeserialize};
 use serde_json::Value as JsonValue;
 use slatedb::Db;
 use slatedb::DbIterator;
+use slatedb::ErrorKind as SlateErrorKind;
+use slatedb::IsolationLevel;
 use slatedb::WriteBatch;
 use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::codec::{
-    decode_job_status, decode_lease, decode_task, encode_attempt, encode_job_info,
-    encode_job_status, encode_lease, encode_task, CodecError,
+    decode_job_cancellation, decode_job_status, decode_lease, decode_task, encode_attempt,
+    encode_job_cancellation, encode_job_info, encode_job_status, encode_lease, encode_task,
+    CodecError,
 };
 use crate::concurrency::{
     ConcurrencyManager, MemoryEvent, RequestTicketOutcome, RequestTicketTaskOutcome,
 };
 use crate::gubernator::{GubernatorError, NullGubernatorClient, RateLimitClient, RateLimitResult};
-use crate::job::{JobInfo, JobStatus, JobStatusKind, JobView, Limit};
+use crate::job::{JobCancellation, JobInfo, JobStatus, JobStatusKind, JobView, Limit};
 use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt, JobAttemptView};
 use crate::keys::{
-    attempt_key, idx_metadata_key, idx_metadata_prefix, idx_status_time_key, job_info_key,
-    job_status_key, leased_task_key, task_key,
+    attempt_key, idx_metadata_key, idx_metadata_prefix, idx_status_time_key, job_cancelled_key,
+    job_info_key, job_status_key, leased_task_key, task_key,
 };
 use crate::query::JobSql;
 use crate::retry::RetryPolicy;
@@ -31,7 +34,8 @@ use tracing::{info, info_span};
 
 // Re-export commonly used types from task module for convenience
 pub use crate::task::{
-    ConcurrencyAction, HolderRecord, LeaseRecord, LeasedTask, Task, DEFAULT_LEASE_MS,
+    ConcurrencyAction, HeartbeatResult, HolderRecord, LeaseRecord, LeasedTask, Task,
+    DEFAULT_LEASE_MS,
 };
 
 /// Represents a single shard of the system. Owns the SlateDB instance.
@@ -68,6 +72,12 @@ pub enum JobStoreShardError {
     JobNotFound(String),
     #[error("cannot delete job {0}: job is currently running or has pending requests")]
     JobInProgress(String),
+    #[error("job already cancelled with id {0}")]
+    JobAlreadyCancelled(String),
+    #[error("cannot cancel job {0}: job is already in terminal state {1:?}")]
+    JobAlreadyTerminal(String, JobStatusKind),
+    #[error("transaction conflict during {0}, exceeded max retries")]
+    TransactionConflict(String),
 }
 
 impl JobStoreShard {
@@ -398,9 +408,197 @@ impl JobStoreShard {
         }
         batch.delete(job_info_key.as_bytes());
         batch.delete(job_status_key.as_bytes());
+        // Also delete cancellation record if present
+        batch.delete(job_cancelled_key(tenant, id).as_bytes());
         self.db.write(batch).await?;
         self.db.flush().await?;
         Ok(())
+    }
+
+    /// Cancel a job by id. Prevents further execution and signals running workers to stop.
+    ///
+    /// Cancellation semantics:
+    /// - Cancellation is tracked separately from status for performance
+    /// - For scheduled jobs: immediately removes from queue and sets status to Cancelled
+    /// - For running jobs: sets cancellation flag; worker discovers on heartbeat
+    /// - For terminal jobs: returns error (cannot cancel completed jobs)
+    /// - Cancellation is monotonic: once cancelled, always cancelled
+    ///
+    /// Uses a transaction with optimistic concurrency control to detect if the job state
+    /// changes during the cancellation flow. Retries automatically on conflict.
+    pub async fn cancel_job(&self, tenant: &str, id: &str) -> Result<(), JobStoreShardError> {
+        const MAX_RETRIES: usize = 5;
+
+        for attempt in 0..MAX_RETRIES {
+            match self.cancel_job_inner(tenant, id).await {
+                Ok(()) => return Ok(()),
+                Err(JobStoreShardError::Slate(ref e))
+                    if e.kind() == SlateErrorKind::Transaction =>
+                {
+                    // Transaction conflict - retry with exponential backoff
+                    if attempt + 1 < MAX_RETRIES {
+                        let delay_ms = 10 * (1 << attempt); // 10ms, 20ms, 40ms, 80ms
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        tracing::debug!(
+                            job_id = %id,
+                            attempt = attempt + 1,
+                            "cancel_job transaction conflict, retrying"
+                        );
+                        continue;
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(JobStoreShardError::TransactionConflict(
+            "cancel_job".to_string(),
+        ))
+    }
+
+    /// Inner implementation of cancel_job that runs within a single transaction attempt.
+    /// All business logic checks are performed within the transaction so they are re-evaluated
+    /// on retry if the transaction conflicts.
+    async fn cancel_job_inner(&self, tenant: &str, id: &str) -> Result<(), JobStoreShardError> {
+        let now_ms = now_epoch_ms();
+
+        // Start a transaction with SerializableSnapshot isolation for conflict detection
+        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+
+        // [SILO-CXL-1] Pre: job must exist and not already be cancelled
+        // Read status within transaction to detect concurrent modifications
+        let status_key = job_status_key(tenant, id);
+        let maybe_status_raw = txn.get(status_key.as_bytes()).await?;
+        let Some(status_raw) = maybe_status_raw else {
+            // No status means job doesn't exist
+            return Err(JobStoreShardError::JobNotFound(id.to_string()));
+        };
+
+        let decoded = decode_job_status(&status_raw).map_err(codec_error_to_shard_error)?;
+        let mut des = rkyv::Infallible;
+        let status: JobStatus = RkyvDeserialize::deserialize(decoded.archived(), &mut des)
+            .unwrap_or_else(|_| unreachable!("infallible deserialization for JobStatus"));
+
+        // Check if already cancelled within transaction
+        let cancelled_key = job_cancelled_key(tenant, id);
+        let maybe_cancelled = txn.get(cancelled_key.as_bytes()).await?;
+        if maybe_cancelled.is_some() {
+            return Err(JobStoreShardError::JobAlreadyCancelled(id.to_string()));
+        }
+
+        // Cannot cancel jobs in terminal states (Succeeded/Failed are truly terminal)
+        if status.kind == JobStatusKind::Succeeded || status.kind == JobStatusKind::Failed {
+            return Err(JobStoreShardError::JobAlreadyTerminal(
+                id.to_string(),
+                status.kind,
+            ));
+        }
+
+        // [SILO-CXL-2] Post: Mark job as cancelled (write cancellation record)
+        let cancellation = JobCancellation {
+            cancelled_at_ms: now_ms,
+        };
+        let cancellation_value =
+            encode_job_cancellation(&cancellation).map_err(codec_error_to_shard_error)?;
+        txn.put(cancelled_key.as_bytes(), &cancellation_value)?;
+
+        // [SILO-CXL-3] If job is Scheduled (not yet Running), remove from DB queue and set Cancelled status immediately
+        // For Running jobs, we leave status as Running - worker discovers cancellation on heartbeat
+        if status.kind == JobStatusKind::Scheduled {
+            // Remove tasks from DB queue for this job
+            // Scan tasks/<time>/<priority>/<job_id>/<attempt> and delete matching job_id
+            let task_prefix = "tasks/".as_bytes();
+            let mut task_end = task_prefix.to_vec();
+            task_end.push(0xFF);
+            let mut iter = txn.scan(task_prefix.to_vec()..=task_end).await?;
+            while let Some(kv) = iter.next().await? {
+                let key_str = String::from_utf8_lossy(&kv.key);
+                // Parse job_id from key: tasks/<time>/<priority>/<job_id>/<attempt>
+                let parts: Vec<&str> = key_str.split('/').collect();
+                if parts.len() >= 4 && parts[3] == id {
+                    txn.delete(&kv.key)?;
+                }
+            }
+
+            // Also remove any concurrency requests for this job
+            type ArchivedConcurrencyAction = <ConcurrencyAction as Archive>::Archived;
+            let req_prefix = format!("requests/{}/", tenant);
+            let mut req_end = req_prefix.as_bytes().to_vec();
+            req_end.push(0xFF);
+            let mut req_iter = txn.scan(req_prefix.as_bytes().to_vec()..=req_end).await?;
+            while let Some(kv) = req_iter.next().await? {
+                // Request key contains job_id in the ConcurrencyAction value
+                // For simplicity, decode and check; alternatively we could encode job_id in key
+                if let Ok(decoded) = crate::codec::decode_concurrency_action(&kv.value) {
+                    let archived = decoded.archived();
+                    let req_job_id = match archived {
+                        ArchivedConcurrencyAction::EnqueueTask { job_id, .. } => job_id.as_str(),
+                    };
+                    if req_job_id == id {
+                        txn.delete(&kv.key)?;
+                    }
+                }
+            }
+
+            // Delete old status index entry
+            let old_time =
+                idx_status_time_key(tenant, status.kind.as_str(), status.changed_at_ms, id);
+            txn.delete(old_time.as_bytes())?;
+
+            // Set status to Cancelled immediately since job never started
+            let cancelled_status = JobStatus::cancelled(now_ms);
+            let status_value =
+                encode_job_status(&cancelled_status).map_err(codec_error_to_shard_error)?;
+            txn.put(status_key.as_bytes(), &status_value)?;
+
+            // Insert new status index entry
+            let new_time = idx_status_time_key(
+                tenant,
+                cancelled_status.kind.as_str(),
+                cancelled_status.changed_at_ms,
+                id,
+            );
+            txn.put(new_time.as_bytes(), &[])?;
+        }
+        // Note: For Running jobs, status stays Running
+        // Worker discovers cancellation on heartbeat and reports Cancelled outcome
+
+        // Commit the transaction - this will detect conflicts with concurrent modifications
+        txn.commit().await?;
+
+        // Wake broker to potentially evict cancelled tasks from buffer
+        self.broker.wakeup();
+
+        Ok(())
+    }
+
+    /// Check if a job has been cancelled.
+    /// Returns true if the job has a cancellation record, false otherwise.
+    pub async fn is_job_cancelled(
+        &self,
+        tenant: &str,
+        id: &str,
+    ) -> Result<bool, JobStoreShardError> {
+        let key = job_cancelled_key(tenant, id);
+        let maybe_raw = self.db.get(key.as_bytes()).await?;
+        Ok(maybe_raw.is_some())
+    }
+
+    /// Get the cancellation timestamp if job was cancelled.
+    /// Returns None if job was not cancelled.
+    pub async fn get_job_cancellation(
+        &self,
+        tenant: &str,
+        id: &str,
+    ) -> Result<Option<i64>, JobStoreShardError> {
+        let key = job_cancelled_key(tenant, id);
+        let maybe_raw = self.db.get(key.as_bytes()).await?;
+        if let Some(raw) = maybe_raw {
+            let decoded = decode_job_cancellation(&raw).map_err(codec_error_to_shard_error)?;
+            Ok(Some(decoded.archived().cancelled_at_ms))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Fetch a job by id as a zero-copy archived view.
@@ -948,12 +1146,17 @@ impl JobStoreShard {
         Ok((tasks, keys))
     }
 
-    /// Heartbeat a lease to renew it if the worker id matches. Bumps expiry by DEFAULT_LEASE_MS
+    /// Heartbeat a lease to renew it if the worker id matches. Bumps expiry by DEFAULT_LEASE_MS.
+    ///
+    /// [SILO-HB-3]: Heartbeat ALWAYS renews the lease, even for cancelled jobs.
+    /// Worker discovers cancellation from the heartbeat response
+    /// Worker can keep heartbeating during graceful shutdown until they report completion.
     pub async fn heartbeat_task(
         &self,
+        tenant: &str,
         worker_id: &str,
         task_id: &str,
-    ) -> Result<(), JobStoreShardError> {
+    ) -> Result<HeartbeatResult, JobStoreShardError> {
         // [SILO-HB-2] Directly read the lease for this task id
         let key = leased_task_key(task_id);
         let maybe_raw = self.db.get(key.as_bytes()).await?;
@@ -973,6 +1176,9 @@ impl JobStoreShard {
             });
         }
 
+        // Extract job_id for cancellation checking (use helper method)
+        let job_id = decoded.job_id().to_string();
+
         // [SILO-HB-3] Renew by creating new record with updated expiry
         // Note: to_task() allocates, but we need owned Task for LeaseRecord
         let record = LeaseRecord {
@@ -986,7 +1192,15 @@ impl JobStoreShard {
         batch.put(key.as_bytes(), &value);
         self.db.write(batch).await?;
         self.db.flush().await?;
-        Ok(())
+
+        // Check cancellation status to return in response
+        // Worker discovers cancellation via heartbeat response per Alloy spec
+        let cancelled_at_ms = self.get_job_cancellation(tenant, &job_id).await?;
+
+        Ok(HeartbeatResult {
+            cancelled: cancelled_at_ms.is_some(),
+            cancelled_at_ms,
+        })
     }
 
     /// Report the outcome of a running attempt identified by task id.
@@ -1022,6 +1236,9 @@ impl JobStoreShard {
                 error_code: error_code.clone(),
                 error: error.clone(),
             },
+            AttemptOutcome::Cancelled => AttemptStatus::Cancelled {
+                finished_at_ms: now_ms,
+            },
         };
         let attempt = JobAttempt {
             job_id: job_id.clone(),
@@ -1042,16 +1259,23 @@ impl JobStoreShard {
         let mut job_missing_error: Option<JobStoreShardError> = None;
         let mut followup_next_time: Option<i64> = None;
 
-        // [SILO-SUCC-3] If success: mark job succeeded now (pure write)
-        if let AttemptOutcome::Success { .. } = outcome {
-            let job_status = JobStatus::succeeded(now_ms);
-            self.set_job_status_with_index(&mut batch, tenant, &job_id, job_status)
-                .await?;
-        } else {
-            // if error, maybe enqueue next attempt; otherwise mark job failed
-            let mut scheduled_followup: bool = false;
+        match &outcome {
+            // [SILO-SUCC-3] If success: mark job succeeded now (pure write)
+            AttemptOutcome::Success { .. } => {
+                let job_status = JobStatus::succeeded(now_ms);
+                self.set_job_status_with_index(&mut batch, tenant, &job_id, job_status)
+                    .await?;
+            }
+            // Worker acknowledges cancellation - set job status to Cancelled
+            AttemptOutcome::Cancelled => {
+                let job_status = JobStatus::cancelled(now_ms);
+                self.set_job_status_with_index(&mut batch, tenant, &job_id, job_status)
+                    .await?;
+            }
+            // Error: maybe enqueue next attempt; otherwise mark job failed
+            AttemptOutcome::Error { .. } => {
+                let mut scheduled_followup: bool = false;
 
-            if let AttemptOutcome::Error { .. } = outcome {
                 // Load job info to get priority and retry policy
                 let job_info_key = job_info_key(tenant, &job_id);
                 let maybe_job = self.db.get(job_info_key.as_bytes()).await?;
@@ -1158,9 +1382,10 @@ impl JobStoreShard {
         Ok(())
     }
 
-    /// Scan all held leases and mark any expired ones as failed with a WORKER_CRASHED error code.
+    /// Scan all held leases and mark any expired ones as failed with a WORKER_CRASHED error code, or as Cancelled if the job was cancelled.
     /// Returns the number of expired leases reaped.
-    pub async fn reap_expired_leases(&self) -> Result<usize, JobStoreShardError> {
+    pub async fn reap_expired_leases(&self, tenant: &str) -> Result<usize, JobStoreShardError> {
+        // Scan leases under lease/
         let start: Vec<u8> = b"lease/".to_vec();
         let mut end: Vec<u8> = b"lease/".to_vec();
         end.push(0xFF);
@@ -1185,27 +1410,36 @@ impl JobStoreShard {
                 continue;
             }
 
+            // Get task_id and job_id using helper methods
             let Some(task_id) = decoded.task_id() else {
                 continue; // Not a RunAttempt lease
             };
+            let job_id = decoded.job_id().to_string();
 
-            // [SILO-REAP-2][SILO-REAP-3][SILO-REAP-4] Report as worker crashed
-            let _ = self
-                .report_attempt_outcome(
-                    "-", // Default tenant
-                    task_id,
-                    AttemptOutcome::Error {
-                        error_code: "WORKER_CRASHED".to_string(),
-                        error: format!(
-                            "lease expired at {} (now {}), worker={}",
-                            decoded.expiry_ms(),
-                            now_ms,
-                            decoded.worker_id()
-                        )
-                        .into_bytes(),
-                    },
-                )
-                .await;
+            // Check if job was cancelled - if so, report Cancelled instead of WORKER_CRASHED
+            let was_cancelled = self
+                .is_job_cancelled(tenant, &job_id)
+                .await
+                .unwrap_or(false);
+
+            let outcome = if was_cancelled {
+                // Job was cancelled - report as Cancelled (clean termination)
+                AttemptOutcome::Cancelled
+            } else {
+                // [SILO-REAP-2][SILO-REAP-3][SILO-REAP-4] Report as worker crashed
+                AttemptOutcome::Error {
+                    error_code: "WORKER_CRASHED".to_string(),
+                    error: format!(
+                        "lease expired at {} (now {}), worker={}",
+                        decoded.expiry_ms(),
+                        now_ms,
+                        decoded.worker_id()
+                    )
+                    .into_bytes(),
+                }
+            };
+
+            let _ = self.report_attempt_outcome(tenant, task_id, outcome).await;
             reaped += 1;
         }
 

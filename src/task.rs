@@ -136,3 +136,12 @@ impl LeasedTask {
     }
 }
 
+/// Result from heartbeat indicating if the job has been cancelled.
+/// Workers should check this and begin graceful shutdown if cancelled.
+#[derive(Debug, Clone)]
+pub struct HeartbeatResult {
+    /// True if the job has been cancelled. Worker should stop work and report Cancelled outcome.
+    pub cancelled: bool,
+    /// Timestamp when cancellation was requested, if cancelled
+    pub cancelled_at_ms: Option<i64>,
+}

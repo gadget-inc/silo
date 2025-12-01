@@ -502,7 +502,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         .expect("put mutated lease");
     shard.db().flush().await.expect("flush mutated lease");
 
-    let reaped = shard.reap_expired_leases().await.expect("reap");
+    let reaped = shard.reap_expired_leases("-").await.expect("reap");
     assert_eq!(reaped, 1);
 
     // Lease removed
@@ -562,7 +562,7 @@ async fn reap_ignores_unexpired_leases() {
         .await
         .expect("lease present");
 
-    let reaped = shard.reap_expired_leases().await.expect("reap");
+    let reaped = shard.reap_expired_leases("-").await.expect("reap");
     assert_eq!(reaped, 0);
 
     // Lease should still exist
@@ -1029,7 +1029,7 @@ async fn concurrency_reap_expired_lease_releases_holder() {
     shard.db().flush().await.expect("flush");
 
     // Reap -> should release holder and schedule retry
-    let reaped = shard.reap_expired_leases().await.expect("reap");
+    let reaped = shard.reap_expired_leases("-").await.expect("reap");
     assert_eq!(reaped, 1);
 
     // Job 2 should now be granted (holder released from job 1)
