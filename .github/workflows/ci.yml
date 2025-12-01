@@ -29,3 +29,47 @@ jobs:
         shell: bash
         run: |
           cargo test
+
+  alloy:
+    name: Alloy model verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: ./.github/actions/setup-test-env
+      - name: Run Alloy model checker
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          echo "Running Alloy model verification..."
+          alloy6 exec -f specs/job_shard.als 2>&1 | tee alloy_output.txt
+          
+          echo ""
+          echo "Verifying results..."
+          
+          # Check that all 'check' commands are UNSAT (no counterexamples found)
+          if grep -E "^[0-9]+\. check .* SAT$" alloy_output.txt; then
+            echo ""
+            echo "ERROR: Alloy found counterexamples for the above assertions!"
+            echo "A 'check' command returning SAT means the assertion is violated."
+            exit 1
+          fi
+          
+          # Check that all 'run' commands are SAT (examples are satisfiable)
+          if grep -E "^[0-9]+\. run .* UNSAT$" alloy_output.txt; then
+            echo ""
+            echo "ERROR: Alloy could not find instances for the above examples!"
+            echo "A 'run' command returning UNSAT means the scenario is impossible."
+            exit 1
+          fi
+          
+          # Verify we actually ran some checks
+          check_count=$(grep -c "^[0-9]*\. check" alloy_output.txt || true)
+          if [ "$check_count" -eq 0 ]; then
+            echo "ERROR: No 'check' commands found in Alloy output!"
+            exit 1
+          fi
+          
+          echo ""
+          echo "✓ All $check_count assertions verified (no counterexamples found)"
+          echo "✓ All example scenarios are satisfiable"
