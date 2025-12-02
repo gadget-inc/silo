@@ -12,7 +12,7 @@ use tokio::sync::Notify;
 
 use crate::codec::decode_task;
 use crate::concurrency::ConcurrencyManager;
-use crate::job_store_shard::Task;
+use crate::task::Task;
 use tracing::debug;
 
 /// A task entry stored in the in-memory broker buffer

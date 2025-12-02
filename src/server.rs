@@ -8,11 +8,81 @@ use tonic::{Request, Response, Status};
 use tracing::info;
 
 use crate::factory::{CloseAllError, ShardFactory};
+use crate::job::{GubernatorAlgorithm, GubernatorRateLimit, RateLimitRetryPolicy};
 use crate::job_attempt::AttemptOutcome;
-use crate::job_store_shard::{JobStoreShard, JobStoreShardError, DEFAULT_LEASE_MS};
+use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::pb::silo_server::{Silo, SiloServer};
 use crate::pb::*;
 use crate::settings::AppConfig;
+use crate::task::DEFAULT_LEASE_MS;
+
+/// Convert a proto Limit to a job::Limit
+fn proto_limit_to_job_limit(proto: Limit) -> Option<crate::job::Limit> {
+    match proto.limit? {
+        limit::Limit::Concurrency(c) => Some(crate::job::Limit::Concurrency(
+            crate::job::ConcurrencyLimit {
+                key: c.key,
+                max_concurrency: c.max_concurrency,
+            },
+        )),
+        limit::Limit::RateLimit(r) => {
+            let algorithm = match r.algorithm {
+                0 => GubernatorAlgorithm::TokenBucket,
+                1 => GubernatorAlgorithm::LeakyBucket,
+                _ => GubernatorAlgorithm::TokenBucket,
+            };
+            let retry_policy = r
+                .retry_policy
+                .map(|rp| RateLimitRetryPolicy {
+                    initial_backoff_ms: rp.initial_backoff_ms,
+                    max_backoff_ms: rp.max_backoff_ms,
+                    backoff_multiplier: rp.backoff_multiplier,
+                    max_retries: rp.max_retries,
+                })
+                .unwrap_or_default();
+
+            Some(crate::job::Limit::RateLimit(GubernatorRateLimit {
+                name: r.name,
+                unique_key: r.unique_key,
+                limit: r.limit,
+                duration_ms: r.duration_ms,
+                hits: r.hits,
+                algorithm,
+                behavior: r.behavior,
+                retry_policy,
+            }))
+        }
+    }
+}
+
+/// Convert a job::Limit to a proto Limit
+fn job_limit_to_proto_limit(job_limit: crate::job::Limit) -> Limit {
+    match job_limit {
+        crate::job::Limit::Concurrency(c) => Limit {
+            limit: Some(limit::Limit::Concurrency(ConcurrencyLimit {
+                key: c.key,
+                max_concurrency: c.max_concurrency,
+            })),
+        },
+        crate::job::Limit::RateLimit(r) => Limit {
+            limit: Some(limit::Limit::RateLimit(crate::pb::GubernatorRateLimit {
+                name: r.name,
+                unique_key: r.unique_key,
+                limit: r.limit,
+                duration_ms: r.duration_ms,
+                hits: r.hits,
+                algorithm: r.algorithm.as_u8() as i32,
+                behavior: r.behavior,
+                retry_policy: Some(crate::pb::RateLimitRetryPolicy {
+                    initial_backoff_ms: r.retry_policy.initial_backoff_ms,
+                    max_backoff_ms: r.retry_policy.max_backoff_ms,
+                    backoff_multiplier: r.retry_policy.backoff_multiplier,
+                    max_retries: r.retry_policy.max_retries,
+                }),
+            })),
+        },
+    }
+}
 
 fn map_err(e: JobStoreShardError) -> Status {
     match e {
@@ -81,14 +151,14 @@ impl Silo for SiloService {
             randomize_interval: rp.randomize_interval,
             backoff_factor: rp.backoff_factor,
         });
-        let limits = r
-            .concurrency_limits
+
+        // Convert proto Limits to job::Limit
+        let limits: Vec<crate::job::Limit> = r
+            .limits
             .into_iter()
-            .map(|l| crate::job::ConcurrencyLimit {
-                key: l.key,
-                max_concurrency: l.max_concurrency,
-            })
+            .filter_map(|l| proto_limit_to_job_limit(l))
             .collect();
+
         // Validate metadata constraints: <=16 entries, key < 64 chars, value < u16::MAX
         if r.metadata.len() > 16 {
             return Err(Status::invalid_argument(
@@ -113,7 +183,7 @@ impl Silo for SiloService {
             Some(r.metadata.into_iter().collect())
         };
         let id = shard
-            .enqueue_with_metadata(
+            .enqueue(
                 &tenant,
                 if r.id.is_empty() { None } else { Some(r.id) },
                 r.priority as u8,
@@ -154,13 +224,10 @@ impl Silo for SiloService {
                 data: view.payload_bytes().to_vec(),
             }),
             retry_policy,
-            concurrency_limits: view
-                .concurrency_limits()
+            limits: view
+                .limits()
                 .into_iter()
-                .map(|l| ConcurrencyLimit {
-                    key: l.key,
-                    max_concurrency: l.max_concurrency,
-                })
+                .map(job_limit_to_proto_limit)
                 .collect(),
             metadata: view.metadata().into_iter().collect(),
         };

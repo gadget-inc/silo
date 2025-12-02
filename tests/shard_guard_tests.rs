@@ -55,7 +55,7 @@ where
     false
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shard_guard_acquire_and_release() {
     // Requires etcd to be running locally (e.g., `just etcd`).
     let prefix = unique_prefix();
@@ -91,7 +91,7 @@ async fn shard_guard_acquire_and_release() {
     handle.abort();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shard_guard_contention_and_handoff() {
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
@@ -160,7 +160,7 @@ async fn shard_guard_contention_and_handoff() {
     h2.abort();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shard_guard_idempotent_set_desired_true() {
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
@@ -204,7 +204,7 @@ async fn shard_guard_idempotent_set_desired_true() {
     handle.abort();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shard_guard_quick_flip_reacquires() {
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
@@ -244,7 +244,7 @@ async fn shard_guard_quick_flip_reacquires() {
     handle.abort();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shard_guard_acquire_aborts_when_desired_changes() {
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
@@ -291,7 +291,7 @@ async fn shard_guard_acquire_aborts_when_desired_changes() {
     h2.abort();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shard_guard_acquire_abort_sets_idle() {
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
@@ -335,7 +335,7 @@ async fn shard_guard_acquire_abort_sets_idle() {
     h2.abort();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shard_guard_release_cancelled_on_desired_true() {
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
@@ -381,7 +381,7 @@ async fn shard_guard_release_cancelled_on_desired_true() {
     h.abort();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shard_guard_shutdown_in_idle() {
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
@@ -407,7 +407,7 @@ async fn shard_guard_shutdown_in_idle() {
     assert!(!owned.lock().await.contains(&shard_id));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shard_guard_shutdown_while_acquiring() {
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
@@ -458,7 +458,7 @@ async fn shard_guard_shutdown_while_acquiring() {
     h2.abort();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shard_guard_shutdown_while_held() {
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
@@ -488,7 +488,7 @@ async fn shard_guard_shutdown_while_held() {
     h.abort();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shard_guard_shutdown_while_releasing() {
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");

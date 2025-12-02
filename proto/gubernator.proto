@@ -1,0 +1,111 @@
+syntax = "proto3";
+
+package pb.gubernator;
+
+option go_package = "github.com/gubernator-io/gubernator/v2;gubernator";
+
+// Algorithm used for rate limiting
+enum Algorithm {
+  // Token bucket algorithm - tokens are added at a fixed rate, requests consume tokens
+  TOKEN_BUCKET = 0;
+  // Leaky bucket algorithm - requests are processed at a fixed rate
+  LEAKY_BUCKET = 1;
+}
+
+// Behavior flags that modify how the rate limit operates
+enum Behavior {
+  // Default batching behavior - requests are batched to peers for efficiency
+  BATCHING = 0;
+  // Disable request batching - each request is sent immediately
+  NO_BATCHING = 1;
+  // Global rate limit - synchronized across all peers
+  GLOBAL = 2;
+  // Duration resets on calendar boundaries (minute, hour, day, etc.)
+  DURATION_IS_GREGORIAN = 4;
+  // Reset the rate limit remaining counter
+  RESET_REMAINING = 8;
+  // Drain remaining counter to zero on first over limit event
+  DRAIN_OVER_LIMIT = 16;
+}
+
+// Status of the rate limit check
+enum Status {
+  // Request is under the rate limit
+  UNDER_LIMIT = 0;
+  // Request exceeds the rate limit
+  OVER_LIMIT = 1;
+}
+
+// A single rate limit request
+message RateLimitReq {
+  // A name that uniquely identifies this rate limit (e.g., "api_requests")
+  string name = 1;
+  // A unique key within the rate limit name (e.g., user ID, IP address)
+  string unique_key = 2;
+  // Number of hits/requests to add (set to 0 to just check current state)
+  int64 hits = 3;
+  // The maximum number of requests allowed in the duration
+  int64 limit = 4;
+  // Duration of the rate limit window in milliseconds
+  int64 duration = 5;
+  // The algorithm used to calculate the rate limit
+  Algorithm algorithm = 6;
+  // Behavior flags (can be OR'd together)
+  int32 behavior = 7;
+  // Maximum burst size for token bucket algorithm
+  int64 burst = 8;
+  // Arbitrary metadata to pass through
+  map<string, string> metadata = 9;
+  // Unix timestamp when the rate limit was created (optional, for DURATION_IS_GREGORIAN)
+  int64 created_at = 10;
+}
+
+// Response for a single rate limit request
+message RateLimitResp {
+  // Status of the rate limit check
+  Status status = 1;
+  // The currently configured limit
+  int64 limit = 2;
+  // Number of requests remaining in the current window
+  int64 remaining = 3;
+  // Unix timestamp (in milliseconds) when the rate limit will reset
+  int64 reset_time = 4;
+  // Error message if something went wrong
+  string error = 5;
+  // Arbitrary metadata from the request
+  map<string, string> metadata = 6;
+}
+
+// Request containing multiple rate limit checks
+message GetRateLimitsReq {
+  // List of rate limit requests to check
+  repeated RateLimitReq requests = 1;
+}
+
+// Response containing results for all rate limit checks
+message GetRateLimitsResp {
+  // List of rate limit responses (in same order as requests)
+  repeated RateLimitResp responses = 1;
+}
+
+// Health check request
+message HealthCheckReq {}
+
+// Health check response  
+message HealthCheckResp {
+  // Health status (e.g., "healthy", "unhealthy")
+  string status = 1;
+  // Message describing the health status
+  string message = 2;
+  // Number of peers in the cluster
+  int32 peer_count = 3;
+}
+
+// The Gubernator rate limiting service
+service V1 {
+  // Check one or more rate limits
+  rpc GetRateLimits(GetRateLimitsReq) returns (GetRateLimitsResp);
+  // Health check endpoint
+  rpc HealthCheck(HealthCheckReq) returns (HealthCheckResp);
+}
+

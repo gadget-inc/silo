@@ -48,7 +48,7 @@ async fn enqueue_job(shard: &JobStoreShard, id: &str, priority: u8, now: i64) ->
             now,
             None,
             serde_json::json!({}),
-            vec![],
+            vec![], None,
         )
         .await
         .expect("enqueue")
@@ -63,7 +63,7 @@ async fn enqueue_job_with_metadata(
     metadata: Vec<(String, String)>,
 ) -> String {
     shard
-        .enqueue_with_metadata(
+        .enqueue(
             "-",
             Some(id.to_string()),
             priority,
@@ -77,7 +77,7 @@ async fn enqueue_job_with_metadata(
         .expect("enqueue")
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_lists_jobs_basic() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -92,7 +92,7 @@ async fn sql_lists_jobs_basic() {
     assert_eq!(got, vec!["a1", "a2", "b1"]);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_pushdown_status_kind_running() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -113,7 +113,7 @@ async fn sql_pushdown_status_kind_running() {
     assert!(got.contains(&j1));
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_exact_id_match() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -128,7 +128,7 @@ async fn sql_exact_id_match() {
     assert_eq!(got, vec!["b1"]);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_prefix_id_match() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -147,7 +147,7 @@ async fn sql_prefix_id_match() {
     assert_eq!(got, vec!["a1", "a2", "ax"]);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_status_and_exact_id() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -168,7 +168,7 @@ async fn sql_status_and_exact_id() {
     assert_eq!(got, vec![j1]);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_status_and_prefix_id() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -185,7 +185,7 @@ async fn sql_status_and_prefix_id() {
     assert_eq!(got, vec!["job_a", "job_b"]);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_metadata_exact_match() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -216,7 +216,7 @@ async fn sql_metadata_exact_match() {
     assert_eq!(got, vec!["m1"]);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_metadata_and_status_pushdown() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -247,7 +247,7 @@ async fn sql_metadata_and_status_pushdown() {
     assert_eq!(got, vec![j1]);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_metadata_select_returns_values() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -279,7 +279,7 @@ async fn sql_metadata_select_returns_values() {
     assert_eq!(batches[0].num_rows(), 1);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_metadata_or_condition() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -315,7 +315,7 @@ async fn sql_metadata_or_condition() {
     assert_eq!(got, vec!["or1", "or2"]);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_metadata_multiple_keys() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -360,7 +360,7 @@ async fn sql_metadata_multiple_keys() {
     assert_eq!(got, vec!["mk1"]);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_metadata_with_status_and_id_prefix() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -387,7 +387,7 @@ async fn sql_metadata_with_status_and_id_prefix() {
 
 // ===== Predicate Pushdown Verification Tests =====
 
-#[tokio::test]
+#[silo::test]
 async fn verify_exact_id_pushdown() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -413,7 +413,7 @@ async fn verify_exact_id_pushdown() {
     );
 }
 
-#[tokio::test]
+#[silo::test]
 async fn verify_metadata_filter_pushdown() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -445,7 +445,7 @@ async fn verify_metadata_filter_pushdown() {
     );
 }
 
-#[tokio::test]
+#[silo::test]
 async fn verify_status_filter_pushdown() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -471,7 +471,7 @@ async fn verify_status_filter_pushdown() {
     );
 }
 
-#[tokio::test]
+#[silo::test]
 async fn verify_tenant_filter_always_pushed() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -493,7 +493,7 @@ async fn verify_tenant_filter_always_pushed() {
     );
 }
 
-#[tokio::test]
+#[silo::test]
 async fn verify_multiple_filters_pushed() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -524,7 +524,7 @@ async fn verify_multiple_filters_pushed() {
     );
 }
 
-#[tokio::test]
+#[silo::test]
 async fn explain_plan_shows_filter_pushdown() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -547,7 +547,7 @@ async fn explain_plan_shows_filter_pushdown() {
 
 // ===== Status Kind Coverage Tests =====
 
-#[tokio::test]
+#[silo::test]
 async fn sql_filter_scheduled_status() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -570,7 +570,7 @@ async fn sql_filter_scheduled_status() {
     assert_eq!(got, vec!["s2"]);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_filter_succeeded_status() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -602,7 +602,7 @@ async fn sql_filter_succeeded_status() {
     assert_eq!(got, vec!["success1"]);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_filter_failed_status() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -616,7 +616,7 @@ async fn sql_filter_failed_status() {
             now,
             None,
             serde_json::json!({}),
-            vec![],
+            vec![], None,
         )
         .await
         .expect("enqueue");
@@ -651,7 +651,7 @@ async fn sql_filter_failed_status() {
 
 // ===== Column Type and Projection Tests =====
 
-#[tokio::test]
+#[silo::test]
 async fn sql_select_all_columns() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -673,7 +673,7 @@ async fn sql_select_all_columns() {
     assert_eq!(batches[0].num_rows(), 1);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_select_priority_and_timestamps() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -712,7 +712,7 @@ async fn sql_select_priority_and_timestamps() {
         .is_some());
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_order_by_priority() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -733,7 +733,7 @@ async fn sql_order_by_priority() {
     assert_eq!(got, vec!["high", "mid", "low"]);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_filter_priority_range() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -753,7 +753,7 @@ async fn sql_filter_priority_range() {
     assert_eq!(got, vec!["p10", "p5"]);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_filter_by_enqueue_time() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -777,7 +777,7 @@ async fn sql_filter_by_enqueue_time() {
 
 // ===== Empty and Null Cases =====
 
-#[tokio::test]
+#[silo::test]
 async fn sql_jobs_without_metadata() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -801,7 +801,7 @@ async fn sql_jobs_without_metadata() {
     assert_eq!(ids, vec!["no_meta"]);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_empty_result_set() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -818,7 +818,7 @@ async fn sql_empty_result_set() {
     assert_eq!(got, Vec::<String>::new());
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_query_with_no_jobs() {
     let (_tmp, shard) = open_temp_shard().await;
 
@@ -828,7 +828,7 @@ async fn sql_query_with_no_jobs() {
     assert_eq!(got, Vec::<String>::new());
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_count_aggregate() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -860,7 +860,7 @@ async fn sql_count_aggregate() {
 
 // ===== LIKE Pattern Tests =====
 
-#[tokio::test]
+#[silo::test]
 async fn sql_suffix_id_match() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -880,7 +880,7 @@ async fn sql_suffix_id_match() {
     assert_eq!(got, vec!["job_test", "other_test"]);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_contains_id_match() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -901,7 +901,7 @@ async fn sql_contains_id_match() {
 
 // ===== Limit Tests =====
 
-#[tokio::test]
+#[silo::test]
 async fn sql_explicit_limit() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -920,7 +920,7 @@ async fn sql_explicit_limit() {
     assert_eq!(got.len(), 3);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_limit_beyond_available() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -940,7 +940,7 @@ async fn sql_limit_beyond_available() {
 
 // ===== Tenant Isolation Tests =====
 
-#[tokio::test]
+#[silo::test]
 async fn sql_tenant_isolation() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -954,7 +954,7 @@ async fn sql_tenant_isolation() {
             now,
             None,
             serde_json::json!({}),
-            vec![],
+            vec![], None,
         )
         .await
         .expect("enqueue");
@@ -966,7 +966,7 @@ async fn sql_tenant_isolation() {
             now,
             None,
             serde_json::json!({}),
-            vec![],
+            vec![], None,
         )
         .await
         .expect("enqueue");
@@ -990,7 +990,7 @@ async fn sql_tenant_isolation() {
     assert_eq!(got, vec!["job_b"]);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_default_tenant() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -1007,7 +1007,7 @@ async fn sql_default_tenant() {
             now,
             None,
             serde_json::json!({}),
-            vec![],
+            vec![], None,
         )
         .await
         .expect("enqueue");
@@ -1021,7 +1021,7 @@ async fn sql_default_tenant() {
 
 // ===== Error Handling Tests =====
 
-#[tokio::test]
+#[silo::test]
 async fn sql_invalid_column_name() {
     let (_tmp, shard) = open_temp_shard().await;
 
@@ -1034,7 +1034,7 @@ async fn sql_invalid_column_name() {
     assert!(result.is_err());
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_invalid_syntax() {
     let (_tmp, shard) = open_temp_shard().await;
 
@@ -1047,7 +1047,7 @@ async fn sql_invalid_syntax() {
 
 // ===== Metadata Edge Cases =====
 
-#[tokio::test]
+#[silo::test]
 async fn sql_metadata_empty_value() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -1071,7 +1071,7 @@ async fn sql_metadata_empty_value() {
     assert_eq!(got, vec!["empty"]);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_metadata_not_exists() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -1096,7 +1096,7 @@ async fn sql_metadata_not_exists() {
     assert_eq!(got, Vec::<String>::new());
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_metadata_special_chars() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -1125,7 +1125,7 @@ async fn sql_metadata_special_chars() {
 
 // ===== Additional Pushdown Verification Tests =====
 
-#[tokio::test]
+#[silo::test]
 async fn verify_priority_not_pushed() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -1145,7 +1145,7 @@ async fn verify_priority_not_pushed() {
     // We can't really verify it's NOT pushed, but we verify the query works
 }
 
-#[tokio::test]
+#[silo::test]
 async fn verify_combined_filters_all_pushed() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -1175,7 +1175,7 @@ async fn verify_combined_filters_all_pushed() {
     );
 }
 
-#[tokio::test]
+#[silo::test]
 async fn sql_multiple_order_by() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();

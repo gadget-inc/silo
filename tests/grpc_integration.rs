@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use silo::factory::ShardFactory;
+use silo::gubernator::MockGubernatorClient;
 use silo::pb::silo_client::SiloClient;
 use silo::pb::*;
 use silo::server::run_grpc_with_reaper;
@@ -9,7 +10,7 @@ use silo::settings::{Backend, DatabaseTemplate};
 use tokio::net::TcpListener;
 
 // Integration test that boots the real gRPC server and talks to it over TCP.
-#[tokio::test(flavor = "multi_thread")] // multi_thread to match server expectations
+#[silo::test(flavor = "multi_thread")] // multi_thread to match server expectations
 async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
     let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
         // Temp storage per test
@@ -20,7 +21,8 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
         };
-        let mut factory = ShardFactory::new(template);
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let mut factory = ShardFactory::new(template, rate_limiter);
         // Open shard 0 so the server can find it
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
@@ -56,7 +58,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
             payload: Some(JsonValueBytes {
                 data: payload_bytes.clone(),
             }),
-            concurrency_limits: vec![],
+            limits: vec![],
             tenant: None,
             metadata: md,
         };
@@ -145,7 +147,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")] // multi_thread to match server expectations
+#[silo::test(flavor = "multi_thread")] // multi_thread to match server expectations
 async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
     let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
         let tmp = tempfile::tempdir()?;
@@ -153,7 +155,8 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
         };
-        let mut factory = ShardFactory::new(template);
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let mut factory = ShardFactory::new(template, rate_limiter);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -200,7 +203,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
                 payload: Some(JsonValueBytes {
                     data: b"{}".to_vec(),
                 }),
-                concurrency_limits: vec![],
+                limits: vec![],
                 tenant: None,
                 metadata: md,
             };
@@ -221,7 +224,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
                 payload: Some(JsonValueBytes {
                     data: b"{}".to_vec(),
                 }),
-                concurrency_limits: vec![],
+                limits: vec![],
                 tenant: None,
                 metadata: md,
             };
@@ -245,7 +248,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
                 payload: Some(JsonValueBytes {
                     data: b"{}".to_vec(),
                 }),
-                concurrency_limits: vec![],
+                limits: vec![],
                 tenant: None,
                 metadata: md,
             };
@@ -269,7 +272,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[silo::test(flavor = "multi_thread")]
 async fn grpc_server_query_basic() -> anyhow::Result<()> {
     let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
         let tmp = tempfile::tempdir()?;
@@ -277,7 +280,8 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
         };
-        let mut factory = ShardFactory::new(template);
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let mut factory = ShardFactory::new(template, rate_limiter);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -309,7 +313,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
                 payload: Some(JsonValueBytes {
                     data: payload_bytes,
                 }),
-                concurrency_limits: vec![],
+                limits: vec![],
                 tenant: None,
                 metadata: md,
             };
@@ -386,7 +390,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[silo::test(flavor = "multi_thread")]
 async fn grpc_server_query_errors() -> anyhow::Result<()> {
     let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
         let tmp = tempfile::tempdir()?;
@@ -394,7 +398,8 @@ async fn grpc_server_query_errors() -> anyhow::Result<()> {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
         };
-        let mut factory = ShardFactory::new(template);
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let mut factory = ShardFactory::new(template, rate_limiter);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -480,7 +485,7 @@ async fn grpc_server_query_errors() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[silo::test(flavor = "multi_thread")]
 async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
     let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
         let tmp = tempfile::tempdir()?;
@@ -488,7 +493,8 @@ async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
         };
-        let mut factory = ShardFactory::new(template);
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let mut factory = ShardFactory::new(template, rate_limiter);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -530,7 +536,7 @@ async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
             payload: Some(JsonValueBytes {
                 data: payload_bytes,
             }),
-            concurrency_limits: vec![],
+            limits: vec![],
             tenant: None,
             metadata: std::collections::HashMap::new(),
         };
@@ -569,7 +575,7 @@ async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[silo::test(flavor = "multi_thread")]
 async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
     let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
         let tmp = tempfile::tempdir()?;
@@ -577,7 +583,8 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
         };
-        let mut factory = ShardFactory::new(template);
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let mut factory = ShardFactory::new(template, rate_limiter);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -612,7 +619,7 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
             payload: Some(JsonValueBytes {
                 data: payload_bytes,
             }),
-            concurrency_limits: vec![],
+            limits: vec![],
             tenant: None,
             metadata: md,
         };

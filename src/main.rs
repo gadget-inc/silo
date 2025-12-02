@@ -6,6 +6,7 @@ use tracing::error;
 
 use silo::coordination::Coordination;
 use silo::factory::ShardFactory;
+use silo::gubernator::{GubernatorClient, NullGubernatorClient, RateLimitClient};
 use silo::server::run_grpc_with_reaper;
 use silo::settings;
 use tokio::net::TcpListener;
@@ -37,7 +38,17 @@ async fn main() -> anyhow::Result<()> {
     let _coord = Coordination::connect(&cfg.coordination).await?;
     tracing::info!(endpoints = ?cfg.coordination.etcd_endpoints, "connected to etcd");
 
-    let mut shard_factory = ShardFactory::new(cfg.database.clone());
+    // Create rate limiter based on configuration
+    let rate_limiter: Arc<dyn RateLimitClient> = if let Some(guber_cfg) = cfg.gubernator.to_config() {
+        let client = GubernatorClient::new(guber_cfg);
+        client.connect().await?;
+        tracing::info!(address = ?cfg.gubernator.address, "connected to Gubernator");
+        client
+    } else {
+        NullGubernatorClient::new()
+    };
+
+    let mut shard_factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
 
     // Start gRPC server and scheduled reaper together
     let addr: SocketAddr = cfg.server.grpc_addr.parse()?;

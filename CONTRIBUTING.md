@@ -1,15 +1,31 @@
 # silo development
 
-You can run silo locally to make requests to a test instance. Running locally requires a running `etcd` instance. You can run one with:
+## Nix + flakes
+
+Silo uses nix flakes to set up a local development environment. Ensure you have nix installed, with flakes support enabled, and `nix-direnv` in your profile. The flake will be automatically loaded by the `.envrc` file
+
+## Running background services
+
+You can run silo locally to make requests to a test instance. Running locally requires running `etcd` and `gubernator` in the background. You can run these with:
 
 ```shell
-just etcd
+dev
 ```
 
-Then you can run tests with:
+## Running tests
+
+After starting the background services, you can run tests with:
 
 ```shell
 cargo test
+```
+
+## Running a local instance
+
+You can run a local server instance by using cargo to build and run the `silo` binary:
+
+```shell
+cargo run --bin silo
 ```
 
 ### Perfetto traces for debugging

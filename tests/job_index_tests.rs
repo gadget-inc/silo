@@ -6,14 +6,14 @@ use silo::job::JobStatusKind;
 use silo::job_attempt::AttemptOutcome;
 use test_helpers::*;
 
-#[tokio::test]
+#[silo::test]
 async fn status_index_scheduled_then_running_then_succeeded() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
     let payload = serde_json::json!({"k":"v"});
 
     let job_id = shard
-        .enqueue("-", None, 10u8, now, None, payload, vec![])
+        .enqueue("-", None, 10u8, now, None, payload, vec![], None)
         .await
         .expect("enqueue");
 
@@ -48,7 +48,7 @@ async fn status_index_scheduled_then_running_then_succeeded() {
     assert!(succ.contains(&job_id));
 }
 
-#[tokio::test]
+#[silo::test]
 async fn status_index_failed_and_scheduled_then_order_newest_first() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -62,7 +62,7 @@ async fn status_index_failed_and_scheduled_then_order_newest_first() {
             now,
             None,
             serde_json::json!({"a":1}),
-            vec![],
+            vec![], None,
         )
         .await
         .expect("enq a");
@@ -101,7 +101,7 @@ async fn status_index_failed_and_scheduled_then_order_newest_first() {
             now,
             Some(policy),
             serde_json::json!({"b":2}),
-            vec![],
+            vec![], None,
         )
         .await
         .expect("enq b");
@@ -135,7 +135,7 @@ async fn status_index_failed_and_scheduled_then_order_newest_first() {
     assert!(scheduled.contains(&b));
 }
 
-#[tokio::test]
+#[silo::test]
 async fn retry_flow_running_to_scheduled_to_running_to_succeeded() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -154,7 +154,7 @@ async fn retry_flow_running_to_scheduled_to_running_to_succeeded() {
             now,
             Some(policy),
             serde_json::json!({"j":1}),
-            vec![],
+            vec![], None,
         )
         .await
         .expect("enqueue");
@@ -207,7 +207,7 @@ async fn retry_flow_running_to_scheduled_to_running_to_succeeded() {
     assert!(succ.contains(&job_id));
 }
 
-#[tokio::test]
+#[silo::test]
 async fn reaper_without_retries_marks_failed_in_index() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -220,7 +220,7 @@ async fn reaper_without_retries_marks_failed_in_index() {
             now,
             None,
             serde_json::json!({"x":1}),
-            vec![],
+            vec![], None,
         )
         .await
         .expect("enqueue");
@@ -272,7 +272,7 @@ async fn reaper_without_retries_marks_failed_in_index() {
     assert!(failed.contains(&job_id));
 }
 
-#[tokio::test]
+#[silo::test]
 async fn reaper_with_retries_moves_to_scheduled_in_index() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -291,7 +291,7 @@ async fn reaper_with_retries_moves_to_scheduled_in_index() {
             now,
             Some(policy),
             serde_json::json!({"y":2}),
-            vec![],
+            vec![], None,
         )
         .await
         .expect("enqueue");
@@ -342,7 +342,7 @@ async fn reaper_with_retries_moves_to_scheduled_in_index() {
     assert!(scheduled.contains(&job_id));
 }
 
-#[tokio::test]
+#[silo::test]
 async fn delete_removes_from_index() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -354,7 +354,7 @@ async fn delete_removes_from_index() {
             now,
             None,
             serde_json::json!({"z":3}),
-            vec![],
+            vec![], None,
         )
         .await
         .expect("enqueue");
@@ -382,7 +382,7 @@ async fn delete_removes_from_index() {
     assert!(!succ2.contains(&job_id));
 }
 
-#[tokio::test]
+#[silo::test]
 async fn cross_tenant_isolation_in_scans() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -394,7 +394,7 @@ async fn cross_tenant_isolation_in_scans() {
             now,
             None,
             serde_json::json!({"t":"A"}),
-            vec![],
+            vec![], None,
         )
         .await
         .unwrap();
@@ -406,7 +406,7 @@ async fn cross_tenant_isolation_in_scans() {
             now,
             None,
             serde_json::json!({"t":"B"}),
-            vec![],
+            vec![], None,
         )
         .await
         .unwrap();
@@ -419,7 +419,7 @@ async fn cross_tenant_isolation_in_scans() {
     assert_eq!(a_list.len(), 1);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn pagination_and_ordering_newest_first() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -433,7 +433,7 @@ async fn pagination_and_ordering_newest_first() {
                 now + i,
                 None,
                 serde_json::json!({"i": i}),
-                vec![],
+                vec![], None,
             )
             .await
             .unwrap();
@@ -455,7 +455,7 @@ async fn pagination_and_ordering_newest_first() {
     assert!(empty.is_empty());
 }
 
-#[tokio::test]
+#[silo::test]
 async fn future_enqueue_is_in_scheduled_scan() {
     let (_tmp, shard) = open_temp_shard().await;
     let future = now_ms() + 60_000;
@@ -467,7 +467,7 @@ async fn future_enqueue_is_in_scheduled_scan() {
             future,
             None,
             serde_json::json!({"f":1}),
-            vec![],
+            vec![], None,
         )
         .await
         .unwrap();
@@ -478,14 +478,14 @@ async fn future_enqueue_is_in_scheduled_scan() {
     assert!(scheduled.contains(&id));
 }
 
-#[tokio::test]
+#[silo::test]
 async fn metadata_index_basic_and_delete_cleanup() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
 
     // Enqueue three jobs with overlapping metadata
     let a = shard
-        .enqueue_with_metadata(
+        .enqueue(
             "-",
             None,
             10u8,
@@ -501,7 +501,7 @@ async fn metadata_index_basic_and_delete_cleanup() {
         .await
         .expect("enqueue a");
     let b = shard
-        .enqueue_with_metadata(
+        .enqueue(
             "-",
             None,
             10u8,
@@ -514,7 +514,7 @@ async fn metadata_index_basic_and_delete_cleanup() {
         .await
         .expect("enqueue b");
     let c = shard
-        .enqueue_with_metadata(
+        .enqueue(
             "-",
             None,
             10u8,
@@ -569,13 +569,13 @@ async fn metadata_index_basic_and_delete_cleanup() {
     assert_eq!(kv2, vec![b]);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn metadata_scan_cross_tenant_isolation() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
 
     let a = shard
-        .enqueue_with_metadata(
+        .enqueue(
             "tenantA",
             None,
             10u8,
@@ -588,7 +588,7 @@ async fn metadata_scan_cross_tenant_isolation() {
         .await
         .unwrap();
     let _b = shard
-        .enqueue_with_metadata(
+        .enqueue(
             "tenantB",
             None,
             10u8,
@@ -611,14 +611,14 @@ async fn metadata_scan_cross_tenant_isolation() {
     assert_eq!(list_a.len(), 1);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn metadata_scan_limit_zero_returns_empty() {
     let (_tmp, shard) = open_temp_shard().await;
     let empty = shard.scan_jobs_by_metadata("-", "k", "v", 0).await.unwrap();
     assert!(empty.is_empty());
 }
 
-#[tokio::test]
+#[silo::test]
 async fn scan_jobs_unfiltered_basic_and_ordering() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -633,7 +633,7 @@ async fn scan_jobs_unfiltered_basic_and_ordering() {
                 now,
                 None,
                 serde_json::json!({}),
-                vec![],
+                vec![], None,
             )
             .await
             .expect("enqueue");
@@ -660,7 +660,7 @@ async fn scan_jobs_unfiltered_basic_and_ordering() {
     );
 }
 
-#[tokio::test]
+#[silo::test]
 async fn scan_jobs_is_tenant_isolated_and_limit_zero_empty() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -673,7 +673,7 @@ async fn scan_jobs_is_tenant_isolated_and_limit_zero_empty() {
             now,
             None,
             serde_json::json!({}),
-            vec![],
+            vec![], None,
         )
         .await
         .unwrap();
@@ -685,7 +685,7 @@ async fn scan_jobs_is_tenant_isolated_and_limit_zero_empty() {
             now,
             None,
             serde_json::json!({}),
-            vec![],
+            vec![], None,
         )
         .await
         .unwrap();

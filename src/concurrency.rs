@@ -7,8 +7,8 @@ use crate::codec::{
     decode_concurrency_action, encode_concurrency_action, encode_holder, encode_task,
 };
 use crate::job::{ConcurrencyLimit, JobView};
-use crate::job_store_shard::{HolderRecord, Task};
 use crate::keys::{concurrency_holder_key, concurrency_request_key, task_key};
+use crate::task::{ConcurrencyAction, HolderRecord, Task};
 
 #[derive(Debug, Clone)]
 pub enum MemoryEvent {
@@ -339,7 +339,7 @@ fn append_request_edits(
     job_id: &str,
     attempt_number: u32,
 ) -> Result<(), String> {
-    let action = crate::job_store_shard::ConcurrencyAction::EnqueueTask {
+    let action = ConcurrencyAction::EnqueueTask {
         start_time_ms,
         priority,
         job_id: job_id.to_string(),
@@ -382,8 +382,7 @@ async fn append_release_and_grant_next(
             .await
             .map_err(|e| e.to_string())?;
         if let Some(kv) = iter.next().await.map_err(|e| e.to_string())? {
-            type ArchivedAction =
-                <crate::job_store_shard::ConcurrencyAction as rkyv::Archive>::Archived;
+            type ArchivedAction = <ConcurrencyAction as rkyv::Archive>::Archived;
             let decoded = decode_concurrency_action(&kv.value)?;
             let a: &ArchivedAction = decoded.archived();
             match a {

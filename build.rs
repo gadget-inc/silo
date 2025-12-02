@@ -1,17 +1,27 @@
 fn main() {
     let protoc = protoc_bin_vendored::protoc_bin_path().expect("protoc not found");
     std::env::set_var("PROTOC", protoc);
-    let proto_files = &["proto/silo.proto"];
     let includes = &["proto"];
 
+    // Compile silo.proto
     tonic_build::configure()
         .build_client(true)
         .build_server(true)
-        // Let prost/tonic write into OUT_DIR per best practice
         .type_attribute(
             ".silo.v1.RetryPolicy",
             "#[derive(serde::Serialize, serde::Deserialize)]",
         )
-        .compile_protos(proto_files, includes)
-        .expect("failed to compile protos");
+        .type_attribute(
+            ".silo.v1.RateLimitRetryPolicy",
+            "#[derive(serde::Serialize, serde::Deserialize)]",
+        )
+        .compile_protos(&["proto/silo.proto"], includes)
+        .expect("failed to compile silo.proto");
+
+    // Compile gubernator.proto for the rate limit client
+    tonic_build::configure()
+        .build_client(true)
+        .build_server(false) // We only need the client for gubernator
+        .compile_protos(&["proto/gubernator.proto"], includes)
+        .expect("failed to compile gubernator.proto");
 }

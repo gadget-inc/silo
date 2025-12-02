@@ -6,10 +6,11 @@ use core::future::Future;
 use hyper::Uri;
 use hyper_util::rt::TokioIo;
 use silo::factory::ShardFactory;
+use silo::gubernator::MockGubernatorClient;
 use silo::pb::silo_client::SiloClient;
 use silo::pb::*;
 use silo::server::run_grpc_with_reaper_incoming;
-use silo::settings::{AppConfig, Backend};
+use silo::settings::{AppConfig, Backend, GubernatorSettings};
 use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tonic::transport::Endpoint;
@@ -48,13 +49,15 @@ fn grpc_end_to_end_under_turmoil() {
             },
             coordination: silo::settings::CoordinationConfig::default(),
             tenancy: silo::settings::TenancyConfig { enabled: false },
+            gubernator: GubernatorSettings::default(),
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
             },
         };
 
-        let mut factory = ShardFactory::new(cfg.database.clone());
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let mut factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
         let _ = factory.open(0).await.unwrap();
         let factory = Arc::new(factory);
 
@@ -131,7 +134,7 @@ fn grpc_end_to_end_under_turmoil() {
             payload: Some(JsonValueBytes {
                 data: serde_json::to_vec(&serde_json::json!({"hello": "world"})).unwrap(),
             }),
-            concurrency_limits: vec![],
+            limits: vec![],
             tenant: None,
             metadata: std::collections::HashMap::new(),
         };
@@ -197,13 +200,15 @@ fn grpc_fault_injection_with_partition() {
             },
             coordination: silo::settings::CoordinationConfig::default(),
             tenancy: silo::settings::TenancyConfig { enabled: false },
+            gubernator: GubernatorSettings::default(),
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
             },
         };
 
-        let mut factory = ShardFactory::new(cfg.database.clone());
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let mut factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
         let _ = factory.open(0).await.unwrap();
         let factory = Arc::new(factory);
 
@@ -283,7 +288,7 @@ fn grpc_fault_injection_with_partition() {
             payload: Some(JsonValueBytes {
                 data: serde_json::to_vec(&serde_json::json!({"hello": "faults"})).unwrap(),
             }),
-            concurrency_limits: vec![],
+            limits: vec![],
             tenant: None,
             metadata: std::collections::HashMap::new(),
         };
@@ -388,13 +393,15 @@ fn stress_multiple_workers_with_partitions() {
             },
             coordination: silo::settings::CoordinationConfig::default(),
             tenancy: silo::settings::TenancyConfig { enabled: false },
+            gubernator: GubernatorSettings::default(),
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
             },
         };
 
-        let mut factory = ShardFactory::new(cfg.database.clone());
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let mut factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
         let _ = factory.open(0).await.unwrap();
         let factory = Arc::new(factory);
 
@@ -487,7 +494,7 @@ fn stress_multiple_workers_with_partitions() {
                 payload: Some(JsonValueBytes {
                     data: serde_json::to_vec(&serde_json::json!({"job": i})).unwrap(),
                 }),
-                concurrency_limits: vec![],
+                limits: vec![],
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
             };
@@ -658,13 +665,15 @@ fn stress_duplicate_completion_idempotency() {
             },
             coordination: silo::settings::CoordinationConfig::default(),
             tenancy: silo::settings::TenancyConfig { enabled: false },
+            gubernator: GubernatorSettings::default(),
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
             },
         };
 
-        let mut factory = ShardFactory::new(cfg.database.clone());
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let mut factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
         let _ = factory.open(0).await.unwrap();
         let factory = Arc::new(factory);
 
@@ -744,7 +753,7 @@ fn stress_duplicate_completion_idempotency() {
                 payload: Some(JsonValueBytes {
                     data: b"test".to_vec(),
                 }),
-                concurrency_limits: vec![],
+                limits: vec![],
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
             }))
@@ -838,13 +847,15 @@ fn stress_lease_expiry_during_partition() {
             },
             coordination: silo::settings::CoordinationConfig::default(),
             tenancy: silo::settings::TenancyConfig { enabled: false },
+            gubernator: GubernatorSettings::default(),
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
             },
         };
 
-        let mut factory = ShardFactory::new(cfg.database.clone());
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let mut factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
         let _ = factory.open(0).await.unwrap();
         let factory = Arc::new(factory);
 
@@ -924,7 +935,7 @@ fn stress_lease_expiry_during_partition() {
                 payload: Some(JsonValueBytes {
                     data: b"test".to_vec(),
                 }),
-                concurrency_limits: vec![],
+                limits: vec![],
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
             }))
@@ -1036,13 +1047,15 @@ fn stress_high_message_loss() {
             },
             coordination: silo::settings::CoordinationConfig::default(),
             tenancy: silo::settings::TenancyConfig { enabled: false },
+            gubernator: GubernatorSettings::default(),
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
             },
         };
 
-        let mut factory = ShardFactory::new(cfg.database.clone());
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let mut factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
         let _ = factory.open(0).await.unwrap();
         let factory = Arc::new(factory);
 
@@ -1123,7 +1136,7 @@ fn stress_high_message_loss() {
                 payload: Some(JsonValueBytes {
                     data: serde_json::to_vec(&serde_json::json!({"id": i})).unwrap(),
                 }),
-                concurrency_limits: vec![],
+                limits: vec![],
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
             };
@@ -1242,12 +1255,14 @@ fn concurrency_request_ready_without_release_fails() {
             },
             coordination: silo::settings::CoordinationConfig::default(),
             tenancy: silo::settings::TenancyConfig { enabled: false },
+            gubernator: GubernatorSettings::default(),
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
             },
         };
-        let mut factory = ShardFactory::new(cfg.database.clone());
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let mut factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
         let _ = factory.open(0).await.unwrap();
         let factory = Arc::new(factory);
         let addr = (IpAddr::from(Ipv4Addr::UNSPECIFIED), 9996);
@@ -1279,9 +1294,11 @@ fn concurrency_request_ready_without_release_fails() {
         let mut client = SiloClient::new(ch);
 
         // Enqueue job1 with concurrency limit X, start now
-        let conc = vec![ConcurrencyLimit {
-            key: "X".to_string(),
-            max_concurrency: 1,
+        let conc = vec![Limit {
+            limit: Some(limit::Limit::Concurrency(ConcurrencyLimit {
+                key: "X".to_string(),
+                max_concurrency: 1,
+            })),
         }];
         let _j1 = client
             .enqueue(tonic::Request::new(EnqueueRequest {
@@ -1293,7 +1310,7 @@ fn concurrency_request_ready_without_release_fails() {
                 payload: Some(JsonValueBytes {
                     data: b"p".to_vec(),
                 }),
-                concurrency_limits: conc,
+                limits: conc,
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
             }))
@@ -1317,9 +1334,11 @@ fn concurrency_request_ready_without_release_fails() {
         // Use current time + relative offset to ensure it's in the past by the time we poll
         // Since we can't rely on turmoil's simulated time with SystemTime, we enqueue with
         // a timestamp that will be "past" after a real-time delay
-        let conc2 = vec![ConcurrencyLimit {
-            key: "X".to_string(),
-            max_concurrency: 1,
+        let conc2 = vec![Limit {
+            limit: Some(limit::Limit::Concurrency(ConcurrencyLimit {
+                key: "X".to_string(),
+                max_concurrency: 1,
+            })),
         }];
         let _j2 = client
             .enqueue(tonic::Request::new(EnqueueRequest {
@@ -1331,7 +1350,7 @@ fn concurrency_request_ready_without_release_fails() {
                 payload: Some(JsonValueBytes {
                     data: b"p2".to_vec(),
                 }),
-                concurrency_limits: conc2,
+                limits: conc2,
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
             }))

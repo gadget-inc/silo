@@ -1,0 +1,35 @@
+version: "0.5"
+
+processes:
+  etcd:
+    command: |
+      etcd \
+        --name silo-dev \
+        --data-dir ./tmp/etcd-data \
+        --listen-client-urls http://127.0.0.1:2379 \
+        --advertise-client-urls http://127.0.0.1:2379 \
+        --listen-peer-urls http://127.0.0.1:2380 \
+        --initial-advertise-peer-urls http://127.0.0.1:2380 \
+        --initial-cluster silo-dev=http://127.0.0.1:2380 \
+        --initial-cluster-token silo-dev-token \
+        --initial-cluster-state new
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        port: 2379
+        path: /health
+      initial_delay_seconds: 1
+      period_seconds: 2
+
+  gubernator:
+    command: gubernator
+    environment:
+      - GUBER_GRPC_ADDRESS=localhost:9991
+      - GUBER_HTTP_ADDRESS=0.0.0.0:9981
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        port: 9981
+        path: /v1/HealthCheck
+      initial_delay_seconds: 1
+      period_seconds: 2

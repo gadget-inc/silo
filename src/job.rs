@@ -16,6 +16,108 @@ pub struct ConcurrencyLimit {
     pub max_concurrency: u32,
 }
 
+/// Rate limiting algorithm used by Gubernator
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, RkyvSerialize, RkyvDeserialize)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
+pub enum GubernatorAlgorithm {
+    TokenBucket,
+    LeakyBucket,
+}
+
+impl Default for GubernatorAlgorithm {
+    fn default() -> Self {
+        Self::TokenBucket
+    }
+}
+
+impl GubernatorAlgorithm {
+    pub fn as_u8(&self) -> u8 {
+        match self {
+            Self::TokenBucket => 0,
+            Self::LeakyBucket => 1,
+        }
+    }
+}
+
+/// Retry policy for rate limit checks when the limit is exceeded
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+#[archive(check_bytes)]
+pub struct RateLimitRetryPolicy {
+    /// Initial backoff time when rate limited (ms)
+    pub initial_backoff_ms: i64,
+    /// Maximum backoff time (ms)
+    pub max_backoff_ms: i64,
+    /// Multiplier for exponential backoff (default 2.0)
+    pub backoff_multiplier: f64,
+    /// Maximum number of retries (0 = retry until reset_time)
+    pub max_retries: u32,
+}
+
+impl Default for RateLimitRetryPolicy {
+    fn default() -> Self {
+        Self {
+            initial_backoff_ms: 100,
+            max_backoff_ms: 30_000,
+            backoff_multiplier: 2.0,
+            max_retries: 0, // Infinite retries until reset_time by default
+        }
+    }
+}
+
+/// Gubernator-based rate limit declaration
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+#[archive(check_bytes)]
+pub struct GubernatorRateLimit {
+    /// Name identifying this rate limit (for debugging/metrics)
+    pub name: String,
+    /// Unique key for this specific rate limit instance
+    pub unique_key: String,
+    /// Maximum requests allowed in the duration
+    pub limit: i64,
+    /// Duration window in milliseconds
+    pub duration_ms: i64,
+    /// Number of hits to consume (usually 1)
+    pub hits: i32,
+    /// Rate limiting algorithm
+    pub algorithm: GubernatorAlgorithm,
+    /// Behavior flags (bitwise OR of GubernatorBehavior values)
+    pub behavior: i32,
+    /// How to retry when rate limited
+    pub retry_policy: RateLimitRetryPolicy,
+}
+
+impl GubernatorRateLimit {
+    /// Create a new rate limit with default settings
+    pub fn new(
+        name: impl Into<String>,
+        unique_key: impl Into<String>,
+        limit: i64,
+        duration_ms: i64,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            unique_key: unique_key.into(),
+            limit,
+            duration_ms,
+            hits: 1,
+            algorithm: GubernatorAlgorithm::default(),
+            behavior: 0, // BATCHING (default)
+            retry_policy: RateLimitRetryPolicy::default(),
+        }
+    }
+}
+
+/// A unified limit type that can be either a concurrency limit or a rate limit
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+#[archive(check_bytes)]
+pub enum Limit {
+    /// A concurrency-based limit (slot-based)
+    Concurrency(ConcurrencyLimit),
+    /// A rate-based limit (checked via Gubernator)
+    RateLimit(GubernatorRateLimit),
+}
+
 /// Discriminant for job status kinds
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize, PartialEq, Eq, Copy)]
 #[archive(check_bytes)]
@@ -25,6 +127,19 @@ pub enum JobStatusKind {
     Failed,
     Cancelled,
     Succeeded,
+}
+
+impl JobStatusKind {
+    /// Return the string name of this status kind for indexing
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Scheduled => "Scheduled",
+            Self::Running => "Running",
+            Self::Failed => "Failed",
+            Self::Cancelled => "Cancelled",
+            Self::Succeeded => "Succeeded",
+        }
+    }
 }
 
 /// Job status with the last change time for secondary indexing
@@ -95,8 +210,8 @@ pub struct JobInfo {
     pub enqueue_time_ms: i64, // epoch millis
     pub payload: Vec<u8>,     // JSON bytes for now (opaque to rkyv)
     pub retry_policy: Option<RetryPolicy>,
-    pub concurrency_limits: Vec<ConcurrencyLimit>,
     pub metadata: Vec<(String, String)>,
+    pub limits: Vec<Limit>, // Ordered list of limits to check before execution
 }
 
 impl JobView {
@@ -142,17 +257,15 @@ impl JobView {
         })
     }
 
-    /// Return declared concurrency limits as owned runtime structs by copying fields
+    /// Return declared concurrency limits extracted from the limits field
     pub fn concurrency_limits(&self) -> Vec<ConcurrencyLimit> {
-        let a = self.archived();
-        let mut out = Vec::with_capacity(a.concurrency_limits.len());
-        for lim in a.concurrency_limits.iter() {
-            out.push(ConcurrencyLimit {
-                key: lim.key.as_str().to_string(),
-                max_concurrency: lim.max_concurrency,
-            });
-        }
-        out
+        self.limits()
+            .into_iter()
+            .filter_map(|l| match l {
+                Limit::Concurrency(c) => Some(c),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Return metadata as owned key/value string pairs
@@ -162,6 +275,48 @@ impl JobView {
         for pair in a.metadata.iter() {
             let (k, v) = pair;
             out.push((k.as_str().to_string(), v.as_str().to_string()));
+        }
+        out
+    }
+
+    /// Return the ordered list of limits (both concurrency and rate limits)
+    pub fn limits(&self) -> Vec<Limit> {
+        let a = self.archived();
+        let mut out = Vec::with_capacity(a.limits.len());
+        for lim in a.limits.iter() {
+            match lim {
+                ArchivedLimit::Concurrency(c) => {
+                    out.push(Limit::Concurrency(ConcurrencyLimit {
+                        key: c.key.as_str().to_string(),
+                        max_concurrency: c.max_concurrency,
+                    }));
+                }
+                ArchivedLimit::RateLimit(r) => {
+                    let algorithm = match &r.algorithm {
+                        ArchivedGubernatorAlgorithm::TokenBucket => {
+                            GubernatorAlgorithm::TokenBucket
+                        }
+                        ArchivedGubernatorAlgorithm::LeakyBucket => {
+                            GubernatorAlgorithm::LeakyBucket
+                        }
+                    };
+                    out.push(Limit::RateLimit(GubernatorRateLimit {
+                        name: r.name.as_str().to_string(),
+                        unique_key: r.unique_key.as_str().to_string(),
+                        limit: r.limit,
+                        duration_ms: r.duration_ms,
+                        hits: r.hits,
+                        algorithm,
+                        behavior: r.behavior,
+                        retry_policy: RateLimitRetryPolicy {
+                            initial_backoff_ms: r.retry_policy.initial_backoff_ms,
+                            max_backoff_ms: r.retry_policy.max_backoff_ms,
+                            backoff_multiplier: r.retry_policy.backoff_multiplier,
+                            max_retries: r.retry_policy.max_retries,
+                        },
+                    }));
+                }
+            }
         }
         out
     }

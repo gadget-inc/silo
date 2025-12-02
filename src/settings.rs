@@ -10,7 +10,45 @@ pub struct AppConfig {
     pub coordination: CoordinationConfig,
     #[serde(default)]
     pub tenancy: TenancyConfig,
+    #[serde(default)]
+    pub gubernator: GubernatorSettings,
     pub database: DatabaseTemplate,
+}
+
+/// Settings for Gubernator rate limiting service
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct GubernatorSettings {
+    /// Gubernator server address (e.g., "http://localhost:1051")
+    /// If not set, rate limiting will be disabled and rate limit tasks will fail.
+    pub address: Option<String>,
+    /// Maximum time to wait for coalescing before sending a batch (default: 5ms)
+    #[serde(default = "default_coalesce_interval_ms")]
+    pub coalesce_interval_ms: u64,
+    /// Maximum number of requests to batch together (default: 100)
+    #[serde(default = "default_max_batch_size")]
+    pub max_batch_size: usize,
+    /// Connection timeout in milliseconds (default: 5000ms)
+    #[serde(default = "default_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+    /// Request timeout in milliseconds (default: 10000ms)
+    #[serde(default = "default_request_timeout_ms")]
+    pub request_timeout_ms: u64,
+}
+
+fn default_coalesce_interval_ms() -> u64 {
+    5
+}
+
+fn default_max_batch_size() -> usize {
+    100
+}
+
+fn default_connect_timeout_ms() -> u64 {
+    5000
+}
+
+fn default_request_timeout_ms() -> u64 {
+    10000
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -84,6 +122,7 @@ impl AppConfig {
                 etcd_endpoints: default_etcd_endpoints(),
             },
             tenancy: TenancyConfig { enabled: false },
+            gubernator: GubernatorSettings::default(),
             database: DatabaseTemplate {
                 backend: Backend::Fs,
                 path: "/tmp/silo-%shard%".to_string(),
@@ -98,5 +137,18 @@ impl AppConfig {
             }
             None => Ok(default),
         }
+    }
+}
+
+impl GubernatorSettings {
+    /// Convert settings to a GubernatorConfig if an address is configured
+    pub fn to_config(&self) -> Option<crate::gubernator::GubernatorConfig> {
+        self.address.as_ref().map(|addr| crate::gubernator::GubernatorConfig {
+            address: addr.clone(),
+            coalesce_interval_ms: self.coalesce_interval_ms,
+            max_batch_size: self.max_batch_size,
+            connect_timeout_ms: self.connect_timeout_ms,
+            request_timeout_ms: self.request_timeout_ms,
+        })
     }
 }

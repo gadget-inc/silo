@@ -21,6 +21,50 @@ message ConcurrencyLimit {
   uint32 max_concurrency = 2; // maximum concurrent running jobs for this key
 }
 
+// Gubernator rate limiting algorithm
+enum GubernatorAlgorithm {
+  GUBERNATOR_ALGORITHM_TOKEN_BUCKET = 0;  // Token bucket algorithm
+  GUBERNATOR_ALGORITHM_LEAKY_BUCKET = 1;  // Leaky bucket algorithm
+}
+
+// Gubernator behavior flags (can be combined via bitwise OR)
+enum GubernatorBehavior {
+  GUBERNATOR_BEHAVIOR_BATCHING = 0;           // Default: batch requests to peers
+  GUBERNATOR_BEHAVIOR_NO_BATCHING = 1;        // Disable batching
+  GUBERNATOR_BEHAVIOR_GLOBAL = 2;             // Global rate limit across all peers
+  GUBERNATOR_BEHAVIOR_DURATION_IS_GREGORIAN = 4; // Duration resets on calendar boundaries
+  GUBERNATOR_BEHAVIOR_RESET_REMAINING = 8;    // Reset the rate limit on this request
+  GUBERNATOR_BEHAVIOR_DRAIN_OVER_LIMIT = 16;  // Drain remaining counter on over limit
+}
+
+// Retry policy specifically for rate limit check retries (when rate limit is exceeded)
+message RateLimitRetryPolicy {
+  int64 initial_backoff_ms = 1;  // Initial backoff time when rate limited
+  int64 max_backoff_ms = 2;      // Maximum backoff time
+  double backoff_multiplier = 3; // Multiplier for exponential backoff (default 2.0)
+  uint32 max_retries = 4;        // Maximum number of retries (0 = infinite until reset_time)
+}
+
+// Gubernator-based rate limit declaration
+message GubernatorRateLimit {
+  string name = 1;              // Name identifying this rate limit (for debugging/metrics)
+  string unique_key = 2;        // Unique key for this specific rate limit instance
+  int64 limit = 3;              // Maximum requests allowed in the duration
+  int64 duration_ms = 4;        // Duration window in milliseconds
+  int32 hits = 5;               // Number of hits to consume (usually 1)
+  GubernatorAlgorithm algorithm = 6;  // Rate limiting algorithm
+  int32 behavior = 7;           // Behavior flags (bitwise OR of GubernatorBehavior)
+  RateLimitRetryPolicy retry_policy = 8; // How to retry when rate limited
+}
+
+// A single limit that can be either a concurrency limit or a rate limit
+message Limit {
+  oneof limit {
+    ConcurrencyLimit concurrency = 1;
+    GubernatorRateLimit rate_limit = 2;
+  }
+}
+
 message EnqueueRequest {
   string shard = 1; // shard name
   string id = 2; // optional
@@ -28,7 +72,7 @@ message EnqueueRequest {
   int64 start_at_ms = 4; // epoch ms
   optional RetryPolicy retry_policy = 5; // optional
   JsonValueBytes payload = 6; // JSON
-  repeated ConcurrencyLimit concurrency_limits = 7; // zero or more limits
+  repeated Limit limits = 7; // ordered list of limits to check before execution
   optional string tenant = 8; // optional tenant id when tenancy is enabled
   map<string, string> metadata = 9; // arbitrary key/value metadata stored with the job
 }
@@ -44,7 +88,7 @@ message GetJobResponse {
   int64 enqueue_time_ms = 3;
   JsonValueBytes payload = 4;
   optional RetryPolicy retry_policy = 5; // presence indicates some policy
-  repeated ConcurrencyLimit concurrency_limits = 6; // declared limits
+  repeated Limit limits = 6; // declared limits
   map<string, string> metadata = 7; // arbitrary key/value metadata stored with the job
 }
 

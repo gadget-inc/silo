@@ -14,7 +14,7 @@ One attempt to run a unit of work
 
 ### Task
 
-One item that a worker needs to pickup and action to move the system forward. Is usually running an attempt, but there may be other task types in the future.
+One item that we need to dequeue and run. Usually, its a task for a worker to run an attempt, but there are other task types that represent internal operations that should happen after a point in time in the future. Most tasks need to be processed by the external worker that is polling Silo for what to do next, but some tasks are handled purely internally.
 
 ### Task lease
 
@@ -116,3 +116,7 @@ Key layout (control plane):
 
 - `coord/members/<node_id>` → ephemeral; node metadata
 - `coord/shards/<shard_id>/owner` → ephemeral; ownership record
+
+### Gubernator rate limiting
+
+Incoming jobs may specify that they need to pass a Gubernator rate limit to proceed. For each attempt, Silo will make RPCs to Gubernator to check these rate limits before allowing the attempt to run. This is done by enqueuing and running a task that polls the rate limit in Gubernator. If the rate limit passes, we enqueue the actual task to run the attempt, and if it doesn't, we re-enqueue a task for the future to poll the rate limit again.

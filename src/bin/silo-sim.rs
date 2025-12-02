@@ -7,7 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use silo::coordination::{Coordination, Coordinator};
-use silo::job::ConcurrencyLimit;
+use silo::gubernator::MockGubernatorClient;
+use silo::job::{ConcurrencyLimit, Limit};
 use silo::job_attempt::AttemptOutcome;
 use silo::job_store_shard::JobStoreShard;
 use silo::settings::{AppConfig, Backend, DatabaseConfig};
@@ -79,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
     let (c2, h2) = Coordinator::start(&coord, &prefix, "node-b", num_shards, 10).await?;
 
     let tmpdir = tempfile::tempdir()?;
+    let rate_limiter = MockGubernatorClient::new_arc();
     let mut shards: Vec<Arc<JobStoreShard>> = Vec::new();
     for s in 0..num_shards as usize {
         let cfg = DatabaseConfig {
@@ -91,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
                 .to_string(),
             flush_interval_ms: Some(10), // Fast flushes for simulation
         };
-        let shard = JobStoreShard::open(&cfg).await?;
+        let shard = JobStoreShard::open_with_rate_limiter(&cfg, rate_limiter.clone()).await?;
         shards.push(shard);
     }
 
@@ -137,10 +139,11 @@ async fn main() -> anyhow::Result<()> {
                         now_ms().await,
                         None,
                         payload,
-                        vec![ConcurrencyLimit {
+                        vec![Limit::Concurrency(ConcurrencyLimit {
                             key: q_name.clone(),
                             max_concurrency: *q_limit,
-                        }],
+                        })],
+                        None,
                     )
                     .await;
                 i = i.wrapping_add(1);

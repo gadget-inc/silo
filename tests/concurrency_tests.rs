@@ -2,6 +2,7 @@ mod test_helpers;
 
 use rkyv::Archive;
 use silo::codec::{decode_lease, decode_task, encode_lease};
+use silo::job::{ConcurrencyLimit, Limit};
 use silo::job_attempt::{AttemptOutcome, AttemptStatus};
 use silo::job_store_shard::{LeaseRecord, Task};
 use silo::keys::concurrency_holder_key;
@@ -9,7 +10,7 @@ use silo::retry::RetryPolicy;
 
 use test_helpers::*;
 
-#[tokio::test]
+#[silo::test]
 async fn concurrency_immediate_grant_enqueues_task_and_writes_holder() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -24,10 +25,7 @@ async fn concurrency_immediate_grant_enqueues_task_and_writes_holder() {
             now,
             None,
             payload,
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue");
@@ -50,7 +48,7 @@ async fn concurrency_immediate_grant_enqueues_task_and_writes_holder() {
     );
 }
 
-#[tokio::test]
+#[silo::test]
 async fn concurrency_queues_when_full_and_grants_on_release() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -65,10 +63,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
             now,
             None,
             serde_json::json!({"j": 1}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue1");
@@ -85,10 +80,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
             now,
             None,
             serde_json::json!({"j": 2}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue2");
@@ -101,6 +93,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
                 panic!("unexpected RunAttempt while holder is occupied")
             }
             Task::RequestTicket { .. } => {}
+            Task::CheckRateLimit { .. } => {}
         }
     }
 
@@ -115,7 +108,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
     assert!(some.is_some(), "task should be enqueued for next requester");
 }
 
-#[tokio::test]
+#[silo::test]
 async fn concurrency_held_queues_propagate_across_retries_and_release_on_finish() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -135,10 +128,7 @@ async fn concurrency_held_queues_propagate_across_retries_and_release_on_finish(
                 backoff_factor: 1.0,
             }),
             serde_json::json!({"j": 3}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue");
@@ -177,7 +167,7 @@ async fn concurrency_held_queues_propagate_across_retries_and_release_on_finish(
     assert_eq!(count_with_prefix(shard.db(), "holders/").await, 0);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn concurrency_tickets_are_tenant_scoped() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -192,10 +182,7 @@ async fn concurrency_tickets_are_tenant_scoped() {
             now,
             None,
             serde_json::json!({"t": "A"}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue A");
@@ -211,10 +198,7 @@ async fn concurrency_tickets_are_tenant_scoped() {
             now,
             None,
             serde_json::json!({"t": "B"}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue B");
@@ -226,7 +210,7 @@ async fn concurrency_tickets_are_tenant_scoped() {
     );
 }
 
-#[tokio::test]
+#[silo::test]
 async fn concurrency_retry_releases_original_holder() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -247,10 +231,7 @@ async fn concurrency_retry_releases_original_holder() {
                 backoff_factor: 1.0,
             }),
             serde_json::json!({"j": 33}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue");
@@ -290,7 +271,7 @@ async fn concurrency_retry_releases_original_holder() {
     );
 }
 
-#[tokio::test]
+#[silo::test]
 async fn concurrency_no_overgrant_after_release() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -305,10 +286,7 @@ async fn concurrency_no_overgrant_after_release() {
             now,
             None,
             serde_json::json!({"a": true}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue a");
@@ -325,10 +303,7 @@ async fn concurrency_no_overgrant_after_release() {
             now,
             None,
             serde_json::json!({"b": true}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue b");
@@ -349,10 +324,7 @@ async fn concurrency_no_overgrant_after_release() {
             now,
             None,
             serde_json::json!({"c": true}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue c");
@@ -366,7 +338,7 @@ async fn concurrency_no_overgrant_after_release() {
     );
 }
 
-#[tokio::test]
+#[silo::test]
 async fn stress_single_queue_no_double_grant() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -383,10 +355,7 @@ async fn stress_single_queue_no_double_grant() {
                 now,
                 None,
                 serde_json::json!({"i": i}),
-                vec![silo::job::ConcurrencyLimit {
-                    key: queue.clone(),
-                    max_concurrency: 1,
-                }],
+                vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
             )
             .await
             .expect("enqueue");
@@ -418,7 +387,7 @@ async fn stress_single_queue_no_double_grant() {
     assert_eq!(count_with_prefix(shard.db(), "requests/").await, 0);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -433,10 +402,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
             now,
             None,
             serde_json::json!({"first": true}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue1");
@@ -455,10 +421,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
                 now,
                 None,
                 serde_json::json!({"i": i}),
-                vec![silo::job::ConcurrencyLimit {
-                    key: queue.clone(),
-                    max_concurrency: 1,
-                }],
+                vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
             )
             .await
             .expect("enqueue add");
@@ -469,6 +432,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
         match task {
             Task::RunAttempt { .. } => panic!("unexpected RunAttempt before release"),
             Task::RequestTicket { .. } => {}
+            Task::CheckRateLimit { .. } => {}
         }
     }
 
@@ -481,7 +445,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
     assert!(after.is_some(), "one task should be enqueued after release");
 }
 
-#[tokio::test]
+#[silo::test]
 async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
     let (_tmp, shard) = open_temp_shard().await;
 
@@ -495,7 +459,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         backoff_factor: 1.0,
     };
     let job_id = shard
-        .enqueue("-", None, 10u8, now, Some(policy), payload, vec![])
+        .enqueue("-", None, 10u8, now, Some(policy), payload, vec![], None)
         .await
         .expect("enqueue");
 
@@ -522,6 +486,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
             held_queues: Vec::new(),
         },
         ArchivedTask::RequestTicket { .. } => panic!("unexpected RequestTicket in lease"),
+        ArchivedTask::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in lease"),
     };
     let expired_ms = now_ms() - 1;
     let new_record = LeaseRecord {
@@ -571,18 +536,21 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         Task::RequestTicket { .. } => {
             panic!("unexpected RequestTicket in tasks/ for this test")
         }
+        Task::CheckRateLimit { .. } => {
+            panic!("unexpected CheckRateLimit in tasks/ for this test")
+        }
     };
     assert_eq!(attempt2, 2);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn reap_ignores_unexpired_leases() {
     let (_tmp, shard) = open_temp_shard().await;
 
     let payload = serde_json::json!({"k": "v"});
     let now = now_ms();
     let job_id = shard
-        .enqueue("-", None, 10u8, now, None, payload, vec![])
+        .enqueue("-", None, 10u8, now, None, payload, vec![], None)
         .await
         .expect("enqueue");
 
@@ -617,7 +585,7 @@ async fn reap_ignores_unexpired_leases() {
     }
 }
 
-#[tokio::test]
+#[silo::test]
 async fn concurrency_multiple_holders_max_greater_than_one() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -634,10 +602,7 @@ async fn concurrency_multiple_holders_max_greater_than_one() {
                 now,
                 None,
                 serde_json::json!({"i": i}),
-                vec![silo::job::ConcurrencyLimit {
-                    key: queue.clone(),
-                    max_concurrency: 3,
-                }],
+                vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 3 })], None,
             )
             .await
             .expect("enqueue");
@@ -705,7 +670,7 @@ async fn concurrency_multiple_holders_max_greater_than_one() {
     assert_eq!(count_with_prefix(shard.db(), "requests/").await, 0);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn concurrency_multiple_queues_per_job() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -722,15 +687,10 @@ async fn concurrency_multiple_queues_per_job() {
             None,
             serde_json::json!({"task": "needs both"}),
             vec![
-                silo::job::ConcurrencyLimit {
-                    key: q1.clone(),
-                    max_concurrency: 2,
-                },
-                silo::job::ConcurrencyLimit {
-                    key: q2.clone(),
-                    max_concurrency: 2,
-                },
+                Limit::Concurrency(ConcurrencyLimit { key: q1.clone(), max_concurrency: 2 }),
+                Limit::Concurrency(ConcurrencyLimit { key: q2.clone(), max_concurrency: 2 }),
             ],
+            None,
         )
         .await
         .expect("enqueue");
@@ -773,7 +733,7 @@ async fn concurrency_multiple_queues_per_job() {
     assert_eq!(count_with_prefix(shard.db(), "holders/").await, 0);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn concurrency_future_request_waits_until_ready() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -789,10 +749,7 @@ async fn concurrency_future_request_waits_until_ready() {
             now,
             None,
             serde_json::json!({"j": 1}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue1");
@@ -808,10 +765,7 @@ async fn concurrency_future_request_waits_until_ready() {
             future,
             None,
             serde_json::json!({"j": 2}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue2");
@@ -849,7 +803,7 @@ async fn concurrency_future_request_waits_until_ready() {
     );
 }
 
-#[tokio::test]
+#[silo::test]
 async fn concurrency_request_priority_ordering() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -864,10 +818,7 @@ async fn concurrency_request_priority_ordering() {
             now,
             None,
             serde_json::json!({"j": 1}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue1");
@@ -883,10 +834,7 @@ async fn concurrency_request_priority_ordering() {
             now,
             None,
             serde_json::json!({"j": 2}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue2");
@@ -900,10 +848,7 @@ async fn concurrency_request_priority_ordering() {
             now,
             None,
             serde_json::json!({"j": 3}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue3");
@@ -939,7 +884,7 @@ async fn concurrency_request_priority_ordering() {
     assert_eq!(t3_vec[0].job().id(), j2, "low priority job comes last");
 }
 
-#[tokio::test]
+#[silo::test]
 async fn concurrency_permanent_failure_releases_holder() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -954,10 +899,7 @@ async fn concurrency_permanent_failure_releases_holder() {
             now,
             None,
             serde_json::json!({"j": 1}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue1");
@@ -973,10 +915,7 @@ async fn concurrency_permanent_failure_releases_holder() {
             now,
             None,
             serde_json::json!({"j": 2}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue2");
@@ -1012,7 +951,7 @@ async fn concurrency_permanent_failure_releases_holder() {
     assert_eq!(count_with_prefix(shard.db(), "holders/").await, 0);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn concurrency_reap_expired_lease_releases_holder() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -1033,10 +972,7 @@ async fn concurrency_reap_expired_lease_releases_holder() {
                 backoff_factor: 1.0,
             }),
             serde_json::json!({"j": 1}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue1");
@@ -1052,10 +988,7 @@ async fn concurrency_reap_expired_lease_releases_holder() {
             now,
             None,
             serde_json::json!({"j": 2}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue2");
@@ -1079,7 +1012,8 @@ async fn concurrency_reap_expired_lease_releases_holder() {
             attempt_number: *attempt_number,
             held_queues: held_queues.iter().map(|s| s.as_str().to_string()).collect(),
         },
-        ArchivedTask::RequestTicket { .. } => panic!("unexpected"),
+        ArchivedTask::RequestTicket { .. } => panic!("unexpected RequestTicket"),
+        ArchivedTask::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit"),
     };
     let expired_record = LeaseRecord {
         worker_id: archived.worker_id.as_str().to_string(),
@@ -1123,7 +1057,7 @@ async fn concurrency_reap_expired_lease_releases_holder() {
         .expect("report2");
 }
 
-#[tokio::test]
+#[silo::test]
 async fn concurrency_future_request_granted_after_time_passes() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -1139,10 +1073,7 @@ async fn concurrency_future_request_granted_after_time_passes() {
             now,
             None,
             serde_json::json!({"j": 1}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue1");
@@ -1159,10 +1090,7 @@ async fn concurrency_future_request_granted_after_time_passes() {
             future,
             None,
             serde_json::json!({"j": 2}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue2");
@@ -1210,7 +1138,7 @@ async fn concurrency_future_request_granted_after_time_passes() {
     assert_eq!(t2_vec.len(), 1, "Job 2 should get exactly one lease");
 }
 
-#[tokio::test]
+#[silo::test]
 async fn cannot_delete_job_with_future_request_ticket() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -1226,10 +1154,7 @@ async fn cannot_delete_job_with_future_request_ticket() {
             now,
             None,
             serde_json::json!({"j": 1}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue1");
@@ -1245,10 +1170,7 @@ async fn cannot_delete_job_with_future_request_ticket() {
             future,
             None,
             serde_json::json!({"j": 2}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue2");
@@ -1290,7 +1212,7 @@ async fn cannot_delete_job_with_future_request_ticket() {
         .expect("report1");
 }
 
-#[tokio::test]
+#[silo::test]
 async fn cannot_delete_job_with_pending_request() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -1305,10 +1227,7 @@ async fn cannot_delete_job_with_pending_request() {
             now,
             None,
             serde_json::json!({"j": 1}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue1");
@@ -1324,10 +1243,7 @@ async fn cannot_delete_job_with_pending_request() {
             now,
             None,
             serde_json::json!({"j": 2}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue2");
