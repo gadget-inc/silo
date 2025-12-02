@@ -497,10 +497,6 @@ pub async fn run_grpc_with_reaper(
         }
     });
 
-    let local_addr = listener.local_addr()?;
-    // Log after successful bind (listener provided by main)
-    tracing::info!(addr = %local_addr, "server started and listening");
-
     let incoming = TcpListenerStream::new(listener);
 
     // Serve with graceful shutdown

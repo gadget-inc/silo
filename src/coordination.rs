@@ -11,6 +11,24 @@ use tracing::{debug, info, warn};
 use crate::settings::CoordinationConfig;
 use crate::shard_guard::ShardGuard;
 
+/// Information about a cluster member
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MemberInfo {
+    pub node_id: String,
+    pub grpc_addr: String,
+}
+
+/// Mapping of shard IDs to their owning node's gRPC address
+#[derive(Debug, Clone)]
+pub struct ShardOwnerMap {
+    /// Total number of shards in the cluster
+    pub num_shards: u32,
+    /// Maps shard_id -> grpc_addr of the owning node
+    pub shard_to_addr: HashMap<u32, String>,
+    /// Maps shard_id -> node_id of the owning node
+    pub shard_to_node: HashMap<u32, String>,
+}
+
 /// Entity that coordinates between all the running nodes within a Silo cluster to decide who is going to serve which shards
 pub struct Coordination {
     client: Client,
@@ -61,6 +79,7 @@ pub struct Coordinator {
     client: Client,
     cluster_prefix: String,
     node_id: String,
+    grpc_addr: String,
     num_shards: u32,
     membership_lease_id: i64,
     liveness_lease_id: i64,
@@ -73,10 +92,12 @@ pub struct Coordinator {
 
 impl Coordinator {
     /// Start a coordinator instance under a cluster prefix. TTL is seconds for leases.
+    /// The grpc_addr should be the address other nodes can use to reach this node's gRPC server.
     pub async fn start(
         coord: &Coordination,
         cluster_prefix: impl Into<String>,
         node_id: impl Into<String>,
+        grpc_addr: impl Into<String>,
         num_shards: u32,
         ttl_secs: i64,
     ) -> anyhow::Result<(Self, tokio::task::JoinHandle<()>)> {
@@ -87,15 +108,20 @@ impl Coordinator {
         let mut kv = client.kv_client();
         let cluster_prefix = cluster_prefix.into();
         let node_id = node_id.into();
+        let grpc_addr = grpc_addr.into();
 
         // Create membership and liveness leases (we do not keepalive in this first cut;
         // tests complete well within TTL).
         let membership_lease = client.lease_grant(ttl_secs, None).await?.id();
         let liveness_lease = client.lease_grant(ttl_secs, None).await?.id();
 
-        // Write membership key
+        // Write membership key with node_id and grpc_addr
         let member_key = crate::coordination::keys::member_key(&cluster_prefix, &node_id);
-        let member_value = serde_json::json!({ "node_id": &node_id }).to_string();
+        let member_info = MemberInfo {
+            node_id: node_id.clone(),
+            grpc_addr: grpc_addr.clone(),
+        };
+        let member_value = serde_json::to_string(&member_info)?;
         kv.put(
             member_key,
             member_value,
@@ -117,6 +143,7 @@ impl Coordinator {
             client,
             cluster_prefix,
             node_id,
+            grpc_addr,
             num_shards,
             membership_lease_id: membership_lease,
             liveness_lease_id: liveness_lease,
@@ -430,6 +457,74 @@ impl Coordinator {
             .collect();
         member_ids.sort();
         Ok(member_ids)
+    }
+
+    /// Get all member information from the cluster
+    pub async fn get_members(&self) -> Result<Vec<MemberInfo>, etcd_client::Error> {
+        let resp = self
+            .client
+            .kv_client()
+            .get(
+                crate::coordination::keys::members_prefix(&self.cluster_prefix).to_string(),
+                Some(GetOptions::new().with_prefix()),
+            )
+            .await?;
+        let mut members: Vec<MemberInfo> = resp
+            .kvs()
+            .iter()
+            .filter_map(|kv| {
+                let value = String::from_utf8_lossy(kv.value());
+                serde_json::from_str(&value).ok()
+            })
+            .collect();
+        members.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        Ok(members)
+    }
+
+    /// Compute a mapping of shard IDs to their owning node's address.
+    /// Uses rendezvous hashing to deterministically assign shards to nodes.
+    pub async fn get_shard_owner_map(&self) -> Result<ShardOwnerMap, etcd_client::Error> {
+        let members = self.get_members().await?;
+        let member_ids: Vec<String> = members.iter().map(|m| m.node_id.clone()).collect();
+        
+        // Build node_id -> grpc_addr lookup
+        let addr_map: HashMap<String, String> = members
+            .into_iter()
+            .map(|m| (m.node_id, m.grpc_addr))
+            .collect();
+
+        let mut shard_to_addr = HashMap::new();
+        let mut shard_to_node = HashMap::new();
+
+        for shard_id in 0..self.num_shards {
+            if let Some(owner_node) = select_owner_for_shard(shard_id, &member_ids) {
+                if let Some(addr) = addr_map.get(&owner_node) {
+                    shard_to_addr.insert(shard_id, addr.clone());
+                    shard_to_node.insert(shard_id, owner_node);
+                }
+            }
+        }
+
+        Ok(ShardOwnerMap {
+            num_shards: self.num_shards,
+            shard_to_addr,
+            shard_to_node,
+        })
+    }
+
+    /// Get the number of shards in the cluster
+    pub fn num_shards(&self) -> u32 {
+        self.num_shards
+    }
+
+    /// Get this node's ID
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
+    /// Get this node's gRPC address
+    pub fn grpc_addr(&self) -> &str {
+        &self.grpc_addr
     }
 }
 
