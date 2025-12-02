@@ -15,7 +15,7 @@ async fn open_temp_shard(
         flush_interval_ms,
     };
     let shard = JobStoreShard::open(&cfg).await.expect("open shard");
-    (tmp, Arc::new(shard))
+    (tmp, shard)
 }
 
 fn now_ms() -> i64 {

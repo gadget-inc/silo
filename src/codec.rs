@@ -1,6 +1,6 @@
 use rkyv::{AlignedVec, Archive};
 
-use crate::job::{JobInfo, JobStatus};
+use crate::job::{JobCancellation, JobInfo, JobStatus};
 use crate::job_attempt::JobAttempt;
 use crate::task::{ConcurrencyAction, GubernatorRateLimitData, HolderRecord, LeaseRecord, Task};
 
@@ -56,6 +56,8 @@ pub const JOB_STATUS_VERSION: u8 = 1;
 pub const HOLDER_RECORD_VERSION: u8 = 1;
 /// Version for ConcurrencyAction serialization format
 pub const CONCURRENCY_ACTION_VERSION: u8 = 1;
+/// Version for JobCancellation serialization format
+pub const JOB_CANCELLATION_VERSION: u8 = 1;
 
 /// Size of the version header - just a single byte.
 /// Alignment is handled at decode time by copying into an AlignedVec.
@@ -461,4 +463,37 @@ pub fn decode_concurrency_action(bytes: &[u8]) -> Result<DecodedConcurrencyActio
     let _ = rkyv::check_archived_root::<ConcurrencyAction>(&data)
         .map_err(|e| CodecError::Rkyv(e.to_string()))?;
     Ok(DecodedConcurrencyAction { data })
+}
+
+// ============================================================================
+// JobCancellation encoding/decoding
+// ============================================================================
+
+#[inline]
+pub fn encode_job_cancellation(cancellation: &JobCancellation) -> Result<Vec<u8>, CodecError> {
+    let data = rkyv::to_bytes::<JobCancellation, 64>(cancellation)
+        .map_err(|e| CodecError::Rkyv(e.to_string()))?;
+    Ok(prepend_version(JOB_CANCELLATION_VERSION, data))
+}
+
+/// Decoded job cancellation that owns its aligned data
+#[derive(Clone)]
+pub struct DecodedJobCancellation {
+    data: AlignedVec,
+}
+
+impl DecodedJobCancellation {
+    pub fn archived(&self) -> &<JobCancellation as Archive>::Archived {
+        // SAFETY: data was validated at construction in decode_job_cancellation
+        unsafe { rkyv::archived_root::<JobCancellation>(&self.data) }
+    }
+}
+
+#[inline]
+pub fn decode_job_cancellation(bytes: &[u8]) -> Result<DecodedJobCancellation, CodecError> {
+    let data = strip_version(JOB_CANCELLATION_VERSION, bytes)?;
+    // Validate the data
+    let _ = rkyv::check_archived_root::<JobCancellation>(&data)
+        .map_err(|e| CodecError::Rkyv(e.to_string()))?;
+    Ok(DecodedJobCancellation { data })
 }

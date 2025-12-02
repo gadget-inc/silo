@@ -125,3 +125,12 @@ pub fn concurrency_holder_key(tenant: &str, queue: &str, task_id: &str) -> Strin
     validate_tenant_len(tenant);
     format!("holders/{}/{}/{}", escape_tenant(tenant), queue, task_id)
 }
+
+/// The KV store key for a job's cancellation flag.
+/// Cancellation is stored separately from status to allow dequeue to blindly write Running
+/// without losing cancellation info. See Alloy spec: JobCancelled is orthogonal to JobStatus.
+pub fn job_cancelled_key(tenant: &str, id: &str) -> String {
+    validate_tenant_len(tenant);
+    validate_id_len(id);
+    format!("job_cancelled/{}/{}", escape_tenant(tenant), id)
+}

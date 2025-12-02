@@ -14,6 +14,9 @@ fn codec_error_to_shard_error(e: CodecError) -> JobStoreShardError {
 pub enum AttemptOutcome {
     Success { result: Vec<u8> },
     Error { error_code: String, error: Vec<u8> },
+    /// Worker acknowledges cancellation after discovering it via heartbeat.
+    /// This is the clean shutdown path where worker reports it has stopped work.
+    Cancelled,
 }
 
 /// Attempt status lifecycle
@@ -31,6 +34,10 @@ pub enum AttemptStatus {
         finished_at_ms: i64,
         error_code: String,
         error: Vec<u8>,
+    },
+    /// Attempt was cancelled (either worker acknowledged or lease expired while job was cancelled)
+    Cancelled {
+        finished_at_ms: i64,
     },
 }
 
@@ -102,6 +109,9 @@ impl JobAttemptView {
                 finished_at_ms: *finished_at_ms,
                 error_code: error_code.as_str().to_string(),
                 error: error.to_vec(),
+            },
+            ArchivedAttemptState::Cancelled { finished_at_ms } => AttemptStatus::Cancelled {
+                finished_at_ms: *finished_at_ms,
             },
         }
     }

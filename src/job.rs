@@ -4,6 +4,17 @@ use crate::codec::{decode_job_info, CodecError, DecodedJobInfo};
 use crate::job_store_shard::JobStoreShardError;
 use crate::retry::RetryPolicy;
 
+/// Cancellation record stored at job_cancelled/<tenant>/<job-id>.
+/// Cancellation is tracked separately from status per the Alloy spec:
+/// this allows dequeue to blindly write Running without losing cancellation info.
+/// Once cancelled, always cancelled (monotonic).
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+#[archive(check_bytes)]
+pub struct JobCancellation {
+    /// Timestamp (epoch ms) when cancellation was requested
+    pub cancelled_at_ms: i64,
+}
+
 fn codec_error_to_shard_error(e: CodecError) -> JobStoreShardError {
     JobStoreShardError::Rkyv(e.to_string())
 }
