@@ -138,7 +138,7 @@ fn test_concurrency_action_roundtrip() {
     assert_eq!(encoded[0], CONCURRENCY_ACTION_VERSION);
     let decoded = decode_concurrency_action(&encoded).unwrap();
     match decoded.archived() {
-        silo::job_store_shard::ArchivedConcurrencyAction::EnqueueTask {
+        silo::task::ArchivedConcurrencyAction::EnqueueTask {
             start_time_ms,
             priority,
             job_id,

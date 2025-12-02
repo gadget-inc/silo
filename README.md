@@ -16,6 +16,7 @@ Status: crappy experiment
 - tracks job and attempt history for operators
 - allows searching for jobs with a few different filters
 - brokers work for userland workers in any language that communicate with the broker via RPCs
+- simple operator-facing webui
 
 It's like Sidekiq, BullMQ, Temporal, Restate or similar, but durable.
 
@@ -159,17 +160,6 @@ Returns
 - status not found if the job wasn't found (or has already been deleted)
 - status error if the job is currently running, it needs to be cancelled before it can be deleted
 
-## Development (Flakes)
+## Development
 
-This repo uses [Flakes](https://nixos.asia/en/flakes) from the get-go.
-
-```bash
-# Dev shell
-nix develop
-
-# or run via cargo
-nix develop -c cargo run
-
-# build
-nix build
-```
+See `CONTRIBUTING.md` for details on how to work on the `silo` repo.

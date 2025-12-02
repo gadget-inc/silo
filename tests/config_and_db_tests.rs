@@ -1,7 +1,8 @@
 use silo::factory::ShardFactory;
-use silo::settings::{AppConfig, Backend, DatabaseTemplate};
+use silo::gubernator::MockGubernatorClient;
+use silo::settings::{AppConfig, Backend, DatabaseTemplate, GubernatorSettings};
 
-#[tokio::test]
+#[silo::test]
 async fn open_fs_db_from_config() {
     let tmp = tempfile::tempdir().unwrap();
 
@@ -9,13 +10,15 @@ async fn open_fs_db_from_config() {
         server: Default::default(),
         coordination: Default::default(),
         tenancy: silo::settings::TenancyConfig { enabled: false },
+        gubernator: GubernatorSettings::default(),
         database: DatabaseTemplate {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
         },
     };
 
-    let mut factory = ShardFactory::new(cfg.database.clone());
+    let rate_limiter = MockGubernatorClient::new_arc();
+    let mut factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
     let shard = factory.open(0).await.expect("open shard");
 
     shard.db().put(b"k", b"v").await.expect("put");

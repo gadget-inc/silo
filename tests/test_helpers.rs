@@ -1,6 +1,8 @@
+use silo::gubernator::{MockGubernatorClient, RateLimitClient};
 use silo::job_store_shard::JobStoreShard;
 use silo::settings::{Backend, DatabaseConfig};
 use slatedb::{Db, DbIterator};
+use std::sync::Arc;
 
 // Helper: enforce a tight timeout for async tests likely to hang
 #[macro_export]
@@ -25,6 +27,14 @@ pub fn parse_time_from_task_key(key: &str) -> Option<u64> {
 }
 
 pub async fn open_temp_shard() -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>) {
+    let rate_limiter = MockGubernatorClient::new_arc();
+    open_temp_shard_with_rate_limiter(rate_limiter).await
+}
+
+/// Open a temp shard with a custom rate limiter (useful for testing rate limit behavior)
+pub async fn open_temp_shard_with_rate_limiter(
+    rate_limiter: Arc<dyn RateLimitClient>,
+) -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>) {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = DatabaseConfig {
         name: "test".to_string(),
@@ -33,7 +43,9 @@ pub async fn open_temp_shard() -> (tempfile::TempDir, std::sync::Arc<JobStoreSha
         // Use fast flush interval for tests to speed them up
         flush_interval_ms: Some(10),
     };
-    let shard = JobStoreShard::open(&cfg).await.expect("open shard");
+    let shard = JobStoreShard::open_with_rate_limiter(&cfg, rate_limiter)
+        .await
+        .expect("open shard");
     (tmp, shard)
 }
 

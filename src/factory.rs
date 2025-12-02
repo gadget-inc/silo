@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::gubernator::RateLimitClient;
 use crate::job_store_shard::JobStoreShard;
 use crate::job_store_shard::JobStoreShardError;
 use crate::settings::{DatabaseConfig, DatabaseTemplate};
@@ -10,13 +11,15 @@ use thiserror::Error;
 pub struct ShardFactory {
     instances: HashMap<String, Arc<JobStoreShard>>,
     template: DatabaseTemplate,
+    rate_limiter: Arc<dyn RateLimitClient>,
 }
 
 impl ShardFactory {
-    pub fn new(template: DatabaseTemplate) -> Self {
+    pub fn new(template: DatabaseTemplate, rate_limiter: Arc<dyn RateLimitClient>) -> Self {
         Self {
             instances: HashMap::new(),
             template,
+            rate_limiter,
         }
     }
 
@@ -41,7 +44,7 @@ impl ShardFactory {
             path,
             flush_interval_ms: None, // Use SlateDB's default in production
         };
-        let shard_arc = JobStoreShard::open(&cfg).await?;
+        let shard_arc = JobStoreShard::open_with_rate_limiter(&cfg, Arc::clone(&self.rate_limiter)).await?;
         self.instances
             .insert(cfg.name.clone(), Arc::clone(&shard_arc));
         Ok(shard_arc)

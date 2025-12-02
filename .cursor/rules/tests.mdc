@@ -1,0 +1,5 @@
+---
+alwaysApply: true
+---
+
+Use the #[silo::test] macro for wrapping rust test cases (not tokio::test).

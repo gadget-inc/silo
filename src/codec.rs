@@ -2,7 +2,7 @@ use rkyv::{AlignedVec, Archive};
 
 use crate::job::{JobInfo, JobStatus};
 use crate::job_attempt::JobAttempt;
-use crate::job_store_shard::{ConcurrencyAction, HolderRecord, LeaseRecord, Task};
+use crate::task::{ConcurrencyAction, GubernatorRateLimitData, HolderRecord, LeaseRecord, Task};
 
 /// Error type for versioned codec operations
 #[derive(Debug, Clone)]
@@ -88,10 +88,6 @@ fn strip_version(expected: u8, data: &[u8]) -> Result<AlignedVec, CodecError> {
     Ok(aligned)
 }
 
-// ============================================================================
-// Task encoding/decoding
-// ============================================================================
-
 #[inline]
 pub fn encode_task(task: &Task) -> Result<Vec<u8>, CodecError> {
     let data = rkyv::to_bytes::<Task, 256>(task).map_err(|e| CodecError::Rkyv(e.to_string()))?;
@@ -134,12 +130,44 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
             attempt_number: *attempt_number,
             request_id: request_id.as_str().to_string(),
         },
+        ArchivedTask::CheckRateLimit {
+            task_id,
+            job_id,
+            attempt_number,
+            limit_index,
+            rate_limit,
+            retry_count,
+            started_at_ms,
+            priority,
+            held_queues,
+        } => Task::CheckRateLimit {
+            task_id: task_id.as_str().to_string(),
+            job_id: job_id.as_str().to_string(),
+            attempt_number: *attempt_number,
+            limit_index: *limit_index,
+            rate_limit: GubernatorRateLimitData {
+                name: rate_limit.name.as_str().to_string(),
+                unique_key: rate_limit.unique_key.as_str().to_string(),
+                limit: rate_limit.limit,
+                duration_ms: rate_limit.duration_ms,
+                hits: rate_limit.hits,
+                algorithm: rate_limit.algorithm,
+                behavior: rate_limit.behavior,
+                retry_initial_backoff_ms: rate_limit.retry_initial_backoff_ms,
+                retry_max_backoff_ms: rate_limit.retry_max_backoff_ms,
+                retry_backoff_multiplier: rate_limit.retry_backoff_multiplier,
+                retry_max_retries: rate_limit.retry_max_retries,
+            },
+            retry_count: *retry_count,
+            started_at_ms: *started_at_ms,
+            priority: *priority,
+            held_queues: held_queues
+                .iter()
+                .map(|s| s.as_str().to_string())
+                .collect::<Vec<String>>(),
+        },
     })
 }
-
-// ============================================================================
-// LeaseRecord encoding/decoding
-// ============================================================================
 
 #[inline]
 pub fn encode_lease(record: &LeaseRecord) -> Result<Vec<u8>, CodecError> {
@@ -154,10 +182,131 @@ pub struct DecodedLease {
     data: AlignedVec,
 }
 
+type ArchivedTask = <Task as Archive>::Archived;
+
 impl DecodedLease {
     pub fn archived(&self) -> &<LeaseRecord as Archive>::Archived {
         // SAFETY: data was validated at construction in decode_lease
         unsafe { rkyv::archived_root::<LeaseRecord>(&self.data) }
+    }
+
+    /// Get the worker_id from this lease (zero-copy)
+    pub fn worker_id(&self) -> &str {
+        self.archived().worker_id.as_str()
+    }
+
+    /// Get the expiry time from this lease
+    pub fn expiry_ms(&self) -> i64 {
+        self.archived().expiry_ms
+    }
+
+    /// Get a reference to the archived task (zero-copy)
+    pub fn archived_task(&self) -> &ArchivedTask {
+        &self.archived().task
+    }
+
+    /// Extract task_id from the leased task (zero-copy). Only valid for RunAttempt tasks.
+    pub fn task_id(&self) -> Option<&str> {
+        match self.archived_task() {
+            ArchivedTask::RunAttempt { id, .. } => Some(id.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Extract job_id from the leased task (zero-copy)
+    pub fn job_id(&self) -> &str {
+        match self.archived_task() {
+            ArchivedTask::RunAttempt { job_id, .. } => job_id.as_str(),
+            ArchivedTask::RequestTicket { job_id, .. } => job_id.as_str(),
+            ArchivedTask::CheckRateLimit { job_id, .. } => job_id.as_str(),
+        }
+    }
+
+    /// Extract attempt_number from the leased task (zero-copy)
+    pub fn attempt_number(&self) -> u32 {
+        match self.archived_task() {
+            ArchivedTask::RunAttempt { attempt_number, .. } => *attempt_number,
+            ArchivedTask::RequestTicket { attempt_number, .. } => *attempt_number,
+            ArchivedTask::CheckRateLimit { attempt_number, .. } => *attempt_number,
+        }
+    }
+
+    /// Extract held_queues from the leased task as owned strings (allocation required)
+    pub fn held_queues(&self) -> Vec<String> {
+        match self.archived_task() {
+            ArchivedTask::RunAttempt { held_queues, .. } => {
+                held_queues.iter().map(|s| s.as_str().to_string()).collect()
+            }
+            ArchivedTask::CheckRateLimit { held_queues, .. } => {
+                held_queues.iter().map(|s| s.as_str().to_string()).collect()
+            }
+            ArchivedTask::RequestTicket { .. } => Vec::new(),
+        }
+    }
+
+    /// Convert to an owned Task - only call when you need to create a new record
+    pub fn to_task(&self) -> Task {
+        match self.archived_task() {
+            ArchivedTask::RunAttempt {
+                id,
+                job_id,
+                attempt_number,
+                held_queues,
+            } => Task::RunAttempt {
+                id: id.as_str().to_string(),
+                job_id: job_id.as_str().to_string(),
+                attempt_number: *attempt_number,
+                held_queues: held_queues.iter().map(|s| s.as_str().to_string()).collect(),
+            },
+            ArchivedTask::RequestTicket {
+                queue,
+                start_time_ms,
+                priority,
+                job_id,
+                attempt_number,
+                request_id,
+            } => Task::RequestTicket {
+                queue: queue.as_str().to_string(),
+                start_time_ms: *start_time_ms,
+                priority: *priority,
+                job_id: job_id.as_str().to_string(),
+                attempt_number: *attempt_number,
+                request_id: request_id.as_str().to_string(),
+            },
+            ArchivedTask::CheckRateLimit {
+                task_id,
+                job_id,
+                attempt_number,
+                limit_index,
+                rate_limit,
+                retry_count,
+                started_at_ms,
+                priority,
+                held_queues,
+            } => Task::CheckRateLimit {
+                task_id: task_id.as_str().to_string(),
+                job_id: job_id.as_str().to_string(),
+                attempt_number: *attempt_number,
+                limit_index: *limit_index,
+                rate_limit: GubernatorRateLimitData {
+                    name: rate_limit.name.as_str().to_string(),
+                    unique_key: rate_limit.unique_key.as_str().to_string(),
+                    limit: rate_limit.limit,
+                    duration_ms: rate_limit.duration_ms,
+                    hits: rate_limit.hits,
+                    algorithm: rate_limit.algorithm,
+                    behavior: rate_limit.behavior,
+                    retry_initial_backoff_ms: rate_limit.retry_initial_backoff_ms,
+                    retry_max_backoff_ms: rate_limit.retry_max_backoff_ms,
+                    retry_backoff_multiplier: rate_limit.retry_backoff_multiplier,
+                    retry_max_retries: rate_limit.retry_max_retries,
+                },
+                retry_count: *retry_count,
+                started_at_ms: *started_at_ms,
+                priority: *priority,
+                held_queues: held_queues.iter().map(|s| s.as_str().to_string()).collect(),
+            },
+        }
     }
 }
 
@@ -169,10 +318,6 @@ pub fn decode_lease(bytes: &[u8]) -> Result<DecodedLease, CodecError> {
         .map_err(|e| CodecError::Rkyv(e.to_string()))?;
     Ok(DecodedLease { data })
 }
-
-// ============================================================================
-// JobAttempt encoding/decoding
-// ============================================================================
 
 #[inline]
 pub fn encode_attempt(attempt: &JobAttempt) -> Result<Vec<u8>, CodecError> {
@@ -203,10 +348,6 @@ pub fn decode_attempt(bytes: &[u8]) -> Result<DecodedAttempt, CodecError> {
     Ok(DecodedAttempt { data })
 }
 
-// ============================================================================
-// JobInfo encoding/decoding
-// ============================================================================
-
 #[inline]
 pub fn encode_job_info(job: &JobInfo) -> Result<Vec<u8>, CodecError> {
     let data = rkyv::to_bytes::<JobInfo, 256>(job).map_err(|e| CodecError::Rkyv(e.to_string()))?;
@@ -234,10 +375,6 @@ pub fn decode_job_info(bytes: &[u8]) -> Result<DecodedJobInfo, CodecError> {
         rkyv::check_archived_root::<JobInfo>(&data).map_err(|e| CodecError::Rkyv(e.to_string()))?;
     Ok(DecodedJobInfo { data })
 }
-
-// ============================================================================
-// JobStatus encoding/decoding
-// ============================================================================
 
 #[inline]
 pub fn encode_job_status(status: &JobStatus) -> Result<Vec<u8>, CodecError> {
@@ -268,10 +405,6 @@ pub fn decode_job_status(bytes: &[u8]) -> Result<DecodedJobStatus, CodecError> {
     Ok(DecodedJobStatus { data })
 }
 
-// ============================================================================
-// HolderRecord encoding/decoding
-// ============================================================================
-
 #[inline]
 pub fn encode_holder(holder: &HolderRecord) -> Result<Vec<u8>, CodecError> {
     let data =
@@ -300,10 +433,6 @@ pub fn decode_holder(bytes: &[u8]) -> Result<DecodedHolder, CodecError> {
         .map_err(|e| CodecError::Rkyv(e.to_string()))?;
     Ok(DecodedHolder { data })
 }
-
-// ============================================================================
-// ConcurrencyAction encoding/decoding
-// ============================================================================
 
 #[inline]
 pub fn encode_concurrency_action(action: &ConcurrencyAction) -> Result<Vec<u8>, CodecError> {

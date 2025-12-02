@@ -16,7 +16,7 @@ use std::sync::{
 
 use test_helpers::*;
 
-#[tokio::test]
+#[silo::test]
 async fn enqueue_round_trip_with_explicit_id() {
     let (_tmp, shard) = open_temp_shard().await;
 
@@ -33,7 +33,7 @@ async fn enqueue_round_trip_with_explicit_id() {
             start_time_ms,
             None,
             payload.clone(),
-            vec![],
+            vec![], None,
         )
         .await
         .expect("enqueue");
@@ -66,7 +66,7 @@ async fn enqueue_round_trip_with_explicit_id() {
     );
 }
 
-#[tokio::test]
+#[silo::test]
 async fn enqueue_with_metadata_round_trips_in_job_view() {
     let (_tmp, shard) = open_temp_shard().await;
 
@@ -79,7 +79,7 @@ async fn enqueue_with_metadata_round_trips_in_job_view() {
     ];
 
     let job_id = shard
-        .enqueue_with_metadata(
+        .enqueue(
             "-",
             None,
             priority,
@@ -110,7 +110,7 @@ async fn enqueue_with_metadata_round_trips_in_job_view() {
     assert_eq!(map, exp, "metadata should roundtrip in JobView");
 }
 
-#[tokio::test]
+#[silo::test]
 async fn enqueue_generates_uuid_when_none_provided() {
     let (_tmp, shard) = open_temp_shard().await;
 
@@ -126,7 +126,7 @@ async fn enqueue_generates_uuid_when_none_provided() {
             start_time_ms,
             None,
             payload.clone(),
-            vec![],
+            vec![], None,
         )
         .await
         .expect("enqueue");
@@ -152,7 +152,7 @@ async fn enqueue_generates_uuid_when_none_provided() {
     );
 }
 
-#[tokio::test]
+#[silo::test]
 async fn delete_job_removes_key_and_is_idempotent() {
     let (_tmp, shard) = open_temp_shard().await;
 
@@ -170,7 +170,7 @@ async fn delete_job_removes_key_and_is_idempotent() {
             start_time_ms,
             None,
             payload.clone(),
-            vec![],
+            vec![], None,
         )
         .await
         .expect("enqueue");
@@ -204,7 +204,7 @@ async fn delete_job_removes_key_and_is_idempotent() {
     assert!(got.is_none(), "job should remain deleted");
 }
 
-#[tokio::test]
+#[silo::test]
 async fn peek_omits_future_scheduled_tasks() {
     let (_tmp, shard) = open_temp_shard().await;
 
@@ -214,7 +214,7 @@ async fn peek_omits_future_scheduled_tasks() {
     let future_ms = now_ms + 60_000;
 
     let _ = shard
-        .enqueue("-", None, priority, future_ms, None, payload, vec![])
+        .enqueue("-", None, priority, future_ms, None, payload, vec![], None)
         .await
         .expect("enqueue");
 
@@ -223,7 +223,7 @@ async fn peek_omits_future_scheduled_tasks() {
     assert!(tasks.is_empty(), "future task should not be visible");
 }
 
-#[tokio::test]
+#[silo::test]
 async fn dequeue_moves_tasks_to_leased_with_uuid() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
@@ -233,7 +233,7 @@ async fn dequeue_moves_tasks_to_leased_with_uuid() {
         let now_ms = now_ms();
 
         let job_id = shard
-            .enqueue("-", None, priority, now_ms, None, payload, vec![])
+            .enqueue("-", None, priority, now_ms, None, payload, vec![], None)
             .await
             .expect("enqueue");
         let tasks = shard.dequeue("-", "worker-1", 1).await.expect("dequeue");
@@ -280,6 +280,7 @@ async fn dequeue_moves_tasks_to_leased_with_uuid() {
                 assert_eq!(*attempt_number, 1);
             }
             ArchivedTask::RequestTicket { .. } => panic!("unexpected RequestTicket in lease"),
+            ArchivedTask::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in lease"),
         }
 
         // Ensure original task queue is empty now
@@ -288,7 +289,7 @@ async fn dequeue_moves_tasks_to_leased_with_uuid() {
     });
 }
 
-#[tokio::test]
+#[silo::test]
 async fn heartbeat_renews_lease_when_worker_matches() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
@@ -298,7 +299,7 @@ async fn heartbeat_renews_lease_when_worker_matches() {
         let now_ms = now_ms();
 
         let _job_id = shard
-            .enqueue("-", None, priority, now_ms, None, payload, vec![])
+            .enqueue("-", None, priority, now_ms, None, payload, vec![], None)
             .await
             .expect("enqueue");
 
@@ -336,7 +337,7 @@ async fn heartbeat_renews_lease_when_worker_matches() {
     });
 }
 
-#[tokio::test]
+#[silo::test]
 async fn heartbeat_rejects_mismatched_worker() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
@@ -346,7 +347,7 @@ async fn heartbeat_rejects_mismatched_worker() {
         let now_ms = now_ms();
 
         let _job_id = shard
-            .enqueue("-", None, priority, now_ms, None, payload, vec![])
+            .enqueue("-", None, priority, now_ms, None, payload, vec![], None)
             .await
             .expect("enqueue");
 
@@ -374,7 +375,7 @@ async fn heartbeat_rejects_mismatched_worker() {
     });
 }
 
-#[tokio::test]
+#[silo::test]
 async fn reporting_attempt_outcome_updates_attempt_and_deletes_lease() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
@@ -384,7 +385,7 @@ async fn reporting_attempt_outcome_updates_attempt_and_deletes_lease() {
         let now_ms = now_ms();
 
         let job_id = shard
-            .enqueue("-", None, priority, now_ms, None, payload, vec![])
+            .enqueue("-", None, priority, now_ms, None, payload, vec![], None)
             .await
             .expect("enqueue");
 
@@ -426,7 +427,7 @@ async fn reporting_attempt_outcome_updates_attempt_and_deletes_lease() {
     });
 }
 
-#[tokio::test]
+#[silo::test]
 async fn error_with_no_retries_does_not_enqueue_next_attempt() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
@@ -444,7 +445,7 @@ async fn error_with_no_retries_does_not_enqueue_next_attempt() {
             backoff_factor: 2.0,
         };
         let _job_id = shard
-            .enqueue("-", None, priority, now, Some(policy), payload, vec![])
+            .enqueue("-", None, priority, now, Some(policy), payload, vec![], None)
             .await
             .expect("enqueue");
 
@@ -469,7 +470,7 @@ async fn error_with_no_retries_does_not_enqueue_next_attempt() {
     });
 }
 
-#[tokio::test]
+#[silo::test]
 async fn error_with_retries_enqueues_next_attempt_until_limit() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
@@ -487,7 +488,7 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
             backoff_factor: 1.0,
         };
         let _job_id = shard
-            .enqueue("-", None, priority, now, Some(policy), payload, vec![])
+            .enqueue("-", None, priority, now, Some(policy), payload, vec![], None)
             .await
             .expect("enqueue");
 
@@ -516,6 +517,7 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
             Task::RequestTicket { .. } => {
                 panic!("unexpected RequestTicket in tasks/ for this test")
             }
+            Task::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in tasks/ for this test"),
         };
         assert_eq!(attempt, 2);
 
@@ -544,6 +546,7 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
             Task::RequestTicket { .. } => {
                 panic!("unexpected RequestTicket in tasks/ for this test")
             }
+            Task::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in tasks/ for this test"),
         };
         assert_eq!(attempt3, 3);
 
@@ -566,7 +569,7 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
     });
 }
 
-#[tokio::test]
+#[silo::test]
 async fn double_reporting_same_attempt_is_idempotent_success_then_success() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
@@ -576,7 +579,7 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_success() {
         let now_ms = now_ms();
 
         let job_id = shard
-            .enqueue("-", None, priority, now_ms, None, payload, vec![])
+            .enqueue("-", None, priority, now_ms, None, payload, vec![], None)
             .await
             .expect("enqueue");
 
@@ -638,7 +641,7 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_success() {
     });
 }
 
-#[tokio::test]
+#[silo::test]
 async fn double_reporting_same_attempt_is_idempotent_success_then_error() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
@@ -648,7 +651,7 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_error() {
         let now_ms = now_ms();
 
         let job_id = shard
-            .enqueue("-", None, priority, now_ms, None, payload, vec![])
+            .enqueue("-", None, priority, now_ms, None, payload, vec![], None)
             .await
             .expect("enqueue");
 
@@ -702,7 +705,7 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_error() {
     });
 }
 
-#[tokio::test]
+#[silo::test]
 async fn enqueue_fails_when_id_already_exists_and_db_unchanged() {
     let (_tmp, shard) = open_temp_shard().await;
 
@@ -719,7 +722,7 @@ async fn enqueue_fails_when_id_already_exists_and_db_unchanged() {
             start1,
             None,
             payload1.clone(),
-            vec![],
+            vec![], None,
         )
         .await
         .expect("first enqueue ok");
@@ -742,7 +745,7 @@ async fn enqueue_fails_when_id_already_exists_and_db_unchanged() {
             start2,
             None,
             payload2.clone(),
-            vec![],
+            vec![], None,
         )
         .await
         .expect_err("duplicate enqueue should fail");
@@ -770,7 +773,7 @@ async fn enqueue_fails_when_id_already_exists_and_db_unchanged() {
     assert_eq!(got_payload, payload1);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn retry_count_one_boundary_enqueues_attempt2_then_stops_on_second_error() {
     let (_tmp, shard) = open_temp_shard().await;
 
@@ -792,7 +795,7 @@ async fn retry_count_one_boundary_enqueues_attempt2_then_stops_on_second_error()
             now,
             Some(policy.clone()),
             payload,
-            vec![],
+            vec![], None,
         )
         .await
         .expect("enqueue");
@@ -822,6 +825,7 @@ async fn retry_count_one_boundary_enqueues_attempt2_then_stops_on_second_error()
         Task::RequestTicket { .. } => {
             panic!("unexpected RequestTicket in tasks/ for this test")
         }
+            Task::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in tasks/ for this test"),
     };
     assert_eq!(attempt2, 2);
 
@@ -855,7 +859,7 @@ async fn retry_count_one_boundary_enqueues_attempt2_then_stops_on_second_error()
     }
 }
 
-#[tokio::test]
+#[silo::test]
 async fn next_retry_time_matches_scheduled_time_smoke() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
@@ -877,7 +881,7 @@ async fn next_retry_time_matches_scheduled_time_smoke() {
                 now,
                 Some(policy.clone()),
                 payload.clone(),
-                vec![],
+                vec![], None,
             )
             .await
             .expect("enqueue");
@@ -918,7 +922,7 @@ async fn next_retry_time_matches_scheduled_time_smoke() {
     });
 }
 
-#[tokio::test]
+#[silo::test]
 async fn duplicate_reporting_error_then_error_is_rejected_and_no_extra_tasks() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
@@ -933,7 +937,7 @@ async fn duplicate_reporting_error_then_error_is_rejected_and_no_extra_tasks() {
             backoff_factor: 1.0,
         };
         let _job_id = shard
-            .enqueue("-", None, priority, now, Some(policy), payload, vec![])
+            .enqueue("-", None, priority, now, Some(policy), payload, vec![], None)
             .await
             .expect("enqueue");
 
@@ -974,7 +978,7 @@ async fn duplicate_reporting_error_then_error_is_rejected_and_no_extra_tasks() {
     });
 }
 
-#[tokio::test]
+#[silo::test]
 async fn duplicate_reporting_error_then_success_is_rejected_and_state_persists() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
@@ -982,7 +986,7 @@ async fn duplicate_reporting_error_then_success_is_rejected_and_state_persists()
         let priority = 10u8;
         let now = now_ms();
         let job_id = shard
-            .enqueue("-", None, priority, now, None, payload, vec![])
+            .enqueue("-", None, priority, now, None, payload, vec![], None)
             .await
             .expect("enqueue");
 
@@ -1026,7 +1030,7 @@ async fn duplicate_reporting_error_then_success_is_rejected_and_state_persists()
     });
 }
 
-#[tokio::test]
+#[silo::test]
 async fn heartbeat_after_outcome_returns_lease_not_found() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
@@ -1034,7 +1038,7 @@ async fn heartbeat_after_outcome_returns_lease_not_found() {
         let priority = 10u8;
         let now = now_ms();
         let _job_id = shard
-            .enqueue("-", None, priority, now, None, payload, vec![])
+            .enqueue("-", None, priority, now, None, payload, vec![], None)
             .await
             .expect("enqueue");
         let tasks = shard.dequeue("-", "worker-1", 1).await.expect("dequeue");
@@ -1060,7 +1064,7 @@ async fn heartbeat_after_outcome_returns_lease_not_found() {
     });
 }
 
-#[tokio::test]
+#[silo::test]
 async fn cannot_delete_running_job() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
@@ -1068,7 +1072,7 @@ async fn cannot_delete_running_job() {
         let priority = 10u8;
         let now = now_ms();
         let job_id = shard
-            .enqueue("-", None, priority, now, None, payload, vec![])
+            .enqueue("-", None, priority, now, None, payload, vec![], None)
             .await
             .expect("enqueue");
         let tasks = shard.dequeue("-", "w", 1).await.expect("dequeue");
@@ -1108,7 +1112,7 @@ async fn cannot_delete_running_job() {
     });
 }
 
-#[tokio::test]
+#[silo::test]
 async fn cannot_delete_scheduled_job() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
@@ -1116,7 +1120,7 @@ async fn cannot_delete_scheduled_job() {
         let priority = 10u8;
         let now = now_ms();
         let job_id = shard
-            .enqueue("-", None, priority, now, None, payload, vec![])
+            .enqueue("-", None, priority, now, None, payload, vec![], None)
             .await
             .expect("enqueue");
 
@@ -1160,7 +1164,7 @@ async fn cannot_delete_scheduled_job() {
     });
 }
 
-#[tokio::test]
+#[silo::test]
 async fn attempt_records_exist_across_retries_and_task_ids_distinct() {
     with_timeout!(30000, {
         let (_tmp, shard) = open_temp_shard().await;
@@ -1175,7 +1179,7 @@ async fn attempt_records_exist_across_retries_and_task_ids_distinct() {
             backoff_factor: 1.0,
         };
         let job_id = shard
-            .enqueue("-", None, priority, now, Some(policy), payload, vec![])
+            .enqueue("-", None, priority, now, Some(policy), payload, vec![], None)
             .await
             .expect("enqueue");
 
@@ -1231,7 +1235,7 @@ async fn attempt_records_exist_across_retries_and_task_ids_distinct() {
     });
 }
 
-#[tokio::test]
+#[silo::test]
 async fn outcome_payload_edge_cases_empty_vectors_round_trip() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
@@ -1239,7 +1243,7 @@ async fn outcome_payload_edge_cases_empty_vectors_round_trip() {
         let priority = 10u8;
         let now = now_ms();
         let job_id = shard
-            .enqueue("-", None, priority, now, None, payload, vec![])
+            .enqueue("-", None, priority, now, None, payload, vec![], None)
             .await
             .expect("enqueue");
         let tasks = shard.dequeue("-", "w", 1).await.expect("dequeue");
@@ -1273,7 +1277,7 @@ async fn outcome_payload_edge_cases_empty_vectors_round_trip() {
                 now,
                 None,
                 serde_json::json!({"k": "v2"}),
-                vec![],
+                vec![], None,
             )
             .await
             .expect("enqueue2");
@@ -1304,7 +1308,7 @@ async fn outcome_payload_edge_cases_empty_vectors_round_trip() {
     });
 }
 
-#[tokio::test]
+#[silo::test]
 async fn concurrent_dequeue_many_workers_no_duplicates() {
     with_timeout!(30000, {
         let (_tmp, shard) = open_temp_shard().await;
@@ -1369,7 +1373,7 @@ async fn concurrent_dequeue_many_workers_no_duplicates() {
             for i in 0..total_jobs {
                 let payload = serde_json::json!({"i": i});
                 shard_prod
-                    .enqueue("-", None, (i % 50) as u8, now, None, payload, vec![])
+                    .enqueue("-", None, (i % 50) as u8, now, None, payload, vec![], None)
                     .await
                     .expect("enqueue");
                 // Yield occasionally to allow scanner/workers to run
@@ -1391,7 +1395,7 @@ async fn concurrent_dequeue_many_workers_no_duplicates() {
     });
 }
 
-#[tokio::test]
+#[silo::test]
 async fn future_tasks_are_not_dequeued_under_concurrency() {
     with_timeout!(30000, {
         let (_tmp, shard) = open_temp_shard().await;
@@ -1412,7 +1416,7 @@ async fn future_tasks_are_not_dequeued_under_concurrency() {
                     now,
                     None,
                     serde_json::json!({"r": i}),
-                    vec![],
+                    vec![], None,
                 )
                 .await
                 .expect("enqueue ready");
@@ -1427,7 +1431,7 @@ async fn future_tasks_are_not_dequeued_under_concurrency() {
                     future,
                     None,
                     serde_json::json!({"f": i}),
-                    vec![],
+                    vec![], None,
                 )
                 .await
                 .expect("enqueue future");
@@ -1477,7 +1481,7 @@ async fn future_tasks_are_not_dequeued_under_concurrency() {
     });
 }
 
-#[tokio::test]
+#[silo::test]
 async fn large_outcome_payloads_round_trip() {
     with_timeout!(30000, {
         let (_tmp, shard) = open_temp_shard().await;
@@ -1485,7 +1489,7 @@ async fn large_outcome_payloads_round_trip() {
         let priority = 10u8;
         let now = now_ms();
         let job_id = shard
-            .enqueue("-", None, priority, now, None, payload, vec![])
+            .enqueue("-", None, priority, now, None, payload, vec![], None)
             .await
             .expect("enqueue");
         let tasks = shard.dequeue("-", "w", 1).await.expect("dequeue");
@@ -1521,7 +1525,7 @@ async fn large_outcome_payloads_round_trip() {
                 now,
                 None,
                 serde_json::json!({"k": "v2"}),
-                vec![],
+                vec![], None,
             )
             .await
             .expect("enqueue2");
@@ -1553,7 +1557,7 @@ async fn large_outcome_payloads_round_trip() {
     });
 }
 
-#[tokio::test]
+#[silo::test]
 async fn priority_ordering_when_start_times_equal() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
@@ -1568,7 +1572,7 @@ async fn priority_ordering_when_start_times_equal() {
                 now,
                 None,
                 serde_json::json!({"j": "hi"}),
-                vec![],
+                vec![], None,
             )
             .await
             .expect("enqueue hi");
@@ -1580,7 +1584,7 @@ async fn priority_ordering_when_start_times_equal() {
                 now,
                 None,
                 serde_json::json!({"j": "lo"}),
-                vec![],
+                vec![], None,
             )
             .await
             .expect("enqueue lo");
@@ -1597,7 +1601,7 @@ async fn priority_ordering_when_start_times_equal() {
     });
 }
 
-#[tokio::test]
+#[silo::test]
 async fn concurrency_immediate_grant_enqueues_task_and_writes_holder() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -1612,10 +1616,7 @@ async fn concurrency_immediate_grant_enqueues_task_and_writes_holder() {
             now,
             None,
             payload,
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue");
@@ -1638,7 +1639,7 @@ async fn concurrency_immediate_grant_enqueues_task_and_writes_holder() {
     );
 }
 
-#[tokio::test]
+#[silo::test]
 async fn concurrency_queues_when_full_and_grants_on_release() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -1653,10 +1654,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
             now,
             None,
             serde_json::json!({"j": 1}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue1");
@@ -1673,10 +1671,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
             now,
             None,
             serde_json::json!({"j": 2}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue2");
@@ -1688,7 +1683,8 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
             Task::RunAttempt { .. } => {
                 panic!("unexpected RunAttempt while holder is occupied")
             }
-            Task::RequestTicket { .. } => {}
+            Task::RequestTicket { .. } => {},
+            Task::CheckRateLimit { .. } => {}
         }
     }
 
@@ -1703,7 +1699,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
     assert!(some.is_some(), "task should be enqueued for next requester");
 }
 
-#[tokio::test]
+#[silo::test]
 async fn concurrency_held_queues_propagate_across_retries_and_release_on_finish() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -1723,10 +1719,7 @@ async fn concurrency_held_queues_propagate_across_retries_and_release_on_finish(
                 backoff_factor: 1.0,
             }),
             serde_json::json!({"j": 3}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue");
@@ -1765,7 +1758,7 @@ async fn concurrency_held_queues_propagate_across_retries_and_release_on_finish(
     assert_eq!(count_with_prefix(shard.db(), "holders/").await, 0);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn concurrency_retry_releases_original_holder() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -1786,10 +1779,7 @@ async fn concurrency_retry_releases_original_holder() {
                 backoff_factor: 1.0,
             }),
             serde_json::json!({"j": 33}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue");
@@ -1829,7 +1819,7 @@ async fn concurrency_retry_releases_original_holder() {
     );
 }
 
-#[tokio::test]
+#[silo::test]
 async fn concurrency_no_overgrant_after_release() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -1844,10 +1834,7 @@ async fn concurrency_no_overgrant_after_release() {
             now,
             None,
             serde_json::json!({"a": true}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue a");
@@ -1864,10 +1851,7 @@ async fn concurrency_no_overgrant_after_release() {
             now,
             None,
             serde_json::json!({"b": true}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue b");
@@ -1888,10 +1872,7 @@ async fn concurrency_no_overgrant_after_release() {
             now,
             None,
             serde_json::json!({"c": true}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue c");
@@ -1905,7 +1886,7 @@ async fn concurrency_no_overgrant_after_release() {
     );
 }
 
-#[tokio::test]
+#[silo::test]
 async fn stress_single_queue_no_double_grant() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -1922,11 +1903,8 @@ async fn stress_single_queue_no_double_grant() {
                 now,
                 None,
                 serde_json::json!({"i": i}),
-                vec![silo::job::ConcurrencyLimit {
-                    key: queue.clone(),
-                    max_concurrency: 1,
-                }],
-            )
+                vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+        )
             .await
             .expect("enqueue");
     }
@@ -1957,7 +1935,7 @@ async fn stress_single_queue_no_double_grant() {
     assert_eq!(count_with_prefix(shard.db(), "requests/").await, 0);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
@@ -1972,10 +1950,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
             now,
             None,
             serde_json::json!({"first": true}),
-            vec![silo::job::ConcurrencyLimit {
-                key: queue.clone(),
-                max_concurrency: 1,
-            }],
+            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
         )
         .await
         .expect("enqueue1");
@@ -1994,11 +1969,8 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
                 now,
                 None,
                 serde_json::json!({"i": i}),
-                vec![silo::job::ConcurrencyLimit {
-                    key: queue.clone(),
-                    max_concurrency: 1,
-                }],
-            )
+                vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+        )
             .await
             .expect("enqueue add");
     }
@@ -2007,7 +1979,8 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
         let task = decode_task(&v).expect("decode task");
         match task {
             Task::RunAttempt { .. } => panic!("unexpected RunAttempt before release"),
-            Task::RequestTicket { .. } => {}
+            Task::RequestTicket { .. } => {},
+            Task::CheckRateLimit { .. } => {}
         }
     }
 
@@ -2020,7 +1993,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
     assert!(after.is_some(), "one task should be enqueued after release");
 }
 
-#[tokio::test]
+#[silo::test]
 async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
     let (_tmp, shard) = open_temp_shard().await;
 
@@ -2034,7 +2007,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         backoff_factor: 1.0,
     };
     let job_id = shard
-        .enqueue("-", None, 10u8, now, Some(policy), payload, vec![])
+        .enqueue("-", None, 10u8, now, Some(policy), payload, vec![], None)
         .await
         .expect("enqueue");
 
@@ -2061,6 +2034,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
             held_queues: Vec::new(),
         },
         ArchivedTask::RequestTicket { .. } => panic!("unexpected RequestTicket in lease"),
+            ArchivedTask::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in lease"),
     };
     let expired_ms = now_ms() - 1;
     let new_record = LeaseRecord {
@@ -2110,18 +2084,19 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         Task::RequestTicket { .. } => {
             panic!("unexpected RequestTicket in tasks/ for this test")
         }
+            Task::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in tasks/ for this test"),
     };
     assert_eq!(attempt2, 2);
 }
 
-#[tokio::test]
+#[silo::test]
 async fn reap_ignores_unexpired_leases() {
     let (_tmp, shard) = open_temp_shard().await;
 
     let payload = serde_json::json!({"k": "v"});
     let now = now_ms();
     let job_id = shard
-        .enqueue("-", None, 10u8, now, None, payload, vec![])
+        .enqueue("-", None, 10u8, now, None, payload, vec![], None)
         .await
         .expect("enqueue");
 
@@ -2156,7 +2131,7 @@ async fn reap_ignores_unexpired_leases() {
     }
 }
 
-#[tokio::test]
+#[silo::test]
 async fn delete_job_before_dequeue_skips_task_and_no_lease_created() {
     let (_tmp, shard) = open_temp_shard().await;
 
@@ -2165,7 +2140,7 @@ async fn delete_job_before_dequeue_skips_task_and_no_lease_created() {
     let now_ms = now_ms();
 
     let job_id = shard
-        .enqueue("-", None, priority, now_ms, None, payload, vec![])
+        .enqueue("-", None, priority, now_ms, None, payload, vec![], None)
         .await
         .expect("enqueue");
 
@@ -2199,7 +2174,7 @@ async fn delete_job_before_dequeue_skips_task_and_no_lease_created() {
     assert!(status.is_none(), "job status should be deleted");
 }
 
-#[tokio::test]
+#[silo::test]
 async fn dequeue_gracefully_handles_missing_job_info() {
     let (_tmp, shard) = open_temp_shard().await;
 
@@ -2208,7 +2183,7 @@ async fn dequeue_gracefully_handles_missing_job_info() {
     let now_ms = now_ms();
 
     let job_id = shard
-        .enqueue("-", None, priority, now_ms, None, payload, vec![])
+        .enqueue("-", None, priority, now_ms, None, payload, vec![], None)
         .await
         .expect("enqueue");
 
@@ -2254,7 +2229,7 @@ async fn dequeue_gracefully_handles_missing_job_info() {
     );
 }
 
-#[tokio::test]
+#[silo::test]
 async fn tenant_allows_same_job_id_independent() {
     with_timeout!(2_000, {
         let (_tmp, shard) = open_temp_shard().await;
@@ -2272,7 +2247,7 @@ async fn tenant_allows_same_job_id_independent() {
                 now,
                 None,
                 serde_json::json!({"tenant": "A"}),
-                vec![],
+                vec![], None,
             )
             .await
             .expect("enqueue A");
@@ -2286,7 +2261,7 @@ async fn tenant_allows_same_job_id_independent() {
                 now + 1, // avoid any potential key collisions in task queue
                 None,
                 serde_json::json!({"tenant": "B"}),
-                vec![],
+                vec![], None,
             )
             .await
             .expect("enqueue B");

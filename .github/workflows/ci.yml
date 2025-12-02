@@ -20,15 +20,16 @@ jobs:
     steps:
       - uses: actions/checkout@v2
       - uses: ./.github/actions/setup-test-env
-      - name: Run etcd
-        shell: bash
-        run: |
-          just etcd &
-          sleep 3
+      - uses: JarvusInnovations/background-action@v1
+        name: Run background processes
+        with:
+          run: dev --tui=false &
+          wait-on: |
+            tcp:localhost:2379
+          tail: true
       - name: Run cargo test
         shell: bash
-        run: |
-          cargo test
+        run: cargo test
 
   alloy:
     name: Alloy model verification
