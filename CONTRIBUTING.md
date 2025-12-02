@@ -28,6 +28,21 @@ You can run a local server instance by using cargo to build and run the `silo` b
 cargo run --bin silo
 ```
 
+## Running Alloy system models
+
+We use [Alloy](https://alloytools.org/) for software modelling to help us prove that Silo's algorithms are sound. The `specs/` directory contains the Alloy models, and the Rust implementation has some [SILO-XYZ-1] sigils in comments referring back to specific Alloy predicates we know we need for correctness.
+
+Run the alloy verifier with:
+
+```shell
+alloy6 exec -f -o specs/output specs/job_shard.als
+```
+
+A pass is indicated by these two things being true:
+
+- all the `check` commands are `UNSAT`, ie, no counter examples are found for any checks
+- all the `run` commands are `SAT` such that one trace matches the examples we require
+
 ### Perfetto traces for debugging
 
 We support exporting `tracing` spans to a Perfetto trace you can open in the Perfetto UI.
