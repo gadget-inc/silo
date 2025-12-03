@@ -1,3 +1,26 @@
+//! Concurrency ticket management for limiting parallel job execution.
+//!
+//! This module implements a ticket-based concurrency control system where jobs must acquire
+//! tickets from named queues before they can proceed to execution.
+//!
+//! # Key Invariants (see specs/job_shard.als for formal specification)
+//!
+//! - Queue limit is enforced: at most N holders per queue at any time.
+//!   Currently modeled with N=1 (mutex semantics). Enforced by checking `can_grant` before granting.
+//!
+//! - Holders only exist for tasks that are active (in DB queue, buffer, or leased).
+//!   Holders are created at enqueue (granted) or grant_next, and released when task completes,
+//!   lease expires, or cancelled task is cleaned up at dequeue.
+//!
+//! # Cancellation Semantics
+//!
+//! - [SILO-GRANT-CXL] Requests for cancelled jobs are skipped during grant_next.
+//!   When release_and_grant_next scans for the next request to grant, it checks if the job
+//!   is cancelled and deletes the request without granting.
+//!
+//! - [SILO-DEQ-CXL-REL] Holders for cancelled tasks are released at dequeue cleanup.
+//!   When dequeue encounters a cancelled job's task, it releases any held tickets.
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
@@ -166,8 +189,9 @@ impl ConcurrencyManager {
         let queue = &limit.key;
         let max_allowed = limit.max_concurrency as usize;
 
+        // [SILO-ENQ-CONC-1] Check if queue has capacity
         if self.counts.can_grant(tenant, queue, max_allowed) {
-            // Grant immediately
+            // Grant immediately: [SILO-ENQ-CONC-2] create holder, [SILO-ENQ-CONC-3] create task
             let events = append_grant_edits(
                 batch,
                 now_ms,
@@ -185,7 +209,9 @@ impl ConcurrencyManager {
                 events,
             }))
         } else if start_at_ms <= now_ms {
-            // Job should start now but no capacity: queue as request
+            // [SILO-ENQ-CONC-4] Queue is at capacity
+            // [SILO-ENQ-CONC-5] No task in DB queue
+            // [SILO-ENQ-CONC-6] Create request record instead
             append_request_edits(
                 batch,
                 tenant,
@@ -367,14 +393,15 @@ async fn append_release_and_grant_next(
 ) -> Result<Vec<MemoryEvent>, String> {
     let mut events: Vec<MemoryEvent> = Vec::new();
     for queue in queues {
+        // [SILO-REL-1] Remove holder for this task/queue
         batch.delete(concurrency_holder_key(tenant, queue, finished_task_id).as_bytes());
         events.push(MemoryEvent::Released {
             queue: queue.clone(),
             task_id: finished_task_id.to_string(),
         });
 
-        // grant next: requests/<tenant>/<queue>/...
-        // Loop through requests to find the first non-cancelled, ready request
+        // [SILO-GRANT-1] Queue now has capacity (we just released)
+        // [SILO-GRANT-2] Find pending requests for this queue
         let start = format!("requests/{}/{}/", tenant, queue).into_bytes();
         let mut end: Vec<u8> = format!("requests/{}/{}/", tenant, queue).into_bytes();
         end.push(0xFF);
@@ -405,7 +432,7 @@ async fn append_release_and_grant_next(
                         .is_some();
 
                     if is_cancelled {
-                        // Delete the cancelled request and continue to next candidate
+                        // [SILO-GRANT-CXL-2] Delete the cancelled request without granting
                         batch.delete(&kv.key);
                         tracing::debug!(
                             job_id = %job_id_str,
@@ -424,7 +451,7 @@ async fn append_release_and_grant_next(
                         break;
                     }
 
-                    // Grant this request
+                    // [SILO-GRANT-3] Create holder for this task/queue
                     let holder = HolderRecord {
                         granted_at_ms: now_ms,
                     };
@@ -434,6 +461,7 @@ async fn append_release_and_grant_next(
                         &holder_val,
                     );
 
+                    // [SILO-GRANT-4] Create RunAttempt task in DB queue
                     let task = Task::RunAttempt {
                         id: request_id.clone(),
                         job_id: job_id_str.to_string(),

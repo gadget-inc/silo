@@ -57,6 +57,7 @@
           process-compose
           gubernator
           devScript
+          nodejs_24 # For validation scripts
         ];
 
         # Set the project root for the dev script

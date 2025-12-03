@@ -983,11 +983,40 @@ impl JobStoreShard {
                     if self.is_job_cancelled(&tenant, &job_id).await? {
                         batch.delete(entry.key.as_bytes());
                         ack_keys.push(entry.key.clone());
+
+                        // [SILO-DEQ-CXL-REL] Release any held concurrency tickets
+                        // This is required to maintain invariant: holders can only exist for active tasks
+                        let held_queues = match task {
+                            Task::RunAttempt { held_queues, .. } => held_queues.clone(),
+                            Task::CheckRateLimit { held_queues, .. } => held_queues.clone(),
+                            Task::RequestTicket { .. } => Vec::new(),
+                        };
+                        if !held_queues.is_empty() {
+                            let release_events = self
+                                .concurrency
+                                .release_and_grant_next(
+                                    &self.db,
+                                    &mut batch,
+                                    &tenant,
+                                    &held_queues,
+                                    &task_id,
+                                    now_ms,
+                                )
+                                .await
+                                .map_err(JobStoreShardError::Rkyv)?;
+                            self.apply_concurrency_events(&tenant, release_events);
+                            tracing::debug!(job_id = %job_id, queues = ?held_queues, "dequeue: released tickets for cancelled job task");
+                        }
+
                         tracing::debug!(job_id = %job_id, "dequeue: skipping cancelled job task");
                         continue;
                     }
 
                     let view = JobView::new(job_bytes)?;
+
+                    // [SILO-DEQ-CONC] Implicit: If job requires concurrency, task must hold all required queues.
+                    // This is guaranteed by construction: RunAttempt tasks are only created when concurrency
+                    // is granted (at enqueue or grant_next), with held_queues populated.
 
                     // [SILO-DEQ-4] Create lease record
                     let lease_key = leased_task_key(&task_id);
@@ -1309,7 +1338,8 @@ impl JobStoreShard {
             }
         }
 
-        // Release any held concurrency tickets
+        // [SILO-REL-1] Release any held concurrency tickets
+        // This also handles [SILO-GRANT-*] granting to next waiting request
         let release_events: Vec<MemoryEvent> = self
             .concurrency
             .release_and_grant_next(
@@ -1390,7 +1420,8 @@ impl JobStoreShard {
                 Err(_) => continue,
             };
 
-            // [SILO-REAP-1] Check if lease has expired
+            // [SILO-REAP-1] Pre: Lease exists (we found it)
+            // [SILO-REAP-2] Pre: Check if lease has expired
             if decoded.expiry_ms() > now_ms {
                 continue;
             }
@@ -1411,7 +1442,9 @@ impl JobStoreShard {
                 // Job was cancelled - report as Cancelled (clean termination)
                 AttemptOutcome::Cancelled
             } else {
-                // [SILO-REAP-2][SILO-REAP-3][SILO-REAP-4] Report as worker crashed
+                // [SILO-REAP-3][SILO-REAP-4] Report as worker crashed
+                // SILO-REAP-3: Post: Set job status to Failed (via report_attempt_outcome)
+                // SILO-REAP-4: Post: Set attempt status to AttemptFailed
                 AttemptOutcome::Error {
                     error_code: "WORKER_CRASHED".to_string(),
                     error: format!(
@@ -1424,6 +1457,7 @@ impl JobStoreShard {
                 }
             };
 
+            // [SILO-REAP-REL] Release lease and update job/attempt status via report_attempt_outcome
             let _ = self.report_attempt_outcome(tenant, task_id, outcome).await;
             reaped += 1;
         }
@@ -1456,6 +1490,27 @@ impl JobStoreShard {
         let timek = idx_status_time_key(tenant, new_kind.as_str(), changed, job_id);
         batch.put(timek.as_bytes(), []);
         Ok(())
+    }
+
+    /// Apply concurrency release/grant events to in-memory counts and wake broker.
+    /// Called after durably committing releases to update optimistic counts.
+    fn apply_concurrency_events(&self, tenant: &str, events: Vec<MemoryEvent>) {
+        for ev in events {
+            match ev {
+                MemoryEvent::Released { queue, task_id } => {
+                    self.concurrency
+                        .counts()
+                        .record_release(tenant, &queue, &task_id);
+                    self.broker.wakeup();
+                }
+                MemoryEvent::Granted { queue, task_id } => {
+                    self.concurrency
+                        .counts()
+                        .record_grant(tenant, &queue, &task_id);
+                    self.broker.wakeup();
+                }
+            }
+        }
     }
 
     /// Scan all jobs for a tenant ordered by job id (lexicographic), unfiltered.

@@ -1,0 +1,12 @@
+---
+globs: **/*.als
+alwaysApply: false
+---
+
+Silo uses Alloy for software modelling. Alloy models go in `.als` files in the `specs/` directory. Run verification commands of Alloy models with:
+
+```shell
+alloy6 exec -f -o specs/output specs/<some-spec>.als
+```
+
+Don't use `| head` or `| tail` commands when running alloy verifications -- they are slow and these piped commands make it hard to see if the command is working or not.
