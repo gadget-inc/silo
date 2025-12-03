@@ -32,7 +32,8 @@ async fn enqueue_round_trip_with_explicit_id() {
             start_time_ms,
             None,
             payload.clone(),
-            vec![], None,
+            vec![],
+            None,
         )
         .await
         .expect("enqueue");
@@ -125,7 +126,8 @@ async fn enqueue_generates_uuid_when_none_provided() {
             start_time_ms,
             None,
             payload.clone(),
-            vec![], None,
+            vec![],
+            None,
         )
         .await
         .expect("enqueue");
@@ -169,7 +171,8 @@ async fn delete_job_removes_key_and_is_idempotent() {
             start_time_ms,
             None,
             payload.clone(),
-            vec![], None,
+            vec![],
+            None,
         )
         .await
         .expect("enqueue");
@@ -444,7 +447,16 @@ async fn error_with_no_retries_does_not_enqueue_next_attempt() {
             backoff_factor: 2.0,
         };
         let _job_id = shard
-            .enqueue("-", None, priority, now, Some(policy), payload, vec![], None)
+            .enqueue(
+                "-",
+                None,
+                priority,
+                now,
+                Some(policy),
+                payload,
+                vec![],
+                None,
+            )
             .await
             .expect("enqueue");
 
@@ -487,7 +499,16 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
             backoff_factor: 1.0,
         };
         let _job_id = shard
-            .enqueue("-", None, priority, now, Some(policy), payload, vec![], None)
+            .enqueue(
+                "-",
+                None,
+                priority,
+                now,
+                Some(policy),
+                payload,
+                vec![],
+                None,
+            )
             .await
             .expect("enqueue");
 
@@ -516,7 +537,9 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
             Task::RequestTicket { .. } => {
                 panic!("unexpected RequestTicket in tasks/ for this test")
             }
-            Task::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in tasks/ for this test"),
+            Task::CheckRateLimit { .. } => {
+                panic!("unexpected CheckRateLimit in tasks/ for this test")
+            }
         };
         assert_eq!(attempt, 2);
 
@@ -545,7 +568,9 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
             Task::RequestTicket { .. } => {
                 panic!("unexpected RequestTicket in tasks/ for this test")
             }
-            Task::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in tasks/ for this test"),
+            Task::CheckRateLimit { .. } => {
+                panic!("unexpected CheckRateLimit in tasks/ for this test")
+            }
         };
         assert_eq!(attempt3, 3);
 
@@ -721,7 +746,8 @@ async fn enqueue_fails_when_id_already_exists_and_db_unchanged() {
             start1,
             None,
             payload1.clone(),
-            vec![], None,
+            vec![],
+            None,
         )
         .await
         .expect("first enqueue ok");
@@ -744,7 +770,8 @@ async fn enqueue_fails_when_id_already_exists_and_db_unchanged() {
             start2,
             None,
             payload2.clone(),
-            vec![], None,
+            vec![],
+            None,
         )
         .await
         .expect_err("duplicate enqueue should fail");
@@ -794,7 +821,8 @@ async fn retry_count_one_boundary_enqueues_attempt2_then_stops_on_second_error()
             now,
             Some(policy.clone()),
             payload,
-            vec![], None,
+            vec![],
+            None,
         )
         .await
         .expect("enqueue");
@@ -824,7 +852,7 @@ async fn retry_count_one_boundary_enqueues_attempt2_then_stops_on_second_error()
         Task::RequestTicket { .. } => {
             panic!("unexpected RequestTicket in tasks/ for this test")
         }
-            Task::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in tasks/ for this test"),
+        Task::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in tasks/ for this test"),
     };
     assert_eq!(attempt2, 2);
 
@@ -880,7 +908,8 @@ async fn next_retry_time_matches_scheduled_time_smoke() {
                 now,
                 Some(policy.clone()),
                 payload.clone(),
-                vec![], None,
+                vec![],
+                None,
             )
             .await
             .expect("enqueue");
@@ -936,7 +965,16 @@ async fn duplicate_reporting_error_then_error_is_rejected_and_no_extra_tasks() {
             backoff_factor: 1.0,
         };
         let _job_id = shard
-            .enqueue("-", None, priority, now, Some(policy), payload, vec![], None)
+            .enqueue(
+                "-",
+                None,
+                priority,
+                now,
+                Some(policy),
+                payload,
+                vec![],
+                None,
+            )
             .await
             .expect("enqueue");
 
@@ -1178,7 +1216,16 @@ async fn attempt_records_exist_across_retries_and_task_ids_distinct() {
             backoff_factor: 1.0,
         };
         let job_id = shard
-            .enqueue("-", None, priority, now, Some(policy), payload, vec![], None)
+            .enqueue(
+                "-",
+                None,
+                priority,
+                now,
+                Some(policy),
+                payload,
+                vec![],
+                None,
+            )
             .await
             .expect("enqueue");
 
@@ -1276,7 +1323,8 @@ async fn outcome_payload_edge_cases_empty_vectors_round_trip() {
                 now,
                 None,
                 serde_json::json!({"k": "v2"}),
-                vec![], None,
+                vec![],
+                None,
             )
             .await
             .expect("enqueue2");
@@ -1415,7 +1463,8 @@ async fn future_tasks_are_not_dequeued_under_concurrency() {
                     now,
                     None,
                     serde_json::json!({"r": i}),
-                    vec![], None,
+                    vec![],
+                    None,
                 )
                 .await
                 .expect("enqueue ready");
@@ -1430,7 +1479,8 @@ async fn future_tasks_are_not_dequeued_under_concurrency() {
                     future,
                     None,
                     serde_json::json!({"f": i}),
-                    vec![], None,
+                    vec![],
+                    None,
                 )
                 .await
                 .expect("enqueue future");
@@ -1524,7 +1574,8 @@ async fn large_outcome_payloads_round_trip() {
                 now,
                 None,
                 serde_json::json!({"k": "v2"}),
-                vec![], None,
+                vec![],
+                None,
             )
             .await
             .expect("enqueue2");
@@ -1571,7 +1622,8 @@ async fn priority_ordering_when_start_times_equal() {
                 now,
                 None,
                 serde_json::json!({"j": "hi"}),
-                vec![], None,
+                vec![],
+                None,
             )
             .await
             .expect("enqueue hi");
@@ -1583,7 +1635,8 @@ async fn priority_ordering_when_start_times_equal() {
                 now,
                 None,
                 serde_json::json!({"j": "lo"}),
-                vec![], None,
+                vec![],
+                None,
             )
             .await
             .expect("enqueue lo");
@@ -1615,7 +1668,11 @@ async fn concurrency_immediate_grant_enqueues_task_and_writes_holder() {
             now,
             None,
             payload,
-            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue");
@@ -1653,7 +1710,11 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
             now,
             None,
             serde_json::json!({"j": 1}),
-            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue1");
@@ -1670,7 +1731,11 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
             now,
             None,
             serde_json::json!({"j": 2}),
-            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue2");
@@ -1682,7 +1747,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
             Task::RunAttempt { .. } => {
                 panic!("unexpected RunAttempt while holder is occupied")
             }
-            Task::RequestTicket { .. } => {},
+            Task::RequestTicket { .. } => {}
             Task::CheckRateLimit { .. } => {}
         }
     }
@@ -1718,7 +1783,11 @@ async fn concurrency_held_queues_propagate_across_retries_and_release_on_finish(
                 backoff_factor: 1.0,
             }),
             serde_json::json!({"j": 3}),
-            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue");
@@ -1778,7 +1847,11 @@ async fn concurrency_retry_releases_original_holder() {
                 backoff_factor: 1.0,
             }),
             serde_json::json!({"j": 33}),
-            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue");
@@ -1833,7 +1906,11 @@ async fn concurrency_no_overgrant_after_release() {
             now,
             None,
             serde_json::json!({"a": true}),
-            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue a");
@@ -1850,7 +1927,11 @@ async fn concurrency_no_overgrant_after_release() {
             now,
             None,
             serde_json::json!({"b": true}),
-            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue b");
@@ -1871,7 +1952,11 @@ async fn concurrency_no_overgrant_after_release() {
             now,
             None,
             serde_json::json!({"c": true}),
-            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue c");
@@ -1902,8 +1987,12 @@ async fn stress_single_queue_no_double_grant() {
                 now,
                 None,
                 serde_json::json!({"i": i}),
-                vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
-        )
+                vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue.clone(),
+                    max_concurrency: 1,
+                })],
+                None,
+            )
             .await
             .expect("enqueue");
     }
@@ -1949,7 +2038,11 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
             now,
             None,
             serde_json::json!({"first": true}),
-            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue1");
@@ -1968,8 +2061,12 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
                 now,
                 None,
                 serde_json::json!({"i": i}),
-                vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
-        )
+                vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue.clone(),
+                    max_concurrency: 1,
+                })],
+                None,
+            )
             .await
             .expect("enqueue add");
     }
@@ -1978,7 +2075,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
         let task = decode_task(&v).expect("decode task");
         match task {
             Task::RunAttempt { .. } => panic!("unexpected RunAttempt before release"),
-            Task::RequestTicket { .. } => {},
+            Task::RequestTicket { .. } => {}
             Task::CheckRateLimit { .. } => {}
         }
     }
@@ -2033,7 +2130,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
             held_queues: Vec::new(),
         },
         ArchivedTask::RequestTicket { .. } => panic!("unexpected RequestTicket in lease"),
-            ArchivedTask::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in lease"),
+        ArchivedTask::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in lease"),
     };
     let expired_ms = now_ms() - 1;
     let new_record = LeaseRecord {
@@ -2083,7 +2180,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         Task::RequestTicket { .. } => {
             panic!("unexpected RequestTicket in tasks/ for this test")
         }
-            Task::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in tasks/ for this test"),
+        Task::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in tasks/ for this test"),
     };
     assert_eq!(attempt2, 2);
 }
@@ -2246,7 +2343,8 @@ async fn tenant_allows_same_job_id_independent() {
                 now,
                 None,
                 serde_json::json!({"tenant": "A"}),
-                vec![], None,
+                vec![],
+                None,
             )
             .await
             .expect("enqueue A");
@@ -2260,7 +2358,8 @@ async fn tenant_allows_same_job_id_independent() {
                 now + 1, // avoid any potential key collisions in task queue
                 None,
                 serde_json::json!({"tenant": "B"}),
-                vec![], None,
+                vec![],
+                None,
             )
             .await
             .expect("enqueue B");
@@ -2307,10 +2406,6 @@ async fn tenant_allows_same_job_id_independent() {
             .is_some());
     });
 }
-
-// =============================================================================
-// Cancellation Tests
-// =============================================================================
 
 /// [SILO-CXL-1][SILO-CXL-2][SILO-CXL-3] Cancel scheduled job immediately sets Cancelled status
 /// and removes task from queue

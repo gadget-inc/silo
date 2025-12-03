@@ -35,8 +35,10 @@ We use [Alloy](https://alloytools.org/) for software modelling to help us prove 
 Run the alloy verifier with:
 
 ```shell
-alloy6 exec -f -o specs/output specs/job_shard.als
+alloy6 exec -f -s lingeling.parallel -o specs/output specs/job_shard.als
 ```
+
+The `lingeling.parallel` solver uses multiple CPU cores and is ~10x faster than the default SAT4J solver.
 
 A pass is indicated by these two things being true:
 

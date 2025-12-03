@@ -32,7 +32,7 @@ jobs:
           set -euo pipefail
           
           echo "Running Alloy model verification..."
-          alloy6 exec -f specs/job_shard.als 2>&1 | tee alloy_output.txt
+          alloy6 exec -f -s lingeling.parallel specs/job_shard.als 2>&1 | tee alloy_output.txt
           
           echo ""
           echo "Verifying results..."
@@ -63,3 +63,6 @@ jobs:
           echo ""
           echo "✓ All $check_count assertions verified (no counterexamples found)"
           echo "✓ All example scenarios are satisfiable"
+      - name: Validate SILO tags synchronized
+        shell: bash
+        run: node scripts/validate-silo-tags.js
