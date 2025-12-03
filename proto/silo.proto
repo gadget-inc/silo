@@ -21,6 +21,14 @@ message ConcurrencyLimit {
   uint32 max_concurrency = 2; // maximum concurrent running jobs for this key
 }
 
+// Floating concurrency limit - max concurrency is dynamic and refreshed by workers
+message FloatingConcurrencyLimit {
+  string key = 1;                        // grouping key; jobs with same key share a limit
+  uint32 default_max_concurrency = 2;    // initial max concurrency value used until first refresh
+  int64 refresh_interval_ms = 3;         // how often to refresh the max concurrency value
+  map<string, string> metadata = 4;      // arbitrary key/value metadata passed to workers during refresh
+}
+
 // Gubernator rate limiting algorithm
 enum GubernatorAlgorithm {
   GUBERNATOR_ALGORITHM_TOKEN_BUCKET = 0;  // Token bucket algorithm
@@ -57,11 +65,12 @@ message GubernatorRateLimit {
   RateLimitRetryPolicy retry_policy = 8; // How to retry when rate limited
 }
 
-// A single limit that can be either a concurrency limit or a rate limit
+// A single limit that can be either a concurrency limit, rate limit, or floating concurrency limit
 message Limit {
   oneof limit {
     ConcurrencyLimit concurrency = 1;
     GubernatorRateLimit rate_limit = 2;
+    FloatingConcurrencyLimit floating_concurrency = 3;
   }
 }
 
@@ -107,8 +116,23 @@ message Task {
   JsonValueBytes payload = 5; // job payload for convenience
   uint32 priority = 6;
 }
-message LeaseTasksResponse { repeated Task tasks = 1; }
 
+// Task for refreshing a floating concurrency limit - workers compute new max concurrency
+message RefreshFloatingLimitTask {
+  string id = 1;                          // task id
+  string queue_key = 2;                   // the floating limit queue key
+  uint32 current_max_concurrency = 3;     // the current max concurrency value
+  int64 last_refreshed_at_ms = 4;         // when the value was last refreshed
+  map<string, string> metadata = 5;       // opaque metadata from the limit definition
+  int64 lease_ms = 6;                     // how long to heartbeat in ms
+}
+
+message LeaseTasksResponse { 
+  repeated Task tasks = 1;
+  repeated RefreshFloatingLimitTask refresh_tasks = 2;  // floating limit refresh tasks
+}
+
+// Report the outcome of a job attempt task from a worker back to the server
 message ReportOutcomeRequest {
   string shard = 1;
   string task_id = 2;
@@ -122,6 +146,28 @@ message ReportOutcomeRequest {
 message Failure { string code = 1; bytes data = 2; }
 message Cancelled {} // Empty marker for cancelled outcome
 message ReportOutcomeResponse {}
+
+// Report the outcome of a floating limit refresh task from a worker back to the server
+message ReportRefreshOutcomeRequest {
+  string shard = 1;
+  string task_id = 2;
+  optional string tenant = 3;
+  oneof outcome {
+    RefreshSuccess success = 4;
+    RefreshFailure failure = 5;
+  }
+}
+
+message RefreshSuccess {
+  uint32 new_max_concurrency = 1;  // the new max concurrency value computed by the worker
+}
+
+message RefreshFailure {
+  string code = 1;    // error code
+  string message = 2; // error message
+}
+
+message ReportRefreshOutcomeResponse {}
 
 message HeartbeatRequest { 
   string shard = 1; 
@@ -163,6 +209,7 @@ service Silo {
   rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
   rpc LeaseTasks(LeaseTasksRequest) returns (LeaseTasksResponse);
   rpc ReportOutcome(ReportOutcomeRequest) returns (ReportOutcomeResponse);
+  rpc ReportRefreshOutcome(ReportRefreshOutcomeRequest) returns (ReportRefreshOutcomeResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc Query(QueryRequest) returns (QueryResponse);
 }
