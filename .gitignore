@@ -5,3 +5,5 @@
 /default.etcd
 /tmp
 /specs/output
+/typescript_client/dist
+/typescript_client/node_modules

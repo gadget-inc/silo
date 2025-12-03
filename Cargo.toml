@@ -62,6 +62,11 @@ protoc-bin-vendored = "3.0"
 debug = 1     # debug info with line tables only for profiling
 strip = false # do not strip symbols for profiling
 
+# Fast build for testing - much faster than release, some optimization for reasonable perf
+[profile.dev-fast]
+inherits = "dev"
+opt-level = 1
+
 [[bench]]
 name = "job_shard_throughput"
 harness = false
