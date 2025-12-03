@@ -9,6 +9,9 @@ jobs:
     steps:
       - uses: actions/checkout@v2
       - uses: ./.github/actions/setup-test-env
+        with:
+          cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
       - uses: JarvusInnovations/background-action@v1
         name: Run background processes
         with:
@@ -26,6 +29,8 @@ jobs:
     steps:
       - uses: actions/checkout@v2
       - uses: ./.github/actions/setup-test-env
+        with:
+          cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - name: Run Alloy model checker
         shell: bash
         run: |
@@ -68,11 +73,14 @@ jobs:
         run: node scripts/validate-silo-tags.js
 
   typescript-client:
-    name: TypeScript client test
+    name: TypeScript tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
       - uses: ./.github/actions/setup-test-env
+        with:
+          cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
       - name: Install dependencies
         shell: bash
         working-directory: typescript_client
@@ -91,7 +99,7 @@ jobs:
         run: pnpm run lint
       - name: Build silo server
         shell: bash
-        run: cargo build --release
+        run: cargo build
       - name: Start etcd
         shell: bash
         run: |
@@ -100,7 +108,7 @@ jobs:
       - name: Start silo server
         shell: bash
         run: |
-          ./target/release/silo -c typescript_client/test/silo-test-config.toml &
+          ./target/debug/silo -c typescript_client/test/silo-test-config.toml &
           sleep 2
       - name: Run tests
         shell: bash

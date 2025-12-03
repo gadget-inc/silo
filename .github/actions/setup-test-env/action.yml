@@ -1,11 +1,19 @@
 name: "Setup test environment"
 description: ""
-inputs: {}
+inputs:
+  cachix_auth_token:
+    description: "Cachix auth token"
+    required: true
 outputs: {}
 runs:
   using: "composite"
   steps:
     - uses: cachix/install-nix-action@v31
+    - name: Cache Nix
+      uses: cachix/cachix-action@v16
+      with:
+        name: silo
+        authToken: "${{ inputs.cachix_auth_token }}"
     - run: |
         source <(nix print-dev-env --show-trace) 
         output_file="nix-env.txt"
