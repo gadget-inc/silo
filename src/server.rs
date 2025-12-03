@@ -52,6 +52,16 @@ fn proto_limit_to_job_limit(proto: Limit) -> Option<crate::job::Limit> {
                 retry_policy,
             }))
         }
+        limit::Limit::FloatingConcurrency(f) => {
+            Some(crate::job::Limit::FloatingConcurrency(
+                crate::job::FloatingConcurrencyLimit {
+                    key: f.key,
+                    default_max_concurrency: f.default_max_concurrency,
+                    refresh_interval_ms: f.refresh_interval_ms,
+                    metadata: f.metadata.into_iter().collect(),
+                },
+            ))
+        }
     }
 }
 
@@ -80,6 +90,16 @@ fn job_limit_to_proto_limit(job_limit: crate::job::Limit) -> Limit {
                     max_retries: r.retry_policy.max_retries,
                 }),
             })),
+        },
+        crate::job::Limit::FloatingConcurrency(f) => Limit {
+            limit: Some(limit::Limit::FloatingConcurrency(
+                crate::pb::FloatingConcurrencyLimit {
+                    key: f.key,
+                    default_max_concurrency: f.default_max_concurrency,
+                    refresh_interval_ms: f.refresh_interval_ms,
+                    metadata: f.metadata.into_iter().collect(),
+                },
+            )),
         },
     }
 }
@@ -263,12 +283,12 @@ impl Silo for SiloService {
         let r = req.into_inner();
         let shard = self.shard(&r.shard)?;
         let tenant = self.validate_tenant(r.tenant.as_deref())?;
-        let tasks = shard
+        let result = shard
             .dequeue(&tenant, &r.worker_id, r.max_tasks as usize)
             .await
             .map_err(map_err)?;
-        let mut out = Vec::with_capacity(tasks.len());
-        for lt in tasks {
+        let mut out = Vec::with_capacity(result.tasks.len());
+        for lt in result.tasks {
             let job = lt.job();
             let attempt = lt.attempt();
             out.push(Task {
@@ -282,7 +302,22 @@ impl Silo for SiloService {
                 priority: job.priority() as u32,
             });
         }
-        Ok(Response::new(LeaseTasksResponse { tasks: out }))
+        let refresh_tasks: Vec<RefreshFloatingLimitTask> = result
+            .refresh_tasks
+            .into_iter()
+            .map(|rt| RefreshFloatingLimitTask {
+                id: rt.task_id,
+                queue_key: rt.queue_key,
+                current_max_concurrency: rt.current_max_concurrency,
+                last_refreshed_at_ms: rt.last_refreshed_at_ms,
+                metadata: rt.metadata.into_iter().collect(),
+                lease_ms: DEFAULT_LEASE_MS,
+            })
+            .collect();
+        Ok(Response::new(LeaseTasksResponse {
+            tasks: out,
+            refresh_tasks,
+        }))
     }
 
     async fn report_outcome(
@@ -310,6 +345,34 @@ impl Silo for SiloService {
             .await
             .map_err(map_err)?;
         Ok(Response::new(ReportOutcomeResponse {}))
+    }
+
+    async fn report_refresh_outcome(
+        &self,
+        req: Request<ReportRefreshOutcomeRequest>,
+    ) -> Result<Response<ReportRefreshOutcomeResponse>, Status> {
+        let r = req.into_inner();
+        let shard = self.shard(&r.shard)?;
+        let tenant = self.validate_tenant(r.tenant.as_deref())?;
+        let outcome = r
+            .outcome
+            .ok_or_else(|| Status::invalid_argument("missing outcome"))?;
+
+        match outcome {
+            report_refresh_outcome_request::Outcome::Success(s) => {
+                shard
+                    .report_refresh_success(&tenant, &r.task_id, s.new_max_concurrency)
+                    .await
+                    .map_err(map_err)?;
+            }
+            report_refresh_outcome_request::Outcome::Failure(f) => {
+                shard
+                    .report_refresh_failure(&tenant, &r.task_id, &f.code, &f.message)
+                    .await
+                    .map_err(map_err)?;
+            }
+        }
+        Ok(Response::new(ReportRefreshOutcomeResponse {}))
     }
 
     async fn heartbeat(

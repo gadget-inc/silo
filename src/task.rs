@@ -49,6 +49,16 @@ pub enum Task {
         /// Queues already held from previous concurrency limits
         held_queues: Vec<String>,
     },
+    /// Worker task: refresh a floating concurrency limit's max concurrency value
+    RefreshFloatingLimit {
+        task_id: String,
+        tenant: String,
+        queue_key: String,
+        current_max_concurrency: u32,
+        last_refreshed_at_ms: i64,
+        /// Opaque metadata from the floating limit definition
+        metadata: Vec<(String, String)>,
+    },
 }
 
 /// Serializable rate limit data stored with CheckRateLimit tasks

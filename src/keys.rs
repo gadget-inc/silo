@@ -134,3 +134,14 @@ pub fn job_cancelled_key(tenant: &str, id: &str) -> String {
     validate_id_len(id);
     format!("job_cancelled/{}/{}", escape_tenant(tenant), id)
 }
+
+/// The KV store key for a floating concurrency limit's state.
+/// Stores the current max concurrency, last refresh time, and refresh task status.
+pub fn floating_limit_state_key(tenant: &str, queue_key: &str) -> String {
+    validate_tenant_len(tenant);
+    format!(
+        "floating_limits/{}/{}",
+        escape_tenant(tenant),
+        escape_segment(queue_key)
+    )
+}
