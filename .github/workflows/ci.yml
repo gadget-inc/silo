@@ -1,13 +1,16 @@
-on: [push]
-
 name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
 
 jobs:
   test:
     name: Rust tests
     runs-on: ubuntu-latest-l
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-test-env
         with:
           cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
@@ -27,7 +30,7 @@ jobs:
     name: K8S coordination tests
     runs-on: ubuntu-latest-l
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-test-env
         with:
           cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
@@ -47,7 +50,7 @@ jobs:
     name: Alloy model verification
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-test-env
         with:
           cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
@@ -96,7 +99,7 @@ jobs:
     name: TypeScript tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-test-env
         with:
           cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
@@ -136,3 +139,51 @@ jobs:
         env:
           CI: "true"
         run: pnpm test
+
+  build-docker:
+    name: Build and push Docker image
+    runs-on: ubuntu-latest-l
+    permissions:
+      contents: "read"
+      id-token: "write"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up environment
+        uses: ./.github/actions/setup-test-env
+        with:
+          cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Build Docker image with Nix
+        run: |
+          nix build .#packages.x86_64-linux.silo-docker -L
+
+      - name: Authenticate gcloud
+        if: github.ref == 'refs/heads/main'
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          token_format: access_token
+          workload_identity_provider: ${{ vars.GCLOUD_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCLOUD_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Login to Google Artifact Registry
+        if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: us-central1-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - name: Tag and push image
+        if: github.ref == 'refs/heads/main'
+        run: |
+          sha=$(git rev-parse --short HEAD)
+          registry="us-central1-docker.pkg.dev/${{ vars.GCLOUD_PROJECT_ID }}/silo"
+
+          docker tag silo:latest "${registry}/silo:sha-${sha}"
+          docker push "${registry}/silo:sha-${sha}"
+
+          docker tag silo:latest "${registry}/silo:latest"
+          docker push "${registry}/silo:latest"
