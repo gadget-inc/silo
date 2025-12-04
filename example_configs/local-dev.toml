@@ -1,0 +1,17 @@
+# Example config for local development
+# No coordination (single-node mode), local filesystem storage
+
+[server]
+grpc_addr = "127.0.0.1:50051"
+
+[coordination]
+backend = "none"
+
+[webui]
+enabled = true
+addr = "127.0.0.1:50052"
+
+[database]
+backend = "fs"
+# %shard% placeholder will be replaced with the shard number
+path = "/var/lib/silo/data-%shard%"

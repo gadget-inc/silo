@@ -15,6 +15,7 @@ async fn open_fs_db_from_config() {
         database: DatabaseTemplate {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
         },
     };
 

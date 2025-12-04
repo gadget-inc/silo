@@ -54,6 +54,7 @@ fn grpc_end_to_end_under_turmoil() {
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
+                wal: None,
             },
         };
 
@@ -206,6 +207,7 @@ fn grpc_fault_injection_with_partition() {
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
+                wal: None,
             },
         };
 
@@ -400,6 +402,7 @@ fn stress_multiple_workers_with_partitions() {
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
+                wal: None,
             },
         };
 
@@ -673,6 +676,7 @@ fn stress_duplicate_completion_idempotency() {
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
+                wal: None,
             },
         };
 
@@ -856,6 +860,7 @@ fn stress_lease_expiry_during_partition() {
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
+                wal: None,
             },
         };
 
@@ -1057,6 +1062,7 @@ fn stress_high_message_loss() {
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
+                wal: None,
             },
         };
 
@@ -1266,6 +1272,7 @@ fn concurrency_request_ready_without_release_fails() {
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
+                wal: None,
             },
         };
         let rate_limiter = MockGubernatorClient::new_arc();

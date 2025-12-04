@@ -8,6 +8,8 @@ use silo::pb::*;
 use silo::server::run_grpc_with_reaper;
 use silo::settings::{Backend, DatabaseTemplate};
 use tokio::net::TcpListener;
+use tonic_health::pb::health_client::HealthClient;
+use tonic_health::pb::HealthCheckRequest;
 
 // Integration test that boots the real gRPC server and talks to it over TCP.
 #[silo::test(flavor = "multi_thread")] // multi_thread to match server expectations
@@ -20,6 +22,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
         let template = DatabaseTemplate {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let mut factory = ShardFactory::new(template, rate_limiter);
@@ -154,6 +157,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
         let template = DatabaseTemplate {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let mut factory = ShardFactory::new(template, rate_limiter);
@@ -279,6 +283,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
         let template = DatabaseTemplate {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let mut factory = ShardFactory::new(template, rate_limiter);
@@ -397,6 +402,7 @@ async fn grpc_server_query_errors() -> anyhow::Result<()> {
         let template = DatabaseTemplate {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let mut factory = ShardFactory::new(template, rate_limiter);
@@ -492,6 +498,7 @@ async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
         let template = DatabaseTemplate {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let mut factory = ShardFactory::new(template, rate_limiter);
@@ -582,6 +589,7 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
         let template = DatabaseTemplate {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let mut factory = ShardFactory::new(template, rate_limiter);
@@ -660,6 +668,75 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
         let parsed_payload: serde_json::Value = serde_json::from_str(payload_str)?;
         assert_eq!(parsed_payload["task"], "process");
         assert_eq!(parsed_payload["nested"]["field"], "value");
+
+        let _ = shutdown_tx.send(());
+        let join_result = server.await;
+        match join_result {
+            Ok(inner) => {
+                if let Err(e) = inner {
+                    return Err(anyhow::anyhow!(e.to_string()));
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        }
+        Ok(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_health_check_returns_serving() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let tmp = tempfile::tempdir()?;
+        let template = DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+        };
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let mut factory = ShardFactory::new(template, rate_limiter);
+        let _ = factory.open(0).await?;
+        let factory = Arc::new(factory);
+
+        let listener =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+        let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), shutdown_rx));
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint.clone())?
+            .connect()
+            .await?;
+        let mut health_client = HealthClient::new(channel);
+
+        // Check overall health (empty service name)
+        let resp = health_client
+            .check(HealthCheckRequest {
+                service: "".to_string(),
+            })
+            .await?
+            .into_inner();
+        assert_eq!(
+            resp.status,
+            tonic_health::pb::health_check_response::ServingStatus::Serving as i32,
+            "overall health should be SERVING"
+        );
+
+        // Check the specific Silo service health (silo.v1.Silo is the full gRPC service name)
+        let resp = health_client
+            .check(HealthCheckRequest {
+                service: "silo.v1.Silo".to_string(),
+            })
+            .await?
+            .into_inner();
+        assert_eq!(
+            resp.status,
+            tonic_health::pb::health_check_response::ServingStatus::Serving as i32,
+            "silo.v1.Silo service should be SERVING"
+        );
 
         let _ = shutdown_tx.send(());
         let join_result = server.await;

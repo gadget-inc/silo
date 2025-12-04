@@ -11,7 +11,7 @@ use tokio::sync::RwLock;
 use tonic::transport::Channel;
 use tracing::{debug, warn};
 
-use crate::coordination::{Coordinator, ShardOwnerMap};
+use crate::coordination::{CoordinationError, Coordinator, ShardOwnerMap};
 use crate::factory::ShardFactory;
 use crate::pb::silo_client::SiloClient;
 use crate::pb::{ColumnInfo, JsonValueBytes, QueryRequest};
@@ -47,14 +47,14 @@ pub struct ClusterClient {
     /// Local shard factory for querying local shards
     factory: Arc<ShardFactory>,
     /// Coordinator for getting shard ownership information
-    coordinator: Option<Arc<Coordinator>>,
+    coordinator: Option<Arc<dyn Coordinator>>,
     /// Cache of gRPC client connections to peer nodes
     connections: RwLock<HashMap<String, SiloClient<Channel>>>,
 }
 
 impl ClusterClient {
     /// Create a new cluster client
-    pub fn new(factory: Arc<ShardFactory>, coordinator: Option<Arc<Coordinator>>) -> Self {
+    pub fn new(factory: Arc<ShardFactory>, coordinator: Option<Arc<dyn Coordinator>>) -> Self {
         Self {
             factory,
             coordinator,
@@ -113,7 +113,7 @@ impl ClusterClient {
         let owner_map = coordinator
             .get_shard_owner_map()
             .await
-            .map_err(|e| ClusterClientError::QueryFailed(e.to_string()))?;
+            .map_err(|e: CoordinationError| ClusterClientError::QueryFailed(e.to_string()))?;
 
         let Some(addr) = owner_map.shard_to_addr.get(&shard_id) else {
             return Err(ClusterClientError::ShardNotFound(shard_id));
@@ -139,10 +139,9 @@ impl ClusterClient {
 
         let schema = Arc::new(dataframe.schema().as_arrow().clone());
 
-        let batches = dataframe
-            .collect()
-            .await
-            .map_err(|e| ClusterClientError::QueryFailed(format!("Query execution failed: {}", e)))?;
+        let batches = dataframe.collect().await.map_err(|e| {
+            ClusterClientError::QueryFailed(format!("Query execution failed: {}", e))
+        })?;
 
         // Use schema from dataframe or first batch
         let schema = if let Some(batch) = batches.first() {
@@ -165,19 +164,20 @@ impl ClusterClient {
         for batch in batches {
             let mut buf = Vec::new();
             let mut writer = datafusion::arrow::json::ArrayWriter::new(&mut buf);
-            writer
-                .write(&batch)
-                .map_err(|e| ClusterClientError::QueryFailed(format!("Serialization error: {}", e)))?;
-            writer
-                .finish()
-                .map_err(|e| ClusterClientError::QueryFailed(format!("Serialization error: {}", e)))?;
+            writer.write(&batch).map_err(|e| {
+                ClusterClientError::QueryFailed(format!("Serialization error: {}", e))
+            })?;
+            writer.finish().map_err(|e| {
+                ClusterClientError::QueryFailed(format!("Serialization error: {}", e))
+            })?;
 
             let json_array: Vec<serde_json::Value> = serde_json::from_slice(&buf)
                 .map_err(|e| ClusterClientError::QueryFailed(format!("JSON parse error: {}", e)))?;
 
             for row_value in json_array {
-                let row_bytes = serde_json::to_vec(&row_value)
-                    .map_err(|e| ClusterClientError::QueryFailed(format!("JSON serialize error: {}", e)))?;
+                let row_bytes = serde_json::to_vec(&row_value).map_err(|e| {
+                    ClusterClientError::QueryFailed(format!("JSON serialize error: {}", e))
+                })?;
                 rows.push(JsonValueBytes { data: row_bytes });
             }
         }
@@ -223,7 +223,10 @@ impl ClusterClient {
     }
 
     /// Query all shards in the cluster and combine results
-    pub async fn query_all_shards(&self, sql: &str) -> Result<Vec<QueryResult>, ClusterClientError> {
+    pub async fn query_all_shards(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<QueryResult>, ClusterClientError> {
         let shard_ids = self.get_all_shard_ids().await?;
         let mut results = Vec::new();
 
@@ -246,7 +249,7 @@ impl ClusterClient {
             let owner_map = coordinator
                 .get_shard_owner_map()
                 .await
-                .map_err(|e| ClusterClientError::QueryFailed(e.to_string()))?;
+                .map_err(|e: CoordinationError| ClusterClientError::QueryFailed(e.to_string()))?;
             Ok((0..owner_map.num_shards).collect())
         } else {
             // No coordinator, just return local shard IDs
@@ -269,7 +272,7 @@ impl ClusterClient {
         coordinator
             .get_shard_owner_map()
             .await
-            .map_err(|e| ClusterClientError::QueryFailed(e.to_string()))
+            .map_err(|e: CoordinationError| ClusterClientError::QueryFailed(e.to_string()))
     }
 
     /// Check if this node owns a specific shard
@@ -277,4 +280,3 @@ impl ClusterClient {
         self.factory.get(&shard_id.to_string()).is_some()
     }
 }
-

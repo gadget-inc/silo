@@ -27,7 +27,7 @@ use crate::settings::AppConfig;
 #[derive(Clone)]
 pub struct AppState {
     pub factory: Arc<ShardFactory>,
-    pub coordinator: Option<Arc<Coordinator>>,
+    pub coordinator: Option<Arc<dyn Coordinator>>,
     pub cluster_client: Arc<ClusterClient>,
 }
 
@@ -659,7 +659,7 @@ pub fn create_router(state: AppState) -> Router {
 pub async fn run_webui(
     addr: SocketAddr,
     factory: Arc<ShardFactory>,
-    coordinator: Option<Arc<Coordinator>>,
+    coordinator: Option<Arc<dyn Coordinator>>,
     _cfg: AppConfig,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

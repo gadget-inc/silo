@@ -1,7 +1,16 @@
 { inputs, ... }:
 {
-  perSystem = { config, self', pkgs, lib, ... }:
+  perSystem = { config, self', pkgs, lib, system, ... }:
     let
+      # Set up rust overlay for the toolchain
+      rustPkgs = import inputs.nixpkgs {
+        inherit system;
+        overlays = [ inputs.rust-overlay.overlays.default ];
+      };
+      
+      # Get rust toolchain from rust-toolchain.toml
+      rustToolchain = rustPkgs.rust-bin.fromRustupToolchainFile ../../rust-toolchain.toml;
+
       # Custom packages not in nixpkgs
       gubernator = pkgs.buildGoModule rec {
         pname = "gubernator";
@@ -43,10 +52,9 @@
     {
       devShells.default = pkgs.mkShell {
         name = "silo-shell";
-        inputsFrom = [
-          self'.devShells.rust
-        ];
-        packages = with pkgs; [
+        packages = [
+          rustToolchain
+        ] ++ (with pkgs; [
           git
           just
           nixd # Nix language server
@@ -60,7 +68,8 @@
           devScript
           nodejs_24 # For validation scripts
           pnpm # Package manager for TypeScript client
-        ];
+          kubectl # for interacting with local K8S API server
+        ]);
 
         # Set the project root for the dev script
         shellHook = ''

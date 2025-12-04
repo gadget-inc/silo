@@ -16,7 +16,7 @@ pub enum StorageError {
     InvalidUrl(String),
 }
 
-pub(crate) fn resolve_object_store(
+pub fn resolve_object_store(
     backend: &Backend,
     path: &str,
 ) -> Result<Arc<dyn ObjectStore>, StorageError> {

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use silo::coordination::{Coordination, Coordinator};
+use silo::coordination::{etcd::EtcdConnection, Coordinator, EtcdCoordinator};
 
 // Global mutex to serialize coordination tests
 static COORDINATION_TEST_MUTEX: Mutex<()> = Mutex::new(());
@@ -25,20 +25,41 @@ async fn multiple_nodes_own_unique_shards() {
     let num_shards: u32 = 128;
 
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
-    let coord = Coordination::connect(&cfg.coordination)
+    let coord = EtcdConnection::connect(&cfg.coordination)
         .await
         .expect("connect etcd");
 
     // Start three coordinators (nodes)
-    let (c1, h1) = Coordinator::start(&coord, &prefix, "n1", "http://127.0.0.1:50051", num_shards, 10)
-        .await
-        .expect("start c1");
-    let (c2, h2) = Coordinator::start(&coord, &prefix, "n2", "http://127.0.0.1:50052", num_shards, 10)
-        .await
-        .expect("start c2");
-    let (c3, h3) = Coordinator::start(&coord, &prefix, "n3", "http://127.0.0.1:50053", num_shards, 10)
-        .await
-        .expect("start c3");
+    let (c1, h1) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n1",
+        "http://127.0.0.1:50051",
+        num_shards,
+        10,
+    )
+    .await
+    .expect("start c1");
+    let (c2, h2) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n2",
+        "http://127.0.0.1:50052",
+        num_shards,
+        10,
+    )
+    .await
+    .expect("start c2");
+    let (c3, h3) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n3",
+        "http://127.0.0.1:50053",
+        num_shards,
+        10,
+    )
+    .await
+    .expect("start c3");
 
     // Rely on convergence and explicit membership checks instead of per-node readiness
 
@@ -114,16 +135,27 @@ async fn adding_a_node_rebalances_shards() {
     let prefix = unique_prefix();
     let num_shards: u32 = 128;
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
-    let coord = Coordination::connect(&cfg.coordination)
-        .await
-        .expect("connect etcd");
 
-    let (c1, h1) = Coordinator::start(&coord, &prefix, "n1", "http://127.0.0.1:50051", num_shards, 10)
-        .await
-        .unwrap();
-    let (c2, h2) = Coordinator::start(&coord, &prefix, "n2", "http://127.0.0.1:50052", num_shards, 10)
-        .await
-        .unwrap();
+    let (c1, h1) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n1",
+        "http://127.0.0.1:50051",
+        num_shards,
+        10,
+    )
+    .await
+    .unwrap();
+    let (c2, h2) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n2",
+        "http://127.0.0.1:50052",
+        num_shards,
+        10,
+    )
+    .await
+    .unwrap();
     assert!(c1.wait_converged(std::time::Duration::from_secs(20)).await);
     assert!(c2.wait_converged(std::time::Duration::from_secs(20)).await);
 
@@ -137,9 +169,16 @@ async fn adding_a_node_rebalances_shards() {
     assert_eq!(before_union, expected);
 
     // Add new node
-    let (c3, h3) = Coordinator::start(&coord, &prefix, "n3", "http://127.0.0.1:50053", num_shards, 10)
-        .await
-        .unwrap();
+    let (c3, h3) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n3",
+        "http://127.0.0.1:50053",
+        num_shards,
+        10,
+    )
+    .await
+    .unwrap();
     // Converge after adding the new member
     assert!(c1.wait_converged(std::time::Duration::from_secs(5)).await);
     assert!(c2.wait_converged(std::time::Duration::from_secs(5)).await);
@@ -179,19 +218,37 @@ async fn removing_a_node_rebalances_shards() {
     let prefix = unique_prefix();
     let num_shards: u32 = 128;
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
-    let coord = Coordination::connect(&cfg.coordination)
-        .await
-        .expect("connect etcd");
 
-    let (c1, h1) = Coordinator::start(&coord, &prefix, "n1", "http://127.0.0.1:50051", num_shards, 10)
-        .await
-        .unwrap();
-    let (c2, h2) = Coordinator::start(&coord, &prefix, "n2", "http://127.0.0.1:50052", num_shards, 10)
-        .await
-        .unwrap();
-    let (c3, h3) = Coordinator::start(&coord, &prefix, "n3", "http://127.0.0.1:50053", num_shards, 10)
-        .await
-        .unwrap();
+    let (c1, h1) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n1",
+        "http://127.0.0.1:50051",
+        num_shards,
+        10,
+    )
+    .await
+    .unwrap();
+    let (c2, h2) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n2",
+        "http://127.0.0.1:50052",
+        num_shards,
+        10,
+    )
+    .await
+    .unwrap();
+    let (c3, h3) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n3",
+        "http://127.0.0.1:50053",
+        num_shards,
+        10,
+    )
+    .await
+    .unwrap();
     assert!(c1.wait_converged(Duration::from_secs(20)).await);
     assert!(c2.wait_converged(Duration::from_secs(20)).await);
     assert!(c3.wait_converged(Duration::from_secs(20)).await);
@@ -225,31 +282,56 @@ async fn rapid_membership_churn_converges() {
     let prefix = unique_prefix();
     let num_shards: u32 = 128;
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
-    let coord = Coordination::connect(&cfg.coordination)
-        .await
-        .expect("connect etcd");
 
     // Start first node, then quickly add/remove others to simulate churn
-    let (c1, h1) = Coordinator::start(&coord, &prefix, "n1", "http://127.0.0.1:50051", num_shards, 10)
-        .await
-        .unwrap();
+    let (c1, h1) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n1",
+        "http://127.0.0.1:50051",
+        num_shards,
+        10,
+    )
+    .await
+    .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let (c2, h2) = Coordinator::start(&coord, &prefix, "n2", "http://127.0.0.1:50052", num_shards, 10)
-        .await
-        .unwrap();
+    let (c2, h2) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n2",
+        "http://127.0.0.1:50052",
+        num_shards,
+        10,
+    )
+    .await
+    .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let (c3, h3) = Coordinator::start(&coord, &prefix, "n3", "http://127.0.0.1:50053", num_shards, 10)
-        .await
-        .unwrap();
+    let (c3, h3) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n3",
+        "http://127.0.0.1:50053",
+        num_shards,
+        10,
+    )
+    .await
+    .unwrap();
 
     // Brief churn: stop and restart n2 quickly
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     c2.shutdown().await.unwrap();
     let _ = h2.abort();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    let (c2b, h2b) = Coordinator::start(&coord, &prefix, "n2", "http://127.0.0.1:50052", num_shards, 10)
-        .await
-        .unwrap();
+    let (c2b, h2b) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n2",
+        "http://127.0.0.1:50052",
+        num_shards,
+        10,
+    )
+    .await
+    .unwrap();
 
     // Wait for all to converge post-churn
     let deadline = std::time::Duration::from_secs(20);

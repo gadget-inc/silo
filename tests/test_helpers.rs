@@ -42,6 +42,7 @@ pub async fn open_temp_shard_with_rate_limiter(
         path: tmp.path().to_string_lossy().to_string(),
         // Use fast flush interval for tests to speed them up
         flush_interval_ms: Some(10),
+        wal: None,
     };
     let shard = JobStoreShard::open_with_rate_limiter(&cfg, rate_limiter)
         .await

@@ -1,0 +1,28 @@
+# Example config for Kubernetes deployment with Google Cloud Storage
+# Uses K8s Lease-based coordination and GCS for object storage
+# WAL is stored locally for low-latency writes, main data in GCS
+
+[server]
+grpc_addr = "0.0.0.0:50051"
+
+[coordination]
+backend = "k8s"
+cluster_prefix = "silo-prod"
+lease_ttl_secs = 15
+k8s_namespace = "silo"
+
+[webui]
+enabled = true
+addr = "0.0.0.0:50052"
+
+[database]
+# Use URL backend for GCS - SlateDB resolves gs:// URLs automatically
+# Credentials are read from GOOGLE_APPLICATION_CREDENTIALS or workload identity
+backend = "url"
+path = "gs://my-bucket/silo/data-%shard%"
+
+# Optional: Use local filesystem for WAL for lower write latency
+# If omitted, WAL uses the same backend as the main store
+[database.wal]
+backend = "fs"
+path = "/var/lib/silo/wal-%shard%"

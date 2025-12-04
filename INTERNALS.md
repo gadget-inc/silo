@@ -1,6 +1,6 @@
 # Silo internals
 
-Silo is built on top of SlateDB, which is a low-level key value store. So, we implement and maintain higher-level data-structurs within this KV store.
+Silo is built on top of SlateDB, which is a low-level key value store. Silo implements and maintain higher-level data-structurs within this KV store.
 
 ## Entities
 
@@ -34,18 +34,6 @@ All of Silo is built to house job data for multiple tenants, if necessary. Stora
 Secondary indexes are also mapped as ordered keys in the k/v store:
 
 - `idx/status_ts/<tenant>/<status>/<inv_ts:020>/<job-id>` stores a secondary index for all jobs, by status, ordered by the time of the last transition
-
-## Concurrency Queues
-
-TODO: document concurrency queues
-
-### Floating max concurrency limits
-
-Silo supports concurrency queues who's max concurrency is adjusted continuously over time. This allows queues to be adjusted by operators, as well as by automated controllers trying to achieve some setpoint in some other system, like rate limit usage of a downstream API.
-
-Floating max concurrency limits are specified by each job when the job is enqueued, which puts the job in that concurrency queue. The max concurrency for that queue is defaulted to an initial value, and then periodically refreshed. If too many jobs are currently running, no more will start until the queue is below its new max concurrency, and likewise if the queue now has more headroom, more jobs will start. The max concurrency value for the queue is refreshed by sending a special type of refresh task to any listening Silo worker, which can then run whatever fancy business logic necessary to compute a new value.
-
-We're careful to only push refresh tasks for queues that are actively in use.
 
 ## Clustering approach
 
@@ -128,6 +116,18 @@ Key layout (control plane):
 
 - `coord/members/<node_id>` → ephemeral; node metadata
 - `coord/shards/<shard_id>/owner` → ephemeral; ownership record
+
+## Concurrency Queues
+
+TODO: document concurrency queues
+
+### Floating max concurrency limits
+
+Silo supports concurrency queues who's max concurrency is adjusted continuously over time. This allows queues to be adjusted by operators, as well as by automated controllers trying to achieve some setpoint in some other system, like rate limit usage of a downstream API.
+
+Floating max concurrency limits are specified by each job when the job is enqueued, which puts the job in that concurrency queue. The max concurrency for that queue is defaulted to an initial value, and then periodically refreshed. If too many jobs are currently running, no more will start until the queue is below its new max concurrency, and likewise if the queue now has more headroom, more jobs will start. The max concurrency value for the queue is refreshed by sending a special type of refresh task to any listening Silo worker, which can then run whatever fancy business logic necessary to compute a new value.
+
+We're careful to only push refresh tasks for queues that are actively in use.
 
 ### Gubernator rate limiting
 

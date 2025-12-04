@@ -204,7 +204,10 @@ async fn floating_concurrency_limit_dequeue_returns_refresh_tasks() {
     assert_eq!(refresh.queue_key, queue);
     assert_eq!(refresh.current_max_concurrency, 2);
     assert_eq!(refresh.metadata.len(), 1);
-    assert_eq!(refresh.metadata[0], ("key".to_string(), "value".to_string()));
+    assert_eq!(
+        refresh.metadata[0],
+        ("key".to_string(), "value".to_string())
+    );
 }
 
 #[silo::test]
@@ -387,7 +390,10 @@ async fn floating_limit_refresh_failure_triggers_backoff() {
         .as_ref()
         .copied()
         .expect("next_retry_at_ms should be set");
-    assert!(next_retry_at > now_ms(), "retry should be in the future (backoff)");
+    assert!(
+        next_retry_at > now_ms(),
+        "retry should be in the future (backoff)"
+    );
     // A new refresh task should be scheduled
     assert!(archived.refresh_task_scheduled);
 
@@ -560,7 +566,10 @@ async fn floating_limit_uses_dynamic_max_concurrency() {
             Task::RunAttempt { job_id, .. } if job_id == &j2
         )
     });
-    assert!(has_j2_run, "j2 should have RunAttempt task after j1 completes");
+    assert!(
+        has_j2_run,
+        "j2 should have RunAttempt task after j1 completes"
+    );
 }
 
 #[silo::test]
@@ -611,8 +620,12 @@ async fn floating_limit_job_persists_limit_type() {
             assert_eq!(fl.default_max_concurrency, 10);
             assert_eq!(fl.refresh_interval_ms, 5000);
             assert_eq!(fl.metadata.len(), 2);
-            assert!(fl.metadata.contains(&("org_id".to_string(), "123".to_string())));
-            assert!(fl.metadata.contains(&("env".to_string(), "prod".to_string())));
+            assert!(fl
+                .metadata
+                .contains(&("org_id".to_string(), "123".to_string())));
+            assert!(fl
+                .metadata
+                .contains(&("env".to_string(), "prod".to_string())));
         }
         _ => panic!("expected FloatingConcurrency limit"),
     }
@@ -822,4 +835,3 @@ async fn floating_limit_successful_refresh_resets_backoff() {
         assert!(decoded.archived().next_retry_at_ms.is_none());
     }
 }
-

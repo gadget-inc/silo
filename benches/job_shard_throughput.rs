@@ -13,6 +13,7 @@ async fn open_temp_shard(
         backend: Backend::Fs,
         path: tmp.path().to_string_lossy().to_string(),
         flush_interval_ms,
+        wal: None,
     };
     let shard = JobStoreShard::open(&cfg).await.expect("open shard");
     (tmp, shard)
@@ -44,7 +45,7 @@ async fn measure_enqueue_throughput(
             for i in 0..jobs_per_producer {
                 let payload = json!({"producer": producer_id, "i": i});
                 shard
-                    .enqueue("-", None, 50, now_ms, None, payload, vec![])
+                    .enqueue("-", None, 50, now_ms, None, payload, vec![], None)
                     .await
                     .expect("enqueue");
             }
@@ -79,7 +80,7 @@ async fn measure_dequeue_throughput(
     for i in 0..total_jobs {
         let payload = json!({"i": i});
         shard
-            .enqueue("-", None, 50, now_ms, None, payload, vec![])
+            .enqueue("-", None, 50, now_ms, None, payload, vec![], None)
             .await
             .expect("enqueue");
     }
@@ -100,17 +101,17 @@ async fn measure_dequeue_throughput(
                     break;
                 }
 
-                let tasks = shard
+                let result = shard
                     .dequeue("-", &worker_id, batch)
                     .await
                     .expect("dequeue");
-                if tasks.is_empty() {
+                if result.tasks.is_empty() {
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                     continue;
                 }
 
                 // Report success to release leases
-                for t in &tasks {
+                for t in &result.tasks {
                     let tid = t.attempt().task_id().to_string();
                     shard
                         .report_attempt_outcome(
@@ -121,7 +122,7 @@ async fn measure_dequeue_throughput(
                         .await
                         .expect("report");
                 }
-                processed.fetch_add(tasks.len(), std::sync::atomic::Ordering::Relaxed);
+                processed.fetch_add(result.tasks.len(), std::sync::atomic::Ordering::Relaxed);
             }
         });
         handles.push(handle);
