@@ -536,10 +536,7 @@ async fn queue_handler(
                             });
                         }
                         "requester" => {
-                            let job_id = json["job_id"]
-                                .as_str()
-                                .unwrap_or("unknown")
-                                .to_string();
+                            let job_id = json["job_id"].as_str().unwrap_or("unknown").to_string();
                             let priority = json["priority"].as_u64().unwrap_or(50) as u8;
                             requesters.push(RequesterRow {
                                 job_id,

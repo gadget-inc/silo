@@ -108,7 +108,29 @@ jobs:
         shell: bash
         run: node scripts/validate-silo-tags.js
 
-  typescript-client:
+  typescript-client-lint:
+    name: TypeScript lints
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-test-env
+        with:
+          cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install dependencies
+        shell: bash
+        working-directory: typescript_client
+        run: pnpm install --frozen-lockfile
+      - name: Lint
+        shell: bash
+        working-directory: typescript_client
+        run: pnpm run lint
+      - name: Typecheck
+        shell: bash
+        working-directory: typescript_client
+        run: pnpm run typecheck
+
+  typescript-client-tests:
     name: TypeScript tests
     runs-on: ubuntu-latest
     steps:
@@ -121,18 +143,6 @@ jobs:
         shell: bash
         working-directory: typescript_client
         run: pnpm install --frozen-lockfile
-      - name: Generate proto code
-        shell: bash
-        working-directory: typescript_client
-        run: pnpm run generate
-      - name: Build TypeScript client
-        shell: bash
-        working-directory: typescript_client
-        run: pnpm run build
-      - name: Lint
-        shell: bash
-        working-directory: typescript_client
-        run: pnpm run lint
       - name: Build silo server
         shell: bash
         run: cargo build
@@ -141,16 +151,38 @@ jobs:
         run: |
           just etcd &
           sleep 3
-      - name: Start silo server
+      - name: Start gubernator
+        shell: bash
+        run: |
+          gubernator &
+          sleep 2
+        env:
+          GUBER_GRPC_ADDRESS: localhost:9991
+          GUBER_HTTP_ADDRESS: 0.0.0.0:9981
+      - name: Start silo server 1
         shell: bash
         run: |
           ./target/debug/silo -c typescript_client/test/silo-test-config.toml &
           sleep 2
+        env:
+          SILO_SERVER__GRPC_ADDR: "127.0.0.1:50051"
+          SILO_WEBUI__ADDR: "127.0.0.1:8081"
+          SILO_DATABASE__PATH: "./tmp/silo-test-data/node1/shard-%shard%"
+      - name: Start silo server 2
+        shell: bash
+        run: |
+          ./target/debug/silo -c typescript_client/test/silo-test-config.toml &
+          sleep 2
+        env:
+          SILO_SERVER__GRPC_ADDR: "127.0.0.1:50052"
+          SILO_WEBUI__ADDR: "127.0.0.1:8082"
+          SILO_DATABASE__PATH: "./tmp/silo-test-data/node2/shard-%shard%"
       - name: Run tests
         shell: bash
         working-directory: typescript_client
         env:
           CI: "true"
+          SILO_SERVERS: "localhost:50051,localhost:50052"
         run: pnpm test
 
   build-docker:

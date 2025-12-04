@@ -14,10 +14,38 @@ dev
 
 ## Running tests
 
-After starting the background services, you can run tests with:
+### Rust tests
+
+After starting the background services, you can run Rust tests with:
 
 ```shell
 cargo test
+```
+
+### TypeScript client tests
+
+The TypeScript client has unit tests and integration tests. Run from the `typescript_client/` directory:
+
+```shell
+cd typescript_client
+pnpm install
+pnpm test
+```
+
+Unit tests use mocks and run without any backend services. Integration tests automatically skip when no server is available.
+
+To run integration tests, start etcd and a silo server, then run with `RUN_INTEGRATION=true`:
+
+```shell
+# Terminal 1: Start etcd
+just etcd
+
+# Terminal 2: Start silo with the test config
+cargo run --bin silo -- -c typescript_client/test/silo-test-config.toml
+
+# Terminal 3: Run all tests including integration tests
+cd typescript_client
+RUN_INTEGRATION=true pnpm test
 ```
 
 ## Running a local instance

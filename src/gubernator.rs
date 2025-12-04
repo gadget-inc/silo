@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tonic::transport::{Channel, Endpoint};
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 use crate::pb::gubernator::{
     v1_client::V1Client, Algorithm, GetRateLimitsReq, RateLimitReq, RateLimitResp, Status,
@@ -219,7 +219,7 @@ impl GubernatorClient {
         let mut client = self.client.write().await;
         *client = Some(grpc_client);
 
-        info!(address = %self.config.address, "connected to Gubernator");
+        debug!(address = %self.config.address, "connected to Gubernator");
         Ok(())
     }
 

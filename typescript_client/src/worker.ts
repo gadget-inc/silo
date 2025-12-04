@@ -1,7 +1,7 @@
 import PQueue from "p-queue";
 import { serializeError } from "serialize-error";
 import type { Task } from "./pb/silo";
-import type { SiloGrpcClient, TaskOutcome } from "./client";
+import type { SiloGRPCClient, TaskOutcome } from "./client";
 
 export { Task };
 
@@ -11,8 +11,8 @@ export { Task };
 export interface TaskContext {
   /** The task being executed */
   task: Task;
-  /** The shard the task is from */
-  shard: string;
+  /** The shard the task is from (for reference) */
+  shard: number;
   /** The worker ID processing this task */
   workerId: string;
   /** Signal that is aborted when the worker is stopping */
@@ -29,13 +29,16 @@ export type TaskHandler = (context: TaskContext) => Promise<TaskOutcome>;
  */
 export interface SiloWorkerOptions {
   /** The silo client to use for communication */
-  client: SiloGrpcClient;
-  /** The shard to poll for tasks */
-  shard: string;
+  client: SiloGRPCClient;
   /** Unique identifier for this worker */
   workerId: string;
   /** The function that will handle each task */
   handler: TaskHandler;
+  /**
+   * Tenant ID for this worker. Required when the server has tenancy enabled.
+   * The worker will only process tasks for this tenant.
+   */
+  tenant?: string;
   /**
    * Number of concurrent poll calls to make.
    * More pollers can help ensure work is always available.
@@ -64,10 +67,6 @@ export interface SiloWorkerOptions {
    */
   heartbeatIntervalMs?: number;
   /**
-   * Optional tenant ID when tenancy is enabled.
-   */
-  tenant?: string;
-  /**
    * Called when an error occurs during polling or task execution.
    * If not provided, errors are logged to console.error.
    */
@@ -77,11 +76,14 @@ export interface SiloWorkerOptions {
 /**
  * A worker that continuously polls for tasks and executes them.
  *
+ * The worker polls the server for tasks from all shards the server owns.
+ * Each task includes a `shard` field that is automatically used for
+ * heartbeats and reporting outcomes.
+ *
  * @example
  * ```typescript
  * const worker = new SiloWorker({
  *   client,
- *   shard: "0",
  *   workerId: "worker-1",
  *   concurrentPollers: 2,
  *   maxConcurrentTasks: 10,
@@ -92,45 +94,51 @@ export interface SiloWorkerOptions {
  *   },
  * });
  *
- * await worker.start();
+ * worker.start();
  * // ... later
  * await worker.stop();
  * ```
  */
 export class SiloWorker {
-  private readonly _client: SiloGrpcClient;
-  private readonly _shard: string;
+  private readonly _client: SiloGRPCClient;
   private readonly _workerId: string;
   private readonly _handler: TaskHandler;
+  private readonly _tenant: string | undefined;
   private readonly _concurrentPollers: number;
   private readonly _maxConcurrentTasks: number;
   private readonly _tasksPerPoll: number;
   private readonly _pollIntervalMs: number;
   private readonly _heartbeatIntervalMs: number;
-  private readonly _tenant?: string;
-  private readonly _onError: (error: Error, context?: { taskId?: string }) => void;
+  private readonly _onError: (
+    error: Error,
+    context?: { taskId?: string }
+  ) => void;
 
   private _running = false;
   private _abortController: AbortController | null = null;
   private _pollerPromises: Promise<void>[] = [];
   private _taskQueue: PQueue;
-  private _heartbeatIntervals: Map<string, ReturnType<typeof setInterval>> = new Map();
+  private _heartbeatIntervals: Map<string, ReturnType<typeof setInterval>> =
+    new Map();
 
   public constructor(options: SiloWorkerOptions) {
     this._client = options.client;
-    this._shard = options.shard;
     this._workerId = options.workerId;
     this._handler = options.handler;
+    this._tenant = options.tenant;
     this._concurrentPollers = options.concurrentPollers ?? 1;
     this._maxConcurrentTasks = options.maxConcurrentTasks ?? 10;
-    this._tasksPerPoll = options.tasksPerPoll ?? Math.ceil(this._maxConcurrentTasks / 2);
+    this._tasksPerPoll =
+      options.tasksPerPoll ?? Math.ceil(this._maxConcurrentTasks / 2);
     this._pollIntervalMs = options.pollIntervalMs ?? 1000;
     this._heartbeatIntervalMs = options.heartbeatIntervalMs ?? 5000;
-    this._tenant = options.tenant;
     this._onError =
       options.onError ??
       ((error, ctx) => {
-        console.error(`[SiloWorker] Error${ctx?.taskId ? ` (task ${ctx.taskId})` : ""}:`, error);
+        console.error(
+          `[SiloWorker] Error${ctx?.taskId ? ` (task ${ctx.taskId})` : ""}:`,
+          error
+        );
       });
 
     // Initialize the task queue with concurrency limit
@@ -175,7 +183,7 @@ export class SiloWorker {
 
     // Start the configured number of pollers
     for (let i = 0; i < this._concurrentPollers; i++) {
-      this._pollerPromises.push(this._pollLoop(i));
+      this._pollerPromises.push(this._pollLoop());
     }
   }
 
@@ -198,7 +206,9 @@ export class SiloWorker {
 
     // Wait for all queued and active tasks to complete with timeout
     const queueIdlePromise = this._taskQueue.onIdle();
-    const timeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, timeoutMs));
+    const timeoutPromise = new Promise<void>((resolve) =>
+      setTimeout(resolve, timeoutMs)
+    );
     await Promise.race([queueIdlePromise, timeoutPromise]);
 
     // Clear the queue (any remaining tasks will be abandoned)
@@ -216,13 +226,15 @@ export class SiloWorker {
   /**
    * The main polling loop for a single poller.
    */
-  private async _pollLoop(_pollerId: number): Promise<void> {
+  private async _pollLoop(): Promise<void> {
     while (this._running) {
       try {
         await this._poll();
       } catch (error) {
         if (this._running) {
-          this._onError(error instanceof Error ? error : new Error(String(error)));
+          this._onError(
+            error instanceof Error ? error : new Error(String(error))
+          );
         }
       }
 
@@ -238,8 +250,6 @@ export class SiloWorker {
    */
   private async _poll(): Promise<void> {
     // Wait if the queue is too full
-    // We allow queueing up to 1 task for every 1 task currently running
-    // So total capacity = maxConcurrentTasks (running) + maxConcurrentTasks (queued)
     while (this._running && this._taskQueue.size >= this._maxConcurrentTasks) {
       await this._sleep(this._pollIntervalMs / 2);
     }
@@ -249,7 +259,6 @@ export class SiloWorker {
     }
 
     // Calculate how many tasks we can accept
-    // Available queue slots = max queue depth - current queue size
     const availableQueueSlots = this._maxConcurrentTasks - this._taskQueue.size;
     if (availableQueueSlots <= 0) {
       return;
@@ -257,8 +266,8 @@ export class SiloWorker {
 
     const tasksToRequest = Math.min(availableQueueSlots, this._tasksPerPoll);
 
+    // Lease tasks from the server (server handles multi-shard polling)
     const tasks = await this._client.leaseTasks({
-      shard: this._shard,
       workerId: this._workerId,
       maxTasks: tasksToRequest,
       tenant: this._tenant,
@@ -274,12 +283,18 @@ export class SiloWorker {
    * Add a task to the execution queue.
    */
   private _enqueueTask(task: Task): void {
+    // Shard is now a number from the proto
+    const shard = task.shard;
+
     // Start heartbeat for this task immediately
     const heartbeatInterval = setInterval(() => {
-      this._sendHeartbeat(task.id).catch((error) => {
-        this._onError(error instanceof Error ? error : new Error(String(error)), {
-          taskId: task.id,
-        });
+      this._sendHeartbeat(task.id, shard).catch((error) => {
+        this._onError(
+          error instanceof Error ? error : new Error(String(error)),
+          {
+            taskId: task.id,
+          }
+        );
       });
     }, this._heartbeatIntervalMs);
     this._heartbeatIntervals.set(task.id, heartbeatInterval);
@@ -287,12 +302,15 @@ export class SiloWorker {
     // Add task to the queue for execution
     this._taskQueue
       .add(async () => {
-        await this._executeTask(task);
+        await this._executeTask(task, shard);
       })
       .catch((error) => {
-        this._onError(error instanceof Error ? error : new Error(String(error)), {
-          taskId: task.id,
-        });
+        this._onError(
+          error instanceof Error ? error : new Error(String(error)),
+          {
+            taskId: task.id,
+          }
+        );
       })
       .finally(() => {
         // Stop heartbeat for this task
@@ -307,10 +325,10 @@ export class SiloWorker {
   /**
    * Execute a single task and report its outcome.
    */
-  private async _executeTask(task: Task): Promise<void> {
+  private async _executeTask(task: Task, shard: number): Promise<void> {
     const context: TaskContext = {
       task,
-      shard: this._shard,
+      shard,
       workerId: this._workerId,
       signal: this._abortController?.signal ?? new AbortController().signal,
     };
@@ -327,20 +345,20 @@ export class SiloWorker {
       };
     }
 
-    // Report the outcome
+    // Report the outcome to the correct shard
     await this._client.reportOutcome({
-      shard: this._shard,
       taskId: task.id,
-      tenant: this._tenant,
+      shard,
       outcome,
+      tenant: this._tenant,
     });
   }
 
   /**
    * Send a heartbeat for a task.
    */
-  private async _sendHeartbeat(taskId: string): Promise<void> {
-    await this._client.heartbeat(this._shard, this._workerId, taskId);
+  private async _sendHeartbeat(taskId: string, shard: number): Promise<void> {
+    await this._client.heartbeat(this._workerId, taskId, shard, this._tenant);
   }
 
   /**
@@ -356,7 +374,7 @@ export class SiloWorker {
           clearTimeout(timeout);
           resolve();
         },
-        { once: true },
+        { once: true }
       );
     });
   }

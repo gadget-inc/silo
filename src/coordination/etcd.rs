@@ -13,6 +13,8 @@ use tokio::sync::{watch, Mutex, Notify};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
+use crate::factory::ShardFactory;
+
 use super::{
     compute_desired_shards_for_node, keys, CoordinationError, Coordinator, MemberInfo,
     ShardOwnerMap,
@@ -32,10 +34,15 @@ pub struct EtcdCoordinator {
     shard_guards: Arc<Mutex<HashMap<u32, Arc<EtcdShardGuard>>>>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
+    /// Factory for opening/closing shards when ownership changes
+    factory: Arc<ShardFactory>,
 }
 
 impl EtcdCoordinator {
     /// Connect to etcd and start the coordinator.
+    ///
+    /// The coordinator will manage shard ownership and automatically open/close
+    /// shards in the factory as ownership changes.
     pub async fn start(
         endpoints: &[String],
         cluster_prefix: &str,
@@ -43,6 +50,7 @@ impl EtcdCoordinator {
         grpc_addr: impl Into<String>,
         num_shards: u32,
         ttl_secs: i64,
+        factory: Arc<ShardFactory>,
     ) -> Result<(Self, tokio::task::JoinHandle<()>), CoordinationError> {
         let endpoints = if endpoints.is_empty() {
             vec!["http://127.0.0.1:2379".to_string()]
@@ -105,6 +113,7 @@ impl EtcdCoordinator {
             shard_guards: Arc::new(Mutex::new(HashMap::new())),
             shutdown_tx,
             shutdown_rx: shutdown_rx.clone(),
+            factory,
         };
 
         let me_bg = me.clone();
@@ -275,7 +284,8 @@ impl EtcdCoordinator {
         );
         let runner = guard.clone();
         let owned_arc = self.owned.clone();
-        tokio::spawn(async move { runner.run(owned_arc).await });
+        let factory = self.factory.clone();
+        tokio::spawn(async move { runner.run(owned_arc, factory).await });
         guards.insert(shard_id, guard.clone());
         guard
     }
@@ -523,7 +533,11 @@ impl EtcdShardGuard {
         }
     }
 
-    pub async fn run(self: Arc<Self>, owned_arc: Arc<Mutex<HashSet<u32>>>) {
+    pub async fn run(
+        self: Arc<Self>,
+        owned_arc: Arc<Mutex<HashSet<u32>>>,
+        factory: Arc<ShardFactory>,
+    ) {
         use tracing::{info_span, Instrument};
 
         loop {
@@ -599,8 +613,14 @@ impl EtcdShardGuard {
                                         st.held_key = Some(key);
                                         st.phase = ShardPhase::Held;
                                     }
-                                    let mut owned = owned_arc.lock().await;
-                                    owned.insert(self.shard_id);
+                                    {
+                                        let mut owned = owned_arc.lock().await;
+                                        owned.insert(self.shard_id);
+                                    }
+                                    // Open the shard now that we own it
+                                    if let Err(e) = factory.open(self.shard_id as usize).await {
+                                        tracing::error!(shard_id = self.shard_id, error = %e, "failed to open shard after acquiring lock");
+                                    }
                                     debug!(shard_id = self.shard_id, attempts = attempt, "shard: acquire success");
                                     break;
                                 }
@@ -645,6 +665,10 @@ impl EtcdShardGuard {
                             return;
                         }
                         if let Some(key) = key_opt {
+                            // Close the shard before releasing the lock
+                            if let Err(e) = factory.close(self.shard_id as usize).await {
+                                tracing::error!(shard_id = self.shard_id, error = %e, "failed to close shard before releasing lock");
+                            }
                             let mut lock_cli = self.client.lock_client();
                             let _ = lock_cli.unlock(key).await;
                             {
@@ -652,8 +676,10 @@ impl EtcdShardGuard {
                                 st.held_key = None;
                                 st.phase = ShardPhase::Idle;
                             }
-                            let mut owned = owned_arc.lock().await;
-                            owned.remove(&self.shard_id);
+                            {
+                                let mut owned = owned_arc.lock().await;
+                                owned.remove(&self.shard_id);
+                            }
                             debug!(shard_id = self.shard_id, "shard: release done");
                         } else {
                             let mut st = self.state.lock().await;
@@ -667,10 +693,16 @@ impl EtcdShardGuard {
                 ShardPhase::ShuttingDown => {
                     let key_opt = { self.state.lock().await.held_key.clone() };
                     if let Some(key) = key_opt {
+                        // Close the shard before releasing the lock
+                        if let Err(e) = factory.close(self.shard_id as usize).await {
+                            tracing::error!(shard_id = self.shard_id, error = %e, "failed to close shard during shutdown");
+                        }
                         let mut lock_cli = self.client.lock_client();
                         let _ = lock_cli.unlock(key).await;
-                        let mut owned = owned_arc.lock().await;
-                        owned.remove(&self.shard_id);
+                        {
+                            let mut owned = owned_arc.lock().await;
+                            owned.remove(&self.shard_id);
+                        }
                     }
                     {
                         let mut st = self.state.lock().await;

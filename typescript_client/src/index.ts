@@ -1,10 +1,12 @@
 export {
-  SiloGrpcClient,
+  SiloGRPCClient,
   encodePayload,
   decodePayload,
+  fnv1a32,
+  defaultTenantToShard,
   GubernatorAlgorithm,
   GubernatorBehavior,
-  type SiloGrpcClientOptions,
+  type SiloGRPCClientOptions,
   type EnqueueJobOptions,
   type LeaseTasksOptions,
   type ReportOutcomeOptions,
@@ -16,6 +18,9 @@ export {
   type ConcurrencyLimitConfig,
   type RateLimitConfig,
   type RateLimitRetryPolicyConfig,
+  type ShardRoutingConfig,
+  type TenantToShardFn,
+  type ShardOwner,
 } from "./client";
 
 export { SiloWorker, type SiloWorkerOptions, type TaskContext, type TaskHandler } from "./worker";

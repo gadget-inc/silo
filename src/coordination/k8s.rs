@@ -38,13 +38,15 @@ use kube::{
     runtime::watcher::{watcher, Config as WatcherConfig, Event},
     Client,
 };
-use std::pin::pin;
-use tokio_stream::StreamExt;
 use std::collections::{HashMap, HashSet};
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, Mutex, Notify};
+use tokio_stream::StreamExt;
 use tracing::{debug, info, warn};
+
+use crate::factory::ShardFactory;
 
 use super::{
     compute_desired_shards_for_node, keys, CoordinationError, Coordinator, MemberInfo,
@@ -74,10 +76,15 @@ pub struct K8sCoordinator {
     shutdown_rx: watch::Receiver<bool>,
     /// Notifier for membership changes (from watcher)
     membership_changed: Arc<Notify>,
+    /// Factory for opening/closing shards when ownership changes
+    factory: Arc<ShardFactory>,
 }
 
 impl K8sCoordinator {
     /// Start the K8S coordinator.
+    ///
+    /// The coordinator will manage shard ownership and automatically open/close
+    /// shards in the factory as ownership changes.
     pub async fn start(
         namespace: &str,
         cluster_prefix: &str,
@@ -85,6 +92,7 @@ impl K8sCoordinator {
         grpc_addr: impl Into<String>,
         num_shards: u32,
         lease_duration_secs: i64,
+        factory: Arc<ShardFactory>,
     ) -> Result<(Self, tokio::task::JoinHandle<()>), CoordinationError> {
         let client = Client::try_default()
             .await
@@ -156,6 +164,7 @@ impl K8sCoordinator {
             shutdown_tx,
             shutdown_rx: shutdown_rx.clone(),
             membership_changed,
+            factory,
         };
 
         // Do initial member list fetch before starting background tasks
@@ -421,9 +430,7 @@ impl K8sCoordinator {
                 resource_version: Some(current_rv.clone()),
                 uid: existing.metadata.uid.clone(),
                 labels: existing.metadata.labels.clone(),
-                annotations: Some(
-                    [("silo.dev/member-info".to_string(), member_info_json)].into(),
-                ),
+                annotations: Some([("silo.dev/member-info".to_string(), member_info_json)].into()),
                 ..Default::default()
             },
             spec: Some(k8s_openapi::api::coordination::v1::LeaseSpec {
@@ -518,7 +525,8 @@ impl K8sCoordinator {
         );
         let runner = guard.clone();
         let owned_arc = self.owned.clone();
-        tokio::spawn(async move { runner.run(owned_arc).await });
+        let factory = self.factory.clone();
+        tokio::spawn(async move { runner.run(owned_arc, factory).await });
         guards.insert(shard_id, guard.clone());
         guard
     }
@@ -736,7 +744,11 @@ impl K8sShardGuard {
         }
     }
 
-    pub async fn run(self: Arc<Self>, owned_arc: Arc<Mutex<HashSet<u32>>>) {
+    pub async fn run(
+        self: Arc<Self>,
+        owned_arc: Arc<Mutex<HashSet<u32>>>,
+        factory: Arc<ShardFactory>,
+    ) {
         let leases: Api<Lease> = Api::namespaced(self.client.clone(), &self.namespace);
         let lease_name = self.lease_name();
 
@@ -793,11 +805,20 @@ impl K8sShardGuard {
                                     let mut owned = owned_arc.lock().await;
                                     owned.insert(self.shard_id);
                                 }
+                                // Open the shard now that we own it
+                                if let Err(e) = factory.open(self.shard_id as usize).await {
+                                    tracing::error!(shard_id = self.shard_id, error = %e, "failed to open shard after acquiring lease");
+                                }
                                 debug!(shard_id = self.shard_id, rv = %rv, "k8s shard: acquired");
 
                                 // Start renewal loop
                                 self.clone()
-                                    .run_renewal_loop(owned_arc.clone(), &leases, &lease_name)
+                                    .run_renewal_loop(
+                                        owned_arc.clone(),
+                                        factory.clone(),
+                                        &leases,
+                                        &lease_name,
+                                    )
                                     .await;
                                 break;
                             }
@@ -829,6 +850,11 @@ impl K8sShardGuard {
                     };
 
                     if !cancelled {
+                        // Close the shard before releasing the lease
+                        if let Err(e) = factory.close(self.shard_id as usize).await {
+                            tracing::error!(shard_id = self.shard_id, error = %e, "failed to close shard before releasing lease");
+                        }
+
                         // Release the lease by clearing holderIdentity with CAS
                         let has_rv = {
                             let st = self.state.lock().await;
@@ -836,12 +862,12 @@ impl K8sShardGuard {
                         };
 
                         if has_rv {
-                            match self
-                                .release_lease_cas(&leases, &lease_name)
-                                .await
-                            {
+                            match self.release_lease_cas(&leases, &lease_name).await {
                                 Ok(_) => {
-                                    debug!(shard_id = self.shard_id, "k8s shard: released with CAS");
+                                    debug!(
+                                        shard_id = self.shard_id,
+                                        "k8s shard: released with CAS"
+                                    );
                                 }
                                 Err(e) => {
                                     // This is okay - we may have already lost the lease
@@ -862,6 +888,11 @@ impl K8sShardGuard {
                     }
                 }
                 ShardPhase::ShuttingDown => {
+                    // Close the shard before releasing the lease
+                    if let Err(e) = factory.close(self.shard_id as usize).await {
+                        tracing::error!(shard_id = self.shard_id, error = %e, "failed to close shard during shutdown");
+                    }
+
                     // Release our lease if we hold it
                     let has_rv = {
                         let st = self.state.lock().await;
@@ -869,9 +900,7 @@ impl K8sShardGuard {
                     };
 
                     if has_rv {
-                        let _ = self
-                            .release_lease_cas(&leases, &lease_name)
-                            .await;
+                        let _ = self.release_lease_cas(&leases, &lease_name).await;
                     }
 
                     {
@@ -936,7 +965,9 @@ impl K8sShardGuard {
                     // Use JSON Patch with test operation for true CAS
                     // This ensures we only update if the resourceVersion matches
                     let rv = existing_rv.ok_or_else(|| {
-                        CoordinationError::BackendError("existing lease has no resourceVersion".into())
+                        CoordinationError::BackendError(
+                            "existing lease has no resourceVersion".into(),
+                        )
                     })?;
 
                     // Build the full lease for replace (includes resourceVersion check)
@@ -966,10 +997,15 @@ impl K8sShardGuard {
                     };
 
                     // Use replace which does CAS based on resourceVersion
-                    match leases.replace(lease_name, &PostParams::default(), &updated_lease).await {
+                    match leases
+                        .replace(lease_name, &PostParams::default(), &updated_lease)
+                        .await
+                    {
                         Ok(result) => {
                             let new_rv = result.metadata.resource_version.ok_or_else(|| {
-                                CoordinationError::BackendError("no resource_version in response".into())
+                                CoordinationError::BackendError(
+                                    "no resource_version in response".into(),
+                                )
                             })?;
                             debug!(
                                 shard_id = self.shard_id,
@@ -1153,6 +1189,7 @@ impl K8sShardGuard {
     async fn run_renewal_loop(
         self: Arc<Self>,
         owned_arc: Arc<Mutex<HashSet<u32>>>,
+        factory: Arc<ShardFactory>,
         leases: &Api<Lease>,
         lease_name: &str,
     ) {
@@ -1180,7 +1217,10 @@ impl K8sShardGuard {
             }
 
             if expected_rv.is_none() {
-                warn!(shard_id = self.shard_id, "renewal loop: no resourceVersion, exiting");
+                warn!(
+                    shard_id = self.shard_id,
+                    "renewal loop: no resourceVersion, exiting"
+                );
                 break;
             }
 
@@ -1193,7 +1233,10 @@ impl K8sShardGuard {
                 }
                 Err(e) => {
                     warn!(shard_id = self.shard_id, error = %e, "failed to renew shard lease (lost ownership)");
-                    // We lost the lease - update state
+                    // We lost the lease - close the shard and update state
+                    if let Err(close_err) = factory.close(self.shard_id as usize).await {
+                        tracing::error!(shard_id = self.shard_id, error = %close_err, "failed to close shard after losing lease");
+                    }
                     {
                         let mut st = self.state.lock().await;
                         st.resource_version = None;

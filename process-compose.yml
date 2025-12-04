@@ -20,12 +20,18 @@ processes:
         path: /health
       initial_delay_seconds: 1
       period_seconds: 2
+    shutdown:
+      timeout_seconds: 2
+    availability:
+      restart: always
+      backoff_seconds: 2
 
   gubernator:
     command: gubernator
     environment:
-      - GUBER_GRPC_ADDRESS=localhost:9991
-      - GUBER_HTTP_ADDRESS=0.0.0.0:9981
+      - GUBER_GRPC_ADDRESS=127.0.0.1:9991
+      - GUBER_HTTP_ADDRESS=127.0.0.1:9981
+      - GUBER_MEMBERLIST_KNOWN_NODES=127.0.0.1:7946
     readiness_probe:
       http_get:
         host: 127.0.0.1
@@ -33,4 +39,58 @@ processes:
         path: /v1/HealthCheck
       initial_delay_seconds: 1
       period_seconds: 2
+    shutdown:
+      timeout_seconds: 1
+    availability:
+      restart: always
+      backoff_seconds: 1
 
+  # Silo instance 1 - watchexec restarts cargo run on source changes
+  silo-1:
+    command: |
+      watchexec \
+        --restart \
+        --stop-signal SIGTERM \
+        --stop-timeout 1 \
+        --watch src \
+        --watch proto \
+        --watch Cargo.toml \
+        --ignore target \
+        --ignore tmp \
+        --ignore '*.lock' \
+        -- cargo run --bin silo -- -c example_configs/dev-node1.toml
+    depends_on:
+      etcd:
+        condition: process_healthy
+      gubernator:
+        condition: process_healthy
+    shutdown:
+      timeout_seconds: 1
+    availability:
+      restart: always
+      backoff_seconds: 1
+
+  # Silo instance 2 - watchexec restarts cargo run on source changes
+  silo-2:
+    command: |
+      watchexec \
+        --restart \
+        --stop-signal SIGTERM \
+        --stop-timeout 1 \
+        --watch src \
+        --watch proto \
+        --watch Cargo.toml \
+        --ignore target \
+        --ignore tmp \
+        --ignore '*.lock' \
+        -- cargo run --bin silo -- -c example_configs/dev-node2.toml
+    depends_on:
+      etcd:
+        condition: process_healthy
+      gubernator:
+        condition: process_healthy
+    shutdown:
+      timeout_seconds: 1
+    availability:
+      restart: always
+      backoff_seconds: 1

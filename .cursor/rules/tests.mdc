@@ -2,4 +2,24 @@
 alwaysApply: true
 ---
 
+When running tests, assume the background services required are already running.
+
+You can run rust tests with `cargo test`.
+
+You can run TypeScript client tests with
+
+```shell
+cd typescript_client
+pnpm test
+```
+
+You can run the TypeScript integration tests with:
+
+```shell
+cd typescript_client
+RUN_INTEGRATION=true pnpm test
+```
+
+The TypeScript integration tests require a running Silo server. Assume one is running, but if you see that it can't be connected to, run your own in the background. Shut it down when you are done.
+
 Use the #[silo::test] macro for wrapping rust test cases (not tokio::test).

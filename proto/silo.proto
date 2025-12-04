@@ -75,7 +75,7 @@ message Limit {
 }
 
 message EnqueueRequest {
-  string shard = 1; // shard name
+  uint32 shard = 1; // shard id
   string id = 2; // optional
   uint32 priority = 3; // 0..99, 0 highest
   int64 start_at_ms = 4; // epoch ms
@@ -90,7 +90,7 @@ message EnqueueResponse {
   string id = 1;
 }
 
-message GetJobRequest { string shard = 1; string id = 2; optional string tenant = 3; }
+message GetJobRequest { uint32 shard = 1; string id = 2; optional string tenant = 3; }
 message GetJobResponse {
   string id = 1;
   uint32 priority = 2;
@@ -101,20 +101,29 @@ message GetJobResponse {
   map<string, string> metadata = 7; // arbitrary key/value metadata stored with the job
 }
 
-message DeleteJobRequest { string shard = 1; string id = 2; optional string tenant = 3; }
+message DeleteJobRequest { uint32 shard = 1; string id = 2; optional string tenant = 3; }
 message DeleteJobResponse {}
 
-message CancelJobRequest { string shard = 1; string id = 2; optional string tenant = 3; }
+message CancelJobRequest { uint32 shard = 1; string id = 2; optional string tenant = 3; }
 message CancelJobResponse {}
 
-message LeaseTasksRequest { string shard = 1; string worker_id = 2; uint32 max_tasks = 3; optional string tenant = 4; }
+// Lease tasks for processing from this server.
+// By default, leases from all shards this server owns (fair distribution).
+// If shard is specified, filters to only that shard.
+message LeaseTasksRequest { 
+  optional uint32 shard = 1;  // optional filter - if set, only lease from this shard
+  string worker_id = 2; 
+  uint32 max_tasks = 3; 
+  optional string tenant = 4; 
+}
 message Task {
-  string id = 1; // task id
+  string id = 1;              // task id
   string job_id = 2;
   uint32 attempt_number = 3;
-  int64 lease_ms = 4; // how long to heartbeat in ms
+  int64 lease_ms = 4;         // how long to heartbeat in ms
   JsonValueBytes payload = 5; // job payload for convenience
   uint32 priority = 6;
+  uint32 shard = 7;           // which shard this task came from (for reporting outcomes)
 }
 
 // Task for refreshing a floating concurrency limit - workers compute new max concurrency
@@ -134,7 +143,7 @@ message LeaseTasksResponse {
 
 // Report the outcome of a job attempt task from a worker back to the server
 message ReportOutcomeRequest {
-  string shard = 1;
+  uint32 shard = 1;
   string task_id = 2;
   optional string tenant = 5;
   oneof outcome {
@@ -149,7 +158,7 @@ message ReportOutcomeResponse {}
 
 // Report the outcome of a floating limit refresh task from a worker back to the server
 message ReportRefreshOutcomeRequest {
-  string shard = 1;
+  uint32 shard = 1;
   string task_id = 2;
   optional string tenant = 3;
   oneof outcome {
@@ -170,7 +179,7 @@ message RefreshFailure {
 message ReportRefreshOutcomeResponse {}
 
 message HeartbeatRequest { 
-  string shard = 1; 
+  uint32 shard = 1; 
   string worker_id = 2; 
   string task_id = 3; 
   optional string tenant = 4;
@@ -184,7 +193,7 @@ message HeartbeatResponse {
 
 // Execute SQL query against shard data
 message QueryRequest { 
-  string shard = 1; 
+  uint32 shard = 1; 
   string sql = 2; 
   optional string tenant = 3; 
 }
@@ -202,7 +211,26 @@ message QueryResponse {
   int32 row_count = 3; // Number of rows returned
 }
 
+// Cluster topology information for client-side routing
+message GetClusterInfoRequest {}
+
+message ShardOwner {
+  uint32 shard_id = 1;
+  string grpc_addr = 2;  // The gRPC address of the server owning this shard
+  string node_id = 3;    // The node ID of the owner
+}
+
+message GetClusterInfoResponse {
+  uint32 num_shards = 1;                    // Total number of shards in the cluster
+  repeated ShardOwner shard_owners = 2;     // Mapping of shards to their owners
+  string this_node_id = 3;                  // The node ID of the server responding
+  string this_grpc_addr = 4;                // The gRPC address of the server responding
+}
+
 service Silo {
+  // Get cluster topology for client-side routing
+  rpc GetClusterInfo(GetClusterInfoRequest) returns (GetClusterInfoResponse);
+  
   rpc Enqueue(EnqueueRequest) returns (EnqueueResponse);
   rpc GetJob(GetJobRequest) returns (GetJobResponse);
   rpc DeleteJob(DeleteJobRequest) returns (DeleteJobResponse);

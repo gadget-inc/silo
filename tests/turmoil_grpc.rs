@@ -113,9 +113,15 @@ fn grpc_end_to_end_under_turmoil() {
             }
         };
         let (_tx, rx) = tokio::sync::broadcast::channel::<()>(1);
-        run_grpc_with_reaper_incoming(incoming, factory, rx)
-            .await
-            .unwrap();
+        run_grpc_with_reaper_incoming(
+            incoming,
+            factory,
+            None,
+            silo::settings::AppConfig::load(None).unwrap(),
+            rx,
+        )
+        .await
+        .unwrap();
         Ok(())
     });
 
@@ -128,7 +134,7 @@ fn grpc_end_to_end_under_turmoil() {
 
         // enqueue a job
         let req = EnqueueRequest {
-            shard: "0".into(),
+            shard: 0,
             id: "".into(),
             priority: 1,
             start_at_ms: 0,
@@ -146,7 +152,7 @@ fn grpc_end_to_end_under_turmoil() {
         // lease a task
         let lease = client
             .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                shard: "0".into(),
+                shard: Some(0),
                 worker_id: "w".into(),
                 max_tasks: 1,
                 tenant: None,
@@ -159,7 +165,7 @@ fn grpc_end_to_end_under_turmoil() {
         // report success
         let _ = client
             .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                shard: "0".into(),
+                shard: 0,
                 task_id: task_id.clone(),
                 tenant: None,
                 outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
@@ -171,7 +177,7 @@ fn grpc_end_to_end_under_turmoil() {
         // verify job status via get_job
         let got = client
             .get_job(tonic::Request::new(GetJobRequest {
-                shard: "0".into(),
+                shard: 0,
                 id: job_id.clone(),
                 tenant: None,
             }))
@@ -266,9 +272,15 @@ fn grpc_fault_injection_with_partition() {
             }
         };
         let (_tx, rx) = tokio::sync::broadcast::channel::<()>(1);
-        run_grpc_with_reaper_incoming(incoming, factory, rx)
-            .await
-            .unwrap();
+        run_grpc_with_reaper_incoming(
+            incoming,
+            factory,
+            None,
+            silo::settings::AppConfig::load(None).unwrap(),
+            rx,
+        )
+        .await
+        .unwrap();
         Ok(())
     });
 
@@ -284,7 +296,7 @@ fn grpc_fault_injection_with_partition() {
 
         // Enqueue a job
         let req = EnqueueRequest {
-            shard: "0".into(),
+            shard: 0,
             id: "".into(),
             priority: 1,
             start_at_ms: 0,
@@ -313,7 +325,7 @@ fn grpc_fault_injection_with_partition() {
         for _ in 0..20 {
             match client
                 .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                    shard: "0".into(),
+                    shard: Some(0),
                     worker_id: "w".into(),
                     max_tasks: 1,
                     tenant: None,
@@ -340,7 +352,7 @@ fn grpc_fault_injection_with_partition() {
         // Report success
         client
             .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                shard: "0".into(),
+                shard: 0,
                 task_id: task_id.clone(),
                 tenant: None,
                 outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
@@ -352,7 +364,7 @@ fn grpc_fault_injection_with_partition() {
         // Validate job completion
         let got = client
             .get_job(tonic::Request::new(GetJobRequest {
-                shard: "0".into(),
+                shard: 0,
                 id: job_id.clone(),
                 tenant: None,
             }))
@@ -363,7 +375,7 @@ fn grpc_fault_injection_with_partition() {
         // Verify no duplicate tasks
         let lease2 = client
             .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                shard: "0".into(),
+                shard: Some(0),
                 worker_id: "w".into(),
                 max_tasks: 1,
                 tenant: None,
@@ -461,9 +473,15 @@ fn stress_multiple_workers_with_partitions() {
             }
         };
         let (_tx, rx) = tokio::sync::broadcast::channel::<()>(1);
-        run_grpc_with_reaper_incoming(incoming, factory, rx)
-            .await
-            .unwrap();
+        run_grpc_with_reaper_incoming(
+            incoming,
+            factory,
+            None,
+            silo::settings::AppConfig::load(None).unwrap(),
+            rx,
+        )
+        .await
+        .unwrap();
         Ok(())
     });
 
@@ -492,7 +510,7 @@ fn stress_multiple_workers_with_partitions() {
         // Enqueue 20 jobs
         for i in 0..20 {
             let req = EnqueueRequest {
-                shard: "0".into(),
+                shard: 0,
                 id: format!("job-{}", i),
                 priority: 1,
                 start_at_ms: 0,
@@ -532,7 +550,7 @@ fn stress_multiple_workers_with_partitions() {
             // Try to lease tasks
             match client
                 .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                    shard: "0".into(),
+                    shard: Some(0),
                     worker_id: "w1".into(),
                     max_tasks: 2,
                     tenant: None,
@@ -556,7 +574,7 @@ fn stress_multiple_workers_with_partitions() {
                         for _ in 0..3 {
                             match client
                                 .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                                    shard: "0".into(),
+                                    shard: 0,
                                     task_id: task.id.clone(),
                                     tenant: None,
                                     outcome: Some(report_outcome_request::Outcome::Success(
@@ -598,7 +616,7 @@ fn stress_multiple_workers_with_partitions() {
             // Reduced iterations
             match client
                 .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                    shard: "0".into(),
+                    shard: Some(0),
                     worker_id: "w2".into(),
                     max_tasks: 2,
                     tenant: None,
@@ -620,7 +638,7 @@ fn stress_multiple_workers_with_partitions() {
                         for _ in 0..3 {
                             match client
                                 .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                                    shard: "0".into(),
+                                    shard: 0,
                                     task_id: task.id.clone(),
                                     tenant: None,
                                     outcome: Some(report_outcome_request::Outcome::Success(
@@ -735,9 +753,15 @@ fn stress_duplicate_completion_idempotency() {
             }
         };
         let (_tx, rx) = tokio::sync::broadcast::channel::<()>(1);
-        run_grpc_with_reaper_incoming(incoming, factory, rx)
-            .await
-            .unwrap();
+        run_grpc_with_reaper_incoming(
+            incoming,
+            factory,
+            None,
+            silo::settings::AppConfig::load(None).unwrap(),
+            rx,
+        )
+        .await
+        .unwrap();
         Ok(())
     });
 
@@ -753,7 +777,7 @@ fn stress_duplicate_completion_idempotency() {
         // Enqueue a job
         let job_id = client
             .enqueue(tonic::Request::new(EnqueueRequest {
-                shard: "0".into(),
+                shard: 0,
                 id: "".into(),
                 priority: 1,
                 start_at_ms: 0,
@@ -772,7 +796,7 @@ fn stress_duplicate_completion_idempotency() {
         // Lease the task
         let lease = client
             .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                shard: "0".into(),
+                shard: Some(0),
                 worker_id: "w".into(),
                 max_tasks: 1,
                 tenant: None,
@@ -787,7 +811,7 @@ fn stress_duplicate_completion_idempotency() {
         for i in 0..5 {
             let result = client
                 .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                    shard: "0".into(),
+                    shard: 0,
                     task_id: task_id.clone(),
                     tenant: None,
                     outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
@@ -809,7 +833,7 @@ fn stress_duplicate_completion_idempotency() {
         // Verify the task isn't available again
         let lease2 = client
             .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                shard: "0".into(),
+                shard: Some(0),
                 worker_id: "w".into(),
                 max_tasks: 10,
                 tenant: None,
@@ -826,7 +850,7 @@ fn stress_duplicate_completion_idempotency() {
         // Verify job state
         let _job = client
             .get_job(tonic::Request::new(GetJobRequest {
-                shard: "0".into(),
+                shard: 0,
                 id: job_id,
                 tenant: None,
             }))
@@ -919,9 +943,15 @@ fn stress_lease_expiry_during_partition() {
             }
         };
         let (_tx, rx) = tokio::sync::broadcast::channel::<()>(1);
-        run_grpc_with_reaper_incoming(incoming, factory, rx)
-            .await
-            .unwrap();
+        run_grpc_with_reaper_incoming(
+            incoming,
+            factory,
+            None,
+            silo::settings::AppConfig::load(None).unwrap(),
+            rx,
+        )
+        .await
+        .unwrap();
         Ok(())
     });
 
@@ -937,7 +967,7 @@ fn stress_lease_expiry_during_partition() {
         // Enqueue and lease a task
         client
             .enqueue(tonic::Request::new(EnqueueRequest {
-                shard: "0".into(),
+                shard: 0,
                 id: "lease-expiry-test".into(),
                 priority: 1,
                 start_at_ms: 0,
@@ -953,7 +983,7 @@ fn stress_lease_expiry_during_partition() {
 
         let lease = client
             .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                shard: "0".into(),
+                shard: Some(0),
                 worker_id: "w1".into(),
                 max_tasks: 1,
                 tenant: None,
@@ -972,7 +1002,7 @@ fn stress_lease_expiry_during_partition() {
         // Try to complete the task (should fail - lease expired)
         let result = client
             .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                shard: "0".into(),
+                shard: 0,
                 task_id: task_id.clone(),
                 tenant: None,
                 outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
@@ -1001,7 +1031,7 @@ fn stress_lease_expiry_during_partition() {
         for _ in 0..10 {
             match client
                 .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                    shard: "0".into(),
+                    shard: Some(0),
                     worker_id: "w2".into(),
                     max_tasks: 1,
                     tenant: None,
@@ -1016,7 +1046,7 @@ fn stress_lease_expiry_during_partition() {
                         // Complete it
                         client
                             .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                                shard: "0".into(),
+                                shard: 0,
                                 task_id: task_id.clone(),
                                 tenant: None,
                                 outcome: Some(report_outcome_request::Outcome::Success(
@@ -1121,9 +1151,15 @@ fn stress_high_message_loss() {
             }
         };
         let (_tx, rx) = tokio::sync::broadcast::channel::<()>(1);
-        run_grpc_with_reaper_incoming(incoming, factory, rx)
-            .await
-            .unwrap();
+        run_grpc_with_reaper_incoming(
+            incoming,
+            factory,
+            None,
+            silo::settings::AppConfig::load(None).unwrap(),
+            rx,
+        )
+        .await
+        .unwrap();
         Ok(())
     });
 
@@ -1140,7 +1176,7 @@ fn stress_high_message_loss() {
         let mut job_ids = Vec::new();
         for i in 0..5 {
             let req = EnqueueRequest {
-                shard: "0".into(),
+                shard: 0,
                 id: format!("lossy-job-{}", i),
                 priority: 1,
                 start_at_ms: 0,
@@ -1175,7 +1211,7 @@ fn stress_high_message_loss() {
             // Reduced from 200
             match client
                 .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                    shard: "0".into(),
+                    shard: Some(0),
                     worker_id: "resilient".into(),
                     max_tasks: 5,
                     tenant: None,
@@ -1203,7 +1239,7 @@ fn stress_high_message_loss() {
                         for attempt in 0..10 {
                             match client
                                 .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                                    shard: "0".into(),
+                                    shard: 0,
                                     task_id: task.id.clone(),
                                     tenant: None,
                                     outcome: Some(report_outcome_request::Outcome::Success(
@@ -1296,7 +1332,7 @@ fn concurrency_request_ready_without_release_fails() {
         }
         let incoming = async_stream::stream! { loop { let (s, _a) = listener.accept().await.unwrap(); yield Ok::<_, std::io::Error>(Accepted(s)); } };
         let (_tx, rx) = tokio::sync::broadcast::channel::<()>(1);
-        run_grpc_with_reaper_incoming(incoming, factory, rx).await.unwrap();
+        run_grpc_with_reaper_incoming(incoming, factory, None, silo::settings::AppConfig::load(None).unwrap(), rx).await.unwrap();
         Ok(())
     });
 
@@ -1316,7 +1352,7 @@ fn concurrency_request_ready_without_release_fails() {
         }];
         let _j1 = client
             .enqueue(tonic::Request::new(EnqueueRequest {
-                shard: "0".into(),
+                shard: 0,
                 id: "".into(),
                 priority: 1,
                 start_at_ms: 0,  // Use 0 for "start immediately"
@@ -1334,7 +1370,7 @@ fn concurrency_request_ready_without_release_fails() {
         // Lease job1
         let lease1 = client
             .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                shard: "0".into(),
+                shard: Some(0),
                 worker_id: "w".into(),
                 max_tasks: 1,
                 tenant: None,
@@ -1356,7 +1392,7 @@ fn concurrency_request_ready_without_release_fails() {
         }];
         let _j2 = client
             .enqueue(tonic::Request::new(EnqueueRequest {
-                shard: "0".into(),
+                shard: 0,
                 id: "".into(),
                 priority: 1,
                 start_at_ms: 0,  // Changed: enqueue with start_at 0 since time handling is complex with turmoil
@@ -1375,7 +1411,7 @@ fn concurrency_request_ready_without_release_fails() {
         // Finish job1, which should release concurrency
         client
             .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                shard: "0".into(),
+                shard: 0,
                 task_id: t1.clone(),
                 tenant: None,
                 outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
@@ -1390,7 +1426,7 @@ fn concurrency_request_ready_without_release_fails() {
         for _ in 0..100u32 {
             let lease2 = client
                 .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                    shard: "0".into(),
+                    shard: Some(0),
                     worker_id: "w".into(),
                     max_tasks: 1,
                     tenant: None,

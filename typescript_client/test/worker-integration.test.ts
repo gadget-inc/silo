@@ -1,24 +1,34 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
-import { SiloGrpcClient, decodePayload } from "../src/client";
+import { SiloGRPCClient, decodePayload } from "../src/client";
 import {
   SiloWorker,
   type TaskHandler,
   type SiloWorkerOptions,
 } from "../src/worker";
 
-const SILO_SERVER = process.env.SILO_SERVER || "localhost:50051";
+// Support comma-separated list of servers for multi-node testing
+const SILO_SERVERS = (
+  process.env.SILO_SERVERS ||
+  process.env.SILO_SERVER ||
+  "localhost:50051"
+).split(",");
 const RUN_INTEGRATION =
   process.env.RUN_INTEGRATION === "true" || process.env.CI === "true";
 
 describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
-  let client: SiloGrpcClient;
+  let client: SiloGRPCClient;
   let activeWorkers: SiloWorker[] = [];
 
-  beforeAll(() => {
-    client = new SiloGrpcClient({
-      server: SILO_SERVER,
+  beforeAll(async () => {
+    client = new SiloGRPCClient({
+      servers: SILO_SERVERS,
       useTls: false,
+      shardRouting: {
+        topologyRefreshIntervalMs: 0,
+      },
     });
+    // Discover cluster topology
+    await client.refreshTopology();
   });
 
   afterAll(() => {
@@ -31,19 +41,22 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
     activeWorkers = [];
   });
 
+  // Default tenant for tests - worker must match tenant of enqueued jobs
+  const DEFAULT_TENANT = "test-tenant";
+
   function createWorker(
     handler: TaskHandler,
     options?: Partial<
-      Omit<SiloWorkerOptions, "client" | "shard" | "workerId" | "handler">
+      Omit<SiloWorkerOptions, "client" | "workerId" | "handler">
     >
   ): SiloWorker {
     const worker = new SiloWorker({
       client,
-      shard: "0",
       workerId: `test-worker-${Date.now()}-${Math.random()
         .toString(36)
         .slice(2)}`,
       handler,
+      tenant: DEFAULT_TENANT,
       pollIntervalMs: 50,
       heartbeatIntervalMs: 1000,
       ...options,
@@ -53,7 +66,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
   }
 
   describe("basic task processing", () => {
-    it("processes a single task", async () => {
+    it("processes a single task from any shard", async () => {
       const processedJobs: string[] = [];
 
       const handler: TaskHandler = async (ctx) => {
@@ -64,12 +77,13 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         return { type: "success", result: { processed: true } };
       };
 
+      // Worker polls all shards
       const worker = createWorker(handler);
       worker.start();
 
-      // Enqueue a job
+      // Enqueue a job to test tenant
       await client.enqueue({
-        shard: "0",
+        tenant: DEFAULT_TENANT,
         payload: { message: "hello-worker" },
         priority: 1,
       });
@@ -109,7 +123,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       // Enqueue multiple jobs with unique batch identifier
       for (let i = 0; i < 5; i++) {
         await client.enqueue({
-          shard: "0",
+          tenant: DEFAULT_TENANT,
           payload: { index: i, batch: testBatch },
           priority: 1,
         });
@@ -146,7 +160,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       await Promise.all(
         Array.from({ length: 10 }, (_, i) =>
           client.enqueue({
-            shard: "0",
+            tenant: DEFAULT_TENANT,
             payload: { index: i },
             priority: 1,
           })
@@ -162,6 +176,47 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
     });
   });
 
+  describe("multi-job processing", () => {
+    it("processes multiple jobs from the same tenant", async () => {
+      const processedPayloads = new Set<string>();
+
+      const handler: TaskHandler = async (ctx) => {
+        const payload = decodePayload<{ label: string }>(
+          ctx.task.payload?.data
+        );
+        if (payload?.label) {
+          processedPayloads.add(payload.label);
+        }
+        return { type: "success", result: {} };
+      };
+
+      // Single worker polls all shards
+      const worker = createWorker(handler);
+      worker.start();
+
+      // Enqueue multiple jobs to the same tenant
+      const labels = ["alpha", "beta", "gamma"];
+      await Promise.all(
+        labels.map((label) =>
+          client.enqueue({
+            tenant: DEFAULT_TENANT,
+            payload: { label },
+            priority: 1,
+          })
+        )
+      );
+
+      // Wait for processing
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+
+      // Should have processed all jobs
+      expect(processedPayloads.size).toBe(labels.length);
+      for (const label of labels) {
+        expect(processedPayloads.has(label)).toBe(true);
+      }
+    });
+  });
+
   describe("failure handling", () => {
     it("reports failure when handler returns failure outcome", async () => {
       const handler: TaskHandler = async () => ({
@@ -174,7 +229,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       worker.start();
 
       const jobId = await client.enqueue({
-        shard: "0",
+        tenant: DEFAULT_TENANT,
         payload: { action: "fail" },
         priority: 1,
       });
@@ -183,7 +238,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       await new Promise((resolve) => setTimeout(resolve, 300));
 
       // Job should still exist but task completed with failure
-      const job = await client.getJob("0", jobId);
+      const job = await client.getJob(jobId, "failure-test");
       expect(job).toBeDefined();
     });
 
@@ -200,7 +255,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       worker.start();
 
       await client.enqueue({
-        shard: "0",
+        tenant: DEFAULT_TENANT,
         payload: { action: "throw" },
         priority: 1,
       });
@@ -228,8 +283,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       worker.start();
 
       await client.enqueue({
-        shard: "0",
-        payload: { action: "slow-graceful-stop" },
+        tenant: DEFAULT_TENANT,
+        payload: { action: "slow" },
         priority: 1,
       });
 
@@ -264,7 +319,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       // First run
       worker.start();
       await client.enqueue({
-        shard: "0",
+        tenant: DEFAULT_TENANT,
         payload: { run: 1 },
         priority: 1,
       });
@@ -277,7 +332,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       // Second run
       worker.start();
       await client.enqueue({
-        shard: "0",
+        tenant: DEFAULT_TENANT,
         payload: { run: 2 },
         priority: 1,
       });
@@ -308,7 +363,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       await Promise.all(
         Array.from({ length: 20 }, (_, i) =>
           client.enqueue({
-            shard: "0",
+            tenant: DEFAULT_TENANT,
             payload: { index: i },
             priority: 1,
           })
@@ -343,8 +398,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       worker.start();
 
       await client.enqueue({
-        shard: "0",
-        payload: { action: "long-abort-test" },
+        tenant: DEFAULT_TENANT,
+        payload: { action: "long" },
         priority: 1,
       });
 
@@ -360,6 +415,33 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         // Worker didn't pick up our task, just stop and skip the assertion
         await worker.stop();
       }
+    });
+  });
+
+  describe("shard context", () => {
+    it("provides correct shard in task context", async () => {
+      let receivedShard: number | undefined;
+
+      const handler: TaskHandler = async (ctx) => {
+        receivedShard = ctx.shard;
+        return { type: "success", result: {} };
+      };
+
+      const worker = createWorker(handler);
+      worker.start();
+
+      await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        payload: { test: true },
+        priority: 1,
+      });
+
+      // Wait for processing
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      // Should have received a valid shard ID
+      expect(receivedShard).toBeDefined();
+      expect(receivedShard).toBeGreaterThanOrEqual(0);
     });
   });
 });

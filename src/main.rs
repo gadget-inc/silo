@@ -58,13 +58,27 @@ async fn main() -> anyhow::Result<()> {
     // Load configuration
     let cfg = settings::AppConfig::load(args.config.as_deref())?;
 
-    // Initialize coordination based on configured backend
+    // Create rate limiter based on configuration
+    let rate_limiter: Arc<dyn RateLimitClient> = if let Some(guber_cfg) = cfg.gubernator.to_config()
+    {
+        let client = GubernatorClient::new(guber_cfg);
+        client.connect().await?;
+        client
+    } else {
+        NullGubernatorClient::new()
+    };
+
+    // Create factory first - coordinator will own a reference and manage shard lifecycle
+    let factory = Arc::new(ShardFactory::new(cfg.database.clone(), rate_limiter));
+
+    // Initialize coordination - coordinator will open/close shards as ownership changes
     let node_id = uuid::Uuid::new_v4().to_string();
     let coord_result = create_coordinator(
         &cfg.coordination,
         &node_id,
         &cfg.server.grpc_addr,
-        1, // num_shards - single shard for now
+        cfg.coordination.num_shards,
+        factory.clone(),
     )
     .await;
 
@@ -97,19 +111,6 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Create rate limiter based on configuration
-    let rate_limiter: Arc<dyn RateLimitClient> = if let Some(guber_cfg) = cfg.gubernator.to_config()
-    {
-        let client = GubernatorClient::new(guber_cfg);
-        client.connect().await?;
-        tracing::info!(address = ?cfg.gubernator.address, "connected to Gubernator");
-        client
-    } else {
-        NullGubernatorClient::new()
-    };
-
-    let mut shard_factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
-
     // Start gRPC server and scheduled reaper together
     let addr: SocketAddr = cfg.server.grpc_addr.parse()?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
@@ -123,11 +124,13 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let _handle = shard_factory.open(0).await?;
-
-    let factory = Arc::new(shard_factory);
-
-    let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), shutdown_rx));
+    let server = tokio::spawn(run_grpc_with_reaper(
+        listener,
+        factory.clone(),
+        coordinator.clone(),
+        cfg.clone(),
+        shutdown_rx,
+    ));
 
     // Start WebUI server if enabled
     let webui_handle = if cfg.webui.enabled {
@@ -155,13 +158,40 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Wait for Ctrl+C, then signal shutdown and wait for server
-    tokio::signal::ctrl_c().await?;
+    // Wait for shutdown signal (SIGINT or SIGTERM)
+    let shutdown_signal = async {
+        let ctrl_c = tokio::signal::ctrl_c();
+
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+            tokio::select! {
+                _ = ctrl_c => info!("received SIGINT, shutting down"),
+                _ = sigterm.recv() => info!("received SIGTERM, shutting down"),
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            ctrl_c.await.ok();
+            info!("received SIGINT, shutting down");
+        }
+    };
+
+    shutdown_signal.await;
     let _ = shutdown_tx.send(());
     let _ = server.await?;
     if let Some(handle) = webui_handle {
         let _ = handle.await;
     }
+
+    // Close all shards gracefully before exit
+    if let Err(e) = factory.close_all().await {
+        error!(error = %e, "failed to close some shards during shutdown");
+    }
+
     // Ensure all spans are flushed before process exit
     silo::trace::shutdown();
     Ok(())

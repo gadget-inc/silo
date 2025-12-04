@@ -63,6 +63,31 @@ export interface ConcurrencyLimit {
     maxConcurrency: number; // maximum concurrent running jobs for this key
 }
 /**
+ * Floating concurrency limit - max concurrency is dynamic and refreshed by workers
+ *
+ * @generated from protobuf message silo.v1.FloatingConcurrencyLimit
+ */
+export interface FloatingConcurrencyLimit {
+    /**
+     * @generated from protobuf field: string key = 1
+     */
+    key: string; // grouping key; jobs with same key share a limit
+    /**
+     * @generated from protobuf field: uint32 default_max_concurrency = 2
+     */
+    defaultMaxConcurrency: number; // initial max concurrency value used until first refresh
+    /**
+     * @generated from protobuf field: int64 refresh_interval_ms = 3
+     */
+    refreshIntervalMs: bigint; // how often to refresh the max concurrency value
+    /**
+     * @generated from protobuf field: map<string, string> metadata = 4
+     */
+    metadata: {
+        [key: string]: string;
+    }; // arbitrary key/value metadata passed to workers during refresh
+}
+/**
  * Retry policy specifically for rate limit check retries (when rate limit is exceeded)
  *
  * @generated from protobuf message silo.v1.RateLimitRetryPolicy
@@ -125,7 +150,7 @@ export interface GubernatorRateLimit {
     retryPolicy?: RateLimitRetryPolicy; // How to retry when rate limited
 }
 /**
- * A single limit that can be either a concurrency limit or a rate limit
+ * A single limit that can be either a concurrency limit, rate limit, or floating concurrency limit
  *
  * @generated from protobuf message silo.v1.Limit
  */
@@ -146,6 +171,12 @@ export interface Limit {
          */
         rateLimit: GubernatorRateLimit;
     } | {
+        oneofKind: "floatingConcurrency";
+        /**
+         * @generated from protobuf field: silo.v1.FloatingConcurrencyLimit floating_concurrency = 3
+         */
+        floatingConcurrency: FloatingConcurrencyLimit;
+    } | {
         oneofKind: undefined;
     };
 }
@@ -154,9 +185,9 @@ export interface Limit {
  */
 export interface EnqueueRequest {
     /**
-     * @generated from protobuf field: string shard = 1
+     * @generated from protobuf field: uint32 shard = 1
      */
-    shard: string; // shard name
+    shard: number; // shard id
     /**
      * @generated from protobuf field: string id = 2
      */
@@ -206,9 +237,9 @@ export interface EnqueueResponse {
  */
 export interface GetJobRequest {
     /**
-     * @generated from protobuf field: string shard = 1
+     * @generated from protobuf field: uint32 shard = 1
      */
-    shard: string;
+    shard: number;
     /**
      * @generated from protobuf field: string id = 2
      */
@@ -258,9 +289,9 @@ export interface GetJobResponse {
  */
 export interface DeleteJobRequest {
     /**
-     * @generated from protobuf field: string shard = 1
+     * @generated from protobuf field: uint32 shard = 1
      */
-    shard: string;
+    shard: number;
     /**
      * @generated from protobuf field: string id = 2
      */
@@ -280,9 +311,9 @@ export interface DeleteJobResponse {
  */
 export interface CancelJobRequest {
     /**
-     * @generated from protobuf field: string shard = 1
+     * @generated from protobuf field: uint32 shard = 1
      */
-    shard: string;
+    shard: number;
     /**
      * @generated from protobuf field: string id = 2
      */
@@ -298,13 +329,17 @@ export interface CancelJobRequest {
 export interface CancelJobResponse {
 }
 /**
+ * Lease tasks for processing from this server.
+ * By default, leases from all shards this server owns (fair distribution).
+ * If shard is specified, filters to only that shard.
+ *
  * @generated from protobuf message silo.v1.LeaseTasksRequest
  */
 export interface LeaseTasksRequest {
     /**
-     * @generated from protobuf field: string shard = 1
+     * @generated from protobuf field: optional uint32 shard = 1
      */
-    shard: string;
+    shard?: number; // optional filter - if set, only lease from this shard
     /**
      * @generated from protobuf field: string worker_id = 2
      */
@@ -346,6 +381,43 @@ export interface Task {
      * @generated from protobuf field: uint32 priority = 6
      */
     priority: number;
+    /**
+     * @generated from protobuf field: uint32 shard = 7
+     */
+    shard: number; // which shard this task came from (for reporting outcomes)
+}
+/**
+ * Task for refreshing a floating concurrency limit - workers compute new max concurrency
+ *
+ * @generated from protobuf message silo.v1.RefreshFloatingLimitTask
+ */
+export interface RefreshFloatingLimitTask {
+    /**
+     * @generated from protobuf field: string id = 1
+     */
+    id: string; // task id
+    /**
+     * @generated from protobuf field: string queue_key = 2
+     */
+    queueKey: string; // the floating limit queue key
+    /**
+     * @generated from protobuf field: uint32 current_max_concurrency = 3
+     */
+    currentMaxConcurrency: number; // the current max concurrency value
+    /**
+     * @generated from protobuf field: int64 last_refreshed_at_ms = 4
+     */
+    lastRefreshedAtMs: bigint; // when the value was last refreshed
+    /**
+     * @generated from protobuf field: map<string, string> metadata = 5
+     */
+    metadata: {
+        [key: string]: string;
+    }; // opaque metadata from the limit definition
+    /**
+     * @generated from protobuf field: int64 lease_ms = 6
+     */
+    leaseMs: bigint; // how long to heartbeat in ms
 }
 /**
  * @generated from protobuf message silo.v1.LeaseTasksResponse
@@ -355,15 +427,21 @@ export interface LeaseTasksResponse {
      * @generated from protobuf field: repeated silo.v1.Task tasks = 1
      */
     tasks: Task[];
+    /**
+     * @generated from protobuf field: repeated silo.v1.RefreshFloatingLimitTask refresh_tasks = 2
+     */
+    refreshTasks: RefreshFloatingLimitTask[]; // floating limit refresh tasks
 }
 /**
+ * Report the outcome of a job attempt task from a worker back to the server
+ *
  * @generated from protobuf message silo.v1.ReportOutcomeRequest
  */
 export interface ReportOutcomeRequest {
     /**
-     * @generated from protobuf field: string shard = 1
+     * @generated from protobuf field: uint32 shard = 1
      */
-    shard: string;
+    shard: number;
     /**
      * @generated from protobuf field: string task_id = 2
      */
@@ -421,13 +499,77 @@ export interface Cancelled {
 export interface ReportOutcomeResponse {
 }
 /**
+ * Report the outcome of a floating limit refresh task from a worker back to the server
+ *
+ * @generated from protobuf message silo.v1.ReportRefreshOutcomeRequest
+ */
+export interface ReportRefreshOutcomeRequest {
+    /**
+     * @generated from protobuf field: uint32 shard = 1
+     */
+    shard: number;
+    /**
+     * @generated from protobuf field: string task_id = 2
+     */
+    taskId: string;
+    /**
+     * @generated from protobuf field: optional string tenant = 3
+     */
+    tenant?: string;
+    /**
+     * @generated from protobuf oneof: outcome
+     */
+    outcome: {
+        oneofKind: "success";
+        /**
+         * @generated from protobuf field: silo.v1.RefreshSuccess success = 4
+         */
+        success: RefreshSuccess;
+    } | {
+        oneofKind: "failure";
+        /**
+         * @generated from protobuf field: silo.v1.RefreshFailure failure = 5
+         */
+        failure: RefreshFailure;
+    } | {
+        oneofKind: undefined;
+    };
+}
+/**
+ * @generated from protobuf message silo.v1.RefreshSuccess
+ */
+export interface RefreshSuccess {
+    /**
+     * @generated from protobuf field: uint32 new_max_concurrency = 1
+     */
+    newMaxConcurrency: number; // the new max concurrency value computed by the worker
+}
+/**
+ * @generated from protobuf message silo.v1.RefreshFailure
+ */
+export interface RefreshFailure {
+    /**
+     * @generated from protobuf field: string code = 1
+     */
+    code: string; // error code
+    /**
+     * @generated from protobuf field: string message = 2
+     */
+    message: string; // error message
+}
+/**
+ * @generated from protobuf message silo.v1.ReportRefreshOutcomeResponse
+ */
+export interface ReportRefreshOutcomeResponse {
+}
+/**
  * @generated from protobuf message silo.v1.HeartbeatRequest
  */
 export interface HeartbeatRequest {
     /**
-     * @generated from protobuf field: string shard = 1
+     * @generated from protobuf field: uint32 shard = 1
      */
-    shard: string;
+    shard: number;
     /**
      * @generated from protobuf field: string worker_id = 2
      */
@@ -465,9 +607,9 @@ export interface HeartbeatResponse {
  */
 export interface QueryRequest {
     /**
-     * @generated from protobuf field: string shard = 1
+     * @generated from protobuf field: uint32 shard = 1
      */
-    shard: string;
+    shard: number;
     /**
      * @generated from protobuf field: string sql = 2
      */
@@ -510,6 +652,51 @@ export interface QueryResponse {
      * @generated from protobuf field: int32 row_count = 3
      */
     rowCount: number; // Number of rows returned
+}
+/**
+ * Cluster topology information for client-side routing
+ *
+ * @generated from protobuf message silo.v1.GetClusterInfoRequest
+ */
+export interface GetClusterInfoRequest {
+}
+/**
+ * @generated from protobuf message silo.v1.ShardOwner
+ */
+export interface ShardOwner {
+    /**
+     * @generated from protobuf field: uint32 shard_id = 1
+     */
+    shardId: number;
+    /**
+     * @generated from protobuf field: string grpc_addr = 2
+     */
+    grpcAddr: string; // The gRPC address of the server owning this shard
+    /**
+     * @generated from protobuf field: string node_id = 3
+     */
+    nodeId: string; // The node ID of the owner
+}
+/**
+ * @generated from protobuf message silo.v1.GetClusterInfoResponse
+ */
+export interface GetClusterInfoResponse {
+    /**
+     * @generated from protobuf field: uint32 num_shards = 1
+     */
+    numShards: number; // Total number of shards in the cluster
+    /**
+     * @generated from protobuf field: repeated silo.v1.ShardOwner shard_owners = 2
+     */
+    shardOwners: ShardOwner[]; // Mapping of shards to their owners
+    /**
+     * @generated from protobuf field: string this_node_id = 3
+     */
+    thisNodeId: string; // The node ID of the server responding
+    /**
+     * @generated from protobuf field: string this_grpc_addr = 4
+     */
+    thisGrpcAddr: string; // The gRPC address of the server responding
 }
 /**
  * Gubernator rate limiting algorithm
@@ -755,6 +942,93 @@ class ConcurrencyLimit$Type extends MessageType<ConcurrencyLimit> {
  */
 export const ConcurrencyLimit = new ConcurrencyLimit$Type();
 // @generated message type with reflection information, may provide speed optimized methods
+class FloatingConcurrencyLimit$Type extends MessageType<FloatingConcurrencyLimit> {
+    constructor() {
+        super("silo.v1.FloatingConcurrencyLimit", [
+            { no: 1, name: "key", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "default_max_concurrency", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
+            { no: 3, name: "refresh_interval_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 4, name: "metadata", kind: "map", K: 9 /*ScalarType.STRING*/, V: { kind: "scalar", T: 9 /*ScalarType.STRING*/ } }
+        ]);
+    }
+    create(value?: PartialMessage<FloatingConcurrencyLimit>): FloatingConcurrencyLimit {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.key = "";
+        message.defaultMaxConcurrency = 0;
+        message.refreshIntervalMs = 0n;
+        message.metadata = {};
+        if (value !== undefined)
+            reflectionMergePartial<FloatingConcurrencyLimit>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: FloatingConcurrencyLimit): FloatingConcurrencyLimit {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string key */ 1:
+                    message.key = reader.string();
+                    break;
+                case /* uint32 default_max_concurrency */ 2:
+                    message.defaultMaxConcurrency = reader.uint32();
+                    break;
+                case /* int64 refresh_interval_ms */ 3:
+                    message.refreshIntervalMs = reader.int64().toBigInt();
+                    break;
+                case /* map<string, string> metadata */ 4:
+                    this.binaryReadMap4(message.metadata, reader, options);
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    private binaryReadMap4(map: FloatingConcurrencyLimit["metadata"], reader: IBinaryReader, options: BinaryReadOptions): void {
+        let len = reader.uint32(), end = reader.pos + len, key: keyof FloatingConcurrencyLimit["metadata"] | undefined, val: FloatingConcurrencyLimit["metadata"][any] | undefined;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case 1:
+                    key = reader.string();
+                    break;
+                case 2:
+                    val = reader.string();
+                    break;
+                default: throw new globalThis.Error("unknown map entry field for silo.v1.FloatingConcurrencyLimit.metadata");
+            }
+        }
+        map[key ?? ""] = val ?? "";
+    }
+    internalBinaryWrite(message: FloatingConcurrencyLimit, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string key = 1; */
+        if (message.key !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.key);
+        /* uint32 default_max_concurrency = 2; */
+        if (message.defaultMaxConcurrency !== 0)
+            writer.tag(2, WireType.Varint).uint32(message.defaultMaxConcurrency);
+        /* int64 refresh_interval_ms = 3; */
+        if (message.refreshIntervalMs !== 0n)
+            writer.tag(3, WireType.Varint).int64(message.refreshIntervalMs);
+        /* map<string, string> metadata = 4; */
+        for (let k of globalThis.Object.keys(message.metadata))
+            writer.tag(4, WireType.LengthDelimited).fork().tag(1, WireType.LengthDelimited).string(k).tag(2, WireType.LengthDelimited).string(message.metadata[k]).join();
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.FloatingConcurrencyLimit
+ */
+export const FloatingConcurrencyLimit = new FloatingConcurrencyLimit$Type();
+// @generated message type with reflection information, may provide speed optimized methods
 class RateLimitRetryPolicy$Type extends MessageType<RateLimitRetryPolicy> {
     constructor() {
         super("silo.v1.RateLimitRetryPolicy", [
@@ -932,7 +1206,8 @@ class Limit$Type extends MessageType<Limit> {
     constructor() {
         super("silo.v1.Limit", [
             { no: 1, name: "concurrency", kind: "message", oneof: "limit", T: () => ConcurrencyLimit },
-            { no: 2, name: "rate_limit", kind: "message", oneof: "limit", T: () => GubernatorRateLimit }
+            { no: 2, name: "rate_limit", kind: "message", oneof: "limit", T: () => GubernatorRateLimit },
+            { no: 3, name: "floating_concurrency", kind: "message", oneof: "limit", T: () => FloatingConcurrencyLimit }
         ]);
     }
     create(value?: PartialMessage<Limit>): Limit {
@@ -959,6 +1234,12 @@ class Limit$Type extends MessageType<Limit> {
                         rateLimit: GubernatorRateLimit.internalBinaryRead(reader, reader.uint32(), options, (message.limit as any).rateLimit)
                     };
                     break;
+                case /* silo.v1.FloatingConcurrencyLimit floating_concurrency */ 3:
+                    message.limit = {
+                        oneofKind: "floatingConcurrency",
+                        floatingConcurrency: FloatingConcurrencyLimit.internalBinaryRead(reader, reader.uint32(), options, (message.limit as any).floatingConcurrency)
+                    };
+                    break;
                 default:
                     let u = options.readUnknownField;
                     if (u === "throw")
@@ -977,6 +1258,9 @@ class Limit$Type extends MessageType<Limit> {
         /* silo.v1.GubernatorRateLimit rate_limit = 2; */
         if (message.limit.oneofKind === "rateLimit")
             GubernatorRateLimit.internalBinaryWrite(message.limit.rateLimit, writer.tag(2, WireType.LengthDelimited).fork(), options).join();
+        /* silo.v1.FloatingConcurrencyLimit floating_concurrency = 3; */
+        if (message.limit.oneofKind === "floatingConcurrency")
+            FloatingConcurrencyLimit.internalBinaryWrite(message.limit.floatingConcurrency, writer.tag(3, WireType.LengthDelimited).fork(), options).join();
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -991,7 +1275,7 @@ export const Limit = new Limit$Type();
 class EnqueueRequest$Type extends MessageType<EnqueueRequest> {
     constructor() {
         super("silo.v1.EnqueueRequest", [
-            { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 1, name: "shard", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
             { no: 2, name: "id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
             { no: 3, name: "priority", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
             { no: 4, name: "start_at_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
@@ -1004,7 +1288,7 @@ class EnqueueRequest$Type extends MessageType<EnqueueRequest> {
     }
     create(value?: PartialMessage<EnqueueRequest>): EnqueueRequest {
         const message = globalThis.Object.create((this.messagePrototype!));
-        message.shard = "";
+        message.shard = 0;
         message.id = "";
         message.priority = 0;
         message.startAtMs = 0n;
@@ -1019,8 +1303,8 @@ class EnqueueRequest$Type extends MessageType<EnqueueRequest> {
         while (reader.pos < end) {
             let [fieldNo, wireType] = reader.tag();
             switch (fieldNo) {
-                case /* string shard */ 1:
-                    message.shard = reader.string();
+                case /* uint32 shard */ 1:
+                    message.shard = reader.uint32();
                     break;
                 case /* string id */ 2:
                     message.id = reader.string();
@@ -1074,9 +1358,9 @@ class EnqueueRequest$Type extends MessageType<EnqueueRequest> {
         map[key ?? ""] = val ?? "";
     }
     internalBinaryWrite(message: EnqueueRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
-        /* string shard = 1; */
-        if (message.shard !== "")
-            writer.tag(1, WireType.LengthDelimited).string(message.shard);
+        /* uint32 shard = 1; */
+        if (message.shard !== 0)
+            writer.tag(1, WireType.Varint).uint32(message.shard);
         /* string id = 2; */
         if (message.id !== "")
             writer.tag(2, WireType.LengthDelimited).string(message.id);
@@ -1162,14 +1446,14 @@ export const EnqueueResponse = new EnqueueResponse$Type();
 class GetJobRequest$Type extends MessageType<GetJobRequest> {
     constructor() {
         super("silo.v1.GetJobRequest", [
-            { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 1, name: "shard", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
             { no: 2, name: "id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
             { no: 3, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ }
         ]);
     }
     create(value?: PartialMessage<GetJobRequest>): GetJobRequest {
         const message = globalThis.Object.create((this.messagePrototype!));
-        message.shard = "";
+        message.shard = 0;
         message.id = "";
         if (value !== undefined)
             reflectionMergePartial<GetJobRequest>(this, message, value);
@@ -1180,8 +1464,8 @@ class GetJobRequest$Type extends MessageType<GetJobRequest> {
         while (reader.pos < end) {
             let [fieldNo, wireType] = reader.tag();
             switch (fieldNo) {
-                case /* string shard */ 1:
-                    message.shard = reader.string();
+                case /* uint32 shard */ 1:
+                    message.shard = reader.uint32();
                     break;
                 case /* string id */ 2:
                     message.id = reader.string();
@@ -1201,9 +1485,9 @@ class GetJobRequest$Type extends MessageType<GetJobRequest> {
         return message;
     }
     internalBinaryWrite(message: GetJobRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
-        /* string shard = 1; */
-        if (message.shard !== "")
-            writer.tag(1, WireType.LengthDelimited).string(message.shard);
+        /* uint32 shard = 1; */
+        if (message.shard !== 0)
+            writer.tag(1, WireType.Varint).uint32(message.shard);
         /* string id = 2; */
         if (message.id !== "")
             writer.tag(2, WireType.LengthDelimited).string(message.id);
@@ -1333,14 +1617,14 @@ export const GetJobResponse = new GetJobResponse$Type();
 class DeleteJobRequest$Type extends MessageType<DeleteJobRequest> {
     constructor() {
         super("silo.v1.DeleteJobRequest", [
-            { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 1, name: "shard", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
             { no: 2, name: "id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
             { no: 3, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ }
         ]);
     }
     create(value?: PartialMessage<DeleteJobRequest>): DeleteJobRequest {
         const message = globalThis.Object.create((this.messagePrototype!));
-        message.shard = "";
+        message.shard = 0;
         message.id = "";
         if (value !== undefined)
             reflectionMergePartial<DeleteJobRequest>(this, message, value);
@@ -1351,8 +1635,8 @@ class DeleteJobRequest$Type extends MessageType<DeleteJobRequest> {
         while (reader.pos < end) {
             let [fieldNo, wireType] = reader.tag();
             switch (fieldNo) {
-                case /* string shard */ 1:
-                    message.shard = reader.string();
+                case /* uint32 shard */ 1:
+                    message.shard = reader.uint32();
                     break;
                 case /* string id */ 2:
                     message.id = reader.string();
@@ -1372,9 +1656,9 @@ class DeleteJobRequest$Type extends MessageType<DeleteJobRequest> {
         return message;
     }
     internalBinaryWrite(message: DeleteJobRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
-        /* string shard = 1; */
-        if (message.shard !== "")
-            writer.tag(1, WireType.LengthDelimited).string(message.shard);
+        /* uint32 shard = 1; */
+        if (message.shard !== 0)
+            writer.tag(1, WireType.Varint).uint32(message.shard);
         /* string id = 2; */
         if (message.id !== "")
             writer.tag(2, WireType.LengthDelimited).string(message.id);
@@ -1433,14 +1717,14 @@ export const DeleteJobResponse = new DeleteJobResponse$Type();
 class CancelJobRequest$Type extends MessageType<CancelJobRequest> {
     constructor() {
         super("silo.v1.CancelJobRequest", [
-            { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 1, name: "shard", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
             { no: 2, name: "id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
             { no: 3, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ }
         ]);
     }
     create(value?: PartialMessage<CancelJobRequest>): CancelJobRequest {
         const message = globalThis.Object.create((this.messagePrototype!));
-        message.shard = "";
+        message.shard = 0;
         message.id = "";
         if (value !== undefined)
             reflectionMergePartial<CancelJobRequest>(this, message, value);
@@ -1451,8 +1735,8 @@ class CancelJobRequest$Type extends MessageType<CancelJobRequest> {
         while (reader.pos < end) {
             let [fieldNo, wireType] = reader.tag();
             switch (fieldNo) {
-                case /* string shard */ 1:
-                    message.shard = reader.string();
+                case /* uint32 shard */ 1:
+                    message.shard = reader.uint32();
                     break;
                 case /* string id */ 2:
                     message.id = reader.string();
@@ -1472,9 +1756,9 @@ class CancelJobRequest$Type extends MessageType<CancelJobRequest> {
         return message;
     }
     internalBinaryWrite(message: CancelJobRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
-        /* string shard = 1; */
-        if (message.shard !== "")
-            writer.tag(1, WireType.LengthDelimited).string(message.shard);
+        /* uint32 shard = 1; */
+        if (message.shard !== 0)
+            writer.tag(1, WireType.Varint).uint32(message.shard);
         /* string id = 2; */
         if (message.id !== "")
             writer.tag(2, WireType.LengthDelimited).string(message.id);
@@ -1533,7 +1817,7 @@ export const CancelJobResponse = new CancelJobResponse$Type();
 class LeaseTasksRequest$Type extends MessageType<LeaseTasksRequest> {
     constructor() {
         super("silo.v1.LeaseTasksRequest", [
-            { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 1, name: "shard", kind: "scalar", opt: true, T: 13 /*ScalarType.UINT32*/ },
             { no: 2, name: "worker_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
             { no: 3, name: "max_tasks", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
             { no: 4, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ }
@@ -1541,7 +1825,6 @@ class LeaseTasksRequest$Type extends MessageType<LeaseTasksRequest> {
     }
     create(value?: PartialMessage<LeaseTasksRequest>): LeaseTasksRequest {
         const message = globalThis.Object.create((this.messagePrototype!));
-        message.shard = "";
         message.workerId = "";
         message.maxTasks = 0;
         if (value !== undefined)
@@ -1553,8 +1836,8 @@ class LeaseTasksRequest$Type extends MessageType<LeaseTasksRequest> {
         while (reader.pos < end) {
             let [fieldNo, wireType] = reader.tag();
             switch (fieldNo) {
-                case /* string shard */ 1:
-                    message.shard = reader.string();
+                case /* optional uint32 shard */ 1:
+                    message.shard = reader.uint32();
                     break;
                 case /* string worker_id */ 2:
                     message.workerId = reader.string();
@@ -1577,9 +1860,9 @@ class LeaseTasksRequest$Type extends MessageType<LeaseTasksRequest> {
         return message;
     }
     internalBinaryWrite(message: LeaseTasksRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
-        /* string shard = 1; */
-        if (message.shard !== "")
-            writer.tag(1, WireType.LengthDelimited).string(message.shard);
+        /* optional uint32 shard = 1; */
+        if (message.shard !== undefined)
+            writer.tag(1, WireType.Varint).uint32(message.shard);
         /* string worker_id = 2; */
         if (message.workerId !== "")
             writer.tag(2, WireType.LengthDelimited).string(message.workerId);
@@ -1608,7 +1891,8 @@ class Task$Type extends MessageType<Task> {
             { no: 3, name: "attempt_number", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
             { no: 4, name: "lease_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
             { no: 5, name: "payload", kind: "message", T: () => JsonValueBytes },
-            { no: 6, name: "priority", kind: "scalar", T: 13 /*ScalarType.UINT32*/ }
+            { no: 6, name: "priority", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
+            { no: 7, name: "shard", kind: "scalar", T: 13 /*ScalarType.UINT32*/ }
         ]);
     }
     create(value?: PartialMessage<Task>): Task {
@@ -1618,6 +1902,7 @@ class Task$Type extends MessageType<Task> {
         message.attemptNumber = 0;
         message.leaseMs = 0n;
         message.priority = 0;
+        message.shard = 0;
         if (value !== undefined)
             reflectionMergePartial<Task>(this, message, value);
         return message;
@@ -1644,6 +1929,9 @@ class Task$Type extends MessageType<Task> {
                     break;
                 case /* uint32 priority */ 6:
                     message.priority = reader.uint32();
+                    break;
+                case /* uint32 shard */ 7:
+                    message.shard = reader.uint32();
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -1675,6 +1963,9 @@ class Task$Type extends MessageType<Task> {
         /* uint32 priority = 6; */
         if (message.priority !== 0)
             writer.tag(6, WireType.Varint).uint32(message.priority);
+        /* uint32 shard = 7; */
+        if (message.shard !== 0)
+            writer.tag(7, WireType.Varint).uint32(message.shard);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -1686,15 +1977,120 @@ class Task$Type extends MessageType<Task> {
  */
 export const Task = new Task$Type();
 // @generated message type with reflection information, may provide speed optimized methods
+class RefreshFloatingLimitTask$Type extends MessageType<RefreshFloatingLimitTask> {
+    constructor() {
+        super("silo.v1.RefreshFloatingLimitTask", [
+            { no: 1, name: "id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "queue_key", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 3, name: "current_max_concurrency", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
+            { no: 4, name: "last_refreshed_at_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 5, name: "metadata", kind: "map", K: 9 /*ScalarType.STRING*/, V: { kind: "scalar", T: 9 /*ScalarType.STRING*/ } },
+            { no: 6, name: "lease_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ }
+        ]);
+    }
+    create(value?: PartialMessage<RefreshFloatingLimitTask>): RefreshFloatingLimitTask {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.id = "";
+        message.queueKey = "";
+        message.currentMaxConcurrency = 0;
+        message.lastRefreshedAtMs = 0n;
+        message.metadata = {};
+        message.leaseMs = 0n;
+        if (value !== undefined)
+            reflectionMergePartial<RefreshFloatingLimitTask>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: RefreshFloatingLimitTask): RefreshFloatingLimitTask {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string id */ 1:
+                    message.id = reader.string();
+                    break;
+                case /* string queue_key */ 2:
+                    message.queueKey = reader.string();
+                    break;
+                case /* uint32 current_max_concurrency */ 3:
+                    message.currentMaxConcurrency = reader.uint32();
+                    break;
+                case /* int64 last_refreshed_at_ms */ 4:
+                    message.lastRefreshedAtMs = reader.int64().toBigInt();
+                    break;
+                case /* map<string, string> metadata */ 5:
+                    this.binaryReadMap5(message.metadata, reader, options);
+                    break;
+                case /* int64 lease_ms */ 6:
+                    message.leaseMs = reader.int64().toBigInt();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    private binaryReadMap5(map: RefreshFloatingLimitTask["metadata"], reader: IBinaryReader, options: BinaryReadOptions): void {
+        let len = reader.uint32(), end = reader.pos + len, key: keyof RefreshFloatingLimitTask["metadata"] | undefined, val: RefreshFloatingLimitTask["metadata"][any] | undefined;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case 1:
+                    key = reader.string();
+                    break;
+                case 2:
+                    val = reader.string();
+                    break;
+                default: throw new globalThis.Error("unknown map entry field for silo.v1.RefreshFloatingLimitTask.metadata");
+            }
+        }
+        map[key ?? ""] = val ?? "";
+    }
+    internalBinaryWrite(message: RefreshFloatingLimitTask, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string id = 1; */
+        if (message.id !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.id);
+        /* string queue_key = 2; */
+        if (message.queueKey !== "")
+            writer.tag(2, WireType.LengthDelimited).string(message.queueKey);
+        /* uint32 current_max_concurrency = 3; */
+        if (message.currentMaxConcurrency !== 0)
+            writer.tag(3, WireType.Varint).uint32(message.currentMaxConcurrency);
+        /* int64 last_refreshed_at_ms = 4; */
+        if (message.lastRefreshedAtMs !== 0n)
+            writer.tag(4, WireType.Varint).int64(message.lastRefreshedAtMs);
+        /* map<string, string> metadata = 5; */
+        for (let k of globalThis.Object.keys(message.metadata))
+            writer.tag(5, WireType.LengthDelimited).fork().tag(1, WireType.LengthDelimited).string(k).tag(2, WireType.LengthDelimited).string(message.metadata[k]).join();
+        /* int64 lease_ms = 6; */
+        if (message.leaseMs !== 0n)
+            writer.tag(6, WireType.Varint).int64(message.leaseMs);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.RefreshFloatingLimitTask
+ */
+export const RefreshFloatingLimitTask = new RefreshFloatingLimitTask$Type();
+// @generated message type with reflection information, may provide speed optimized methods
 class LeaseTasksResponse$Type extends MessageType<LeaseTasksResponse> {
     constructor() {
         super("silo.v1.LeaseTasksResponse", [
-            { no: 1, name: "tasks", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => Task }
+            { no: 1, name: "tasks", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => Task },
+            { no: 2, name: "refresh_tasks", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => RefreshFloatingLimitTask }
         ]);
     }
     create(value?: PartialMessage<LeaseTasksResponse>): LeaseTasksResponse {
         const message = globalThis.Object.create((this.messagePrototype!));
         message.tasks = [];
+        message.refreshTasks = [];
         if (value !== undefined)
             reflectionMergePartial<LeaseTasksResponse>(this, message, value);
         return message;
@@ -1706,6 +2102,9 @@ class LeaseTasksResponse$Type extends MessageType<LeaseTasksResponse> {
             switch (fieldNo) {
                 case /* repeated silo.v1.Task tasks */ 1:
                     message.tasks.push(Task.internalBinaryRead(reader, reader.uint32(), options));
+                    break;
+                case /* repeated silo.v1.RefreshFloatingLimitTask refresh_tasks */ 2:
+                    message.refreshTasks.push(RefreshFloatingLimitTask.internalBinaryRead(reader, reader.uint32(), options));
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -1722,6 +2121,9 @@ class LeaseTasksResponse$Type extends MessageType<LeaseTasksResponse> {
         /* repeated silo.v1.Task tasks = 1; */
         for (let i = 0; i < message.tasks.length; i++)
             Task.internalBinaryWrite(message.tasks[i], writer.tag(1, WireType.LengthDelimited).fork(), options).join();
+        /* repeated silo.v1.RefreshFloatingLimitTask refresh_tasks = 2; */
+        for (let i = 0; i < message.refreshTasks.length; i++)
+            RefreshFloatingLimitTask.internalBinaryWrite(message.refreshTasks[i], writer.tag(2, WireType.LengthDelimited).fork(), options).join();
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -1736,7 +2138,7 @@ export const LeaseTasksResponse = new LeaseTasksResponse$Type();
 class ReportOutcomeRequest$Type extends MessageType<ReportOutcomeRequest> {
     constructor() {
         super("silo.v1.ReportOutcomeRequest", [
-            { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 1, name: "shard", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
             { no: 2, name: "task_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
             { no: 5, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
             { no: 3, name: "success", kind: "message", oneof: "outcome", T: () => JsonValueBytes },
@@ -1746,7 +2148,7 @@ class ReportOutcomeRequest$Type extends MessageType<ReportOutcomeRequest> {
     }
     create(value?: PartialMessage<ReportOutcomeRequest>): ReportOutcomeRequest {
         const message = globalThis.Object.create((this.messagePrototype!));
-        message.shard = "";
+        message.shard = 0;
         message.taskId = "";
         message.outcome = { oneofKind: undefined };
         if (value !== undefined)
@@ -1758,8 +2160,8 @@ class ReportOutcomeRequest$Type extends MessageType<ReportOutcomeRequest> {
         while (reader.pos < end) {
             let [fieldNo, wireType] = reader.tag();
             switch (fieldNo) {
-                case /* string shard */ 1:
-                    message.shard = reader.string();
+                case /* uint32 shard */ 1:
+                    message.shard = reader.uint32();
                     break;
                 case /* string task_id */ 2:
                     message.taskId = reader.string();
@@ -1797,9 +2199,9 @@ class ReportOutcomeRequest$Type extends MessageType<ReportOutcomeRequest> {
         return message;
     }
     internalBinaryWrite(message: ReportOutcomeRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
-        /* string shard = 1; */
-        if (message.shard !== "")
-            writer.tag(1, WireType.LengthDelimited).string(message.shard);
+        /* uint32 shard = 1; */
+        if (message.shard !== 0)
+            writer.tag(1, WireType.Varint).uint32(message.shard);
         /* string task_id = 2; */
         if (message.taskId !== "")
             writer.tag(2, WireType.LengthDelimited).string(message.taskId);
@@ -1957,10 +2359,233 @@ class ReportOutcomeResponse$Type extends MessageType<ReportOutcomeResponse> {
  */
 export const ReportOutcomeResponse = new ReportOutcomeResponse$Type();
 // @generated message type with reflection information, may provide speed optimized methods
+class ReportRefreshOutcomeRequest$Type extends MessageType<ReportRefreshOutcomeRequest> {
+    constructor() {
+        super("silo.v1.ReportRefreshOutcomeRequest", [
+            { no: 1, name: "shard", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
+            { no: 2, name: "task_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 3, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
+            { no: 4, name: "success", kind: "message", oneof: "outcome", T: () => RefreshSuccess },
+            { no: 5, name: "failure", kind: "message", oneof: "outcome", T: () => RefreshFailure }
+        ]);
+    }
+    create(value?: PartialMessage<ReportRefreshOutcomeRequest>): ReportRefreshOutcomeRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.shard = 0;
+        message.taskId = "";
+        message.outcome = { oneofKind: undefined };
+        if (value !== undefined)
+            reflectionMergePartial<ReportRefreshOutcomeRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: ReportRefreshOutcomeRequest): ReportRefreshOutcomeRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* uint32 shard */ 1:
+                    message.shard = reader.uint32();
+                    break;
+                case /* string task_id */ 2:
+                    message.taskId = reader.string();
+                    break;
+                case /* optional string tenant */ 3:
+                    message.tenant = reader.string();
+                    break;
+                case /* silo.v1.RefreshSuccess success */ 4:
+                    message.outcome = {
+                        oneofKind: "success",
+                        success: RefreshSuccess.internalBinaryRead(reader, reader.uint32(), options, (message.outcome as any).success)
+                    };
+                    break;
+                case /* silo.v1.RefreshFailure failure */ 5:
+                    message.outcome = {
+                        oneofKind: "failure",
+                        failure: RefreshFailure.internalBinaryRead(reader, reader.uint32(), options, (message.outcome as any).failure)
+                    };
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: ReportRefreshOutcomeRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* uint32 shard = 1; */
+        if (message.shard !== 0)
+            writer.tag(1, WireType.Varint).uint32(message.shard);
+        /* string task_id = 2; */
+        if (message.taskId !== "")
+            writer.tag(2, WireType.LengthDelimited).string(message.taskId);
+        /* optional string tenant = 3; */
+        if (message.tenant !== undefined)
+            writer.tag(3, WireType.LengthDelimited).string(message.tenant);
+        /* silo.v1.RefreshSuccess success = 4; */
+        if (message.outcome.oneofKind === "success")
+            RefreshSuccess.internalBinaryWrite(message.outcome.success, writer.tag(4, WireType.LengthDelimited).fork(), options).join();
+        /* silo.v1.RefreshFailure failure = 5; */
+        if (message.outcome.oneofKind === "failure")
+            RefreshFailure.internalBinaryWrite(message.outcome.failure, writer.tag(5, WireType.LengthDelimited).fork(), options).join();
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.ReportRefreshOutcomeRequest
+ */
+export const ReportRefreshOutcomeRequest = new ReportRefreshOutcomeRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class RefreshSuccess$Type extends MessageType<RefreshSuccess> {
+    constructor() {
+        super("silo.v1.RefreshSuccess", [
+            { no: 1, name: "new_max_concurrency", kind: "scalar", T: 13 /*ScalarType.UINT32*/ }
+        ]);
+    }
+    create(value?: PartialMessage<RefreshSuccess>): RefreshSuccess {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.newMaxConcurrency = 0;
+        if (value !== undefined)
+            reflectionMergePartial<RefreshSuccess>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: RefreshSuccess): RefreshSuccess {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* uint32 new_max_concurrency */ 1:
+                    message.newMaxConcurrency = reader.uint32();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: RefreshSuccess, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* uint32 new_max_concurrency = 1; */
+        if (message.newMaxConcurrency !== 0)
+            writer.tag(1, WireType.Varint).uint32(message.newMaxConcurrency);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.RefreshSuccess
+ */
+export const RefreshSuccess = new RefreshSuccess$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class RefreshFailure$Type extends MessageType<RefreshFailure> {
+    constructor() {
+        super("silo.v1.RefreshFailure", [
+            { no: 1, name: "code", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "message", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value?: PartialMessage<RefreshFailure>): RefreshFailure {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.code = "";
+        message.message = "";
+        if (value !== undefined)
+            reflectionMergePartial<RefreshFailure>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: RefreshFailure): RefreshFailure {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string code */ 1:
+                    message.code = reader.string();
+                    break;
+                case /* string message */ 2:
+                    message.message = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: RefreshFailure, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string code = 1; */
+        if (message.code !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.code);
+        /* string message = 2; */
+        if (message.message !== "")
+            writer.tag(2, WireType.LengthDelimited).string(message.message);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.RefreshFailure
+ */
+export const RefreshFailure = new RefreshFailure$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class ReportRefreshOutcomeResponse$Type extends MessageType<ReportRefreshOutcomeResponse> {
+    constructor() {
+        super("silo.v1.ReportRefreshOutcomeResponse", []);
+    }
+    create(value?: PartialMessage<ReportRefreshOutcomeResponse>): ReportRefreshOutcomeResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        if (value !== undefined)
+            reflectionMergePartial<ReportRefreshOutcomeResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: ReportRefreshOutcomeResponse): ReportRefreshOutcomeResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: ReportRefreshOutcomeResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.ReportRefreshOutcomeResponse
+ */
+export const ReportRefreshOutcomeResponse = new ReportRefreshOutcomeResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
 class HeartbeatRequest$Type extends MessageType<HeartbeatRequest> {
     constructor() {
         super("silo.v1.HeartbeatRequest", [
-            { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 1, name: "shard", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
             { no: 2, name: "worker_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
             { no: 3, name: "task_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
             { no: 4, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ }
@@ -1968,7 +2593,7 @@ class HeartbeatRequest$Type extends MessageType<HeartbeatRequest> {
     }
     create(value?: PartialMessage<HeartbeatRequest>): HeartbeatRequest {
         const message = globalThis.Object.create((this.messagePrototype!));
-        message.shard = "";
+        message.shard = 0;
         message.workerId = "";
         message.taskId = "";
         if (value !== undefined)
@@ -1980,8 +2605,8 @@ class HeartbeatRequest$Type extends MessageType<HeartbeatRequest> {
         while (reader.pos < end) {
             let [fieldNo, wireType] = reader.tag();
             switch (fieldNo) {
-                case /* string shard */ 1:
-                    message.shard = reader.string();
+                case /* uint32 shard */ 1:
+                    message.shard = reader.uint32();
                     break;
                 case /* string worker_id */ 2:
                     message.workerId = reader.string();
@@ -2004,9 +2629,9 @@ class HeartbeatRequest$Type extends MessageType<HeartbeatRequest> {
         return message;
     }
     internalBinaryWrite(message: HeartbeatRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
-        /* string shard = 1; */
-        if (message.shard !== "")
-            writer.tag(1, WireType.LengthDelimited).string(message.shard);
+        /* uint32 shard = 1; */
+        if (message.shard !== 0)
+            writer.tag(1, WireType.Varint).uint32(message.shard);
         /* string worker_id = 2; */
         if (message.workerId !== "")
             writer.tag(2, WireType.LengthDelimited).string(message.workerId);
@@ -2084,14 +2709,14 @@ export const HeartbeatResponse = new HeartbeatResponse$Type();
 class QueryRequest$Type extends MessageType<QueryRequest> {
     constructor() {
         super("silo.v1.QueryRequest", [
-            { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 1, name: "shard", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
             { no: 2, name: "sql", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
             { no: 3, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ }
         ]);
     }
     create(value?: PartialMessage<QueryRequest>): QueryRequest {
         const message = globalThis.Object.create((this.messagePrototype!));
-        message.shard = "";
+        message.shard = 0;
         message.sql = "";
         if (value !== undefined)
             reflectionMergePartial<QueryRequest>(this, message, value);
@@ -2102,8 +2727,8 @@ class QueryRequest$Type extends MessageType<QueryRequest> {
         while (reader.pos < end) {
             let [fieldNo, wireType] = reader.tag();
             switch (fieldNo) {
-                case /* string shard */ 1:
-                    message.shard = reader.string();
+                case /* uint32 shard */ 1:
+                    message.shard = reader.uint32();
                     break;
                 case /* string sql */ 2:
                     message.sql = reader.string();
@@ -2123,9 +2748,9 @@ class QueryRequest$Type extends MessageType<QueryRequest> {
         return message;
     }
     internalBinaryWrite(message: QueryRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
-        /* string shard = 1; */
-        if (message.shard !== "")
-            writer.tag(1, WireType.LengthDelimited).string(message.shard);
+        /* uint32 shard = 1; */
+        if (message.shard !== 0)
+            writer.tag(1, WireType.Varint).uint32(message.shard);
         /* string sql = 2; */
         if (message.sql !== "")
             writer.tag(2, WireType.LengthDelimited).string(message.sql);
@@ -2260,16 +2885,190 @@ class QueryResponse$Type extends MessageType<QueryResponse> {
  * @generated MessageType for protobuf message silo.v1.QueryResponse
  */
 export const QueryResponse = new QueryResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class GetClusterInfoRequest$Type extends MessageType<GetClusterInfoRequest> {
+    constructor() {
+        super("silo.v1.GetClusterInfoRequest", []);
+    }
+    create(value?: PartialMessage<GetClusterInfoRequest>): GetClusterInfoRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        if (value !== undefined)
+            reflectionMergePartial<GetClusterInfoRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: GetClusterInfoRequest): GetClusterInfoRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: GetClusterInfoRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.GetClusterInfoRequest
+ */
+export const GetClusterInfoRequest = new GetClusterInfoRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class ShardOwner$Type extends MessageType<ShardOwner> {
+    constructor() {
+        super("silo.v1.ShardOwner", [
+            { no: 1, name: "shard_id", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
+            { no: 2, name: "grpc_addr", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 3, name: "node_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value?: PartialMessage<ShardOwner>): ShardOwner {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.shardId = 0;
+        message.grpcAddr = "";
+        message.nodeId = "";
+        if (value !== undefined)
+            reflectionMergePartial<ShardOwner>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: ShardOwner): ShardOwner {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* uint32 shard_id */ 1:
+                    message.shardId = reader.uint32();
+                    break;
+                case /* string grpc_addr */ 2:
+                    message.grpcAddr = reader.string();
+                    break;
+                case /* string node_id */ 3:
+                    message.nodeId = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: ShardOwner, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* uint32 shard_id = 1; */
+        if (message.shardId !== 0)
+            writer.tag(1, WireType.Varint).uint32(message.shardId);
+        /* string grpc_addr = 2; */
+        if (message.grpcAddr !== "")
+            writer.tag(2, WireType.LengthDelimited).string(message.grpcAddr);
+        /* string node_id = 3; */
+        if (message.nodeId !== "")
+            writer.tag(3, WireType.LengthDelimited).string(message.nodeId);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.ShardOwner
+ */
+export const ShardOwner = new ShardOwner$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class GetClusterInfoResponse$Type extends MessageType<GetClusterInfoResponse> {
+    constructor() {
+        super("silo.v1.GetClusterInfoResponse", [
+            { no: 1, name: "num_shards", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
+            { no: 2, name: "shard_owners", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => ShardOwner },
+            { no: 3, name: "this_node_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 4, name: "this_grpc_addr", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value?: PartialMessage<GetClusterInfoResponse>): GetClusterInfoResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.numShards = 0;
+        message.shardOwners = [];
+        message.thisNodeId = "";
+        message.thisGrpcAddr = "";
+        if (value !== undefined)
+            reflectionMergePartial<GetClusterInfoResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: GetClusterInfoResponse): GetClusterInfoResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* uint32 num_shards */ 1:
+                    message.numShards = reader.uint32();
+                    break;
+                case /* repeated silo.v1.ShardOwner shard_owners */ 2:
+                    message.shardOwners.push(ShardOwner.internalBinaryRead(reader, reader.uint32(), options));
+                    break;
+                case /* string this_node_id */ 3:
+                    message.thisNodeId = reader.string();
+                    break;
+                case /* string this_grpc_addr */ 4:
+                    message.thisGrpcAddr = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: GetClusterInfoResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* uint32 num_shards = 1; */
+        if (message.numShards !== 0)
+            writer.tag(1, WireType.Varint).uint32(message.numShards);
+        /* repeated silo.v1.ShardOwner shard_owners = 2; */
+        for (let i = 0; i < message.shardOwners.length; i++)
+            ShardOwner.internalBinaryWrite(message.shardOwners[i], writer.tag(2, WireType.LengthDelimited).fork(), options).join();
+        /* string this_node_id = 3; */
+        if (message.thisNodeId !== "")
+            writer.tag(3, WireType.LengthDelimited).string(message.thisNodeId);
+        /* string this_grpc_addr = 4; */
+        if (message.thisGrpcAddr !== "")
+            writer.tag(4, WireType.LengthDelimited).string(message.thisGrpcAddr);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.GetClusterInfoResponse
+ */
+export const GetClusterInfoResponse = new GetClusterInfoResponse$Type();
 /**
  * @generated ServiceType for protobuf service silo.v1.Silo
  */
 export const Silo = new ServiceType("silo.v1.Silo", [
+    { name: "GetClusterInfo", options: {}, I: GetClusterInfoRequest, O: GetClusterInfoResponse },
     { name: "Enqueue", options: {}, I: EnqueueRequest, O: EnqueueResponse },
     { name: "GetJob", options: {}, I: GetJobRequest, O: GetJobResponse },
     { name: "DeleteJob", options: {}, I: DeleteJobRequest, O: DeleteJobResponse },
     { name: "CancelJob", options: {}, I: CancelJobRequest, O: CancelJobResponse },
     { name: "LeaseTasks", options: {}, I: LeaseTasksRequest, O: LeaseTasksResponse },
     { name: "ReportOutcome", options: {}, I: ReportOutcomeRequest, O: ReportOutcomeResponse },
+    { name: "ReportRefreshOutcome", options: {}, I: ReportRefreshOutcomeRequest, O: ReportRefreshOutcomeResponse },
     { name: "Heartbeat", options: {}, I: HeartbeatRequest, O: HeartbeatResponse },
     { name: "Query", options: {}, I: QueryRequest, O: QueryResponse }
 ]);
