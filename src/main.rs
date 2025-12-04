@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,17 +17,40 @@ use tokio::net::TcpListener;
 /// Application CLI arguments
 struct Args {
     /// whether to be verbose
-    #[arg(short = 'v')]
+    #[arg(short = 'v', global = true)]
     verbose: bool,
 
     /// path to a TOML config file
-    #[arg(short = 'c', long = "config")]
+    #[arg(short = 'c', long = "config", global = true)]
     config: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Validate a config file and exit
+    ValidateConfig,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    // Handle validate-config command
+    if let Some(Command::ValidateConfig) = args.command {
+        match settings::AppConfig::load(args.config.as_deref()) {
+            Ok(_) => {
+                println!("Config is valid");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("Config validation failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
 
     // Initialize tracing via shared helper (Perfetto or OTLP based on env)
     silo::trace::init_from_env()?;
