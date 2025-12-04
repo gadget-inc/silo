@@ -145,20 +145,20 @@ async fn main() {
     println!("Job Store Shard Throughput Benchmark");
     println!("========================================\n");
 
-    println!("Testing with 50ms flush interval\n");
+    println!("Testing with 1ms flush interval\n");
 
     println!("--- Enqueue Throughput ---");
-    let enq_1p = measure_enqueue_throughput(50, 1, 50).await;
+    let enq_1p = measure_enqueue_throughput(1, 1, 50).await;
     println!("  1 producer  x 50  jobs: {:.0} jobs/sec", enq_1p);
 
-    let enq_4p = measure_enqueue_throughput(50, 4, 50).await;
+    let enq_4p = measure_enqueue_throughput(1, 4, 50).await;
     println!(
         "  4 producers x 50  jobs: {:.0} jobs/sec ({}x speedup)",
         enq_4p,
         enq_4p / enq_1p
     );
 
-    let enq_8p = measure_enqueue_throughput(50, 8, 25).await;
+    let enq_8p = measure_enqueue_throughput(1, 8, 25).await;
     println!(
         "  8 producers x 25  jobs: {:.0} jobs/sec ({}x speedup)\n",
         enq_8p,
@@ -166,20 +166,20 @@ async fn main() {
     );
 
     println!("--- Dequeue Throughput ---");
-    let deq_1c = measure_dequeue_throughput(50, 1, 100, 32).await;
+    let deq_1c = measure_dequeue_throughput(1, 1, 100, 32).await;
     println!(
         "  1 consumer  x 100 jobs (batch 32): {:.0} jobs/sec",
         deq_1c
     );
 
-    let deq_4c = measure_dequeue_throughput(50, 4, 100, 32).await;
+    let deq_4c = measure_dequeue_throughput(1, 4, 100, 32).await;
     println!(
         "  4 consumers x 100 jobs (batch 32): {:.0} jobs/sec ({}x speedup)",
         deq_4c,
         deq_4c / deq_1c
     );
 
-    let deq_8c = measure_dequeue_throughput(50, 8, 200, 32).await;
+    let deq_8c = measure_dequeue_throughput(1, 8, 200, 32).await;
     println!(
         "  8 consumers x 200 jobs (batch 32): {:.0} jobs/sec ({}x speedup)\n",
         deq_8c,

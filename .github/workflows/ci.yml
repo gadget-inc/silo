@@ -26,6 +26,19 @@ jobs:
         shell: bash
         run: cargo test
 
+  benchmark:
+    name: Run benchmarks
+    runs-on: ubuntu-latest-l
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-test-env
+        with:
+          cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Run throughput benchmark
+        shell: bash
+        run: cargo bench --bench job_shard_throughput
+
   test-k8s:
     name: K8S coordination tests
     runs-on: ubuntu-latest-l
