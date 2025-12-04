@@ -67,7 +67,7 @@ fn proto_limit_to_job_limit(proto: Limit) -> Option<crate::job::Limit> {
 }
 
 /// Convert a job::Limit to a proto Limit
-fn job_limit_to_proto_limit(job_limit: crate::job::Limit) -> Limit {
+pub fn job_limit_to_proto_limit(job_limit: crate::job::Limit) -> Limit {
     match job_limit {
         crate::job::Limit::Concurrency(c) => Limit {
             limit: Some(limit::Limit::Concurrency(ConcurrencyLimit {

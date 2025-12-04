@@ -1196,3 +1196,398 @@ async fn sql_multiple_order_by() {
     // c has priority 5, then b (newer) then a (older)
     assert_eq!(got, vec!["c", "b", "a"]);
 }
+
+// =============================================================================
+// Queues Table Tests - Tests for the concurrency queue SQL table
+// =============================================================================
+
+use silo::job::{ConcurrencyLimit, Limit};
+
+// Helper to query queues table and extract queue names
+async fn query_queue_names(sql: &JobSql, query: &str) -> Vec<String> {
+    let batches = sql
+        .sql(query)
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+    extract_string_column(&batches, 0)
+}
+
+#[silo::test]
+async fn queues_table_exists() {
+    let (_tmp, shard) = open_temp_shard().await;
+
+    let sql = JobSql::new(Arc::clone(&shard), "jobs").expect("new JobSql");
+    // Just verify we can query the queues table without error
+    let batches = sql
+        .sql("SELECT * FROM queues LIMIT 1")
+        .await
+        .expect("queues table should exist")
+        .collect()
+        .await
+        .expect("collect");
+
+    // Should have the expected columns
+    if !batches.is_empty() {
+        assert_eq!(batches[0].num_columns(), 7); // tenant, queue_name, entry_type, task_id, job_id, priority, timestamp_ms
+    }
+}
+
+#[silo::test]
+async fn queues_table_shows_holders() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    // Enqueue a job with a concurrency limit
+    shard
+        .enqueue(
+            "-",
+            Some("holder-job".to_string()),
+            10,
+            now,
+            None,
+            serde_json::json!({}),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: "test-queue".to_string(),
+                max_concurrency: 1,
+            })],
+            None,
+        )
+        .await
+        .expect("enqueue");
+
+    // Dequeue to create a holder
+    let tasks = shard.dequeue("-", "worker", 1).await.expect("dequeue").tasks;
+    assert_eq!(tasks.len(), 1);
+
+    let sql = JobSql::new(Arc::clone(&shard), "jobs").expect("new JobSql");
+    let queue_names = query_queue_names(
+        &sql,
+        "SELECT queue_name FROM queues WHERE tenant = '-' AND entry_type = 'holder'",
+    )
+    .await;
+
+    assert!(
+        queue_names.contains(&"test-queue".to_string()),
+        "Expected holder for test-queue, got: {:?}",
+        queue_names
+    );
+}
+
+#[silo::test]
+async fn queues_table_shows_requesters() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    // Enqueue two jobs with the same concurrency limit (max 1)
+    // First job will get the holder, second will be a requester
+    shard
+        .enqueue(
+            "-",
+            Some("first-job".to_string()),
+            10,
+            now,
+            None,
+            serde_json::json!({}),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: "limited-queue".to_string(),
+                max_concurrency: 1,
+            })],
+            None,
+        )
+        .await
+        .expect("enqueue first");
+
+    shard
+        .enqueue(
+            "-",
+            Some("second-job".to_string()),
+            10,
+            now,
+            None,
+            serde_json::json!({}),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: "limited-queue".to_string(),
+                max_concurrency: 1,
+            })],
+            None,
+        )
+        .await
+        .expect("enqueue second");
+
+    // Dequeue both - first gets holder, second becomes requester
+    shard.dequeue("-", "worker", 2).await.expect("dequeue");
+
+    let sql = JobSql::new(Arc::clone(&shard), "jobs").expect("new JobSql");
+
+    // Check for holders
+    let holders = query_queue_names(
+        &sql,
+        "SELECT queue_name FROM queues WHERE tenant = '-' AND entry_type = 'holder'",
+    )
+    .await;
+    assert!(
+        holders.contains(&"limited-queue".to_string()),
+        "Expected holder, got: {:?}",
+        holders
+    );
+
+    // Check for requesters
+    let requesters = query_queue_names(
+        &sql,
+        "SELECT queue_name FROM queues WHERE tenant = '-' AND entry_type = 'requester'",
+    )
+    .await;
+    assert!(
+        requesters.contains(&"limited-queue".to_string()),
+        "Expected requester, got: {:?}",
+        requesters
+    );
+}
+
+#[silo::test]
+async fn queues_table_filter_by_queue_name() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    // Create holders in two different queues
+    shard
+        .enqueue(
+            "-",
+            Some("job-a".to_string()),
+            10,
+            now,
+            None,
+            serde_json::json!({}),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: "queue-alpha".to_string(),
+                max_concurrency: 1,
+            })],
+            None,
+        )
+        .await
+        .expect("enqueue");
+
+    shard
+        .enqueue(
+            "-",
+            Some("job-b".to_string()),
+            10,
+            now,
+            None,
+            serde_json::json!({}),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: "queue-beta".to_string(),
+                max_concurrency: 1,
+            })],
+            None,
+        )
+        .await
+        .expect("enqueue");
+
+    shard.dequeue("-", "worker", 2).await.expect("dequeue");
+
+    let sql = JobSql::new(Arc::clone(&shard), "jobs").expect("new JobSql");
+
+    // Filter by specific queue name
+    let alpha_queues = query_queue_names(
+        &sql,
+        "SELECT queue_name FROM queues WHERE tenant = '-' AND queue_name = 'queue-alpha'",
+    )
+    .await;
+
+    assert_eq!(alpha_queues.len(), 1);
+    assert_eq!(alpha_queues[0], "queue-alpha");
+}
+
+#[silo::test]
+async fn queues_table_all_columns() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    shard
+        .enqueue(
+            "-",
+            Some("test-job".to_string()),
+            10,
+            now,
+            None,
+            serde_json::json!({}),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: "my-queue".to_string(),
+                max_concurrency: 1,
+            })],
+            None,
+        )
+        .await
+        .expect("enqueue");
+
+    shard.dequeue("-", "worker", 1).await.expect("dequeue");
+
+    let sql = JobSql::new(Arc::clone(&shard), "jobs").expect("new JobSql");
+    let batches = sql
+        .sql("SELECT tenant, queue_name, entry_type, task_id, timestamp_ms FROM queues WHERE tenant = '-'")
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+
+    assert!(!batches.is_empty());
+    assert_eq!(batches[0].num_columns(), 5);
+    assert!(batches[0].num_rows() >= 1);
+
+    // Verify tenant column
+    let tenants = extract_string_column(&batches, 0);
+    assert!(tenants.iter().all(|t| t == "-"));
+
+    // Verify queue_name column
+    let queues = extract_string_column(&batches, 1);
+    assert!(queues.contains(&"my-queue".to_string()));
+
+    // Verify entry_type column
+    let types = extract_string_column(&batches, 2);
+    assert!(types.contains(&"holder".to_string()));
+}
+
+#[silo::test]
+async fn queues_table_empty_when_no_concurrency() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    // Enqueue a job WITHOUT concurrency limits
+    shard
+        .enqueue(
+            "-",
+            Some("no-limit-job".to_string()),
+            10,
+            now,
+            None,
+            serde_json::json!({}),
+            vec![], // No limits
+            None,
+        )
+        .await
+        .expect("enqueue");
+
+    shard.dequeue("-", "worker", 1).await.expect("dequeue");
+
+    let sql = JobSql::new(Arc::clone(&shard), "jobs").expect("new JobSql");
+    let queue_names = query_queue_names(&sql, "SELECT queue_name FROM queues WHERE tenant = '-'").await;
+
+    // Should be empty - no concurrency queues
+    assert!(
+        queue_names.is_empty(),
+        "Expected no queues without concurrency limits, got: {:?}",
+        queue_names
+    );
+}
+
+#[silo::test]
+async fn queues_table_count_aggregate() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    // Create multiple holders in the same queue
+    for i in 0..3 {
+        shard
+            .enqueue(
+                "-",
+                Some(format!("job-{}", i)),
+                10,
+                now,
+                None,
+                serde_json::json!({}),
+                vec![Limit::Concurrency(ConcurrencyLimit {
+                    key: "shared-queue".to_string(),
+                    max_concurrency: 10, // High limit so all get holders
+                })],
+                None,
+            )
+            .await
+            .expect("enqueue");
+    }
+
+    shard.dequeue("-", "worker", 3).await.expect("dequeue");
+
+    let sql = JobSql::new(Arc::clone(&shard), "jobs").expect("new JobSql");
+    let batches = sql
+        .sql("SELECT COUNT(*) FROM queues WHERE tenant = '-' AND queue_name = 'shared-queue'")
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+
+    assert!(!batches.is_empty());
+    let count_col = batches[0].column(0);
+    let count_arr = count_col
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .expect("count column");
+    assert_eq!(count_arr.value(0), 3);
+}
+
+#[silo::test]
+async fn queues_table_tenant_isolation() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    // Create queues for different tenants
+    shard
+        .enqueue(
+            "tenant_x",
+            Some("job-x".to_string()),
+            10,
+            now,
+            None,
+            serde_json::json!({}),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: "queue-x".to_string(),
+                max_concurrency: 1,
+            })],
+            None,
+        )
+        .await
+        .expect("enqueue tenant_x");
+
+    shard
+        .enqueue(
+            "tenant_y",
+            Some("job-y".to_string()),
+            10,
+            now,
+            None,
+            serde_json::json!({}),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: "queue-y".to_string(),
+                max_concurrency: 1,
+            })],
+            None,
+        )
+        .await
+        .expect("enqueue tenant_y");
+
+    shard.dequeue("tenant_x", "worker", 1).await.expect("dequeue x");
+    shard.dequeue("tenant_y", "worker", 1).await.expect("dequeue y");
+
+    let sql = JobSql::new(Arc::clone(&shard), "jobs").expect("new JobSql");
+
+    // Query tenant_x
+    let x_queues = query_queue_names(
+        &sql,
+        "SELECT queue_name FROM queues WHERE tenant = 'tenant_x'",
+    )
+    .await;
+    assert_eq!(x_queues, vec!["queue-x"]);
+
+    // Query tenant_y
+    let y_queues = query_queue_names(
+        &sql,
+        "SELECT queue_name FROM queues WHERE tenant = 'tenant_y'",
+    )
+    .await;
+    assert_eq!(y_queues, vec!["queue-y"]);
+}

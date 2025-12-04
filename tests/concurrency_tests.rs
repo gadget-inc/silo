@@ -983,7 +983,7 @@ async fn concurrency_reap_expired_lease_releases_holder() {
         .await
         .expect("enqueue1");
     let t1_vec = shard.dequeue("-", "w", 1).await.expect("deq1").tasks;
-    let t1 = t1_vec[0].attempt().task_id().to_string();
+    let _t1 = t1_vec[0].attempt().task_id().to_string();
 
     // Job 2 queues as request
     let _j2 = shard

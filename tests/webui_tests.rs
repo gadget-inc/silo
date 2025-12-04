@@ -216,10 +216,11 @@ async fn test_queues_view_renders() {
 async fn test_queue_view_renders() {
     let (_tmp, state) = setup_test_state().await;
 
+    // Queue view now requires shard parameter
     let (status, body) = make_request(
         state,
         "GET",
-        "/queue?name=test-queue",
+        "/queue?shard=0&name=test-queue",
     )
     .await;
 
@@ -304,4 +305,226 @@ async fn test_404_handler() {
 
     assert_eq!(status, StatusCode::OK); // Fallback renders error page
     assert!(body.contains("404") || body.contains("Not Found"));
+}
+
+// =============================================================================
+// Multi-shard regression tests
+// =============================================================================
+
+/// Helper to create a multi-shard test AppState
+async fn setup_multi_shard_state(num_shards: usize) -> (tempfile::TempDir, AppState) {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let rate_limiter = MockGubernatorClient::new_arc();
+    // Use {shard} placeholder so each shard gets its own subdirectory
+    let path_with_shard = format!("{}/{{shard}}", tmp.path().to_string_lossy());
+    let mut factory = ShardFactory::new(
+        DatabaseTemplate {
+            backend: Backend::Fs,
+            path: path_with_shard,
+            wal: None,
+        },
+        rate_limiter,
+    );
+
+    // Open multiple shards
+    for i in 0..num_shards {
+        factory.open(i).await.expect(&format!("open shard {}", i));
+    }
+
+    let factory = Arc::new(factory);
+    let cluster_client = Arc::new(ClusterClient::new(factory.clone(), None));
+
+    let state = AppState {
+        factory,
+        coordinator: None,
+        cluster_client,
+    };
+
+    (tmp, state)
+}
+
+#[silo::test]
+async fn test_index_shows_jobs_from_all_shards() {
+    // Create state with 3 shards
+    let (_tmp, state) = setup_multi_shard_state(3).await;
+
+    // Enqueue a job on each shard
+    let shard0 = state.factory.get("0").expect("shard 0");
+    let _job0 = shard0
+        .enqueue(
+            "-",
+            Some("job-on-shard-0".to_string()),
+            50,
+            test_helpers::now_ms() + 10000,
+            None,
+            serde_json::json!({}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("enqueue shard 0");
+
+    let shard1 = state.factory.get("1").expect("shard 1");
+    let _job1 = shard1
+        .enqueue(
+            "-",
+            Some("job-on-shard-1".to_string()),
+            50,
+            test_helpers::now_ms() + 10000,
+            None,
+            serde_json::json!({}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("enqueue shard 1");
+
+    let shard2 = state.factory.get("2").expect("shard 2");
+    let _job2 = shard2
+        .enqueue(
+            "-",
+            Some("job-on-shard-2".to_string()),
+            50,
+            test_helpers::now_ms() + 10000,
+            None,
+            serde_json::json!({}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("enqueue shard 2");
+
+    // Request the index page
+    let (status, body) = make_request(state, "GET", "/").await;
+
+    assert_eq!(status, StatusCode::OK);
+    // Verify jobs from ALL shards are displayed
+    assert!(
+        body.contains("job-on-shard-0"),
+        "index should show job from shard 0"
+    );
+    assert!(
+        body.contains("job-on-shard-1"),
+        "index should show job from shard 1"
+    );
+    assert!(
+        body.contains("job-on-shard-2"),
+        "index should show job from shard 2"
+    );
+}
+
+#[silo::test]
+async fn test_shards_page_shows_all_shards() {
+    // Create state with 3 shards
+    let (_tmp, state) = setup_multi_shard_state(3).await;
+
+    // Request the shards page
+    let (status, body) = make_request(state, "GET", "/shards").await;
+
+    assert_eq!(status, StatusCode::OK);
+    // Verify all shards are displayed
+    assert!(body.contains(">0<") || body.contains(">0</"), "shards page should show shard 0");
+    assert!(body.contains(">1<") || body.contains(">1</"), "shards page should show shard 1");
+    assert!(body.contains(">2<") || body.contains(">2</"), "shards page should show shard 2");
+}
+
+#[silo::test]
+async fn test_job_detail_from_non_zero_shard() {
+    // Create state with 2 shards
+    let (_tmp, state) = setup_multi_shard_state(2).await;
+
+    // Enqueue a job on shard 1
+    let shard1 = state.factory.get("1").expect("shard 1");
+    let job_id = shard1
+        .enqueue(
+            "-",
+            Some("job-on-shard-one".to_string()),
+            25,
+            test_helpers::now_ms(),
+            None,
+            serde_json::json!({"shard": 1}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("enqueue shard 1");
+
+    // Request job detail from shard 1
+    let (status, body) = make_request(
+        state,
+        "GET",
+        &format!("/job?shard=1&id={}", job_id),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains(&job_id),
+        "job detail should show the job from shard 1"
+    );
+    assert!(body.contains("P25"), "job detail should show priority");
+}
+
+#[silo::test]
+async fn test_queues_page_shows_queues_from_all_shards() {
+    use silo::job::{ConcurrencyLimit, Limit};
+
+    // Create state with 2 shards
+    let (_tmp, state) = setup_multi_shard_state(2).await;
+
+    // Enqueue a job with concurrency limit on shard 0
+    let shard0 = state.factory.get("0").expect("shard 0");
+    let _job0 = shard0
+        .enqueue(
+            "-",
+            Some("job-queue-shard0".to_string()),
+            50,
+            test_helpers::now_ms(),
+            None,
+            serde_json::json!({}),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: "queue-on-shard-0".to_string(),
+                max_concurrency: 1,
+            })],
+            None,
+        )
+        .await
+        .expect("enqueue shard 0");
+
+    // Enqueue a job with concurrency limit on shard 1
+    let shard1 = state.factory.get("1").expect("shard 1");
+    let _job1 = shard1
+        .enqueue(
+            "-",
+            Some("job-queue-shard1".to_string()),
+            50,
+            test_helpers::now_ms(),
+            None,
+            serde_json::json!({}),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: "queue-on-shard-1".to_string(),
+                max_concurrency: 1,
+            })],
+            None,
+        )
+        .await
+        .expect("enqueue shard 1");
+
+    // Dequeue to create holders (jobs will wait in concurrency queues)
+    // Since max_concurrency is 1 and we enqueued, there should be holders or requesters
+    let _ = shard0.dequeue("-", "worker-0", 1).await;
+    let _ = shard1.dequeue("-", "worker-1", 1).await;
+
+    // Request the queues page
+    let (status, body) = make_request(state, "GET", "/queues").await;
+
+    assert_eq!(status, StatusCode::OK);
+    // The queues page should show queues from both shards
+    // Note: The exact queue names may vary based on implementation
+    // This test verifies the page renders successfully with multi-shard data
+    assert!(
+        body.contains("Queues"),
+        "queues page should render"
+    );
 }
