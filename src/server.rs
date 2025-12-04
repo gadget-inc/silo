@@ -7,7 +7,11 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
 use tonic_health::server::health_reporter;
+use tonic_reflection::server::Builder as ReflectionBuilder;
 use tracing::info;
+
+/// File descriptor set for gRPC reflection
+pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("silo_descriptor");
 
 use crate::coordination::Coordinator;
 use crate::factory::{CloseAllError, ShardFactory};
@@ -658,9 +662,16 @@ pub async fn run_grpc_with_reaper(
 
     let incoming = TcpListenerStream::new(listener);
 
+    // Create reflection service for grpcurl/debugging
+    let reflection_service = ReflectionBuilder::configure()
+        .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
+        .build_v1()
+        .expect("failed to build reflection service");
+
     // Serve with graceful shutdown
     let serve = tonic::transport::Server::builder()
         .add_service(health_service)
+        .add_service(reflection_service)
         .add_service(server)
         .serve_with_incoming_shutdown(incoming, async move {
             let _ = shutdown.recv().await;
@@ -728,8 +739,15 @@ where
         }
     });
 
+    // Create reflection service for grpcurl/debugging
+    let reflection_service = ReflectionBuilder::configure()
+        .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
+        .build_v1()
+        .expect("failed to build reflection service");
+
     let serve = tonic::transport::Server::builder()
         .add_service(health_service)
+        .add_service(reflection_service)
         .add_service(server)
         .serve_with_incoming_shutdown(incoming, async move {
             let _ = shutdown.recv().await;

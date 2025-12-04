@@ -3,10 +3,15 @@ fn main() {
     std::env::set_var("PROTOC", protoc);
     let includes = &["proto"];
 
-    // Compile silo.proto
+    // Generate file descriptor set for gRPC reflection
+    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let descriptor_path = out_dir.join("silo_descriptor.bin");
+
+    // Compile silo.proto with file descriptor set for reflection
     tonic_build::configure()
         .build_client(true)
         .build_server(true)
+        .file_descriptor_set_path(&descriptor_path)
         .type_attribute(
             ".silo.v1.RetryPolicy",
             "#[derive(serde::Serialize, serde::Deserialize)]",
