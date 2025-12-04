@@ -76,8 +76,8 @@ async fn main() -> anyhow::Result<()> {
         .await
         .expect("connect etcd");
 
-    let (c1, h1) = Coordinator::start(&coord, &prefix, "node-a", num_shards, 10).await?;
-    let (c2, h2) = Coordinator::start(&coord, &prefix, "node-b", num_shards, 10).await?;
+    let (c1, h1) = Coordinator::start(&coord, &prefix, "node-a", "http://127.0.0.1:50051", num_shards, 10).await?;
+    let (c2, h2) = Coordinator::start(&coord, &prefix, "node-b", "http://127.0.0.1:50052", num_shards, 10).await?;
 
     let tmpdir = tempfile::tempdir()?;
     let rate_limiter = MockGubernatorClient::new_arc();
@@ -230,7 +230,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Add third coordinator mid-run
     tokio::time::sleep(Duration::from_secs(1)).await;
-    let (c3, h3) = Coordinator::start(&coord, &prefix, "node-c", num_shards, 10).await?;
+    let (c3, h3) = Coordinator::start(&coord, &prefix, "node-c", "http://127.0.0.1:50053", num_shards, 10).await?;
 
     // Run for desired duration
     tokio::time::sleep(Duration::from_secs(args.duration_secs)).await;

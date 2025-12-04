@@ -2,13 +2,14 @@ use clap::Parser;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::error;
+use tracing::{error, info};
 
 use silo::coordination::Coordination;
 use silo::factory::ShardFactory;
 use silo::gubernator::{GubernatorClient, NullGubernatorClient, RateLimitClient};
 use silo::server::run_grpc_with_reaper;
 use silo::settings;
+use silo::webui::run_webui;
 use tokio::net::TcpListener;
 
 #[derive(Parser, Debug)]
@@ -39,7 +40,8 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(endpoints = ?cfg.coordination.etcd_endpoints, "connected to etcd");
 
     // Create rate limiter based on configuration
-    let rate_limiter: Arc<dyn RateLimitClient> = if let Some(guber_cfg) = cfg.gubernator.to_config() {
+    let rate_limiter: Arc<dyn RateLimitClient> = if let Some(guber_cfg) = cfg.gubernator.to_config()
+    {
         let client = GubernatorClient::new(guber_cfg);
         client.connect().await?;
         tracing::info!(address = ?cfg.gubernator.address, "connected to Gubernator");
@@ -69,10 +71,32 @@ async fn main() -> anyhow::Result<()> {
 
     let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), shutdown_rx));
 
+    // Start WebUI server if enabled
+    let webui_handle = if cfg.webui.enabled {
+        let webui_addr: SocketAddr = cfg.webui.addr.parse()?;
+        let webui_shutdown = shutdown_tx.subscribe();
+        let webui_factory = factory.clone();
+        let webui_cfg = cfg.clone();
+        info!(grpc = %addr, webui = %webui_addr, "server started");
+        Some(tokio::spawn(async move {
+            if let Err(e) =
+                run_webui(webui_addr, webui_factory, None, webui_cfg, webui_shutdown).await
+            {
+                error!(error = %e, "WebUI server error");
+            }
+        }))
+    } else {
+        info!(grpc = %addr, "server started");
+        None
+    };
+
     // Wait for Ctrl+C, then signal shutdown and wait for server
     tokio::signal::ctrl_c().await?;
     let _ = shutdown_tx.send(());
     let _ = server.await?;
+    if let Some(handle) = webui_handle {
+        let _ = handle.await;
+    }
     // Ensure all spans are flushed before process exit
     silo::trace::shutdown();
     Ok(())

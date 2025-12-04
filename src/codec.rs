@@ -465,6 +465,11 @@ impl DecodedHolder {
         // SAFETY: data was validated at construction in decode_holder
         unsafe { rkyv::archived_root::<HolderRecord>(&self.data) }
     }
+
+    /// Get the granted_at time from this holder record
+    pub fn granted_at_ms(&self) -> i64 {
+        self.archived().granted_at_ms
+    }
 }
 
 #[inline]

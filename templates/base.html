@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Silo{% endblock %}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <style>
+        body { font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', Consolas, monospace; }
+        .ascii-logo { font-size: 0.7rem; line-height: 0.85rem; letter-spacing: 0.05em; }
+    </style>
+</head>
+<body class="bg-zinc-900 text-zinc-100 min-h-screen">
+    <div class="flex flex-col h-screen">
+        <!-- Header -->
+        <header class="bg-zinc-950 border-b border-zinc-800 px-4 py-2">
+            <div class="flex items-center justify-between">
+                <div class="flex items-center gap-6">
+                    <a href="/" class="flex items-center">
+                        <pre class="ascii-logo text-emerald-500 select-none">
+╔═╗╦╦  ╔═╗
+╚═╗║║  ║ ║
+╚═╝╩╩═╝╚═╝</pre>
+                    </a>
+                    <nav class="flex items-center gap-2">
+                        <a href="/" class="px-3 py-1 text-sm font-mono {% if nav_active == "index" %}bg-zinc-700 text-emerald-400{% else %}text-zinc-400 hover:text-emerald-400 hover:bg-zinc-800{% endif %}">Jobs</a>
+                        <a href="/queues" class="px-3 py-1 text-sm font-mono {% if nav_active == "queues" %}bg-zinc-700 text-emerald-400{% else %}text-zinc-400 hover:text-emerald-400 hover:bg-zinc-800{% endif %}">Queues</a>
+                        <a href="/shards" class="px-3 py-1 text-sm font-mono {% if nav_active == "shards" %}bg-zinc-700 text-emerald-400{% else %}text-zinc-400 hover:text-emerald-400 hover:bg-zinc-800{% endif %}">Shards</a>
+                    </nav>
+                </div>
+            </div>
+        </header>
+        
+        <!-- Main Content -->
+        <main class="flex-1 overflow-auto p-4">
+            {% block content %}{% endblock %}
+        </main>
+        
+        <!-- Footer -->
+        <footer class="bg-zinc-950 border-t border-zinc-800 px-4 py-2 text-xs text-zinc-500">
+            <div class="flex justify-between">
+                <span>Silo WebUI</span>
+                <span id="clock"></span>
+            </div>
+        </footer>
+    </div>
+    
+    <script>
+        function updateClock() {
+            const now = new Date();
+            document.getElementById('clock').textContent = now.toISOString();
+        }
+        setInterval(updateClock, 1000);
+        updateClock();
+    </script>
+</body>
+</html>
+

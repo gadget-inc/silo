@@ -1,6 +1,6 @@
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
-use silo::settings::{AppConfig, Backend, DatabaseTemplate, GubernatorSettings};
+use silo::settings::{AppConfig, Backend, DatabaseTemplate, GubernatorSettings, WebUiConfig};
 
 #[silo::test]
 async fn open_fs_db_from_config() {
@@ -11,6 +11,7 @@ async fn open_fs_db_from_config() {
         coordination: Default::default(),
         tenancy: silo::settings::TenancyConfig { enabled: false },
         gubernator: GubernatorSettings::default(),
+        webui: WebUiConfig::default(),
         database: DatabaseTemplate {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
