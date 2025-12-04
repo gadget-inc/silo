@@ -167,12 +167,12 @@ async fn main() -> anyhow::Result<()> {
                 if !workers_running.load(Ordering::SeqCst) {
                     break;
                 }
-                let tasks = shard.dequeue("-", &wid, 4).await.unwrap_or_default();
-                if tasks.is_empty() {
+                let result = shard.dequeue("-", &wid, 4).await.unwrap_or_default();
+                if result.tasks.is_empty() {
                     tokio::task::yield_now().await;
                     continue;
                 }
-                for t in tasks {
+                for t in result.tasks {
                     let tid = t.attempt().task_id().to_string();
                     {
                         let mut g = seen.lock().unwrap();

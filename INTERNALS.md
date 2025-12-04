@@ -35,6 +35,18 @@ Secondary indexes are also mapped as ordered keys in the k/v store:
 
 - `idx/status_ts/<tenant>/<status>/<inv_ts:020>/<job-id>` stores a secondary index for all jobs, by status, ordered by the time of the last transition
 
+## Concurrency Queues
+
+TODO: document concurrency queues
+
+### Floating max concurrency limits
+
+Silo supports concurrency queues who's max concurrency is adjusted continuously over time. This allows queues to be adjusted by operators, as well as by automated controllers trying to achieve some setpoint in some other system, like rate limit usage of a downstream API.
+
+Floating max concurrency limits are specified by each job when the job is enqueued, which puts the job in that concurrency queue. The max concurrency for that queue is defaulted to an initial value, and then periodically refreshed. If too many jobs are currently running, no more will start until the queue is below its new max concurrency, and likewise if the queue now has more headroom, more jobs will start. The max concurrency value for the queue is refreshed by sending a special type of refresh task to any listening Silo worker, which can then run whatever fancy business logic necessary to compute a new value.
+
+We're careful to only push refresh tasks for queues that are actively in use.
+
 ## Clustering approach
 
 Silo works by separating the compute and storage tiers. Storage is provided by object storage, and the compute is "stateless", in the sense that it can be started and stopped without fear of dataloss.

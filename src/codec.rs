@@ -168,6 +168,24 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
                 .map(|s| s.as_str().to_string())
                 .collect::<Vec<String>>(),
         },
+        ArchivedTask::RefreshFloatingLimit {
+            task_id,
+            tenant,
+            queue_key,
+            current_max_concurrency,
+            last_refreshed_at_ms,
+            metadata,
+        } => Task::RefreshFloatingLimit {
+            task_id: task_id.as_str().to_string(),
+            tenant: tenant.as_str().to_string(),
+            queue_key: queue_key.as_str().to_string(),
+            current_max_concurrency: *current_max_concurrency,
+            last_refreshed_at_ms: *last_refreshed_at_ms,
+            metadata: metadata
+                .iter()
+                .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
+                .collect(),
+        },
     })
 }
 
@@ -215,21 +233,23 @@ impl DecodedLease {
         }
     }
 
-    /// Extract job_id from the leased task (zero-copy)
+    /// Extract job_id from the leased task (zero-copy). Returns None for RefreshFloatingLimit.
     pub fn job_id(&self) -> &str {
         match self.archived_task() {
             ArchivedTask::RunAttempt { job_id, .. } => job_id.as_str(),
             ArchivedTask::RequestTicket { job_id, .. } => job_id.as_str(),
             ArchivedTask::CheckRateLimit { job_id, .. } => job_id.as_str(),
+            ArchivedTask::RefreshFloatingLimit { .. } => "",
         }
     }
 
-    /// Extract attempt_number from the leased task (zero-copy)
+    /// Extract attempt_number from the leased task (zero-copy). Returns 0 for RefreshFloatingLimit.
     pub fn attempt_number(&self) -> u32 {
         match self.archived_task() {
             ArchivedTask::RunAttempt { attempt_number, .. } => *attempt_number,
             ArchivedTask::RequestTicket { attempt_number, .. } => *attempt_number,
             ArchivedTask::CheckRateLimit { attempt_number, .. } => *attempt_number,
+            ArchivedTask::RefreshFloatingLimit { .. } => 0,
         }
     }
 
@@ -242,7 +262,9 @@ impl DecodedLease {
             ArchivedTask::CheckRateLimit { held_queues, .. } => {
                 held_queues.iter().map(|s| s.as_str().to_string()).collect()
             }
-            ArchivedTask::RequestTicket { .. } => Vec::new(),
+            ArchivedTask::RequestTicket { .. } | ArchivedTask::RefreshFloatingLimit { .. } => {
+                Vec::new()
+            }
         }
     }
 
@@ -307,6 +329,24 @@ impl DecodedLease {
                 started_at_ms: *started_at_ms,
                 priority: *priority,
                 held_queues: held_queues.iter().map(|s| s.as_str().to_string()).collect(),
+            },
+            ArchivedTask::RefreshFloatingLimit {
+                task_id,
+                tenant,
+                queue_key,
+                current_max_concurrency,
+                last_refreshed_at_ms,
+                metadata,
+            } => Task::RefreshFloatingLimit {
+                task_id: task_id.as_str().to_string(),
+                tenant: tenant.as_str().to_string(),
+                queue_key: queue_key.as_str().to_string(),
+                current_max_concurrency: *current_max_concurrency,
+                last_refreshed_at_ms: *last_refreshed_at_ms,
+                metadata: metadata
+                    .iter()
+                    .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
+                    .collect(),
             },
         }
     }
@@ -496,4 +536,42 @@ pub fn decode_job_cancellation(bytes: &[u8]) -> Result<DecodedJobCancellation, C
     let _ = rkyv::check_archived_root::<JobCancellation>(&data)
         .map_err(|e| CodecError::Rkyv(e.to_string()))?;
     Ok(DecodedJobCancellation { data })
+}
+
+// ============================================================================
+// FloatingLimitState encoding/decoding
+// ============================================================================
+
+use crate::job::FloatingLimitState;
+
+/// Version for FloatingLimitState serialization format
+pub const FLOATING_LIMIT_STATE_VERSION: u8 = 1;
+
+#[inline]
+pub fn encode_floating_limit_state(state: &FloatingLimitState) -> Result<Vec<u8>, CodecError> {
+    let data = rkyv::to_bytes::<FloatingLimitState, 256>(state)
+        .map_err(|e| CodecError::Rkyv(e.to_string()))?;
+    Ok(prepend_version(FLOATING_LIMIT_STATE_VERSION, data))
+}
+
+/// Decoded floating limit state that owns its aligned data
+#[derive(Clone)]
+pub struct DecodedFloatingLimitState {
+    data: AlignedVec,
+}
+
+impl DecodedFloatingLimitState {
+    pub fn archived(&self) -> &<FloatingLimitState as Archive>::Archived {
+        // SAFETY: data was validated at construction in decode_floating_limit_state
+        unsafe { rkyv::archived_root::<FloatingLimitState>(&self.data) }
+    }
+}
+
+#[inline]
+pub fn decode_floating_limit_state(bytes: &[u8]) -> Result<DecodedFloatingLimitState, CodecError> {
+    let data = strip_version(FLOATING_LIMIT_STATE_VERSION, bytes)?;
+    // Validate the data
+    let _ = rkyv::check_archived_root::<FloatingLimitState>(&data)
+        .map_err(|e| CodecError::Rkyv(e.to_string()))?;
+    Ok(DecodedFloatingLimitState { data })
 }

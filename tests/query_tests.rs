@@ -101,7 +101,7 @@ async fn sql_pushdown_status_kind_running() {
     enqueue_job(&shard, "j2", 10, now).await;
 
     // Move j1 to Running by leasing a task
-    shard.dequeue("-", "w", 1).await.expect("dequeue");
+    shard.dequeue("-", "w", 1).await.expect("dequeue").tasks;
 
     let sql = JobSql::new(Arc::clone(&shard), "jobs").expect("new JobSql");
     let got = query_ids(
@@ -156,7 +156,7 @@ async fn sql_status_and_exact_id() {
     enqueue_job(&shard, "j2", 10, now).await;
 
     // Move j1 to Running
-    shard.dequeue("-", "w", 1).await.expect("dequeue");
+    shard.dequeue("-", "w", 1).await.expect("dequeue").tasks;
 
     let sql = JobSql::new(Arc::clone(&shard), "jobs").expect("new JobSql");
     let got = query_ids(
@@ -177,7 +177,7 @@ async fn sql_status_and_prefix_id() {
         enqueue_job(&shard, id, 10, now).await;
     }
     // Make two jobs Running
-    shard.dequeue("-", "w", 2).await.expect("dequeue");
+    shard.dequeue("-", "w", 2).await.expect("dequeue").tasks;
 
     let sql = JobSql::new(Arc::clone(&shard), "jobs").expect("new JobSql");
     let got = query_ids(&sql, "SELECT id FROM jobs WHERE tenant='-' AND status_kind='Running' AND id LIKE 'job_%' ORDER BY id").await;
@@ -239,7 +239,7 @@ async fn sql_metadata_and_status_pushdown() {
     .await;
 
     // Make j1 Running
-    shard.dequeue("-", "w", 1).await.expect("dequeue");
+    shard.dequeue("-", "w", 1).await.expect("dequeue").tasks;
 
     let sql = JobSql::new(Arc::clone(&shard), "jobs").expect("new JobSql");
     let got = query_ids(&sql, "SELECT id FROM jobs WHERE tenant='-' AND array_contains(element_at(metadata, 'role'), 'api') AND status_kind='Running'").await;
@@ -377,7 +377,7 @@ async fn sql_metadata_with_status_and_id_prefix() {
     }
 
     // Make two jobs Running (app_1 and app_2 by priority order)
-    shard.dequeue("-", "w", 2).await.expect("dequeue");
+    shard.dequeue("-", "w", 2).await.expect("dequeue").tasks;
 
     let sql = JobSql::new(Arc::clone(&shard), "jobs").expect("new JobSql");
     let got = query_ids(&sql, "SELECT id FROM jobs WHERE tenant='-' AND array_contains(element_at(metadata, 'version'), 'v1') AND status_kind='Running' AND id LIKE 'app_%' ORDER BY id").await;
@@ -451,7 +451,7 @@ async fn verify_status_filter_pushdown() {
     let now = now_ms();
 
     enqueue_job(&shard, "j1", 10, now).await;
-    shard.dequeue("-", "w", 1).await.expect("dequeue");
+    shard.dequeue("-", "w", 1).await.expect("dequeue").tasks;
 
     let sql = JobSql::new(Arc::clone(&shard), "jobs").expect("new JobSql");
     let plan = sql
@@ -506,7 +506,7 @@ async fn verify_multiple_filters_pushed() {
         vec![("role".to_string(), "api".to_string())],
     )
     .await;
-    shard.dequeue("-", "w", 1).await.expect("dequeue");
+    shard.dequeue("-", "w", 1).await.expect("dequeue").tasks;
 
     let sql = JobSql::new(Arc::clone(&shard), "jobs").expect("new JobSql");
     // Query has metadata AND status filters
@@ -557,7 +557,7 @@ async fn sql_filter_scheduled_status() {
     enqueue_job(&shard, "s2", 10, now).await;
 
     // Make one Running
-    shard.dequeue("-", "w", 1).await.expect("dequeue");
+    shard.dequeue("-", "w", 1).await.expect("dequeue").tasks;
 
     let sql = JobSql::new(Arc::clone(&shard), "jobs").expect("new JobSql");
     let got = query_ids(
@@ -579,7 +579,7 @@ async fn sql_filter_succeeded_status() {
     enqueue_job(&shard, "other", 10, now).await;
 
     // Dequeue and complete success1
-    let tasks = shard.dequeue("-", "w", 1).await.expect("dequeue");
+    let tasks = shard.dequeue("-", "w", 1).await.expect("dequeue").tasks;
     assert_eq!(tasks.len(), 1);
     let task_id = tasks[0].attempt().task_id().to_string();
 
@@ -623,7 +623,7 @@ async fn sql_filter_failed_status() {
     enqueue_job(&shard, "other", 10, now).await;
 
     // Dequeue and fail fail1
-    let tasks = shard.dequeue("-", "w", 1).await.expect("dequeue");
+    let tasks = shard.dequeue("-", "w", 1).await.expect("dequeue").tasks;
     assert_eq!(tasks.len(), 1);
     let task_id = tasks[0].attempt().task_id().to_string();
 
@@ -1158,7 +1158,7 @@ async fn verify_combined_filters_all_pushed() {
         vec![("env".to_string(), "prod".to_string())],
     )
     .await;
-    shard.dequeue("-", "w", 1).await.expect("dequeue");
+    shard.dequeue("-", "w", 1).await.expect("dequeue").tasks;
 
     let sql = JobSql::new(Arc::clone(&shard), "jobs").expect("new JobSql");
     let plan = sql

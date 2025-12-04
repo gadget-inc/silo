@@ -25,7 +25,7 @@ async fn status_index_scheduled_then_running_then_succeeded() {
     assert!(s.contains(&job_id));
 
     // Dequeue -> Running
-    let tasks = shard.dequeue("-", "w", 1).await.expect("dequeue");
+    let tasks = shard.dequeue("-", "w", 1).await.expect("dequeue").tasks;
     assert_eq!(tasks.len(), 1);
 
     let running = shard
@@ -66,7 +66,7 @@ async fn status_index_failed_and_scheduled_then_order_newest_first() {
         )
         .await
         .expect("enq a");
-    let ta = shard.dequeue("-", "w", 1).await.expect("deq a")[0]
+    let ta = shard.dequeue("-", "w", 1).await.expect("deq a").tasks[0]
         .attempt()
         .task_id()
         .to_string();
@@ -105,7 +105,7 @@ async fn status_index_failed_and_scheduled_then_order_newest_first() {
         )
         .await
         .expect("enq b");
-    let tb = shard.dequeue("-", "w", 1).await.expect("deq b")[0]
+    let tb = shard.dequeue("-", "w", 1).await.expect("deq b").tasks[0]
         .attempt()
         .task_id()
         .to_string();
@@ -159,7 +159,7 @@ async fn retry_flow_running_to_scheduled_to_running_to_succeeded() {
         .await
         .expect("enqueue");
     // Running
-    let t1 = shard.dequeue("-", "w", 1).await.expect("deq")[0]
+    let t1 = shard.dequeue("-", "w", 1).await.expect("deq").tasks[0]
         .attempt()
         .task_id()
         .to_string();
@@ -186,7 +186,7 @@ async fn retry_flow_running_to_scheduled_to_running_to_succeeded() {
         .expect("scan scheduled");
     assert!(scheduled.contains(&job_id));
     // Dequeue attempt 2 -> Running
-    let t2 = shard.dequeue("-", "w", 1).await.expect("deq2")[0]
+    let t2 = shard.dequeue("-", "w", 1).await.expect("deq2").tasks[0]
         .attempt()
         .task_id()
         .to_string();
@@ -225,7 +225,7 @@ async fn reaper_without_retries_marks_failed_in_index() {
         .await
         .expect("enqueue");
     // Lease one task
-    let _tid = shard.dequeue("-", "w", 1).await.expect("deq")[0]
+    let _tid = shard.dequeue("-", "w", 1).await.expect("deq").tasks[0]
         .attempt()
         .task_id()
         .to_string();
@@ -296,7 +296,7 @@ async fn reaper_with_retries_moves_to_scheduled_in_index() {
         .await
         .expect("enqueue");
     // Lease and expire
-    let _tid = shard.dequeue("-", "w", 1).await.expect("deq")[0]
+    let _tid = shard.dequeue("-", "w", 1).await.expect("deq").tasks[0]
         .attempt()
         .task_id()
         .to_string();
@@ -359,7 +359,7 @@ async fn delete_removes_from_index() {
         .await
         .expect("enqueue");
     // Run and succeed
-    let tid = shard.dequeue("-", "w", 1).await.expect("deq")[0]
+    let tid = shard.dequeue("-", "w", 1).await.expect("deq").tasks[0]
         .attempt()
         .task_id()
         .to_string();
@@ -551,7 +551,7 @@ async fn metadata_index_basic_and_delete_cleanup() {
     assert_eq!(kw, vec![c.clone()]);
 
     // Complete A so it reaches a terminal state, then delete and verify cleanup
-    let tasks = shard.dequeue("-", "w", 3).await.expect("dequeue");
+    let tasks = shard.dequeue("-", "w", 3).await.expect("dequeue").tasks;
     let a_tid = tasks
         .iter()
         .find(|t| t.job().id() == a)

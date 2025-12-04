@@ -27,6 +27,38 @@ pub struct ConcurrencyLimit {
     pub max_concurrency: u32,
 }
 
+/// Floating concurrency limit - max concurrency is dynamic and refreshed by workers
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+#[archive(check_bytes)]
+pub struct FloatingConcurrencyLimit {
+    pub key: String,
+    pub default_max_concurrency: u32,
+    pub refresh_interval_ms: i64,
+    pub metadata: Vec<(String, String)>,
+}
+
+/// State of a floating concurrency limit stored in the DB
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+#[archive(check_bytes)]
+pub struct FloatingLimitState {
+    /// Current max concurrency value in use
+    pub current_max_concurrency: u32,
+    /// When the value was last successfully refreshed (epoch ms)
+    pub last_refreshed_at_ms: i64,
+    /// True if a refresh task is currently scheduled/in-progress
+    pub refresh_task_scheduled: bool,
+    /// Refresh interval in milliseconds
+    pub refresh_interval_ms: i64,
+    /// Default max concurrency for new limits
+    pub default_max_concurrency: u32,
+    /// Number of consecutive refresh failures (for exponential backoff)
+    pub retry_count: u32,
+    /// When the next retry should happen (epoch ms) if in backoff
+    pub next_retry_at_ms: Option<i64>,
+    /// Opaque metadata passed to workers during refresh
+    pub metadata: Vec<(String, String)>,
+}
+
 /// Rate limiting algorithm used by Gubernator
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, RkyvSerialize, RkyvDeserialize)]
 #[archive(check_bytes)]
@@ -119,7 +151,7 @@ impl GubernatorRateLimit {
     }
 }
 
-/// A unified limit type that can be either a concurrency limit or a rate limit
+/// A unified limit type that can be either a concurrency limit, rate limit, or floating concurrency limit
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
 #[archive(check_bytes)]
 pub enum Limit {
@@ -127,6 +159,8 @@ pub enum Limit {
     Concurrency(ConcurrencyLimit),
     /// A rate-based limit (checked via Gubernator)
     RateLimit(GubernatorRateLimit),
+    /// A floating concurrency limit with dynamic max concurrency refreshed by workers
+    FloatingConcurrency(FloatingConcurrencyLimit),
 }
 
 /// Discriminant for job status kinds
@@ -290,7 +324,7 @@ impl JobView {
         out
     }
 
-    /// Return the ordered list of limits (both concurrency and rate limits)
+    /// Return the ordered list of limits (concurrency, rate limits, and floating concurrency limits)
     pub fn limits(&self) -> Vec<Limit> {
         let a = self.archived();
         let mut out = Vec::with_capacity(a.limits.len());
@@ -325,6 +359,19 @@ impl JobView {
                             backoff_multiplier: r.retry_policy.backoff_multiplier,
                             max_retries: r.retry_policy.max_retries,
                         },
+                    }));
+                }
+                ArchivedLimit::FloatingConcurrency(f) => {
+                    let metadata: Vec<(String, String)> = f
+                        .metadata
+                        .iter()
+                        .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
+                        .collect();
+                    out.push(Limit::FloatingConcurrency(FloatingConcurrencyLimit {
+                        key: f.key.as_str().to_string(),
+                        default_max_concurrency: f.default_max_concurrency,
+                        refresh_interval_ms: f.refresh_interval_ms,
+                        metadata,
                     }));
                 }
             }
