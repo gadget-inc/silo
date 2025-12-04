@@ -229,13 +229,13 @@ async fn test_queue_view_renders() {
 }
 
 #[silo::test]
-async fn test_shards_view_renders() {
+async fn test_cluster_view_renders() {
     let (_tmp, state) = setup_test_state().await;
 
-    let (status, body) = make_request(state, "GET", "/shards").await;
+    let (status, body) = make_request(state, "GET", "/cluster").await;
 
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("Shard"));
+    assert!(body.contains("Cluster"));
     assert!(body.contains("0")); // Shard 0 should be listed
 }
 
@@ -415,18 +415,18 @@ async fn test_index_shows_jobs_from_all_shards() {
 }
 
 #[silo::test]
-async fn test_shards_page_shows_all_shards() {
+async fn test_cluster_page_shows_all_shards() {
     // Create state with 3 shards
     let (_tmp, state) = setup_multi_shard_state(3).await;
 
-    // Request the shards page
-    let (status, body) = make_request(state, "GET", "/shards").await;
+    // Request the cluster page
+    let (status, body) = make_request(state, "GET", "/cluster").await;
 
     assert_eq!(status, StatusCode::OK);
     // Verify all shards are displayed
-    assert!(body.contains(">0<") || body.contains(">0</"), "shards page should show shard 0");
-    assert!(body.contains(">1<") || body.contains(">1</"), "shards page should show shard 1");
-    assert!(body.contains(">2<") || body.contains(">2</"), "shards page should show shard 2");
+    assert!(body.contains(">0<") || body.contains(">0</"), "cluster page should show shard 0");
+    assert!(body.contains(">1<") || body.contains(">1</"), "cluster page should show shard 1");
+    assert!(body.contains(">2<") || body.contains(">2</"), "cluster page should show shard 2");
 }
 
 #[silo::test]
