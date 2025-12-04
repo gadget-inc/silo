@@ -43,16 +43,24 @@ datafusion = { version = "50", features = [
     "regex_expressions",
     "recursive_protection",
 ] }
+hyper = { version = "1", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+axum = "0.7"
+askama = "0.12"
+askama_axum = "0.4"
+tower-http = { version = "0.5", features = ["fs"] }
 
 [dev-dependencies]
 turmoil = { git = "https://github.com/tokio-rs/turmoil", rev = "dd7c0b1515537e639e045fe1034b6287dc026440" }
 rand = "0.8"
 rand_chacha = "0.3"
 async-stream = "0.3"
-hyper-util = "0.1"
-hyper = "1"
 tower = "0.4"
 criterion = { version = "0.5", features = ["async_tokio"] }
+hyper = { version = "1", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
 
 [build-dependencies]
 tonic-build = "0.12"

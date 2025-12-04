@@ -1,0 +1,13 @@
+{# Standalone status badge partial for HTMX responses #}
+{% if status == "Scheduled" %}
+<span class="px-2 py-0.5 text-xs font-medium border  bg-blue-900/50 border-blue-700 text-blue-400">{{ status }}</span>
+{% else if status == "Running" %}
+<span class="px-2 py-0.5 text-xs font-medium border  bg-yellow-900/50 border-yellow-700 text-yellow-400">{{ status }}</span>
+{% else if status == "Succeeded" %}
+<span class="px-2 py-0.5 text-xs font-medium border  bg-green-900/50 border-green-700 text-green-400">{{ status }}</span>
+{% else if status == "Failed" %}
+<span class="px-2 py-0.5 text-xs font-medium border  bg-red-900/50 border-red-700 text-red-400">{{ status }}</span>
+{% else %}
+<span class="px-2 py-0.5 text-xs font-medium border  bg-zinc-700/50 border-zinc-600 text-zinc-400">{{ status }}</span>
+{% endif %}
+

@@ -12,6 +12,8 @@ pub struct AppConfig {
     pub tenancy: TenancyConfig,
     #[serde(default)]
     pub gubernator: GubernatorSettings,
+    #[serde(default)]
+    pub webui: WebUiConfig,
     pub database: DatabaseTemplate,
 }
 
@@ -62,6 +64,33 @@ pub struct DatabaseTemplate {
 pub struct ServerConfig {
     #[serde(default = "default_grpc_addr")]
     pub grpc_addr: String, // e.g. 127.0.0.1:50051
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct WebUiConfig {
+    /// Enable web UI server
+    #[serde(default = "default_webui_enabled")]
+    pub enabled: bool,
+    /// Web UI listen address (e.g., "127.0.0.1:50052")
+    #[serde(default = "default_webui_addr")]
+    pub addr: String,
+}
+
+impl Default for WebUiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_webui_enabled(),
+            addr: default_webui_addr(),
+        }
+    }
+}
+
+fn default_webui_enabled() -> bool {
+    true
+}
+
+fn default_webui_addr() -> String {
+    "127.0.0.1:50052".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -123,6 +152,7 @@ impl AppConfig {
             },
             tenancy: TenancyConfig { enabled: false },
             gubernator: GubernatorSettings::default(),
+            webui: WebUiConfig::default(),
             database: DatabaseTemplate {
                 backend: Backend::Fs,
                 path: "/tmp/silo-%shard%".to_string(),

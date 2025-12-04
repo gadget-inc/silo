@@ -20,6 +20,32 @@ Status: crappy experiment
 
 It's like Sidekiq, BullMQ, Temporal, Restate or similar, but durable.
 
+## Temporal VS Silo
+
+Silo is heavily inspired by Temporal, but strikes a different balance for a different kind of workload.
+
+**Key similarities**:
+
+Silo and Temporal both are built for high throughput, low latency background execution.
+
+Silo and Temporal are both durable and deeply concerned with dataloss -- there's no Redis disappearing acts that can lose jobs once ack'd.
+
+Silo and Temporal are both horizontally and elastically scalable with no single point of failure.
+
+**Key differences**:
+
+Silo is built to run simpler single-step jobs, or short workflows, not many-month-long workflows. In spirit, Silo is similar to Sidekiq or Celery rather than Temporal.
+
+Silo makes no distinction between workflows and activities, and there's no heavyweight client-side deterministic isolated execution environment. Silo clients just report progress as atomically committed forward steps which can be fetched on demand, instead of discrete events in a history that can never change.
+
+Silo doesn't use an external visibility service. Instead, jobs can be searched for via some very simple predicates using Silo's built-in operator-facing SQL query capabilities.
+
+Silo is built to be much cheaper to run -- data is stored in object storage via [`slatedb`] rather than another datastore, there's no independent microservices that increase RPC overhead, and key functionality like rate limiting is built right in to minimize extra roundtrips to workers.
+
+Silo isn't in production at Uber etc.
+
+Silo is built to be autoscaled, with frequent cluster membership changes being just fine, and compute/storage separation baked in deeply.
+
 ## RPCs
 
 ### `enqueue`

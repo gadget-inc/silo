@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+
+{% block title %}{{ title }} - Silo{% endblock %}
+
+{% block content %}
+<div class="text-center py-16">
+    <div class="text-6xl text-zinc-700 mb-4">{{ code }}</div>
+    <div class="text-zinc-400">{{ message }}</div>
+    <a href="/" class="text-emerald-400 hover:underline mt-4 inline-block">Go home</a>
+</div>
+{% endblock %}
+

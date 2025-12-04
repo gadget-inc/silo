@@ -1,0 +1,133 @@
+{% extends "base.html" %}
+
+{% block title %}Job: {{ job_id }} - Silo{% endblock %}
+
+{% block content %}
+<div class="space-y-4">
+    <div class="flex items-center justify-between">
+        <div class="flex items-center gap-4">
+            <a href="/" class="text-zinc-400 hover:text-zinc-200">←</a>
+            <h1 class="text-xl font-bold text-zinc-100">Job: {{ job_id }}</h1>
+            <span id="job-status">{% call status_badge(status) %}</span>
+        </div>
+        <div class="flex items-center gap-2">
+            {% if !is_terminal %}
+            <form hx-post="/job/cancel?shard={{ shard }}&id={{ job_id }}" hx-swap="outerHTML" hx-target="#job-status" class="inline">
+                <button type="submit" class="px-3 py-1 text-sm bg-red-900/50 border border-red-700 text-red-400  hover:bg-red-900 transition-colors">
+                    Cancel Job
+                </button>
+            </form>
+            {% endif %}
+        </div>
+    </div>
+    
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <!-- Job Info Card -->
+        <div class="bg-zinc-800 border border-zinc-700  overflow-hidden">
+            <div class="bg-zinc-850 border-b border-zinc-700 px-4 py-2">
+                <h2 class="text-sm font-semibold text-zinc-300">Job Info</h2>
+            </div>
+            <div class="p-4">
+                <dl class="grid grid-cols-2 gap-2 text-sm">
+                    <dt class="text-zinc-500">ID</dt><dd class="text-zinc-200 font-mono">{{ job_id }}</dd>
+                    <dt class="text-zinc-500">Shard</dt><dd class="text-zinc-200">{{ shard }}</dd>
+                    <dt class="text-zinc-500">Priority</dt><dd class="text-zinc-200">P{{ priority }}</dd>
+                    <dt class="text-zinc-500">Enqueue Time</dt><dd class="text-zinc-200">{{ enqueue_time }}</dd>
+                    <dt class="text-zinc-500">Status Changed</dt><dd class="text-zinc-200">{{ status_changed }}</dd>
+                </dl>
+            </div>
+        </div>
+        
+        <!-- Metadata Card -->
+        <div class="bg-zinc-800 border border-zinc-700  overflow-hidden">
+            <div class="bg-zinc-850 border-b border-zinc-700 px-4 py-2">
+                <h2 class="text-sm font-semibold text-zinc-300">Metadata</h2>
+            </div>
+            <div class="p-4">
+                {% if metadata.is_empty() %}
+                <div class="text-zinc-500 text-sm">No metadata</div>
+                {% else %}
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-zinc-700">
+                        <thead class="bg-zinc-850">
+                            <tr>
+                                <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Key</th>
+                                <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Value</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-zinc-700">
+                            {% for (key, value) in metadata %}
+                            <tr class="border-b border-zinc-700 hover:bg-zinc-750">
+                                <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">{{ key }}</td>
+                                <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">{{ value }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <!-- Limits Card -->
+        <div class="bg-zinc-800 border border-zinc-700  overflow-hidden">
+            <div class="bg-zinc-850 border-b border-zinc-700 px-4 py-2">
+                <h2 class="text-sm font-semibold text-zinc-300">Limits</h2>
+            </div>
+            <div class="p-4">
+                {% if limits.is_empty() %}
+                <div class="text-zinc-500 text-sm">No limits</div>
+                {% else %}
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-zinc-700">
+                        <thead class="bg-zinc-850">
+                            <tr>
+                                <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Type</th>
+                                <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Key</th>
+                                <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Limit</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-zinc-700">
+                            {% for limit in limits %}
+                            <tr class="border-b border-zinc-700 hover:bg-zinc-750">
+                                <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">{{ limit.limit_type }}</td>
+                                <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">{{ limit.key }}</td>
+                                <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">{{ limit.value }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+        
+        <!-- Payload Card -->
+        <div class="bg-zinc-800 border border-zinc-700  overflow-hidden">
+            <div class="bg-zinc-850 border-b border-zinc-700 px-4 py-2">
+                <h2 class="text-sm font-semibold text-zinc-300">Payload</h2>
+            </div>
+            <div class="p-4">
+                <pre class="text-xs text-zinc-300 overflow-x-auto bg-zinc-900 p-2 ">{{ payload }}</pre>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% macro status_badge(status) %}
+{% if status == "Scheduled" %}
+<span class="px-2 py-0.5 text-xs font-medium border  bg-blue-900/50 border-blue-700 text-blue-400">{{ status }}</span>
+{% else if status == "Running" %}
+<span class="px-2 py-0.5 text-xs font-medium border  bg-yellow-900/50 border-yellow-700 text-yellow-400">{{ status }}</span>
+{% else if status == "Succeeded" %}
+<span class="px-2 py-0.5 text-xs font-medium border  bg-green-900/50 border-green-700 text-green-400">{{ status }}</span>
+{% else if status == "Failed" %}
+<span class="px-2 py-0.5 text-xs font-medium border  bg-red-900/50 border-red-700 text-red-400">{{ status }}</span>
+{% else %}
+<span class="px-2 py-0.5 text-xs font-medium border  bg-zinc-700/50 border-zinc-600 text-zinc-400">{{ status }}</span>
+{% endif %}
+{% endmacro %}
+

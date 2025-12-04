@@ -30,13 +30,13 @@ async fn multiple_nodes_own_unique_shards() {
         .expect("connect etcd");
 
     // Start three coordinators (nodes)
-    let (c1, h1) = Coordinator::start(&coord, &prefix, "n1", num_shards, 10)
+    let (c1, h1) = Coordinator::start(&coord, &prefix, "n1", "http://127.0.0.1:50051", num_shards, 10)
         .await
         .expect("start c1");
-    let (c2, h2) = Coordinator::start(&coord, &prefix, "n2", num_shards, 10)
+    let (c2, h2) = Coordinator::start(&coord, &prefix, "n2", "http://127.0.0.1:50052", num_shards, 10)
         .await
         .expect("start c2");
-    let (c3, h3) = Coordinator::start(&coord, &prefix, "n3", num_shards, 10)
+    let (c3, h3) = Coordinator::start(&coord, &prefix, "n3", "http://127.0.0.1:50053", num_shards, 10)
         .await
         .expect("start c3");
 
@@ -118,10 +118,10 @@ async fn adding_a_node_rebalances_shards() {
         .await
         .expect("connect etcd");
 
-    let (c1, h1) = Coordinator::start(&coord, &prefix, "n1", num_shards, 10)
+    let (c1, h1) = Coordinator::start(&coord, &prefix, "n1", "http://127.0.0.1:50051", num_shards, 10)
         .await
         .unwrap();
-    let (c2, h2) = Coordinator::start(&coord, &prefix, "n2", num_shards, 10)
+    let (c2, h2) = Coordinator::start(&coord, &prefix, "n2", "http://127.0.0.1:50052", num_shards, 10)
         .await
         .unwrap();
     assert!(c1.wait_converged(std::time::Duration::from_secs(20)).await);
@@ -137,7 +137,7 @@ async fn adding_a_node_rebalances_shards() {
     assert_eq!(before_union, expected);
 
     // Add new node
-    let (c3, h3) = Coordinator::start(&coord, &prefix, "n3", num_shards, 10)
+    let (c3, h3) = Coordinator::start(&coord, &prefix, "n3", "http://127.0.0.1:50053", num_shards, 10)
         .await
         .unwrap();
     // Converge after adding the new member
@@ -183,13 +183,13 @@ async fn removing_a_node_rebalances_shards() {
         .await
         .expect("connect etcd");
 
-    let (c1, h1) = Coordinator::start(&coord, &prefix, "n1", num_shards, 10)
+    let (c1, h1) = Coordinator::start(&coord, &prefix, "n1", "http://127.0.0.1:50051", num_shards, 10)
         .await
         .unwrap();
-    let (c2, h2) = Coordinator::start(&coord, &prefix, "n2", num_shards, 10)
+    let (c2, h2) = Coordinator::start(&coord, &prefix, "n2", "http://127.0.0.1:50052", num_shards, 10)
         .await
         .unwrap();
-    let (c3, h3) = Coordinator::start(&coord, &prefix, "n3", num_shards, 10)
+    let (c3, h3) = Coordinator::start(&coord, &prefix, "n3", "http://127.0.0.1:50053", num_shards, 10)
         .await
         .unwrap();
     assert!(c1.wait_converged(Duration::from_secs(20)).await);
@@ -230,15 +230,15 @@ async fn rapid_membership_churn_converges() {
         .expect("connect etcd");
 
     // Start first node, then quickly add/remove others to simulate churn
-    let (c1, h1) = Coordinator::start(&coord, &prefix, "n1", num_shards, 10)
+    let (c1, h1) = Coordinator::start(&coord, &prefix, "n1", "http://127.0.0.1:50051", num_shards, 10)
         .await
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let (c2, h2) = Coordinator::start(&coord, &prefix, "n2", num_shards, 10)
+    let (c2, h2) = Coordinator::start(&coord, &prefix, "n2", "http://127.0.0.1:50052", num_shards, 10)
         .await
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let (c3, h3) = Coordinator::start(&coord, &prefix, "n3", num_shards, 10)
+    let (c3, h3) = Coordinator::start(&coord, &prefix, "n3", "http://127.0.0.1:50053", num_shards, 10)
         .await
         .unwrap();
 
@@ -247,7 +247,7 @@ async fn rapid_membership_churn_converges() {
     c2.shutdown().await.unwrap();
     let _ = h2.abort();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    let (c2b, h2b) = Coordinator::start(&coord, &prefix, "n2", num_shards, 10)
+    let (c2b, h2b) = Coordinator::start(&coord, &prefix, "n2", "http://127.0.0.1:50052", num_shards, 10)
         .await
         .unwrap();
 
