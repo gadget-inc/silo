@@ -22,6 +22,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
         let template = DatabaseTemplate {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let mut factory = ShardFactory::new(template, rate_limiter);
@@ -156,6 +157,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
         let template = DatabaseTemplate {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let mut factory = ShardFactory::new(template, rate_limiter);
@@ -281,6 +283,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
         let template = DatabaseTemplate {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let mut factory = ShardFactory::new(template, rate_limiter);
@@ -399,6 +402,7 @@ async fn grpc_server_query_errors() -> anyhow::Result<()> {
         let template = DatabaseTemplate {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let mut factory = ShardFactory::new(template, rate_limiter);
@@ -494,6 +498,7 @@ async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
         let template = DatabaseTemplate {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let mut factory = ShardFactory::new(template, rate_limiter);
@@ -584,6 +589,7 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
         let template = DatabaseTemplate {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let mut factory = ShardFactory::new(template, rate_limiter);
@@ -687,6 +693,7 @@ async fn grpc_health_check_returns_serving() -> anyhow::Result<()> {
         let template = DatabaseTemplate {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let mut factory = ShardFactory::new(template, rate_limiter);

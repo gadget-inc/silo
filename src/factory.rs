@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::gubernator::RateLimitClient;
 use crate::job_store_shard::JobStoreShard;
 use crate::job_store_shard::JobStoreShardError;
-use crate::settings::{DatabaseConfig, DatabaseTemplate};
+use crate::settings::{DatabaseConfig, DatabaseTemplate, WalConfig};
 use thiserror::Error;
 
 /// Factory for opening and holding `Shard` instances by name.
@@ -38,11 +38,20 @@ impl ShardFactory {
             .path
             .replace("%shard%", &name)
             .replace("{shard}", &name);
+        // Resolve WAL config with shard placeholder substitution if present
+        let wal = self.template.wal.as_ref().map(|wal_template| WalConfig {
+            backend: wal_template.backend.clone(),
+            path: wal_template
+                .path
+                .replace("%shard%", &name)
+                .replace("{shard}", &name),
+        });
         let cfg = DatabaseConfig {
             name: name.clone(),
             backend: self.template.backend.clone(),
             path,
             flush_interval_ms: None, // Use SlateDB's default in production
+            wal,
         };
         let shard_arc = JobStoreShard::open_with_rate_limiter(&cfg, Arc::clone(&self.rate_limiter)).await?;
         self.instances

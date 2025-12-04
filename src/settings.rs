@@ -58,6 +58,18 @@ pub struct DatabaseTemplate {
     pub backend: Backend,
     /// May contain "%shard%" placeholder that will be replaced with the shard number
     pub path: String,
+    /// Optional separate WAL storage configuration.
+    /// If not set, WAL uses the same backend/path as the main store.
+    #[serde(default)]
+    pub wal: Option<WalConfig>,
+}
+
+/// Configuration for a separate WAL object store
+#[derive(Debug, Deserialize, Clone)]
+pub struct WalConfig {
+    pub backend: Backend,
+    /// May contain "%shard%" placeholder that will be replaced with the shard number
+    pub path: String,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -177,6 +189,10 @@ pub struct DatabaseConfig {
     /// Optional flush interval for SlateDB. If None, uses SlateDB's default.
     #[serde(default)]
     pub flush_interval_ms: Option<u64>,
+    /// Optional separate WAL storage configuration.
+    /// If not set, WAL uses the same backend/path as the main store.
+    #[serde(default)]
+    pub wal: Option<WalConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -201,6 +217,7 @@ impl AppConfig {
             database: DatabaseTemplate {
                 backend: Backend::Fs,
                 path: "/tmp/silo-%shard%".to_string(),
+                wal: None,
             },
         };
 

@@ -26,6 +26,7 @@ async fn setup_test_state() -> (tempfile::TempDir, AppState) {
         DatabaseTemplate {
             backend: Backend::Fs,
             path: tmp.path().to_string_lossy().to_string(),
+            wal: None,
         },
         rate_limiter,
     );

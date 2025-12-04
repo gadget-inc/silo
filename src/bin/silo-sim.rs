@@ -89,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
                 .to_string_lossy()
                 .to_string(),
             flush_interval_ms: Some(10), // Fast flushes for simulation
+            wal: None,
         };
         let shard = JobStoreShard::open_with_rate_limiter(&cfg, rate_limiter.clone()).await?;
         shards.push(shard);

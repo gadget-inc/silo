@@ -116,6 +116,12 @@ impl JobStoreShard {
 
         let mut db_builder = slatedb::DbBuilder::new(cfg.path.as_str(), object_store);
 
+        // Configure separate WAL object store if specified
+        if let Some(wal_cfg) = &cfg.wal {
+            let wal_object_store = resolve_object_store(&wal_cfg.backend, &wal_cfg.path)?;
+            db_builder = db_builder.with_wal_object_store(wal_object_store);
+        }
+
         // Apply custom flush interval if specified
         if let Some(flush_ms) = cfg.flush_interval_ms {
             let settings = slatedb::config::Settings {

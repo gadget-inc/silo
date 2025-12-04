@@ -562,6 +562,15 @@ impl Coordinator for K8sCoordinator {
     async fn wait_converged(&self, timeout: Duration) -> bool {
         let start = std::time::Instant::now();
         while start.elapsed() < timeout {
+            // Refresh the members cache to get current membership.
+            // This is important because the watcher runs asynchronously and might not
+            // have processed membership changes yet (e.g., after a node shutdown).
+            if let Err(e) = self.refresh_members_cache().await {
+                debug!(node_id = %self.node_id, error = %e, "wait_converged: failed to refresh members cache");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+
             let member_ids = match self.get_active_member_ids().await {
                 Ok(m) => m,
                 Err(_) => {
