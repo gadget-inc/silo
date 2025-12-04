@@ -106,7 +106,6 @@ async fn worker_loop(
             shard: Some(shard),
             worker_id: worker_id.clone(),
             max_tasks,
-            tenant: tenant.clone(),
         };
 
         poll_count.fetch_add(1, Ordering::Relaxed);

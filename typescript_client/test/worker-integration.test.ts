@@ -67,13 +67,19 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
 
   describe("basic task processing", () => {
     it("processes a single task from any shard", async () => {
+      const testBatch = `single-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2)}`;
       const processedJobs: string[] = [];
 
       const handler: TaskHandler = async (ctx) => {
-        const payload = decodePayload<{ message: string }>(
+        const payload = decodePayload<{ message: string; batch?: string }>(
           ctx.task.payload?.data
         );
-        processedJobs.push(payload?.message ?? "");
+        // Only track jobs from this test batch
+        if (payload?.batch === testBatch) {
+          processedJobs.push(payload?.message ?? "");
+        }
         return { type: "success", result: { processed: true } };
       };
 
@@ -84,7 +90,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       // Enqueue a job to test tenant
       await client.enqueue({
         tenant: DEFAULT_TENANT,
-        payload: { message: "hello-worker" },
+        payload: { message: "hello-worker", batch: testBatch },
         priority: 1,
       });
 
@@ -238,7 +244,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       await new Promise((resolve) => setTimeout(resolve, 300));
 
       // Job should still exist but task completed with failure
-      const job = await client.getJob(jobId, "failure-test");
+      const job = await client.getJob(jobId, DEFAULT_TENANT);
       expect(job).toBeDefined();
     });
 

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, Mutex, Notify};
 use tokio::time::sleep;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::factory::ShardFactory;
 
@@ -124,56 +124,73 @@ impl EtcdCoordinator {
         let mut lock_bg = client.lock_client();
 
         let handle = tokio::spawn(async move {
-            // Start lease keepalives
-            let (mut _memb_keeper, mut memb_stream) =
-                match lease_bg.keep_alive(membership_lease).await {
-                    Ok(x) => x,
-                    Err(_) => loop {
-                        if *shutdown_rx.borrow() {
-                            return;
-                        }
-                        if let Ok(x) = lease_bg.keep_alive(membership_lease).await {
-                            break x;
-                        }
-                        sleep(Duration::from_millis(200)).await;
-                    },
-                };
-
-            let (mut _live_keeper, mut live_stream) =
-                match lease_bg.keep_alive(liveness_lease).await {
-                    Ok(x) => x,
-                    Err(_) => loop {
-                        if *shutdown_rx.borrow() {
-                            return;
-                        }
-                        if let Ok(x) = lease_bg.keep_alive(liveness_lease).await {
-                            break x;
-                        }
-                        sleep(Duration::from_millis(200)).await;
-                    },
-                };
-
-            // Establish member watch
-            let members_prefix = keys::members_prefix(&cprefix);
-            debug!(node_id = %nid, ttl = membership_lease, "starting coordinator keepalives");
-
-            let (_members_watcher, mut members_stream) = match watch_bg
-                .watch(
-                    members_prefix.clone(),
-                    Some(etcd_client::WatchOptions::new().with_prefix()),
-                )
-                .await
-            {
-                Ok(w) => {
-                    debug!(node_id = %nid, prefix = %members_prefix, "members watch established");
-                    w
+            // Start lease keepalives with retries
+            let (mut memb_keeper, mut memb_stream) = loop {
+                if *shutdown_rx.borrow() {
+                    return;
                 }
-                Err(_) => loop {
-                    if *shutdown_rx.borrow() {
-                        return;
+                match lease_bg.keep_alive(membership_lease).await {
+                    Ok(x) => {
+                        info!(node_id = %nid, lease_id = membership_lease, "membership lease keepalive channel established");
+                        break x;
                     }
-                    sleep(Duration::from_millis(200)).await;
-                },
+                    Err(e) => {
+                        warn!(node_id = %nid, error = %e, "failed to start membership keepalive, retrying...");
+                        sleep(Duration::from_millis(200)).await;
+                    }
+                }
+            };
+
+            let (mut live_keeper, mut live_stream) = loop {
+                if *shutdown_rx.borrow() {
+                    return;
+                }
+                match lease_bg.keep_alive(liveness_lease).await {
+                    Ok(x) => {
+                        info!(node_id = %nid, lease_id = liveness_lease, "liveness lease keepalive channel established");
+                        break x;
+                    }
+                    Err(e) => {
+                        warn!(node_id = %nid, error = %e, "failed to start liveness keepalive, retrying...");
+                        sleep(Duration::from_millis(200)).await;
+                    }
+                }
+            };
+
+            // Send initial keepalive requests - this is REQUIRED to keep the lease alive!
+            // etcd-client's keep_alive() only establishes the channel, you must call
+            // keeper.keep_alive() to actually send keepalive requests.
+            if let Err(e) = memb_keeper.keep_alive().await {
+                error!(node_id = %nid, error = %e, "failed to send initial membership keepalive");
+            }
+            if let Err(e) = live_keeper.keep_alive().await {
+                error!(node_id = %nid, error = %e, "failed to send initial liveness keepalive");
+            }
+
+            // Establish member watch with retries
+            let members_prefix = keys::members_prefix(&cprefix);
+            debug!(node_id = %nid, "starting coordinator background tasks");
+
+            let (_members_watcher, mut members_stream) = loop {
+                if *shutdown_rx.borrow() {
+                    return;
+                }
+                match watch_bg
+                    .watch(
+                        members_prefix.clone(),
+                        Some(etcd_client::WatchOptions::new().with_prefix()),
+                    )
+                    .await
+                {
+                    Ok(w) => {
+                        debug!(node_id = %nid, prefix = %members_prefix, "members watch established");
+                        break w;
+                    }
+                    Err(e) => {
+                        warn!(node_id = %nid, error = %e, "failed to establish members watch, retrying...");
+                        sleep(Duration::from_millis(200)).await;
+                    }
+                }
             };
 
             // Initial reconcile
@@ -181,10 +198,26 @@ impl EtcdCoordinator {
                 warn!(node_id = %nid, error = %err, "initial reconcile failed");
             }
 
-            // Main loop: reconcile on membership events or periodic resync
+            // Main loop: reconcile on membership events, periodic resync, and send keepalives
             let mut resync = tokio::time::interval(Duration::from_secs(1));
+            // Send keepalives at 1/3 of TTL to ensure lease doesn't expire
+            let keepalive_interval_secs = (ttl_secs / 3).max(1) as u64;
+            let mut keepalive_timer =
+                tokio::time::interval(Duration::from_secs(keepalive_interval_secs));
+            info!(node_id = %nid, interval_secs = keepalive_interval_secs, "starting keepalive timer");
+
             loop {
                 tokio::select! {
+                    _ = keepalive_timer.tick() => {
+                        if *shutdown_rx.borrow() { break; }
+                        // Send keepalive requests to both leases
+                        if let Err(e) = memb_keeper.keep_alive().await {
+                            error!(node_id = %nid, error = %e, "failed to send membership keepalive");
+                        }
+                        if let Err(e) = live_keeper.keep_alive().await {
+                            error!(node_id = %nid, error = %e, "failed to send liveness keepalive");
+                        }
+                    }
                     _ = resync.tick() => {
                         if *shutdown_rx.borrow() { break; }
                         if let Err(err) = me_bg.reconcile_shards(&mut lock_bg).await {
@@ -200,12 +233,43 @@ impl EtcdCoordinator {
                                     warn!(node_id = %nid, error = %err, "watch-triggered reconcile failed");
                                 }
                             }
-                            Ok(None) => { break; }
-                            Err(_) => { /* transient errors; rely on periodic resync */ }
+                            Ok(None) => {
+                                warn!(node_id = %nid, "members watch stream closed, coordinator exiting");
+                                break;
+                            }
+                            Err(e) => {
+                                warn!(node_id = %nid, error = %e, "members watch error, continuing with periodic resync");
+                            }
                         }
                     }
-                    _m = memb_stream.message() => { if *shutdown_rx.borrow() { break; } }
-                    _m = live_stream.message() => { if *shutdown_rx.borrow() { break; } }
+                    resp = memb_stream.message() => {
+                        if *shutdown_rx.borrow() { break; }
+                        match resp {
+                            Ok(Some(ka_resp)) => {
+                                debug!(node_id = %nid, ttl = ka_resp.ttl(), "membership keepalive response received");
+                            }
+                            Ok(None) => {
+                                error!(node_id = %nid, "membership lease keepalive stream closed! Lease will expire.");
+                            }
+                            Err(e) => {
+                                error!(node_id = %nid, error = %e, "membership lease keepalive error");
+                            }
+                        }
+                    }
+                    resp = live_stream.message() => {
+                        if *shutdown_rx.borrow() { break; }
+                        match resp {
+                            Ok(Some(ka_resp)) => {
+                                debug!(node_id = %nid, ttl = ka_resp.ttl(), "liveness keepalive response received");
+                            }
+                            Ok(None) => {
+                                error!(node_id = %nid, "liveness lease keepalive stream closed! Lease will expire.");
+                            }
+                            Err(e) => {
+                                error!(node_id = %nid, error = %e, "liveness lease keepalive error");
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -219,6 +283,19 @@ impl EtcdCoordinator {
     ) -> Result<(), etcd_client::Error> {
         let members = self.get_sorted_member_ids().await?;
         debug!(node_id = %self.node_id, members = ?members, "reconcile: begin");
+
+        // Safety check: if we don't see ourselves in the member list, our membership
+        // lease may have expired or there's a connectivity issue. Don't reconcile
+        // based on incomplete membership data - it would cause us to release all shards.
+        if members.is_empty() {
+            warn!(node_id = %self.node_id, "reconcile: no members found, skipping reconcile");
+            return Ok(());
+        }
+        if !members.contains(&self.node_id) {
+            warn!(node_id = %self.node_id, members = ?members, "reconcile: our node not in member list, skipping reconcile (membership may have expired)");
+            return Ok(());
+        }
+
         let desired = compute_desired_shards_for_node(self.num_shards, &self.node_id, &members);
 
         let current_locks: Vec<u32> = {
@@ -446,10 +523,6 @@ impl Coordinator for EtcdCoordinator {
     }
 }
 
-// ============================================================================
-// EtcdShardGuard - per-shard lock management (moved from shard_guard.rs)
-// ============================================================================
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShardPhase {
     Idle,
@@ -608,21 +681,34 @@ impl EtcdShardGuard {
                             {
                                 Ok(Ok(resp)) => {
                                     let key = resp.key().to_vec();
-                                    {
-                                        let mut st = self.state.lock().await;
-                                        st.held_key = Some(key);
-                                        st.phase = ShardPhase::Held;
+                                    // Open the shard BEFORE marking as Held - if open fails,
+                                    // we should release the lock and not claim ownership
+                                    match factory.open(self.shard_id as usize).await {
+                                        Ok(_) => {
+                                            {
+                                                let mut st = self.state.lock().await;
+                                                st.held_key = Some(key);
+                                                st.phase = ShardPhase::Held;
+                                            }
+                                            {
+                                                let mut owned = owned_arc.lock().await;
+                                                owned.insert(self.shard_id);
+                                            }
+                                            info!(shard_id = self.shard_id, attempts = attempt, "shard: acquired and opened");
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            // Failed to open - release the lock and retry
+                                            tracing::error!(shard_id = self.shard_id, error = %e, "failed to open shard, releasing lock");
+                                            let mut lock_cli = self.client.lock_client();
+                                            let _ = lock_cli.unlock(key).await;
+                                            // Exponential backoff before retry
+                                            let backoff_ms = 200 * (1 << attempt.min(5));
+                                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                                            attempt = attempt.wrapping_add(1);
+                                            continue;
+                                        }
                                     }
-                                    {
-                                        let mut owned = owned_arc.lock().await;
-                                        owned.insert(self.shard_id);
-                                    }
-                                    // Open the shard now that we own it
-                                    if let Err(e) = factory.open(self.shard_id as usize).await {
-                                        tracing::error!(shard_id = self.shard_id, error = %e, "failed to open shard after acquiring lock");
-                                    }
-                                    debug!(shard_id = self.shard_id, attempts = attempt, "shard: acquire success");
-                                    break;
                                 }
                                 Ok(Err(_)) | Err(_) => {
                                     attempt = attempt.wrapping_add(1);

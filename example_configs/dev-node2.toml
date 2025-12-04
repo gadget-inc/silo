@@ -22,4 +22,5 @@ addr = "127.0.0.1:8082"
 
 [database]
 backend = "fs"
-path = "./tmp/silo-data/node2/shard-%shard%"
+# use the same data path as the other node to simulate prod-like usage of object storage and compute/storage separation
+path = "./tmp/silo-data/shard-%shard%"

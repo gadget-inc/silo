@@ -403,7 +403,7 @@ impl Silo for SiloService {
         req: Request<LeaseTasksRequest>,
     ) -> Result<Response<LeaseTasksResponse>, Status> {
         let r = req.into_inner();
-        let tenant = self.validate_tenant(r.tenant.as_deref())?;
+        // LeaseTasks is tenant-agnostic - it returns tasks from all tenants on local shards
         let max_tasks = r.max_tasks as usize;
 
         // Determine which shards to poll:
@@ -438,7 +438,7 @@ impl Silo for SiloService {
             }
 
             let result = shard
-                .dequeue(&tenant, &r.worker_id, remaining)
+                .dequeue(&r.worker_id, remaining)
                 .await
                 .map_err(map_err)?;
 

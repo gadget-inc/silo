@@ -25,7 +25,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
             wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let mut factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter);
         // Open shard 0 so the server can find it
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
@@ -74,7 +74,6 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
                 shard: Some(0),
                 worker_id: "w1".to_string(),
                 max_tasks: 1,
-                tenant: None,
             })
             .await?
             .into_inner();
@@ -160,7 +159,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
             wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let mut factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -286,7 +285,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
             wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let mut factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -405,7 +404,7 @@ async fn grpc_server_query_errors() -> anyhow::Result<()> {
             wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let mut factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -501,7 +500,7 @@ async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
             wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let mut factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -592,7 +591,7 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
             wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let mut factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -696,7 +695,7 @@ async fn grpc_health_check_returns_serving() -> anyhow::Result<()> {
             wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let mut factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 

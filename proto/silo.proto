@@ -114,7 +114,6 @@ message LeaseTasksRequest {
   optional uint32 shard = 1;  // optional filter - if set, only lease from this shard
   string worker_id = 2; 
   uint32 max_tasks = 3; 
-  optional string tenant = 4; 
 }
 message Task {
   string id = 1;              // task id

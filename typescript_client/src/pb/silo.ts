@@ -348,10 +348,6 @@ export interface LeaseTasksRequest {
      * @generated from protobuf field: uint32 max_tasks = 3
      */
     maxTasks: number;
-    /**
-     * @generated from protobuf field: optional string tenant = 4
-     */
-    tenant?: string;
 }
 /**
  * @generated from protobuf message silo.v1.Task
@@ -1819,8 +1815,7 @@ class LeaseTasksRequest$Type extends MessageType<LeaseTasksRequest> {
         super("silo.v1.LeaseTasksRequest", [
             { no: 1, name: "shard", kind: "scalar", opt: true, T: 13 /*ScalarType.UINT32*/ },
             { no: 2, name: "worker_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
-            { no: 3, name: "max_tasks", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
-            { no: 4, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ }
+            { no: 3, name: "max_tasks", kind: "scalar", T: 13 /*ScalarType.UINT32*/ }
         ]);
     }
     create(value?: PartialMessage<LeaseTasksRequest>): LeaseTasksRequest {
@@ -1845,9 +1840,6 @@ class LeaseTasksRequest$Type extends MessageType<LeaseTasksRequest> {
                 case /* uint32 max_tasks */ 3:
                     message.maxTasks = reader.uint32();
                     break;
-                case /* optional string tenant */ 4:
-                    message.tenant = reader.string();
-                    break;
                 default:
                     let u = options.readUnknownField;
                     if (u === "throw")
@@ -1869,9 +1861,6 @@ class LeaseTasksRequest$Type extends MessageType<LeaseTasksRequest> {
         /* uint32 max_tasks = 3; */
         if (message.maxTasks !== 0)
             writer.tag(3, WireType.Varint).uint32(message.maxTasks);
-        /* optional string tenant = 4; */
-        if (message.tenant !== undefined)
-            writer.tag(4, WireType.LengthDelimited).string(message.tenant);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);

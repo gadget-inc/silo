@@ -266,12 +266,15 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         priority: 1,
       });
 
+      // Get the shard for this tenant to poll from the correct server
+      const shard = client.getShardForTenant(tenant);
+
       let task;
       for (let i = 0; i < 5 && !task; i++) {
         const tasks = await client.leaseTasks({
           workerId: `test-worker-lease-${Date.now()}`,
           maxTasks: 50,
-          tenant,
+          shard,
         });
         task = tasks.find((t) => t.jobId === jobId);
         if (!task) {
@@ -308,12 +311,15 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         priority: 1,
       });
 
+      // Get the shard for this tenant to poll from the correct server
+      const shard = client.getShardForTenant(tenant);
+
       let task;
       for (let i = 0; i < 5 && !task; i++) {
         const tasks = await client.leaseTasks({
           workerId: `test-worker-fail-${Date.now()}`,
           maxTasks: 50,
-          tenant,
+          shard,
         });
         task = tasks.find((t) => t.jobId === jobId);
         if (!task) {
@@ -346,10 +352,13 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         priority: 1,
       });
 
+      // Get the shard for this tenant to poll from the correct server
+      const shard = client.getShardForTenant(tenant);
+
       const tasks = await client.leaseTasks({
         workerId: "test-worker-3",
         maxTasks: 10,
-        tenant,
+        shard,
       });
 
       const task = tasks.find((t) => t.jobId === jobId);
@@ -381,12 +390,15 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       const job = await client.getJob(jobId, tenant);
       expect(job?.id).toBe(jobId);
 
+      // Get the shard for this tenant to poll from the correct server
+      const shard = client.getShardForTenant(tenant);
+
       let task;
       for (let i = 0; i < 5 && !task; i++) {
         const tasks = await client.leaseTasks({
           workerId: `delete-test-worker-${Date.now()}`,
           maxTasks: 50,
-          tenant,
+          shard,
         });
         task = tasks.find((t) => t.jobId === jobId);
         if (!task) {
@@ -420,7 +432,11 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         });
       }
 
-      const result = await client.query("SELECT * FROM jobs", tenant);
+      // SQL queries require tenant in WHERE clause for filtering
+      const result = await client.query(
+        `SELECT * FROM jobs WHERE tenant = '${tenant}'`,
+        tenant
+      );
       expect(result.rowCount).toBeGreaterThanOrEqual(3);
       expect(result.columns.length).toBeGreaterThan(0);
       expect(result.columns.some((c) => c.name === "id")).toBe(true);

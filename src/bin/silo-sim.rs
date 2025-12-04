@@ -184,7 +184,7 @@ async fn main() -> anyhow::Result<()> {
                 if !workers_running.load(Ordering::SeqCst) {
                     break;
                 }
-                let result = shard.dequeue("-", &wid, 4).await.unwrap_or_default();
+                let result = shard.dequeue(&wid, 4).await.unwrap_or_default();
                 if result.tasks.is_empty() {
                     tokio::task::yield_now().await;
                     continue;

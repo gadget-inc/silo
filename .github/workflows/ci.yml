@@ -15,13 +15,11 @@ jobs:
         with:
           cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - uses: Swatinem/rust-cache@v2
-      - uses: JarvusInnovations/background-action@v1
-        name: Run background processes
-        with:
-          run: dev --tui=false &
-          wait-on: |
-            tcp:localhost:2379
-          tail: true
+      - name: Run background processes
+        shell: bash
+        run: |
+          process-compose up --tui=false gubernator etcd &
+          sleep 2
       - name: Run cargo test
         shell: bash
         run: cargo test
@@ -73,7 +71,7 @@ jobs:
           set -euo pipefail
           
           echo "Running Alloy model verification..."
-          alloy6 exec -f -s lingeling.parallel specs/job_shard.als 2>&1 | tee alloy_output.txt
+          alloy6 exec -f -s glucose specs/job_shard.als 2>&1 | tee alloy_output.txt
           
           echo ""
           echo "Verifying results..."
@@ -132,7 +130,7 @@ jobs:
 
   typescript-client-tests:
     name: TypeScript tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-l
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-test-env
@@ -146,37 +144,11 @@ jobs:
       - name: Build silo server
         shell: bash
         run: cargo build
-      - name: Start etcd
+      - name: Run background processes
         shell: bash
         run: |
-          just etcd &
-          sleep 3
-      - name: Start gubernator
-        shell: bash
-        run: |
-          gubernator &
+          process-compose up --tui=false &
           sleep 2
-        env:
-          GUBER_GRPC_ADDRESS: localhost:9991
-          GUBER_HTTP_ADDRESS: 0.0.0.0:9981
-      - name: Start silo server 1
-        shell: bash
-        run: |
-          ./target/debug/silo -c typescript_client/test/silo-test-config.toml &
-          sleep 2
-        env:
-          SILO_SERVER__GRPC_ADDR: "127.0.0.1:50051"
-          SILO_WEBUI__ADDR: "127.0.0.1:8081"
-          SILO_DATABASE__PATH: "./tmp/silo-test-data/node1/shard-%shard%"
-      - name: Start silo server 2
-        shell: bash
-        run: |
-          ./target/debug/silo -c typescript_client/test/silo-test-config.toml &
-          sleep 2
-        env:
-          SILO_SERVER__GRPC_ADDR: "127.0.0.1:50052"
-          SILO_WEBUI__ADDR: "127.0.0.1:8082"
-          SILO_DATABASE__PATH: "./tmp/silo-test-data/node2/shard-%shard%"
       - name: Run tests
         shell: bash
         working-directory: typescript_client

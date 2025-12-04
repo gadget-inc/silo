@@ -22,7 +22,7 @@ async fn setup_test_state() -> (tempfile::TempDir, AppState) {
     let tmp = tempfile::tempdir().unwrap();
 
     let rate_limiter = MockGubernatorClient::new_arc();
-    let mut factory = ShardFactory::new(
+    let factory = ShardFactory::new(
         DatabaseTemplate {
             backend: Backend::Fs,
             path: tmp.path().to_string_lossy().to_string(),
@@ -318,7 +318,7 @@ async fn setup_multi_shard_state(num_shards: usize) -> (tempfile::TempDir, AppSt
     let rate_limiter = MockGubernatorClient::new_arc();
     // Use {shard} placeholder so each shard gets its own subdirectory
     let path_with_shard = format!("{}/{{shard}}", tmp.path().to_string_lossy());
-    let mut factory = ShardFactory::new(
+    let factory = ShardFactory::new(
         DatabaseTemplate {
             backend: Backend::Fs,
             path: path_with_shard,
@@ -513,8 +513,8 @@ async fn test_queues_page_shows_queues_from_all_shards() {
 
     // Dequeue to create holders (jobs will wait in concurrency queues)
     // Since max_concurrency is 1 and we enqueued, there should be holders or requesters
-    let _ = shard0.dequeue("-", "worker-0", 1).await;
-    let _ = shard1.dequeue("-", "worker-1", 1).await;
+    let _ = shard0.dequeue("worker-0", 1).await;
+    let _ = shard1.dequeue("worker-1", 1).await;
 
     // Request the queues page
     let (status, body) = make_request(state, "GET", "/queues").await;

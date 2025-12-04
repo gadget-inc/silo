@@ -34,7 +34,7 @@ use crate::settings::DatabaseConfig;
 use crate::storage::{resolve_object_store, StorageError};
 use crate::task::GubernatorRateLimitData;
 use crate::task_broker::{BrokerTask, TaskBroker};
-use tracing::{info, info_span};
+use tracing::{debug, info, info_span};
 
 // Re-export commonly used types from task module for convenience
 pub use crate::task::{
@@ -112,14 +112,16 @@ impl JobStoreShard {
         cfg: &DatabaseConfig,
         rate_limiter: Arc<dyn RateLimitClient>,
     ) -> Result<Arc<Self>, JobStoreShardError> {
-        let object_store = resolve_object_store(&cfg.backend, &cfg.path)?;
+        let resolved = resolve_object_store(&cfg.backend, &cfg.path)?;
 
-        let mut db_builder = slatedb::DbBuilder::new(cfg.path.as_str(), object_store);
+        // Use the canonical path for both object store AND DbBuilder to ensure consistency
+        let mut db_builder =
+            slatedb::DbBuilder::new(resolved.canonical_path.as_str(), resolved.store);
 
         // Configure separate WAL object store if specified
         if let Some(wal_cfg) = &cfg.wal {
-            let wal_object_store = resolve_object_store(&wal_cfg.backend, &wal_cfg.path)?;
-            db_builder = db_builder.with_wal_object_store(wal_object_store);
+            let wal_resolved = resolve_object_store(&wal_cfg.backend, &wal_cfg.path)?;
+            db_builder = db_builder.with_wal_object_store(wal_resolved.store);
         }
 
         // Apply custom flush interval if specified
@@ -230,6 +232,7 @@ impl JobStoreShard {
                 // No limits - write RunAttempt task directly
                 let first_task = Task::RunAttempt {
                     id: first_task_id.clone(),
+                    tenant: tenant.to_string(),
                     job_id: job_id.clone(),
                     attempt_number: 1,
                     held_queues: Vec::new(),
@@ -257,6 +260,7 @@ impl JobStoreShard {
                     // Granted immediately, but we need to proceed to next limit
                     self.enqueue_next_limit_task(
                         &mut batch,
+                        tenant,
                         &first_task_id,
                         &job_id,
                         1, // attempt number
@@ -273,6 +277,7 @@ impl JobStoreShard {
                 // First limit is a rate limit - create CheckRateLimit task
                 let check_task = Task::CheckRateLimit {
                     task_id: first_task_id.clone(),
+                    tenant: tenant.to_string(),
                     job_id: job_id.clone(),
                     attempt_number: 1,
                     limit_index: 0,
@@ -320,6 +325,7 @@ impl JobStoreShard {
                     // Granted immediately, but we need to proceed to next limit
                     self.enqueue_next_limit_task(
                         &mut batch,
+                        tenant,
                         &first_task_id,
                         &job_id,
                         1, // attempt number
@@ -345,7 +351,6 @@ impl JobStoreShard {
                         if let MemoryEvent::Granted { queue, task_id } = ev {
                             let span = info_span!("concurrency.grant", queue = %queue, task_id = %task_id, job_id = %job_id, attempt = 1u32, source = "immediate");
                             let _g = span.enter();
-                            info!("granted ticket and enqueued first task");
                             self.concurrency
                                 .counts()
                                 .record_grant(tenant, &queue, &task_id);
@@ -355,12 +360,10 @@ impl JobStoreShard {
                 RequestTicketOutcome::TicketRequested { queue } => {
                     let span = info_span!("concurrency.request", queue = %queue, job_id = %job_id, attempt = 1u32, start_at_ms = start_at_ms, priority = priority);
                     let _g = span.enter();
-                    info!("enqueued concurrency request");
                 }
                 RequestTicketOutcome::FutureRequestTaskWritten { queue, .. } => {
                     let span = info_span!("concurrency.ticket", queue = %queue, job_id = %job_id, attempt = 1u32, start_at_ms = start_at_ms, priority = priority);
                     let _g = span.enter();
-                    info!("enqueued RequestTicket for future start");
                 }
             }
         }
@@ -378,6 +381,7 @@ impl JobStoreShard {
     fn enqueue_next_limit_task(
         &self,
         batch: &mut WriteBatch,
+        tenant: &str,
         task_id: &str,
         job_id: &str,
         attempt_number: u32,
@@ -394,6 +398,7 @@ impl JobStoreShard {
             // No more limits - enqueue RunAttempt
             let run_task = Task::RunAttempt {
                 id: task_id.to_string(),
+                tenant: tenant.to_string(),
                 job_id: job_id.to_string(),
                 attempt_number,
                 held_queues,
@@ -414,12 +419,14 @@ impl JobStoreShard {
                 queue: cl.key.clone(),
                 start_time_ms: start_at_ms,
                 priority,
+                tenant: tenant.to_string(),
                 job_id: job_id.to_string(),
                 attempt_number,
                 request_id: Uuid::new_v4().to_string(),
             },
             Limit::RateLimit(rl) => Task::CheckRateLimit {
                 task_id: Uuid::new_v4().to_string(),
+                tenant: tenant.to_string(),
                 job_id: job_id.to_string(),
                 attempt_number,
                 limit_index: next_index,
@@ -434,6 +441,7 @@ impl JobStoreShard {
                 queue: fl.key.clone(),
                 start_time_ms: start_at_ms,
                 priority,
+                tenant: tenant.to_string(),
                 job_id: job_id.to_string(),
                 attempt_number,
                 request_id: Uuid::new_v4().to_string(),
@@ -523,7 +531,7 @@ impl JobStoreShard {
                     if attempt + 1 < MAX_RETRIES {
                         let delay_ms = 10 * (1 << attempt); // 10ms, 20ms, 40ms, 80ms
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        tracing::debug!(
+                        debug!(
                             job_id = %id,
                             attempt = attempt + 1,
                             "cancel_job transaction conflict, retrying"
@@ -803,7 +811,6 @@ impl JobStoreShard {
     /// RunAttempt tasks for job execution and RefreshFloatingLimit tasks for workers to refresh floating limits.
     pub async fn dequeue(
         &self,
-        tenant: &str,
         worker_id: &str,
         max_tasks: usize,
     ) -> Result<DequeueResult, JobStoreShardError> {
@@ -827,11 +834,8 @@ impl JobStoreShard {
                 break;
             }
 
-            // [SILO-DEQ-1] Claim from the broker buffer for this tenant
-            let claimed: Vec<BrokerTask> = self
-                .broker
-                .claim_ready_for_tenant_or_nudge(tenant, remaining)
-                .await;
+            // [SILO-DEQ-1] Claim from the broker buffer (tenant-agnostic)
+            let claimed: Vec<BrokerTask> = self.broker.claim_ready_or_nudge(remaining).await;
 
             if claimed.is_empty() {
                 break;
@@ -851,6 +855,7 @@ impl JobStoreShard {
                         queue,
                         start_time_ms: _,
                         priority: _priority,
+                        tenant,
                         job_id,
                         attempt_number,
                         request_id,
@@ -895,6 +900,7 @@ impl JobStoreShard {
                                 // Create lease and attempt records
                                 let run = Task::RunAttempt {
                                     id: request_id.clone(),
+                                    tenant: tenant.clone(),
                                     job_id: job_id.clone(),
                                     attempt_number: *attempt_number,
                                     held_queues: vec![queue.clone()],
@@ -955,6 +961,7 @@ impl JobStoreShard {
                     }
                     Task::CheckRateLimit {
                         task_id: check_task_id,
+                        tenant,
                         job_id,
                         attempt_number,
                         limit_index,
@@ -989,6 +996,7 @@ impl JobStoreShard {
                                 // Rate limit passed! Proceed to next limit or RunAttempt
                                 self.enqueue_next_limit_task(
                                     &mut batch,
+                                    &tenant,
                                     check_task_id,
                                     job_id,
                                     *attempt_number,
@@ -1021,6 +1029,7 @@ impl JobStoreShard {
                                 );
                                 self.schedule_rate_limit_retry(
                                     &mut batch,
+                                    &tenant,
                                     job_id,
                                     *attempt_number,
                                     *limit_index,
@@ -1037,6 +1046,7 @@ impl JobStoreShard {
                                 let retry_backoff = now_ms + rate_limit.retry_initial_backoff_ms;
                                 self.schedule_rate_limit_retry(
                                     &mut batch,
+                                    &tenant,
                                     job_id,
                                     *attempt_number,
                                     *limit_index,
@@ -1084,20 +1094,25 @@ impl JobStoreShard {
                     }
                     Task::RunAttempt { .. } => {}
                 }
-                let (task_id, job_id, attempt_number) = match task {
+                let (task_id, tenant, job_id, attempt_number) = match task {
                     Task::RunAttempt {
                         id,
+                        tenant,
                         job_id,
                         attempt_number,
                         ..
-                    } => (id.clone(), job_id.to_string(), *attempt_number),
+                    } => (
+                        id.clone(),
+                        tenant.to_string(),
+                        job_id.to_string(),
+                        *attempt_number,
+                    ),
                     Task::RequestTicket { .. }
                     | Task::CheckRateLimit { .. }
                     | Task::RefreshFloatingLimit { .. } => unreachable!(),
                 };
 
-                // [SILO-DEQ-2] Determine tenant from key and look up job info; if missing, delete the task and skip
-                let tenant = tenant.to_string();
+                // [SILO-DEQ-2] Look up job info; if missing, delete the task and skip
                 let job_key = job_info_key(&tenant, &job_id);
                 let maybe_job = self.db.get(job_key.as_bytes()).await?;
                 if let Some(job_bytes) = maybe_job {
@@ -1437,6 +1452,7 @@ impl JobStoreShard {
                             let next_attempt_number = attempt_number + 1;
                             let next_task = Task::RunAttempt {
                                 id: Uuid::new_v4().to_string(),
+                                tenant: tenant.to_string(),
                                 job_id: job_id.clone(),
                                 attempt_number: next_attempt_number,
                                 held_queues: held_queues_local.clone(),
@@ -1511,7 +1527,7 @@ impl JobStoreShard {
                         .record_grant(tenant, &queue, &task_id);
                     let span = info_span!("task.enqueue_from_grant", queue = %queue, task_id = %task_id, cause = "release");
                     let _g = span.enter();
-                    info!("enqueued task for next requester after release");
+                    debug!("enqueued task for next requester after release");
                     self.broker.wakeup();
                 }
             }
@@ -1853,7 +1869,7 @@ impl JobStoreShard {
             encode_floating_limit_state(&new_state).map_err(codec_error_to_shard_error)?;
         batch.put(state_key.as_bytes(), &state_value);
 
-        tracing::info!(
+        tracing::debug!(
             queue_key = %fl.key,
             current_max = state.current_max_concurrency,
             last_refreshed = state.last_refreshed_at_ms,
@@ -1934,7 +1950,7 @@ impl JobStoreShard {
         self.db.write(batch).await?;
         self.db.flush().await?;
 
-        tracing::info!(
+        tracing::debug!(
             queue_key = %queue_key,
             new_max_concurrency = new_max_concurrency,
             "floating limit refresh succeeded"
@@ -2074,6 +2090,7 @@ impl JobStoreShard {
     fn schedule_rate_limit_retry(
         &self,
         batch: &mut WriteBatch,
+        tenant: &str,
         job_id: &str,
         attempt_number: u32,
         limit_index: u32,
@@ -2086,6 +2103,7 @@ impl JobStoreShard {
     ) -> Result<(), JobStoreShardError> {
         let retry_task = Task::CheckRateLimit {
             task_id: Uuid::new_v4().to_string(),
+            tenant: tenant.to_string(),
             job_id: job_id.to_string(),
             attempt_number,
             limit_index,

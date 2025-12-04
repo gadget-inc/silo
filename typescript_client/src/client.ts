@@ -322,8 +322,6 @@ export interface LeaseTasksOptions {
    * If not specified (the default), the server leases from all its shards.
    */
   shard?: number;
-  /** Tenant ID. Required when server has tenancy enabled. */
-  tenant?: string;
 }
 
 /** Outcome for reporting task success */
@@ -835,7 +833,7 @@ export class SiloGRPCClient {
    * @returns The leased tasks (each with a `shard` field).
    */
   public async leaseTasks(options: LeaseTasksOptions): Promise<Task[]> {
-    // Get a client - if shard filter is specified, route to that shard's server
+    // If shard is specified, route to that shard's server
     // Otherwise, use any available server (it will poll all its local shards)
     const client =
       options.shard !== undefined
@@ -847,7 +845,6 @@ export class SiloGRPCClient {
         shard: options.shard,
         workerId: options.workerId,
         maxTasks: options.maxTasks,
-        tenant: options.tenant,
       },
       this._rpcOptions()
     );

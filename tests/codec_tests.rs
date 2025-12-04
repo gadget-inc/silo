@@ -13,6 +13,7 @@ use silo::job_store_shard::{ConcurrencyAction, HolderRecord, LeaseRecord, Task};
 fn test_task_roundtrip() {
     let task = Task::RunAttempt {
         id: "task-1".to_string(),
+        tenant: "tenant-1".to_string(),
         job_id: "job-1".to_string(),
         attempt_number: 1,
         held_queues: vec!["queue-1".to_string()],
@@ -23,11 +24,13 @@ fn test_task_roundtrip() {
     match decoded {
         Task::RunAttempt {
             id,
+            tenant,
             job_id,
             attempt_number,
             held_queues,
         } => {
             assert_eq!(id, "task-1");
+            assert_eq!(tenant, "tenant-1");
             assert_eq!(job_id, "job-1");
             assert_eq!(attempt_number, 1);
             assert_eq!(held_queues, vec!["queue-1"]);
@@ -40,6 +43,7 @@ fn test_task_roundtrip() {
 fn test_version_mismatch() {
     let task = Task::RunAttempt {
         id: "task-1".to_string(),
+        tenant: "-".to_string(),
         job_id: "job-1".to_string(),
         attempt_number: 1,
         held_queues: vec![],
@@ -68,6 +72,7 @@ fn test_lease_roundtrip() {
         worker_id: "worker-1".to_string(),
         task: Task::RunAttempt {
             id: "task-1".to_string(),
+            tenant: "-".to_string(),
             job_id: "job-1".to_string(),
             attempt_number: 1,
             held_queues: vec![],

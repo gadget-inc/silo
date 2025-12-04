@@ -232,6 +232,7 @@ impl ConcurrencyManager {
                 queue: queue.clone(),
                 start_time_ms: start_at_ms,
                 priority,
+                tenant: tenant.to_string(),
                 job_id: job_id.to_string(),
                 attempt_number: 1,
                 request_id: request_id.clone(),
@@ -338,6 +339,7 @@ fn append_grant_edits(
 
     let task = Task::RunAttempt {
         id: task_id.to_string(),
+        tenant: tenant.to_string(),
         job_id: job_id.to_string(),
         attempt_number,
         held_queues: vec![queue.to_string()],
@@ -464,6 +466,7 @@ async fn append_release_and_grant_next(
                     // [SILO-GRANT-4] Create RunAttempt task in DB queue
                     let task = Task::RunAttempt {
                         id: request_id.clone(),
+                        tenant: tenant.to_string(),
                         job_id: job_id_str.to_string(),
                         attempt_number: *attempt_number,
                         held_queues: vec![queue.clone()],

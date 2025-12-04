@@ -270,7 +270,6 @@ export class SiloWorker {
     const tasks = await this._client.leaseTasks({
       workerId: this._workerId,
       maxTasks: tasksToRequest,
-      tenant: this._tenant,
     });
 
     // Add each task to the queue

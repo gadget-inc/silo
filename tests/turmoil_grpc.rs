@@ -59,7 +59,7 @@ fn grpc_end_to_end_under_turmoil() {
         };
 
         let rate_limiter = MockGubernatorClient::new_arc();
-        let mut factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
+        let factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
         let _ = factory.open(0).await.unwrap();
         let factory = Arc::new(factory);
 
@@ -155,7 +155,6 @@ fn grpc_end_to_end_under_turmoil() {
                 shard: Some(0),
                 worker_id: "w".into(),
                 max_tasks: 1,
-                tenant: None,
             }))
             .await?
             .into_inner();
@@ -166,8 +165,8 @@ fn grpc_end_to_end_under_turmoil() {
         let _ = client
             .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                 shard: 0,
-                task_id: task_id.clone(),
                 tenant: None,
+                task_id: task_id.clone(),
                 outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
                     data: b"ok".to_vec(),
                 })),
@@ -178,8 +177,8 @@ fn grpc_end_to_end_under_turmoil() {
         let got = client
             .get_job(tonic::Request::new(GetJobRequest {
                 shard: 0,
-                id: job_id.clone(),
                 tenant: None,
+                id: job_id.clone(),
             }))
             .await?
             .into_inner();
@@ -218,7 +217,7 @@ fn grpc_fault_injection_with_partition() {
         };
 
         let rate_limiter = MockGubernatorClient::new_arc();
-        let mut factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
+        let factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
         let _ = factory.open(0).await.unwrap();
         let factory = Arc::new(factory);
 
@@ -328,7 +327,6 @@ fn grpc_fault_injection_with_partition() {
                     shard: Some(0),
                     worker_id: "w".into(),
                     max_tasks: 1,
-                    tenant: None,
                 }))
                 .await
             {
@@ -353,8 +351,8 @@ fn grpc_fault_injection_with_partition() {
         client
             .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                 shard: 0,
-                task_id: task_id.clone(),
                 tenant: None,
+                task_id: task_id.clone(),
                 outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
                     data: b"ok".to_vec(),
                 })),
@@ -365,8 +363,8 @@ fn grpc_fault_injection_with_partition() {
         let got = client
             .get_job(tonic::Request::new(GetJobRequest {
                 shard: 0,
-                id: job_id.clone(),
                 tenant: None,
+                id: job_id.clone(),
             }))
             .await?
             .into_inner();
@@ -378,7 +376,6 @@ fn grpc_fault_injection_with_partition() {
                 shard: Some(0),
                 worker_id: "w".into(),
                 max_tasks: 1,
-                tenant: None,
             }))
             .await?
             .into_inner();
@@ -419,7 +416,7 @@ fn stress_multiple_workers_with_partitions() {
         };
 
         let rate_limiter = MockGubernatorClient::new_arc();
-        let mut factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
+        let factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
         let _ = factory.open(0).await.unwrap();
         let factory = Arc::new(factory);
 
@@ -553,7 +550,6 @@ fn stress_multiple_workers_with_partitions() {
                     shard: Some(0),
                     worker_id: "w1".into(),
                     max_tasks: 2,
-                    tenant: None,
                 }))
                 .await
             {
@@ -575,8 +571,8 @@ fn stress_multiple_workers_with_partitions() {
                             match client
                                 .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                                     shard: 0,
-                                    task_id: task.id.clone(),
                                     tenant: None,
+                                    task_id: task.id.clone(),
                                     outcome: Some(report_outcome_request::Outcome::Success(
                                         JsonValueBytes {
                                             data: b"ok".to_vec(),
@@ -619,7 +615,6 @@ fn stress_multiple_workers_with_partitions() {
                     shard: Some(0),
                     worker_id: "w2".into(),
                     max_tasks: 2,
-                    tenant: None,
                 }))
                 .await
             {
@@ -639,8 +634,8 @@ fn stress_multiple_workers_with_partitions() {
                             match client
                                 .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                                     shard: 0,
-                                    task_id: task.id.clone(),
                                     tenant: None,
+                                    task_id: task.id.clone(),
                                     outcome: Some(report_outcome_request::Outcome::Success(
                                         JsonValueBytes {
                                             data: b"ok".to_vec(),
@@ -699,7 +694,7 @@ fn stress_duplicate_completion_idempotency() {
         };
 
         let rate_limiter = MockGubernatorClient::new_arc();
-        let mut factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
+        let factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
         let _ = factory.open(0).await.unwrap();
         let factory = Arc::new(factory);
 
@@ -799,7 +794,6 @@ fn stress_duplicate_completion_idempotency() {
                 shard: Some(0),
                 worker_id: "w".into(),
                 max_tasks: 1,
-                tenant: None,
             }))
             .await?
             .into_inner();
@@ -812,8 +806,8 @@ fn stress_duplicate_completion_idempotency() {
             let result = client
                 .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                     shard: 0,
-                    task_id: task_id.clone(),
                     tenant: None,
+                    task_id: task_id.clone(),
                     outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
                         data: format!("attempt-{}", i).into_bytes(),
                     })),
@@ -836,7 +830,6 @@ fn stress_duplicate_completion_idempotency() {
                 shard: Some(0),
                 worker_id: "w".into(),
                 max_tasks: 10,
-                tenant: None,
             }))
             .await?
             .into_inner();
@@ -851,8 +844,8 @@ fn stress_duplicate_completion_idempotency() {
         let _job = client
             .get_job(tonic::Request::new(GetJobRequest {
                 shard: 0,
-                id: job_id,
                 tenant: None,
+                id: job_id,
             }))
             .await?
             .into_inner();
@@ -889,7 +882,7 @@ fn stress_lease_expiry_during_partition() {
         };
 
         let rate_limiter = MockGubernatorClient::new_arc();
-        let mut factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
+        let factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
         let _ = factory.open(0).await.unwrap();
         let factory = Arc::new(factory);
 
@@ -986,7 +979,6 @@ fn stress_lease_expiry_during_partition() {
                 shard: Some(0),
                 worker_id: "w1".into(),
                 max_tasks: 1,
-                tenant: None,
             }))
             .await?
             .into_inner();
@@ -1003,8 +995,8 @@ fn stress_lease_expiry_during_partition() {
         let result = client
             .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                 shard: 0,
-                task_id: task_id.clone(),
                 tenant: None,
+                task_id: task_id.clone(),
                 outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
                     data: b"late".to_vec(),
                 })),
@@ -1034,7 +1026,6 @@ fn stress_lease_expiry_during_partition() {
                     shard: Some(0),
                     worker_id: "w2".into(),
                     max_tasks: 1,
-                    tenant: None,
                 }))
                 .await
             {
@@ -1047,8 +1038,8 @@ fn stress_lease_expiry_during_partition() {
                         client
                             .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                                 shard: 0,
-                                task_id: task_id.clone(),
                                 tenant: None,
+                                task_id: task_id.clone(),
                                 outcome: Some(report_outcome_request::Outcome::Success(
                                     JsonValueBytes {
                                         data: b"recovered".to_vec(),
@@ -1097,7 +1088,7 @@ fn stress_high_message_loss() {
         };
 
         let rate_limiter = MockGubernatorClient::new_arc();
-        let mut factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
+        let factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
         let _ = factory.open(0).await.unwrap();
         let factory = Arc::new(factory);
 
@@ -1214,7 +1205,6 @@ fn stress_high_message_loss() {
                     shard: Some(0),
                     worker_id: "resilient".into(),
                     max_tasks: 5,
-                    tenant: None,
                 }))
                 .await
             {
@@ -1240,8 +1230,8 @@ fn stress_high_message_loss() {
                             match client
                                 .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                                     shard: 0,
-                                    task_id: task.id.clone(),
                                     tenant: None,
+                                    task_id: task.id.clone(),
                                     outcome: Some(report_outcome_request::Outcome::Success(
                                         JsonValueBytes {
                                             data: b"done".to_vec(),
@@ -1312,7 +1302,7 @@ fn concurrency_request_ready_without_release_fails() {
             },
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let mut factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
+        let factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
         let _ = factory.open(0).await.unwrap();
         let factory = Arc::new(factory);
         let addr = (IpAddr::from(Ipv4Addr::UNSPECIFIED), 9996);
@@ -1373,7 +1363,6 @@ fn concurrency_request_ready_without_release_fails() {
                 shard: Some(0),
                 worker_id: "w".into(),
                 max_tasks: 1,
-                tenant: None,
             }))
             .await?
             .into_inner();
@@ -1412,8 +1401,8 @@ fn concurrency_request_ready_without_release_fails() {
         client
             .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                 shard: 0,
-                task_id: t1.clone(),
                 tenant: None,
+                task_id: t1.clone(),
                 outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
                     data: b"ok".to_vec(),
                 })),
@@ -1429,7 +1418,6 @@ fn concurrency_request_ready_without_release_fails() {
                     shard: Some(0),
                     worker_id: "w".into(),
                     max_tasks: 1,
-                    tenant: None,
                 }))
                 .await?
                 .into_inner();
