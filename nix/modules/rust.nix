@@ -6,13 +6,22 @@
   ];
   perSystem = { config, self', pkgs, lib, ... }:
     let
+      # Get crane lib for the filter function
+      craneLib = config.rust-project.crane.lib;
+      
       # Custom source filter that includes proto files alongside Rust sources
       protoFilter = path: _type:
         (builtins.match ".*\\.proto$" path != null) ||  # .proto files
         (builtins.match ".*/proto$" path != null) ||    # proto directory
         (builtins.match ".*/proto/.*" path != null);    # files inside proto/
       sourceFilter = path: type:
-        (protoFilter path type) || (config.rust-project.crane.lib.filterCargoSources path type);
+        (protoFilter path type) || (craneLib.filterCargoSources path type);
+      
+      # Source with proto files included
+      srcWithProto = lib.cleanSourceWith {
+        src = craneLib.cleanCargoSource inputs.self;
+        filter = sourceFilter;
+      };
     in
     {
       packages.default = self'.packages.silo;
@@ -23,10 +32,7 @@
         # protoc is needed for etcd-client and tonic-build
         nativeBuildInputs = [ pkgs.protobuf ];
         # Include proto files in the source
-        src = lib.cleanSourceWith {
-          src = config.rust-project.crane.args.src;
-          filter = sourceFilter;
-        };
+        src = srcWithProto;
       };
     };
 }
