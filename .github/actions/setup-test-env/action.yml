@@ -8,12 +8,17 @@ outputs: {}
 runs:
   using: "composite"
   steps:
-    - uses: cachix/install-nix-action@v31
-    - name: Cache Nix
+    - uses: nixbuild/nix-quick-install-action@v30
+    - name: Cachix setup
       uses: cachix/cachix-action@v16
       with:
         name: silo
         authToken: "${{ inputs.cachix_auth_token }}"
+    - name: Restore and save Nix store
+      uses: nix-community/cache-nix-action@v6
+      with:
+        primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+        restore-prefixes-first-match: nix-${{ runner.os }}-
     - run: |
         source <(nix print-dev-env --show-trace) 
         output_file="nix-env.txt"
