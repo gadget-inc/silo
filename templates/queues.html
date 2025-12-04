@@ -22,6 +22,7 @@
                     <thead class="bg-zinc-850">
                         <tr>
                             <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Queue</th>
+                            <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Shard</th>
                             <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Holders</th>
                             <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Waiters</th>
                             <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Total</th>
@@ -31,8 +32,9 @@
                         {% for queue in queues %}
                         <tr class="border-b border-zinc-700 hover:bg-zinc-750">
                             <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">
-                                <a href="/queue?name={{ queue.name }}" class="text-emerald-400 hover:underline">{{ queue.name }}</a>
+                                <a href="/queue?shard={{ queue.shard }}&name={{ queue.name }}" class="text-emerald-400 hover:underline">{{ queue.name }}</a>
                             </td>
+                            <td class="px-3 py-2 text-sm text-zinc-400 whitespace-nowrap">{{ queue.shard }}</td>
                             <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">{{ queue.holders }}</td>
                             <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">{{ queue.waiters }}</td>
                             <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">{{ queue.total }}</td>

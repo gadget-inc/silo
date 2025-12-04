@@ -47,10 +47,23 @@ impl std::fmt::Debug for JobSql {
 impl JobSql {
     pub fn new(shard: Arc<JobStoreShard>, table_name: &str) -> DfResult<Self> {
         let ctx = SessionContext::new();
-        let schema = JobsScanner::base_schema();
-        let scanner: ScannerRef = Arc::new(JobsScanner { shard });
-        let provider = Arc::new(SiloTableProvider::new(schema, scanner));
-        ctx.register_table(table_name, provider)?;
+
+        // Register jobs table
+        let jobs_schema = JobsScanner::base_schema();
+        let jobs_scanner: ScannerRef = Arc::new(JobsScanner {
+            shard: Arc::clone(&shard),
+        });
+        let jobs_provider = Arc::new(SiloTableProvider::new(jobs_schema, jobs_scanner));
+        ctx.register_table(table_name, jobs_provider)?;
+
+        // Register queues table for concurrency queue data
+        let queues_schema = QueuesScanner::base_schema();
+        let queues_scanner: ScannerRef = Arc::new(QueuesScanner {
+            shard: Arc::clone(&shard),
+        });
+        let queues_provider = Arc::new(SiloTableProvider::new(queues_schema, queues_scanner));
+        ctx.register_table("queues", queues_provider)?;
+
         Ok(Self { ctx })
     }
 
@@ -651,6 +664,294 @@ impl Scan for JobsScanner {
                     return;
                 }
                 i = end;
+            }
+        });
+
+        Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&projection),
+            ReceiverStream::new(rx).map(|r| r),
+        ))
+    }
+}
+
+// =============================================================================
+// QueuesScanner - provides SQL access to concurrency queue data (holders/requests)
+// =============================================================================
+
+struct QueuesScanner {
+    shard: Arc<JobStoreShard>,
+}
+
+impl std::fmt::Debug for QueuesScanner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("QueuesScanner")
+    }
+}
+
+/// Row type for queue entries
+#[derive(Debug, Clone)]
+struct QueueEntry {
+    tenant: String,
+    queue_name: String,
+    entry_type: String, // "holder" or "requester"
+    task_id: String,
+    job_id: Option<String>,
+    priority: Option<u8>,
+    timestamp_ms: i64,
+}
+
+impl QueuesScanner {
+    fn base_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("tenant", DataType::Utf8, false),
+            Field::new("queue_name", DataType::Utf8, false),
+            Field::new("entry_type", DataType::Utf8, false), // "holder" or "requester"
+            Field::new("task_id", DataType::Utf8, false),
+            Field::new("job_id", DataType::Utf8, true),
+            Field::new("priority", DataType::UInt8, true),
+            Field::new("timestamp_ms", DataType::Int64, false),
+        ]))
+    }
+}
+
+impl Scan for QueuesScanner {
+    fn scan(
+        &self,
+        projection: SchemaRef,
+        filters: &[Expr],
+        batch_size: usize,
+        limit: Option<usize>,
+    ) -> SendableRecordBatchStream {
+        // Parse filters for tenant and queue_name
+        let mut tenant_filter: Option<String> = None;
+        let mut queue_filter: Option<String> = None;
+        for f in filters {
+            if let Some((col, val)) = parse_eq_filter(f) {
+                match col.as_str() {
+                    "tenant" => tenant_filter = Some(val),
+                    "queue_name" => queue_filter = Some(val),
+                    _ => {}
+                }
+            }
+        }
+        let tenant = tenant_filter.unwrap_or_else(|| "-".to_string());
+
+        let (tx, rx) = mpsc::channel::<DfResult<RecordBatch>>(2);
+        let shard = Arc::clone(&self.shard);
+        let proj_for_stream = Arc::clone(&projection);
+        let hard_limit = limit.unwrap_or(DEFAULT_SCAN_LIMIT);
+
+        tokio::spawn(async move {
+            let db = shard.db();
+            let mut entries: Vec<QueueEntry> = Vec::new();
+
+            // Scan holders: holders/<tenant>/<queue>/<task-id>
+            let holders_prefix = if let Some(ref q) = queue_filter {
+                format!("holders/{}/{}/", tenant, q)
+            } else {
+                format!("holders/{}/", tenant)
+            };
+            let holders_start: Vec<u8> = holders_prefix.as_bytes().to_vec();
+            let mut holders_end: Vec<u8> = holders_start.clone();
+            holders_end.push(0xFF);
+
+            if let Ok(mut iter) = db.scan::<Vec<u8>, _>(holders_start..=holders_end).await {
+                while let Ok(Some(kv)) = iter.next().await {
+                    if entries.len() >= hard_limit {
+                        break;
+                    }
+                    if let Ok(key_str) = std::str::from_utf8(&kv.key) {
+                        let parts: Vec<&str> = key_str.split('/').collect();
+                        // holders/<tenant>/<queue>/<task-id>
+                        if parts.len() >= 4 && parts[0] == "holders" {
+                            let queue_name = parts[2].to_string();
+                            let task_id = parts[3].to_string();
+                            let timestamp_ms =
+                                if let Ok(holder) = crate::codec::decode_holder(&kv.value) {
+                                    holder.granted_at_ms()
+                                } else {
+                                    0
+                                };
+                            entries.push(QueueEntry {
+                                tenant: parts[1].to_string(),
+                                queue_name,
+                                entry_type: "holder".to_string(),
+                                task_id,
+                                job_id: None,
+                                priority: None,
+                                timestamp_ms,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Scan requests: requests/<tenant>/<queue>/<start_time_ms>/<priority>/<request_id>
+            let requests_prefix = if let Some(ref q) = queue_filter {
+                format!("requests/{}/{}/", tenant, q)
+            } else {
+                format!("requests/{}/", tenant)
+            };
+            let requests_start: Vec<u8> = requests_prefix.as_bytes().to_vec();
+            let mut requests_end: Vec<u8> = requests_start.clone();
+            requests_end.push(0xFF);
+
+            if let Ok(mut iter) = db.scan::<Vec<u8>, _>(requests_start..=requests_end).await {
+                while let Ok(Some(kv)) = iter.next().await {
+                    if entries.len() >= hard_limit {
+                        break;
+                    }
+                    if let Ok(key_str) = std::str::from_utf8(&kv.key) {
+                        let parts: Vec<&str> = key_str.split('/').collect();
+                        // requests/<tenant>/<queue>/<start_time_ms>/<priority>/<request_id>
+                        if parts.len() >= 6 && parts[0] == "requests" {
+                            let queue_name = parts[2].to_string();
+                            let start_time_ms: i64 = parts[3].parse().unwrap_or(0);
+                            let priority: u8 = parts[4].parse().unwrap_or(50);
+                            let request_id = parts[5].to_string();
+                            let job_id =
+                                if let Ok(action) = crate::codec::decode_concurrency_action(&kv.value)
+                                {
+                                    match action.archived() {
+                                        crate::task::ArchivedConcurrencyAction::EnqueueTask {
+                                            job_id,
+                                            ..
+                                        } => Some(job_id.as_str().to_string()),
+                                    }
+                                } else {
+                                    None
+                                };
+                            entries.push(QueueEntry {
+                                tenant: parts[1].to_string(),
+                                queue_name,
+                                entry_type: "requester".to_string(),
+                                task_id: request_id,
+                                job_id,
+                                priority: Some(priority),
+                                timestamp_ms: start_time_ms,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Build record batches
+            let mut i: usize = 0;
+            while i < entries.len() {
+                let start = i;
+                let end = std::cmp::min(entries.len(), start + batch_size);
+                let batch_entries = &entries[start..end];
+
+                // Handle empty projection (when DataFusion just needs row count)
+                if proj_for_stream.fields().is_empty() {
+                    let batch = match RecordBatch::try_new_with_options(
+                        Arc::clone(&proj_for_stream),
+                        vec![],
+                        &datafusion::arrow::record_batch::RecordBatchOptions::new()
+                            .with_row_count(Some(batch_entries.len())),
+                    ) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(DataFusionError::Execution(e.to_string())))
+                                .await;
+                            return;
+                        }
+                    };
+                    if tx.send(Ok(batch)).await.is_err() {
+                        return;
+                    }
+                    i = end;
+                    continue;
+                }
+
+                let mut cols: Vec<ArrayRef> = Vec::with_capacity(proj_for_stream.fields().len());
+                for f in proj_for_stream.fields() {
+                    match f.name().as_str() {
+                        "tenant" => {
+                            let vals: Vec<&str> =
+                                batch_entries.iter().map(|e| e.tenant.as_str()).collect();
+                            cols.push(Arc::new(StringArray::from(vals)));
+                        }
+                        "queue_name" => {
+                            let vals: Vec<&str> =
+                                batch_entries.iter().map(|e| e.queue_name.as_str()).collect();
+                            cols.push(Arc::new(StringArray::from(vals)));
+                        }
+                        "entry_type" => {
+                            let vals: Vec<&str> =
+                                batch_entries.iter().map(|e| e.entry_type.as_str()).collect();
+                            cols.push(Arc::new(StringArray::from(vals)));
+                        }
+                        "task_id" => {
+                            let vals: Vec<&str> =
+                                batch_entries.iter().map(|e| e.task_id.as_str()).collect();
+                            cols.push(Arc::new(StringArray::from(vals)));
+                        }
+                        "job_id" => {
+                            let vals: Vec<Option<&str>> = batch_entries
+                                .iter()
+                                .map(|e| e.job_id.as_deref())
+                                .collect();
+                            cols.push(Arc::new(StringArray::from(vals)));
+                        }
+                        "priority" => {
+                            let vals: Vec<Option<u8>> =
+                                batch_entries.iter().map(|e| e.priority).collect();
+                            cols.push(Arc::new(UInt8Array::from(vals)));
+                        }
+                        "timestamp_ms" => {
+                            let vals: Vec<i64> =
+                                batch_entries.iter().map(|e| e.timestamp_ms).collect();
+                            cols.push(Arc::new(Int64Array::from(vals)));
+                        }
+                        other => {
+                            let _ = tx
+                                .send(Err(DataFusionError::Execution(format!(
+                                    "unknown column {}",
+                                    other
+                                ))))
+                                .await;
+                            return;
+                        }
+                    }
+                }
+
+                let batch = match RecordBatch::try_new(Arc::clone(&proj_for_stream), cols) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(DataFusionError::Execution(e.to_string())))
+                            .await;
+                        return;
+                    }
+                };
+                if tx.send(Ok(batch)).await.is_err() {
+                    return;
+                }
+                i = end;
+            }
+
+            // If no entries, send an empty batch
+            if entries.is_empty() {
+                let empty_cols: Vec<ArrayRef> = proj_for_stream
+                    .fields()
+                    .iter()
+                    .map(|f| -> ArrayRef {
+                        match f.name().as_str() {
+                            "tenant" | "queue_name" | "entry_type" | "task_id" => {
+                                Arc::new(StringArray::from(Vec::<&str>::new()))
+                            }
+                            "job_id" => Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
+                            "priority" => Arc::new(UInt8Array::from(Vec::<Option<u8>>::new())),
+                            "timestamp_ms" => Arc::new(Int64Array::from(Vec::<i64>::new())),
+                            _ => Arc::new(StringArray::from(Vec::<&str>::new())),
+                        }
+                    })
+                    .collect();
+                if let Ok(batch) = RecordBatch::try_new(Arc::clone(&proj_for_stream), empty_cols) {
+                    let _ = tx.send(Ok(batch)).await;
+                }
             }
         });
 

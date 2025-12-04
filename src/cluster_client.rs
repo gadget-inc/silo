@@ -14,17 +14,23 @@ use tracing::{debug, warn};
 use crate::coordination::{CoordinationError, Coordinator, ShardOwnerMap};
 use crate::factory::ShardFactory;
 use crate::pb::silo_client::SiloClient;
-use crate::pb::{ColumnInfo, JsonValueBytes, QueryRequest};
+use crate::pb::{
+    CancelJobRequest, ColumnInfo, GetJobRequest, GetJobResponse, JsonValueBytes, QueryRequest,
+};
 
 /// Error types for cluster client operations
 #[derive(Debug, thiserror::Error)]
 pub enum ClusterClientError {
     #[error("Shard {0} not found in cluster")]
     ShardNotFound(u32),
+    #[error("Job not found")]
+    JobNotFound,
     #[error("Failed to connect to node at {0}: {1}")]
     ConnectionFailed(String, String),
     #[error("Query failed: {0}")]
     QueryFailed(String),
+    #[error("RPC failed: {0}")]
+    RpcFailed(String),
     #[error("No coordinator available")]
     NoCoordinator,
 }
@@ -278,5 +284,134 @@ impl ClusterClient {
     /// Check if this node owns a specific shard
     pub fn owns_shard(&self, shard_id: u32) -> bool {
         self.factory.get(&shard_id.to_string()).is_some()
+    }
+
+    /// Get the address for a remote shard
+    async fn get_shard_addr(&self, shard_id: u32) -> Result<String, ClusterClientError> {
+        let Some(coordinator) = &self.coordinator else {
+            return Err(ClusterClientError::NoCoordinator);
+        };
+
+        let owner_map = coordinator
+            .get_shard_owner_map()
+            .await
+            .map_err(|e: CoordinationError| ClusterClientError::QueryFailed(e.to_string()))?;
+
+        owner_map
+            .shard_to_addr
+            .get(&shard_id)
+            .cloned()
+            .ok_or(ClusterClientError::ShardNotFound(shard_id))
+    }
+
+    /// Get a job from any shard (local or remote)
+    pub async fn get_job(
+        &self,
+        shard_id: u32,
+        tenant: &str,
+        job_id: &str,
+    ) -> Result<GetJobResponse, ClusterClientError> {
+        let shard_name = shard_id.to_string();
+
+        // Check if shard is local first
+        if let Some(shard) = self.factory.get(&shard_name) {
+            debug!(
+                shard_id = shard_id,
+                job_id = job_id,
+                "getting job from local shard"
+            );
+            let job_view = shard
+                .get_job(tenant, job_id)
+                .await
+                .map_err(|e| ClusterClientError::QueryFailed(e.to_string()))?
+                .ok_or(ClusterClientError::JobNotFound)?;
+
+            let retry_policy = job_view.retry_policy().map(|p| crate::pb::RetryPolicy {
+                retry_count: p.retry_count,
+                initial_interval_ms: p.initial_interval_ms,
+                max_interval_ms: p.max_interval_ms,
+                randomize_interval: p.randomize_interval,
+                backoff_factor: p.backoff_factor,
+            });
+
+            return Ok(GetJobResponse {
+                id: job_view.id().to_string(),
+                priority: job_view.priority() as u32,
+                enqueue_time_ms: job_view.enqueue_time_ms(),
+                payload: Some(JsonValueBytes {
+                    data: job_view.payload_bytes().to_vec(),
+                }),
+                retry_policy,
+                limits: job_view
+                    .limits()
+                    .into_iter()
+                    .map(crate::server::job_limit_to_proto_limit)
+                    .collect(),
+                metadata: job_view.metadata().into_iter().collect(),
+            });
+        }
+
+        // Shard is not local, need to call remote node
+        let addr = self.get_shard_addr(shard_id).await?;
+        debug!(shard_id = shard_id, addr = %addr, job_id = job_id, "getting job from remote shard");
+
+        let mut client = self.get_client(&addr).await?;
+        let request = GetJobRequest {
+            shard: shard_name,
+            id: job_id.to_string(),
+            tenant: Some(tenant.to_string()),
+        };
+
+        let response = client.get_job(request).await.map_err(|e| {
+            if e.code() == tonic::Code::NotFound {
+                ClusterClientError::JobNotFound
+            } else {
+                ClusterClientError::RpcFailed(e.to_string())
+            }
+        })?;
+
+        Ok(response.into_inner())
+    }
+
+    /// Cancel a job on any shard (local or remote)
+    pub async fn cancel_job(
+        &self,
+        shard_id: u32,
+        tenant: &str,
+        job_id: &str,
+    ) -> Result<(), ClusterClientError> {
+        let shard_name = shard_id.to_string();
+
+        // Check if shard is local first
+        if let Some(shard) = self.factory.get(&shard_name) {
+            debug!(
+                shard_id = shard_id,
+                job_id = job_id,
+                "cancelling job on local shard"
+            );
+            shard
+                .cancel_job(tenant, job_id)
+                .await
+                .map_err(|e| ClusterClientError::QueryFailed(e.to_string()))?;
+            return Ok(());
+        }
+
+        // Shard is not local, need to call remote node
+        let addr = self.get_shard_addr(shard_id).await?;
+        debug!(shard_id = shard_id, addr = %addr, job_id = job_id, "cancelling job on remote shard");
+
+        let mut client = self.get_client(&addr).await?;
+        let request = CancelJobRequest {
+            shard: shard_name,
+            id: job_id.to_string(),
+            tenant: Some(tenant.to_string()),
+        };
+
+        client
+            .cancel_job(request)
+            .await
+            .map_err(|e| ClusterClientError::RpcFailed(e.to_string()))?;
+
+        Ok(())
     }
 }
