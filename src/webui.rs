@@ -21,7 +21,6 @@ use tracing::{info, warn};
 use crate::cluster_client::ClusterClient;
 use crate::coordination::Coordinator;
 use crate::factory::ShardFactory;
-use crate::job::JobStatusKind;
 use crate::settings::AppConfig;
 
 #[derive(Clone)]
@@ -43,6 +42,7 @@ pub struct JobRow {
 #[derive(Clone)]
 pub struct QueueRow {
     pub name: String,
+    pub shard: String,
     pub holders: usize,
     pub waiters: usize,
     pub total: usize,
@@ -147,6 +147,7 @@ pub struct JobParams {
 
 #[derive(serde::Deserialize)]
 pub struct QueueParams {
+    shard: String,
     name: String,
 }
 
@@ -197,16 +198,6 @@ fn format_timestamp(ms: i64) -> String {
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
         year, month, day, hour, minute, second
     )
-}
-
-fn status_to_string(kind: JobStatusKind) -> String {
-    match kind {
-        JobStatusKind::Scheduled => "Scheduled".to_string(),
-        JobStatusKind::Running => "Running".to_string(),
-        JobStatusKind::Succeeded => "Succeeded".to_string(),
-        JobStatusKind::Failed => "Failed".to_string(),
-        JobStatusKind::Cancelled => "Cancelled".to_string(),
-    }
 }
 
 async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
@@ -265,28 +256,49 @@ async fn job_handler(
     State(state): State<AppState>,
     Query(params): Query<JobParams>,
 ) -> impl IntoResponse {
-    let Some(shard) = state.factory.get(&params.shard) else {
-        return Html(
-            ErrorTemplate {
-                nav_active: "job",
-                title: "Shard Not Found".to_string(),
-                code: 404,
-                message: format!("Shard '{}' not found", params.shard),
-            }
-            .render()
-            .unwrap_or_default(),
-        );
+    // Parse shard ID
+    let shard_id: u32 = match params.shard.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return Html(
+                ErrorTemplate {
+                    nav_active: "job",
+                    title: "Invalid Shard".to_string(),
+                    code: 400,
+                    message: format!("Invalid shard ID: '{}'", params.shard),
+                }
+                .render()
+                .unwrap_or_default(),
+            );
+        }
     };
 
-    let job_view = match shard.get_job("-", &params.id).await {
-        Ok(Some(j)) => j,
-        Ok(None) => {
+    // Get job from any shard (local or remote)
+    let job_response = match state
+        .cluster_client
+        .get_job(shard_id, "-", &params.id)
+        .await
+    {
+        Ok(j) => j,
+        Err(crate::cluster_client::ClusterClientError::JobNotFound) => {
             return Html(
                 ErrorTemplate {
                     nav_active: "job",
                     title: "Job Not Found".to_string(),
                     code: 404,
                     message: format!("Job '{}' not found", params.id),
+                }
+                .render()
+                .unwrap_or_default(),
+            );
+        }
+        Err(crate::cluster_client::ClusterClientError::ShardNotFound(_)) => {
+            return Html(
+                ErrorTemplate {
+                    nav_active: "job",
+                    title: "Shard Not Found".to_string(),
+                    code: 404,
+                    message: format!("Shard '{}' not found in cluster", params.shard),
                 }
                 .render()
                 .unwrap_or_default(),
@@ -306,52 +318,81 @@ async fn job_handler(
         }
     };
 
-    let status = match shard.get_job_status("-", &params.id).await {
-        Ok(Some(s)) => s,
-        Ok(None) => crate::job::JobStatus::scheduled(0),
-        Err(_) => crate::job::JobStatus::scheduled(0),
-    };
+    // Get job status via SQL query
+    let sql = format!(
+        "SELECT status_kind, status_changed_at_ms FROM jobs WHERE id = '{}'",
+        params.id.replace('\'', "''") // Basic SQL escaping
+    );
+    let (status_kind, status_changed_at_ms) =
+        match state.cluster_client.query_shard(shard_id, &sql).await {
+            Ok(result) => {
+                if let Some(row) = result.rows.first() {
+                    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&row.data) {
+                        let kind = json["status_kind"]
+                            .as_str()
+                            .unwrap_or("Scheduled")
+                            .to_string();
+                        let changed_at = json["status_changed_at_ms"].as_i64().unwrap_or(0);
+                        (kind, changed_at)
+                    } else {
+                        ("Scheduled".to_string(), 0)
+                    }
+                } else {
+                    ("Scheduled".to_string(), 0)
+                }
+            }
+            Err(_) => ("Scheduled".to_string(), 0),
+        };
 
-    let limits: Vec<LimitRow> = job_view
-        .limits()
+    let is_terminal = matches!(status_kind.as_str(), "Succeeded" | "Failed" | "Cancelled");
+
+    // Convert proto limits to LimitRow
+    let limits: Vec<LimitRow> = job_response
+        .limits
         .iter()
-        .map(|l| match l {
-            crate::job::Limit::Concurrency(c) => LimitRow {
-                limit_type: "Concurrency".to_string(),
-                key: c.key.clone(),
-                value: c.max_concurrency.to_string(),
-            },
-            crate::job::Limit::RateLimit(r) => LimitRow {
-                limit_type: "Rate Limit".to_string(),
-                key: r.name.clone(),
-                value: format!("{}/{}ms", r.limit, r.duration_ms),
-            },
-            crate::job::Limit::FloatingConcurrency(f) => LimitRow {
-                limit_type: "Floating Concurrency".to_string(),
-                key: f.key.clone(),
-                value: format!(
-                    "default={}, refresh={}ms",
-                    f.default_max_concurrency, f.refresh_interval_ms
-                ),
-            },
+        .filter_map(|l| {
+            l.limit.as_ref().map(|limit| match limit {
+                crate::pb::limit::Limit::Concurrency(c) => LimitRow {
+                    limit_type: "Concurrency".to_string(),
+                    key: c.key.clone(),
+                    value: c.max_concurrency.to_string(),
+                },
+                crate::pb::limit::Limit::RateLimit(r) => LimitRow {
+                    limit_type: "Rate Limit".to_string(),
+                    key: r.name.clone(),
+                    value: format!("{}/{}ms", r.limit, r.duration_ms),
+                },
+                crate::pb::limit::Limit::FloatingConcurrency(f) => LimitRow {
+                    limit_type: "Floating Concurrency".to_string(),
+                    key: f.key.clone(),
+                    value: format!(
+                        "default={}, refresh={}ms",
+                        f.default_max_concurrency, f.refresh_interval_ms
+                    ),
+                },
+            })
         })
         .collect();
 
-    let payload_str = match job_view.payload_json() {
-        Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".to_string()),
-        Err(_) => "{}".to_string(),
+    // Parse payload JSON for pretty display
+    let payload_str = if let Some(payload) = &job_response.payload {
+        serde_json::from_slice::<serde_json::Value>(&payload.data)
+            .map(|v| serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".to_string()))
+            .unwrap_or_else(|_| "{}".to_string())
+    } else {
+        "{}".to_string()
     };
 
     let template = JobTemplate {
         nav_active: "job",
         job_id: params.id,
         shard: params.shard,
-        status: status_to_string(status.kind),
-        is_terminal: status.is_terminal(),
-        priority: job_view.priority(),
-        enqueue_time: format_timestamp(job_view.enqueue_time_ms()),
-        status_changed: format_timestamp(status.changed_at_ms),
-        metadata: job_view.metadata(),
+        status: status_kind,
+        is_terminal,
+        priority: job_response.priority as u8,
+        enqueue_time: format_timestamp(job_response.enqueue_time_ms),
+        status_changed: format_timestamp(status_changed_at_ms),
+        metadata: job_response.metadata.into_iter().collect(),
         limits,
         payload: payload_str,
     };
@@ -367,11 +408,19 @@ async fn cancel_job_handler(
     State(state): State<AppState>,
     Query(params): Query<JobParams>,
 ) -> impl IntoResponse {
-    let Some(shard) = state.factory.get(&params.shard) else {
-        return Html(r#"<span class="text-red-400">Shard not found</span>"#.to_string());
+    // Parse shard ID
+    let shard_id: u32 = match params.shard.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return Html(r#"<span class="text-red-400">Invalid shard ID</span>"#.to_string());
+        }
     };
 
-    match shard.cancel_job("-", &params.id).await {
+    match state
+        .cluster_client
+        .cancel_job(shard_id, "-", &params.id)
+        .await
+    {
         Ok(()) => Html(
             StatusBadgeTemplate {
                 status: "Cancelled".to_string(),
@@ -384,53 +433,43 @@ async fn cancel_job_handler(
 }
 
 async fn queues_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let mut all_queues: HashMap<String, (usize, usize)> = HashMap::new();
+    // Key: (shard_id, queue_name) -> (holders, waiters)
+    let mut all_queues: HashMap<(String, String), (usize, usize)> = HashMap::new();
 
-    // For queue scanning, we need direct DB access which requires local shards
-    // In a distributed setup, this would require a dedicated RPC endpoint
-    // For now, query local shards and note that this is a limitation
-    for (_shard_name, shard) in state.factory.instances().iter() {
-        let db = shard.db();
+    // Query all shards for queue data using SQL
+    let sql = "SELECT queue_name, entry_type FROM queues";
 
-        // Scan holders
-        let holders_start: Vec<u8> = b"holders/".to_vec();
-        let mut holders_end: Vec<u8> = b"holders/".to_vec();
-        holders_end.push(0xFF);
-
-        if let Ok(mut iter) = db.scan::<Vec<u8>, _>(holders_start..=holders_end).await {
-            while let Ok(Some(kv)) = iter.next().await {
-                let key_str = String::from_utf8_lossy(&kv.key);
-                let parts: Vec<&str> = key_str.split('/').collect();
-                if parts.len() >= 4 {
-                    let queue = parts[2].to_string();
-                    let entry = all_queues.entry(queue).or_insert((0, 0));
-                    entry.0 += 1;
+    match state.cluster_client.query_all_shards(sql).await {
+        Ok(results) => {
+            for result in results {
+                let shard_name = result.shard_id.to_string();
+                for row in result.rows {
+                    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&row.data) {
+                        let queue_name = json["queue_name"].as_str().unwrap_or("").to_string();
+                        let entry_type = json["entry_type"].as_str().unwrap_or("");
+                        if !queue_name.is_empty() {
+                            let key = (shard_name.clone(), queue_name);
+                            let entry = all_queues.entry(key).or_insert((0, 0));
+                            match entry_type {
+                                "holder" => entry.0 += 1,
+                                "requester" => entry.1 += 1,
+                                _ => {}
+                            }
+                        }
+                    }
                 }
             }
         }
-
-        // Scan requests
-        let requests_start: Vec<u8> = b"requests/".to_vec();
-        let mut requests_end: Vec<u8> = b"requests/".to_vec();
-        requests_end.push(0xFF);
-
-        if let Ok(mut iter) = db.scan::<Vec<u8>, _>(requests_start..=requests_end).await {
-            while let Ok(Some(kv)) = iter.next().await {
-                let key_str = String::from_utf8_lossy(&kv.key);
-                let parts: Vec<&str> = key_str.split('/').collect();
-                if parts.len() >= 3 {
-                    let queue = parts[2].to_string();
-                    let entry = all_queues.entry(queue).or_insert((0, 0));
-                    entry.1 += 1;
-                }
-            }
+        Err(e) => {
+            warn!(error = %e, "failed to query queues from shards");
         }
     }
 
     let mut queues: Vec<QueueRow> = all_queues
         .into_iter()
-        .map(|(name, (holders, waiters))| QueueRow {
+        .map(|((shard, name), (holders, waiters))| QueueRow {
             name,
+            shard,
             holders,
             waiters,
             total: holders + waiters,
@@ -454,70 +493,80 @@ async fn queue_handler(
     State(state): State<AppState>,
     Query(params): Query<QueueParams>,
 ) -> impl IntoResponse {
+    // Parse shard ID
+    let shard_id: u32 = match params.shard.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return Html(
+                ErrorTemplate {
+                    nav_active: "queues",
+                    title: "Invalid Shard".to_string(),
+                    code: 400,
+                    message: format!("Invalid shard ID: '{}'", params.shard),
+                }
+                .render()
+                .unwrap_or_default(),
+            );
+        }
+    };
+
     let mut holders: Vec<HolderRow> = Vec::new();
     let mut requesters: Vec<RequesterRow> = Vec::new();
 
-    for (shard_name, shard) in state.factory.instances().iter() {
-        let db = shard.db();
+    // Query queue data from the specific shard via SQL
+    let sql = format!(
+        "SELECT task_id, job_id, entry_type, priority, timestamp_ms FROM queues WHERE queue_name = '{}'",
+        params.name.replace('\'', "''") // Basic SQL escaping
+    );
 
-        // Scan holders for this queue
-        let holders_prefix = format!("holders/-/{}/", params.name);
-        let holders_start: Vec<u8> = holders_prefix.as_bytes().to_vec();
-        let mut holders_end: Vec<u8> = holders_start.clone();
-        holders_end.push(0xFF);
+    match state.cluster_client.query_shard(shard_id, &sql).await {
+        Ok(result) => {
+            for row in result.rows {
+                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&row.data) {
+                    let entry_type = json["entry_type"].as_str().unwrap_or("");
+                    let task_id = json["task_id"].as_str().unwrap_or("").to_string();
+                    let timestamp_ms = json["timestamp_ms"].as_i64().unwrap_or(0);
 
-        if let Ok(mut iter) = db.scan::<Vec<u8>, _>(holders_start..=holders_end).await {
-            while let Ok(Some(kv)) = iter.next().await {
-                let key_str = String::from_utf8_lossy(&kv.key);
-                let parts: Vec<&str> = key_str.split('/').collect();
-                if parts.len() >= 4 {
-                    let task_id = parts[3].to_string();
-                    let granted_at = if let Ok(decoded) = crate::codec::decode_holder(&kv.value) {
-                        format_timestamp(decoded.granted_at_ms())
-                    } else {
-                        "unknown".to_string()
-                    };
-                    holders.push(HolderRow {
-                        task_id,
-                        shard: shard_name.clone(),
-                        granted_at,
-                    });
+                    match entry_type {
+                        "holder" => {
+                            holders.push(HolderRow {
+                                task_id,
+                                shard: params.shard.clone(),
+                                granted_at: format_timestamp(timestamp_ms),
+                            });
+                        }
+                        "requester" => {
+                            let job_id = json["job_id"]
+                                .as_str()
+                                .unwrap_or("unknown")
+                                .to_string();
+                            let priority = json["priority"].as_u64().unwrap_or(50) as u8;
+                            requesters.push(RequesterRow {
+                                job_id,
+                                shard: params.shard.clone(),
+                                priority,
+                                requested_at: format_timestamp(timestamp_ms),
+                            });
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
-
-        // Scan requests for this queue
-        let requests_prefix = format!("requests/-/{}/", params.name);
-        let requests_start: Vec<u8> = requests_prefix.as_bytes().to_vec();
-        let mut requests_end: Vec<u8> = requests_start.clone();
-        requests_end.push(0xFF);
-
-        if let Ok(mut iter) = db.scan::<Vec<u8>, _>(requests_start..=requests_end).await {
-            while let Ok(Some(kv)) = iter.next().await {
-                let key_str = String::from_utf8_lossy(&kv.key);
-                let parts: Vec<&str> = key_str.split('/').collect();
-                if parts.len() >= 6 {
-                    let start_time: i64 = parts[3].parse().unwrap_or(0);
-                    let priority: u8 = parts[4].parse().unwrap_or(50);
-                    let job_id = if let Ok(decoded) =
-                        crate::codec::decode_concurrency_action(&kv.value)
-                    {
-                        match decoded.archived() {
-                            crate::task::ArchivedConcurrencyAction::EnqueueTask {
-                                job_id, ..
-                            } => job_id.as_str().to_string(),
-                        }
-                    } else {
-                        "unknown".to_string()
-                    };
-                    requesters.push(RequesterRow {
-                        job_id,
-                        shard: shard_name.clone(),
-                        priority,
-                        requested_at: format_timestamp(start_time),
-                    });
+        Err(crate::cluster_client::ClusterClientError::ShardNotFound(_)) => {
+            return Html(
+                ErrorTemplate {
+                    nav_active: "queues",
+                    title: "Shard Not Found".to_string(),
+                    code: 404,
+                    message: format!("Shard '{}' not found in cluster", params.shard),
                 }
-            }
+                .render()
+                .unwrap_or_default(),
+            );
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to query queue from shard");
         }
     }
 
