@@ -2,7 +2,7 @@
 
 A background job queueing system built on top of object storage via [slatedb](https://slatedb.io)
 
-Status: crappy experiment
+Status: working prototype
 
 ### Features
 
@@ -12,13 +12,32 @@ Status: crappy experiment
 - future scheduling
 - concurrency limits for limiting throughput of various jobs (with high cardinality and limit change support)
 - compute/storage separation for elastic compute scaling
-- tracks job results
+- tracks job results so jobs can return stuff to the enqueuing process
 - tracks job and attempt history for operators
 - allows searching for jobs with a few different filters
 - brokers work for userland workers in any language that communicate with the broker via RPCs
 - simple operator-facing webui
 
-It's like Sidekiq, BullMQ, Temporal, Restate or similar, but durable.
+It's like Sidekiq, BullMQ, Temporal, Restate or similar, but durable and horizontally scalable (unlike the Redis-based systems), and cheap (unlike the big chatty systems).
+
+## Deployment architecture
+
+To use Silo for job execution, you must set up two things:
+
+- the Silo server, which will store your jobs and broker tasks
+- some workers listening to this Silo server that actually run tasks.
+
+Your worker instances will poll the Silo server for new tasks to run, run them locally, and report the outcome back to Silo. On failure, the job will be re-attempted in the future according to the job's retry schedule.
+
+If you want to run multiple Silo instances in a cluster to spread out your load, you must also configure a cluster membership system for Silo. Currently, etcd and Kubernetes API based cluster membership providers are available.
+
+## Configuration
+
+Silo aims to work well out of the box, but when needed, has a deep set of configurations you can adjust to tune things as you see fit. See [CONFIGURATION.md](./CONFIGURATION.md) for details on supported configuration options.
+
+## Observability
+
+Silo is built for production and exports a healthy number of OpenTelemetry logs, metrics, and traces for consumption in your observability tool of choice. See [OBSERVABILITY.md](./OBSERVABILITY.md) for more details.
 
 ## Temporal VS Silo
 
@@ -40,13 +59,13 @@ Silo makes no distinction between workflows and activities, and there's no heavy
 
 Silo doesn't use an external visibility service. Instead, jobs can be searched for via some very simple predicates using Silo's built-in operator-facing SQL query capabilities.
 
-Silo is built to be much cheaper to run -- data is stored in object storage via [`slatedb`] rather than another datastore, there's no independent microservices that increase RPC overhead, and key functionality like rate limiting is built right in to minimize extra roundtrips to workers.
+Silo is built to be much cheaper to run -- data is stored in object storage via [slatedb](https://slatedb.io) rather than another datastore, there's no independent microservices that increase RPC overhead, and key functionality like rate limiting is built right in to minimize extra roundtrips to workers.
 
 Silo isn't in production at Uber etc.
 
 Silo is built to be autoscaled, with frequent cluster membership changes being just fine, and compute/storage separation baked in deeply.
 
-## RPCs
+## RPC reference
 
 ### `enqueue`
 

@@ -1,7 +1,6 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use silo::coordination::Coordination;
-use silo::shard_guard::{ShardGuard, ShardPhase};
+use silo::coordination::etcd::{EtcdConnection, EtcdShardGuard, ShardPhase};
 
 fn unique_prefix() -> String {
     let nanos = SystemTime::now()
@@ -12,11 +11,11 @@ fn unique_prefix() -> String {
 }
 
 async fn make_guard(
-    coord: &Coordination,
+    coord: &EtcdConnection,
     cluster_prefix: &str,
     shard_id: u32,
 ) -> (
-    std::sync::Arc<ShardGuard>,
+    std::sync::Arc<EtcdShardGuard>,
     std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<u32>>>,
     tokio::sync::watch::Sender<bool>,
     tokio::task::JoinHandle<()>,
@@ -25,7 +24,7 @@ async fn make_guard(
     let liveness_lease_id = client.lease_grant(5, None).await.unwrap().id();
     let owned = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
     let (tx, rx) = tokio::sync::watch::channel(false);
-    let guard = ShardGuard::new(
+    let guard = EtcdShardGuard::new(
         shard_id,
         client.clone(),
         cluster_prefix.to_string(),
@@ -60,7 +59,7 @@ async fn shard_guard_acquire_and_release() {
     // Requires etcd to be running locally (e.g., `just etcd`).
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
-    let coord = Coordination::connect(&cfg.coordination)
+    let coord = EtcdConnection::connect(&cfg.coordination)
         .await
         .expect("connect etcd");
 
@@ -95,10 +94,10 @@ async fn shard_guard_acquire_and_release() {
 async fn shard_guard_contention_and_handoff() {
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
-    let coord1 = Coordination::connect(&cfg.coordination)
+    let coord1 = EtcdConnection::connect(&cfg.coordination)
         .await
         .expect("connect etcd #1");
-    let coord2 = Coordination::connect(&cfg.coordination)
+    let coord2 = EtcdConnection::connect(&cfg.coordination)
         .await
         .expect("connect etcd #2");
 
@@ -164,7 +163,7 @@ async fn shard_guard_contention_and_handoff() {
 async fn shard_guard_idempotent_set_desired_true() {
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
-    let coord = Coordination::connect(&cfg.coordination)
+    let coord = EtcdConnection::connect(&cfg.coordination)
         .await
         .expect("connect etcd");
 
@@ -208,7 +207,7 @@ async fn shard_guard_idempotent_set_desired_true() {
 async fn shard_guard_quick_flip_reacquires() {
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
-    let coord = Coordination::connect(&cfg.coordination)
+    let coord = EtcdConnection::connect(&cfg.coordination)
         .await
         .expect("connect etcd");
 
@@ -248,10 +247,10 @@ async fn shard_guard_quick_flip_reacquires() {
 async fn shard_guard_acquire_aborts_when_desired_changes() {
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
-    let coord = Coordination::connect(&cfg.coordination)
+    let coord = EtcdConnection::connect(&cfg.coordination)
         .await
         .expect("connect etcd");
-    let coord2 = Coordination::connect(&cfg.coordination)
+    let coord2 = EtcdConnection::connect(&cfg.coordination)
         .await
         .expect("connect etcd #2");
 
@@ -295,10 +294,10 @@ async fn shard_guard_acquire_aborts_when_desired_changes() {
 async fn shard_guard_acquire_abort_sets_idle() {
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
-    let coord1 = Coordination::connect(&cfg.coordination)
+    let coord1 = EtcdConnection::connect(&cfg.coordination)
         .await
         .expect("connect etcd #1");
-    let coord2 = Coordination::connect(&cfg.coordination)
+    let coord2 = EtcdConnection::connect(&cfg.coordination)
         .await
         .expect("connect etcd #2");
 
@@ -339,7 +338,7 @@ async fn shard_guard_acquire_abort_sets_idle() {
 async fn shard_guard_release_cancelled_on_desired_true() {
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
-    let coord = Coordination::connect(&cfg.coordination)
+    let coord = EtcdConnection::connect(&cfg.coordination)
         .await
         .expect("connect etcd");
 
@@ -385,7 +384,7 @@ async fn shard_guard_release_cancelled_on_desired_true() {
 async fn shard_guard_shutdown_in_idle() {
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
-    let coord = Coordination::connect(&cfg.coordination)
+    let coord = EtcdConnection::connect(&cfg.coordination)
         .await
         .expect("connect etcd");
 
@@ -411,10 +410,10 @@ async fn shard_guard_shutdown_in_idle() {
 async fn shard_guard_shutdown_while_acquiring() {
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
-    let coord1 = Coordination::connect(&cfg.coordination)
+    let coord1 = EtcdConnection::connect(&cfg.coordination)
         .await
         .expect("connect etcd #1");
-    let coord2 = Coordination::connect(&cfg.coordination)
+    let coord2 = EtcdConnection::connect(&cfg.coordination)
         .await
         .expect("connect etcd #2");
 
@@ -462,7 +461,7 @@ async fn shard_guard_shutdown_while_acquiring() {
 async fn shard_guard_shutdown_while_held() {
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
-    let coord = Coordination::connect(&cfg.coordination)
+    let coord = EtcdConnection::connect(&cfg.coordination)
         .await
         .expect("connect etcd");
 
@@ -492,7 +491,7 @@ async fn shard_guard_shutdown_while_held() {
 async fn shard_guard_shutdown_while_releasing() {
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
-    let coord = Coordination::connect(&cfg.coordination)
+    let coord = EtcdConnection::connect(&cfg.coordination)
         .await
         .expect("connect etcd");
 

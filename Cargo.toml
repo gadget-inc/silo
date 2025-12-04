@@ -30,6 +30,13 @@ tracing-perfetto = "0.1"
 silo-macros = { path = "silo-macros" }
 tokio-stream = "0.1"
 etcd-client = { version = "0.13", default-features = false, features = ["tls"] }
+kube = { version = "0.98", features = [
+    "runtime",
+    "client",
+    "derive",
+], optional = true }
+k8s-openapi = { version = "0.24", features = ["v1_31"], optional = true }
+chrono = { version = "0.4", optional = true }
 tracing-opentelemetry = "0.27"
 opentelemetry = { version = "0.26" }
 opentelemetry_sdk = { version = "0.26", features = ["rt-tokio"] }
@@ -50,6 +57,10 @@ axum = "0.7"
 askama = "0.12"
 askama_axum = "0.4"
 tower-http = { version = "0.5", features = ["fs"] }
+
+[features]
+default = []
+k8s = ["kube", "k8s-openapi", "chrono"]
 
 [dev-dependencies]
 turmoil = { git = "https://github.com/tokio-rs/turmoil", rev = "dd7c0b1515537e639e045fe1034b6287dc026440" }

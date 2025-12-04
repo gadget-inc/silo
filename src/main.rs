@@ -4,11 +4,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info};
 
-use silo::coordination::Coordination;
+use silo::coordination::{create_coordinator, Coordinator};
 use silo::factory::ShardFactory;
 use silo::gubernator::{GubernatorClient, NullGubernatorClient, RateLimitClient};
 use silo::server::run_grpc_with_reaper;
-use silo::settings;
+use silo::settings::{self, CoordinationBackend};
 use silo::webui::run_webui;
 use tokio::net::TcpListener;
 
@@ -35,9 +35,44 @@ async fn main() -> anyhow::Result<()> {
     // Load configuration
     let cfg = settings::AppConfig::load(args.config.as_deref())?;
 
-    // Initialize coordination client (etcd). Fail fast if it cannot connect.
-    let _coord = Coordination::connect(&cfg.coordination).await?;
-    tracing::info!(endpoints = ?cfg.coordination.etcd_endpoints, "connected to etcd");
+    // Initialize coordination based on configured backend
+    let node_id = uuid::Uuid::new_v4().to_string();
+    let coord_result = create_coordinator(
+        &cfg.coordination,
+        &node_id,
+        &cfg.server.grpc_addr,
+        1, // num_shards - single shard for now
+    )
+    .await;
+
+    let (coordinator, _coord_handle): (
+        Option<Arc<dyn Coordinator>>,
+        Option<tokio::task::JoinHandle<()>>,
+    ) = match coord_result {
+        Ok((coord, handle)) => {
+            match cfg.coordination.backend {
+                CoordinationBackend::None => {
+                    tracing::info!("coordination: none (single-node mode)");
+                }
+                CoordinationBackend::Etcd => {
+                    tracing::info!(endpoints = ?cfg.coordination.etcd_endpoints, "coordination: connected to etcd");
+                }
+                CoordinationBackend::K8s => {
+                    tracing::info!(namespace = ?cfg.coordination.k8s_namespace, "coordination: connected to kubernetes");
+                }
+            }
+            (Some(coord), handle)
+        }
+        Err(e) => {
+            // In single-node mode, coordination errors are warnings not failures
+            if cfg.coordination.backend == CoordinationBackend::None {
+                tracing::warn!(error = %e, "coordination: failed but continuing in single-node mode");
+                (None, None)
+            } else {
+                return Err(anyhow::anyhow!("coordination: {}", e));
+            }
+        }
+    };
 
     // Create rate limiter based on configuration
     let rate_limiter: Arc<dyn RateLimitClient> = if let Some(guber_cfg) = cfg.gubernator.to_config()
@@ -77,10 +112,17 @@ async fn main() -> anyhow::Result<()> {
         let webui_shutdown = shutdown_tx.subscribe();
         let webui_factory = factory.clone();
         let webui_cfg = cfg.clone();
+        let webui_coordinator = coordinator.clone();
         info!(grpc = %addr, webui = %webui_addr, "server started");
         Some(tokio::spawn(async move {
-            if let Err(e) =
-                run_webui(webui_addr, webui_factory, None, webui_cfg, webui_shutdown).await
+            if let Err(e) = run_webui(
+                webui_addr,
+                webui_factory,
+                webui_coordinator,
+                webui_cfg,
+                webui_shutdown,
+            )
+            .await
             {
                 error!(error = %e, "WebUI server error");
             }

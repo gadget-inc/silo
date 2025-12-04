@@ -60,6 +60,7 @@
           devScript
           nodejs_24 # For validation scripts
           pnpm # Package manager for TypeScript client
+          kubectl # for interacting with local K8S API server
         ];
 
         # Set the project root for the dev script
