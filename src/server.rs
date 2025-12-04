@@ -5,6 +5,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
+use tonic_health::server::health_reporter;
 use tracing::info;
 
 use crate::factory::{CloseAllError, ShardFactory};
@@ -477,6 +478,12 @@ pub async fn run_grpc_with_reaper(
     let svc = SiloService::new(factory.clone(), cfg);
     let server = SiloServer::new(svc);
 
+    // Create health service for gRPC health probes
+    let (mut health_reporter, health_service) = health_reporter();
+    health_reporter
+        .set_serving::<SiloServer<SiloService>>()
+        .await;
+
     // Periodic reaper that iterates all shards every second
     let (tick_tx, mut tick_rx) = broadcast::channel::<()>(1);
     let reaper_factory = factory.clone();
@@ -501,6 +508,7 @@ pub async fn run_grpc_with_reaper(
 
     // Serve with graceful shutdown
     let serve = tonic::transport::Server::builder()
+        .add_service(health_service)
         .add_service(server)
         .serve_with_incoming_shutdown(incoming, async move {
             let _ = shutdown.recv().await;
@@ -544,6 +552,12 @@ where
     let svc = SiloService::new(factory.clone(), cfg);
     let server = SiloServer::new(svc);
 
+    // Create health service for gRPC health probes
+    let (mut health_reporter, health_service) = health_reporter();
+    health_reporter
+        .set_serving::<SiloServer<SiloService>>()
+        .await;
+
     // Periodic reaper that iterates all shards every second
     let (tick_tx, mut tick_rx) = broadcast::channel::<()>(1);
     let reaper_factory = factory.clone();
@@ -563,6 +577,7 @@ where
     });
 
     let serve = tonic::transport::Server::builder()
+        .add_service(health_service)
         .add_service(server)
         .serve_with_incoming_shutdown(incoming, async move {
             let _ = shutdown.recv().await;

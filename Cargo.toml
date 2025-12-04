@@ -22,6 +22,7 @@ bytecheck = "0.6"
 bytes = "1"
 crossbeam-skiplist = "0.1"
 tonic = { version = "0.12", features = ["transport"] }
+tonic-health = "0.12"
 prost = "0.13"
 prost-types = "0.13"
 tracing = "0.1"
