@@ -238,7 +238,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
         // 3) Value too long (>= u16::MAX)
         {
             let mut md = std::collections::HashMap::new();
-            let long_val = vec![b'a'; (u16::MAX as usize)];
+            let long_val = vec![b'a'; u16::MAX as usize];
             md.insert(
                 "k".to_string(),
                 String::from_utf8(long_val).unwrap_or_default(),

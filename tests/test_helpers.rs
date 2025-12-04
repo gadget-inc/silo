@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use silo::gubernator::{MockGubernatorClient, RateLimitClient};
 use silo::job_store_shard::JobStoreShard;
 use silo::settings::{Backend, DatabaseConfig};
