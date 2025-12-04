@@ -1,38 +1,56 @@
 { inputs, ... }:
 {
-  imports = [
-    inputs.rust-flake.flakeModules.default
-    inputs.rust-flake.flakeModules.nixpkgs
-  ];
-  perSystem = { config, self', pkgs, lib, ... }:
+  perSystem = { config, self', pkgs, lib, system, ... }:
     let
-      # Get crane lib for the filter function
-      craneLib = config.rust-project.crane.lib;
+      # Set up rust overlay for the toolchain from rust-toolchain.toml
+      rustPkgs = import inputs.nixpkgs {
+        inherit system;
+        overlays = [ inputs.rust-overlay.overlays.default ];
+      };
       
-      # Custom source filter that includes proto files alongside Rust sources
-      protoFilter = path: _type:
-        (builtins.match ".*\\.proto$" path != null) ||  # .proto files
-        (builtins.match ".*/proto$" path != null) ||    # proto directory
-        (builtins.match ".*/proto/.*" path != null);    # files inside proto/
+      # Get rust toolchain from rust-toolchain.toml
+      rustToolchain = rustPkgs.rust-bin.fromRustupToolchainFile ../../rust-toolchain.toml;
+      
+      # Create crane lib with our toolchain
+      craneLib = (inputs.crane.mkLib pkgs).overrideToolchain rustToolchain;
+      
+      # Source filter that includes proto files and templates alongside Rust sources
+      extraFilter = path: _type:
+        # Proto files
+        (lib.hasSuffix ".proto" path) ||
+        (builtins.match ".*/proto$" path != null) ||
+        (builtins.match ".*/proto/.*" path != null) ||
+        # Askama templates
+        (lib.hasSuffix ".html" path) ||
+        (builtins.match ".*/templates$" path != null) ||
+        (builtins.match ".*/templates/.*" path != null);
       sourceFilter = path: type:
-        (protoFilter path type) || (craneLib.filterCargoSources path type);
+        (extraFilter path type) || (craneLib.filterCargoSources path type);
       
-      # Source with proto files included
-      srcWithProto = lib.cleanSourceWith {
-        src = craneLib.cleanCargoSource inputs.self;
+      src = lib.cleanSourceWith {
+        src = inputs.self;
         filter = sourceFilter;
       };
+      
+      # Common args for crane builds
+      commonArgs = {
+        inherit src;
+        strictDeps = true;
+        nativeBuildInputs = [ pkgs.protobuf ];
+        cargoExtraArgs = "--features k8s";
+      };
+      
+      # Build dependencies separately for caching
+      cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+      
+      # Main package
+      silo = craneLib.buildPackage (commonArgs // {
+        inherit cargoArtifacts;
+        doCheck = false; # Tests require external services, CI runs them separately
+      });
     in
     {
-      packages.default = self'.packages.silo;
-
-      # Production build with k8s feature enabled
-      rust-project.crates.silo.crane.args = {
-        cargoExtraArgs = "--features k8s";
-        # protoc is needed for etcd-client and tonic-build
-        nativeBuildInputs = [ pkgs.protobuf ];
-        # Include proto files in the source
-        src = srcWithProto;
-      };
+      packages.default = silo;
+      packages.silo = silo;
     };
 }
