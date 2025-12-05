@@ -14,7 +14,28 @@ pub struct AppConfig {
     pub gubernator: GubernatorSettings,
     #[serde(default)]
     pub webui: WebUiConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
     pub database: DatabaseTemplate,
+}
+
+/// Logging configuration
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct LoggingConfig {
+    /// Log output format: "text" (default) or "json"
+    #[serde(default)]
+    pub format: LogFormat,
+}
+
+/// Log output format
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    /// Human-readable text format (default)
+    #[default]
+    Text,
+    /// Structured JSON format
+    Json,
 }
 
 /// Settings for Gubernator rate limiting service
@@ -228,6 +249,7 @@ impl AppConfig {
             tenancy: TenancyConfig { enabled: false },
             gubernator: GubernatorSettings::default(),
             webui: WebUiConfig::default(),
+            logging: LoggingConfig::default(),
             database: DatabaseTemplate {
                 backend: Backend::Fs,
                 path: "/tmp/silo-%shard%".to_string(),

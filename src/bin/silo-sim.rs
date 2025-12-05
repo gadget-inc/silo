@@ -12,7 +12,7 @@ use silo::gubernator::MockGubernatorClient;
 use silo::job::{ConcurrencyLimit, Limit};
 use silo::job_attempt::AttemptOutcome;
 use silo::job_store_shard::JobStoreShard;
-use silo::settings::{AppConfig, Backend, DatabaseConfig, DatabaseTemplate};
+use silo::settings::{AppConfig, Backend, DatabaseConfig, DatabaseTemplate, LogFormat};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -66,7 +66,7 @@ async fn now_ms() -> i64 {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
-    silo::trace::init_from_env()?;
+    silo::trace::init(LogFormat::Text)?;
     let args = Args::parse();
 
     let prefix = unique_prefix();

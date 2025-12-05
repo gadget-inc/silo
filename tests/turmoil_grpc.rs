@@ -10,7 +10,7 @@ use silo::gubernator::MockGubernatorClient;
 use silo::pb::silo_client::SiloClient;
 use silo::pb::*;
 use silo::server::run_grpc_with_reaper_incoming;
-use silo::settings::{AppConfig, Backend, GubernatorSettings, WebUiConfig};
+use silo::settings::{AppConfig, Backend, GubernatorSettings, LoggingConfig, WebUiConfig};
 use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tonic::transport::Endpoint;
@@ -52,6 +52,7 @@ fn grpc_end_to_end_under_turmoil() {
             tenancy: silo::settings::TenancyConfig { enabled: false },
             gubernator: GubernatorSettings::default(),
             webui: WebUiConfig::default(),
+            logging: LoggingConfig::default(),
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
@@ -211,6 +212,7 @@ fn grpc_fault_injection_with_partition() {
             tenancy: silo::settings::TenancyConfig { enabled: false },
             gubernator: GubernatorSettings::default(),
             webui: WebUiConfig::default(),
+            logging: LoggingConfig::default(),
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
@@ -411,6 +413,7 @@ fn stress_multiple_workers_with_partitions() {
             tenancy: silo::settings::TenancyConfig { enabled: false },
             gubernator: GubernatorSettings::default(),
             webui: WebUiConfig::default(),
+            logging: LoggingConfig::default(),
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
@@ -690,6 +693,7 @@ fn stress_duplicate_completion_idempotency() {
             tenancy: silo::settings::TenancyConfig { enabled: false },
             gubernator: GubernatorSettings::default(),
             webui: WebUiConfig::default(),
+            logging: LoggingConfig::default(),
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
@@ -879,6 +883,7 @@ fn stress_lease_expiry_during_partition() {
             tenancy: silo::settings::TenancyConfig { enabled: false },
             gubernator: GubernatorSettings::default(),
             webui: WebUiConfig::default(),
+            logging: LoggingConfig::default(),
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
@@ -1086,6 +1091,7 @@ fn stress_high_message_loss() {
             tenancy: silo::settings::TenancyConfig { enabled: false },
             gubernator: GubernatorSettings::default(),
             webui: WebUiConfig::default(),
+            logging: LoggingConfig::default(),
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
@@ -1302,6 +1308,7 @@ fn concurrency_request_ready_without_release_fails() {
             tenancy: silo::settings::TenancyConfig { enabled: false },
             gubernator: GubernatorSettings::default(),
             webui: WebUiConfig::default(),
+            logging: LoggingConfig::default(),
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
