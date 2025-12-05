@@ -55,7 +55,7 @@ struct Args {
     report_interval_secs: u64,
 
     /// Tenant ID for multi-tenant mode (required if server has tenancy enabled)
-    #[arg(long, default_value = "default")]
+    #[arg(long, default_value = "-")]
     tenant: String,
 }
 

@@ -578,3 +578,187 @@ async fn cluster_two_nodes_queues_table() {
     h1.abort();
     h2.abort();
 }
+
+/// Test that projection works correctly when querying remote shards.
+/// This ensures that when we SELECT specific columns, the projection is
+/// properly applied to results from both local and remote shards.
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cluster_two_nodes_projection_remote_shards() {
+    use datafusion::arrow::array::UInt32Array;
+
+    let prefix = unique_prefix();
+    let cfg = silo::settings::AppConfig::load(None).expect("load config");
+
+    let factory1 = make_test_factory("proj-n1");
+    let factory2 = make_test_factory("proj-n2");
+
+    // Start nodes
+    let (coordinator1, h1) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n1",
+        "127.0.0.1:50211",
+        NUM_SHARDS,
+        10,
+        factory1.clone(),
+    )
+    .await
+    .expect("start coordinator 1");
+    let coordinator1 = Arc::new(coordinator1);
+
+    let (coordinator2, h2) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n2",
+        "127.0.0.1:50212",
+        NUM_SHARDS,
+        10,
+        factory2.clone(),
+    )
+    .await
+    .expect("start coordinator 2");
+    let coordinator2 = Arc::new(coordinator2);
+
+    assert!(coordinator1.wait_converged(Duration::from_secs(30)).await);
+
+    // Start gRPC servers
+    let listener1 = TcpListener::bind("127.0.0.1:50211").await.unwrap();
+    let listener2 = TcpListener::bind("127.0.0.1:50212").await.unwrap();
+
+    let (shutdown_tx1, shutdown_rx1) = tokio::sync::broadcast::channel(1);
+    let (shutdown_tx2, shutdown_rx2) = tokio::sync::broadcast::channel(1);
+
+    let server1 = tokio::spawn(run_grpc_with_reaper(
+        listener1,
+        factory1.clone(),
+        Some(coordinator1.clone()),
+        cfg.clone(),
+        shutdown_rx1,
+    ));
+
+    let server2 = tokio::spawn(run_grpc_with_reaper(
+        listener2,
+        factory2.clone(),
+        Some(coordinator2.clone()),
+        cfg.clone(),
+        shutdown_rx2,
+    ));
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Set up cluster clients with shard routing
+    let mut clients =
+        ClusterClients::new("127.0.0.1:50211", "127.0.0.1:50212", &coordinator1).await;
+
+    // Enqueue jobs to different shards, ensuring some go to each node
+    for i in 0..10u32 {
+        let shard = i % NUM_SHARDS;
+        let client = clients.client_for_shard(shard);
+        enqueue_job(client, shard, &format!("proj-job-{:03}", i), None).await;
+    }
+
+    // Create cluster query engine on node 1
+    let query_engine =
+        ClusterQueryEngine::new(factory1.clone(), Some(coordinator1.clone()), NUM_SHARDS)
+            .await
+            .expect("failed to create query engine");
+
+    // Test projection with specific columns (not SELECT *)
+    // This is the pattern used by the webui and catches schema mismatches
+    // between local and remote shards
+    let df = query_engine
+        .sql("SELECT shard_id, id, status_kind, enqueue_time_ms FROM jobs ORDER BY id")
+        .await
+        .expect("projection query failed");
+    let batches = df.collect().await.expect("collect failed");
+
+    // Verify we got results
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 10, "should have 10 jobs from projection query");
+
+    // Verify the schema has exactly the columns we requested
+    for batch in &batches {
+        let schema = batch.schema();
+        assert_eq!(schema.fields().len(), 4, "should have exactly 4 columns");
+        assert_eq!(schema.field(0).name(), "shard_id");
+        assert_eq!(schema.field(1).name(), "id");
+        assert_eq!(schema.field(2).name(), "status_kind");
+        assert_eq!(schema.field(3).name(), "enqueue_time_ms");
+
+        // Verify column types are correct (this catches the bug where
+        // projection indices were applied to wrong columns)
+        let shard_col = batch
+            .column_by_name("shard_id")
+            .expect("shard_id column missing")
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .expect("shard_id should be UInt32");
+        let id_col = batch
+            .column_by_name("id")
+            .expect("id column missing")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("id should be String");
+        let status_col = batch
+            .column_by_name("status_kind")
+            .expect("status_kind column missing")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("status_kind should be String");
+        let time_col = batch
+            .column_by_name("enqueue_time_ms")
+            .expect("enqueue_time_ms column missing")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("enqueue_time_ms should be Int64");
+
+        // Verify actual data values make sense
+        for i in 0..batch.num_rows() {
+            assert!(
+                shard_col.value(i) < NUM_SHARDS,
+                "shard_id should be < NUM_SHARDS"
+            );
+            assert!(
+                id_col.value(i).starts_with("proj-job-"),
+                "id should start with proj-job-"
+            );
+            assert_eq!(
+                status_col.value(i),
+                "Scheduled",
+                "status should be Scheduled"
+            );
+            // Just verify enqueue_time_ms is accessible (timestamp value depends on test env)
+            let _ = time_col.value(i);
+        }
+    }
+
+    // Also test a projection without shard_id to ensure non-first-column projections work
+    let df = query_engine
+        .sql("SELECT id, priority FROM jobs ORDER BY id LIMIT 5")
+        .await
+        .expect("second projection query failed");
+    let batches = df.collect().await.expect("collect failed");
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 5,
+        "should have 5 jobs from limited projection query"
+    );
+
+    for batch in &batches {
+        let schema = batch.schema();
+        assert_eq!(schema.fields().len(), 2, "should have exactly 2 columns");
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(1).name(), "priority");
+    }
+
+    // Cleanup
+    let _ = shutdown_tx1.send(());
+    let _ = shutdown_tx2.send(());
+    coordinator1.shutdown().await.ok();
+    coordinator2.shutdown().await.ok();
+    server1.abort();
+    server2.abort();
+    h1.abort();
+    h2.abort();
+}

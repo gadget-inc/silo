@@ -558,8 +558,6 @@ impl Silo for SiloService {
     async fn query(&self, req: Request<QueryRequest>) -> Result<Response<QueryResponse>, Status> {
         let r = req.into_inner();
         let shard = self.shard_with_redirect(r.shard).await?;
-        // Note: tenant is intentionally not validated or used here.
-        // This endpoint is for admin/operator queries that can span all tenants.
 
         // Get the cached query engine for this shard
         let query_engine = shard.query_engine();
@@ -637,8 +635,6 @@ impl Silo for SiloService {
     ) -> Result<Response<Self::QueryArrowStream>, Status> {
         let r = req.into_inner();
         let shard = self.shard_with_redirect(r.shard).await?;
-        // Note: tenant is intentionally not validated or used here.
-        // This endpoint is for admin/operator queries that span all tenants.
 
         // Get the cached query engine for this shard
         let query_engine = shard.query_engine();

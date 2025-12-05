@@ -39,7 +39,7 @@
                         {% for queue in queues %}
                         <tr class="border-b border-zinc-700 hover:bg-zinc-750">
                             <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">
-                                <a href="/queue?shard={{ queue.shard }}&name={{ queue.name }}" class="text-emerald-400 hover:underline">{{ queue.name }}</a>
+                                <a href="/queue?name={{ queue.name }}" class="text-emerald-400 hover:underline">{{ queue.name }}</a>
                             </td>
                             <td class="px-3 py-2 text-sm text-zinc-400 whitespace-nowrap">{{ queue.shard }}</td>
                             <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">{{ queue.holders }}</td>

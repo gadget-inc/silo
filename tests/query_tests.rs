@@ -675,8 +675,8 @@ async fn sql_select_all_columns() {
         .expect("collect");
 
     assert!(!batches.is_empty());
-    // Should have all 8 columns: tenant, id, priority, enqueue_time_ms, payload, status_kind, status_changed_at_ms, metadata
-    assert_eq!(batches[0].num_columns(), 8);
+    // Should have all 9 columns: shard_id, tenant, id, priority, enqueue_time_ms, payload, status_kind, status_changed_at_ms, metadata
+    assert_eq!(batches[0].num_columns(), 9);
     assert_eq!(batches[0].num_rows(), 1);
 }
 

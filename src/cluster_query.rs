@@ -12,8 +12,8 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, RecordBatch, UInt32Array};
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session as CatalogSession;
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DfResult};
@@ -42,30 +42,6 @@ use crate::job_store_shard::JobStoreShard;
 use crate::pb::silo_client::SiloClient;
 use crate::pb::QueryArrowRequest;
 use crate::query::{explain_dataframe, JobsScanner, QueuesScanner, ScannerRef};
-
-/// Extend a base schema with a shard_id column at the beginning
-fn schema_with_shard_id(base_schema: &SchemaRef) -> SchemaRef {
-    let mut fields: Vec<Arc<Field>> =
-        vec![Arc::new(Field::new("shard_id", DataType::UInt32, false))];
-    fields.extend(base_schema.fields().iter().cloned());
-    Arc::new(Schema::new(fields))
-}
-
-/// Add a shard_id column to a record batch
-fn add_shard_id_to_batch(
-    batch: &RecordBatch,
-    shard_id: u32,
-    output_schema: &SchemaRef,
-) -> DfResult<RecordBatch> {
-    let num_rows = batch.num_rows();
-    let shard_id_array = Arc::new(UInt32Array::from(vec![shard_id; num_rows]));
-
-    let mut columns: Vec<Arc<dyn Array>> = vec![shard_id_array];
-    columns.extend(batch.columns().iter().cloned());
-
-    RecordBatch::try_new(output_schema.clone(), columns)
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-}
 
 /// Cluster-wide SQL query engine using DataFusion.
 ///
@@ -103,12 +79,10 @@ impl ClusterQueryEngine {
     ) -> DfResult<Self> {
         let ctx = SessionContext::new();
 
-        // Register cluster-wide jobs table with shard_id column
-        let jobs_base_schema = JobsScanner::base_schema();
-        let jobs_schema = schema_with_shard_id(&jobs_base_schema);
+        // Register cluster-wide jobs table (shard_id is included in the scanner's schema)
+        let jobs_schema = JobsScanner::base_schema();
         let jobs_provider = Arc::new(ClusterTableProvider::new(
             jobs_schema,
-            jobs_base_schema,
             factory.clone(),
             coordinator.clone(),
             num_shards,
@@ -116,12 +90,10 @@ impl ClusterQueryEngine {
         ));
         ctx.register_table("jobs", jobs_provider)?;
 
-        // Register cluster-wide queues table with shard_id column
-        let queues_base_schema = QueuesScanner::base_schema();
-        let queues_schema = schema_with_shard_id(&queues_base_schema);
+        // Register cluster-wide queues table (shard_id is included in the scanner's schema)
+        let queues_schema = QueuesScanner::base_schema();
         let queues_provider = Arc::new(ClusterTableProvider::new(
             queues_schema,
-            queues_base_schema,
             factory,
             coordinator,
             num_shards,
@@ -205,10 +177,7 @@ enum TableKind {
 /// Shard configurations are computed dynamically at scan time to ensure
 /// queries always use the current cluster state.
 struct ClusterTableProvider {
-    /// Schema including shard_id column
     schema: SchemaRef,
-    /// Base schema without shard_id (used for underlying scanners)
-    base_schema: SchemaRef,
     /// Factory for accessing local shards
     factory: Arc<ShardFactory>,
     /// Optional coordinator for discovering remote shards
@@ -241,7 +210,6 @@ impl std::fmt::Debug for ShardConfig {
 impl ClusterTableProvider {
     fn new(
         schema: SchemaRef,
-        base_schema: SchemaRef,
         factory: Arc<ShardFactory>,
         coordinator: Option<Arc<dyn Coordinator>>,
         num_shards: u32,
@@ -249,7 +217,6 @@ impl ClusterTableProvider {
     ) -> Self {
         Self {
             schema,
-            base_schema,
             factory,
             coordinator,
             num_shards,
@@ -287,34 +254,20 @@ impl TableProvider for ClusterTableProvider {
         )
         .await;
 
-        // Handle projection: we need to track if shard_id is requested and which
-        // base columns are requested
-        let (output_schema, include_shard_id, base_projection) = match projection {
-            Some(p) => {
-                let output_schema = SchemaRef::new(self.schema.project(p)?);
-                // Check if shard_id (column 0) is in the projection
-                let include_shard_id = p.contains(&0);
-                // Convert projection indices: subtract 1 for columns after shard_id
-                let base_proj: Vec<usize> = p.iter().filter(|&&i| i > 0).map(|&i| i - 1).collect();
-                let base_projection = if base_proj.is_empty() {
-                    None
-                } else {
-                    Some(base_proj)
-                };
-                (output_schema, include_shard_id, base_projection)
-            }
-            None => (Arc::clone(&self.schema), true, None),
+        // Handle projection
+        let (output_schema, projection_indices) = match projection {
+            Some(p) => (SchemaRef::new(self.schema.project(p)?), Some(p.clone())),
+            None => (Arc::clone(&self.schema), None),
         };
 
         Ok(Arc::new(ClusterExecutionPlan::new(
             output_schema,
-            Arc::clone(&self.base_schema),
+            Arc::clone(&self.schema),
             shard_configs,
             self.table_kind,
             filters.to_vec(),
             limit,
-            include_shard_id,
-            base_projection,
+            projection_indices,
         )))
     }
 
@@ -332,34 +285,31 @@ impl TableProvider for ClusterTableProvider {
 /// aggregate results across all partitions.
 #[derive(Debug)]
 struct ClusterExecutionPlan {
-    /// Output schema (may include shard_id)
-    output_schema: SchemaRef,
-    /// Base schema without shard_id (for underlying scanners)
-    base_schema: SchemaRef,
+    /// Output schema (projected if applicable)
+    schema: SchemaRef,
+    /// Full schema (for remote queries that return all columns)
+    full_schema: SchemaRef,
     shard_configs: Vec<ShardConfig>,
     table_kind: TableKind,
     filters: Vec<Expr>,
     limit: Option<usize>,
-    /// Whether to include shard_id in output
-    include_shard_id: bool,
-    /// Projection for base schema columns (None = all columns)
-    base_projection: Option<Vec<usize>>,
+    /// Projection indices to apply to remote results (None = no projection)
+    projection: Option<Vec<usize>>,
     plan_properties: PlanProperties,
 }
 
 impl ClusterExecutionPlan {
     fn new(
-        output_schema: SchemaRef,
-        base_schema: SchemaRef,
+        schema: SchemaRef,
+        full_schema: SchemaRef,
         shard_configs: Vec<ShardConfig>,
         table_kind: TableKind,
         filters: Vec<Expr>,
         limit: Option<usize>,
-        include_shard_id: bool,
-        base_projection: Option<Vec<usize>>,
+        projection: Option<Vec<usize>>,
     ) -> Self {
         let num_partitions = shard_configs.len().max(1);
-        let eq = EquivalenceProperties::new(output_schema.clone());
+        let eq = EquivalenceProperties::new(schema.clone());
         let props = PlanProperties::new(
             eq,
             Partitioning::UnknownPartitioning(num_partitions),
@@ -369,14 +319,13 @@ impl ClusterExecutionPlan {
         .with_scheduling_type(SchedulingType::Cooperative);
 
         Self {
-            output_schema,
-            base_schema,
+            schema,
+            full_schema,
             shard_configs,
             table_kind,
             filters,
             limit,
-            include_shard_id,
-            base_projection,
+            projection,
             plan_properties: props,
         }
     }
@@ -392,7 +341,7 @@ impl ExecutionPlan for ClusterExecutionPlan {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.output_schema.clone()
+        self.schema.clone()
     }
 
     fn properties(&self) -> &PlanProperties {
@@ -422,7 +371,7 @@ impl ExecutionPlan for ClusterExecutionPlan {
     ) -> DfResult<SendableRecordBatchStream> {
         if partition >= self.shard_configs.len() {
             // Return empty stream for invalid partition
-            let schema = self.output_schema.clone();
+            let schema = self.schema.clone();
             let (tx, rx) = mpsc::channel::<DfResult<RecordBatch>>(1);
             drop(tx); // Close immediately to signal empty
             return Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -432,21 +381,12 @@ impl ExecutionPlan for ClusterExecutionPlan {
         }
 
         let shard_config = self.shard_configs[partition].clone();
-        let output_schema = self.output_schema.clone();
-        let output_schema_for_stream = output_schema.clone();
-        let base_schema = self.base_schema.clone();
+        let schema = self.schema.clone();
         let table_kind = self.table_kind;
         let filters = self.filters.clone();
         let limit = self.limit;
-        let include_shard_id = self.include_shard_id;
-        let base_projection = self.base_projection.clone();
+        let projection = self.projection.clone();
         let batch_size = context.session_config().batch_size();
-
-        // Get the shard_id for this partition
-        let shard_id: u32 = match &shard_config {
-            ShardConfig::Local(shard) => shard.name().parse().unwrap_or(partition as u32),
-            ShardConfig::Remote { shard_id, .. } => *shard_id,
-        };
 
         let (tx, rx) = mpsc::channel::<DfResult<RecordBatch>>(4);
 
@@ -459,60 +399,32 @@ impl ExecutionPlan for ClusterExecutionPlan {
                         TableKind::Queues => Arc::new(QueuesScanner::new(Arc::clone(&shard))),
                     };
 
-                    // Execute the scan with base schema (scanner doesn't know about shard_id)
-                    let mut stream = scanner.scan(base_schema.clone(), &filters, batch_size, limit);
+                    // Execute the scan - scanner handles projection via schema
+                    let mut stream = scanner.scan(schema, &filters, batch_size, limit);
 
                     while let Some(result) = stream.next().await {
-                        let batch = match result {
-                            Ok(b) => b,
+                        match result {
+                            Ok(batch) => {
+                                if tx.send(Ok(batch)).await.is_err() {
+                                    break; // Receiver dropped
+                                }
+                            }
                             Err(e) => {
                                 let _ = tx.send(Err(e)).await;
                                 break;
                             }
-                        };
-
-                        // Apply base projection if needed
-                        let batch = if let Some(ref proj) = base_projection {
-                            match batch.project(proj) {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    let _ = tx
-                                        .send(Err(DataFusionError::ArrowError(Box::new(e), None)))
-                                        .await;
-                                    break;
-                                }
-                            }
-                        } else {
-                            batch
-                        };
-
-                        // Add shard_id column if requested
-                        let output_batch = if include_shard_id {
-                            match add_shard_id_to_batch(&batch, shard_id, &output_schema) {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    let _ = tx.send(Err(e)).await;
-                                    break;
-                                }
-                            }
-                        } else {
-                            batch
-                        };
-
-                        if tx.send(Ok(output_batch)).await.is_err() {
-                            break; // Receiver dropped
                         }
                     }
                 }
                 ShardConfig::Remote { shard_id, addr } => {
-                    // Query remote shard via gRPC with Arrow IPC
+                    // Query remote shard via gRPC with Arrow IPC (returns full schema)
                     match query_remote_shard_batches(shard_id, &addr, table_kind, &filters, limit)
                         .await
                     {
                         Ok(batches) => {
                             for batch in batches {
-                                // Apply base projection if needed
-                                let batch = if let Some(ref proj) = base_projection {
+                                // Apply projection if needed (remote returns all columns)
+                                let output_batch = if let Some(ref proj) = projection {
                                     match batch.project(proj) {
                                         Ok(b) => b,
                                         Err(e) => {
@@ -522,19 +434,6 @@ impl ExecutionPlan for ClusterExecutionPlan {
                                                     None,
                                                 )))
                                                 .await;
-                                            break;
-                                        }
-                                    }
-                                } else {
-                                    batch
-                                };
-
-                                // Add shard_id column if requested
-                                let output_batch = if include_shard_id {
-                                    match add_shard_id_to_batch(&batch, shard_id, &output_schema) {
-                                        Ok(b) => b,
-                                        Err(e) => {
-                                            let _ = tx.send(Err(e)).await;
                                             break;
                                         }
                                     }
@@ -556,13 +455,13 @@ impl ExecutionPlan for ClusterExecutionPlan {
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            output_schema_for_stream,
+            self.schema.clone(),
             ReceiverStream::new(rx),
         )))
     }
 
     fn statistics(&self) -> DfResult<Statistics> {
-        Ok(Statistics::new_unknown(&self.output_schema))
+        Ok(Statistics::new_unknown(&self.schema))
     }
 }
 

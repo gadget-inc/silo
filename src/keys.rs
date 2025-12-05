@@ -3,6 +3,13 @@ fn escape_tenant(tenant: &str) -> String {
     tenant.replace('%', "%25").replace('/', "%2F")
 }
 
+/// Decode an escaped tenant string back to its original form
+pub fn decode_tenant(encoded: &str) -> String {
+    // Reverse the escaping: %2F -> /, %25 -> %
+    // Order matters: decode %2F first, then %25
+    encoded.replace("%2F", "/").replace("%25", "%")
+}
+
 fn escape_segment(segment: &str) -> String {
     // Apply the same escaping used for tenants to arbitrary path segments
     segment.replace('%', "%25").replace('/', "%2F")

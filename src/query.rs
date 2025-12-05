@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, ArrayRef, Int64Array, StringArray, UInt8Array};
+use datafusion::arrow::array::{Array, ArrayRef, Int64Array, StringArray, UInt32Array, UInt8Array};
 use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session as CatalogSession;
@@ -338,6 +338,7 @@ impl JobsScanner {
     /// Get the base schema for the jobs table
     pub fn base_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
+            Field::new("shard_id", DataType::UInt32, false),
             Field::new("tenant", DataType::Utf8, false),
             Field::new("id", DataType::Utf8, false),
             Field::new("priority", DataType::UInt8, false),
@@ -374,7 +375,7 @@ impl Scan for JobsScanner {
         batch_size: usize,
         limit: Option<usize>,
     ) -> SendableRecordBatchStream {
-        let mut tenant: Option<String> = None;
+        let mut tenant_filter: Option<String> = None;
         let mut status_kind: Option<crate::job::JobStatusKind> = None;
         let mut id_filter: Option<String> = None;
         // Track optional metadata filter of the form metadata['key'] = 'value' or element_at(metadata, 'key') = 'value'
@@ -382,7 +383,7 @@ impl Scan for JobsScanner {
         for f in filters {
             if let Some((col, val)) = parse_eq_filter(f) {
                 match col.as_str() {
-                    "tenant" => tenant = Some(val),
+                    "tenant" => tenant_filter = Some(val),
                     "status_kind" => status_kind = parse_status_kind(&val),
                     "id" => id_filter = Some(val),
                     _ => {}
@@ -393,7 +394,6 @@ impl Scan for JobsScanner {
                 metadata_filter = Some((k, v));
             }
         }
-        let tenant = tenant.unwrap_or_else(|| "-".to_string());
 
         let (tx, rx) = mpsc::channel::<DfResult<RecordBatch>>(2);
         let shard = Arc::clone(&self.shard);
@@ -402,83 +402,158 @@ impl Scan for JobsScanner {
             let mut sent: usize = 0;
             let hard_limit = limit.unwrap_or(DEFAULT_SCAN_LIMIT);
 
-            let ids: Vec<String> = if let Some(idv) = id_filter.clone() {
-                vec![idv]
+            // Get list of (tenant, job_id) pairs to process
+            // When tenant_filter is None, scan ALL tenants
+            let job_pairs: Vec<(String, String)> = if let Some(idv) = id_filter.clone() {
+                // For ID filter with tenant specified, use that tenant
+                // Without tenant, scan all tenants looking for the job
+                if let Some(ref t) = tenant_filter {
+                    vec![(t.clone(), idv)]
+                } else {
+                    // Search all tenants for this job ID
+                    match shard.scan_all_jobs(hard_limit).await {
+                        Ok(all) => all.into_iter().filter(|(_, id)| id == &idv).collect(),
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(DataFusionError::Execution(e.to_string())))
+                                .await;
+                            return;
+                        }
+                    }
+                }
             } else if let Some((meta_key, meta_val)) = metadata_filter.clone() {
-                match shard
-                    .scan_jobs_by_metadata(tenant.as_str(), &meta_key, &meta_val, hard_limit)
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(DataFusionError::Execution(e.to_string())))
-                            .await;
-                        return;
+                // Metadata filter - scan specific tenant or all tenants
+                if let Some(ref t) = tenant_filter {
+                    match shard
+                        .scan_jobs_by_metadata(t.as_str(), &meta_key, &meta_val, hard_limit)
+                        .await
+                    {
+                        Ok(v) => v.into_iter().map(|id| (t.clone(), id)).collect(),
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(DataFusionError::Execution(e.to_string())))
+                                .await;
+                            return;
+                        }
+                    }
+                } else {
+                    // Scan all jobs and filter by metadata post-hoc
+                    // (Less efficient but works without tenant)
+                    match shard.scan_all_jobs(hard_limit).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(DataFusionError::Execution(e.to_string())))
+                                .await;
+                            return;
+                        }
                     }
                 }
             } else if let Some(kind) = status_kind {
-                match shard
-                    .scan_jobs_by_status(tenant.as_str(), kind, hard_limit)
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(DataFusionError::Execution(e.to_string())))
-                            .await;
-                        return;
+                // Status filter - use all-tenant scan if no tenant specified
+                if let Some(ref t) = tenant_filter {
+                    match shard
+                        .scan_jobs_by_status(t.as_str(), kind, hard_limit)
+                        .await
+                    {
+                        Ok(v) => v.into_iter().map(|id| (t.clone(), id)).collect(),
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(DataFusionError::Execution(e.to_string())))
+                                .await;
+                            return;
+                        }
+                    }
+                } else {
+                    // Scan all tenants
+                    match shard.scan_all_jobs_by_status(kind, hard_limit).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(DataFusionError::Execution(e.to_string())))
+                                .await;
+                            return;
+                        }
                     }
                 }
             } else {
-                match shard.scan_jobs(tenant.as_str(), hard_limit).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(DataFusionError::Execution(e.to_string())))
-                            .await;
-                        return;
+                // No specific filter - scan all jobs
+                if let Some(ref t) = tenant_filter {
+                    match shard.scan_jobs(t.as_str(), hard_limit).await {
+                        Ok(v) => v.into_iter().map(|id| (t.clone(), id)).collect(),
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(DataFusionError::Execution(e.to_string())))
+                                .await;
+                            return;
+                        }
+                    }
+                } else {
+                    // Scan all tenants
+                    match shard.scan_all_jobs(hard_limit).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(DataFusionError::Execution(e.to_string())))
+                                .await;
+                            return;
+                        }
                     }
                 }
             };
 
             let mut i: usize = 0;
-            while i < ids.len() && sent < hard_limit {
+            while i < job_pairs.len() && sent < hard_limit {
                 let start = i;
-                let end = std::cmp::min(ids.len(), start + batch_size);
+                let end = std::cmp::min(job_pairs.len(), start + batch_size);
 
-                // Batch fetch all jobs and statuses for this batch to avoid N+1 queries
-                let batch_ids: Vec<String> = ids[start..end].to_vec();
-                let jobs_map = match shard.get_jobs_batch(tenant.as_str(), &batch_ids).await {
-                    Ok(m) => m,
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(DataFusionError::Execution(e.to_string())))
-                            .await;
-                        return;
+                // Group by tenant to batch fetch
+                let batch_pairs = &job_pairs[start..end];
+                let mut jobs_map: std::collections::HashMap<String, crate::job::JobView> =
+                    std::collections::HashMap::new();
+                let mut status_map: std::collections::HashMap<String, crate::job::JobStatus> =
+                    std::collections::HashMap::new();
+
+                // Group IDs by tenant for batch fetching
+                let mut by_tenant: std::collections::HashMap<String, Vec<String>> =
+                    std::collections::HashMap::new();
+                for (tenant, job_id) in batch_pairs {
+                    by_tenant
+                        .entry(tenant.clone())
+                        .or_default()
+                        .push(job_id.clone());
+                }
+
+                // Fetch jobs and statuses for each tenant
+                for (tenant, ids) in &by_tenant {
+                    match shard.get_jobs_batch(tenant.as_str(), ids).await {
+                        Ok(m) => jobs_map.extend(m),
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(DataFusionError::Execution(e.to_string())))
+                                .await;
+                            return;
+                        }
                     }
-                };
-                let status_map = match shard
-                    .get_jobs_status_batch(tenant.as_str(), &batch_ids)
-                    .await
-                {
-                    Ok(m) => m,
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(DataFusionError::Execution(e.to_string())))
-                            .await;
-                        return;
+                    match shard.get_jobs_status_batch(tenant.as_str(), ids).await {
+                        Ok(m) => status_map.extend(m),
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(DataFusionError::Execution(e.to_string())))
+                                .await;
+                            return;
+                        }
                     }
-                };
+                }
 
                 // Filter to only include IDs that actually have jobs
-                let existing_ids: Vec<&String> = ids[start..end]
+                let existing_pairs: Vec<&(String, String)> = batch_pairs
                     .iter()
-                    .filter(|id| jobs_map.contains_key(*id))
+                    .filter(|(_, id)| jobs_map.contains_key(id))
                     .collect();
 
                 // Skip this batch if no jobs exist
-                if existing_ids.is_empty() {
+                if existing_pairs.is_empty() {
                     i = end;
                     continue;
                 }
@@ -490,7 +565,7 @@ impl Scan for JobsScanner {
                         Arc::clone(&proj_for_stream),
                         vec![],
                         &datafusion::arrow::record_batch::RecordBatchOptions::new()
-                            .with_row_count(Some(existing_ids.len())),
+                            .with_row_count(Some(existing_pairs.len())),
                     ) {
                         Ok(b) => b,
                         Err(e) => {
@@ -508,17 +583,24 @@ impl Scan for JobsScanner {
                     continue;
                 }
 
+                // Get shard_id from shard name
+                let shard_id: u32 = shard.name().parse().unwrap_or(0);
+
                 let mut cols: Vec<ArrayRef> = Vec::with_capacity(proj_for_stream.fields().len());
                 for f in proj_for_stream.fields() {
                     match f.name().as_str() {
+                        "shard_id" => {
+                            let vals: Vec<u32> = vec![shard_id; existing_pairs.len()];
+                            cols.push(Arc::new(UInt32Array::from(vals)));
+                        }
                         "tenant" => {
                             let vals: Vec<String> =
-                                existing_ids.iter().map(|_| tenant.clone()).collect();
+                                existing_pairs.iter().map(|(t, _)| t.clone()).collect();
                             cols.push(Arc::new(StringArray::from(vals)));
                         }
                         "id" => {
-                            let mut out: Vec<String> = Vec::with_capacity(existing_ids.len());
-                            for id in &existing_ids {
+                            let mut out: Vec<String> = Vec::with_capacity(existing_pairs.len());
+                            for (_, id) in &existing_pairs {
                                 out.push((*id).clone());
                             }
                             cols.push(Arc::new(StringArray::from(out)));
@@ -530,8 +612,8 @@ impl Scan for JobsScanner {
                             let need_prio = f.name() == "priority";
                             let need_enq = f.name() == "enqueue_time_ms";
                             let need_payload = f.name() == "payload";
-                            for id in &existing_ids {
-                                if let Some(view) = jobs_map.get(*id) {
+                            for (_, id) in &existing_pairs {
+                                if let Some(view) = jobs_map.get(id) {
                                     if need_prio {
                                         prio.push(view.priority());
                                     }
@@ -561,8 +643,8 @@ impl Scan for JobsScanner {
                             let mut changed: Vec<Option<i64>> = Vec::new();
                             let need_kind = f.name() == "status_kind";
                             let need_changed = f.name() == "status_changed_at_ms";
-                            for id in &existing_ids {
-                                if let Some(status) = status_map.get(*id) {
+                            for (_, id) in &existing_pairs {
+                                if let Some(status) = status_map.get(id) {
                                     if need_kind {
                                         kinds.push(Some(format!("{:?}", status.kind)));
                                     }
@@ -590,8 +672,8 @@ impl Scan for JobsScanner {
 
                             // Build the metadata map arrays
                             let mut all_metadata: Vec<Vec<(String, String)>> = Vec::new();
-                            for id in &existing_ids {
-                                if let Some(view) = jobs_map.get(*id) {
+                            for (_, id) in &existing_pairs {
+                                if let Some(view) = jobs_map.get(id) {
                                     all_metadata.push(view.metadata());
                                 } else {
                                     all_metadata.push(Vec::new());
@@ -724,6 +806,7 @@ impl QueuesScanner {
     /// Get the base schema for the queues table
     pub fn base_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
+            Field::new("shard_id", DataType::UInt32, false),
             Field::new("tenant", DataType::Utf8, false),
             Field::new("queue_name", DataType::Utf8, false),
             Field::new("entry_type", DataType::Utf8, false), // "holder" or "requester"
@@ -755,8 +838,6 @@ impl Scan for QueuesScanner {
                 }
             }
         }
-        let tenant = tenant_filter.unwrap_or_else(|| "-".to_string());
-
         let (tx, rx) = mpsc::channel::<DfResult<RecordBatch>>(2);
         let shard = Arc::clone(&self.shard);
         let proj_for_stream = Arc::clone(&projection);
@@ -767,10 +848,11 @@ impl Scan for QueuesScanner {
             let mut entries: Vec<QueueEntry> = Vec::new();
 
             // Scan holders: holders/<tenant>/<queue>/<task-id>
-            let holders_prefix = if let Some(ref q) = queue_filter {
-                format!("holders/{}/{}/", tenant, q)
-            } else {
-                format!("holders/{}/", tenant)
+            // When no tenant filter, scan all: holders/
+            let holders_prefix = match (&tenant_filter, &queue_filter) {
+                (Some(t), Some(q)) => format!("holders/{}/{}/", t, q),
+                (Some(t), None) => format!("holders/{}/", t),
+                (None, _) => "holders/".to_string(), // Scan all tenants
             };
             let holders_start: Vec<u8> = holders_prefix.as_bytes().to_vec();
             let mut holders_end: Vec<u8> = holders_start.clone();
@@ -785,6 +867,13 @@ impl Scan for QueuesScanner {
                         let parts: Vec<&str> = key_str.split('/').collect();
                         // holders/<tenant>/<queue>/<task-id>
                         if parts.len() >= 4 && parts[0] == "holders" {
+                            let tenant = crate::keys::decode_tenant(parts[1]);
+                            // Filter by queue if specified
+                            if let Some(ref q) = queue_filter {
+                                if parts[2] != q.as_str() {
+                                    continue;
+                                }
+                            }
                             let queue_name = parts[2].to_string();
                             let task_id = parts[3].to_string();
                             let timestamp_ms =
@@ -794,7 +883,7 @@ impl Scan for QueuesScanner {
                                     0
                                 };
                             entries.push(QueueEntry {
-                                tenant: parts[1].to_string(),
+                                tenant,
                                 queue_name,
                                 entry_type: "holder".to_string(),
                                 task_id,
@@ -808,10 +897,11 @@ impl Scan for QueuesScanner {
             }
 
             // Scan requests: requests/<tenant>/<queue>/<start_time_ms>/<priority>/<request_id>
-            let requests_prefix = if let Some(ref q) = queue_filter {
-                format!("requests/{}/{}/", tenant, q)
-            } else {
-                format!("requests/{}/", tenant)
+            // When no tenant filter, scan all: requests/
+            let requests_prefix = match (&tenant_filter, &queue_filter) {
+                (Some(t), Some(q)) => format!("requests/{}/{}/", t, q),
+                (Some(t), None) => format!("requests/{}/", t),
+                (None, _) => "requests/".to_string(), // Scan all tenants
             };
             let requests_start: Vec<u8> = requests_prefix.as_bytes().to_vec();
             let mut requests_end: Vec<u8> = requests_start.clone();
@@ -826,6 +916,13 @@ impl Scan for QueuesScanner {
                         let parts: Vec<&str> = key_str.split('/').collect();
                         // requests/<tenant>/<queue>/<start_time_ms>/<priority>/<request_id>
                         if parts.len() >= 6 && parts[0] == "requests" {
+                            let tenant = crate::keys::decode_tenant(parts[1]);
+                            // Filter by queue if specified
+                            if let Some(ref q) = queue_filter {
+                                if parts[2] != q.as_str() {
+                                    continue;
+                                }
+                            }
                             let queue_name = parts[2].to_string();
                             let start_time_ms: i64 = parts[3].parse().unwrap_or(0);
                             let priority: u8 = parts[4].parse().unwrap_or(50);
@@ -843,7 +940,7 @@ impl Scan for QueuesScanner {
                                 None
                             };
                             entries.push(QueueEntry {
-                                tenant: parts[1].to_string(),
+                                tenant,
                                 queue_name,
                                 entry_type: "requester".to_string(),
                                 task_id: request_id,
@@ -886,9 +983,16 @@ impl Scan for QueuesScanner {
                     continue;
                 }
 
+                // Get shard_id from shard name
+                let shard_id: u32 = shard.name().parse().unwrap_or(0);
+
                 let mut cols: Vec<ArrayRef> = Vec::with_capacity(proj_for_stream.fields().len());
                 for f in proj_for_stream.fields() {
                     match f.name().as_str() {
+                        "shard_id" => {
+                            let vals: Vec<u32> = vec![shard_id; batch_entries.len()];
+                            cols.push(Arc::new(UInt32Array::from(vals)));
+                        }
                         "tenant" => {
                             let vals: Vec<&str> =
                                 batch_entries.iter().map(|e| e.tenant.as_str()).collect();
