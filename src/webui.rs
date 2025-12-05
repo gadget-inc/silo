@@ -37,6 +37,7 @@ pub struct AppState {
 pub struct JobRow {
     pub id: String,
     pub shard: String,
+    pub tenant: String,
     pub status: String,
     pub priority: u8,
     pub scheduled_for: String,
@@ -62,6 +63,7 @@ pub struct HolderRow {
 pub struct RequesterRow {
     pub job_id: String,
     pub shard: String,
+    pub tenant: String,
     pub priority: u8,
     pub requested_at: String,
 }
@@ -187,9 +189,11 @@ struct StatusBadgeTemplate {
 
 #[derive(serde::Deserialize)]
 pub struct JobParams {
-    /// Shard ID from URL - ignored, we always search the cluster via query engine
-    #[allow(dead_code)]
-    shard: Option<String>,
+    /// Optional shard ID - used to make lookup more efficient if provided
+    shard: Option<u32>,
+    /// Optional tenant - used to make lookup more efficient if provided
+    tenant: Option<String>,
+    /// Job ID to look up (required)
     id: String,
 }
 
@@ -260,7 +264,7 @@ async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
 
     // Use cluster query engine for proper cross-shard aggregation
     // Show all recent jobs, not just scheduled - jobs transition quickly through states
-    let sql = "SELECT shard_id, id, status_kind, enqueue_time_ms, priority FROM jobs ORDER BY enqueue_time_ms DESC LIMIT 100";
+    let sql = "SELECT shard_id, tenant, id, status_kind, enqueue_time_ms, priority FROM jobs ORDER BY enqueue_time_ms DESC LIMIT 100";
 
     match state.query_engine.sql(sql).await {
         Ok(df) => match df.collect().await {
@@ -269,6 +273,10 @@ async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
                     let shard_col = batch.column_by_name("shard_id").and_then(|c| {
                         c.as_any()
                             .downcast_ref::<datafusion::arrow::array::UInt32Array>()
+                    });
+                    let tenant_col = batch.column_by_name("tenant").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::StringArray>()
                     });
                     let id_col = batch.column_by_name("id").and_then(|c| {
                         c.as_any()
@@ -289,16 +297,24 @@ async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
 
                     if let (
                         Some(shards),
+                        Some(tenants),
                         Some(ids),
                         Some(statuses),
                         Some(times),
                         Some(priorities),
-                    ) = (shard_col, id_col, status_col, time_col, priority_col)
-                    {
+                    ) = (
+                        shard_col,
+                        tenant_col,
+                        id_col,
+                        status_col,
+                        time_col,
+                        priority_col,
+                    ) {
                         for i in 0..batch.num_rows() {
                             all_jobs.push(JobRow {
                                 id: ids.value(i).to_string(),
                                 shard: shards.value(i).to_string(),
+                                tenant: tenants.value(i).to_string(),
                                 status: statuses.value(i).to_string(),
                                 priority: priorities.value(i),
                                 scheduled_for: format_timestamp(times.value(i)),
@@ -356,11 +372,18 @@ async fn job_handler(
     State(state): State<AppState>,
     Query(params): Query<JobParams>,
 ) -> impl IntoResponse {
-    // Use the cluster query engine to fetch job data - this works across all shards
-    // and doesn't have tenant filtering issues that cluster_client.get_job has
+    // Build SQL query with optional shard/tenant filters for performance
+    // If shard and tenant are provided, the query engine can route directly to that shard
+    let mut where_clauses = vec![format!("id = '{}'", params.id.replace('\'', "''"))];
+    if let Some(shard) = params.shard {
+        where_clauses.push(format!("shard_id = {}", shard));
+    }
+    if let Some(ref tenant) = params.tenant {
+        where_clauses.push(format!("tenant = '{}'", tenant.replace('\'', "''")));
+    }
     let sql = format!(
-        "SELECT shard_id, priority, enqueue_time_ms, payload, status_kind, status_changed_at_ms, metadata FROM jobs WHERE id = '{}' LIMIT 1",
-        params.id.replace('\'', "''")
+        "SELECT shard_id, priority, enqueue_time_ms, payload, status_kind, status_changed_at_ms, metadata FROM jobs WHERE {} LIMIT 1",
+        where_clauses.join(" AND ")
     );
 
     let job_result: Option<JobQueryResult> = match state.query_engine.sql(&sql).await {
@@ -558,50 +581,65 @@ async fn cancel_job_handler(
     State(state): State<AppState>,
     Query(params): Query<JobParams>,
 ) -> impl IntoResponse {
-    // Query the job's shard and tenant from the cluster query engine
-    let sql = format!(
-        "SELECT shard_id, tenant FROM jobs WHERE id = '{}' LIMIT 1",
-        params.id.replace('\'', "''")
-    );
-
-    let job_info: Option<(u32, String)> = match state.query_engine.sql(&sql).await {
-        Ok(df) => match df.collect().await {
-            Ok(batches) => {
-                let mut result = None;
-                for batch in batches {
-                    if batch.num_rows() == 0 {
-                        continue;
-                    }
-                    let shard_id = batch
-                        .column_by_name("shard_id")
-                        .and_then(|c| {
-                            c.as_any()
-                                .downcast_ref::<datafusion::arrow::array::UInt32Array>()
-                        })
-                        .map(|a| a.value(0));
-                    let tenant = batch
-                        .column_by_name("tenant")
-                        .and_then(|c| {
-                            c.as_any()
-                                .downcast_ref::<datafusion::arrow::array::StringArray>()
-                        })
-                        .map(|a| a.value(0).to_string());
-
-                    if let (Some(s), Some(t)) = (shard_id, tenant) {
-                        result = Some((s, t));
-                        break;
-                    }
-                }
-                result
+    // If both shard and tenant are provided, we can cancel directly without querying
+    // Otherwise, query the job's shard and tenant from the cluster query engine
+    let (shard_id, tenant) =
+        if let (Some(shard), Some(tenant)) = (params.shard, params.tenant.clone()) {
+            (shard, tenant)
+        } else {
+            // Build query with optional filters for efficiency
+            let mut where_clauses = vec![format!("id = '{}'", params.id.replace('\'', "''"))];
+            if let Some(shard) = params.shard {
+                where_clauses.push(format!("shard_id = {}", shard));
             }
-            Err(_) => None,
-        },
-        Err(_) => None,
-    };
+            if let Some(ref tenant) = params.tenant {
+                where_clauses.push(format!("tenant = '{}'", tenant.replace('\'', "''")));
+            }
+            let sql = format!(
+                "SELECT shard_id, tenant FROM jobs WHERE {} LIMIT 1",
+                where_clauses.join(" AND ")
+            );
 
-    let Some((shard_id, tenant)) = job_info else {
-        return Html(r#"<span class="text-red-400">Job not found</span>"#.to_string());
-    };
+            let job_info: Option<(u32, String)> = match state.query_engine.sql(&sql).await {
+                Ok(df) => match df.collect().await {
+                    Ok(batches) => {
+                        let mut result = None;
+                        for batch in batches {
+                            if batch.num_rows() == 0 {
+                                continue;
+                            }
+                            let shard_id = batch
+                                .column_by_name("shard_id")
+                                .and_then(|c| {
+                                    c.as_any()
+                                        .downcast_ref::<datafusion::arrow::array::UInt32Array>()
+                                })
+                                .map(|a| a.value(0));
+                            let tenant = batch
+                                .column_by_name("tenant")
+                                .and_then(|c| {
+                                    c.as_any()
+                                        .downcast_ref::<datafusion::arrow::array::StringArray>()
+                                })
+                                .map(|a| a.value(0).to_string());
+
+                            if let (Some(s), Some(t)) = (shard_id, tenant) {
+                                result = Some((s, t));
+                                break;
+                            }
+                        }
+                        result
+                    }
+                    Err(_) => None,
+                },
+                Err(_) => None,
+            };
+
+            let Some((shard_id, tenant)) = job_info else {
+                return Html(r#"<span class="text-red-400">Job not found</span>"#.to_string());
+            };
+            (shard_id, tenant)
+        };
 
     match state
         .cluster_client
@@ -708,7 +746,7 @@ async fn queue_handler(
 
     // Query queue data from ALL shards via cluster query engine
     let sql = format!(
-        "SELECT shard_id, task_id, job_id, entry_type, priority, timestamp_ms FROM queues WHERE queue_name = '{}'",
+        "SELECT shard_id, tenant, task_id, job_id, entry_type, priority, timestamp_ms FROM queues WHERE queue_name = '{}'",
         params.name.replace('\'', "''") // Basic SQL escaping
     );
 
@@ -719,6 +757,10 @@ async fn queue_handler(
                     let shard_col = batch.column_by_name("shard_id").and_then(|c| {
                         c.as_any()
                             .downcast_ref::<datafusion::arrow::array::UInt32Array>()
+                    });
+                    let tenant_col = batch.column_by_name("tenant").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::StringArray>()
                     });
                     let task_col = batch.column_by_name("task_id").and_then(|c| {
                         c.as_any()
@@ -743,6 +785,7 @@ async fn queue_handler(
 
                     if let (
                         Some(shards),
+                        Some(tenants),
                         Some(tasks),
                         Some(jobs),
                         Some(entries),
@@ -750,6 +793,7 @@ async fn queue_handler(
                         Some(timestamps),
                     ) = (
                         shard_col,
+                        tenant_col,
                         task_col,
                         job_col,
                         entry_col,
@@ -758,6 +802,7 @@ async fn queue_handler(
                     ) {
                         for i in 0..batch.num_rows() {
                             let shard_id = shards.value(i);
+                            let tenant = tenants.value(i).to_string();
                             let task_id = tasks.value(i).to_string();
                             let job_id = jobs.value(i).to_string();
                             let entry_type = entries.value(i);
@@ -776,6 +821,7 @@ async fn queue_handler(
                                     requesters.push(RequesterRow {
                                         job_id,
                                         shard: shard_id.to_string(),
+                                        tenant,
                                         priority,
                                         requested_at: format_timestamp(timestamp_ms),
                                     });

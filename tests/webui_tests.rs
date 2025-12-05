@@ -565,9 +565,8 @@ async fn test_queues_page_shows_queues_from_all_shards() {
 }
 
 #[silo::test]
-async fn test_job_view_with_wrong_shard_falls_back_to_cluster_search() {
-    // Test that job lookup falls back to cluster-wide search if the provided shard is wrong.
-    // This handles the case where shard info in a URL is stale (e.g., after shard rebalancing).
+async fn test_job_view_with_correct_shard_and_tenant_hint() {
+    // Test that providing correct shard and tenant makes job lookup work efficiently
     let (_tmp, state) = setup_multi_shard_state(3).await;
 
     // Enqueue a job on shard 2
@@ -586,26 +585,26 @@ async fn test_job_view_with_wrong_shard_falls_back_to_cluster_search() {
         .await
         .expect("enqueue");
 
-    // Request job with WRONG shard (shard 0 instead of shard 2)
-    // The handler should fall back to cluster search and find it on shard 2
-    let (status, body) = make_request(state, "GET", &format!("/job?shard=0&id={}", job_id)).await;
+    // Request job with CORRECT shard and tenant
+    let (status, body) = make_request(
+        state,
+        "GET",
+        &format!("/job?shard=2&tenant=-&id={}", job_id),
+    )
+    .await;
 
     assert_eq!(status, StatusCode::OK);
-    assert!(
-        body.contains(&job_id),
-        "job detail should show the job found via cluster search fallback"
-    );
+    assert!(body.contains(&job_id), "job detail should show the job");
     assert!(body.contains("P30"), "job detail should show priority");
-    // The displayed shard should be the actual shard (2), not the requested one (0)
     assert!(
         body.contains("Shard") && body.contains("2"),
-        "should display actual shard 2 where job was found"
+        "should display shard 2"
     );
 }
 
 #[silo::test]
-async fn test_cancel_job_with_wrong_shard_falls_back_to_cluster_search() {
-    // Test that job cancel falls back to cluster-wide search if the provided shard is wrong.
+async fn test_job_view_with_wrong_shard_returns_not_found() {
+    // Test that providing wrong shard returns not found (no fallback to cluster search)
     let (_tmp, state) = setup_multi_shard_state(3).await;
 
     // Enqueue a job on shard 2
@@ -613,7 +612,38 @@ async fn test_cancel_job_with_wrong_shard_falls_back_to_cluster_search() {
     let job_id = shard2
         .enqueue(
             "-",
-            Some("job-cancel-wrong-shard".to_string()),
+            Some("job-wrong-shard".to_string()),
+            30,
+            test_helpers::now_ms(),
+            None,
+            serde_json::json!({}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("enqueue");
+
+    // Request job with WRONG shard - should return not found
+    let (status, body) = make_request(state, "GET", &format!("/job?shard=0&id={}", job_id)).await;
+
+    assert_eq!(status, StatusCode::OK); // Error page still returns 200
+    assert!(
+        body.contains("not found") || body.contains("Not Found"),
+        "should show not found when shard filter doesn't match"
+    );
+}
+
+#[silo::test]
+async fn test_cancel_job_with_correct_shard_and_tenant() {
+    // Test that providing correct shard and tenant makes job cancellation work
+    let (_tmp, state) = setup_multi_shard_state(3).await;
+
+    // Enqueue a job on shard 2
+    let shard2 = state.factory.get("2").expect("shard 2");
+    let job_id = shard2
+        .enqueue(
+            "-",
+            Some("job-cancel-correct".to_string()),
             30,
             test_helpers::now_ms() + 100000, // Future time so it stays scheduled
             None,
@@ -635,21 +665,21 @@ async fn test_cancel_job_with_wrong_shard_falls_back_to_cluster_search() {
         silo::job::JobStatusKind::Scheduled
     );
 
-    // Cancel via HTTP with WRONG shard (shard 0 instead of shard 2)
+    // Cancel via HTTP with CORRECT shard and tenant
     let (status, body) = make_request(
         state.clone(),
         "POST",
-        &format!("/job/cancel?shard=0&id={}", job_id),
+        &format!("/job/cancel?shard=2&tenant=-&id={}", job_id),
     )
     .await;
 
     assert_eq!(status, StatusCode::OK);
     assert!(
         body.contains("Cancelled"),
-        "cancel should succeed via cluster search fallback"
+        "cancel should succeed with correct shard/tenant"
     );
 
-    // Verify job is cancelled on actual shard
+    // Verify job is cancelled
     let status_after = shard2
         .get_job_status("-", &job_id)
         .await

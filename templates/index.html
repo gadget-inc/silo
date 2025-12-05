@@ -39,7 +39,7 @@
                         {% for job in jobs %}
                         <tr class="border-b border-zinc-700 hover:bg-zinc-750">
                             <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">
-                                <a href="/job?shard={{ job.shard }}&id={{ job.id }}" class="text-emerald-400 hover:underline">{{ job.id }}</a>
+                                <a href="/job?shard={{ job.shard }}&tenant={{ job.tenant }}&id={{ job.id }}" class="text-emerald-400 hover:underline">{{ job.id }}</a>
                             </td>
                             <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">{{ job.shard }}</td>
                             <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">
