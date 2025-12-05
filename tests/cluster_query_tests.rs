@@ -1153,3 +1153,309 @@ async fn cluster_query_tenant_isolation_multi_shard() {
     let ids = extract_string_column(&batches, 0);
     assert_eq!(ids, vec!["b_job"]);
 }
+
+// =============================================================================
+// Cross-Tenant Query Tests (no tenant filter - admin/cluster-wide visibility)
+// =============================================================================
+
+/// Test that queries WITHOUT a tenant filter return jobs from ALL tenants
+#[silo::test]
+async fn cluster_query_no_tenant_filter_returns_all_tenants() {
+    let (_temps, factory) = create_multi_shard_factory(2).await;
+    let now = now_ms();
+
+    // Shard 0: tenant A jobs
+    let shard0 = factory.get("0").unwrap();
+    shard0
+        .enqueue(
+            "tenant_a",
+            Some("a_job1".to_string()),
+            10,
+            now,
+            None,
+            serde_json::json!({}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("enqueue");
+    shard0
+        .enqueue(
+            "tenant_a",
+            Some("a_job2".to_string()),
+            10,
+            now,
+            None,
+            serde_json::json!({}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("enqueue");
+
+    // Shard 1: tenant B jobs
+    let shard1 = factory.get("1").unwrap();
+    shard1
+        .enqueue(
+            "tenant_b",
+            Some("b_job1".to_string()),
+            10,
+            now,
+            None,
+            serde_json::json!({}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("enqueue");
+
+    // Shard 0: also a "default" tenant job
+    shard0
+        .enqueue(
+            "default",
+            Some("default_job".to_string()),
+            10,
+            now,
+            None,
+            serde_json::json!({}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("enqueue");
+
+    let engine = ClusterQueryEngine::new(factory.clone(), None, 2)
+        .await
+        .expect("create engine");
+
+    // Query WITHOUT tenant filter - should return ALL jobs from ALL tenants
+    let batches = query_collect(&engine, "SELECT id FROM jobs ORDER BY id").await;
+    let ids = extract_string_column(&batches, 0);
+
+    // Should have all 4 jobs from 3 different tenants
+    assert_eq!(ids.len(), 4);
+    assert!(ids.contains(&"a_job1".to_string()));
+    assert!(ids.contains(&"a_job2".to_string()));
+    assert!(ids.contains(&"b_job1".to_string()));
+    assert!(ids.contains(&"default_job".to_string()));
+}
+
+/// Test that COUNT(*) without tenant filter counts ALL jobs across ALL tenants
+#[silo::test]
+async fn cluster_query_count_no_tenant_filter() {
+    let (_temps, factory) = create_multi_shard_factory(2).await;
+    let now = now_ms();
+
+    // Shard 0: 2 jobs in tenant A
+    let shard0 = factory.get("0").unwrap();
+    for i in 0..2 {
+        shard0
+            .enqueue(
+                "tenant_a",
+                Some(format!("a{}", i)),
+                10,
+                now,
+                None,
+                serde_json::json!({}),
+                vec![],
+                None,
+            )
+            .await
+            .expect("enqueue");
+    }
+
+    // Shard 1: 3 jobs in tenant B
+    let shard1 = factory.get("1").unwrap();
+    for i in 0..3 {
+        shard1
+            .enqueue(
+                "tenant_b",
+                Some(format!("b{}", i)),
+                10,
+                now,
+                None,
+                serde_json::json!({}),
+                vec![],
+                None,
+            )
+            .await
+            .expect("enqueue");
+    }
+
+    let engine = ClusterQueryEngine::new(factory.clone(), None, 2)
+        .await
+        .expect("create engine");
+
+    // COUNT without tenant filter should return 5
+    let batches = query_collect(&engine, "SELECT COUNT(*) as cnt FROM jobs").await;
+    let counts = extract_i64_column(&batches, 0);
+    let total: i64 = counts.iter().sum();
+    assert_eq!(total, 5);
+}
+
+/// Test that querying by ID without tenant filter finds the job in any tenant
+#[silo::test]
+async fn cluster_query_by_id_no_tenant_filter() {
+    let (_temps, factory) = create_multi_shard_factory(1).await;
+    let now = now_ms();
+
+    let shard = factory.get("0").unwrap();
+
+    // Create jobs with same ID pattern but different tenants
+    shard
+        .enqueue(
+            "tenant_x",
+            Some("unique_job_123".to_string()),
+            10,
+            now,
+            None,
+            serde_json::json!({"data": "from_x"}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("enqueue");
+
+    shard
+        .enqueue(
+            "tenant_y",
+            Some("other_job".to_string()),
+            10,
+            now,
+            None,
+            serde_json::json!({}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("enqueue");
+
+    let engine = ClusterQueryEngine::new(factory.clone(), None, 1)
+        .await
+        .expect("create engine");
+
+    // Query by specific ID without tenant filter - should find it
+    let batches = query_collect(
+        &engine,
+        "SELECT tenant, id FROM jobs WHERE id = 'unique_job_123'",
+    )
+    .await;
+
+    assert!(!batches.is_empty());
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 1);
+
+    let tenants = extract_string_column(&batches, 0);
+    assert_eq!(tenants, vec!["tenant_x"]);
+}
+
+/// Test that status filter without tenant returns jobs from all tenants
+#[silo::test]
+async fn cluster_query_by_status_no_tenant_filter() {
+    let (_temps, factory) = create_multi_shard_factory(2).await;
+    let now = now_ms();
+
+    // Create scheduled jobs in different tenants
+    let shard0 = factory.get("0").unwrap();
+    shard0
+        .enqueue(
+            "alpha",
+            Some("alpha_scheduled".to_string()),
+            10,
+            now,
+            None,
+            serde_json::json!({}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("enqueue");
+
+    let shard1 = factory.get("1").unwrap();
+    shard1
+        .enqueue(
+            "beta",
+            Some("beta_scheduled".to_string()),
+            10,
+            now,
+            None,
+            serde_json::json!({}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("enqueue");
+
+    let engine = ClusterQueryEngine::new(factory.clone(), None, 2)
+        .await
+        .expect("create engine");
+
+    // Query by status without tenant filter
+    let batches = query_collect(
+        &engine,
+        "SELECT tenant, id FROM jobs WHERE status_kind = 'Scheduled' ORDER BY id",
+    )
+    .await;
+
+    let tenants = extract_string_column(&batches, 0);
+    let ids = extract_string_column(&batches, 1);
+
+    // Should have both jobs from both tenants
+    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&"alpha_scheduled".to_string()));
+    assert!(ids.contains(&"beta_scheduled".to_string()));
+    assert!(tenants.contains(&"alpha".to_string()));
+    assert!(tenants.contains(&"beta".to_string()));
+}
+
+/// Test the webui-style query (what the index page uses) without tenant filter
+#[silo::test]
+async fn cluster_query_webui_style_no_tenant_filter() {
+    let (_temps, factory) = create_multi_shard_factory(2).await;
+    let now = now_ms();
+
+    // Create jobs across multiple tenants
+    let shard0 = factory.get("0").unwrap();
+    shard0
+        .enqueue(
+            "customer_1",
+            Some("c1_job".to_string()),
+            5,
+            now,
+            None,
+            serde_json::json!({}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("enqueue");
+
+    let shard1 = factory.get("1").unwrap();
+    shard1
+        .enqueue(
+            "customer_2",
+            Some("c2_job".to_string()),
+            10,
+            now + 1000,
+            None,
+            serde_json::json!({}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("enqueue");
+
+    let engine = ClusterQueryEngine::new(factory.clone(), None, 2)
+        .await
+        .expect("create engine");
+
+    // This is the exact query pattern the webui uses (without tenant filter)
+    let batches = query_collect(
+        &engine,
+        "SELECT shard_id, id, status_kind, enqueue_time_ms, priority FROM jobs ORDER BY enqueue_time_ms DESC LIMIT 100",
+    )
+    .await;
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2, "Should see jobs from all tenants");
+}

@@ -630,10 +630,6 @@ impl Coordinator for K8sCoordinator {
     }
 }
 
-// ============================================================================
-// K8sShardGuard - per-shard lease management with proper CAS semantics
-// ============================================================================
-
 /// State for a shard guard, including the resourceVersion for fencing
 pub struct ShardState {
     pub desired: bool,

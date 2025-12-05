@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+
+{% block title %}SQL Console - Silo{% endblock %}
+
+{% block content %}
+<div class="space-y-4">
+    <div class="flex items-center justify-between">
+        <h1 class="text-xl font-bold text-zinc-100">SQL Console</h1>
+        <div class="relative group">
+            <span class="text-amber-500 text-sm cursor-help flex items-center gap-1">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                </svg>
+                With great power comes great responsibility
+            </span>
+            <div class="absolute right-0 top-full mt-1 w-72 p-2 bg-zinc-800 border border-zinc-700 text-xs text-zinc-300 opacity-0 group-hover:opacity-100 transition-opacity z-10 pointer-events-none">
+                There are no guardrails for query intensity. Be careful with what queries you run — expensive queries may impact cluster performance.
+            </div>
+        </div>
+    </div>
+    
+    <div class="bg-zinc-800 border border-zinc-700 overflow-hidden">
+        <div class="bg-zinc-850 border-b border-zinc-700 px-4 py-2">
+            <h2 class="text-sm font-semibold text-zinc-300">Query Editor</h2>
+        </div>
+        <div class="p-4">
+            <form hx-get="/sql/execute" 
+                  hx-target="#results"
+                  hx-indicator="#spinner"
+                  hx-push-url="true"
+                  class="space-y-4">
+                <div>
+                    <textarea 
+                        name="q"
+                        id="sql-input"
+                        rows="6"
+                        class="w-full bg-zinc-900 border border-zinc-700 text-zinc-100 font-mono text-sm p-3 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 placeholder-zinc-500"
+                        placeholder="SELECT * FROM jobs LIMIT 10">{{ query }}</textarea>
+                </div>
+                <div class="flex items-center justify-between">
+                    <div class="text-xs text-zinc-500">
+                        Available tables: <code class="text-emerald-400">jobs</code>, <code class="text-emerald-400">queues</code>
+                    </div>
+                    <button type="submit" 
+                            class="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium transition-colors flex items-center gap-2">
+                        <span>Execute</span>
+                        <svg id="spinner" class="htmx-indicator h-4 w-4 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                        </svg>
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+    
+    <div id="results">
+        {% if has_result %}
+        {% include "sql_result.html" %}
+        {% endif %}
+    </div>
+</div>
+
+<script>
+    // Auto-resize textarea
+    const textarea = document.getElementById('sql-input');
+    textarea.addEventListener('input', function() {
+        this.style.height = 'auto';
+        this.style.height = Math.max(this.scrollHeight, 150) + 'px';
+    });
+    
+    // Ctrl+Enter to submit
+    textarea.addEventListener('keydown', function(e) {
+        if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+            e.preventDefault();
+            this.form.requestSubmit();
+        }
+    });
+</script>
+{% endblock %}

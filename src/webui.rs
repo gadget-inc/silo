@@ -15,8 +15,9 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use datafusion::arrow::array::Array;
 use tokio::sync::broadcast;
-use tracing::{warn};
+use tracing::warn;
 
 use crate::cluster_client::ClusterClient;
 use crate::cluster_query::ClusterQueryEngine;
@@ -93,6 +94,7 @@ struct IndexTemplate {
     nav_active: &'static str,
     jobs: Vec<JobRow>,
     shard_count: usize,
+    error: Option<String>,
 }
 
 #[derive(Template)]
@@ -116,6 +118,7 @@ struct JobTemplate {
 struct QueuesTemplate {
     nav_active: &'static str,
     queues: Vec<QueueRow>,
+    error: Option<String>,
 }
 
 #[derive(Template)]
@@ -136,6 +139,7 @@ struct ClusterTemplate {
     total_shards: usize,
     owned_shards: usize,
     total_jobs: usize,
+    error: Option<String>,
 }
 
 #[derive(Template)]
@@ -148,6 +152,34 @@ struct ErrorTemplate {
 }
 
 #[derive(Template)]
+#[template(path = "sql.html")]
+struct SqlTemplate {
+    nav_active: &'static str,
+    query: String,
+    has_result: bool,
+    // These are for the included sql_result.html when has_result is true
+    columns: Vec<String>,
+    rows: Vec<Vec<String>>,
+    row_count: usize,
+    total_rows: usize,
+    truncated: bool,
+    execution_time_ms: u64,
+    error: Option<String>,
+}
+
+#[derive(Template)]
+#[template(path = "sql_result.html")]
+struct SqlResultTemplate {
+    columns: Vec<String>,
+    rows: Vec<Vec<String>>,
+    row_count: usize,
+    total_rows: usize,
+    truncated: bool,
+    execution_time_ms: u64,
+    error: Option<String>,
+}
+
+#[derive(Template)]
 #[template(path = "status_badge.html")]
 struct StatusBadgeTemplate {
     status: String,
@@ -155,14 +187,21 @@ struct StatusBadgeTemplate {
 
 #[derive(serde::Deserialize)]
 pub struct JobParams {
-    shard: String,
+    /// Optional shard ID - if not provided, we'll search for the job across all shards
+    shard: Option<String>,
     id: String,
 }
 
 #[derive(serde::Deserialize)]
 pub struct QueueParams {
-    shard: String,
+    /// Queue name to look up
     name: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct SqlQueryParams {
+    #[serde(default)]
+    q: String,
 }
 
 fn format_timestamp(ms: i64) -> String {
@@ -216,14 +255,20 @@ fn format_timestamp(ms: i64) -> String {
 
 async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
     let mut all_jobs: Vec<JobRow> = Vec::new();
+    let mut error: Option<String> = None;
 
     // Use cluster query engine for proper cross-shard aggregation
-    let sql = "SELECT id, status_kind, enqueue_time_ms, priority FROM jobs WHERE status_kind = 'Scheduled' ORDER BY enqueue_time_ms ASC LIMIT 100";
+    // Show all recent jobs, not just scheduled - jobs transition quickly through states
+    let sql = "SELECT shard_id, id, status_kind, enqueue_time_ms, priority FROM jobs ORDER BY enqueue_time_ms DESC LIMIT 100";
 
     match state.query_engine.sql(sql).await {
-        Ok(df) => {
-            if let Ok(batches) = df.collect().await {
+        Ok(df) => match df.collect().await {
+            Ok(batches) => {
                 for batch in batches {
+                    let shard_col = batch.column_by_name("shard_id").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::UInt32Array>()
+                    });
                     let id_col = batch.column_by_name("id").and_then(|c| {
                         c.as_any()
                             .downcast_ref::<datafusion::arrow::array::StringArray>()
@@ -241,13 +286,18 @@ async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
                             .downcast_ref::<datafusion::arrow::array::UInt8Array>()
                     });
 
-                    if let (Some(ids), Some(statuses), Some(times), Some(priorities)) =
-                        (id_col, status_col, time_col, priority_col)
+                    if let (
+                        Some(shards),
+                        Some(ids),
+                        Some(statuses),
+                        Some(times),
+                        Some(priorities),
+                    ) = (shard_col, id_col, status_col, time_col, priority_col)
                     {
                         for i in 0..batch.num_rows() {
                             all_jobs.push(JobRow {
                                 id: ids.value(i).to_string(),
-                                shard: "cluster".to_string(), // No longer per-shard
+                                shard: shards.value(i).to_string(),
                                 status: statuses.value(i).to_string(),
                                 priority: priorities.value(i),
                                 scheduled_for: format_timestamp(times.value(i)),
@@ -256,9 +306,14 @@ async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
                     }
                 }
             }
-        }
+            Err(e) => {
+                warn!(error = %e, "failed to collect query results");
+                error = Some(format!("Query execution error: {}", e));
+            }
+        },
         Err(e) => {
             warn!(error = %e, "failed to query jobs from cluster");
+            error = Some(format!("Query error: {}", e));
         }
     }
 
@@ -275,6 +330,7 @@ async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
         nav_active: "index",
         jobs: all_jobs,
         shard_count,
+        error,
     };
 
     Html(
@@ -284,147 +340,240 @@ async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
+/// Job data fetched from the cluster query engine
+struct JobQueryResult {
+    shard_id: u32,
+    priority: u8,
+    enqueue_time_ms: i64,
+    payload: String,
+    status_kind: String,
+    status_changed_at_ms: i64,
+    metadata: Vec<(String, String)>,
+}
+
 async fn job_handler(
     State(state): State<AppState>,
     Query(params): Query<JobParams>,
 ) -> impl IntoResponse {
-    // Parse shard ID
-    let shard_id: u32 = match params.shard.parse() {
-        Ok(id) => id,
-        Err(_) => {
-            return Html(
-                ErrorTemplate {
-                    nav_active: "job",
-                    title: "Invalid Shard".to_string(),
-                    code: 400,
-                    message: format!("Invalid shard ID: '{}'", params.shard),
+    // Use the cluster query engine to fetch job data - this works across all shards
+    // and doesn't have tenant filtering issues that cluster_client.get_job has
+    let sql = format!(
+        "SELECT shard_id, priority, enqueue_time_ms, payload, status_kind, status_changed_at_ms, metadata FROM jobs WHERE id = '{}' LIMIT 1",
+        params.id.replace('\'', "''")
+    );
+
+    let job_result: Option<JobQueryResult> = match state.query_engine.sql(&sql).await {
+        Ok(df) => match df.collect().await {
+            Ok(batches) => {
+                let mut result: Option<JobQueryResult> = None;
+                for batch in batches {
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+
+                    let shard_id = batch
+                        .column_by_name("shard_id")
+                        .and_then(|c| {
+                            c.as_any()
+                                .downcast_ref::<datafusion::arrow::array::UInt32Array>()
+                        })
+                        .map(|a| a.value(0))
+                        .unwrap_or(0);
+
+                    let priority = batch
+                        .column_by_name("priority")
+                        .and_then(|c| {
+                            c.as_any()
+                                .downcast_ref::<datafusion::arrow::array::UInt8Array>()
+                        })
+                        .map(|a| a.value(0))
+                        .unwrap_or(0);
+
+                    let enqueue_time_ms = batch
+                        .column_by_name("enqueue_time_ms")
+                        .and_then(|c| {
+                            c.as_any()
+                                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                        })
+                        .map(|a| a.value(0))
+                        .unwrap_or(0);
+
+                    let payload = batch
+                        .column_by_name("payload")
+                        .and_then(|c| {
+                            c.as_any()
+                                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                        })
+                        .map(|a| {
+                            if a.is_null(0) {
+                                "{}".to_string()
+                            } else {
+                                a.value(0).to_string()
+                            }
+                        })
+                        .unwrap_or_else(|| "{}".to_string());
+
+                    let status_kind = batch
+                        .column_by_name("status_kind")
+                        .and_then(|c| {
+                            c.as_any()
+                                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                        })
+                        .map(|a| {
+                            if a.is_null(0) {
+                                "Scheduled".to_string()
+                            } else {
+                                a.value(0).to_string()
+                            }
+                        })
+                        .unwrap_or_else(|| "Scheduled".to_string());
+
+                    let status_changed_at_ms = batch
+                        .column_by_name("status_changed_at_ms")
+                        .and_then(|c| {
+                            c.as_any()
+                                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                        })
+                        .map(|a| if a.is_null(0) { 0 } else { a.value(0) })
+                        .unwrap_or(0);
+
+                    // Parse metadata from Arrow Map type
+                    let metadata = batch
+                        .column_by_name("metadata")
+                        .and_then(|c| {
+                            c.as_any()
+                                .downcast_ref::<datafusion::arrow::array::MapArray>()
+                        })
+                        .map(|map_array| {
+                            let mut meta = Vec::new();
+                            if !map_array.is_null(0) {
+                                let entries = map_array.value(0);
+                                let struct_array = entries
+                                    .as_any()
+                                    .downcast_ref::<datafusion::arrow::array::StructArray>(
+                                );
+                                if let Some(sa) = struct_array {
+                                    let keys = sa
+                                        .column(0)
+                                        .as_any()
+                                        .downcast_ref::<datafusion::arrow::array::StringArray>(
+                                    );
+                                    let vals = sa
+                                        .column(1)
+                                        .as_any()
+                                        .downcast_ref::<datafusion::arrow::array::StringArray>(
+                                    );
+                                    if let (Some(k), Some(v)) = (keys, vals) {
+                                        for i in 0..k.len() {
+                                            if !k.is_null(i) {
+                                                let key = k.value(i).to_string();
+                                                let val = if v.is_null(i) {
+                                                    String::new()
+                                                } else {
+                                                    v.value(i).to_string()
+                                                };
+                                                meta.push((key, val));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            meta
+                        })
+                        .unwrap_or_default();
+
+                    result = Some(JobQueryResult {
+                        shard_id,
+                        priority,
+                        enqueue_time_ms,
+                        payload,
+                        status_kind,
+                        status_changed_at_ms,
+                        metadata,
+                    });
+                    break;
                 }
-                .render()
-                .unwrap_or_default(),
-            );
+                result
+            }
+            Err(e) => {
+                warn!(error = %e, job_id = %params.id, "failed to query job from cluster");
+                None
+            }
+        },
+        Err(e) => {
+            warn!(error = %e, job_id = %params.id, "failed to query job from cluster");
+            None
         }
     };
 
-    // Get job from any shard (local or remote)
-    let job_response = match state
+    let Some(job) = job_result else {
+        return Html(
+            ErrorTemplate {
+                nav_active: "job",
+                title: "Job Not Found".to_string(),
+                code: 404,
+                message: format!("Job '{}' not found in cluster", params.id),
+            }
+            .render()
+            .unwrap_or_default(),
+        );
+    };
+
+    let is_terminal = matches!(
+        job.status_kind.as_str(),
+        "Succeeded" | "Failed" | "Cancelled"
+    );
+
+    // Try to get limits from cluster_client (this may fail due to tenant issues, but that's OK)
+    let limits: Vec<LimitRow> = match state
         .cluster_client
-        .get_job(shard_id, "-", &params.id)
+        .get_job(job.shard_id, "-", &params.id)
         .await
     {
-        Ok(j) => j,
-        Err(crate::cluster_client::ClusterClientError::JobNotFound) => {
-            return Html(
-                ErrorTemplate {
-                    nav_active: "job",
-                    title: "Job Not Found".to_string(),
-                    code: 404,
-                    message: format!("Job '{}' not found", params.id),
-                }
-                .render()
-                .unwrap_or_default(),
-            );
-        }
-        Err(crate::cluster_client::ClusterClientError::ShardNotFound(_)) => {
-            return Html(
-                ErrorTemplate {
-                    nav_active: "job",
-                    title: "Shard Not Found".to_string(),
-                    code: 404,
-                    message: format!("Shard '{}' not found in cluster", params.shard),
-                }
-                .render()
-                .unwrap_or_default(),
-            );
-        }
-        Err(e) => {
-            return Html(
-                ErrorTemplate {
-                    nav_active: "job",
-                    title: "Error".to_string(),
-                    code: 500,
-                    message: format!("Error fetching job: {}", e),
-                }
-                .render()
-                .unwrap_or_default(),
-            );
-        }
-    };
-
-    // Get job status via SQL query
-    let sql = format!(
-        "SELECT status_kind, status_changed_at_ms FROM jobs WHERE id = '{}'",
-        params.id.replace('\'', "''") // Basic SQL escaping
-    );
-    let (status_kind, status_changed_at_ms) =
-        match state.cluster_client.query_shard(shard_id, &sql).await {
-            Ok(result) => {
-                if let Some(row) = result.rows.first() {
-                    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&row.data) {
-                        let kind = json["status_kind"]
-                            .as_str()
-                            .unwrap_or("Scheduled")
-                            .to_string();
-                        let changed_at = json["status_changed_at_ms"].as_i64().unwrap_or(0);
-                        (kind, changed_at)
-                    } else {
-                        ("Scheduled".to_string(), 0)
-                    }
-                } else {
-                    ("Scheduled".to_string(), 0)
-                }
-            }
-            Err(_) => ("Scheduled".to_string(), 0),
-        };
-
-    let is_terminal = matches!(status_kind.as_str(), "Succeeded" | "Failed" | "Cancelled");
-
-    // Convert proto limits to LimitRow
-    let limits: Vec<LimitRow> = job_response
-        .limits
-        .iter()
-        .filter_map(|l| {
-            l.limit.as_ref().map(|limit| match limit {
-                crate::pb::limit::Limit::Concurrency(c) => LimitRow {
-                    limit_type: "Concurrency".to_string(),
-                    key: c.key.clone(),
-                    value: c.max_concurrency.to_string(),
-                },
-                crate::pb::limit::Limit::RateLimit(r) => LimitRow {
-                    limit_type: "Rate Limit".to_string(),
-                    key: r.name.clone(),
-                    value: format!("{}/{}ms", r.limit, r.duration_ms),
-                },
-                crate::pb::limit::Limit::FloatingConcurrency(f) => LimitRow {
-                    limit_type: "Floating Concurrency".to_string(),
-                    key: f.key.clone(),
-                    value: format!(
-                        "default={}, refresh={}ms",
-                        f.default_max_concurrency, f.refresh_interval_ms
-                    ),
-                },
+        Ok(job_response) => job_response
+            .limits
+            .iter()
+            .filter_map(|l| {
+                l.limit.as_ref().map(|limit| match limit {
+                    crate::pb::limit::Limit::Concurrency(c) => LimitRow {
+                        limit_type: "Concurrency".to_string(),
+                        key: c.key.clone(),
+                        value: c.max_concurrency.to_string(),
+                    },
+                    crate::pb::limit::Limit::RateLimit(r) => LimitRow {
+                        limit_type: "Rate Limit".to_string(),
+                        key: r.name.clone(),
+                        value: format!("{}/{}ms", r.limit, r.duration_ms),
+                    },
+                    crate::pb::limit::Limit::FloatingConcurrency(f) => LimitRow {
+                        limit_type: "Floating Concurrency".to_string(),
+                        key: f.key.clone(),
+                        value: format!(
+                            "default={}, refresh={}ms",
+                            f.default_max_concurrency, f.refresh_interval_ms
+                        ),
+                    },
+                })
             })
-        })
-        .collect();
-
-    // Parse payload JSON for pretty display
-    let payload_str = if let Some(payload) = &job_response.payload {
-        serde_json::from_slice::<serde_json::Value>(&payload.data)
-            .map(|v| serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".to_string()))
-            .unwrap_or_else(|_| "{}".to_string())
-    } else {
-        "{}".to_string()
+            .collect(),
+        Err(_) => Vec::new(), // If we can't get limits, show empty (job still displays)
     };
+
+    // Pretty-print the payload JSON
+    let payload_str = serde_json::from_str::<serde_json::Value>(&job.payload)
+        .map(|v| serde_json::to_string_pretty(&v).unwrap_or_else(|_| job.payload.clone()))
+        .unwrap_or_else(|_| job.payload.clone());
 
     let template = JobTemplate {
         nav_active: "job",
         job_id: params.id,
-        shard: params.shard,
-        status: status_kind,
+        shard: job.shard_id.to_string(),
+        status: job.status_kind,
         is_terminal,
-        priority: job_response.priority as u8,
-        enqueue_time: format_timestamp(job_response.enqueue_time_ms),
-        status_changed: format_timestamp(status_changed_at_ms),
-        metadata: job_response.metadata.into_iter().collect(),
+        priority: job.priority,
+        enqueue_time: format_timestamp(job.enqueue_time_ms),
+        status_changed: format_timestamp(job.status_changed_at_ms),
+        metadata: job.metadata,
         limits,
         payload: payload_str,
     };
@@ -440,19 +589,80 @@ async fn cancel_job_handler(
     State(state): State<AppState>,
     Query(params): Query<JobParams>,
 ) -> impl IntoResponse {
-    // Parse shard ID
-    let shard_id: u32 = match params.shard.parse() {
-        Ok(id) => id,
-        Err(_) => {
-            return Html(r#"<span class="text-red-400">Invalid shard ID</span>"#.to_string());
+    // Helper to search for job shard across cluster
+    let search_job_shard = async |query_engine: &ClusterQueryEngine, job_id: &str| -> Option<u32> {
+        let sql = format!(
+            "SELECT shard_id FROM jobs WHERE id = '{}' LIMIT 1",
+            job_id.replace('\'', "''")
+        );
+
+        match query_engine.sql(&sql).await {
+            Ok(df) => match df.collect().await {
+                Ok(batches) => {
+                    for batch in batches {
+                        if let Some(shard_col) = batch.column_by_name("shard_id").and_then(|c| {
+                            c.as_any()
+                                .downcast_ref::<datafusion::arrow::array::UInt32Array>()
+                        }) {
+                            if batch.num_rows() > 0 {
+                                return Some(shard_col.value(0));
+                            }
+                        }
+                    }
+                    None
+                }
+                Err(_) => None,
+            },
+            Err(_) => None,
         }
     };
 
-    match state
-        .cluster_client
-        .cancel_job(shard_id, "-", &params.id)
-        .await
-    {
+    // Try to cancel - if shard is provided, try it first, then fall back to cluster search
+    let cancel_result = match params.shard {
+        Some(ref shard_str) => match shard_str.parse::<u32>() {
+            Ok(provided_shard_id) => {
+                // Try the provided shard first
+                match state
+                    .cluster_client
+                    .cancel_job(provided_shard_id, "-", &params.id)
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(_) => {
+                        // If cancel failed, search cluster for the actual shard
+                        match search_job_shard(&state.query_engine, &params.id).await {
+                            Some(actual_shard_id) => {
+                                state
+                                    .cluster_client
+                                    .cancel_job(actual_shard_id, "-", &params.id)
+                                    .await
+                            }
+                            None => Err(crate::cluster_client::ClusterClientError::JobNotFound),
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                return Html(r#"<span class="text-red-400">Invalid shard ID</span>"#.to_string());
+            }
+        },
+        None => {
+            // No shard provided - look up via cluster search
+            match search_job_shard(&state.query_engine, &params.id).await {
+                Some(shard_id) => {
+                    state
+                        .cluster_client
+                        .cancel_job(shard_id, "-", &params.id)
+                        .await
+                }
+                None => {
+                    return Html(r#"<span class="text-red-400">Job not found</span>"#.to_string());
+                }
+            }
+        }
+    };
+
+    match cancel_result {
         Ok(()) => Html(
             StatusBadgeTemplate {
                 status: "Cancelled".to_string(),
@@ -467,13 +677,14 @@ async fn cancel_job_handler(
 async fn queues_handler(State(state): State<AppState>) -> impl IntoResponse {
     // Key: queue_name -> (holders, waiters)
     let mut all_queues: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut error: Option<String> = None;
 
     // Use cluster query engine for proper aggregation across all shards
     let sql = "SELECT queue_name, entry_type, COUNT(*) as cnt FROM queues GROUP BY queue_name, entry_type";
 
     match state.query_engine.sql(sql).await {
-        Ok(df) => {
-            if let Ok(batches) = df.collect().await {
+        Ok(df) => match df.collect().await {
+            Ok(batches) => {
                 for batch in batches {
                     let name_col = batch.column_by_name("queue_name").and_then(|c| {
                         c.as_any()
@@ -507,9 +718,14 @@ async fn queues_handler(State(state): State<AppState>) -> impl IntoResponse {
                     }
                 }
             }
-        }
+            Err(e) => {
+                warn!(error = %e, "failed to collect query results");
+                error = Some(format!("Query execution error: {}", e));
+            }
+        },
         Err(e) => {
             warn!(error = %e, "failed to query queues from cluster");
+            error = Some(format!("Query error: {}", e));
         }
     }
 
@@ -528,6 +744,7 @@ async fn queues_handler(State(state): State<AppState>) -> impl IntoResponse {
     let template = QueuesTemplate {
         nav_active: "queues",
         queues,
+        error,
     };
 
     Html(
@@ -541,77 +758,95 @@ async fn queue_handler(
     State(state): State<AppState>,
     Query(params): Query<QueueParams>,
 ) -> impl IntoResponse {
-    // Parse shard ID
-    let shard_id: u32 = match params.shard.parse() {
-        Ok(id) => id,
-        Err(_) => {
-            return Html(
-                ErrorTemplate {
-                    nav_active: "queues",
-                    title: "Invalid Shard".to_string(),
-                    code: 400,
-                    message: format!("Invalid shard ID: '{}'", params.shard),
-                }
-                .render()
-                .unwrap_or_default(),
-            );
-        }
-    };
-
     let mut holders: Vec<HolderRow> = Vec::new();
     let mut requesters: Vec<RequesterRow> = Vec::new();
 
-    // Query queue data from the specific shard via SQL
+    // Query queue data from ALL shards via cluster query engine
     let sql = format!(
-        "SELECT task_id, job_id, entry_type, priority, timestamp_ms FROM queues WHERE queue_name = '{}'",
+        "SELECT shard_id, task_id, job_id, entry_type, priority, timestamp_ms FROM queues WHERE queue_name = '{}'",
         params.name.replace('\'', "''") // Basic SQL escaping
     );
 
-    match state.cluster_client.query_shard(shard_id, &sql).await {
-        Ok(result) => {
-            for row in result.rows {
-                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&row.data) {
-                    let entry_type = json["entry_type"].as_str().unwrap_or("");
-                    let task_id = json["task_id"].as_str().unwrap_or("").to_string();
-                    let timestamp_ms = json["timestamp_ms"].as_i64().unwrap_or(0);
+    match state.query_engine.sql(&sql).await {
+        Ok(df) => match df.collect().await {
+            Ok(batches) => {
+                for batch in batches {
+                    let shard_col = batch.column_by_name("shard_id").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::UInt32Array>()
+                    });
+                    let task_col = batch.column_by_name("task_id").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::StringArray>()
+                    });
+                    let job_col = batch.column_by_name("job_id").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::StringArray>()
+                    });
+                    let entry_col = batch.column_by_name("entry_type").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::StringArray>()
+                    });
+                    let priority_col = batch.column_by_name("priority").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::UInt8Array>()
+                    });
+                    let timestamp_col = batch.column_by_name("timestamp_ms").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                    });
 
-                    match entry_type {
-                        "holder" => {
-                            holders.push(HolderRow {
-                                task_id,
-                                shard: params.shard.clone(),
-                                granted_at: format_timestamp(timestamp_ms),
-                            });
+                    if let (
+                        Some(shards),
+                        Some(tasks),
+                        Some(jobs),
+                        Some(entries),
+                        Some(priorities),
+                        Some(timestamps),
+                    ) = (
+                        shard_col,
+                        task_col,
+                        job_col,
+                        entry_col,
+                        priority_col,
+                        timestamp_col,
+                    ) {
+                        for i in 0..batch.num_rows() {
+                            let shard_id = shards.value(i);
+                            let task_id = tasks.value(i).to_string();
+                            let job_id = jobs.value(i).to_string();
+                            let entry_type = entries.value(i);
+                            let priority = priorities.value(i);
+                            let timestamp_ms = timestamps.value(i);
+
+                            match entry_type {
+                                "holder" => {
+                                    holders.push(HolderRow {
+                                        task_id,
+                                        shard: shard_id.to_string(),
+                                        granted_at: format_timestamp(timestamp_ms),
+                                    });
+                                }
+                                "requester" => {
+                                    requesters.push(RequesterRow {
+                                        job_id,
+                                        shard: shard_id.to_string(),
+                                        priority,
+                                        requested_at: format_timestamp(timestamp_ms),
+                                    });
+                                }
+                                _ => {}
+                            }
                         }
-                        "requester" => {
-                            let job_id = json["job_id"].as_str().unwrap_or("unknown").to_string();
-                            let priority = json["priority"].as_u64().unwrap_or(50) as u8;
-                            requesters.push(RequesterRow {
-                                job_id,
-                                shard: params.shard.clone(),
-                                priority,
-                                requested_at: format_timestamp(timestamp_ms),
-                            });
-                        }
-                        _ => {}
                     }
                 }
             }
-        }
-        Err(crate::cluster_client::ClusterClientError::ShardNotFound(_)) => {
-            return Html(
-                ErrorTemplate {
-                    nav_active: "queues",
-                    title: "Shard Not Found".to_string(),
-                    code: 404,
-                    message: format!("Shard '{}' not found in cluster", params.shard),
-                }
-                .render()
-                .unwrap_or_default(),
-            );
-        }
+            Err(e) => {
+                warn!(error = %e, "failed to collect queue query results");
+            }
+        },
         Err(e) => {
-            warn!(error = %e, "failed to query queue from shard");
+            warn!(error = %e, "failed to query queue from cluster");
         }
     }
 
@@ -685,34 +920,34 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
         shard_job_counts.insert(shard_id, 0);
     }
 
-    // Query job counts per shard using GROUP BY shard_id
-    let sql = "SELECT shard_id, COUNT(*) as cnt FROM jobs GROUP BY shard_id";
+    // Query all jobs with shard_id and count per shard in Rust
+    // (GROUP BY shard_id doesn't work well with the virtual shard_id column)
+    let sql = "SELECT shard_id FROM jobs";
+    let mut error: Option<String> = None;
 
     match state.query_engine.sql(sql).await {
-        Ok(df) => {
-            if let Ok(batches) = df.collect().await {
+        Ok(df) => match df.collect().await {
+            Ok(batches) => {
                 for batch in batches {
-                    let shard_col = batch.column_by_name("shard_id").and_then(|c| {
+                    if let Some(shard_col) = batch.column_by_name("shard_id").and_then(|c| {
                         c.as_any()
                             .downcast_ref::<datafusion::arrow::array::UInt32Array>()
-                    });
-                    let count_col = batch.column_by_name("cnt").and_then(|c| {
-                        c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::Int64Array>()
-                    });
-
-                    if let (Some(shard_ids), Some(counts)) = (shard_col, count_col) {
+                    }) {
                         for i in 0..batch.num_rows() {
-                            let shard_id = shard_ids.value(i);
-                            let job_count = counts.value(i) as usize;
-                            shard_job_counts.insert(shard_id, job_count);
+                            let shard_id = shard_col.value(i);
+                            *shard_job_counts.entry(shard_id).or_insert(0) += 1;
                         }
                     }
                 }
             }
-        }
+            Err(e) => {
+                warn!(error = %e, "failed to collect query results");
+                error = Some(format!("Query execution error: {}", e));
+            }
+        },
         Err(e) => {
             warn!(error = %e, "failed to query shards");
+            error = Some(format!("Query error: {}", e));
         }
     }
 
@@ -772,6 +1007,7 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
         total_shards,
         owned_shards,
         total_jobs,
+        error,
     };
 
     Html(
@@ -779,6 +1015,235 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
             .render()
             .unwrap_or_else(|e| format!("Template error: {}", e)),
     )
+}
+
+/// Maximum number of rows to return from SQL queries to avoid crashing the browser
+const SQL_RESULT_LIMIT: usize = 1000;
+
+async fn sql_handler(Query(params): Query<SqlQueryParams>) -> impl IntoResponse {
+    let template = SqlTemplate {
+        nav_active: "sql",
+        query: params.q,
+        has_result: false,
+        columns: Vec::new(),
+        rows: Vec::new(),
+        row_count: 0,
+        total_rows: 0,
+        truncated: false,
+        execution_time_ms: 0,
+        error: None,
+    };
+
+    Html(
+        template
+            .render()
+            .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
+}
+
+async fn sql_execute_handler(
+    State(state): State<AppState>,
+    Query(params): Query<SqlQueryParams>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    if params.q.trim().is_empty() {
+        return Html(
+            SqlResultTemplate {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: 0,
+                total_rows: 0,
+                truncated: false,
+                execution_time_ms: 0,
+                error: Some("Please enter a SQL query".to_string()),
+            }
+            .render()
+            .unwrap_or_default(),
+        );
+    }
+
+    // Execute the query
+    match state.query_engine.sql(&params.q).await {
+        Ok(df) => {
+            match df.collect().await {
+                Ok(batches) => {
+                    let execution_time_ms = start.elapsed().as_millis() as u64;
+
+                    // Extract column names from schema
+                    let columns: Vec<String> = if let Some(batch) = batches.first() {
+                        batch
+                            .schema()
+                            .fields()
+                            .iter()
+                            .map(|f| f.name().clone())
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+
+                    // Extract rows as strings, with limit
+                    let mut rows: Vec<Vec<String>> = Vec::new();
+                    let mut total_rows: usize = 0;
+
+                    for batch in &batches {
+                        for row_idx in 0..batch.num_rows() {
+                            total_rows += 1;
+                            if rows.len() >= SQL_RESULT_LIMIT {
+                                continue; // Keep counting but don't add more rows
+                            }
+
+                            let mut row: Vec<String> = Vec::new();
+                            for col_idx in 0..batch.num_columns() {
+                                let col = batch.column(col_idx);
+                                let value = array_value_to_string(col, row_idx);
+                                row.push(value);
+                            }
+                            rows.push(row);
+                        }
+                    }
+
+                    let truncated = total_rows > SQL_RESULT_LIMIT;
+                    let row_count = rows.len();
+
+                    Html(
+                        SqlResultTemplate {
+                            columns,
+                            rows,
+                            row_count,
+                            total_rows,
+                            truncated,
+                            execution_time_ms,
+                            error: None,
+                        }
+                        .render()
+                        .unwrap_or_default(),
+                    )
+                }
+                Err(e) => {
+                    let execution_time_ms = start.elapsed().as_millis() as u64;
+                    Html(
+                        SqlResultTemplate {
+                            columns: Vec::new(),
+                            rows: Vec::new(),
+                            row_count: 0,
+                            total_rows: 0,
+                            truncated: false,
+                            execution_time_ms,
+                            error: Some(format!("Execution error: {}", e)),
+                        }
+                        .render()
+                        .unwrap_or_default(),
+                    )
+                }
+            }
+        }
+        Err(e) => {
+            let execution_time_ms = start.elapsed().as_millis() as u64;
+            Html(
+                SqlResultTemplate {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    row_count: 0,
+                    total_rows: 0,
+                    truncated: false,
+                    execution_time_ms,
+                    error: Some(format!("Query error: {}", e)),
+                }
+                .render()
+                .unwrap_or_default(),
+            )
+        }
+    }
+}
+
+/// Convert an Arrow array value at a given index to a string representation
+fn array_value_to_string(array: &dyn datafusion::arrow::array::Array, index: usize) -> String {
+    use datafusion::arrow::array::*;
+    use datafusion::arrow::datatypes::DataType;
+
+    if array.is_null(index) {
+        return "NULL".to_string();
+    }
+
+    match array.data_type() {
+        DataType::Utf8 => array
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .map(|a| a.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::LargeUtf8 => array
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .map(|a| a.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::Int8 => array
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .map(|a| a.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::Int16 => array
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .map(|a| a.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::Int32 => array
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .map(|a| a.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::Int64 => array
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .map(|a| a.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::UInt8 => array
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .map(|a| a.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::UInt16 => array
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .map(|a| a.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::UInt32 => array
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .map(|a| a.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::UInt64 => array
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .map(|a| a.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::Float32 => array
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .map(|a| a.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::Float64 => array
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .map(|a| a.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::Boolean => array
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .map(|a| a.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::Binary => array
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .map(|a| format!("<{} bytes>", a.value(index).len()))
+            .unwrap_or_default(),
+        DataType::LargeBinary => array
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .map(|a| format!("<{} bytes>", a.value(index).len()))
+            .unwrap_or_default(),
+        _ => format!("<{}>", array.data_type()),
+    }
 }
 
 async fn not_found_handler() -> impl IntoResponse {
@@ -802,6 +1267,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/queues", get(queues_handler))
         .route("/queue", get(queue_handler))
         .route("/cluster", get(cluster_handler))
+        .route("/sql", get(sql_handler))
+        .route("/sql/execute", get(sql_execute_handler))
         .fallback(not_found_handler)
         .with_state(state)
 }

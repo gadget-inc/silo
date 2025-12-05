@@ -60,6 +60,7 @@ askama = "0.12"
 askama_axum = "0.4"
 tower-http = { version = "0.5", features = ["fs"] }
 rand = "0.8"
+datafusion-sql = "50"
 
 [features]
 default = []

@@ -209,7 +209,8 @@ impl SiloService {
                 Ok(t.to_string())
             }
             (true, None) => Err(Status::invalid_argument("tenant id required")),
-            (false, Some(_)) => Err(Status::invalid_argument("tenant id not accepted")),
+            // When tenancy is disabled, accept but ignore any provided tenant
+            (false, Some(_)) => Ok("-".to_string()),
             (false, None) => Ok("-".to_string()),
         }
     }
@@ -557,7 +558,6 @@ impl Silo for SiloService {
     async fn query(&self, req: Request<QueryRequest>) -> Result<Response<QueryResponse>, Status> {
         let r = req.into_inner();
         let shard = self.shard_with_redirect(r.shard).await?;
-        let _tenant = self.validate_tenant(r.tenant.as_deref())?;
 
         // Get the cached query engine for this shard
         let query_engine = shard.query_engine();
@@ -635,7 +635,6 @@ impl Silo for SiloService {
     ) -> Result<Response<Self::QueryArrowStream>, Status> {
         let r = req.into_inner();
         let shard = self.shard_with_redirect(r.shard).await?;
-        let _tenant = self.validate_tenant(r.tenant.as_deref())?;
 
         // Get the cached query engine for this shard
         let query_engine = shard.query_engine();

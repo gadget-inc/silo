@@ -1,7 +1,3 @@
-//! WebUI regression tests
-//!
-//! Tests for the web UI HTTP handlers and rendering.
-
 mod test_helpers;
 
 use axum::{
@@ -149,6 +145,43 @@ async fn test_job_view_not_found() {
 }
 
 #[silo::test]
+async fn test_job_view_without_shard_param() {
+    // Test that job lookup works without specifying a shard (searches across cluster)
+    let (_tmp, state) = setup_multi_shard_state(2).await;
+
+    // Enqueue a job on shard 1 (not shard 0)
+    let shard1 = state.factory.get("1").expect("shard 1");
+    let job_id = shard1
+        .enqueue(
+            "-",
+            Some("job-without-shard-param".to_string()),
+            30,
+            test_helpers::now_ms(),
+            None,
+            serde_json::json!({"test": "value"}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("enqueue");
+
+    // Request job WITHOUT specifying shard - should find it by searching cluster
+    let (status, body) = make_request(state, "GET", &format!("/job?id={}", job_id)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains(&job_id),
+        "job detail should show the job found via cluster search"
+    );
+    assert!(body.contains("P30"), "job detail should show priority");
+    // Verify it found the correct shard
+    assert!(
+        body.contains("Shard") && body.contains("1"),
+        "should display shard 1"
+    );
+}
+
+#[silo::test]
 async fn test_job_cancel() {
     let (_tmp, state) = setup_test_state().await;
 
@@ -216,8 +249,8 @@ async fn test_queues_view_renders() {
 async fn test_queue_view_renders() {
     let (_tmp, state) = setup_test_state().await;
 
-    // Queue view now requires shard parameter
-    let (status, body) = make_request(state, "GET", "/queue?shard=0&name=test-queue").await;
+    // Queue view fetches from all shards, only needs name parameter
+    let (status, body) = make_request(state, "GET", "/queue?name=test-queue").await;
 
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("test-queue"));
@@ -304,10 +337,6 @@ async fn test_404_handler() {
     assert_eq!(status, StatusCode::OK); // Fallback renders error page
     assert!(body.contains("404") || body.contains("Not Found"));
 }
-
-// =============================================================================
-// Multi-shard regression tests
-// =============================================================================
 
 /// Helper to create a multi-shard test AppState
 async fn setup_multi_shard_state(num_shards: usize) -> (tempfile::TempDir, AppState) {
@@ -533,4 +562,195 @@ async fn test_queues_page_shows_queues_from_all_shards() {
     // Note: The exact queue names may vary based on implementation
     // This test verifies the page renders successfully with multi-shard data
     assert!(body.contains("Queues"), "queues page should render");
+}
+
+#[silo::test]
+async fn test_job_view_with_wrong_shard_falls_back_to_cluster_search() {
+    // Test that job lookup falls back to cluster-wide search if the provided shard is wrong.
+    // This handles the case where shard info in a URL is stale (e.g., after shard rebalancing).
+    let (_tmp, state) = setup_multi_shard_state(3).await;
+
+    // Enqueue a job on shard 2
+    let shard2 = state.factory.get("2").expect("shard 2");
+    let job_id = shard2
+        .enqueue(
+            "-",
+            Some("job-on-shard-2".to_string()),
+            30,
+            test_helpers::now_ms(),
+            None,
+            serde_json::json!({"test": "value"}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("enqueue");
+
+    // Request job with WRONG shard (shard 0 instead of shard 2)
+    // The handler should fall back to cluster search and find it on shard 2
+    let (status, body) = make_request(state, "GET", &format!("/job?shard=0&id={}", job_id)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains(&job_id),
+        "job detail should show the job found via cluster search fallback"
+    );
+    assert!(body.contains("P30"), "job detail should show priority");
+    // The displayed shard should be the actual shard (2), not the requested one (0)
+    assert!(
+        body.contains("Shard") && body.contains("2"),
+        "should display actual shard 2 where job was found"
+    );
+}
+
+#[silo::test]
+async fn test_cancel_job_with_wrong_shard_falls_back_to_cluster_search() {
+    // Test that job cancel falls back to cluster-wide search if the provided shard is wrong.
+    let (_tmp, state) = setup_multi_shard_state(3).await;
+
+    // Enqueue a job on shard 2
+    let shard2 = state.factory.get("2").expect("shard 2");
+    let job_id = shard2
+        .enqueue(
+            "-",
+            Some("job-cancel-wrong-shard".to_string()),
+            30,
+            test_helpers::now_ms() + 100000, // Future time so it stays scheduled
+            None,
+            serde_json::json!({}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("enqueue");
+
+    // Verify job is scheduled
+    let status_before = shard2
+        .get_job_status("-", &job_id)
+        .await
+        .expect("get status");
+    assert!(status_before.is_some());
+    assert_eq!(
+        status_before.unwrap().kind,
+        silo::job::JobStatusKind::Scheduled
+    );
+
+    // Cancel via HTTP with WRONG shard (shard 0 instead of shard 2)
+    let (status, body) = make_request(
+        state.clone(),
+        "POST",
+        &format!("/job/cancel?shard=0&id={}", job_id),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("Cancelled"),
+        "cancel should succeed via cluster search fallback"
+    );
+
+    // Verify job is cancelled on actual shard
+    let status_after = shard2
+        .get_job_status("-", &job_id)
+        .await
+        .expect("get status");
+    assert!(status_after.is_some());
+    assert_eq!(
+        status_after.unwrap().kind,
+        silo::job::JobStatusKind::Cancelled
+    );
+}
+
+#[silo::test]
+async fn test_sql_page_renders() {
+    let (_tmp, state) = setup_test_state().await;
+    let (status, body) = make_request(state, "GET", "/sql").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("SQL Console"),
+        "body should contain 'SQL Console'"
+    );
+    assert!(
+        body.contains("With great power"),
+        "body should contain warning"
+    );
+}
+
+#[silo::test]
+async fn test_sql_execute_returns_results() {
+    let (_tmp, state) = setup_test_state().await;
+
+    // Enqueue a job first
+    let shard = state.factory.get("0").expect("shard 0");
+    let _job_id = shard
+        .enqueue(
+            "-",
+            Some("sql-test-job".to_string()),
+            50,
+            test_helpers::now_ms() + 10000,
+            None,
+            serde_json::json!({}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("enqueue");
+
+    // Execute SQL query
+    let (status, body) = make_request(
+        state,
+        "GET",
+        "/sql/execute?q=SELECT%20id%20FROM%20jobs%20LIMIT%2010",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Results"), "body should contain 'Results'");
+    assert!(body.contains("sql-test-job"), "body should contain job id");
+}
+
+#[silo::test]
+async fn test_sql_execute_shows_error_for_invalid_query() {
+    let (_tmp, state) = setup_test_state().await;
+
+    let (status, body) = make_request(
+        state,
+        "GET",
+        "/sql/execute?q=SELECT%20*%20FROM%20nonexistent_table",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("error") || body.contains("Error"),
+        "body should contain error"
+    );
+}
+
+#[silo::test]
+async fn test_sql_execute_empty_query_shows_error() {
+    let (_tmp, state) = setup_test_state().await;
+
+    let (status, body) = make_request(state, "GET", "/sql/execute?q=").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("Please enter a SQL query"),
+        "body should prompt for query"
+    );
+}
+
+#[silo::test]
+async fn test_sql_page_shows_query_in_url() {
+    let (_tmp, state) = setup_test_state().await;
+
+    // The page should accept a query parameter to pre-fill the textarea
+    let (status, body) = make_request(state, "GET", "/sql?q=SELECT%20*%20FROM%20jobs").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("SELECT * FROM jobs"),
+        "body should contain the query from URL"
+    );
 }

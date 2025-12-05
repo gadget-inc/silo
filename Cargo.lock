@@ -5364,6 +5364,7 @@ dependencies = [
  "criterion",
  "crossbeam-skiplist",
  "datafusion",
+ "datafusion-sql",
  "etcd-client",
  "http-body-util",
  "hyper 1.7.0",

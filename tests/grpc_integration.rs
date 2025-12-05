@@ -39,7 +39,13 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
 
         // Start server
-        let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), None, silo::settings::AppConfig::load(None).unwrap(), shutdown_rx));
+        let server = tokio::spawn(run_grpc_with_reaper(
+            listener,
+            factory.clone(),
+            None,
+            silo::settings::AppConfig::load(None).unwrap(),
+            shutdown_rx,
+        ));
 
         // Connect real client
         let endpoint = format!("http://{}", addr);
@@ -169,7 +175,13 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
             tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), None, silo::settings::AppConfig::load(None).unwrap(), shutdown_rx));
+        let server = tokio::spawn(run_grpc_with_reaper(
+            listener,
+            factory.clone(),
+            None,
+            silo::settings::AppConfig::load(None).unwrap(),
+            shutdown_rx,
+        ));
 
         let endpoint = format!("http://{}", addr);
         let channel = tonic::transport::Endpoint::new(endpoint.clone())?
@@ -296,7 +308,13 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
             tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), None, silo::settings::AppConfig::load(None).unwrap(), shutdown_rx));
+        let server = tokio::spawn(run_grpc_with_reaper(
+            listener,
+            factory.clone(),
+            None,
+            silo::settings::AppConfig::load(None).unwrap(),
+            shutdown_rx,
+        ));
 
         let endpoint = format!("http://{}", addr);
         let channel = tonic::transport::Endpoint::new(endpoint.clone())?
@@ -416,7 +434,13 @@ async fn grpc_server_query_errors() -> anyhow::Result<()> {
             tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), None, silo::settings::AppConfig::load(None).unwrap(), shutdown_rx));
+        let server = tokio::spawn(run_grpc_with_reaper(
+            listener,
+            factory.clone(),
+            None,
+            silo::settings::AppConfig::load(None).unwrap(),
+            shutdown_rx,
+        ));
 
         let endpoint = format!("http://{}", addr);
         let channel = tonic::transport::Endpoint::new(endpoint.clone())?
@@ -513,7 +537,13 @@ async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
             tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), None, silo::settings::AppConfig::load(None).unwrap(), shutdown_rx));
+        let server = tokio::spawn(run_grpc_with_reaper(
+            listener,
+            factory.clone(),
+            None,
+            silo::settings::AppConfig::load(None).unwrap(),
+            shutdown_rx,
+        ));
 
         let endpoint = format!("http://{}", addr);
         let channel = tonic::transport::Endpoint::new(endpoint.clone())?
@@ -605,7 +635,13 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
             tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), None, silo::settings::AppConfig::load(None).unwrap(), shutdown_rx));
+        let server = tokio::spawn(run_grpc_with_reaper(
+            listener,
+            factory.clone(),
+            None,
+            silo::settings::AppConfig::load(None).unwrap(),
+            shutdown_rx,
+        ));
 
         let endpoint = format!("http://{}", addr);
         let channel = tonic::transport::Endpoint::new(endpoint.clone())?
@@ -691,6 +727,202 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Test that the Query endpoint doesn't require a tenant parameter and can query all data.
+/// This validates that admin/operator queries work without tenant restrictions.
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_query_without_tenant() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let tmp = tempfile::tempdir()?;
+        let template = DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+        };
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let factory = ShardFactory::new(template, rate_limiter);
+        let _ = factory.open(0).await?;
+        let factory = Arc::new(factory);
+
+        let listener =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+        let server = tokio::spawn(run_grpc_with_reaper(
+            listener,
+            factory.clone(),
+            None,
+            silo::settings::AppConfig::load(None).unwrap(),
+            shutdown_rx,
+        ));
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint.clone())?
+            .connect()
+            .await?;
+        let mut client = SiloClient::new(channel);
+
+        // Enqueue jobs via gRPC (will use default tenant "-")
+        for i in 0..3 {
+            let enq = EnqueueRequest {
+                shard: 0,
+                id: format!("job{}", i),
+                priority: 10,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(JsonValueBytes {
+                    data: b"{}".to_vec(),
+                }),
+                limits: vec![],
+                tenant: None, // Will use default tenant
+                metadata: std::collections::HashMap::new(),
+            };
+            let _ = client.enqueue(enq).await?;
+        }
+
+        // Query without specifying tenant - should work and return all jobs
+        let query_resp = client
+            .query(QueryRequest {
+                shard: 0,
+                sql: "SELECT id FROM jobs ORDER BY id".to_string(),
+                tenant: None, // No tenant required for query
+            })
+            .await?
+            .into_inner();
+
+        // Should get all 3 jobs
+        assert_eq!(
+            query_resp.row_count, 3,
+            "expected 3 rows from query without tenant"
+        );
+
+        // Can also query with SQL tenant filter
+        let query_resp = client
+            .query(QueryRequest {
+                shard: 0,
+                sql: "SELECT id FROM jobs WHERE tenant = '-' ORDER BY id".to_string(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+
+        assert_eq!(
+            query_resp.row_count, 3,
+            "expected 3 rows with tenant filter in SQL"
+        );
+
+        let _ = shutdown_tx.send(());
+        let join_result = server.await;
+        match join_result {
+            Ok(inner) => {
+                if let Err(e) = inner {
+                    return Err(anyhow::anyhow!(e.to_string()));
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        }
+        Ok(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// Test that QueryArrow endpoint works without tenant parameter.
+/// This is the streaming Arrow IPC endpoint used by ClusterQueryEngine for remote shard queries.
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_query_arrow_without_tenant() -> anyhow::Result<()> {
+    use tokio_stream::StreamExt;
+
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let tmp = tempfile::tempdir()?;
+        let template = DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+        };
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let factory = ShardFactory::new(template, rate_limiter);
+        let _ = factory.open(0).await?;
+        let factory = Arc::new(factory);
+
+        let listener =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+        let server = tokio::spawn(run_grpc_with_reaper(
+            listener,
+            factory.clone(),
+            None,
+            silo::settings::AppConfig::load(None).unwrap(),
+            shutdown_rx,
+        ));
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint.clone())?
+            .connect()
+            .await?;
+        let mut client = SiloClient::new(channel);
+
+        // Enqueue jobs via gRPC
+        for i in 0..2 {
+            let enq = EnqueueRequest {
+                shard: 0,
+                id: format!("arrow_job{}", i),
+                priority: 10,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(JsonValueBytes {
+                    data: b"{}".to_vec(),
+                }),
+                limits: vec![],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+            };
+            let _ = client.enqueue(enq).await?;
+        }
+
+        // Use QueryArrow without tenant parameter
+        let response = client
+            .query_arrow(QueryArrowRequest {
+                shard: 0,
+                sql: "SELECT id FROM jobs ORDER BY id".to_string(),
+                tenant: None, // No tenant required
+            })
+            .await?;
+
+        let mut stream = response.into_inner();
+        let mut total_messages = 0;
+
+        while let Some(msg) = stream.next().await {
+            let _arrow_msg = msg?;
+            total_messages += 1;
+        }
+
+        // Should have received at least one Arrow IPC message with the results
+        assert!(
+            total_messages >= 1,
+            "expected at least one Arrow IPC message"
+        );
+
+        let _ = shutdown_tx.send(());
+        let join_result = server.await;
+        match join_result {
+            Ok(inner) => {
+                if let Err(e) = inner {
+                    return Err(anyhow::anyhow!(e.to_string()));
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        }
+        Ok(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_health_check_returns_serving() -> anyhow::Result<()> {
     let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
@@ -710,7 +942,13 @@ async fn grpc_health_check_returns_serving() -> anyhow::Result<()> {
             tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), None, silo::settings::AppConfig::load(None).unwrap(), shutdown_rx));
+        let server = tokio::spawn(run_grpc_with_reaper(
+            listener,
+            factory.clone(),
+            None,
+            silo::settings::AppConfig::load(None).unwrap(),
+            shutdown_rx,
+        ));
 
         let endpoint = format!("http://{}", addr);
         let channel = tonic::transport::Endpoint::new(endpoint.clone())?

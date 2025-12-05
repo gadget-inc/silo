@@ -1791,6 +1791,39 @@ impl JobStoreShard {
         Ok(out)
     }
 
+    /// Scan all jobs across ALL tenants, returning (tenant, job_id) pairs.
+    /// Used for admin queries that need cluster-wide visibility.
+    pub async fn scan_all_jobs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, JobStoreShardError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        // Prefix: jobs/ (all tenants)
+        let prefix = "jobs/";
+        let start = prefix.as_bytes().to_vec();
+        let mut end = start.clone();
+        end.push(0xFF);
+        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..=end).await?;
+        let mut out: Vec<(String, String)> = Vec::with_capacity(limit);
+        while out.len() < limit {
+            let maybe = iter.next().await?;
+            let Some(kv) = maybe else { break };
+            let key_str = String::from_utf8_lossy(&kv.key);
+            // key format: jobs/<tenant>/<job-id>
+            let parts: Vec<&str> = key_str.split('/').collect();
+            if parts.len() >= 3 && parts[0] == "jobs" {
+                let tenant = crate::keys::decode_tenant(parts[1]);
+                let job_id = parts[2].to_string();
+                if !job_id.is_empty() {
+                    out.push((tenant, job_id));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Scan newest-first job IDs by status using the time-ordered index.
     pub async fn scan_jobs_by_status(
         &self,
@@ -1820,6 +1853,48 @@ impl JobStoreShard {
             if let Some(job_id) = key_str.rsplit('/').next() {
                 if !job_id.is_empty() {
                     out.push(job_id.to_string());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Scan newest-first job IDs by status across ALL tenants, returning (tenant, job_id) pairs.
+    /// Used for admin queries that need cluster-wide visibility.
+    pub async fn scan_all_jobs_by_status(
+        &self,
+        status: JobStatusKind,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, JobStoreShardError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        // Scan all tenants' status indexes: idx/status_ts/
+        // We need to scan each status across all tenants, so we use a broader prefix
+        let prefix = format!("idx/status_ts/");
+        let start = prefix.as_bytes().to_vec();
+        let mut end = start.clone();
+        end.push(0xFF);
+        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..=end).await?;
+        let mut out: Vec<(String, String)> = Vec::with_capacity(limit);
+        let status_str = status.as_str();
+        while out.len() < limit {
+            let maybe = iter.next().await?;
+            let Some(kv) = maybe else { break };
+            let key_str = String::from_utf8_lossy(&kv.key);
+            // key format: idx/status_ts/<tenant>/<status>/<inv_ts>/<job-id>
+            let parts: Vec<&str> = key_str.split('/').collect();
+            if parts.len() >= 5 && parts[0] == "idx" && parts[1] == "status_ts" {
+                let tenant_enc = parts[2];
+                let key_status = parts[3];
+                // Only include if status matches
+                if key_status == status_str {
+                    let tenant = crate::keys::decode_tenant(tenant_enc);
+                    if let Some(job_id) = parts.last() {
+                        if !job_id.is_empty() {
+                            out.push((tenant, job_id.to_string()));
+                        }
+                    }
                 }
             }
         }
@@ -1856,10 +1931,6 @@ impl JobStoreShard {
         }
         Ok(out)
     }
-
-    // =========================================================================
-    // Floating Concurrency Limit Management
-    // =========================================================================
 
     /// Get or create the floating limit state for a given queue key.
     /// Returns the state and whether it was newly created.
