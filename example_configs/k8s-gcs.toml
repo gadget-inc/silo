@@ -1,15 +1,33 @@
 # Example config for Kubernetes deployment with Google Cloud Storage
 # Uses K8s Lease-based coordination and GCS for object storage
 # WAL is stored locally for low-latency writes, main data in GCS
+#
+# Environment Variable Substitution:
+# Silo supports ${VAR} and ${VAR:-default} syntax in config values.
+# This is useful for injecting Kubernetes Downward API values.
 
 [server]
+# Bind to all interfaces on port 50051
 grpc_addr = "0.0.0.0:50051"
 
 [coordination]
 backend = "k8s"
 cluster_prefix = "silo-prod"
 lease_ttl_secs = 15
-k8s_namespace = "silo"
+k8s_namespace = "${NAMESPACE:-default}"
+
+# IMPORTANT: advertised_grpc_addr is the address other nodes use to connect.
+# In Kubernetes, use the pod IP (exposed via Downward API).
+# If not set, defaults to grpc_addr which won't work if you bind to 0.0.0.0.
+#
+# Expose POD_IP in your deployment using the Downward API:
+#   env:
+#     - name: POD_IP
+#       valueFrom:
+#         fieldRef:
+#           fieldPath: status.podIP
+#
+advertised_grpc_addr = "${POD_IP}:50051"
 
 [webui]
 enabled = true

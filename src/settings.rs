@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::fs;
 use std::path::Path;
 
@@ -182,6 +183,17 @@ pub struct CoordinationConfig {
     #[serde(default = "default_num_shards")]
     pub num_shards: u32,
 
+    /// The gRPC address that other nodes should use to connect to this node.
+    /// If not set, falls back to server.grpc_addr.
+    ///
+    /// This is useful when the bind address (e.g., 0.0.0.0:50051) differs from
+    /// the routable address (e.g., pod-ip:50051 or service-name:50051).
+    ///
+    /// In Kubernetes, this should typically be set to the pod IP or a headless
+    /// service DNS name like "$(POD_NAME).my-service.$(NAMESPACE).svc.cluster.local:50051".
+    #[serde(default)]
+    pub advertised_grpc_addr: Option<String>,
+
     // ---- etcd-specific settings ----
     /// List of etcd endpoints, e.g. ["http://127.0.0.1:2379"]
     #[serde(default = "default_etcd_endpoints")]
@@ -200,6 +212,7 @@ impl Default for CoordinationConfig {
             cluster_prefix: default_cluster_prefix(),
             lease_ttl_secs: default_lease_ttl_secs(),
             num_shards: default_num_shards(),
+            advertised_grpc_addr: None,
             etcd_endpoints: default_etcd_endpoints(),
             k8s_namespace: default_k8s_namespace(),
         }
@@ -268,6 +281,71 @@ pub enum Backend {
     Url,
 }
 
+/// Expand environment variables in a string.
+///
+/// Supports two syntaxes:
+/// - `${VAR}` - expands to the value of VAR, or empty string if not set
+/// - `${VAR:-default}` - expands to the value of VAR, or "default" if not set
+///
+/// This is useful for Kubernetes deployments where you need to inject
+/// values like pod IP via the Downward API.
+fn expand_env_vars(input: &str) -> Cow<'_, str> {
+    use std::env;
+
+    // Quick check: if no `${` exists, return as-is
+    if !input.contains("${") {
+        return Cow::Borrowed(input);
+    }
+
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '$' && chars.peek() == Some(&'{') {
+            chars.next(); // consume '{'
+
+            // Find the closing '}'
+            let mut var_content = String::new();
+            let mut found_close = false;
+            for ch in chars.by_ref() {
+                if ch == '}' {
+                    found_close = true;
+                    break;
+                }
+                var_content.push(ch);
+            }
+
+            if found_close {
+                // Check for default value syntax: VAR:-default
+                let (var_name, default_value) = if let Some(pos) = var_content.find(":-") {
+                    (&var_content[..pos], Some(&var_content[pos + 2..]))
+                } else {
+                    (var_content.as_str(), None)
+                };
+
+                match env::var(var_name) {
+                    Ok(val) => result.push_str(&val),
+                    Err(_) => {
+                        if let Some(default) = default_value {
+                            result.push_str(default);
+                        }
+                        // If no default and var not set, expand to empty string
+                    }
+                }
+            } else {
+                // Malformed: no closing brace, output as-is
+                result.push('$');
+                result.push('{');
+                result.push_str(&var_content);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    Cow::Owned(result)
+}
+
 impl AppConfig {
     pub fn load(path: Option<&Path>) -> anyhow::Result<Self> {
         let default = Self {
@@ -291,7 +369,10 @@ impl AppConfig {
         match path {
             Some(p) => {
                 let data = fs::read_to_string(p)?;
-                let cfg: Self = toml::from_str(&data)?;
+                // Expand environment variables in the config file before parsing.
+                // This allows using ${VAR} or ${VAR:-default} syntax in config values.
+                let expanded = expand_env_vars(&data);
+                let cfg: Self = toml::from_str(&expanded)?;
                 Ok(cfg)
             }
             None => Ok(default),
@@ -312,4 +393,12 @@ impl GubernatorSettings {
                 request_timeout_ms: self.request_timeout_ms,
             })
     }
+}
+
+/// Expand environment variables in a string (public for testing).
+///
+/// See [`expand_env_vars`] for details.
+#[doc(hidden)]
+pub fn expand_env_vars_for_test(input: &str) -> String {
+    expand_env_vars(input).into_owned()
 }

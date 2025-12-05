@@ -1,10 +1,10 @@
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
-use silo::settings::{
-    AppConfig, Backend, DatabaseTemplate, GubernatorSettings, LoggingConfig, WebUiConfig,
-};
 use silo::job_store_shard::JobStoreShard;
-use silo::settings::{DatabaseConfig, WalConfig};
+use silo::settings::{
+    expand_env_vars_for_test, AppConfig, Backend, DatabaseConfig, DatabaseTemplate,
+    GubernatorSettings, LoggingConfig, WalConfig, WebUiConfig,
+};
 
 #[silo::test]
 async fn open_fs_db_from_config() {
@@ -348,4 +348,78 @@ async fn wal_config_is_local_storage_detection() {
         !url_wal.is_local_storage(),
         "Url backend should not be local"
     );
+}
+
+// =============================================================================
+// Environment Variable Expansion Tests
+// =============================================================================
+
+#[test]
+fn expand_env_vars_no_vars() {
+    let input = "hello world";
+    assert_eq!(expand_env_vars_for_test(input), "hello world");
+}
+
+#[test]
+fn expand_env_vars_simple_var() {
+    std::env::set_var("TEST_SILO_VAR", "test_value");
+    let input = "prefix-${TEST_SILO_VAR}-suffix";
+    assert_eq!(expand_env_vars_for_test(input), "prefix-test_value-suffix");
+    std::env::remove_var("TEST_SILO_VAR");
+}
+
+#[test]
+fn expand_env_vars_missing_var() {
+    std::env::remove_var("TEST_SILO_MISSING");
+    let input = "prefix-${TEST_SILO_MISSING}-suffix";
+    assert_eq!(expand_env_vars_for_test(input), "prefix--suffix");
+}
+
+#[test]
+fn expand_env_vars_default_value_used() {
+    std::env::remove_var("TEST_SILO_DEFAULT");
+    let input = "prefix-${TEST_SILO_DEFAULT:-fallback}-suffix";
+    assert_eq!(expand_env_vars_for_test(input), "prefix-fallback-suffix");
+}
+
+#[test]
+fn expand_env_vars_default_value_not_used() {
+    std::env::set_var("TEST_SILO_DEFAULT2", "actual_value");
+    let input = "prefix-${TEST_SILO_DEFAULT2:-fallback}-suffix";
+    assert_eq!(
+        expand_env_vars_for_test(input),
+        "prefix-actual_value-suffix"
+    );
+    std::env::remove_var("TEST_SILO_DEFAULT2");
+}
+
+#[test]
+fn expand_env_vars_multiple_vars() {
+    std::env::set_var("TEST_SILO_A", "aaa");
+    std::env::set_var("TEST_SILO_B", "bbb");
+    let input = "${TEST_SILO_A}:${TEST_SILO_B}";
+    assert_eq!(expand_env_vars_for_test(input), "aaa:bbb");
+    std::env::remove_var("TEST_SILO_A");
+    std::env::remove_var("TEST_SILO_B");
+}
+
+#[test]
+fn expand_env_vars_unclosed_brace() {
+    let input = "prefix-${UNCLOSED-suffix";
+    // Malformed syntax is kept as-is
+    assert_eq!(expand_env_vars_for_test(input), "prefix-${UNCLOSED-suffix");
+}
+
+#[test]
+fn expand_env_vars_dollar_without_brace() {
+    let input = "cost is $50";
+    assert_eq!(expand_env_vars_for_test(input), "cost is $50");
+}
+
+#[test]
+fn expand_env_vars_real_k8s_example() {
+    std::env::set_var("POD_IP", "10.0.0.5");
+    let input = "${POD_IP}:50051";
+    assert_eq!(expand_env_vars_for_test(input), "10.0.0.5:50051");
+    std::env::remove_var("POD_IP");
 }

@@ -71,10 +71,18 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize coordination - coordinator will open/close shards as ownership changes
     let node_id = uuid::Uuid::new_v4().to_string();
+    // Use advertised_grpc_addr if set, otherwise fall back to the bind address.
+    // This allows separating the bind address (e.g., 0.0.0.0:50051) from the
+    // address other nodes should use to connect (e.g., pod-ip:50051).
+    let advertised_grpc_addr = cfg
+        .coordination
+        .advertised_grpc_addr
+        .as_ref()
+        .unwrap_or(&cfg.server.grpc_addr);
     let coord_result = create_coordinator(
         &cfg.coordination,
         &node_id,
-        &cfg.server.grpc_addr,
+        advertised_grpc_addr,
         cfg.coordination.num_shards,
         factory.clone(),
     )
