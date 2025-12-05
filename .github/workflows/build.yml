@@ -3,6 +3,7 @@ name: Build
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -20,12 +21,23 @@ jobs:
         shell: bash
         run: cargo build --release
 
-      - name: Upload all binaries (combined)
+      - name: Upload silo binary
         uses: actions/upload-artifact@v4
         with:
-          name: silo-all-linux-x86_64
-          path: |
-            target/release/silo
-            target/release/silo-bench
-            target/release/silo-sim
+          name: silo-linux-x86_64
+          path: target/release/silo
+          if-no-files-found: error
+
+      - name: Upload silo-bench binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: silo-bench-linux-x86_64
+          path: target/release/silo-bench
+          if-no-files-found: error
+
+      - name: Upload silo-sim binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: silo-sim-linux-x86_64
+          path: target/release/silo-sim
           if-no-files-found: error
