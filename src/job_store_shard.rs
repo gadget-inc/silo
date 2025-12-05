@@ -1613,7 +1613,7 @@ impl JobStoreShard {
                     let span =
                         info_span!("concurrency.release", queue = %queue, finished_task_id = %tid);
                     let _g = span.enter();
-                    info!("released ticket for finished task");
+                    debug!("released ticket for finished task");
                     self.concurrency
                         .counts()
                         .record_release(tenant, &queue, &tid);

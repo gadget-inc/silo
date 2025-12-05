@@ -140,7 +140,7 @@ impl ShardFactory {
                     tracing::warn!(shard = shard_number, path = %wal_path, error = %e, "failed to delete shard WAL directory");
                 }
             } else {
-                tracing::info!(shard = shard_number, path = %wal_path, "deleted shard WAL directory");
+                tracing::debug!(shard = shard_number, path = %wal_path, "deleted shard WAL directory");
             }
         }
 
