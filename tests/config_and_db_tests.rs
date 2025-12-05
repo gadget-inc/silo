@@ -4,10 +4,7 @@ use silo::settings::{
     AppConfig, Backend, DatabaseTemplate, GubernatorSettings, LoggingConfig, WebUiConfig,
 };
 use silo::job_store_shard::JobStoreShard;
-use silo::settings::{
-    AppConfig, Backend, DatabaseConfig, DatabaseTemplate, GubernatorSettings, WalConfig,
-    WebUiConfig,
-};
+use silo::settings::{DatabaseConfig, WalConfig};
 
 #[silo::test]
 async fn open_fs_db_from_config() {

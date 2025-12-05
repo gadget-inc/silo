@@ -34,7 +34,7 @@ use crate::settings::DatabaseConfig;
 use crate::storage::{resolve_object_store, StorageError};
 use crate::task::GubernatorRateLimitData;
 use crate::task_broker::{BrokerTask, TaskBroker};
-use tracing::{debug, info, info_span};
+use tracing::{debug, info_span};
 
 // Re-export commonly used types from task module for convenience
 pub use crate::task::{

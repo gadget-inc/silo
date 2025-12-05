@@ -16,7 +16,7 @@ use axum::{
     Router,
 };
 use tokio::sync::broadcast;
-use tracing::{info, warn};
+use tracing::{warn};
 
 use crate::cluster_client::ClusterClient;
 use crate::cluster_query::ClusterQueryEngine;
