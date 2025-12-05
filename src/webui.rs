@@ -19,6 +19,7 @@ use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 use crate::cluster_client::ClusterClient;
+use crate::cluster_query::ClusterQueryEngine;
 use crate::coordination::Coordinator;
 use crate::factory::ShardFactory;
 use crate::settings::AppConfig;
@@ -28,6 +29,7 @@ pub struct AppState {
     pub factory: Arc<ShardFactory>,
     pub coordinator: Option<Arc<dyn Coordinator>>,
     pub cluster_client: Arc<ClusterClient>,
+    pub query_engine: Arc<ClusterQueryEngine>,
 }
 
 #[derive(Clone)]
@@ -215,34 +217,52 @@ fn format_timestamp(ms: i64) -> String {
 async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
     let mut all_jobs: Vec<JobRow> = Vec::new();
 
+    // Use cluster query engine for proper cross-shard aggregation
     let sql = "SELECT id, status_kind, enqueue_time_ms, priority FROM jobs WHERE status_kind = 'Scheduled' ORDER BY enqueue_time_ms ASC LIMIT 100";
 
-    // Query all shards in the cluster
-    match state.cluster_client.query_all_shards(sql).await {
-        Ok(results) => {
-            for result in results {
-                let shard_name = result.shard_id.to_string();
-                for row in result.rows {
-                    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&row.data) {
-                        all_jobs.push(JobRow {
-                            id: json["id"].as_str().unwrap_or("").to_string(),
-                            shard: shard_name.clone(),
-                            status: json["status_kind"].as_str().unwrap_or("").to_string(),
-                            priority: json["priority"].as_u64().unwrap_or(50) as u8,
-                            scheduled_for: format_timestamp(
-                                json["enqueue_time_ms"].as_i64().unwrap_or(0),
-                            ),
-                        });
+    match state.query_engine.sql(sql).await {
+        Ok(df) => {
+            if let Ok(batches) = df.collect().await {
+                for batch in batches {
+                    let id_col = batch.column_by_name("id").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::StringArray>()
+                    });
+                    let status_col = batch.column_by_name("status_kind").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::StringArray>()
+                    });
+                    let time_col = batch.column_by_name("enqueue_time_ms").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                    });
+                    let priority_col = batch.column_by_name("priority").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::UInt8Array>()
+                    });
+
+                    if let (Some(ids), Some(statuses), Some(times), Some(priorities)) =
+                        (id_col, status_col, time_col, priority_col)
+                    {
+                        for i in 0..batch.num_rows() {
+                            all_jobs.push(JobRow {
+                                id: ids.value(i).to_string(),
+                                shard: "cluster".to_string(), // No longer per-shard
+                                status: statuses.value(i).to_string(),
+                                priority: priorities.value(i),
+                                scheduled_for: format_timestamp(times.value(i)),
+                            });
+                        }
                     }
                 }
             }
         }
         Err(e) => {
-            warn!(error = %e, "failed to query shards");
+            warn!(error = %e, "failed to query jobs from cluster");
         }
     }
 
-    all_jobs.sort_by(|a, b| a.scheduled_for.cmp(&b.scheduled_for));
+    // Already sorted by ORDER BY clause
 
     // Get total shard count from coordinator if available
     let shard_count = if let Some(coordinator) = &state.coordinator {
@@ -445,27 +465,43 @@ async fn cancel_job_handler(
 }
 
 async fn queues_handler(State(state): State<AppState>) -> impl IntoResponse {
-    // Key: (shard_id, queue_name) -> (holders, waiters)
-    let mut all_queues: HashMap<(String, String), (usize, usize)> = HashMap::new();
+    // Key: queue_name -> (holders, waiters)
+    let mut all_queues: HashMap<String, (usize, usize)> = HashMap::new();
 
-    // Query all shards for queue data using SQL
-    let sql = "SELECT queue_name, entry_type FROM queues";
+    // Use cluster query engine for proper aggregation across all shards
+    let sql = "SELECT queue_name, entry_type, COUNT(*) as cnt FROM queues GROUP BY queue_name, entry_type";
 
-    match state.cluster_client.query_all_shards(sql).await {
-        Ok(results) => {
-            for result in results {
-                let shard_name = result.shard_id.to_string();
-                for row in result.rows {
-                    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&row.data) {
-                        let queue_name = json["queue_name"].as_str().unwrap_or("").to_string();
-                        let entry_type = json["entry_type"].as_str().unwrap_or("");
-                        if !queue_name.is_empty() {
-                            let key = (shard_name.clone(), queue_name);
-                            let entry = all_queues.entry(key).or_insert((0, 0));
-                            match entry_type {
-                                "holder" => entry.0 += 1,
-                                "requester" => entry.1 += 1,
-                                _ => {}
+    match state.query_engine.sql(sql).await {
+        Ok(df) => {
+            if let Ok(batches) = df.collect().await {
+                for batch in batches {
+                    let name_col = batch.column_by_name("queue_name").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::StringArray>()
+                    });
+                    let type_col = batch.column_by_name("entry_type").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::StringArray>()
+                    });
+                    let cnt_col = batch.column_by_name("cnt").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                    });
+
+                    if let (Some(names), Some(types), Some(counts)) = (name_col, type_col, cnt_col)
+                    {
+                        for i in 0..batch.num_rows() {
+                            let queue_name = names.value(i).to_string();
+                            let entry_type = types.value(i);
+                            let count = counts.value(i) as usize;
+
+                            if !queue_name.is_empty() {
+                                let entry = all_queues.entry(queue_name).or_insert((0, 0));
+                                match entry_type {
+                                    "holder" => entry.0 += count,
+                                    "requester" => entry.1 += count,
+                                    _ => {}
+                                }
                             }
                         }
                     }
@@ -473,15 +509,15 @@ async fn queues_handler(State(state): State<AppState>) -> impl IntoResponse {
             }
         }
         Err(e) => {
-            warn!(error = %e, "failed to query queues from shards");
+            warn!(error = %e, "failed to query queues from cluster");
         }
     }
 
     let mut queues: Vec<QueueRow> = all_queues
         .into_iter()
-        .map(|((shard, name), (holders, waiters))| QueueRow {
+        .map(|(name, (holders, waiters))| QueueRow {
             name,
-            shard,
+            shard: "cluster".to_string(), // Aggregated across cluster
             holders,
             waiters,
             total: holders + waiters,
@@ -597,8 +633,6 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
     let mut shards: Vec<ShardRow> = Vec::new();
     let mut members: Vec<MemberRow> = Vec::new();
 
-    let sql = "SELECT COUNT(*) as count FROM jobs";
-
     // Get shard owner map and members if coordinator is available
     let (owner_map, this_node_id) = if let Some(coordinator) = &state.coordinator {
         let map = coordinator.get_shard_owner_map().await.ok();
@@ -638,67 +672,70 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
         _ => a.node_id.cmp(&b.node_id),
     });
 
-    // Query all shards in the cluster
-    match state.cluster_client.query_all_shards(sql).await {
-        Ok(results) => {
-            for result in results {
-                let shard_name = result.shard_id.to_string();
-                let job_count = result.rows.first().map_or(0, |row| {
-                    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&row.data) {
-                        json["count"].as_i64().unwrap_or(0) as usize
-                    } else {
-                        0
-                    }
-                });
+    // Get total number of shards
+    let num_shards = state
+        .coordinator
+        .as_ref()
+        .map(|c| c.num_shards())
+        .unwrap_or_else(|| state.factory.instances().len() as u32);
 
-                let owner = if let Some(ref map) = owner_map {
-                    if state.cluster_client.owns_shard(result.shard_id) {
-                        "local".to_string()
-                    } else {
-                        map.shard_to_node
-                            .get(&result.shard_id)
-                            .cloned()
-                            .unwrap_or_else(|| "unknown".to_string())
-                    }
-                } else {
-                    "local".to_string()
-                };
+    // Initialize all shards with 0 job count
+    let mut shard_job_counts: HashMap<u32, usize> = HashMap::new();
+    for shard_id in 0..num_shards {
+        shard_job_counts.insert(shard_id, 0);
+    }
 
-                shards.push(ShardRow {
-                    name: shard_name,
-                    owner,
-                    job_count,
-                });
+    // Query job counts per shard using GROUP BY shard_id
+    let sql = "SELECT shard_id, COUNT(*) as cnt FROM jobs GROUP BY shard_id";
+
+    match state.query_engine.sql(sql).await {
+        Ok(df) => {
+            if let Ok(batches) = df.collect().await {
+                for batch in batches {
+                    let shard_col = batch.column_by_name("shard_id").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::UInt32Array>()
+                    });
+                    let count_col = batch.column_by_name("cnt").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                    });
+
+                    if let (Some(shard_ids), Some(counts)) = (shard_col, count_col) {
+                        for i in 0..batch.num_rows() {
+                            let shard_id = shard_ids.value(i);
+                            let job_count = counts.value(i) as usize;
+                            shard_job_counts.insert(shard_id, job_count);
+                        }
+                    }
+                }
             }
         }
         Err(e) => {
             warn!(error = %e, "failed to query shards");
-            // Fall back to local shards only
-            for (shard_name, shard) in state.factory.instances().iter() {
-                let query_engine = shard.query_engine();
-                let job_count = match query_engine.sql(sql).await {
-                    Ok(df) => {
-                        if let Ok(batches) = df.collect().await {
-                            batches.first().map_or(0, |b| {
-                                b.column(0)
-                                    .as_any()
-                                    .downcast_ref::<datafusion::arrow::array::Int64Array>()
-                                    .map_or(0, |arr| arr.value(0) as usize)
-                            })
-                        } else {
-                            0
-                        }
-                    }
-                    Err(_) => 0,
-                };
-
-                shards.push(ShardRow {
-                    name: shard_name.clone(),
-                    owner: "local".to_string(),
-                    job_count,
-                });
-            }
         }
+    }
+
+    // Build shard rows from the counts map
+    for (shard_id, job_count) in shard_job_counts {
+        let owner = if let Some(ref map) = owner_map {
+            if state.cluster_client.owns_shard(shard_id) {
+                "local".to_string()
+            } else {
+                map.shard_to_node
+                    .get(&shard_id)
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string())
+            }
+        } else {
+            "local".to_string()
+        };
+
+        shards.push(ShardRow {
+            name: shard_id.to_string(),
+            owner,
+            job_count,
+        });
     }
 
     // If no coordinator, add a single "self" member for standalone mode
@@ -779,10 +816,23 @@ pub async fn run_webui(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cluster_client = Arc::new(ClusterClient::new(factory.clone(), coordinator.clone()));
 
+    // Get num_shards from coordinator or default to local shards
+    let num_shards = coordinator
+        .as_ref()
+        .map(|c| c.num_shards())
+        .unwrap_or_else(|| factory.instances().len() as u32);
+
+    let query_engine = Arc::new(
+        ClusterQueryEngine::new(factory.clone(), coordinator.clone(), num_shards)
+            .await
+            .expect("Failed to create cluster query engine"),
+    );
+
     let state = AppState {
         factory,
         coordinator,
         cluster_client,
+        query_engine,
     };
 
     let app = create_router(state);

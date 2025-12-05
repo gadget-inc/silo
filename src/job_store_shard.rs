@@ -28,7 +28,7 @@ use crate::keys::{
     idx_status_time_key, job_cancelled_key, job_info_key, job_status_key, leased_task_key,
     task_key,
 };
-use crate::query::JobSql;
+use crate::query::ShardQueryEngine;
 use crate::retry::RetryPolicy;
 use crate::settings::DatabaseConfig;
 use crate::storage::{resolve_object_store, StorageError};
@@ -65,7 +65,7 @@ pub struct JobStoreShard {
     db: Arc<Db>,
     broker: Arc<TaskBroker>,
     concurrency: Arc<ConcurrencyManager>,
-    query_engine: OnceLock<JobSql>,
+    query_engine: OnceLock<ShardQueryEngine>,
     rate_limiter: Arc<dyn RateLimitClient>,
 }
 
@@ -152,9 +152,12 @@ impl JobStoreShard {
     }
 
     /// Get the query engine for this shard, lazily initializing it on first access.
-    pub fn query_engine(self: &Arc<Self>) -> &JobSql {
+    ///
+    /// This is the low-level query engine for single-shard queries, typically used
+    /// by gRPC handlers. For cluster-wide queries, use `ClusterQueryEngine`.
+    pub fn query_engine(self: &Arc<Self>) -> &ShardQueryEngine {
         self.query_engine.get_or_init(|| {
-            JobSql::new(Arc::clone(self), "jobs").expect("Failed to create query engine")
+            ShardQueryEngine::new(Arc::clone(self), "jobs").expect("Failed to create query engine")
         })
     }
 
