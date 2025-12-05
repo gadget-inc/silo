@@ -10,6 +10,7 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use silo::cluster_client::ClusterClient;
+use silo::cluster_query::ClusterQueryEngine;
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::settings::{Backend, DatabaseTemplate};
@@ -36,22 +37,24 @@ async fn setup_test_state() -> (tempfile::TempDir, AppState) {
 
     let factory = Arc::new(factory);
     let cluster_client = Arc::new(ClusterClient::new(factory.clone(), None));
+    let query_engine = Arc::new(
+        ClusterQueryEngine::new(factory.clone(), None, 1)
+            .await
+            .expect("create query engine"),
+    );
 
     let state = AppState {
         factory,
         coordinator: None,
         cluster_client,
+        query_engine,
     };
 
     (tmp, state)
 }
 
 /// Helper to make HTTP requests to the router
-async fn make_request(
-    state: AppState,
-    method: &str,
-    path: &str,
-) -> (StatusCode, String) {
+async fn make_request(state: AppState, method: &str, path: &str) -> (StatusCode, String) {
     let app = create_router(state);
 
     let request = Request::builder()
@@ -125,12 +128,7 @@ async fn test_job_view_renders() {
         .await
         .expect("enqueue");
 
-    let (status, body) = make_request(
-        state,
-        "GET",
-        &format!("/job?shard=0&id={}", job_id),
-    )
-    .await;
+    let (status, body) = make_request(state, "GET", &format!("/job?shard=0&id={}", job_id)).await;
 
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains(&job_id), "expected job id in body");
@@ -143,12 +141,7 @@ async fn test_job_view_renders() {
 async fn test_job_view_not_found() {
     let (_tmp, state) = setup_test_state().await;
 
-    let (status, body) = make_request(
-        state,
-        "GET",
-        "/job?shard=0&id=nonexistent-job",
-    )
-    .await;
+    let (status, body) = make_request(state, "GET", "/job?shard=0&id=nonexistent-job").await;
 
     assert_eq!(status, StatusCode::OK); // Renders error page with 200
     assert!(body.contains("not found") || body.contains("Not Found"));
@@ -175,7 +168,10 @@ async fn test_job_cancel() {
         .expect("enqueue");
 
     // Verify job is scheduled
-    let status_before = shard.get_job_status("-", &job_id).await.expect("get status");
+    let status_before = shard
+        .get_job_status("-", &job_id)
+        .await
+        .expect("get status");
     assert!(status_before.is_some());
     assert_eq!(
         status_before.unwrap().kind,
@@ -194,7 +190,10 @@ async fn test_job_cancel() {
     assert!(body.contains("Cancelled"));
 
     // Verify job is cancelled
-    let status_after = shard.get_job_status("-", &job_id).await.expect("get status");
+    let status_after = shard
+        .get_job_status("-", &job_id)
+        .await
+        .expect("get status");
     assert!(status_after.is_some());
     assert_eq!(
         status_after.unwrap().kind,
@@ -217,12 +216,7 @@ async fn test_queue_view_renders() {
     let (_tmp, state) = setup_test_state().await;
 
     // Queue view now requires shard parameter
-    let (status, body) = make_request(
-        state,
-        "GET",
-        "/queue?shard=0&name=test-queue",
-    )
-    .await;
+    let (status, body) = make_request(state, "GET", "/queue?shard=0&name=test-queue").await;
 
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("test-queue"));
@@ -263,7 +257,11 @@ async fn test_cancel_already_terminal_job_is_noop() {
     shard.cancel_job("-", &job_id).await.expect("first cancel");
 
     // Verify it's cancelled
-    let status1 = shard.get_job_status("-", &job_id).await.expect("get status").unwrap();
+    let status1 = shard
+        .get_job_status("-", &job_id)
+        .await
+        .expect("get status")
+        .unwrap();
     assert_eq!(status1.kind, silo::job::JobStatusKind::Cancelled);
 
     // Cancel again - should be a no-op
@@ -277,7 +275,11 @@ async fn test_cancel_already_terminal_job_is_noop() {
     assert_eq!(status, StatusCode::OK);
 
     // Still cancelled
-    let status2 = shard.get_job_status("-", &job_id).await.expect("get status").unwrap();
+    let status2 = shard
+        .get_job_status("-", &job_id)
+        .await
+        .expect("get status")
+        .unwrap();
     assert_eq!(status2.kind, silo::job::JobStatusKind::Cancelled);
 }
 
@@ -285,12 +287,7 @@ async fn test_cancel_already_terminal_job_is_noop() {
 async fn test_cancel_nonexistent_job_returns_error() {
     let (_tmp, state) = setup_test_state().await;
 
-    let (status, body) = make_request(
-        state,
-        "POST",
-        "/job/cancel?shard=0&id=nonexistent",
-    )
-    .await;
+    let (status, body) = make_request(state, "POST", "/job/cancel?shard=0&id=nonexistent").await;
 
     // Returns 200 with error message in body
     assert_eq!(status, StatusCode::OK);
@@ -334,11 +331,17 @@ async fn setup_multi_shard_state(num_shards: usize) -> (tempfile::TempDir, AppSt
 
     let factory = Arc::new(factory);
     let cluster_client = Arc::new(ClusterClient::new(factory.clone(), None));
+    let query_engine = Arc::new(
+        ClusterQueryEngine::new(factory.clone(), None, num_shards as u32)
+            .await
+            .expect("create query engine"),
+    );
 
     let state = AppState {
         factory,
         coordinator: None,
         cluster_client,
+        query_engine,
     };
 
     (tmp, state)
@@ -424,9 +427,18 @@ async fn test_cluster_page_shows_all_shards() {
 
     assert_eq!(status, StatusCode::OK);
     // Verify all shards are displayed
-    assert!(body.contains(">0<") || body.contains(">0</"), "cluster page should show shard 0");
-    assert!(body.contains(">1<") || body.contains(">1</"), "cluster page should show shard 1");
-    assert!(body.contains(">2<") || body.contains(">2</"), "cluster page should show shard 2");
+    assert!(
+        body.contains(">0<") || body.contains(">0</"),
+        "cluster page should show shard 0"
+    );
+    assert!(
+        body.contains(">1<") || body.contains(">1</"),
+        "cluster page should show shard 1"
+    );
+    assert!(
+        body.contains(">2<") || body.contains(">2</"),
+        "cluster page should show shard 2"
+    );
 }
 
 #[silo::test]
@@ -451,12 +463,7 @@ async fn test_job_detail_from_non_zero_shard() {
         .expect("enqueue shard 1");
 
     // Request job detail from shard 1
-    let (status, body) = make_request(
-        state,
-        "GET",
-        &format!("/job?shard=1&id={}", job_id),
-    )
-    .await;
+    let (status, body) = make_request(state, "GET", &format!("/job?shard=1&id={}", job_id)).await;
 
     assert_eq!(status, StatusCode::OK);
     assert!(
@@ -523,8 +530,5 @@ async fn test_queues_page_shows_queues_from_all_shards() {
     // The queues page should show queues from both shards
     // Note: The exact queue names may vary based on implementation
     // This test verifies the page renders successfully with multi-shard data
-    assert!(
-        body.contains("Queues"),
-        "queues page should render"
-    );
+    assert!(body.contains("Queues"), "queues page should render");
 }

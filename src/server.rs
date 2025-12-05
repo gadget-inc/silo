@@ -1,3 +1,4 @@
+use std::pin::Pin;
 use std::sync::Arc;
 
 use rand::seq::SliceRandom;
@@ -5,10 +6,13 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
+use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 use tonic_health::server::health_reporter;
 use tonic_reflection::server::Builder as ReflectionBuilder;
 use tracing::info;
+
+use crate::arrow_ipc::batch_to_ipc;
 
 /// File descriptor set for gRPC reflection
 pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("silo_descriptor");
@@ -620,6 +624,60 @@ impl Silo for SiloService {
             rows,
             row_count,
         }))
+    }
+
+    type QueryArrowStream =
+        Pin<Box<dyn Stream<Item = Result<ArrowIpcMessage, Status>> + Send + 'static>>;
+
+    async fn query_arrow(
+        &self,
+        req: Request<QueryArrowRequest>,
+    ) -> Result<Response<Self::QueryArrowStream>, Status> {
+        let r = req.into_inner();
+        let shard = self.shard_with_redirect(r.shard).await?;
+        let _tenant = self.validate_tenant(r.tenant.as_deref())?;
+
+        // Get the cached query engine for this shard
+        let query_engine = shard.query_engine();
+
+        // Execute query
+        let dataframe = query_engine
+            .sql(&r.sql)
+            .await
+            .map_err(|e| Status::invalid_argument(format!("SQL error: {}", e)))?;
+
+        // Collect results
+        let batches = dataframe
+            .collect()
+            .await
+            .map_err(|e| Status::internal(format!("Query execution failed: {}", e)))?;
+
+        // Create a stream that yields Arrow IPC messages
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+
+        tokio::spawn(async move {
+            for batch in batches {
+                match batch_to_ipc(&batch) {
+                    Ok(ipc_data) => {
+                        if tx.send(Ok(ArrowIpcMessage { ipc_data })).await.is_err() {
+                            break; // Client disconnected
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(Status::internal(format!(
+                                "Failed to serialize batch: {}",
+                                e
+                            ))))
+                            .await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn reset_shards(

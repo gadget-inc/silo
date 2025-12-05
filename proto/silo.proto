@@ -210,6 +210,19 @@ message QueryResponse {
   int32 row_count = 3; // Number of rows returned
 }
 
+// Execute SQL query with Arrow IPC streaming response
+message QueryArrowRequest {
+  uint32 shard = 1;
+  string sql = 2;
+  optional string tenant = 3;
+}
+
+// Arrow IPC encoded schema or record batch
+message ArrowIpcMessage {
+  // Arrow IPC stream format: first message is schema, subsequent are record batches
+  bytes ipc_data = 1;
+}
+
 // Cluster topology information for client-side routing
 message GetClusterInfoRequest {}
 
@@ -247,6 +260,10 @@ service Silo {
   rpc ReportRefreshOutcome(ReportRefreshOutcomeRequest) returns (ReportRefreshOutcomeResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc Query(QueryRequest) returns (QueryResponse);
+  
+  // Streaming query that returns Arrow IPC encoded record batches
+  // First message contains the schema, subsequent messages contain record batches
+  rpc QueryArrow(QueryArrowRequest) returns (stream ArrowIpcMessage);
   
   // Admin: Reset all shards owned by this server (dev mode only)
   // Clears all data - jobs, tasks, queues, etc.

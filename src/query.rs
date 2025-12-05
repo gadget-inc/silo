@@ -27,8 +27,34 @@ const DEFAULT_SCAN_LIMIT: usize = 10_000;
 
 use crate::job_store_shard::JobStoreShard;
 
+/// Shared utility to get the EXPLAIN plan for a query.
+/// Used by both ShardQueryEngine and ClusterQueryEngine.
+pub async fn explain_dataframe(ctx: &SessionContext, query: &str) -> DfResult<String> {
+    let df = ctx.sql(query).await?;
+    let explain_df = df.explain(false, false)?;
+    let batches = explain_df.collect().await?;
+
+    let mut output = String::new();
+    for batch in batches {
+        for row in 0..batch.num_rows() {
+            for col in 0..batch.num_columns() {
+                if let Some(arr) = batch.column(col).as_any().downcast_ref::<StringArray>() {
+                    if !arr.is_null(row) {
+                        output.push_str(arr.value(row));
+                        output.push('\n');
+                    }
+                }
+            }
+        }
+    }
+    Ok(output)
+}
+
 /// Represents a query engine over a single `JobStoreShard` using Apache DataFusion.
-pub struct JobSql {
+///
+/// This is the low-level query engine used by gRPC handlers to query individual shards.
+/// For cluster-wide queries, use `ClusterQueryEngine` instead.
+pub struct ShardQueryEngine {
     ctx: SessionContext,
 }
 
@@ -38,13 +64,13 @@ pub struct PushedFilters {
     pub filters: Vec<String>,
 }
 
-impl std::fmt::Debug for JobSql {
+impl std::fmt::Debug for ShardQueryEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("JobSql")
+        f.write_str("ShardQueryEngine")
     }
 }
 
-impl JobSql {
+impl ShardQueryEngine {
     pub fn new(shard: Arc<JobStoreShard>, table_name: &str) -> DfResult<Self> {
         let ctx = SessionContext::new();
 
@@ -67,34 +93,13 @@ impl JobSql {
         Ok(Self { ctx })
     }
 
-    pub fn context(&self) -> &SessionContext {
-        &self.ctx
-    }
-
     pub async fn sql(&self, query: &str) -> DfResult<DataFrame> {
         self.ctx.sql(query).await
     }
 
     /// Get the EXPLAIN plan for a query to inspect optimization strategies
     pub async fn explain(&self, query: &str) -> DfResult<String> {
-        let df = self.ctx.sql(query).await?;
-        let explain_df = df.explain(false, false)?;
-        let batches = explain_df.collect().await?;
-
-        let mut output = String::new();
-        for batch in batches {
-            for row in 0..batch.num_rows() {
-                for col in 0..batch.num_columns() {
-                    if let Some(arr) = batch.column(col).as_any().downcast_ref::<StringArray>() {
-                        if !arr.is_null(row) {
-                            output.push_str(arr.value(row));
-                            output.push('\n');
-                        }
-                    }
-                }
-            }
-        }
-        Ok(output)
+        explain_dataframe(&self.ctx, query).await
     }
 
     /// Get the physical execution plan for a query to inspect what filters were pushed down
@@ -104,7 +109,7 @@ impl JobSql {
     /// # Example
     /// ```ignore
     /// let plan = sql.get_physical_plan("SELECT * FROM jobs WHERE id = 'foo'").await?;
-    /// let filters = JobSql::extract_pushed_filters(&plan).expect("filters");
+    /// let filters = ShardQueryEngine::extract_pushed_filters(&plan).expect("filters");
     /// assert!(filters.filters.iter().any(|f| f.contains("id")));
     /// ```
     pub async fn get_physical_plan(&self, query: &str) -> DfResult<Arc<dyn ExecutionPlan>> {
@@ -135,8 +140,9 @@ impl JobSql {
     }
 }
 
-/// Scan trait and silo provider/plan
-pub(crate) trait Scan: std::fmt::Debug + Send + Sync + 'static {
+/// Scan trait for table scanners.
+/// Implementors provide streaming access to table data with filter pushdown.
+pub trait Scan: std::fmt::Debug + Send + Sync + 'static {
     fn scan(
         &self,
         projection: SchemaRef,
@@ -146,17 +152,18 @@ pub(crate) trait Scan: std::fmt::Debug + Send + Sync + 'static {
     ) -> SendableRecordBatchStream;
 }
 
-pub(crate) type ScannerRef = Arc<dyn Scan>;
+/// Reference to a scanner implementing the Scan trait
+pub type ScannerRef = Arc<dyn Scan>;
 
 // Implementation of the DataFusion TableProvider trait for all our scanners.
 #[derive(Debug)]
-pub(crate) struct SiloTableProvider {
+struct SiloTableProvider {
     schema: SchemaRef,
     scanner: ScannerRef,
 }
 
 impl SiloTableProvider {
-    pub(crate) fn new(schema: SchemaRef, scanner: ScannerRef) -> Self {
+    fn new(schema: SchemaRef, scanner: ScannerRef) -> Self {
         Self { schema, scanner }
     }
     fn schema_ref(&self) -> SchemaRef {
@@ -309,8 +316,16 @@ impl DisplayAs for SiloExecutionPlan {
     }
 }
 
-struct JobsScanner {
-    shard: Arc<JobStoreShard>,
+/// Scanner for the jobs table - reads job data from a single shard.
+pub struct JobsScanner {
+    pub(crate) shard: Arc<JobStoreShard>,
+}
+
+impl JobsScanner {
+    /// Create a new JobsScanner for the given shard
+    pub fn new(shard: Arc<JobStoreShard>) -> Self {
+        Self { shard }
+    }
 }
 
 impl std::fmt::Debug for JobsScanner {
@@ -320,7 +335,8 @@ impl std::fmt::Debug for JobsScanner {
 }
 
 impl JobsScanner {
-    fn base_schema() -> SchemaRef {
+    /// Get the base schema for the jobs table
+    pub fn base_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("tenant", DataType::Utf8, false),
             Field::new("id", DataType::Utf8, false),
@@ -678,8 +694,16 @@ impl Scan for JobsScanner {
 // QueuesScanner - provides SQL access to concurrency queue data (holders/requests)
 // =============================================================================
 
-struct QueuesScanner {
-    shard: Arc<JobStoreShard>,
+/// Scanner for the queues table - reads concurrency queue data from a single shard.
+pub struct QueuesScanner {
+    pub(crate) shard: Arc<JobStoreShard>,
+}
+
+impl QueuesScanner {
+    /// Create a new QueuesScanner for the given shard
+    pub fn new(shard: Arc<JobStoreShard>) -> Self {
+        Self { shard }
+    }
 }
 
 impl std::fmt::Debug for QueuesScanner {
@@ -701,7 +725,8 @@ struct QueueEntry {
 }
 
 impl QueuesScanner {
-    fn base_schema() -> SchemaRef {
+    /// Get the base schema for the queues table
+    pub fn base_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("tenant", DataType::Utf8, false),
             Field::new("queue_name", DataType::Utf8, false),
@@ -809,18 +834,18 @@ impl Scan for QueuesScanner {
                             let start_time_ms: i64 = parts[3].parse().unwrap_or(0);
                             let priority: u8 = parts[4].parse().unwrap_or(50);
                             let request_id = parts[5].to_string();
-                            let job_id =
-                                if let Ok(action) = crate::codec::decode_concurrency_action(&kv.value)
-                                {
-                                    match action.archived() {
-                                        crate::task::ArchivedConcurrencyAction::EnqueueTask {
-                                            job_id,
-                                            ..
-                                        } => Some(job_id.as_str().to_string()),
-                                    }
-                                } else {
-                                    None
-                                };
+                            let job_id = if let Ok(action) =
+                                crate::codec::decode_concurrency_action(&kv.value)
+                            {
+                                match action.archived() {
+                                    crate::task::ArchivedConcurrencyAction::EnqueueTask {
+                                        job_id,
+                                        ..
+                                    } => Some(job_id.as_str().to_string()),
+                                }
+                            } else {
+                                None
+                            };
                             entries.push(QueueEntry {
                                 tenant: parts[1].to_string(),
                                 queue_name,
@@ -874,13 +899,17 @@ impl Scan for QueuesScanner {
                             cols.push(Arc::new(StringArray::from(vals)));
                         }
                         "queue_name" => {
-                            let vals: Vec<&str> =
-                                batch_entries.iter().map(|e| e.queue_name.as_str()).collect();
+                            let vals: Vec<&str> = batch_entries
+                                .iter()
+                                .map(|e| e.queue_name.as_str())
+                                .collect();
                             cols.push(Arc::new(StringArray::from(vals)));
                         }
                         "entry_type" => {
-                            let vals: Vec<&str> =
-                                batch_entries.iter().map(|e| e.entry_type.as_str()).collect();
+                            let vals: Vec<&str> = batch_entries
+                                .iter()
+                                .map(|e| e.entry_type.as_str())
+                                .collect();
                             cols.push(Arc::new(StringArray::from(vals)));
                         }
                         "task_id" => {
@@ -889,10 +918,8 @@ impl Scan for QueuesScanner {
                             cols.push(Arc::new(StringArray::from(vals)));
                         }
                         "job_id" => {
-                            let vals: Vec<Option<&str>> = batch_entries
-                                .iter()
-                                .map(|e| e.job_id.as_deref())
-                                .collect();
+                            let vals: Vec<Option<&str>> =
+                                batch_entries.iter().map(|e| e.job_id.as_deref()).collect();
                             cols.push(Arc::new(StringArray::from(vals)));
                         }
                         "priority" => {
