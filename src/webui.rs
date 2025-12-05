@@ -187,7 +187,8 @@ struct StatusBadgeTemplate {
 
 #[derive(serde::Deserialize)]
 pub struct JobParams {
-    /// Optional shard ID - if not provided, we'll search for the job across all shards
+    /// Shard ID from URL - ignored, we always search the cluster via query engine
+    #[allow(dead_code)]
     shard: Option<String>,
     id: String,
 }
@@ -524,40 +525,8 @@ async fn job_handler(
         "Succeeded" | "Failed" | "Cancelled"
     );
 
-    // Try to get limits from cluster_client (this may fail due to tenant issues, but that's OK)
-    let limits: Vec<LimitRow> = match state
-        .cluster_client
-        .get_job(job.shard_id, "-", &params.id)
-        .await
-    {
-        Ok(job_response) => job_response
-            .limits
-            .iter()
-            .filter_map(|l| {
-                l.limit.as_ref().map(|limit| match limit {
-                    crate::pb::limit::Limit::Concurrency(c) => LimitRow {
-                        limit_type: "Concurrency".to_string(),
-                        key: c.key.clone(),
-                        value: c.max_concurrency.to_string(),
-                    },
-                    crate::pb::limit::Limit::RateLimit(r) => LimitRow {
-                        limit_type: "Rate Limit".to_string(),
-                        key: r.name.clone(),
-                        value: format!("{}/{}ms", r.limit, r.duration_ms),
-                    },
-                    crate::pb::limit::Limit::FloatingConcurrency(f) => LimitRow {
-                        limit_type: "Floating Concurrency".to_string(),
-                        key: f.key.clone(),
-                        value: format!(
-                            "default={}, refresh={}ms",
-                            f.default_max_concurrency, f.refresh_interval_ms
-                        ),
-                    },
-                })
-            })
-            .collect(),
-        Err(_) => Vec::new(), // If we can't get limits, show empty (job still displays)
-    };
+    // Limits are not available from the query engine - would need to be added to the jobs scanner
+    let limits: Vec<LimitRow> = Vec::new();
 
     // Pretty-print the payload JSON
     let payload_str = serde_json::from_str::<serde_json::Value>(&job.payload)
@@ -589,80 +558,56 @@ async fn cancel_job_handler(
     State(state): State<AppState>,
     Query(params): Query<JobParams>,
 ) -> impl IntoResponse {
-    // Helper to search for job shard across cluster
-    let search_job_shard = async |query_engine: &ClusterQueryEngine, job_id: &str| -> Option<u32> {
-        let sql = format!(
-            "SELECT shard_id FROM jobs WHERE id = '{}' LIMIT 1",
-            job_id.replace('\'', "''")
-        );
+    // Query the job's shard and tenant from the cluster query engine
+    let sql = format!(
+        "SELECT shard_id, tenant FROM jobs WHERE id = '{}' LIMIT 1",
+        params.id.replace('\'', "''")
+    );
 
-        match query_engine.sql(&sql).await {
-            Ok(df) => match df.collect().await {
-                Ok(batches) => {
-                    for batch in batches {
-                        if let Some(shard_col) = batch.column_by_name("shard_id").and_then(|c| {
+    let job_info: Option<(u32, String)> = match state.query_engine.sql(&sql).await {
+        Ok(df) => match df.collect().await {
+            Ok(batches) => {
+                let mut result = None;
+                for batch in batches {
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    let shard_id = batch
+                        .column_by_name("shard_id")
+                        .and_then(|c| {
                             c.as_any()
                                 .downcast_ref::<datafusion::arrow::array::UInt32Array>()
-                        }) {
-                            if batch.num_rows() > 0 {
-                                return Some(shard_col.value(0));
-                            }
-                        }
+                        })
+                        .map(|a| a.value(0));
+                    let tenant = batch
+                        .column_by_name("tenant")
+                        .and_then(|c| {
+                            c.as_any()
+                                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                        })
+                        .map(|a| a.value(0).to_string());
+
+                    if let (Some(s), Some(t)) = (shard_id, tenant) {
+                        result = Some((s, t));
+                        break;
                     }
-                    None
                 }
-                Err(_) => None,
-            },
+                result
+            }
             Err(_) => None,
-        }
-    };
-
-    // Try to cancel - if shard is provided, try it first, then fall back to cluster search
-    let cancel_result = match params.shard {
-        Some(ref shard_str) => match shard_str.parse::<u32>() {
-            Ok(provided_shard_id) => {
-                // Try the provided shard first
-                match state
-                    .cluster_client
-                    .cancel_job(provided_shard_id, "-", &params.id)
-                    .await
-                {
-                    Ok(()) => Ok(()),
-                    Err(_) => {
-                        // If cancel failed, search cluster for the actual shard
-                        match search_job_shard(&state.query_engine, &params.id).await {
-                            Some(actual_shard_id) => {
-                                state
-                                    .cluster_client
-                                    .cancel_job(actual_shard_id, "-", &params.id)
-                                    .await
-                            }
-                            None => Err(crate::cluster_client::ClusterClientError::JobNotFound),
-                        }
-                    }
-                }
-            }
-            Err(_) => {
-                return Html(r#"<span class="text-red-400">Invalid shard ID</span>"#.to_string());
-            }
         },
-        None => {
-            // No shard provided - look up via cluster search
-            match search_job_shard(&state.query_engine, &params.id).await {
-                Some(shard_id) => {
-                    state
-                        .cluster_client
-                        .cancel_job(shard_id, "-", &params.id)
-                        .await
-                }
-                None => {
-                    return Html(r#"<span class="text-red-400">Job not found</span>"#.to_string());
-                }
-            }
-        }
+        Err(_) => None,
     };
 
-    match cancel_result {
+    let Some((shard_id, tenant)) = job_info else {
+        return Html(r#"<span class="text-red-400">Job not found</span>"#.to_string());
+    };
+
+    match state
+        .cluster_client
+        .cancel_job(shard_id, &tenant, &params.id)
+        .await
+    {
         Ok(()) => Html(
             StatusBadgeTemplate {
                 status: "Cancelled".to_string(),
