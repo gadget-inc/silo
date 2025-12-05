@@ -15,27 +15,24 @@ use tracing::{debug, error, info, warn};
 
 use crate::factory::ShardFactory;
 
+// Re-export ShardPhase for backwards compatibility (tests reference it from here)
+pub use super::ShardPhase;
+
 use super::{
-    compute_desired_shards_for_node, keys, CoordinationError, Coordinator, MemberInfo,
-    ShardOwnerMap,
+    compute_desired_shards_for_node, keys, CoordinationError, Coordinator, CoordinatorBase,
+    MemberInfo, ShardOwnerMap,
 };
 
 /// etcd-based coordinator for distributed shard ownership.
 #[derive(Clone)]
 pub struct EtcdCoordinator {
+    /// Shared coordinator state (node_id, grpc_addr, owned set, shutdown, factory)
+    base: Arc<CoordinatorBase>,
     client: Client,
     cluster_prefix: String,
-    node_id: String,
-    grpc_addr: String,
-    num_shards: u32,
     membership_lease_id: i64,
     liveness_lease_id: i64,
-    owned: Arc<Mutex<HashSet<u32>>>,
     shard_guards: Arc<Mutex<HashMap<u32, Arc<EtcdShardGuard>>>>,
-    shutdown_tx: watch::Sender<bool>,
-    shutdown_rx: watch::Receiver<bool>,
-    /// Factory for opening/closing shards when ownership changes
-    factory: Arc<ShardFactory>,
 }
 
 impl EtcdCoordinator {
@@ -98,23 +95,22 @@ impl EtcdCoordinator {
             .await
             .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
 
-        let owned = Arc::new(Mutex::new(HashSet::new()));
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
-        let me = Self {
-            client: client.clone(),
-            cluster_prefix: cluster_prefix.clone(),
-            node_id: node_id.clone(),
+        let base = Arc::new(CoordinatorBase::new(
+            node_id.clone(),
             grpc_addr,
             num_shards,
+            factory,
+        ));
+
+        let me = Self {
+            base: base.clone(),
+            client: client.clone(),
+            cluster_prefix: cluster_prefix.clone(),
             membership_lease_id: membership_lease,
             liveness_lease_id: liveness_lease,
-            owned,
             shard_guards: Arc::new(Mutex::new(HashMap::new())),
-            shutdown_tx,
-            shutdown_rx: shutdown_rx.clone(),
-            factory,
         };
+        let shutdown_rx = base.shutdown_rx.clone();
 
         let me_bg = me.clone();
         let cprefix = cluster_prefix.clone();
@@ -282,21 +278,22 @@ impl EtcdCoordinator {
         _lock: &mut etcd_client::LockClient,
     ) -> Result<(), etcd_client::Error> {
         let members = self.get_sorted_member_ids().await?;
-        debug!(node_id = %self.node_id, members = ?members, "reconcile: begin");
+        debug!(node_id = %self.base.node_id, members = ?members, "reconcile: begin");
 
         // Safety check: if we don't see ourselves in the member list, our membership
         // lease may have expired or there's a connectivity issue. Don't reconcile
         // based on incomplete membership data - it would cause us to release all shards.
         if members.is_empty() {
-            warn!(node_id = %self.node_id, "reconcile: no members found, skipping reconcile");
+            warn!(node_id = %self.base.node_id, "reconcile: no members found, skipping reconcile");
             return Ok(());
         }
-        if !members.contains(&self.node_id) {
-            warn!(node_id = %self.node_id, members = ?members, "reconcile: our node not in member list, skipping reconcile (membership may have expired)");
+        if !members.contains(&self.base.node_id) {
+            warn!(node_id = %self.base.node_id, members = ?members, "reconcile: our node not in member list, skipping reconcile (membership may have expired)");
             return Ok(());
         }
 
-        let desired = compute_desired_shards_for_node(self.num_shards, &self.node_id, &members);
+        let desired =
+            compute_desired_shards_for_node(self.base.num_shards, &self.base.node_id, &members);
 
         let current_locks: Vec<u32> = {
             let g = self.shard_guards.lock().await;
@@ -308,7 +305,7 @@ impl EtcdCoordinator {
             }
             v
         };
-        debug!(node_id = %self.node_id, desired_len = desired.len(), have_locks = ?current_locks, "reconcile: computed desired vs current");
+        debug!(node_id = %self.base.node_id, desired_len = desired.len(), have_locks = ?current_locks, "reconcile: computed desired vs current");
 
         // Release undesired shards
         {
@@ -357,11 +354,11 @@ impl EtcdCoordinator {
             self.client.clone(),
             self.cluster_prefix.clone(),
             self.liveness_lease_id,
-            self.shutdown_rx.clone(),
+            self.base.shutdown_rx.clone(),
         );
         let runner = guard.clone();
-        let owned_arc = self.owned.clone();
-        let factory = self.factory.clone();
+        let owned_arc = self.base.owned.clone();
+        let factory = self.base.factory.clone();
         tokio::spawn(async move { runner.run(owned_arc, factory).await });
         guards.insert(shard_id, guard.clone());
         guard
@@ -392,14 +389,11 @@ impl EtcdCoordinator {
 #[async_trait]
 impl Coordinator for EtcdCoordinator {
     async fn owned_shards(&self) -> Vec<u32> {
-        let guard = self.owned.lock().await;
-        let mut v: Vec<u32> = guard.iter().copied().collect();
-        v.sort_unstable();
-        v
+        self.base.owned_shards().await
     }
 
     async fn shutdown(&self) -> Result<(), CoordinationError> {
-        let _ = self.shutdown_tx.send(true);
+        self.base.signal_shutdown();
         {
             let guards = self.shard_guards.lock().await;
             for (_sid, guard) in guards.iter() {
@@ -421,42 +415,14 @@ impl Coordinator for EtcdCoordinator {
     }
 
     async fn wait_converged(&self, timeout: Duration) -> bool {
-        let start = std::time::Instant::now();
-        while start.elapsed() < timeout {
-            let member_ids = match self.get_sorted_member_ids().await {
-                Ok(m) => m,
-                Err(_) => {
-                    sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-            };
-            if member_ids.is_empty() {
-                sleep(Duration::from_millis(50)).await;
-                continue;
-            }
-            let desired: HashSet<u32> =
-                compute_desired_shards_for_node(self.num_shards, &self.node_id, &member_ids);
-            let guard = self.owned.lock().await;
-            if *guard == desired {
-                return true;
-            }
-            drop(guard);
-            sleep(Duration::from_millis(100)).await;
-        }
-
-        // Log diff on timeout
-        if let Ok(member_ids) = self.get_sorted_member_ids().await {
-            let desired: HashSet<u32> =
-                compute_desired_shards_for_node(self.num_shards, &self.node_id, &member_ids);
-            let owned_now: HashSet<u32> = {
-                let g = self.owned.lock().await;
-                g.clone()
-            };
-            let missing: Vec<u32> = desired.difference(&owned_now).copied().collect();
-            let extra: Vec<u32> = owned_now.difference(&desired).copied().collect();
-            debug!(node_id = %self.node_id, missing = ?missing, extra = ?extra, "wait_converged: timed out");
-        }
-        false
+        // Use the shared base implementation with our member-fetching closure
+        self.base
+            .wait_converged(timeout, || async {
+                self.get_sorted_member_ids()
+                    .await
+                    .map_err(|e| CoordinationError::BackendError(e.to_string()))
+            })
+            .await
     }
 
     async fn get_members(&self) -> Result<Vec<MemberInfo>, CoordinationError> {
@@ -484,65 +450,19 @@ impl Coordinator for EtcdCoordinator {
 
     async fn get_shard_owner_map(&self) -> Result<ShardOwnerMap, CoordinationError> {
         let members = self.get_members().await?;
-        let member_ids: Vec<String> = members.iter().map(|m| m.node_id.clone()).collect();
-
-        let addr_map: HashMap<String, String> = members
-            .into_iter()
-            .map(|m| (m.node_id, m.grpc_addr))
-            .collect();
-
-        let mut shard_to_addr = HashMap::new();
-        let mut shard_to_node = HashMap::new();
-
-        for shard_id in 0..self.num_shards {
-            if let Some(owner_node) = super::select_owner_for_shard(shard_id, &member_ids) {
-                if let Some(addr) = addr_map.get(&owner_node) {
-                    shard_to_addr.insert(shard_id, addr.clone());
-                    shard_to_node.insert(shard_id, owner_node);
-                }
-            }
-        }
-
-        Ok(ShardOwnerMap {
-            num_shards: self.num_shards,
-            shard_to_addr,
-            shard_to_node,
-        })
+        Ok(self.base.compute_shard_owner_map(&members))
     }
 
     fn num_shards(&self) -> u32 {
-        self.num_shards
+        self.base.num_shards
     }
 
     fn node_id(&self) -> &str {
-        &self.node_id
+        &self.base.node_id
     }
 
     fn grpc_addr(&self) -> &str {
-        &self.grpc_addr
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShardPhase {
-    Idle,
-    Acquiring,
-    Held,
-    Releasing,
-    ShuttingDown,
-    ShutDown,
-}
-
-impl std::fmt::Display for ShardPhase {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ShardPhase::Idle => write!(f, "Idle"),
-            ShardPhase::Acquiring => write!(f, "Acquiring"),
-            ShardPhase::Held => write!(f, "Held"),
-            ShardPhase::Releasing => write!(f, "Releasing"),
-            ShardPhase::ShuttingDown => write!(f, "ShuttingDown"),
-            ShardPhase::ShutDown => write!(f, "ShutDown"),
-        }
+        &self.base.grpc_addr
     }
 }
 

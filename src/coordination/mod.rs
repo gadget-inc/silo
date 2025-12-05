@@ -11,6 +11,8 @@ use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{watch, Mutex, Notify};
+use tracing::debug;
 
 use crate::factory::ShardFactory;
 
@@ -54,6 +56,261 @@ pub enum CoordinationError {
     ShuttingDown,
     #[error("not supported by this backend")]
     NotSupported,
+}
+
+// ============================================================================
+// Shared Shard Guard Types
+// ============================================================================
+
+/// Phase of a shard guard's lifecycle.
+///
+/// Shared by all coordination backends (etcd, k8s).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardPhase {
+    /// Not attempting to own this shard
+    Idle,
+    /// Actively trying to acquire ownership
+    Acquiring,
+    /// Successfully holding ownership
+    Held,
+    /// Releasing ownership (with delay for cancellation)
+    Releasing,
+    /// Shutdown initiated, releasing resources
+    ShuttingDown,
+    /// Fully shut down
+    ShutDown,
+}
+
+impl std::fmt::Display for ShardPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShardPhase::Idle => write!(f, "Idle"),
+            ShardPhase::Acquiring => write!(f, "Acquiring"),
+            ShardPhase::Held => write!(f, "Held"),
+            ShardPhase::Releasing => write!(f, "Releasing"),
+            ShardPhase::ShuttingDown => write!(f, "ShuttingDown"),
+            ShardPhase::ShutDown => write!(f, "ShutDown"),
+        }
+    }
+}
+
+/// Generic state for a shard guard.
+///
+/// The ownership token type varies by backend:
+/// - etcd: `Vec<u8>` (lock key)
+/// - k8s: `String` (resourceVersion)
+pub struct ShardGuardState<T> {
+    pub desired: bool,
+    pub phase: ShardPhase,
+    pub ownership_token: Option<T>,
+}
+
+impl<T> ShardGuardState<T> {
+    /// Create a new shard guard state in idle phase.
+    pub fn new() -> Self {
+        Self {
+            desired: false,
+            phase: ShardPhase::Idle,
+            ownership_token: None,
+        }
+    }
+
+    /// Check if we have an ownership token (i.e., we believe we own the shard).
+    pub fn has_token(&self) -> bool {
+        self.ownership_token.is_some()
+    }
+
+    /// Compute the next phase based on current state and desired ownership.
+    ///
+    /// Returns the new phase if a transition should occur, or None if no change.
+    pub fn compute_transition(&self) -> Option<ShardPhase> {
+        match (self.phase, self.desired, self.has_token()) {
+            // Terminal states - no transitions
+            (ShardPhase::ShutDown, _, _) => None,
+            (ShardPhase::ShuttingDown, _, _) => None,
+            // Want to own but don't - start acquiring
+            (ShardPhase::Idle, true, false) => Some(ShardPhase::Acquiring),
+            // Don't want to own but do - start releasing
+            (ShardPhase::Held, false, true) => Some(ShardPhase::Releasing),
+            // No transition needed
+            _ => None,
+        }
+    }
+
+    /// Apply a phase transition if one is needed.
+    /// Returns true if a transition occurred.
+    pub fn maybe_transition(&mut self) -> bool {
+        if let Some(new_phase) = self.compute_transition() {
+            self.phase = new_phase;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl<T> Default for ShardGuardState<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Common context for a shard guard that's shared across backends.
+pub struct ShardGuardContext {
+    pub shard_id: u32,
+    pub notify: Notify,
+    pub shutdown: watch::Receiver<bool>,
+}
+
+impl ShardGuardContext {
+    pub fn new(shard_id: u32, shutdown: watch::Receiver<bool>) -> Self {
+        Self {
+            shard_id,
+            notify: Notify::new(),
+            shutdown,
+        }
+    }
+
+    /// Check if shutdown has been signaled.
+    pub fn is_shutdown(&self) -> bool {
+        *self.shutdown.borrow()
+    }
+
+    /// Wait for either a notification or shutdown signal.
+    pub async fn wait_for_change(&self) {
+        let mut shutdown_rx = self.shutdown.clone();
+        tokio::select! {
+            _ = self.notify.notified() => {}
+            _ = shutdown_rx.changed() => {}
+        }
+    }
+}
+
+// ============================================================================
+// Shared Coordinator Base
+// ============================================================================
+
+/// Shared state and helpers for coordinator implementations.
+///
+/// This struct contains the common state that both etcd and k8s coordinators
+/// need, and provides shared implementations for common operations.
+pub struct CoordinatorBase {
+    pub node_id: String,
+    pub grpc_addr: String,
+    pub num_shards: u32,
+    pub owned: Arc<Mutex<HashSet<u32>>>,
+    pub shutdown_tx: watch::Sender<bool>,
+    pub shutdown_rx: watch::Receiver<bool>,
+    pub factory: Arc<ShardFactory>,
+}
+
+impl CoordinatorBase {
+    /// Create a new coordinator base with the given configuration.
+    pub fn new(
+        node_id: impl Into<String>,
+        grpc_addr: impl Into<String>,
+        num_shards: u32,
+        factory: Arc<ShardFactory>,
+    ) -> Self {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        Self {
+            node_id: node_id.into(),
+            grpc_addr: grpc_addr.into(),
+            num_shards,
+            owned: Arc::new(Mutex::new(HashSet::new())),
+            shutdown_tx,
+            shutdown_rx,
+            factory,
+        }
+    }
+
+    /// Get owned shards sorted (shared by both backends).
+    pub async fn owned_shards(&self) -> Vec<u32> {
+        let guard = self.owned.lock().await;
+        let mut v: Vec<u32> = guard.iter().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Compute shard owner map from members (shared by both backends).
+    pub fn compute_shard_owner_map(&self, members: &[MemberInfo]) -> ShardOwnerMap {
+        let member_ids: Vec<String> = members.iter().map(|m| m.node_id.clone()).collect();
+
+        let addr_map: HashMap<String, String> = members
+            .iter()
+            .map(|m| (m.node_id.clone(), m.grpc_addr.clone()))
+            .collect();
+
+        let mut shard_to_addr = HashMap::new();
+        let mut shard_to_node = HashMap::new();
+
+        for shard_id in 0..self.num_shards {
+            if let Some(owner_node) = select_owner_for_shard(shard_id, &member_ids) {
+                if let Some(addr) = addr_map.get(&owner_node) {
+                    shard_to_addr.insert(shard_id, addr.clone());
+                    shard_to_node.insert(shard_id, owner_node);
+                }
+            }
+        }
+
+        ShardOwnerMap {
+            num_shards: self.num_shards,
+            shard_to_addr,
+            shard_to_node,
+        }
+    }
+
+    /// Wait for convergence (shared logic).
+    ///
+    /// The `get_member_ids` closure is called to fetch the current member list,
+    /// allowing backends to use their own membership fetching mechanism.
+    pub async fn wait_converged<F, Fut>(&self, timeout: Duration, get_member_ids: F) -> bool
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<String>, CoordinationError>>,
+    {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            let member_ids = match get_member_ids().await {
+                Ok(m) => m,
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            if member_ids.is_empty() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            let desired: HashSet<u32> =
+                compute_desired_shards_for_node(self.num_shards, &self.node_id, &member_ids);
+            let guard = self.owned.lock().await;
+            if *guard == desired {
+                return true;
+            }
+            drop(guard);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Log diff on timeout
+        if let Ok(member_ids) = get_member_ids().await {
+            let desired: HashSet<u32> =
+                compute_desired_shards_for_node(self.num_shards, &self.node_id, &member_ids);
+            let owned_now: HashSet<u32> = {
+                let g = self.owned.lock().await;
+                g.clone()
+            };
+            let missing: Vec<u32> = desired.difference(&owned_now).copied().collect();
+            let extra: Vec<u32> = owned_now.difference(&desired).copied().collect();
+            debug!(node_id = %self.node_id, missing = ?missing, extra = ?extra, "wait_converged: timed out");
+        }
+        false
+    }
+
+    /// Signal shutdown to all components.
+    pub fn signal_shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+    }
 }
 
 /// Trait for coordination backends.
