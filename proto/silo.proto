@@ -226,6 +226,14 @@ message GetClusterInfoResponse {
   string this_grpc_addr = 4;                // The gRPC address of the server responding
 }
 
+// Admin request to reset all shards (dev mode only)
+// This clears all data from all shards owned by this server.
+// WARNING: This is a destructive operation intended only for testing.
+message ResetShardsRequest {}
+message ResetShardsResponse {
+  uint32 shards_reset = 1;  // Number of shards that were reset
+}
+
 service Silo {
   // Get cluster topology for client-side routing
   rpc GetClusterInfo(GetClusterInfoRequest) returns (GetClusterInfoResponse);
@@ -239,6 +247,10 @@ service Silo {
   rpc ReportRefreshOutcome(ReportRefreshOutcomeRequest) returns (ReportRefreshOutcomeResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc Query(QueryRequest) returns (QueryResponse);
+  
+  // Admin: Reset all shards owned by this server (dev mode only)
+  // Clears all data - jobs, tasks, queues, etc.
+  rpc ResetShards(ResetShardsRequest) returns (ResetShardsResponse);
 }
 
 

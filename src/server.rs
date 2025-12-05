@@ -621,6 +621,48 @@ impl Silo for SiloService {
             row_count,
         }))
     }
+
+    async fn reset_shards(
+        &self,
+        _req: Request<ResetShardsRequest>,
+    ) -> Result<Response<ResetShardsResponse>, Status> {
+        // Only allow in dev mode
+        if !self.cfg.server.dev_mode {
+            return Err(Status::permission_denied(
+                "ResetShards is only available in dev mode",
+            ));
+        }
+
+        // Get all local shard numbers
+        let shard_numbers: Vec<usize> = self
+            .factory
+            .instances()
+            .keys()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+
+        let mut reset_count = 0u32;
+        for shard_number in shard_numbers {
+            match self.factory.reset(shard_number).await {
+                Ok(_) => {
+                    reset_count += 1;
+                    tracing::info!(shard = shard_number, "reset shard successfully");
+                }
+                Err(e) => {
+                    tracing::error!(shard = shard_number, error = %e, "failed to reset shard");
+                    return Err(Status::internal(format!(
+                        "Failed to reset shard {}: {}",
+                        shard_number, e
+                    )));
+                }
+            }
+        }
+
+        tracing::info!(shards_reset = reset_count, "reset all shards successfully");
+        Ok(Response::new(ResetShardsResponse {
+            shards_reset: reset_count,
+        }))
+    }
 }
 
 /// Run the gRPC server and a periodic reaper task together until shutdown.

@@ -2,6 +2,7 @@
 
 [server]
 grpc_addr = "127.0.0.1:50052"
+dev_mode = true
 
 [coordination]
 backend = "etcd"

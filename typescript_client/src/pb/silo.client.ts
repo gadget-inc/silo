@@ -4,6 +4,8 @@
 import type { RpcTransport } from "@protobuf-ts/runtime-rpc";
 import type { ServiceInfo } from "@protobuf-ts/runtime-rpc";
 import { Silo } from "./silo";
+import type { ResetShardsResponse } from "./silo";
+import type { ResetShardsRequest } from "./silo";
 import type { QueryResponse } from "./silo";
 import type { QueryRequest } from "./silo";
 import type { HeartbeatResponse } from "./silo";
@@ -73,6 +75,13 @@ export interface ISiloClient {
      * @generated from protobuf rpc: Query
      */
     query(input: QueryRequest, options?: RpcOptions): UnaryCall<QueryRequest, QueryResponse>;
+    /**
+     * Admin: Reset all shards owned by this server (dev mode only)
+     * Clears all data - jobs, tasks, queues, etc.
+     *
+     * @generated from protobuf rpc: ResetShards
+     */
+    resetShards(input: ResetShardsRequest, options?: RpcOptions): UnaryCall<ResetShardsRequest, ResetShardsResponse>;
 }
 /**
  * @generated from protobuf service silo.v1.Silo
@@ -154,5 +163,15 @@ export class SiloClient implements ISiloClient, ServiceInfo {
     query(input: QueryRequest, options?: RpcOptions): UnaryCall<QueryRequest, QueryResponse> {
         const method = this.methods[9], opt = this._transport.mergeOptions(options);
         return stackIntercept<QueryRequest, QueryResponse>("unary", this._transport, method, opt, input);
+    }
+    /**
+     * Admin: Reset all shards owned by this server (dev mode only)
+     * Clears all data - jobs, tasks, queues, etc.
+     *
+     * @generated from protobuf rpc: ResetShards
+     */
+    resetShards(input: ResetShardsRequest, options?: RpcOptions): UnaryCall<ResetShardsRequest, ResetShardsResponse> {
+        const method = this.methods[10], opt = this._transport.mergeOptions(options);
+        return stackIntercept<ResetShardsRequest, ResetShardsResponse>("unary", this._transport, method, opt, input);
     }
 }

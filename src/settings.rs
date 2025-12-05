@@ -76,6 +76,10 @@ pub struct WalConfig {
 pub struct ServerConfig {
     #[serde(default = "default_grpc_addr")]
     pub grpc_addr: String, // e.g. 127.0.0.1:50051
+    /// Enable development mode features like ResetShards RPC.
+    /// WARNING: This allows destructive operations and should never be enabled in production.
+    #[serde(default)]
+    pub dev_mode: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -218,6 +222,7 @@ impl AppConfig {
         let default = Self {
             server: ServerConfig {
                 grpc_addr: default_grpc_addr(),
+                dev_mode: false,
             },
             coordination: CoordinationConfig::default(),
             tenancy: TenancyConfig { enabled: false },

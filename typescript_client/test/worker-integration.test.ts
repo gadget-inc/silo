@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { SiloGRPCClient, decodePayload } from "../src/client";
 import {
   SiloWorker,
@@ -14,6 +14,29 @@ const SILO_SERVERS = (
 ).split(",");
 const RUN_INTEGRATION =
   process.env.RUN_INTEGRATION === "true" || process.env.CI === "true";
+
+/**
+ * Wait until a condition becomes true, polling at intervals.
+ * @param condition Function that returns true when the condition is met
+ * @param options.timeout Maximum time to wait in ms (default: 5000)
+ * @param options.interval Polling interval in ms (default: 50)
+ * @throws Error if timeout is reached before condition is met
+ */
+async function waitFor(
+  condition: () => boolean,
+  options?: { timeout?: number; interval?: number }
+): Promise<void> {
+  const timeout = options?.timeout ?? 5000;
+  const interval = options?.interval ?? 50;
+  const start = Date.now();
+
+  while (!condition()) {
+    if (Date.now() - start > timeout) {
+      throw new Error(`waitFor timed out after ${timeout}ms`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, interval));
+  }
+}
 
 describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
   let client: SiloGRPCClient;
@@ -35,13 +58,18 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
     client.close();
   });
 
+  beforeEach(async () => {
+    // Reset all shards to ensure test isolation - clean slate before each test
+    await client.resetShards();
+  });
+
   afterEach(async () => {
     // Stop all workers created during test
     await Promise.all(activeWorkers.map((w) => w.stop()));
     activeWorkers = [];
   });
 
-  // Default tenant for tests - worker must match tenant of enqueued jobs
+  // Default tenant for all tests - reset ensures isolation between tests
   const DEFAULT_TENANT = "test-tenant";
 
   function createWorker(
@@ -67,19 +95,13 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
 
   describe("basic task processing", () => {
     it("processes a single task from any shard", async () => {
-      const testBatch = `single-${Date.now()}-${Math.random()
-        .toString(36)
-        .slice(2)}`;
       const processedJobs: string[] = [];
 
       const handler: TaskHandler = async (ctx) => {
-        const payload = decodePayload<{ message: string; batch?: string }>(
+        const payload = decodePayload<{ message: string }>(
           ctx.task.payload?.data
         );
-        // Only track jobs from this test batch
-        if (payload?.batch === testBatch) {
-          processedJobs.push(payload?.message ?? "");
-        }
+        processedJobs.push(payload?.message ?? "");
         return { type: "success", result: { processed: true } };
       };
 
@@ -90,55 +112,49 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       // Enqueue a job to test tenant
       await client.enqueue({
         tenant: DEFAULT_TENANT,
-        payload: { message: "hello-worker", batch: testBatch },
+        payload: { message: "hello-worker" },
         priority: 1,
       });
 
-      // Wait for processing
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      // Wait until job is processed
+      await waitFor(() => processedJobs.includes("hello-worker"));
 
       expect(processedJobs).toContain("hello-worker");
     });
 
     it("processes multiple tasks sequentially with maxConcurrentTasks=1", async () => {
-      const testBatch = `seq-${Date.now()}-${Math.random()
-        .toString(36)
-        .slice(2)}`;
       const processedOrder: number[] = [];
       let maxConcurrent = 0;
       let currentConcurrent = 0;
 
       const handler: TaskHandler = async (ctx) => {
-        const payload = decodePayload<{ index: number; batch: string }>(
+        const payload = decodePayload<{ index: number }>(
           ctx.task.payload?.data
         );
-        // Only track jobs from this test batch
-        if (payload?.batch === testBatch) {
-          currentConcurrent++;
-          maxConcurrent = Math.max(maxConcurrent, currentConcurrent);
-          await new Promise((resolve) => setTimeout(resolve, 20));
-          processedOrder.push(payload?.index ?? -1);
-          currentConcurrent--;
-        }
+        currentConcurrent++;
+        maxConcurrent = Math.max(maxConcurrent, currentConcurrent);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        processedOrder.push(payload?.index ?? -1);
+        currentConcurrent--;
         return { type: "success", result: {} };
       };
 
       const worker = createWorker(handler, { maxConcurrentTasks: 1 });
       worker.start();
 
-      // Enqueue multiple jobs with unique batch identifier
+      // Enqueue multiple jobs
       for (let i = 0; i < 5; i++) {
         await client.enqueue({
           tenant: DEFAULT_TENANT,
-          payload: { index: i, batch: testBatch },
+          payload: { index: i },
           priority: 1,
         });
       }
 
-      // Wait for all to be processed
-      await new Promise((resolve) => setTimeout(resolve, 3000));
+      // Wait until at least 3 are processed
+      await waitFor(() => processedOrder.length >= 3);
 
-      // Should have processed all our batch tasks (at least some)
+      // Should have processed all our tasks (at least some)
       expect(processedOrder.length).toBeGreaterThanOrEqual(3);
       // And should have been sequential (max 1 concurrent)
       expect(maxConcurrent).toBeLessThanOrEqual(1);
@@ -147,12 +163,14 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
     it("processes tasks concurrently", async () => {
       let maxConcurrent = 0;
       let currentConcurrent = 0;
+      let completedCount = 0;
 
       const handler: TaskHandler = async () => {
         currentConcurrent++;
         maxConcurrent = Math.max(maxConcurrent, currentConcurrent);
         await new Promise((resolve) => setTimeout(resolve, 100));
         currentConcurrent--;
+        completedCount++;
         return { type: "success", result: {} };
       };
 
@@ -173,8 +191,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         )
       );
 
-      // Wait for processing
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      // Wait until we've seen concurrent execution
+      await waitFor(() => maxConcurrent > 1 && completedCount >= 5);
 
       // Should have had multiple tasks running concurrently
       expect(maxConcurrent).toBeGreaterThan(1);
@@ -212,8 +230,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         )
       );
 
-      // Wait for processing
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      // Wait until all jobs are processed
+      await waitFor(() => processedPayloads.size === labels.length);
 
       // Should have processed all jobs
       expect(processedPayloads.size).toBe(labels.length);
@@ -225,11 +243,16 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
 
   describe("failure handling", () => {
     it("reports failure when handler returns failure outcome", async () => {
-      const handler: TaskHandler = async () => ({
-        type: "failure",
-        code: "TEST_FAILURE",
-        data: { reason: "intentional" },
-      });
+      let taskProcessed = false;
+
+      const handler: TaskHandler = async () => {
+        taskProcessed = true;
+        return {
+          type: "failure",
+          code: "TEST_FAILURE",
+          data: { reason: "intentional" },
+        };
+      };
 
       const worker = createWorker(handler);
       worker.start();
@@ -240,8 +263,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         priority: 1,
       });
 
-      // Wait for processing
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      // Wait until task is processed
+      await waitFor(() => taskProcessed);
 
       // Job should still exist but task completed with failure
       const job = await client.getJob(jobId, DEFAULT_TENANT);
@@ -249,15 +272,14 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
     });
 
     it("reports failure when handler throws", async () => {
-      const errors: Error[] = [];
+      let taskProcessed = false;
 
       const handler: TaskHandler = async () => {
+        taskProcessed = true;
         throw new Error("Oops!");
       };
 
-      const worker = createWorker(handler, {
-        onError: (err: Error) => errors.push(err),
-      });
+      const worker = createWorker(handler);
       worker.start();
 
       await client.enqueue({
@@ -266,7 +288,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         priority: 1,
       });
 
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      // Wait until task is processed (even though it throws)
+      await waitFor(() => taskProcessed);
 
       // Worker should continue running despite error
       expect(worker.isRunning).toBe(true);
@@ -329,7 +352,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         payload: { run: 1 },
         priority: 1,
       });
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      await waitFor(() => processCount >= 1);
       await worker.stop();
 
       const firstCount = processCount;
@@ -342,7 +365,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         payload: { run: 2 },
         priority: 1,
       });
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      await waitFor(() => processCount > firstCount);
       await worker.stop();
 
       expect(processCount).toBeGreaterThan(firstCount);
@@ -376,8 +399,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         )
       );
 
-      // Wait for processing
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+      // Wait until enough tasks are processed
+      await waitFor(() => processedTasks.length > 10);
 
       // Should have processed many tasks
       expect(processedTasks.length).toBeGreaterThan(10);
@@ -442,8 +465,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         priority: 1,
       });
 
-      // Wait for processing
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      // Wait until task is processed
+      await waitFor(() => receivedShard !== undefined);
 
       // Should have received a valid shard ID
       expect(receivedShard).toBeDefined();

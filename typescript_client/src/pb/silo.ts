@@ -695,6 +695,24 @@ export interface GetClusterInfoResponse {
     thisGrpcAddr: string; // The gRPC address of the server responding
 }
 /**
+ * Admin request to reset all shards (dev mode only)
+ * This clears all data from all shards owned by this server.
+ * WARNING: This is a destructive operation intended only for testing.
+ *
+ * @generated from protobuf message silo.v1.ResetShardsRequest
+ */
+export interface ResetShardsRequest {
+}
+/**
+ * @generated from protobuf message silo.v1.ResetShardsResponse
+ */
+export interface ResetShardsResponse {
+    /**
+     * @generated from protobuf field: uint32 shards_reset = 1
+     */
+    shardsReset: number; // Number of shards that were reset
+}
+/**
  * Gubernator rate limiting algorithm
  *
  * @generated from protobuf enum silo.v1.GubernatorAlgorithm
@@ -3046,6 +3064,91 @@ class GetClusterInfoResponse$Type extends MessageType<GetClusterInfoResponse> {
  * @generated MessageType for protobuf message silo.v1.GetClusterInfoResponse
  */
 export const GetClusterInfoResponse = new GetClusterInfoResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class ResetShardsRequest$Type extends MessageType<ResetShardsRequest> {
+    constructor() {
+        super("silo.v1.ResetShardsRequest", []);
+    }
+    create(value?: PartialMessage<ResetShardsRequest>): ResetShardsRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        if (value !== undefined)
+            reflectionMergePartial<ResetShardsRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: ResetShardsRequest): ResetShardsRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: ResetShardsRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.ResetShardsRequest
+ */
+export const ResetShardsRequest = new ResetShardsRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class ResetShardsResponse$Type extends MessageType<ResetShardsResponse> {
+    constructor() {
+        super("silo.v1.ResetShardsResponse", [
+            { no: 1, name: "shards_reset", kind: "scalar", T: 13 /*ScalarType.UINT32*/ }
+        ]);
+    }
+    create(value?: PartialMessage<ResetShardsResponse>): ResetShardsResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.shardsReset = 0;
+        if (value !== undefined)
+            reflectionMergePartial<ResetShardsResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: ResetShardsResponse): ResetShardsResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* uint32 shards_reset */ 1:
+                    message.shardsReset = reader.uint32();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: ResetShardsResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* uint32 shards_reset = 1; */
+        if (message.shardsReset !== 0)
+            writer.tag(1, WireType.Varint).uint32(message.shardsReset);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.ResetShardsResponse
+ */
+export const ResetShardsResponse = new ResetShardsResponse$Type();
 /**
  * @generated ServiceType for protobuf service silo.v1.Silo
  */
@@ -3059,5 +3162,6 @@ export const Silo = new ServiceType("silo.v1.Silo", [
     { name: "ReportOutcome", options: {}, I: ReportOutcomeRequest, O: ReportOutcomeResponse },
     { name: "ReportRefreshOutcome", options: {}, I: ReportRefreshOutcomeRequest, O: ReportRefreshOutcomeResponse },
     { name: "Heartbeat", options: {}, I: HeartbeatRequest, O: HeartbeatResponse },
-    { name: "Query", options: {}, I: QueryRequest, O: QueryResponse }
+    { name: "Query", options: {}, I: QueryRequest, O: QueryResponse },
+    { name: "ResetShards", options: {}, I: ResetShardsRequest, O: ResetShardsResponse }
 ]);

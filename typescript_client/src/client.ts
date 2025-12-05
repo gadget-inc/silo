@@ -441,6 +441,8 @@ export class SiloGRPCClient {
   /** @internal */
   private _topologyRefreshInterval: ReturnType<typeof setInterval> | null =
     null;
+  /** Counter for round-robin server selection */
+  private _anyClientCounter: number = 0;
 
   /** @internal */
   private _initialServers: string[];
@@ -616,14 +618,17 @@ export class SiloGRPCClient {
 
   /**
    * Get any available client (for operations that work with any server).
+   * Uses round-robin to distribute load across all connected servers.
    * @internal
    */
   private _getAnyClient(): SiloClient {
-    const firstConn = this._connections.values().next().value;
-    if (!firstConn) {
+    const connections = Array.from(this._connections.values());
+    if (connections.length === 0) {
       throw new Error("No server connections available");
     }
-    return firstConn.client;
+    const index = this._anyClientCounter % connections.length;
+    this._anyClientCounter++;
+    return connections[index].client;
   }
 
   /**
@@ -956,6 +961,35 @@ export class SiloGRPCClient {
       numShards: this._numShards,
       shardToServer: new Map(this._shardToServer),
     };
+  }
+
+  /**
+   * Reset all shards on all servers in the cluster.
+   * This is a destructive operation that clears all data and is only available in dev mode.
+   * WARNING: This will delete all jobs, tasks, and queues!
+   *
+   * @throws Error if the server is not in dev mode
+   */
+  public async resetShards(): Promise<void> {
+    // Reset shards on all known servers
+    const servers = new Set<string>();
+    for (const addr of this._shardToServer.values()) {
+      servers.add(addr);
+    }
+
+    // If no shards known, try all configured servers
+    if (servers.size === 0) {
+      for (const conn of this._connections.values()) {
+        await conn.client.resetShards({}, this._rpcOptions());
+      }
+      return;
+    }
+
+    // Reset on each unique server
+    for (const addr of servers) {
+      const conn = this._getOrCreateConnection(addr);
+      await conn.client.resetShards({}, this._rpcOptions());
+    }
   }
 }
 

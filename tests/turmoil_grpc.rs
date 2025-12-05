@@ -46,6 +46,7 @@ fn grpc_end_to_end_under_turmoil() {
         let cfg = AppConfig {
             server: silo::settings::ServerConfig {
                 grpc_addr: "0.0.0.0:9999".to_string(),
+                dev_mode: false,
             },
             coordination: silo::settings::CoordinationConfig::default(),
             tenancy: silo::settings::TenancyConfig { enabled: false },
@@ -204,6 +205,7 @@ fn grpc_fault_injection_with_partition() {
         let cfg = AppConfig {
             server: silo::settings::ServerConfig {
                 grpc_addr: "0.0.0.0:9998".to_string(),
+                dev_mode: false,
             },
             coordination: silo::settings::CoordinationConfig::default(),
             tenancy: silo::settings::TenancyConfig { enabled: false },
@@ -403,6 +405,7 @@ fn stress_multiple_workers_with_partitions() {
         let cfg = AppConfig {
             server: silo::settings::ServerConfig {
                 grpc_addr: "0.0.0.0:9997".to_string(),
+                dev_mode: false,
             },
             coordination: silo::settings::CoordinationConfig::default(),
             tenancy: silo::settings::TenancyConfig { enabled: false },
@@ -681,6 +684,7 @@ fn stress_duplicate_completion_idempotency() {
         let cfg = AppConfig {
             server: silo::settings::ServerConfig {
                 grpc_addr: "0.0.0.0:9995".to_string(),
+                dev_mode: false,
             },
             coordination: silo::settings::CoordinationConfig::default(),
             tenancy: silo::settings::TenancyConfig { enabled: false },
@@ -869,6 +873,7 @@ fn stress_lease_expiry_during_partition() {
         let cfg = AppConfig {
             server: silo::settings::ServerConfig {
                 grpc_addr: "0.0.0.0:9994".to_string(),
+                dev_mode: false,
             },
             coordination: silo::settings::CoordinationConfig::default(),
             tenancy: silo::settings::TenancyConfig { enabled: false },
@@ -1075,6 +1080,7 @@ fn stress_high_message_loss() {
         let cfg = AppConfig {
             server: silo::settings::ServerConfig {
                 grpc_addr: "0.0.0.0:9993".to_string(),
+                dev_mode: false,
             },
             coordination: silo::settings::CoordinationConfig::default(),
             tenancy: silo::settings::TenancyConfig { enabled: false },
@@ -1290,6 +1296,7 @@ fn concurrency_request_ready_without_release_fails() {
         let cfg = AppConfig {
             server: silo::settings::ServerConfig {
                 grpc_addr: "0.0.0.0:9996".to_string(),
+                dev_mode: false,
             },
             coordination: silo::settings::CoordinationConfig::default(),
             tenancy: silo::settings::TenancyConfig { enabled: false },

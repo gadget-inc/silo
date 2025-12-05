@@ -93,6 +93,58 @@ impl ShardFactory {
         Ok(())
     }
 
+    /// Reset a specific shard: close it, delete all data, and reopen fresh.
+    /// This is intended for testing/development only.
+    pub async fn reset(&self, shard_number: usize) -> Result<Arc<JobStoreShard>, JobStoreShardError> {
+        let name = shard_number.to_string();
+        
+        // 1. Close and remove the shard if it exists
+        let shard = {
+            let mut instances = self.instances.write().await;
+            instances.remove(&name)
+        };
+        if let Some(shard) = shard {
+            shard.close().await?;
+            tracing::info!(shard = shard_number, "closed shard for reset");
+        }
+
+        // 2. Delete the data directory
+        let path = self
+            .template
+            .path
+            .replace("%shard%", &name)
+            .replace("{shard}", &name);
+        
+        // Delete the main data path
+        if let Err(e) = tokio::fs::remove_dir_all(&path).await {
+            // Ignore "not found" errors - the directory might not exist yet
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(shard = shard_number, path = %path, error = %e, "failed to delete shard data directory");
+            }
+        } else {
+            tracing::info!(shard = shard_number, path = %path, "deleted shard data directory");
+        }
+
+        // Delete WAL directory if configured separately
+        if let Some(wal_cfg) = &self.template.wal {
+            let wal_path = wal_cfg
+                .path
+                .replace("%shard%", &name)
+                .replace("{shard}", &name);
+            if let Err(e) = tokio::fs::remove_dir_all(&wal_path).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(shard = shard_number, path = %wal_path, error = %e, "failed to delete shard WAL directory");
+                }
+            } else {
+                tracing::info!(shard = shard_number, path = %wal_path, "deleted shard WAL directory");
+            }
+        }
+
+        // 3. Reopen the shard fresh
+        tracing::info!(shard = shard_number, "reopening shard after reset");
+        self.open(shard_number).await
+    }
+
     /// Get a snapshot of all currently open instances.
     pub fn instances(&self) -> HashMap<String, Arc<JobStoreShard>> {
         self.instances
