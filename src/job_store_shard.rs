@@ -1857,10 +1857,6 @@ impl JobStoreShard {
         Ok(out)
     }
 
-    // =========================================================================
-    // Floating Concurrency Limit Management
-    // =========================================================================
-
     /// Get or create the floating limit state for a given queue key.
     /// Returns the state and whether it was newly created.
     async fn get_or_create_floating_limit_state(

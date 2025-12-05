@@ -9,6 +9,13 @@
         <div class="text-sm text-zinc-500">{{ queues.len() }} queues</div>
     </div>
     
+    {% if error.is_some() %}
+    <div class="bg-red-900/30 border border-red-700 p-4">
+        <div class="text-red-400 text-sm font-medium">Error loading queues</div>
+        <pre class="text-red-300 text-xs mt-2 whitespace-pre-wrap">{{ error.as_ref().unwrap() }}</pre>
+    </div>
+    {% endif %}
+    
     <div class="bg-zinc-800 border border-zinc-700  overflow-hidden">
         <div class="bg-zinc-850 border-b border-zinc-700 px-4 py-2">
             <h2 class="text-sm font-semibold text-zinc-300">All Queues</h2>

@@ -8,6 +8,13 @@
         <h1 class="text-xl font-bold text-zinc-100">Cluster Overview</h1>
     </div>
     
+    {% if error.is_some() %}
+    <div class="bg-red-900/30 border border-red-700 p-4">
+        <div class="text-red-400 text-sm font-medium">Error loading cluster data</div>
+        <pre class="text-red-300 text-xs mt-2 whitespace-pre-wrap">{{ error.as_ref().unwrap() }}</pre>
+    </div>
+    {% endif %}
+    
     <!-- Stats -->
     <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
         <div class="bg-zinc-800 border border-zinc-700 p-4">

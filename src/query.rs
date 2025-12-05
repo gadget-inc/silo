@@ -690,10 +690,6 @@ impl Scan for JobsScanner {
     }
 }
 
-// =============================================================================
-// QueuesScanner - provides SQL access to concurrency queue data (holders/requests)
-// =============================================================================
-
 /// Scanner for the queues table - reads concurrency queue data from a single shard.
 pub struct QueuesScanner {
     pub(crate) shard: Arc<JobStoreShard>,

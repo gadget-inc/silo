@@ -70,28 +70,35 @@ impl ClusterClient {
 
     /// Get or create a gRPC client connection to a remote node
     async fn get_client(&self, addr: &str) -> Result<SiloClient<Channel>, ClusterClientError> {
+        // Ensure address has http:// scheme for gRPC connection
+        let full_addr = if addr.starts_with("http://") || addr.starts_with("https://") {
+            addr.to_string()
+        } else {
+            format!("http://{}", addr)
+        };
+
         // Check cache first
         {
             let cache = self.connections.read().await;
-            if let Some(client) = cache.get(addr) {
+            if let Some(client) = cache.get(&full_addr) {
                 return Ok(client.clone());
             }
         }
 
         // Create new connection
-        debug!(addr = %addr, "connecting to remote node");
-        let channel = Channel::from_shared(addr.to_string())
-            .map_err(|e| ClusterClientError::ConnectionFailed(addr.to_string(), e.to_string()))?
+        debug!(addr = %full_addr, "connecting to remote node");
+        let channel = Channel::from_shared(full_addr.clone())
+            .map_err(|e| ClusterClientError::ConnectionFailed(full_addr.clone(), e.to_string()))?
             .connect()
             .await
-            .map_err(|e| ClusterClientError::ConnectionFailed(addr.to_string(), e.to_string()))?;
+            .map_err(|e| ClusterClientError::ConnectionFailed(full_addr.clone(), e.to_string()))?;
 
         let client = SiloClient::new(channel);
 
         // Cache the connection
         {
             let mut cache = self.connections.write().await;
-            cache.insert(addr.to_string(), client.clone());
+            cache.insert(full_addr, client.clone());
         }
 
         Ok(client)

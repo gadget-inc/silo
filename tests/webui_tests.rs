@@ -1,7 +1,3 @@
-//! WebUI regression tests
-//!
-//! Tests for the web UI HTTP handlers and rendering.
-
 mod test_helpers;
 
 use axum::{
@@ -305,10 +301,6 @@ async fn test_404_handler() {
     assert!(body.contains("404") || body.contains("Not Found"));
 }
 
-// =============================================================================
-// Multi-shard regression tests
-// =============================================================================
-
 /// Helper to create a multi-shard test AppState
 async fn setup_multi_shard_state(num_shards: usize) -> (tempfile::TempDir, AppState) {
     let tmp = tempfile::tempdir().unwrap();
@@ -533,4 +525,98 @@ async fn test_queues_page_shows_queues_from_all_shards() {
     // Note: The exact queue names may vary based on implementation
     // This test verifies the page renders successfully with multi-shard data
     assert!(body.contains("Queues"), "queues page should render");
+}
+
+#[silo::test]
+async fn test_sql_page_renders() {
+    let (_tmp, state) = setup_test_state().await;
+    let (status, body) = make_request(state, "GET", "/sql").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("SQL Console"),
+        "body should contain 'SQL Console'"
+    );
+    assert!(
+        body.contains("With great power"),
+        "body should contain warning"
+    );
+}
+
+#[silo::test]
+async fn test_sql_execute_returns_results() {
+    let (_tmp, state) = setup_test_state().await;
+
+    // Enqueue a job first
+    let shard = state.factory.get("0").expect("shard 0");
+    let _job_id = shard
+        .enqueue(
+            "-",
+            Some("sql-test-job".to_string()),
+            50,
+            test_helpers::now_ms() + 10000,
+            None,
+            serde_json::json!({}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("enqueue");
+
+    // Execute SQL query
+    let (status, body) = make_request(
+        state,
+        "GET",
+        "/sql/execute?q=SELECT%20id%20FROM%20jobs%20LIMIT%2010",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Results"), "body should contain 'Results'");
+    assert!(body.contains("sql-test-job"), "body should contain job id");
+}
+
+#[silo::test]
+async fn test_sql_execute_shows_error_for_invalid_query() {
+    let (_tmp, state) = setup_test_state().await;
+
+    let (status, body) = make_request(
+        state,
+        "GET",
+        "/sql/execute?q=SELECT%20*%20FROM%20nonexistent_table",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("error") || body.contains("Error"),
+        "body should contain error"
+    );
+}
+
+#[silo::test]
+async fn test_sql_execute_empty_query_shows_error() {
+    let (_tmp, state) = setup_test_state().await;
+
+    let (status, body) = make_request(state, "GET", "/sql/execute?q=").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("Please enter a SQL query"),
+        "body should prompt for query"
+    );
+}
+
+#[silo::test]
+async fn test_sql_page_shows_query_in_url() {
+    let (_tmp, state) = setup_test_state().await;
+
+    // The page should accept a query parameter to pre-fill the textarea
+    let (status, body) = make_request(state, "GET", "/sql?q=SELECT%20*%20FROM%20jobs").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("SELECT * FROM jobs"),
+        "body should contain the query from URL"
+    );
 }

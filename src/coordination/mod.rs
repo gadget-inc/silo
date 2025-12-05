@@ -58,10 +58,6 @@ pub enum CoordinationError {
     NotSupported,
 }
 
-// ============================================================================
-// Shared Shard Guard Types
-// ============================================================================
-
 /// Phase of a shard guard's lifecycle.
 ///
 /// Shared by all coordination backends (etcd, k8s).
@@ -185,10 +181,6 @@ impl ShardGuardContext {
         }
     }
 }
-
-// ============================================================================
-// Shared Coordinator Base
-// ============================================================================
 
 /// Shared state and helpers for coordinator implementations.
 ///

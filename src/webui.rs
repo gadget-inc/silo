@@ -16,7 +16,7 @@ use axum::{
     Router,
 };
 use tokio::sync::broadcast;
-use tracing::{warn};
+use tracing::warn;
 
 use crate::cluster_client::ClusterClient;
 use crate::cluster_query::ClusterQueryEngine;
@@ -93,6 +93,7 @@ struct IndexTemplate {
     nav_active: &'static str,
     jobs: Vec<JobRow>,
     shard_count: usize,
+    error: Option<String>,
 }
 
 #[derive(Template)]
@@ -116,6 +117,7 @@ struct JobTemplate {
 struct QueuesTemplate {
     nav_active: &'static str,
     queues: Vec<QueueRow>,
+    error: Option<String>,
 }
 
 #[derive(Template)]
@@ -136,6 +138,7 @@ struct ClusterTemplate {
     total_shards: usize,
     owned_shards: usize,
     total_jobs: usize,
+    error: Option<String>,
 }
 
 #[derive(Template)]
@@ -145,6 +148,34 @@ struct ErrorTemplate {
     title: String,
     code: u16,
     message: String,
+}
+
+#[derive(Template)]
+#[template(path = "sql.html")]
+struct SqlTemplate {
+    nav_active: &'static str,
+    query: String,
+    has_result: bool,
+    // These are for the included sql_result.html when has_result is true
+    columns: Vec<String>,
+    rows: Vec<Vec<String>>,
+    row_count: usize,
+    total_rows: usize,
+    truncated: bool,
+    execution_time_ms: u64,
+    error: Option<String>,
+}
+
+#[derive(Template)]
+#[template(path = "sql_result.html")]
+struct SqlResultTemplate {
+    columns: Vec<String>,
+    rows: Vec<Vec<String>>,
+    row_count: usize,
+    total_rows: usize,
+    truncated: bool,
+    execution_time_ms: u64,
+    error: Option<String>,
 }
 
 #[derive(Template)]
@@ -163,6 +194,12 @@ pub struct JobParams {
 pub struct QueueParams {
     shard: String,
     name: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct SqlQueryParams {
+    #[serde(default)]
+    q: String,
 }
 
 fn format_timestamp(ms: i64) -> String {
@@ -216,49 +253,57 @@ fn format_timestamp(ms: i64) -> String {
 
 async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
     let mut all_jobs: Vec<JobRow> = Vec::new();
+    let mut error: Option<String> = None;
 
     // Use cluster query engine for proper cross-shard aggregation
     let sql = "SELECT id, status_kind, enqueue_time_ms, priority FROM jobs WHERE status_kind = 'Scheduled' ORDER BY enqueue_time_ms ASC LIMIT 100";
 
     match state.query_engine.sql(sql).await {
         Ok(df) => {
-            if let Ok(batches) = df.collect().await {
-                for batch in batches {
-                    let id_col = batch.column_by_name("id").and_then(|c| {
-                        c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::StringArray>()
-                    });
-                    let status_col = batch.column_by_name("status_kind").and_then(|c| {
-                        c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::StringArray>()
-                    });
-                    let time_col = batch.column_by_name("enqueue_time_ms").and_then(|c| {
-                        c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::Int64Array>()
-                    });
-                    let priority_col = batch.column_by_name("priority").and_then(|c| {
-                        c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::UInt8Array>()
-                    });
+            match df.collect().await {
+                Ok(batches) => {
+                    for batch in batches {
+                        let id_col = batch.column_by_name("id").and_then(|c| {
+                            c.as_any()
+                                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                        });
+                        let status_col = batch.column_by_name("status_kind").and_then(|c| {
+                            c.as_any()
+                                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                        });
+                        let time_col = batch.column_by_name("enqueue_time_ms").and_then(|c| {
+                            c.as_any()
+                                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                        });
+                        let priority_col = batch.column_by_name("priority").and_then(|c| {
+                            c.as_any()
+                                .downcast_ref::<datafusion::arrow::array::UInt8Array>()
+                        });
 
-                    if let (Some(ids), Some(statuses), Some(times), Some(priorities)) =
-                        (id_col, status_col, time_col, priority_col)
-                    {
-                        for i in 0..batch.num_rows() {
-                            all_jobs.push(JobRow {
-                                id: ids.value(i).to_string(),
-                                shard: "cluster".to_string(), // No longer per-shard
-                                status: statuses.value(i).to_string(),
-                                priority: priorities.value(i),
-                                scheduled_for: format_timestamp(times.value(i)),
-                            });
+                        if let (Some(ids), Some(statuses), Some(times), Some(priorities)) =
+                            (id_col, status_col, time_col, priority_col)
+                        {
+                            for i in 0..batch.num_rows() {
+                                all_jobs.push(JobRow {
+                                    id: ids.value(i).to_string(),
+                                    shard: "cluster".to_string(), // No longer per-shard
+                                    status: statuses.value(i).to_string(),
+                                    priority: priorities.value(i),
+                                    scheduled_for: format_timestamp(times.value(i)),
+                                });
+                            }
                         }
                     }
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to collect query results");
+                    error = Some(format!("Query execution error: {}", e));
                 }
             }
         }
         Err(e) => {
             warn!(error = %e, "failed to query jobs from cluster");
+            error = Some(format!("Query error: {}", e));
         }
     }
 
@@ -275,6 +320,7 @@ async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
         nav_active: "index",
         jobs: all_jobs,
         shard_count,
+        error,
     };
 
     Html(
@@ -467,13 +513,14 @@ async fn cancel_job_handler(
 async fn queues_handler(State(state): State<AppState>) -> impl IntoResponse {
     // Key: queue_name -> (holders, waiters)
     let mut all_queues: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut error: Option<String> = None;
 
     // Use cluster query engine for proper aggregation across all shards
     let sql = "SELECT queue_name, entry_type, COUNT(*) as cnt FROM queues GROUP BY queue_name, entry_type";
 
     match state.query_engine.sql(sql).await {
-        Ok(df) => {
-            if let Ok(batches) = df.collect().await {
+        Ok(df) => match df.collect().await {
+            Ok(batches) => {
                 for batch in batches {
                     let name_col = batch.column_by_name("queue_name").and_then(|c| {
                         c.as_any()
@@ -507,9 +554,14 @@ async fn queues_handler(State(state): State<AppState>) -> impl IntoResponse {
                     }
                 }
             }
-        }
+            Err(e) => {
+                warn!(error = %e, "failed to collect query results");
+                error = Some(format!("Query execution error: {}", e));
+            }
+        },
         Err(e) => {
             warn!(error = %e, "failed to query queues from cluster");
+            error = Some(format!("Query error: {}", e));
         }
     }
 
@@ -528,6 +580,7 @@ async fn queues_handler(State(state): State<AppState>) -> impl IntoResponse {
     let template = QueuesTemplate {
         nav_active: "queues",
         queues,
+        error,
     };
 
     Html(
@@ -687,10 +740,11 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
 
     // Query job counts per shard using GROUP BY shard_id
     let sql = "SELECT shard_id, COUNT(*) as cnt FROM jobs GROUP BY shard_id";
+    let mut error: Option<String> = None;
 
     match state.query_engine.sql(sql).await {
-        Ok(df) => {
-            if let Ok(batches) = df.collect().await {
+        Ok(df) => match df.collect().await {
+            Ok(batches) => {
                 for batch in batches {
                     let shard_col = batch.column_by_name("shard_id").and_then(|c| {
                         c.as_any()
@@ -710,9 +764,14 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
                     }
                 }
             }
-        }
+            Err(e) => {
+                warn!(error = %e, "failed to collect query results");
+                error = Some(format!("Query execution error: {}", e));
+            }
+        },
         Err(e) => {
             warn!(error = %e, "failed to query shards");
+            error = Some(format!("Query error: {}", e));
         }
     }
 
@@ -772,6 +831,7 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
         total_shards,
         owned_shards,
         total_jobs,
+        error,
     };
 
     Html(
@@ -779,6 +839,235 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
             .render()
             .unwrap_or_else(|e| format!("Template error: {}", e)),
     )
+}
+
+/// Maximum number of rows to return from SQL queries to avoid crashing the browser
+const SQL_RESULT_LIMIT: usize = 1000;
+
+async fn sql_handler(Query(params): Query<SqlQueryParams>) -> impl IntoResponse {
+    let template = SqlTemplate {
+        nav_active: "sql",
+        query: params.q,
+        has_result: false,
+        columns: Vec::new(),
+        rows: Vec::new(),
+        row_count: 0,
+        total_rows: 0,
+        truncated: false,
+        execution_time_ms: 0,
+        error: None,
+    };
+
+    Html(
+        template
+            .render()
+            .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
+}
+
+async fn sql_execute_handler(
+    State(state): State<AppState>,
+    Query(params): Query<SqlQueryParams>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    if params.q.trim().is_empty() {
+        return Html(
+            SqlResultTemplate {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: 0,
+                total_rows: 0,
+                truncated: false,
+                execution_time_ms: 0,
+                error: Some("Please enter a SQL query".to_string()),
+            }
+            .render()
+            .unwrap_or_default(),
+        );
+    }
+
+    // Execute the query
+    match state.query_engine.sql(&params.q).await {
+        Ok(df) => {
+            match df.collect().await {
+                Ok(batches) => {
+                    let execution_time_ms = start.elapsed().as_millis() as u64;
+
+                    // Extract column names from schema
+                    let columns: Vec<String> = if let Some(batch) = batches.first() {
+                        batch
+                            .schema()
+                            .fields()
+                            .iter()
+                            .map(|f| f.name().clone())
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+
+                    // Extract rows as strings, with limit
+                    let mut rows: Vec<Vec<String>> = Vec::new();
+                    let mut total_rows: usize = 0;
+
+                    for batch in &batches {
+                        for row_idx in 0..batch.num_rows() {
+                            total_rows += 1;
+                            if rows.len() >= SQL_RESULT_LIMIT {
+                                continue; // Keep counting but don't add more rows
+                            }
+
+                            let mut row: Vec<String> = Vec::new();
+                            for col_idx in 0..batch.num_columns() {
+                                let col = batch.column(col_idx);
+                                let value = array_value_to_string(col, row_idx);
+                                row.push(value);
+                            }
+                            rows.push(row);
+                        }
+                    }
+
+                    let truncated = total_rows > SQL_RESULT_LIMIT;
+                    let row_count = rows.len();
+
+                    Html(
+                        SqlResultTemplate {
+                            columns,
+                            rows,
+                            row_count,
+                            total_rows,
+                            truncated,
+                            execution_time_ms,
+                            error: None,
+                        }
+                        .render()
+                        .unwrap_or_default(),
+                    )
+                }
+                Err(e) => {
+                    let execution_time_ms = start.elapsed().as_millis() as u64;
+                    Html(
+                        SqlResultTemplate {
+                            columns: Vec::new(),
+                            rows: Vec::new(),
+                            row_count: 0,
+                            total_rows: 0,
+                            truncated: false,
+                            execution_time_ms,
+                            error: Some(format!("Execution error: {}", e)),
+                        }
+                        .render()
+                        .unwrap_or_default(),
+                    )
+                }
+            }
+        }
+        Err(e) => {
+            let execution_time_ms = start.elapsed().as_millis() as u64;
+            Html(
+                SqlResultTemplate {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    row_count: 0,
+                    total_rows: 0,
+                    truncated: false,
+                    execution_time_ms,
+                    error: Some(format!("Query error: {}", e)),
+                }
+                .render()
+                .unwrap_or_default(),
+            )
+        }
+    }
+}
+
+/// Convert an Arrow array value at a given index to a string representation
+fn array_value_to_string(array: &dyn datafusion::arrow::array::Array, index: usize) -> String {
+    use datafusion::arrow::array::*;
+    use datafusion::arrow::datatypes::DataType;
+
+    if array.is_null(index) {
+        return "NULL".to_string();
+    }
+
+    match array.data_type() {
+        DataType::Utf8 => array
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .map(|a| a.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::LargeUtf8 => array
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .map(|a| a.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::Int8 => array
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .map(|a| a.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::Int16 => array
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .map(|a| a.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::Int32 => array
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .map(|a| a.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::Int64 => array
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .map(|a| a.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::UInt8 => array
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .map(|a| a.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::UInt16 => array
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .map(|a| a.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::UInt32 => array
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .map(|a| a.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::UInt64 => array
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .map(|a| a.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::Float32 => array
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .map(|a| a.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::Float64 => array
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .map(|a| a.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::Boolean => array
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .map(|a| a.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::Binary => array
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .map(|a| format!("<{} bytes>", a.value(index).len()))
+            .unwrap_or_default(),
+        DataType::LargeBinary => array
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .map(|a| format!("<{} bytes>", a.value(index).len()))
+            .unwrap_or_default(),
+        _ => format!("<{}>", array.data_type()),
+    }
 }
 
 async fn not_found_handler() -> impl IntoResponse {
@@ -802,6 +1091,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/queues", get(queues_handler))
         .route("/queue", get(queue_handler))
         .route("/cluster", get(cluster_handler))
+        .route("/sql", get(sql_handler))
+        .route("/sql/execute", get(sql_execute_handler))
         .fallback(not_found_handler)
         .with_state(state)
 }

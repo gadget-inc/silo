@@ -1,0 +1,580 @@
+//! Cluster query integration tests with etcd coordinator
+//!
+//! These tests start multiple nodes with etcd coordination and verify
+//! cross-cluster queries work correctly.
+
+mod test_helpers;
+
+use datafusion::arrow::array::{Int64Array, StringArray};
+use silo::cluster_query::ClusterQueryEngine;
+use silo::coordination::etcd::EtcdCoordinator;
+use silo::coordination::Coordinator;
+use silo::factory::ShardFactory;
+use silo::gubernator::MockGubernatorClient;
+use silo::pb::silo_client::SiloClient;
+use silo::pb::{EnqueueRequest, JsonValueBytes};
+use silo::server::run_grpc_with_reaper;
+use silo::settings::{Backend, DatabaseTemplate};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::TcpListener;
+use tonic::transport::Channel;
+use uuid::Uuid;
+
+const NUM_SHARDS: u32 = 16;
+
+/// Generate a unique cluster prefix to avoid test interference
+fn unique_prefix() -> String {
+    format!("test-cluster-query-{}", Uuid::new_v4())
+}
+
+/// Create a test shard factory with memory backend
+fn make_test_factory(node_id: &str) -> Arc<ShardFactory> {
+    let tmpdir = std::env::temp_dir().join(format!("silo-cluster-query-test-{}", node_id));
+    Arc::new(ShardFactory::new(
+        DatabaseTemplate {
+            backend: Backend::Memory,
+            path: tmpdir.join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+        },
+        MockGubernatorClient::new_arc(),
+    ))
+}
+
+/// Get a gRPC client for a node
+async fn get_client(addr: &str) -> SiloClient<Channel> {
+    let channel = Channel::from_shared(format!("http://{}", addr))
+        .unwrap()
+        .connect()
+        .await
+        .expect("failed to connect to node");
+    SiloClient::new(channel)
+}
+
+/// Enqueue a job via gRPC to a specific shard
+async fn enqueue_job(
+    client: &mut SiloClient<Channel>,
+    shard: u32,
+    job_id: &str,
+    tenant: Option<&str>,
+) {
+    let request = EnqueueRequest {
+        shard,
+        id: job_id.to_string(),
+        priority: 5,
+        start_at_ms: 0,
+        retry_policy: None,
+        payload: Some(JsonValueBytes {
+            data: b"{}".to_vec(),
+        }),
+        limits: vec![],
+        tenant: tenant.map(|s| s.to_string()),
+        metadata: HashMap::new(),
+    };
+    client
+        .enqueue(request)
+        .await
+        .expect("failed to enqueue job");
+}
+
+/// Helper struct to manage routing to correct nodes based on shard ownership
+struct ClusterClients {
+    client1: SiloClient<Channel>,
+    client2: SiloClient<Channel>,
+    node1_shards: Vec<u32>,
+    node2_shards: Vec<u32>,
+}
+
+impl ClusterClients {
+    async fn new(addr1: &str, addr2: &str, coordinator: &EtcdCoordinator) -> Self {
+        let client1 = get_client(addr1).await;
+        let client2 = get_client(addr2).await;
+
+        // Get shard owner map to know which node owns which shards
+        let owner_map = coordinator
+            .get_shard_owner_map()
+            .await
+            .expect("get owner map");
+
+        let mut node1_shards = Vec::new();
+        let mut node2_shards = Vec::new();
+
+        for (shard_id, addr) in &owner_map.shard_to_addr {
+            if addr.contains(&addr1.replace("127.0.0.1:", "")) || addr == addr1 {
+                node1_shards.push(*shard_id);
+            } else {
+                node2_shards.push(*shard_id);
+            }
+        }
+
+        node1_shards.sort();
+        node2_shards.sort();
+
+        Self {
+            client1,
+            client2,
+            node1_shards,
+            node2_shards,
+        }
+    }
+
+    /// Get the client for the node that owns the given shard
+    fn client_for_shard(&mut self, shard: u32) -> &mut SiloClient<Channel> {
+        if self.node1_shards.contains(&shard) {
+            &mut self.client1
+        } else {
+            &mut self.client2
+        }
+    }
+
+    /// Get a shard owned by node 1
+    fn shard_on_node1(&self) -> u32 {
+        *self
+            .node1_shards
+            .first()
+            .expect("node1 should own at least one shard")
+    }
+
+    /// Get a shard owned by node 2
+    fn shard_on_node2(&self) -> u32 {
+        *self
+            .node2_shards
+            .first()
+            .expect("node2 should own at least one shard")
+    }
+}
+
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cluster_two_nodes_basic_query() {
+    let prefix = unique_prefix();
+    let cfg = silo::settings::AppConfig::load(None).expect("load config");
+
+    let factory1 = make_test_factory("query-n1");
+    let factory2 = make_test_factory("query-n2");
+
+    // Start node 1
+    let (coordinator1, h1) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n1",
+        "127.0.0.1:50161",
+        NUM_SHARDS,
+        10,
+        factory1.clone(),
+    )
+    .await
+    .expect("start coordinator 1");
+    let coordinator1 = Arc::new(coordinator1);
+
+    // Start node 2
+    let (coordinator2, h2) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n2",
+        "127.0.0.1:50162",
+        NUM_SHARDS,
+        10,
+        factory2.clone(),
+    )
+    .await
+    .expect("start coordinator 2");
+    let coordinator2 = Arc::new(coordinator2);
+
+    // Wait for cluster to converge
+    assert!(
+        coordinator1.wait_converged(Duration::from_secs(30)).await,
+        "cluster did not converge"
+    );
+
+    // Start gRPC servers
+    let listener1 = TcpListener::bind("127.0.0.1:50161").await.unwrap();
+    let listener2 = TcpListener::bind("127.0.0.1:50162").await.unwrap();
+
+    let (shutdown_tx1, shutdown_rx1) = tokio::sync::broadcast::channel(1);
+    let (shutdown_tx2, shutdown_rx2) = tokio::sync::broadcast::channel(1);
+
+    let server1 = tokio::spawn(run_grpc_with_reaper(
+        listener1,
+        factory1.clone(),
+        Some(coordinator1.clone()),
+        cfg.clone(),
+        shutdown_rx1,
+    ));
+
+    let server2 = tokio::spawn(run_grpc_with_reaper(
+        listener2,
+        factory2.clone(),
+        Some(coordinator2.clone()),
+        cfg.clone(),
+        shutdown_rx2,
+    ));
+
+    // Give servers time to start
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Set up cluster clients with shard routing
+    let mut clients =
+        ClusterClients::new("127.0.0.1:50161", "127.0.0.1:50162", &coordinator1).await;
+
+    // Get shards owned by each node
+    let shard1 = clients.shard_on_node1();
+    let shard2 = clients.shard_on_node2();
+
+    // Enqueue jobs to shards owned by the correct nodes
+    enqueue_job(clients.client_for_shard(shard1), shard1, "job-001", None).await;
+    enqueue_job(clients.client_for_shard(shard1), shard1, "job-002", None).await;
+    enqueue_job(clients.client_for_shard(shard2), shard2, "job-003", None).await;
+    enqueue_job(clients.client_for_shard(shard2), shard2, "job-004", None).await;
+
+    // Create cluster query engine on node 1
+    let query_engine =
+        ClusterQueryEngine::new(factory1.clone(), Some(coordinator1.clone()), NUM_SHARDS)
+            .await
+            .expect("failed to create query engine");
+
+    // Test basic count query
+    let df = query_engine
+        .sql("SELECT COUNT(*) as cnt FROM jobs")
+        .await
+        .expect("query failed");
+    let batches = df.collect().await.expect("collect failed");
+
+    let total_count: i64 = batches
+        .iter()
+        .map(|b| {
+            b.column_by_name("cnt")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        })
+        .sum();
+
+    assert_eq!(total_count, 4, "should have 4 jobs total");
+
+    // Cleanup
+    let _ = shutdown_tx1.send(());
+    let _ = shutdown_tx2.send(());
+    coordinator1.shutdown().await.ok();
+    coordinator2.shutdown().await.ok();
+    server1.abort();
+    server2.abort();
+    h1.abort();
+    h2.abort();
+}
+
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cluster_two_nodes_status_filter_query() {
+    let prefix = unique_prefix();
+    let cfg = silo::settings::AppConfig::load(None).expect("load config");
+
+    let factory1 = make_test_factory("status-n1");
+    let factory2 = make_test_factory("status-n2");
+
+    // Start nodes
+    let (coordinator1, h1) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n1",
+        "127.0.0.1:50181",
+        NUM_SHARDS,
+        10,
+        factory1.clone(),
+    )
+    .await
+    .expect("start coordinator 1");
+    let coordinator1 = Arc::new(coordinator1);
+
+    let (coordinator2, h2) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n2",
+        "127.0.0.1:50182",
+        NUM_SHARDS,
+        10,
+        factory2.clone(),
+    )
+    .await
+    .expect("start coordinator 2");
+    let coordinator2 = Arc::new(coordinator2);
+
+    assert!(coordinator1.wait_converged(Duration::from_secs(30)).await);
+
+    // Start gRPC servers
+    let listener1 = TcpListener::bind("127.0.0.1:50181").await.unwrap();
+    let listener2 = TcpListener::bind("127.0.0.1:50182").await.unwrap();
+
+    let (shutdown_tx1, shutdown_rx1) = tokio::sync::broadcast::channel(1);
+    let (shutdown_tx2, shutdown_rx2) = tokio::sync::broadcast::channel(1);
+
+    let server1 = tokio::spawn(run_grpc_with_reaper(
+        listener1,
+        factory1.clone(),
+        Some(coordinator1.clone()),
+        cfg.clone(),
+        shutdown_rx1,
+    ));
+
+    let server2 = tokio::spawn(run_grpc_with_reaper(
+        listener2,
+        factory2.clone(),
+        Some(coordinator2.clone()),
+        cfg.clone(),
+        shutdown_rx2,
+    ));
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Set up cluster clients with shard routing
+    let mut clients =
+        ClusterClients::new("127.0.0.1:50181", "127.0.0.1:50182", &coordinator1).await;
+
+    // Enqueue some jobs, routing to the correct node for each shard
+    for i in 0..5u32 {
+        let shard = i % NUM_SHARDS;
+        let client = clients.client_for_shard(shard);
+        enqueue_job(client, shard, &format!("job-{:03}", i), None).await;
+    }
+
+    // Create cluster query engine
+    let query_engine =
+        ClusterQueryEngine::new(factory1.clone(), Some(coordinator1.clone()), NUM_SHARDS)
+            .await
+            .expect("failed to create query engine");
+
+    // Test status filter - this is what the webui uses
+    let df = query_engine
+        .sql("SELECT id, status_kind, enqueue_time_ms, priority FROM jobs WHERE status_kind = 'Scheduled' ORDER BY enqueue_time_ms ASC LIMIT 100")
+        .await
+        .expect("query failed");
+    let batches = df.collect().await.expect("collect failed");
+
+    let mut count = 0;
+    for batch in &batches {
+        count += batch.num_rows();
+        // Verify all returned rows have Scheduled status
+        if let Some(status_col) = batch
+            .column_by_name("status_kind")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        {
+            for i in 0..batch.num_rows() {
+                assert_eq!(status_col.value(i), "Scheduled");
+            }
+        }
+    }
+
+    assert_eq!(count, 5, "should have 5 scheduled jobs");
+
+    // Cleanup
+    let _ = shutdown_tx1.send(());
+    let _ = shutdown_tx2.send(());
+    coordinator1.shutdown().await.ok();
+    coordinator2.shutdown().await.ok();
+    server1.abort();
+    server2.abort();
+    h1.abort();
+    h2.abort();
+}
+
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cluster_two_nodes_count_across_shards() {
+    let prefix = unique_prefix();
+    let cfg = silo::settings::AppConfig::load(None).expect("load config");
+
+    let factory1 = make_test_factory("groupby-n1");
+    let factory2 = make_test_factory("groupby-n2");
+
+    // Start nodes
+    let (coordinator1, h1) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n1",
+        "127.0.0.1:50191",
+        NUM_SHARDS,
+        10,
+        factory1.clone(),
+    )
+    .await
+    .expect("start coordinator 1");
+    let coordinator1 = Arc::new(coordinator1);
+
+    let (coordinator2, h2) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n2",
+        "127.0.0.1:50192",
+        NUM_SHARDS,
+        10,
+        factory2.clone(),
+    )
+    .await
+    .expect("start coordinator 2");
+    let coordinator2 = Arc::new(coordinator2);
+
+    assert!(coordinator1.wait_converged(Duration::from_secs(30)).await);
+
+    // Start gRPC servers
+    let listener1 = TcpListener::bind("127.0.0.1:50191").await.unwrap();
+    let listener2 = TcpListener::bind("127.0.0.1:50192").await.unwrap();
+
+    let (shutdown_tx1, shutdown_rx1) = tokio::sync::broadcast::channel(1);
+    let (shutdown_tx2, shutdown_rx2) = tokio::sync::broadcast::channel(1);
+
+    let server1 = tokio::spawn(run_grpc_with_reaper(
+        listener1,
+        factory1.clone(),
+        Some(coordinator1.clone()),
+        cfg.clone(),
+        shutdown_rx1,
+    ));
+
+    let server2 = tokio::spawn(run_grpc_with_reaper(
+        listener2,
+        factory2.clone(),
+        Some(coordinator2.clone()),
+        cfg.clone(),
+        shutdown_rx2,
+    ));
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Set up cluster clients with shard routing
+    let mut clients =
+        ClusterClients::new("127.0.0.1:50191", "127.0.0.1:50192", &coordinator1).await;
+
+    // Enqueue jobs to different shards, routing to the correct node
+    for i in 0..20u32 {
+        let shard = i % NUM_SHARDS;
+        let client = clients.client_for_shard(shard);
+        enqueue_job(client, shard, &format!("job-{:03}", i), None).await;
+    }
+
+    // Create cluster query engine
+    let query_engine =
+        ClusterQueryEngine::new(factory1.clone(), Some(coordinator1.clone()), NUM_SHARDS)
+            .await
+            .expect("failed to create query engine");
+
+    // Test COUNT aggregation across shards
+    let df = query_engine
+        .sql("SELECT COUNT(*) as cnt FROM jobs")
+        .await
+        .expect("query failed");
+    let batches = df.collect().await.expect("collect failed");
+
+    let total: i64 = batches
+        .iter()
+        .map(|b| {
+            b.column_by_name("cnt")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        })
+        .sum();
+
+    assert_eq!(total, 20, "should have 20 jobs total across all shards");
+
+    // Cleanup
+    let _ = shutdown_tx1.send(());
+    let _ = shutdown_tx2.send(());
+    coordinator1.shutdown().await.ok();
+    coordinator2.shutdown().await.ok();
+    server1.abort();
+    server2.abort();
+    h1.abort();
+    h2.abort();
+}
+
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cluster_two_nodes_queues_table() {
+    let prefix = unique_prefix();
+    let cfg = silo::settings::AppConfig::load(None).expect("load config");
+
+    let factory1 = make_test_factory("queues-n1");
+    let factory2 = make_test_factory("queues-n2");
+
+    // Start nodes
+    let (coordinator1, h1) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n1",
+        "127.0.0.1:50201",
+        NUM_SHARDS,
+        10,
+        factory1.clone(),
+    )
+    .await
+    .expect("start coordinator 1");
+    let coordinator1 = Arc::new(coordinator1);
+
+    let (coordinator2, h2) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n2",
+        "127.0.0.1:50202",
+        NUM_SHARDS,
+        10,
+        factory2.clone(),
+    )
+    .await
+    .expect("start coordinator 2");
+    let coordinator2 = Arc::new(coordinator2);
+
+    assert!(coordinator1.wait_converged(Duration::from_secs(30)).await);
+
+    // Start gRPC servers
+    let listener1 = TcpListener::bind("127.0.0.1:50201").await.unwrap();
+    let listener2 = TcpListener::bind("127.0.0.1:50202").await.unwrap();
+
+    let (shutdown_tx1, shutdown_rx1) = tokio::sync::broadcast::channel(1);
+    let (shutdown_tx2, shutdown_rx2) = tokio::sync::broadcast::channel(1);
+
+    let server1 = tokio::spawn(run_grpc_with_reaper(
+        listener1,
+        factory1.clone(),
+        Some(coordinator1.clone()),
+        cfg.clone(),
+        shutdown_rx1,
+    ));
+
+    let server2 = tokio::spawn(run_grpc_with_reaper(
+        listener2,
+        factory2.clone(),
+        Some(coordinator2.clone()),
+        cfg.clone(),
+        shutdown_rx2,
+    ));
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Create cluster query engine
+    let query_engine =
+        ClusterQueryEngine::new(factory1.clone(), Some(coordinator1.clone()), NUM_SHARDS)
+            .await
+            .expect("failed to create query engine");
+
+    // Test queues table query - used by queues page
+    let df = query_engine
+        .sql("SELECT queue_name, entry_type, COUNT(*) as cnt FROM queues GROUP BY queue_name, entry_type")
+        .await
+        .expect("query failed");
+    let batches = df.collect().await.expect("collect failed");
+
+    // Should succeed even with no queues (just verify we got results without error)
+    let _ = batches;
+
+    // Cleanup
+    let _ = shutdown_tx1.send(());
+    let _ = shutdown_tx2.send(());
+    coordinator1.shutdown().await.ok();
+    coordinator2.shutdown().await.ok();
+    server1.abort();
+    server2.abort();
+    h1.abort();
+    h2.abort();
+}

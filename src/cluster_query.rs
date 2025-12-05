@@ -28,6 +28,7 @@ use datafusion::physical_plan::{
     ExecutionPlan, Partitioning, PlanProperties, SendableRecordBatchStream, Statistics,
 };
 use datafusion::prelude::DataFrame;
+use datafusion_sql::unparser::Unparser;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
@@ -102,17 +103,15 @@ impl ClusterQueryEngine {
     ) -> DfResult<Self> {
         let ctx = SessionContext::new();
 
-        // Build shard configuration - determine which shards are local vs remote
-        let shard_configs =
-            Self::build_shard_configs(&factory, coordinator.as_ref(), num_shards).await;
-
         // Register cluster-wide jobs table with shard_id column
         let jobs_base_schema = JobsScanner::base_schema();
         let jobs_schema = schema_with_shard_id(&jobs_base_schema);
         let jobs_provider = Arc::new(ClusterTableProvider::new(
             jobs_schema,
             jobs_base_schema,
-            shard_configs.clone(),
+            factory.clone(),
+            coordinator.clone(),
+            num_shards,
             TableKind::Jobs,
         ));
         ctx.register_table("jobs", jobs_provider)?;
@@ -123,7 +122,9 @@ impl ClusterQueryEngine {
         let queues_provider = Arc::new(ClusterTableProvider::new(
             queues_schema,
             queues_base_schema,
-            shard_configs,
+            factory,
+            coordinator,
+            num_shards,
             TableKind::Queues,
         ));
         ctx.register_table("queues", queues_provider)?;
@@ -131,7 +132,8 @@ impl ClusterQueryEngine {
         Ok(Self { ctx })
     }
 
-    /// Build shard configurations by checking which shards are local and which are remote
+    /// Build shard configurations by checking which shards are local and which are remote.
+    /// This is called at query time to get the current cluster state.
     async fn build_shard_configs(
         factory: &ShardFactory,
         coordinator: Option<&Arc<dyn Coordinator>>,
@@ -199,14 +201,30 @@ enum TableKind {
 
 /// A TableProvider that spans multiple shards in the cluster.
 /// Each shard becomes a partition in the execution plan.
-#[derive(Debug)]
+///
+/// Shard configurations are computed dynamically at scan time to ensure
+/// queries always use the current cluster state.
 struct ClusterTableProvider {
     /// Schema including shard_id column
     schema: SchemaRef,
     /// Base schema without shard_id (used for underlying scanners)
     base_schema: SchemaRef,
-    shard_configs: Vec<ShardConfig>,
+    /// Factory for accessing local shards
+    factory: Arc<ShardFactory>,
+    /// Optional coordinator for discovering remote shards
+    coordinator: Option<Arc<dyn Coordinator>>,
+    /// Total number of shards in the cluster
+    num_shards: u32,
     table_kind: TableKind,
+}
+
+impl std::fmt::Debug for ClusterTableProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClusterTableProvider")
+            .field("table_kind", &self.table_kind)
+            .field("num_shards", &self.num_shards)
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for ShardConfig {
@@ -224,13 +242,17 @@ impl ClusterTableProvider {
     fn new(
         schema: SchemaRef,
         base_schema: SchemaRef,
-        shard_configs: Vec<ShardConfig>,
+        factory: Arc<ShardFactory>,
+        coordinator: Option<Arc<dyn Coordinator>>,
+        num_shards: u32,
         table_kind: TableKind,
     ) -> Self {
         Self {
             schema,
             base_schema,
-            shard_configs,
+            factory,
+            coordinator,
+            num_shards,
             table_kind,
         }
     }
@@ -257,6 +279,14 @@ impl TableProvider for ClusterTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        // Build shard configs dynamically to pick up current cluster state
+        let shard_configs = ClusterQueryEngine::build_shard_configs(
+            &self.factory,
+            self.coordinator.as_ref(),
+            self.num_shards,
+        )
+        .await;
+
         // Handle projection: we need to track if shard_id is requested and which
         // base columns are requested
         let (output_schema, include_shard_id, base_projection) = match projection {
@@ -279,7 +309,7 @@ impl TableProvider for ClusterTableProvider {
         Ok(Arc::new(ClusterExecutionPlan::new(
             output_schema,
             Arc::clone(&self.base_schema),
-            self.shard_configs.clone(),
+            shard_configs,
             self.table_kind,
             filters.to_vec(),
             limit,
@@ -567,14 +597,31 @@ async fn query_remote_shard_batches(
     };
 
     let sql = build_sql_query(table_name, filters, limit);
-    debug!(shard_id, addr, sql = %sql, "querying remote shard");
+
+    // Ensure address has http:// scheme for gRPC connection
+    let full_addr = if addr.starts_with("http://") || addr.starts_with("https://") {
+        addr.to_string()
+    } else {
+        format!("http://{}", addr)
+    };
+    debug!(shard_id, addr = %full_addr, sql = %sql, "querying remote shard");
 
     // Connect to remote node
-    let channel = Channel::from_shared(addr.to_string())
-        .map_err(|e| DataFusionError::External(Box::new(e)))?
+    let channel = Channel::from_shared(full_addr.clone())
+        .map_err(|e| {
+            DataFusionError::External(format!("invalid address '{}': {}", full_addr, e).into())
+        })?
         .connect()
         .await
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        .map_err(|e| {
+            DataFusionError::External(
+                format!(
+                    "failed to connect to shard {} at '{}': {}",
+                    shard_id, full_addr, e
+                )
+                .into(),
+            )
+        })?;
 
     let mut client = SiloClient::new(channel);
 
@@ -609,13 +656,28 @@ async fn query_remote_shard_batches(
 
 /// Build a SQL query string from filters and limit.
 /// This reconstructs the query to send to remote shards.
+///
+/// Uses DataFusion's SQL unparser to properly convert expressions to standard SQL,
+/// avoiding issues with internal representations like `utf8('value')`.
 fn build_sql_query(table_name: &str, filters: &[Expr], limit: Option<usize>) -> String {
     let mut sql = format!("SELECT * FROM {}", table_name);
 
     if !filters.is_empty() {
-        let filter_strs: Vec<String> = filters.iter().map(|f| format!("{}", f)).collect();
-        sql.push_str(" WHERE ");
-        sql.push_str(&filter_strs.join(" AND "));
+        let unparser = Unparser::default().with_pretty(true);
+        let filter_strs: Vec<String> = filters
+            .iter()
+            .filter_map(|f| {
+                unparser
+                    .expr_to_sql(f)
+                    .ok()
+                    .map(|sql_expr| sql_expr.to_string())
+            })
+            .collect();
+
+        if !filter_strs.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&filter_strs.join(" AND "));
+        }
     }
 
     if let Some(lim) = limit {
