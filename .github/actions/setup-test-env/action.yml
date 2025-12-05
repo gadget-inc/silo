@@ -17,8 +17,14 @@ runs:
     - name: Restore and save Nix store
       uses: nix-community/cache-nix-action@v6
       with:
-        primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+        # Include Cargo.lock since Nix builds depend on Rust dependencies
+        # Include github.run_id to ensure new caches are always saved (GH caches are immutable)
+        primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock', '**/Cargo.lock') }}-${{ github.run_id }}
         restore-prefixes-first-match: nix-${{ runner.os }}-
+        # Garbage collect to keep cache size manageable
+        gc-max-store-size-linux: 4294967296
+        # Save cache even if job fails (to cache partial builds)
+        save-always: true
     - run: |
         source <(nix print-dev-env --show-trace) 
         output_file="nix-env.txt"
