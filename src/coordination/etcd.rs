@@ -127,7 +127,7 @@ impl EtcdCoordinator {
                 }
                 match lease_bg.keep_alive(membership_lease).await {
                     Ok(x) => {
-                        info!(node_id = %nid, lease_id = membership_lease, "membership lease keepalive channel established");
+                        debug!(node_id = %nid, lease_id = membership_lease, "membership lease keepalive channel established");
                         break x;
                     }
                     Err(e) => {
@@ -143,7 +143,7 @@ impl EtcdCoordinator {
                 }
                 match lease_bg.keep_alive(liveness_lease).await {
                     Ok(x) => {
-                        info!(node_id = %nid, lease_id = liveness_lease, "liveness lease keepalive channel established");
+                        debug!(node_id = %nid, lease_id = liveness_lease, "liveness lease keepalive channel established");
                         break x;
                     }
                     Err(e) => {
@@ -200,7 +200,7 @@ impl EtcdCoordinator {
             let keepalive_interval_secs = (ttl_secs / 3).max(1) as u64;
             let mut keepalive_timer =
                 tokio::time::interval(Duration::from_secs(keepalive_interval_secs));
-            info!(node_id = %nid, interval_secs = keepalive_interval_secs, "starting keepalive timer");
+            debug!(node_id = %nid, interval_secs = keepalive_interval_secs, "starting keepalive timer");
 
             loop {
                 tokio::select! {

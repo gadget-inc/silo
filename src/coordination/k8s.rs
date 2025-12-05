@@ -269,7 +269,7 @@ impl K8sCoordinator {
         let mut safety_reconcile_timer = tokio::time::interval(safety_reconcile_interval);
 
         // Do initial reconciliation immediately
-        info!(node_id = %self.base.node_id, "performing initial shard reconciliation");
+        debug!(node_id = %self.base.node_id, "performing initial shard reconciliation");
         if let Err(e) = self.reconcile_shards().await {
             warn!(node_id = %self.base.node_id, error = %e, "initial reconcile failed");
         }

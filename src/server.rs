@@ -704,7 +704,7 @@ impl Silo for SiloService {
             match self.factory.reset(shard_number).await {
                 Ok(_) => {
                     reset_count += 1;
-                    tracing::info!(shard = shard_number, "reset shard successfully");
+                    tracing::debug!(shard = shard_number, "reset shard successfully");
                 }
                 Err(e) => {
                     tracing::error!(shard = shard_number, error = %e, "failed to reset shard");

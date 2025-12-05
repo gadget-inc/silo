@@ -59,6 +59,15 @@ pub struct DequeueResult {
     pub refresh_tasks: Vec<LeasedRefreshTask>,
 }
 
+/// Configuration for WAL cleanup during shard close
+#[derive(Debug, Clone)]
+pub struct WalCloseConfig {
+    /// Path to the local WAL directory to clean up
+    pub path: String,
+    /// Whether to flush memtable to SST before closing
+    pub flush_on_close: bool,
+}
+
 /// Represents a single shard of the system. Owns the SlateDB instance.
 pub struct JobStoreShard {
     name: String,
@@ -67,6 +76,8 @@ pub struct JobStoreShard {
     concurrency: Arc<ConcurrencyManager>,
     query_engine: OnceLock<ShardQueryEngine>,
     rate_limiter: Arc<dyn RateLimitClient>,
+    /// Optional WAL close configuration - present when using local WAL storage
+    wal_close_config: Option<WalCloseConfig>,
 }
 
 #[derive(Debug, Error)]
@@ -118,11 +129,23 @@ impl JobStoreShard {
         let mut db_builder =
             slatedb::DbBuilder::new(resolved.canonical_path.as_str(), resolved.store);
 
-        // Configure separate WAL object store if specified
-        if let Some(wal_cfg) = &cfg.wal {
+        // Configure separate WAL object store if specified, and track for cleanup on close
+        let wal_close_config = if let Some(wal_cfg) = &cfg.wal {
             let wal_resolved = resolve_object_store(&wal_cfg.backend, &wal_cfg.path)?;
             db_builder = db_builder.with_wal_object_store(wal_resolved.store);
-        }
+
+            // Only set up WAL cleanup for local (Fs) storage backends
+            if wal_cfg.is_local_storage() {
+                Some(WalCloseConfig {
+                    path: wal_resolved.canonical_path,
+                    flush_on_close: cfg.apply_wal_on_close,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // Apply custom flush interval if specified
         if let Some(flush_ms) = cfg.flush_interval_ms {
@@ -146,6 +169,7 @@ impl JobStoreShard {
             concurrency,
             query_engine: OnceLock::new(),
             rate_limiter,
+            wal_close_config,
         });
 
         Ok(shard)
@@ -162,9 +186,82 @@ impl JobStoreShard {
     }
 
     /// Close the underlying SlateDB instance gracefully.
+    ///
+    /// When a separate local WAL is configured with `apply_wal_on_close: true`:
+    /// 1. Flushes all memtable data to SSTs in object storage
+    /// 2. Closes the database
+    /// 3. Deletes the local WAL directory
+    ///
+    /// This ensures all data is durably stored in object storage before closing,
+    /// allowing the shard to be safely reopened elsewhere (e.g., on a different node).
     pub async fn close(&self) -> Result<(), JobStoreShardError> {
         self.broker.stop();
-        self.db.close().await.map_err(JobStoreShardError::from)
+
+        // If we have a local WAL with flush_on_close enabled, flush memtable to SSTs first
+        if let Some(ref wal_config) = self.wal_close_config {
+            if wal_config.flush_on_close {
+                tracing::info!(
+                    shard = %self.name,
+                    wal_path = %wal_config.path,
+                    "flushing memtable to object storage before close"
+                );
+
+                // Flush memtable to SST to ensure all data is in object storage
+                // This converts all in-memory data (and WAL data) to SSTs
+                self.db
+                    .flush_with_options(slatedb::config::FlushOptions {
+                        flush_type: slatedb::config::FlushType::MemTable,
+                    })
+                    .await
+                    .map_err(JobStoreShardError::from)?;
+
+                tracing::debug!(
+                    shard = %self.name,
+                    "memtable flushed to SST, closing database"
+                );
+            }
+        }
+
+        // Close the database
+        self.db.close().await.map_err(JobStoreShardError::from)?;
+
+        // After closing, clean up the local WAL directory if configured
+        if let Some(ref wal_config) = self.wal_close_config {
+            if wal_config.flush_on_close {
+                tracing::info!(
+                    shard = %self.name,
+                    wal_path = %wal_config.path,
+                    "removing local WAL directory after successful close"
+                );
+
+                if let Err(e) = tokio::fs::remove_dir_all(&wal_config.path).await {
+                    // Log but don't fail if WAL directory removal fails
+                    // The data is already durably in object storage
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            shard = %self.name,
+                            wal_path = %wal_config.path,
+                            error = %e,
+                            "failed to remove local WAL directory (data is still safe in object storage)"
+                        );
+                    }
+                } else {
+                    tracing::debug!(
+                        shard = %self.name,
+                        wal_path = %wal_config.path,
+                        "local WAL directory removed successfully"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Returns the WAL close configuration, if any.
+    /// This is primarily used for testing to verify WAL cleanup behavior.
+    pub fn wal_close_config(&self) -> Option<&WalCloseConfig> {
+        self.wal_close_config.as_ref()
     }
 
     pub fn name(&self) -> &str {
@@ -1516,7 +1613,7 @@ impl JobStoreShard {
                     let span =
                         info_span!("concurrency.release", queue = %queue, finished_task_id = %tid);
                     let _g = span.enter();
-                    info!("released ticket for finished task");
+                    debug!("released ticket for finished task");
                     self.concurrency
                         .counts()
                         .record_release(tenant, &queue, &tid);

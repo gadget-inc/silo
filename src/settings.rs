@@ -74,6 +74,10 @@ fn default_request_timeout_ms() -> u64 {
     10000
 }
 
+fn default_apply_wal_on_close() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct DatabaseTemplate {
     pub backend: Backend,
@@ -83,6 +87,15 @@ pub struct DatabaseTemplate {
     /// If not set, WAL uses the same backend/path as the main store.
     #[serde(default)]
     pub wal: Option<WalConfig>,
+    /// Whether to flush WAL data to object storage (SSTs) before closing shards.
+    /// When true and a separate local WAL is configured, closing a shard will:
+    /// 1. Flush all memtable data to SSTs in object storage
+    /// 2. Close the database
+    /// 3. Delete the local WAL directory
+    /// This ensures durability and allows shards to be reopened elsewhere.
+    /// Defaults to true.
+    #[serde(default = "default_apply_wal_on_close")]
+    pub apply_wal_on_close: bool,
 }
 
 /// Configuration for a separate WAL object store
@@ -91,6 +104,14 @@ pub struct WalConfig {
     pub backend: Backend,
     /// May contain "%shard%" placeholder that will be replaced with the shard number
     pub path: String,
+}
+
+impl WalConfig {
+    /// Returns true if the WAL is stored on local filesystem (as opposed to object storage).
+    /// Local WAL storage requires special handling on close to ensure durability.
+    pub fn is_local_storage(&self) -> bool {
+        matches!(self.backend, Backend::Fs)
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -227,6 +248,15 @@ pub struct DatabaseConfig {
     /// If not set, WAL uses the same backend/path as the main store.
     #[serde(default)]
     pub wal: Option<WalConfig>,
+    /// Whether to flush WAL data to object storage (SSTs) before closing the shard.
+    /// When true and a separate local WAL is configured, closing the shard will:
+    /// 1. Flush all memtable data to SSTs in object storage
+    /// 2. Close the database
+    /// 3. Delete the local WAL directory
+    /// This ensures durability and allows the shard to be reopened elsewhere.
+    /// Defaults to true when WAL is configured.
+    #[serde(default = "default_apply_wal_on_close")]
+    pub apply_wal_on_close: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -254,6 +284,7 @@ impl AppConfig {
                 backend: Backend::Fs,
                 path: "/tmp/silo-%shard%".to_string(),
                 wal: None,
+                apply_wal_on_close: true,
             },
         };
 

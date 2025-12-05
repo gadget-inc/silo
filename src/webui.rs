@@ -842,7 +842,6 @@ pub async fn run_webui(
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let _ = shutdown.recv().await;
-            info!("WebUI server shutting down");
         })
         .await?;
 

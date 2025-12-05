@@ -57,6 +57,7 @@ fn grpc_end_to_end_under_turmoil() {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
                 wal: None,
+                apply_wal_on_close: true,
             },
         };
 
@@ -217,6 +218,7 @@ fn grpc_fault_injection_with_partition() {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
                 wal: None,
+                apply_wal_on_close: true,
             },
         };
 
@@ -418,6 +420,7 @@ fn stress_multiple_workers_with_partitions() {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
                 wal: None,
+                apply_wal_on_close: true,
             },
         };
 
@@ -698,6 +701,7 @@ fn stress_duplicate_completion_idempotency() {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
                 wal: None,
+                apply_wal_on_close: true,
             },
         };
 
@@ -888,6 +892,7 @@ fn stress_lease_expiry_during_partition() {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
                 wal: None,
+                apply_wal_on_close: true,
             },
         };
 
@@ -1096,6 +1101,7 @@ fn stress_high_message_loss() {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
                 wal: None,
+                apply_wal_on_close: true,
             },
         };
 
@@ -1313,6 +1319,7 @@ fn concurrency_request_ready_without_release_fails() {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
                 wal: None,
+                apply_wal_on_close: true,
             },
         };
         let rate_limiter = MockGubernatorClient::new_arc();

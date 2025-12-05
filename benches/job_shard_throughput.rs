@@ -14,6 +14,7 @@ async fn open_temp_shard(
         path: tmp.path().to_string_lossy().to_string(),
         flush_interval_ms,
         wal: None,
+        apply_wal_on_close: true,
     };
     let shard = JobStoreShard::open(&cfg).await.expect("open shard");
     (tmp, shard)
