@@ -1,12 +1,11 @@
-use std::collections::HashSet;
 use std::str;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 use std::time::Duration;
 
-use crossbeam_skiplist::SkipMap;
+use crossbeam_skiplist::{SkipMap, SkipSet};
 use slatedb::Db;
 use tokio::sync::Notify;
 
@@ -27,10 +26,13 @@ pub struct BrokerTask {
 /// - Maintains a sorted buffer of ready tasks using a skiplist keyed by the task key string.
 /// - Populates from SlateDB in the background with exponential backoff when no work is found.
 /// - Ensures tasks claimed but not yet durably leased are tracked as in-flight and not reinserted.
+/// - Uses lock-free SkipSet for tracking in-flight tasks to minimize contention.
 pub struct TaskBroker {
     db: Arc<Db>,
     buffer: Arc<SkipMap<String, BrokerTask>>,
-    inflight: Arc<Mutex<HashSet<String>>>,
+    /// Lock-free set of task keys that are currently being processed (claimed but not yet durably leased).
+    /// Uses SkipSet for O(log n) operations without mutex contention.
+    inflight: Arc<SkipSet<String>>,
     running: Arc<AtomicBool>,
     notify: Arc<Notify>,
     scan_requested: Arc<AtomicBool>,
@@ -44,7 +46,7 @@ impl TaskBroker {
         Arc::new(Self {
             db,
             buffer: Arc::new(SkipMap::new()),
-            inflight: Arc::new(Mutex::new(HashSet::new())),
+            inflight: Arc::new(SkipSet::new()),
             running: Arc::new(AtomicBool::new(false)),
             notify: Arc::new(Notify::new()),
             scan_requested: Arc::new(AtomicBool::new(false)),
@@ -59,7 +61,7 @@ impl TaskBroker {
     }
 
     pub fn inflight_len(&self) -> usize {
-        self.inflight.lock().unwrap().len()
+        self.inflight.len()
     }
 
     /// Scan tasks from DB and insert into buffer, skipping future tasks and inflight ones.
@@ -100,7 +102,7 @@ impl TaskBroker {
             }
 
             // [SILO-SCAN-3] Skip inflight tasks
-            if self.inflight.lock().unwrap().contains(key_str) {
+            if self.inflight.contains(key_str) {
                 continue;
             }
 
@@ -193,16 +195,25 @@ impl TaskBroker {
     }
 
     /// Claim up to `max` ready tasks from the head of the buffer.
+    ///
+    /// Uses a lock-free algorithm:
+    /// 1. Find candidate not in inflight (best-effort check)
+    /// 2. Insert into inflight (idempotent with SkipSet)
+    /// 3. Atomically remove from buffer - only one thread wins this race
+    /// 4. Winner keeps the entry; loser continues (does NOT remove from inflight)
+    ///
+    /// The buffer.remove() is the synchronization point that determines the winner.
+    /// Losers don't remove from inflight because the winner still needs the key tracked.
     pub fn claim_ready(&self, max: usize) -> Vec<BrokerTask> {
         let mut claimed = Vec::with_capacity(max);
 
         while claimed.len() < max {
-            // Find the first claimable entry
+            // Find the first claimable entry (best-effort check for inflight)
             let candidate_key = self.buffer.iter().find_map(|entry| {
                 let key = entry.key();
 
-                // Skip if inflight
-                if self.inflight.lock().unwrap().contains(key) {
+                // Skip if already inflight (best-effort, may have false negatives)
+                if self.inflight.contains(key) {
                     return None;
                 }
 
@@ -214,18 +225,19 @@ impl TaskBroker {
 
             let Some(key) = candidate_key else { break };
 
-            // Reserve as inflight
-            if !self.inflight.lock().unwrap().insert(key.clone()) {
-                continue; // Lost race, try again
-            }
+            // Insert into inflight BEFORE buffer.remove() to prevent scanner from re-inserting
+            // during the window between remove and durable lease creation.
+            // This is idempotent - if another thread already inserted, that's fine.
+            self.inflight.insert(key.clone());
 
-            // Remove from buffer
+            // Atomically remove from buffer - only one thread wins this race
             if let Some(entry) = self.buffer.remove(&key) {
+                // We won the race - keep the entry
                 claimed.push(entry.value().clone());
-            } else {
-                // Removal failed, clear inflight reservation
-                self.inflight.lock().unwrap().remove(&key);
             }
+            // If we lost the race (entry was already removed by another thread),
+            // do NOT remove from inflight - the winner still needs it tracked.
+            // The key will be removed from inflight when ack_durable is called.
         }
 
         claimed
@@ -264,18 +276,16 @@ impl TaskBroker {
 
     /// Requeue tasks back into the buffer after a failed durable write.
     pub fn requeue(&self, tasks: Vec<BrokerTask>) {
-        let mut inflight = self.inflight.lock().unwrap();
         for entry in tasks {
-            inflight.remove(&entry.key);
+            self.inflight.remove(&entry.key);
             self.buffer.insert(entry.key.clone(), entry);
         }
     }
 
     /// Acknowledge that these tasks are durably leased and can be removed from in-flight tracking.
     pub fn ack_durable(&self, keys: &[String]) {
-        let mut inflight = self.inflight.lock().unwrap();
         for k in keys {
-            inflight.remove(k);
+            self.inflight.remove(k);
         }
     }
 
@@ -290,6 +300,18 @@ impl TaskBroker {
     pub fn wakeup(&self) {
         self.scan_requested.store(true, Ordering::SeqCst);
         self.notify.notify_one();
+    }
+}
+
+/// Test helper to insert a task directly into the buffer for benchmarking.
+#[cfg(any(test, feature = "bench"))]
+impl TaskBroker {
+    pub fn insert_for_test(&self, key: &str, task: Task) {
+        let entry = BrokerTask {
+            key: key.to_string(),
+            task,
+        };
+        self.buffer.insert(entry.key.clone(), entry);
     }
 }
 
