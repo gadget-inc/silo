@@ -4,6 +4,10 @@
 [server]
 grpc_addr = "127.0.0.1:50051"
 
+# [logging]
+# Log format: "text" (default, human-readable) or "json" (structured)
+# format = "json"
+
 [coordination]
 backend = "none"
 

@@ -38,25 +38,23 @@ enum Command {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
+    // Load configuration first (before tracing, so we can configure log format)
+    let cfg = match settings::AppConfig::load(args.config.as_deref()) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("Config error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
     // Handle validate-config command
     if let Some(Command::ValidateConfig) = args.command {
-        match settings::AppConfig::load(args.config.as_deref()) {
-            Ok(_) => {
-                println!("Config is valid");
-                std::process::exit(0);
-            }
-            Err(e) => {
-                eprintln!("Config validation failed: {}", e);
-                std::process::exit(1);
-            }
-        }
+        println!("Config is valid");
+        std::process::exit(0);
     }
 
-    // Initialize tracing via shared helper (Perfetto or OTLP based on env)
-    silo::trace::init_from_env()?;
-
-    // Load configuration
-    let cfg = settings::AppConfig::load(args.config.as_deref())?;
+    // Initialize tracing with configured log format
+    silo::trace::init(cfg.logging.format)?;
 
     // Create rate limiter based on configuration
     let rate_limiter: Arc<dyn RateLimitClient> = if let Some(guber_cfg) = cfg.gubernator.to_config()

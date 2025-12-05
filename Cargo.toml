@@ -27,7 +27,7 @@ tonic-reflection = "0.12"
 prost = "0.13"
 prost-types = "0.13"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-perfetto = "0.1"
 silo-macros = { path = "silo-macros" }
 tokio-stream = "0.1"
