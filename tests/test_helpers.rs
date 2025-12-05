@@ -45,11 +45,62 @@ pub async fn open_temp_shard_with_rate_limiter(
         // Use fast flush interval for tests to speed them up
         flush_interval_ms: Some(10),
         wal: None,
+        apply_wal_on_close: true,
     };
     let shard = JobStoreShard::open_with_rate_limiter(&cfg, rate_limiter)
         .await
         .expect("open shard");
     (tmp, shard)
+}
+
+/// Configuration for opening a shard with separate WAL storage
+pub struct WalShardConfig {
+    pub data_dir: tempfile::TempDir,
+    pub wal_dir: tempfile::TempDir,
+    pub apply_wal_on_close: bool,
+}
+
+/// Open a temp shard with a separate local WAL directory (for testing WAL flush behavior)
+pub async fn open_temp_shard_with_local_wal(
+    flush_on_close: bool,
+) -> (WalShardConfig, std::sync::Arc<JobStoreShard>) {
+    let rate_limiter = MockGubernatorClient::new_arc();
+    open_temp_shard_with_local_wal_and_rate_limiter(rate_limiter, flush_on_close).await
+}
+
+/// Open a temp shard with separate local WAL directory and custom rate limiter
+pub async fn open_temp_shard_with_local_wal_and_rate_limiter(
+    rate_limiter: Arc<dyn RateLimitClient>,
+    flush_on_close: bool,
+) -> (WalShardConfig, std::sync::Arc<JobStoreShard>) {
+    use silo::settings::WalConfig;
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let wal_dir = tempfile::tempdir().unwrap();
+
+    let cfg = DatabaseConfig {
+        name: "test".to_string(),
+        backend: Backend::Fs, // Main data backend - simulates object storage (could be s3 in prod)
+        path: data_dir.path().to_string_lossy().to_string(),
+        flush_interval_ms: Some(10),
+        wal: Some(WalConfig {
+            backend: Backend::Fs, // Local WAL
+            path: wal_dir.path().to_string_lossy().to_string(),
+        }),
+        apply_wal_on_close: flush_on_close,
+    };
+
+    let shard = JobStoreShard::open_with_rate_limiter(&cfg, rate_limiter)
+        .await
+        .expect("open shard with local WAL");
+
+    let config = WalShardConfig {
+        data_dir,
+        wal_dir,
+        apply_wal_on_close: flush_on_close,
+    };
+
+    (config, shard)
 }
 
 pub fn now_ms() -> i64 {

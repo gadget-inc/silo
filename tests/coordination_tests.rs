@@ -25,6 +25,7 @@ fn make_test_factory(node_id: &str) -> Arc<ShardFactory> {
             backend: Backend::Memory,
             path: tmpdir.join("%shard%").to_string_lossy().to_string(),
             wal: None,
+            apply_wal_on_close: true,
         },
         MockGubernatorClient::new_arc(),
     ))
@@ -524,7 +525,11 @@ async fn multi_node_ownership_stable_over_time() {
 
     // Verify initial state
     assert!(initial_s1.is_disjoint(&initial_s2), "no overlap initially");
-    let all: HashSet<u32> = initial_s1.iter().copied().chain(initial_s2.iter().copied()).collect();
+    let all: HashSet<u32> = initial_s1
+        .iter()
+        .copied()
+        .chain(initial_s2.iter().copied())
+        .collect();
     let expected: HashSet<u32> = (0..num_shards).collect();
     assert_eq!(all, expected, "all shards covered initially");
 

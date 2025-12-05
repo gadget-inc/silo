@@ -23,6 +23,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
             wal: None,
+            apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let factory = ShardFactory::new(template, rate_limiter);
@@ -157,6 +158,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
             wal: None,
+            apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let factory = ShardFactory::new(template, rate_limiter);
@@ -283,6 +285,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
             wal: None,
+            apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let factory = ShardFactory::new(template, rate_limiter);
@@ -402,6 +405,7 @@ async fn grpc_server_query_errors() -> anyhow::Result<()> {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
             wal: None,
+            apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let factory = ShardFactory::new(template, rate_limiter);
@@ -498,6 +502,7 @@ async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
             wal: None,
+            apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let factory = ShardFactory::new(template, rate_limiter);
@@ -589,6 +594,7 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
             wal: None,
+            apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let factory = ShardFactory::new(template, rate_limiter);
@@ -693,6 +699,7 @@ async fn grpc_health_check_returns_serving() -> anyhow::Result<()> {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
             wal: None,
+            apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let factory = ShardFactory::new(template, rate_limiter);

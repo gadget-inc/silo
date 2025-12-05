@@ -69,6 +69,7 @@ impl ShardFactory {
             path,
             flush_interval_ms: None, // Use SlateDB's default in production
             wal,
+            apply_wal_on_close: self.template.apply_wal_on_close,
         };
         let shard_arc =
             JobStoreShard::open_with_rate_limiter(&cfg, Arc::clone(&self.rate_limiter)).await?;
@@ -95,9 +96,12 @@ impl ShardFactory {
 
     /// Reset a specific shard: close it, delete all data, and reopen fresh.
     /// This is intended for testing/development only.
-    pub async fn reset(&self, shard_number: usize) -> Result<Arc<JobStoreShard>, JobStoreShardError> {
+    pub async fn reset(
+        &self,
+        shard_number: usize,
+    ) -> Result<Arc<JobStoreShard>, JobStoreShardError> {
         let name = shard_number.to_string();
-        
+
         // 1. Close and remove the shard if it exists
         let shard = {
             let mut instances = self.instances.write().await;
@@ -114,7 +118,7 @@ impl ShardFactory {
             .path
             .replace("%shard%", &name)
             .replace("{shard}", &name);
-        
+
         // Delete the main data path
         if let Err(e) = tokio::fs::remove_dir_all(&path).await {
             // Ignore "not found" errors - the directory might not exist yet

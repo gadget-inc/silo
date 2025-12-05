@@ -47,6 +47,7 @@ async fn open_shard_with_gubernator(
         path: tmp.path().to_string_lossy().to_string(),
         flush_interval_ms: Some(10),
         wal: None,
+        apply_wal_on_close: true,
     };
     let shard = JobStoreShard::open_with_rate_limiter(&cfg, gubernator.clone())
         .await

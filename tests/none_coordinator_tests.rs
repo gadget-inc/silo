@@ -12,6 +12,7 @@ fn make_test_factory() -> Arc<ShardFactory> {
             backend: Backend::Memory,
             path: "unused".to_string(),
             wal: None,
+            apply_wal_on_close: true,
         },
         MockGubernatorClient::new_arc(),
     ))

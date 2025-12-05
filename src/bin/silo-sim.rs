@@ -82,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
             backend: Backend::Fs,
             path: tmpdir.path().join("node-a-%shard%").to_string_lossy().to_string(),
             wal: None,
+            apply_wal_on_close: true,
         },
         rate_limiter.clone(),
     ));
@@ -90,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
             backend: Backend::Fs,
             path: tmpdir.path().join("node-b-%shard%").to_string_lossy().to_string(),
             wal: None,
+            apply_wal_on_close: true,
         },
         rate_limiter.clone(),
     ));
@@ -109,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
                 .to_string(),
             flush_interval_ms: Some(10), // Fast flushes for simulation
             wal: None,
+            apply_wal_on_close: true,
         };
         let shard = JobStoreShard::open_with_rate_limiter(&cfg, rate_limiter.clone()).await?;
         shards.push(shard);
@@ -252,6 +255,7 @@ async fn main() -> anyhow::Result<()> {
             backend: Backend::Fs,
             path: tmpdir.path().join("node-c-%shard%").to_string_lossy().to_string(),
             wal: None,
+            apply_wal_on_close: true,
         },
         rate_limiter.clone(),
     ));

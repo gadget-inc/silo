@@ -28,6 +28,7 @@ async fn setup_test_state() -> (tempfile::TempDir, AppState) {
             backend: Backend::Fs,
             path: tmp.path().to_string_lossy().to_string(),
             wal: None,
+            apply_wal_on_close: true,
         },
         rate_limiter,
     );
@@ -320,6 +321,7 @@ async fn setup_multi_shard_state(num_shards: usize) -> (tempfile::TempDir, AppSt
             backend: Backend::Fs,
             path: path_with_shard,
             wal: None,
+            apply_wal_on_close: true,
         },
         rate_limiter,
     );
