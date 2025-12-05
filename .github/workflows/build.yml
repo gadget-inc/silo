@@ -1,0 +1,31 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    name: Build Linux binaries
+    runs-on: ubuntu-latest-l
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-test-env
+        with:
+          cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        shell: bash
+        run: cargo build --release
+
+      - name: Upload all binaries (combined)
+        uses: actions/upload-artifact@v4
+        with:
+          name: silo-all-linux-x86_64
+          path: |
+            target/release/silo
+            target/release/silo-bench
+            target/release/silo-sim
+          if-no-files-found: error
