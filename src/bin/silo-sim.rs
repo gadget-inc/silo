@@ -7,11 +7,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use silo::coordination::{Coordinator, EtcdCoordinator};
+use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::job::{ConcurrencyLimit, Limit};
 use silo::job_attempt::AttemptOutcome;
 use silo::job_store_shard::JobStoreShard;
-use silo::settings::{AppConfig, Backend, DatabaseConfig};
+use silo::settings::{AppConfig, Backend, DatabaseConfig, DatabaseTemplate};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -72,12 +73,30 @@ async fn main() -> anyhow::Result<()> {
     let num_shards: u32 = args.shards;
 
     let cfg = AppConfig::load(None).expect("load default config");
-
-    let (c1, h1) = EtcdCoordinator::start(&cfg.coordination.etcd_endpoints, &prefix, "node-a", "http://127.0.0.1:50051", num_shards, 10).await?;
-    let (c2, h2) = EtcdCoordinator::start(&cfg.coordination.etcd_endpoints, &prefix, "node-b", "http://127.0.0.1:50052", num_shards, 10).await?;
-
     let tmpdir = tempfile::tempdir()?;
+
+    // Create dummy factories for the coordinators - sim manages shards itself
     let rate_limiter = MockGubernatorClient::new_arc();
+    let factory1 = Arc::new(ShardFactory::new(
+        DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmpdir.path().join("node-a-%shard%").to_string_lossy().to_string(),
+            wal: None,
+        },
+        rate_limiter.clone(),
+    ));
+    let factory2 = Arc::new(ShardFactory::new(
+        DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmpdir.path().join("node-b-%shard%").to_string_lossy().to_string(),
+            wal: None,
+        },
+        rate_limiter.clone(),
+    ));
+
+    let (c1, h1) = EtcdCoordinator::start(&cfg.coordination.etcd_endpoints, &prefix, "node-a", "http://127.0.0.1:50051", num_shards, 10, factory1).await?;
+    let (c2, h2) = EtcdCoordinator::start(&cfg.coordination.etcd_endpoints, &prefix, "node-b", "http://127.0.0.1:50052", num_shards, 10, factory2).await?;
+
     let mut shards: Vec<Arc<JobStoreShard>> = Vec::new();
     for s in 0..num_shards as usize {
         let cfg = DatabaseConfig {
@@ -165,7 +184,7 @@ async fn main() -> anyhow::Result<()> {
                 if !workers_running.load(Ordering::SeqCst) {
                     break;
                 }
-                let result = shard.dequeue("-", &wid, 4).await.unwrap_or_default();
+                let result = shard.dequeue(&wid, 4).await.unwrap_or_default();
                 if result.tasks.is_empty() {
                     tokio::task::yield_now().await;
                     continue;
@@ -228,7 +247,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Add third coordinator mid-run
     tokio::time::sleep(Duration::from_secs(1)).await;
-    let (c3, h3) = EtcdCoordinator::start(&cfg.coordination.etcd_endpoints, &prefix, "node-c", "http://127.0.0.1:50053", num_shards, 10).await?;
+    let factory3 = Arc::new(ShardFactory::new(
+        DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmpdir.path().join("node-c-%shard%").to_string_lossy().to_string(),
+            wal: None,
+        },
+        rate_limiter.clone(),
+    ));
+    let (c3, h3) = EtcdCoordinator::start(&cfg.coordination.etcd_endpoints, &prefix, "node-c", "http://127.0.0.1:50053", num_shards, 10, factory3).await?;
 
     // Run for desired duration
     tokio::time::sleep(Duration::from_secs(args.duration_secs)).await;

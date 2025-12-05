@@ -77,6 +77,14 @@ pub struct ShardRow {
     pub job_count: usize,
 }
 
+#[derive(Clone)]
+pub struct MemberRow {
+    pub node_id: String,
+    pub grpc_addr: String,
+    pub is_self: bool,
+    pub shard_count: usize,
+}
+
 #[derive(Template)]
 #[template(path = "index.html")]
 struct IndexTemplate {
@@ -118,10 +126,14 @@ struct QueueTemplate {
 }
 
 #[derive(Template)]
-#[template(path = "shards.html")]
-struct ShardsTemplate {
+#[template(path = "cluster.html")]
+struct ClusterTemplate {
     nav_active: &'static str,
     shards: Vec<ShardRow>,
+    members: Vec<MemberRow>,
+    total_shards: usize,
+    owned_shards: usize,
+    total_jobs: usize,
 }
 
 #[derive(Template)]
@@ -536,10 +548,7 @@ async fn queue_handler(
                             });
                         }
                         "requester" => {
-                            let job_id = json["job_id"]
-                                .as_str()
-                                .unwrap_or("unknown")
-                                .to_string();
+                            let job_id = json["job_id"].as_str().unwrap_or("unknown").to_string();
                             let priority = json["priority"].as_u64().unwrap_or(50) as u8;
                             requesters.push(RequesterRow {
                                 job_id,
@@ -584,17 +593,50 @@ async fn queue_handler(
     )
 }
 
-async fn shards_handler(State(state): State<AppState>) -> impl IntoResponse {
+async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
     let mut shards: Vec<ShardRow> = Vec::new();
+    let mut members: Vec<MemberRow> = Vec::new();
 
     let sql = "SELECT COUNT(*) as count FROM jobs";
 
-    // Get shard owner map if coordinator is available
-    let owner_map = if let Some(coordinator) = &state.coordinator {
-        coordinator.get_shard_owner_map().await.ok()
+    // Get shard owner map and members if coordinator is available
+    let (owner_map, this_node_id) = if let Some(coordinator) = &state.coordinator {
+        let map = coordinator.get_shard_owner_map().await.ok();
+        let node_id = coordinator.node_id().to_string();
+
+        // Fetch cluster members
+        if let Ok(member_infos) = coordinator.get_members().await {
+            for member_info in member_infos {
+                // Count shards owned by this member
+                let shard_count = if let Some(ref m) = map {
+                    m.shard_to_node
+                        .values()
+                        .filter(|&n| n == &member_info.node_id)
+                        .count()
+                } else {
+                    0
+                };
+
+                members.push(MemberRow {
+                    is_self: member_info.node_id == node_id,
+                    node_id: member_info.node_id,
+                    grpc_addr: member_info.grpc_addr,
+                    shard_count,
+                });
+            }
+        }
+
+        (map, Some(node_id))
     } else {
-        None
+        (None, None)
     };
+
+    // Sort members: self first, then by node_id
+    members.sort_by(|a, b| match (a.is_self, b.is_self) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.node_id.cmp(&b.node_id),
+    });
 
     // Query all shards in the cluster
     match state.cluster_client.query_all_shards(sql).await {
@@ -659,6 +701,16 @@ async fn shards_handler(State(state): State<AppState>) -> impl IntoResponse {
         }
     }
 
+    // If no coordinator, add a single "self" member for standalone mode
+    if members.is_empty() {
+        members.push(MemberRow {
+            node_id: this_node_id.unwrap_or_else(|| "standalone".to_string()),
+            grpc_addr: "localhost".to_string(),
+            is_self: true,
+            shard_count: shards.len(),
+        });
+    }
+
     shards.sort_by(|a, b| {
         // Sort numerically if both are numbers, otherwise alphabetically
         match (a.name.parse::<u32>(), b.name.parse::<u32>()) {
@@ -667,9 +719,22 @@ async fn shards_handler(State(state): State<AppState>) -> impl IntoResponse {
         }
     });
 
-    let template = ShardsTemplate {
-        nav_active: "shards",
+    // Calculate stats
+    let total_shards = shards.len();
+    let owned_shards = members
+        .iter()
+        .find(|m| m.is_self)
+        .map(|m| m.shard_count)
+        .unwrap_or(0);
+    let total_jobs: usize = shards.iter().map(|s| s.job_count).sum();
+
+    let template = ClusterTemplate {
+        nav_active: "cluster",
         shards,
+        members,
+        total_shards,
+        owned_shards,
+        total_jobs,
     };
 
     Html(
@@ -699,7 +764,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/job/cancel", post(cancel_job_handler))
         .route("/queues", get(queues_handler))
         .route("/queue", get(queue_handler))
-        .route("/shards", get(shards_handler))
+        .route("/cluster", get(cluster_handler))
         .fallback(not_found_handler)
         .with_state(state)
 }

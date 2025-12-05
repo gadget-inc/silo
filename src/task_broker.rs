@@ -28,14 +28,23 @@ pub struct BrokerTask {
 /// - Populates from SlateDB in the background with exponential backoff when no work is found.
 /// - Ensures tasks claimed but not yet durably leased are tracked as in-flight and not reinserted.
 pub struct TaskBroker {
+    // The SlateDB database to read tasks from
     db: Arc<Db>,
+    // The buffer of tasks read out of the DB and ready to be claimed by a dequeue-ing worker
     buffer: Arc<SkipMap<String, BrokerTask>>,
+    // The set of tasks already read out of the DB and claimed by a worker but not yet durably leased. Required so that the scanner doesn't re-add tasks that are in the middle of being dequeued to the buffer.
     inflight: Arc<Mutex<HashSet<String>>>,
+    // Whether the background scanner is running
     running: Arc<AtomicBool>,
+    // A notify object to wake up the background scanner when a task is claimed
     notify: Arc<Notify>,
+    // Whether the background scanner should be woken up
     scan_requested: Arc<AtomicBool>,
+    // The concurrency manager to use to grant tickets to tasks
     concurrency: Arc<ConcurrencyManager>,
+    // The target buffer size
     target_buffer: usize,
+    // The batch size for the background scanner to read out of the DB
     scan_batch: usize,
 }
 

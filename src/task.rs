@@ -18,6 +18,7 @@ pub enum Task {
     /// Execute a specific attempt for a job
     RunAttempt {
         id: String,
+        tenant: String,
         job_id: String,
         attempt_number: u32,
         held_queues: Vec<String>,
@@ -27,6 +28,7 @@ pub enum Task {
         queue: String,
         start_time_ms: i64,
         priority: u8,
+        tenant: String,
         job_id: String,
         attempt_number: u32,
         request_id: String,
@@ -34,6 +36,7 @@ pub enum Task {
     /// Internal: check a Gubernator rate limit before proceeding
     CheckRateLimit {
         task_id: String,
+        tenant: String,
         job_id: String,
         attempt_number: u32,
         /// Index of the current limit being checked in the job's limits array

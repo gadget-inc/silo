@@ -69,6 +69,8 @@
           nodejs_24 # For validation scripts
           pnpm # Package manager for TypeScript client
           kubectl # for interacting with local K8S API server
+          watchexec # Auto-reload for development
+          grpcurl # For health checking gRPC servers
         ]);
 
         # Set the project root for the dev script

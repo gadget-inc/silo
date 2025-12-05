@@ -76,6 +76,10 @@ pub struct WalConfig {
 pub struct ServerConfig {
     #[serde(default = "default_grpc_addr")]
     pub grpc_addr: String, // e.g. 127.0.0.1:50051
+    /// Enable development mode features like ResetShards RPC.
+    /// WARNING: This allows destructive operations and should never be enabled in production.
+    #[serde(default)]
+    pub dev_mode: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -102,7 +106,7 @@ fn default_webui_enabled() -> bool {
 }
 
 fn default_webui_addr() -> String {
-    "127.0.0.1:50052".to_string()
+    "127.0.0.1:8080".to_string()
 }
 
 /// Coordination backend type
@@ -132,6 +136,10 @@ pub struct CoordinationConfig {
     #[serde(default = "default_lease_ttl_secs")]
     pub lease_ttl_secs: i64,
 
+    /// Number of shards in the cluster (default: 8)
+    #[serde(default = "default_num_shards")]
+    pub num_shards: u32,
+
     // ---- etcd-specific settings ----
     /// List of etcd endpoints, e.g. ["http://127.0.0.1:2379"]
     #[serde(default = "default_etcd_endpoints")]
@@ -149,10 +157,15 @@ impl Default for CoordinationConfig {
             backend: CoordinationBackend::default(),
             cluster_prefix: default_cluster_prefix(),
             lease_ttl_secs: default_lease_ttl_secs(),
+            num_shards: default_num_shards(),
             etcd_endpoints: default_etcd_endpoints(),
             k8s_namespace: default_k8s_namespace(),
         }
     }
+}
+
+fn default_num_shards() -> u32 {
+    8
 }
 
 fn default_cluster_prefix() -> String {
@@ -209,6 +222,7 @@ impl AppConfig {
         let default = Self {
             server: ServerConfig {
                 grpc_addr: default_grpc_addr(),
+                dev_mode: false,
             },
             coordination: CoordinationConfig::default(),
             tenancy: TenancyConfig { enabled: false },

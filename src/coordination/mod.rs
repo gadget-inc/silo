@@ -12,6 +12,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::factory::ShardFactory;
+
 pub mod etcd;
 #[cfg(feature = "k8s")]
 pub mod k8s;
@@ -88,18 +90,22 @@ pub trait Coordinator: Send + Sync {
 }
 
 /// Dynamically create a coordinator based on configuration.
+///
+/// The coordinator will manage shard ownership and automatically open/close
+/// shards in the factory as ownership changes.
 pub async fn create_coordinator(
     config: &crate::settings::CoordinationConfig,
     node_id: impl Into<String>,
     grpc_addr: impl Into<String>,
     num_shards: u32,
+    factory: Arc<ShardFactory>,
 ) -> Result<(Arc<dyn Coordinator>, Option<tokio::task::JoinHandle<()>>), CoordinationError> {
     let node_id = node_id.into();
     let grpc_addr = grpc_addr.into();
 
     match &config.backend {
         crate::settings::CoordinationBackend::None => {
-            let coord = NoneCoordinator::new(node_id, grpc_addr, num_shards);
+            let coord = NoneCoordinator::new(node_id, grpc_addr, num_shards, factory).await;
             Ok((Arc::new(coord), None))
         }
         crate::settings::CoordinationBackend::Etcd => {
@@ -110,6 +116,7 @@ pub async fn create_coordinator(
                 grpc_addr,
                 num_shards,
                 config.lease_ttl_secs,
+                factory,
             )
             .await?;
             Ok((Arc::new(coord), Some(handle)))
@@ -123,6 +130,7 @@ pub async fn create_coordinator(
                 grpc_addr,
                 num_shards,
                 config.lease_ttl_secs,
+                factory,
             )
             .await?;
             Ok((Arc::new(coord), Some(handle)))

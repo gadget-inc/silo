@@ -1,13 +1,19 @@
 use std::sync::Arc;
 
+use rand::seq::SliceRandom;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
 use tonic_health::server::health_reporter;
+use tonic_reflection::server::Builder as ReflectionBuilder;
 use tracing::info;
 
+/// File descriptor set for gRPC reflection
+pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("silo_descriptor");
+
+use crate::coordination::Coordinator;
 use crate::factory::{CloseAllError, ShardFactory};
 use crate::job::{GubernatorAlgorithm, GubernatorRateLimit, RateLimitRetryPolicy};
 use crate::job_attempt::AttemptOutcome;
@@ -16,6 +22,11 @@ use crate::pb::silo_server::{Silo, SiloServer};
 use crate::pb::*;
 use crate::settings::AppConfig;
 use crate::task::DEFAULT_LEASE_MS;
+
+/// gRPC metadata key for shard owner address on redirect
+pub const SHARD_OWNER_ADDR_METADATA_KEY: &str = "x-silo-shard-owner-addr";
+/// gRPC metadata key for shard owner node ID on redirect  
+pub const SHARD_OWNER_NODE_METADATA_KEY: &str = "x-silo-shard-owner-node";
 
 /// Convert a proto Limit to a job::Limit
 fn proto_limit_to_job_limit(proto: Limit) -> Option<crate::job::Limit> {
@@ -53,16 +64,14 @@ fn proto_limit_to_job_limit(proto: Limit) -> Option<crate::job::Limit> {
                 retry_policy,
             }))
         }
-        limit::Limit::FloatingConcurrency(f) => {
-            Some(crate::job::Limit::FloatingConcurrency(
-                crate::job::FloatingConcurrencyLimit {
-                    key: f.key,
-                    default_max_concurrency: f.default_max_concurrency,
-                    refresh_interval_ms: f.refresh_interval_ms,
-                    metadata: f.metadata.into_iter().collect(),
-                },
-            ))
-        }
+        limit::Limit::FloatingConcurrency(f) => Some(crate::job::Limit::FloatingConcurrency(
+            crate::job::FloatingConcurrencyLimit {
+                key: f.key,
+                default_max_concurrency: f.default_max_concurrency,
+                refresh_interval_ms: f.refresh_interval_ms,
+                metadata: f.metadata.into_iter().collect(),
+            },
+        )),
     }
 }
 
@@ -116,19 +125,72 @@ fn map_err(e: JobStoreShardError) -> Status {
 #[derive(Clone)]
 pub struct SiloService {
     factory: Arc<ShardFactory>,
+    coordinator: Option<Arc<dyn Coordinator>>,
     cfg: AppConfig,
 }
 
 impl SiloService {
-    pub fn new(factory: Arc<ShardFactory>, cfg: AppConfig) -> Self {
-        Self { factory, cfg }
+    pub fn new(
+        factory: Arc<ShardFactory>,
+        coordinator: Option<Arc<dyn Coordinator>>,
+        cfg: AppConfig,
+    ) -> Self {
+        Self {
+            factory,
+            coordinator,
+            cfg,
+        }
     }
 
-    #[allow(clippy::result_large_err)]
-    fn shard(&self, name: &str) -> Result<Arc<JobStoreShard>, Status> {
-        self.factory
-            .get(name)
-            .ok_or_else(|| Status::not_found("shard not found"))
+    /// Get shard with async lookup of owner for redirect metadata.
+    /// If the shard is not found locally, returns NOT_FOUND with metadata
+    /// indicating which server owns the shard (if known).
+    async fn shard_with_redirect(&self, shard_id: u32) -> Result<Arc<JobStoreShard>, Status> {
+        let name = shard_id.to_string();
+        if let Some(shard) = self.factory.get(&name) {
+            return Ok(shard);
+        }
+
+        // Shard not found locally - build error with redirect info
+        let mut status = Status::not_found("shard not found");
+
+        // Look up the owner if we have a coordinator
+        let Some(coord) = &self.coordinator else {
+            // Single-node mode - shard simply doesn't exist
+            tracing::debug!(shard_id, "shard not found (single-node mode)");
+            return Err(status);
+        };
+
+        // Get the owner map to find where this shard lives
+        let owner_map = match coord.get_shard_owner_map().await {
+            Ok(map) => map,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to get shard owner map for redirect");
+                return Err(status);
+            }
+        };
+
+        // Add redirect metadata
+        let metadata = status.metadata_mut();
+        if let Some(addr) = owner_map.shard_to_addr.get(&shard_id) {
+            if let Ok(val) = addr.parse() {
+                metadata.insert(SHARD_OWNER_ADDR_METADATA_KEY, val);
+            }
+        } else {
+            tracing::warn!(
+                shard_id,
+                num_shards = owner_map.num_shards,
+                "shard ID not found in owner map"
+            );
+        }
+
+        if let Some(node) = owner_map.shard_to_node.get(&shard_id) {
+            if let Ok(val) = node.parse() {
+                metadata.insert(SHARD_OWNER_NODE_METADATA_KEY, val);
+            }
+        }
+
+        Err(status)
     }
 
     #[allow(clippy::result_large_err)]
@@ -151,12 +213,71 @@ impl SiloService {
 
 #[tonic::async_trait]
 impl Silo for SiloService {
+    async fn get_cluster_info(
+        &self,
+        _req: Request<GetClusterInfoRequest>,
+    ) -> Result<Response<GetClusterInfoResponse>, Status> {
+        let Some(coord) = &self.coordinator else {
+            // Single-node mode - report just ourselves
+            let local_shards: Vec<u32> = self
+                .factory
+                .instances()
+                .keys()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+
+            let shard_owners: Vec<ShardOwner> = local_shards
+                .into_iter()
+                .map(|shard_id| ShardOwner {
+                    shard_id,
+                    grpc_addr: "localhost".to_string(),
+                    node_id: "local".to_string(),
+                })
+                .collect();
+
+            return Ok(Response::new(GetClusterInfoResponse {
+                num_shards: shard_owners.len() as u32,
+                shard_owners,
+                this_node_id: "local".to_string(),
+                this_grpc_addr: "localhost".to_string(),
+            }));
+        };
+
+        let owner_map = coord
+            .get_shard_owner_map()
+            .await
+            .map_err(|e| Status::internal(format!("failed to get shard owner map: {}", e)))?;
+
+        let shard_owners: Vec<ShardOwner> = (0..owner_map.num_shards)
+            .filter_map(|shard_id| {
+                let grpc_addr = owner_map.shard_to_addr.get(&shard_id)?.clone();
+                let node_id = owner_map
+                    .shard_to_node
+                    .get(&shard_id)
+                    .cloned()
+                    .unwrap_or_default();
+                Some(ShardOwner {
+                    shard_id,
+                    grpc_addr,
+                    node_id,
+                })
+            })
+            .collect();
+
+        Ok(Response::new(GetClusterInfoResponse {
+            num_shards: owner_map.num_shards,
+            shard_owners,
+            this_node_id: coord.node_id().to_string(),
+            this_grpc_addr: coord.grpc_addr().to_string(),
+        }))
+    }
+
     async fn enqueue(
         &self,
         req: Request<EnqueueRequest>,
     ) -> Result<Response<EnqueueResponse>, Status> {
         let r = req.into_inner();
-        let shard = self.shard(&r.shard)?;
+        let shard = self.shard_with_redirect(r.shard).await?;
         let tenant = self.validate_tenant(r.tenant.as_deref())?;
         let payload_bytes = r
             .payload
@@ -224,7 +345,7 @@ impl Silo for SiloService {
         req: Request<GetJobRequest>,
     ) -> Result<Response<GetJobResponse>, Status> {
         let r = req.into_inner();
-        let shard = self.shard(&r.shard)?;
+        let shard = self.shard_with_redirect(r.shard).await?;
         let tenant = self.validate_tenant(r.tenant.as_deref())?;
         let Some(view) = shard.get_job(&tenant, &r.id).await.map_err(map_err)? else {
             return Err(Status::not_found("job not found"));
@@ -260,7 +381,7 @@ impl Silo for SiloService {
         req: Request<DeleteJobRequest>,
     ) -> Result<Response<DeleteJobResponse>, Status> {
         let r = req.into_inner();
-        let shard = self.shard(&r.shard)?;
+        let shard = self.shard_with_redirect(r.shard).await?;
         let tenant = self.validate_tenant(r.tenant.as_deref())?;
         shard.delete_job(&tenant, &r.id).await.map_err(map_err)?;
         Ok(Response::new(DeleteJobResponse {}))
@@ -271,7 +392,7 @@ impl Silo for SiloService {
         req: Request<CancelJobRequest>,
     ) -> Result<Response<CancelJobResponse>, Status> {
         let r = req.into_inner();
-        let shard = self.shard(&r.shard)?;
+        let shard = self.shard_with_redirect(r.shard).await?;
         let tenant = self.validate_tenant(r.tenant.as_deref())?;
         shard.cancel_job(&tenant, &r.id).await.map_err(map_err)?;
         Ok(Response::new(CancelJobResponse {}))
@@ -282,42 +403,78 @@ impl Silo for SiloService {
         req: Request<LeaseTasksRequest>,
     ) -> Result<Response<LeaseTasksResponse>, Status> {
         let r = req.into_inner();
-        let shard = self.shard(&r.shard)?;
-        let tenant = self.validate_tenant(r.tenant.as_deref())?;
-        let result = shard
-            .dequeue(&tenant, &r.worker_id, r.max_tasks as usize)
-            .await
-            .map_err(map_err)?;
-        let mut out = Vec::with_capacity(result.tasks.len());
-        for lt in result.tasks {
-            let job = lt.job();
-            let attempt = lt.attempt();
-            out.push(Task {
-                id: attempt.task_id().to_string(),
-                job_id: job.id().to_string(),
-                attempt_number: attempt.attempt_number(),
-                lease_ms: DEFAULT_LEASE_MS,
-                payload: Some(JsonValueBytes {
-                    data: job.payload_bytes().to_vec(),
-                }),
-                priority: job.priority() as u32,
-            });
+        // LeaseTasks is tenant-agnostic - it returns tasks from all tenants on local shards
+        let max_tasks = r.max_tasks as usize;
+
+        // Determine which shards to poll:
+        // - If shard filter is specified, only poll that shard
+        // - Otherwise, poll all local shards (default behavior for workers)
+        let shards_to_poll: Vec<(u32, Arc<JobStoreShard>)> = if let Some(shard_filter) = r.shard {
+            // Filter to specific shard
+            let shard = self.shard_with_redirect(shard_filter).await?;
+            vec![(shard_filter, shard)]
+        } else {
+            // Poll all local shards - this is the typical worker behavior
+            // Shuffle for fair distribution across shards
+            let mut shards: Vec<_> = self
+                .factory
+                .instances()
+                .iter()
+                .filter_map(|(name, shard)| name.parse::<u32>().ok().map(|id| (id, shard.clone())))
+                .collect();
+            shards.shuffle(&mut rand::thread_rng());
+            shards
+        };
+
+        let mut all_tasks = Vec::new();
+        let mut all_refresh_tasks = Vec::new();
+        let mut remaining = max_tasks;
+
+        // Poll each shard until we have enough tasks or exhausted all shards
+        // TODO: Could implement fair round-robin across shards for better distribution
+        for (shard_id, shard) in shards_to_poll {
+            if remaining == 0 {
+                break;
+            }
+
+            let result = shard
+                .dequeue(&r.worker_id, remaining)
+                .await
+                .map_err(map_err)?;
+
+            for lt in result.tasks {
+                let job = lt.job();
+                let attempt = lt.attempt();
+                all_tasks.push(Task {
+                    id: attempt.task_id().to_string(),
+                    job_id: job.id().to_string(),
+                    attempt_number: attempt.attempt_number(),
+                    lease_ms: DEFAULT_LEASE_MS,
+                    payload: Some(JsonValueBytes {
+                        data: job.payload_bytes().to_vec(),
+                    }),
+                    priority: job.priority() as u32,
+                    shard: shard_id,
+                });
+            }
+
+            for rt in result.refresh_tasks {
+                all_refresh_tasks.push(RefreshFloatingLimitTask {
+                    id: rt.task_id,
+                    queue_key: rt.queue_key,
+                    current_max_concurrency: rt.current_max_concurrency,
+                    last_refreshed_at_ms: rt.last_refreshed_at_ms,
+                    metadata: rt.metadata.into_iter().collect(),
+                    lease_ms: DEFAULT_LEASE_MS,
+                });
+            }
+
+            remaining = remaining.saturating_sub(all_tasks.len());
         }
-        let refresh_tasks: Vec<RefreshFloatingLimitTask> = result
-            .refresh_tasks
-            .into_iter()
-            .map(|rt| RefreshFloatingLimitTask {
-                id: rt.task_id,
-                queue_key: rt.queue_key,
-                current_max_concurrency: rt.current_max_concurrency,
-                last_refreshed_at_ms: rt.last_refreshed_at_ms,
-                metadata: rt.metadata.into_iter().collect(),
-                lease_ms: DEFAULT_LEASE_MS,
-            })
-            .collect();
+
         Ok(Response::new(LeaseTasksResponse {
-            tasks: out,
-            refresh_tasks,
+            tasks: all_tasks,
+            refresh_tasks: all_refresh_tasks,
         }))
     }
 
@@ -326,7 +483,7 @@ impl Silo for SiloService {
         req: Request<ReportOutcomeRequest>,
     ) -> Result<Response<ReportOutcomeResponse>, Status> {
         let r = req.into_inner();
-        let shard = self.shard(&r.shard)?;
+        let shard = self.shard_with_redirect(r.shard).await?;
         let tenant = self.validate_tenant(r.tenant.as_deref())?;
         let outcome = match r
             .outcome
@@ -353,7 +510,7 @@ impl Silo for SiloService {
         req: Request<ReportRefreshOutcomeRequest>,
     ) -> Result<Response<ReportRefreshOutcomeResponse>, Status> {
         let r = req.into_inner();
-        let shard = self.shard(&r.shard)?;
+        let shard = self.shard_with_redirect(r.shard).await?;
         let tenant = self.validate_tenant(r.tenant.as_deref())?;
         let outcome = r
             .outcome
@@ -381,7 +538,7 @@ impl Silo for SiloService {
         req: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let r = req.into_inner();
-        let shard = self.shard(&r.shard)?;
+        let shard = self.shard_with_redirect(r.shard).await?;
         let tenant = self.validate_tenant(r.tenant.as_deref())?;
         let result = shard
             .heartbeat_task(&tenant, &r.worker_id, &r.task_id)
@@ -395,7 +552,7 @@ impl Silo for SiloService {
 
     async fn query(&self, req: Request<QueryRequest>) -> Result<Response<QueryResponse>, Status> {
         let r = req.into_inner();
-        let shard = self.shard(&r.shard)?;
+        let shard = self.shard_with_redirect(r.shard).await?;
         let _tenant = self.validate_tenant(r.tenant.as_deref())?;
 
         // Get the cached query engine for this shard
@@ -464,18 +621,59 @@ impl Silo for SiloService {
             row_count,
         }))
     }
+
+    async fn reset_shards(
+        &self,
+        _req: Request<ResetShardsRequest>,
+    ) -> Result<Response<ResetShardsResponse>, Status> {
+        // Only allow in dev mode
+        if !self.cfg.server.dev_mode {
+            return Err(Status::permission_denied(
+                "ResetShards is only available in dev mode",
+            ));
+        }
+
+        // Get all local shard numbers
+        let shard_numbers: Vec<usize> = self
+            .factory
+            .instances()
+            .keys()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+
+        let mut reset_count = 0u32;
+        for shard_number in shard_numbers {
+            match self.factory.reset(shard_number).await {
+                Ok(_) => {
+                    reset_count += 1;
+                    tracing::info!(shard = shard_number, "reset shard successfully");
+                }
+                Err(e) => {
+                    tracing::error!(shard = shard_number, error = %e, "failed to reset shard");
+                    return Err(Status::internal(format!(
+                        "Failed to reset shard {}: {}",
+                        shard_number, e
+                    )));
+                }
+            }
+        }
+
+        tracing::info!(shards_reset = reset_count, "reset all shards successfully");
+        Ok(Response::new(ResetShardsResponse {
+            shards_reset: reset_count,
+        }))
+    }
 }
 
 /// Run the gRPC server and a periodic reaper task together until shutdown.
 pub async fn run_grpc_with_reaper(
     listener: TcpListener,
     factory: Arc<ShardFactory>,
+    coordinator: Option<Arc<dyn Coordinator>>,
+    cfg: crate::settings::AppConfig,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Load app config to pass tenancy flag; use defaults when not provided here
-    let cfg = crate::settings::AppConfig::load(None)
-        .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
-    let svc = SiloService::new(factory.clone(), cfg);
+    let svc = SiloService::new(factory.clone(), coordinator, cfg);
     let server = SiloServer::new(svc);
 
     // Create health service for gRPC health probes
@@ -506,9 +704,16 @@ pub async fn run_grpc_with_reaper(
 
     let incoming = TcpListenerStream::new(listener);
 
+    // Create reflection service for grpcurl/debugging
+    let reflection_service = ReflectionBuilder::configure()
+        .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
+        .build_v1()
+        .expect("failed to build reflection service");
+
     // Serve with graceful shutdown
     let serve = tonic::transport::Server::builder()
         .add_service(health_service)
+        .add_service(reflection_service)
         .add_service(server)
         .serve_with_incoming_shutdown(incoming, async move {
             let _ = shutdown.recv().await;
@@ -536,6 +741,8 @@ pub async fn run_grpc_with_reaper(
 pub async fn run_grpc_with_reaper_incoming<S, IO>(
     incoming: S,
     factory: Arc<ShardFactory>,
+    coordinator: Option<Arc<dyn Coordinator>>,
+    cfg: crate::settings::AppConfig,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
@@ -547,9 +754,7 @@ where
         + 'static
         + tonic::transport::server::Connected,
 {
-    let cfg = crate::settings::AppConfig::load(None)
-        .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
-    let svc = SiloService::new(factory.clone(), cfg);
+    let svc = SiloService::new(factory.clone(), coordinator, cfg);
     let server = SiloServer::new(svc);
 
     // Create health service for gRPC health probes
@@ -576,8 +781,15 @@ where
         }
     });
 
+    // Create reflection service for grpcurl/debugging
+    let reflection_service = ReflectionBuilder::configure()
+        .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
+        .build_v1()
+        .expect("failed to build reflection service");
+
     let serve = tonic::transport::Server::builder()
         .add_service(health_service)
+        .add_service(reflection_service)
         .add_service(server)
         .serve_with_incoming_shutdown(incoming, async move {
             let _ = shutdown.recv().await;

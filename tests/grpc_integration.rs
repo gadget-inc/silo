@@ -25,7 +25,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
             wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let mut factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter);
         // Open shard 0 so the server can find it
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
@@ -38,7 +38,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
 
         // Start server
-        let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), shutdown_rx));
+        let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), None, silo::settings::AppConfig::load(None).unwrap(), shutdown_rx));
 
         // Connect real client
         let endpoint = format!("http://{}", addr);
@@ -53,7 +53,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
         let mut md = std::collections::HashMap::new();
         md.insert("env".to_string(), "test".to_string());
         let enq = EnqueueRequest {
-            shard: "0".to_string(),
+            shard: 0,
             id: "".to_string(),
             priority: 10,
             start_at_ms: 0,
@@ -71,10 +71,9 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
         // Lease a task
         let lease_resp = client
             .lease_tasks(LeaseTasksRequest {
-                shard: "0".to_string(),
+                shard: Some(0),
                 worker_id: "w1".to_string(),
                 max_tasks: 1,
-                tenant: None,
             })
             .await?
             .into_inner();
@@ -89,7 +88,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
         // Report success
         let _ = client
             .report_outcome(ReportOutcomeRequest {
-                shard: "0".to_string(),
+                shard: 0,
                 task_id: task.id.clone(),
                 tenant: None,
                 outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
@@ -102,7 +101,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
         // First try get_job to ensure job exists pre-delete
         let _ = client
             .get_job(GetJobRequest {
-                shard: "0".to_string(),
+                shard: 0,
                 id: job_id.clone(),
                 tenant: None,
             })
@@ -110,7 +109,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
         // Verify metadata via get_job
         let got = client
             .get_job(GetJobRequest {
-                shard: "0".to_string(),
+                shard: 0,
                 id: job_id.clone(),
                 tenant: None,
             })
@@ -120,7 +119,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
         // Now delete it
         let _ = client
             .delete_job(DeleteJobRequest {
-                shard: "0".to_string(),
+                shard: 0,
                 id: job_id.clone(),
                 tenant: None,
             })
@@ -160,7 +159,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
             wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let mut factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -168,7 +167,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
             tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), shutdown_rx));
+        let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), None, silo::settings::AppConfig::load(None).unwrap(), shutdown_rx));
 
         let endpoint = format!("http://{}", addr);
         let channel = tonic::transport::Endpoint::new(endpoint.clone())?
@@ -199,7 +198,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
                 md.insert(format!("k{}", i), "v".to_string());
             }
             let req = EnqueueRequest {
-                shard: "0".to_string(),
+                shard: 0,
                 id: "".to_string(),
                 priority: 1,
                 start_at_ms: 0,
@@ -220,7 +219,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
             let long_key = "x".repeat(64);
             md.insert(long_key, "v".to_string());
             let req = EnqueueRequest {
-                shard: "0".to_string(),
+                shard: 0,
                 id: "".to_string(),
                 priority: 1,
                 start_at_ms: 0,
@@ -244,7 +243,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
                 String::from_utf8(long_val).unwrap_or_default(),
             );
             let req = EnqueueRequest {
-                shard: "0".to_string(),
+                shard: 0,
                 id: "".to_string(),
                 priority: 1,
                 start_at_ms: 0,
@@ -286,7 +285,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
             wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let mut factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -294,7 +293,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
             tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), shutdown_rx));
+        let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), None, silo::settings::AppConfig::load(None).unwrap(), shutdown_rx));
 
         let endpoint = format!("http://{}", addr);
         let channel = tonic::transport::Endpoint::new(endpoint.clone())?
@@ -310,7 +309,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
             md.insert("env".to_string(), "test".to_string());
             md.insert("batch".to_string(), "batch1".to_string());
             let enq = EnqueueRequest {
-                shard: "0".to_string(),
+                shard: 0,
                 id: format!("job{}", i),
                 priority: (10 + i) as u32,
                 start_at_ms: 0,
@@ -328,7 +327,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
         // Test 1: Basic SELECT query
         let query_resp = client
             .query(QueryRequest {
-                shard: "0".to_string(),
+                shard: 0,
                 sql: "SELECT * FROM jobs".to_string(),
                 tenant: None,
             })
@@ -352,7 +351,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
         // Test 2: Query with WHERE clause
         let query_resp = client
             .query(QueryRequest {
-                shard: "0".to_string(),
+                shard: 0,
                 sql: "SELECT id FROM jobs WHERE priority >= 10".to_string(),
                 tenant: None,
             })
@@ -367,7 +366,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
         // Test 3: Aggregation query
         let query_resp = client
             .query(QueryRequest {
-                shard: "0".to_string(),
+                shard: 0,
                 sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
                 tenant: None,
             })
@@ -405,7 +404,7 @@ async fn grpc_server_query_errors() -> anyhow::Result<()> {
             wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let mut factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -413,7 +412,7 @@ async fn grpc_server_query_errors() -> anyhow::Result<()> {
             tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), shutdown_rx));
+        let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), None, silo::settings::AppConfig::load(None).unwrap(), shutdown_rx));
 
         let endpoint = format!("http://{}", addr);
         let channel = tonic::transport::Endpoint::new(endpoint.clone())?
@@ -424,7 +423,7 @@ async fn grpc_server_query_errors() -> anyhow::Result<()> {
         // Test 1: SQL syntax error
         let res = client
             .query(QueryRequest {
-                shard: "0".to_string(),
+                shard: 0,
                 sql: "SELECT FROM WHERE".to_string(),
                 tenant: None,
             })
@@ -445,7 +444,7 @@ async fn grpc_server_query_errors() -> anyhow::Result<()> {
         // Test 2: Invalid column name
         let res = client
             .query(QueryRequest {
-                shard: "0".to_string(),
+                shard: 0,
                 sql: "SELECT nonexistent_column FROM jobs".to_string(),
                 tenant: None,
             })
@@ -461,7 +460,7 @@ async fn grpc_server_query_errors() -> anyhow::Result<()> {
         // Test 3: Shard not found
         let res = client
             .query(QueryRequest {
-                shard: "999".to_string(),
+                shard: 999,
                 sql: "SELECT * FROM jobs".to_string(),
                 tenant: None,
             })
@@ -501,7 +500,7 @@ async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
             wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let mut factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -509,7 +508,7 @@ async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
             tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), shutdown_rx));
+        let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), None, silo::settings::AppConfig::load(None).unwrap(), shutdown_rx));
 
         let endpoint = format!("http://{}", addr);
         let channel = tonic::transport::Endpoint::new(endpoint.clone())?
@@ -520,7 +519,7 @@ async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
         // Query on empty shard
         let query_resp = client
             .query(QueryRequest {
-                shard: "0".to_string(),
+                shard: 0,
                 sql: "SELECT * FROM jobs".to_string(),
                 tenant: None,
             })
@@ -535,7 +534,7 @@ async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
         let payload = serde_json::json!({ "test": "data" });
         let payload_bytes = serde_json::to_vec(&payload)?;
         let enq = EnqueueRequest {
-            shard: "0".to_string(),
+            shard: 0,
             id: "test_job".to_string(),
             priority: 10,
             start_at_ms: 0,
@@ -552,7 +551,7 @@ async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
         // Query that doesn't match
         let query_resp = client
             .query(QueryRequest {
-                shard: "0".to_string(),
+                shard: 0,
                 sql: "SELECT * FROM jobs WHERE id = 'nonexistent'".to_string(),
                 tenant: None,
             })
@@ -592,7 +591,7 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
             wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let mut factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -600,7 +599,7 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
             tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), shutdown_rx));
+        let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), None, silo::settings::AppConfig::load(None).unwrap(), shutdown_rx));
 
         let endpoint = format!("http://{}", addr);
         let channel = tonic::transport::Endpoint::new(endpoint.clone())?
@@ -619,7 +618,7 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
         md.insert("region".to_string(), "us-west".to_string());
 
         let enq = EnqueueRequest {
-            shard: "0".to_string(),
+            shard: 0,
             id: "complex_job".to_string(),
             priority: 5,
             start_at_ms: 1234567890,
@@ -636,7 +635,7 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
         // Query with multiple columns to verify schema
         let query_resp = client
             .query(QueryRequest {
-                shard: "0".to_string(),
+                shard: 0,
                 sql: "SELECT id, priority, enqueue_time_ms, payload FROM jobs".to_string(),
                 tenant: None,
             })
@@ -696,7 +695,7 @@ async fn grpc_health_check_returns_serving() -> anyhow::Result<()> {
             wal: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let mut factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -704,7 +703,7 @@ async fn grpc_health_check_returns_serving() -> anyhow::Result<()> {
             tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), shutdown_rx));
+        let server = tokio::spawn(run_grpc_with_reaper(listener, factory.clone(), None, silo::settings::AppConfig::load(None).unwrap(), shutdown_rx));
 
         let endpoint = format!("http://{}", addr);
         let channel = tonic::transport::Endpoint::new(endpoint.clone())?

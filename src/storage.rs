@@ -16,10 +16,16 @@ pub enum StorageError {
     InvalidUrl(String),
 }
 
+/// Result of resolving an object store, includes the canonical path used
+pub struct ResolvedStore {
+    pub store: Arc<dyn ObjectStore>,
+    pub canonical_path: String,
+}
+
 pub fn resolve_object_store(
     backend: &Backend,
     path: &str,
-) -> Result<Arc<dyn ObjectStore>, StorageError> {
+) -> Result<ResolvedStore, StorageError> {
     match backend {
         Backend::Fs => {
             // Ensure the directory exists before creating the LocalFileSystem root
@@ -29,16 +35,32 @@ pub fn resolve_object_store(
                     StorageError::InvalidUrl(format!("failed to create fs root {}: {}", path, e))
                 })?;
             }
+            // Canonicalize the path to avoid URL-encoding issues with relative paths
+            // (e.g., "./tmp" being encoded as "%2E/tmp" or "%252E/tmp" inconsistently)
+            let canonical_path = root.canonicalize().map_err(|e| {
+                StorageError::InvalidUrl(format!("failed to canonicalize path {}: {}", path, e))
+            })?;
+            let canonical_str = canonical_path.to_string_lossy().to_string();
             // Use slatedb's re-exported object_store to ensure trait compatibility
-            let fs = slatedb::object_store::local::LocalFileSystem::new_with_prefix(path)
-                .map_err(|e| StorageError::InvalidUrl(format!("{}", e)))?;
-            Ok(Arc::new(fs))
+            let fs =
+                slatedb::object_store::local::LocalFileSystem::new_with_prefix(&canonical_str)
+                    .map_err(|e| StorageError::InvalidUrl(format!("{}", e)))?;
+            Ok(ResolvedStore {
+                store: Arc::new(fs),
+                canonical_path: canonical_str,
+            })
         }
-        Backend::Memory => Ok(Arc::new(slatedb::object_store::memory::InMemory::new())),
+        Backend::Memory => Ok(ResolvedStore {
+            store: Arc::new(slatedb::object_store::memory::InMemory::new()),
+            canonical_path: path.to_string(),
+        }),
         Backend::S3 | Backend::Url => {
             // Interpret path as a URL understood by SlateDB's resolver, e.g. s3://bucket/prefix
             let store = Db::resolve_object_store(path)?;
-            Ok(store)
+            Ok(ResolvedStore {
+                store,
+                canonical_path: path.to_string(),
+            })
         }
     }
 }

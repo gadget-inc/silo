@@ -2,4 +2,27 @@
 alwaysApply: true
 ---
 
+When running tests, assume the background services required are already running.
+
+You can run rust tests with `cargo test`. Some cargo tests are disabled by default:
+
+- the k8s coordination tests, which you can run with `cargo test --features k8s k8s_ -- --test-threads=1`
+- the turmoil DST tests which you don't need to run
+
+You can run TypeScript client tests with
+
+```shell
+cd typescript_client
+pnpm test
+```
+
+You can run the TypeScript integration tests with:
+
+```shell
+cd typescript_client
+RUN_INTEGRATION=true pnpm test
+```
+
+The TypeScript integration tests require a running Silo server. Assume one is running. Don't run `dev` or `process-compose` yourself unless you are a cloud agent.
+
 Use the #[silo::test] macro for wrapping rust test cases (not tokio::test).

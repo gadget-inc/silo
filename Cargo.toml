@@ -23,6 +23,7 @@ bytes = "1"
 crossbeam-skiplist = "0.1"
 tonic = { version = "0.12", features = ["transport"] }
 tonic-health = "0.12"
+tonic-reflection = "0.12"
 prost = "0.13"
 prost-types = "0.13"
 tracing = "0.1"
@@ -58,6 +59,7 @@ axum = "0.7"
 askama = "0.12"
 askama_axum = "0.4"
 tower-http = { version = "0.5", features = ["fs"] }
+rand = "0.8"
 
 [features]
 default = []
@@ -81,11 +83,6 @@ protoc-bin-vendored = "3.0"
 [profile.release]
 debug = 1     # debug info with line tables only for profiling
 strip = false # do not strip symbols for profiling
-
-# Fast build for testing - much faster than release, some optimization for reasonable perf
-[profile.dev-fast]
-inherits = "dev"
-opt-level = 1
 
 [[bench]]
 name = "job_shard_throughput"

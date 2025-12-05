@@ -1,0 +1,27 @@
+# Config for dev node 2 (process-compose)
+
+[server]
+grpc_addr = "127.0.0.1:50052"
+dev_mode = true
+
+[coordination]
+backend = "etcd"
+cluster_prefix = "silo-dev"
+lease_ttl_secs = 10
+num_shards = 8
+etcd_endpoints = ["http://127.0.0.1:2379"]
+
+[tenancy]
+enabled = true
+
+[gubernator]
+address = "http://localhost:9991"
+
+[webui]
+enabled = true
+addr = "127.0.0.1:8082"
+
+[database]
+backend = "fs"
+# use the same data path as the other node to simulate prod-like usage of object storage and compute/storage separation
+path = "./tmp/silo-data/shard-%shard%"

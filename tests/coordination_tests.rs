@@ -1,8 +1,11 @@
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use silo::coordination::{etcd::EtcdConnection, Coordinator, EtcdCoordinator};
+use silo::factory::ShardFactory;
+use silo::gubernator::MockGubernatorClient;
+use silo::settings::{Backend, DatabaseTemplate};
 
 // Global mutex to serialize coordination tests
 static COORDINATION_TEST_MUTEX: Mutex<()> = Mutex::new(());
@@ -13,6 +16,18 @@ fn unique_prefix() -> String {
         .unwrap()
         .as_nanos();
     format!("test-{}", nanos)
+}
+
+fn make_test_factory(node_id: &str) -> Arc<ShardFactory> {
+    let tmpdir = std::env::temp_dir().join(format!("silo-coord-test-{}", node_id));
+    Arc::new(ShardFactory::new(
+        DatabaseTemplate {
+            backend: Backend::Memory,
+            path: tmpdir.join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+        },
+        MockGubernatorClient::new_arc(),
+    ))
 }
 
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
@@ -37,6 +52,7 @@ async fn multiple_nodes_own_unique_shards() {
         "http://127.0.0.1:50051",
         num_shards,
         10,
+        make_test_factory("n1"),
     )
     .await
     .expect("start c1");
@@ -47,6 +63,7 @@ async fn multiple_nodes_own_unique_shards() {
         "http://127.0.0.1:50052",
         num_shards,
         10,
+        make_test_factory("n2"),
     )
     .await
     .expect("start c2");
@@ -57,6 +74,7 @@ async fn multiple_nodes_own_unique_shards() {
         "http://127.0.0.1:50053",
         num_shards,
         10,
+        make_test_factory("n3"),
     )
     .await
     .expect("start c3");
@@ -143,6 +161,7 @@ async fn adding_a_node_rebalances_shards() {
         "http://127.0.0.1:50051",
         num_shards,
         10,
+        make_test_factory("n1"),
     )
     .await
     .unwrap();
@@ -153,6 +172,7 @@ async fn adding_a_node_rebalances_shards() {
         "http://127.0.0.1:50052",
         num_shards,
         10,
+        make_test_factory("n2"),
     )
     .await
     .unwrap();
@@ -176,6 +196,7 @@ async fn adding_a_node_rebalances_shards() {
         "http://127.0.0.1:50053",
         num_shards,
         10,
+        make_test_factory("n3"),
     )
     .await
     .unwrap();
@@ -226,6 +247,7 @@ async fn removing_a_node_rebalances_shards() {
         "http://127.0.0.1:50051",
         num_shards,
         10,
+        make_test_factory("n1"),
     )
     .await
     .unwrap();
@@ -236,6 +258,7 @@ async fn removing_a_node_rebalances_shards() {
         "http://127.0.0.1:50052",
         num_shards,
         10,
+        make_test_factory("n2"),
     )
     .await
     .unwrap();
@@ -246,6 +269,7 @@ async fn removing_a_node_rebalances_shards() {
         "http://127.0.0.1:50053",
         num_shards,
         10,
+        make_test_factory("n3"),
     )
     .await
     .unwrap();
@@ -291,6 +315,7 @@ async fn rapid_membership_churn_converges() {
         "http://127.0.0.1:50051",
         num_shards,
         10,
+        make_test_factory("n1"),
     )
     .await
     .unwrap();
@@ -302,6 +327,7 @@ async fn rapid_membership_churn_converges() {
         "http://127.0.0.1:50052",
         num_shards,
         10,
+        make_test_factory("n2"),
     )
     .await
     .unwrap();
@@ -313,6 +339,7 @@ async fn rapid_membership_churn_converges() {
         "http://127.0.0.1:50053",
         num_shards,
         10,
+        make_test_factory("n3"),
     )
     .await
     .unwrap();
@@ -329,6 +356,7 @@ async fn rapid_membership_churn_converges() {
         "http://127.0.0.1:50052",
         num_shards,
         10,
+        make_test_factory("n2b"),
     )
     .await
     .unwrap();
@@ -371,4 +399,233 @@ async fn rapid_membership_churn_converges() {
     let _ = h1.abort();
     let _ = h2b.abort();
     let _ = h3.abort();
+}
+
+/// Verifies that membership persists beyond the lease TTL.
+/// This catches bugs where keepalive requests aren't being sent.
+/// Uses a short TTL (2s) to keep test fast while still validating keepalives.
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn membership_persists_beyond_lease_ttl() {
+    let _guard = COORDINATION_TEST_MUTEX.lock().unwrap();
+    let prefix = unique_prefix();
+    let num_shards: u32 = 8; // Small for fast convergence
+    let lease_ttl_secs: i64 = 2; // Short TTL to speed up test
+
+    let cfg = silo::settings::AppConfig::load(None).expect("load default config");
+    let coord = silo::coordination::etcd::EtcdConnection::connect(&cfg.coordination)
+        .await
+        .expect("connect etcd");
+
+    let (c1, h1) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n1",
+        "http://127.0.0.1:50051",
+        num_shards,
+        lease_ttl_secs,
+        make_test_factory("n1"),
+    )
+    .await
+    .expect("start coordinator");
+
+    assert!(
+        c1.wait_converged(Duration::from_secs(10)).await,
+        "should converge"
+    );
+    let initial_shards = c1.owned_shards().await;
+    assert_eq!(
+        initial_shards.len(),
+        num_shards as usize,
+        "single node should own all shards"
+    );
+
+    // Verify membership key exists in etcd
+    let mut kv = coord.client().kv_client();
+    let members_prefix = silo::coordination::keys::members_prefix(&prefix);
+    let resp = kv
+        .get(
+            members_prefix.clone(),
+            Some(etcd_client::GetOptions::new().with_prefix()),
+        )
+        .await
+        .expect("get members");
+    assert_eq!(resp.kvs().len(), 1, "should have 1 member initially");
+
+    // Wait for 2.5x the lease TTL - if keepalives aren't working, lease will expire
+    let wait_duration = Duration::from_millis((lease_ttl_secs as u64) * 2500);
+    tokio::time::sleep(wait_duration).await;
+
+    // Verify membership still exists (would FAIL if keepalives are broken!)
+    let resp = kv
+        .get(
+            members_prefix.clone(),
+            Some(etcd_client::GetOptions::new().with_prefix()),
+        )
+        .await
+        .expect("get members after wait");
+    assert_eq!(
+        resp.kvs().len(),
+        1,
+        "member should still exist after 2.5x TTL - keepalives must be working"
+    );
+
+    // Verify owned shards didn't change (no spurious rebalancing)
+    let final_shards = c1.owned_shards().await;
+    assert_eq!(
+        initial_shards, final_shards,
+        "owned shards should be stable over time"
+    );
+
+    c1.shutdown().await.unwrap();
+    h1.abort();
+}
+
+/// Verifies that multiple nodes maintain stable shard ownership over time.
+/// This catches race conditions or keepalive issues that cause unexpected rebalancing.
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_node_ownership_stable_over_time() {
+    let _guard = COORDINATION_TEST_MUTEX.lock().unwrap();
+    let prefix = unique_prefix();
+    let num_shards: u32 = 16;
+    let lease_ttl_secs: i64 = 2;
+
+    let cfg = silo::settings::AppConfig::load(None).expect("load");
+
+    let (c1, h1) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n1",
+        "http://127.0.0.1:50051",
+        num_shards,
+        lease_ttl_secs,
+        make_test_factory("n1"),
+    )
+    .await
+    .unwrap();
+
+    let (c2, h2) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n2",
+        "http://127.0.0.1:50052",
+        num_shards,
+        lease_ttl_secs,
+        make_test_factory("n2"),
+    )
+    .await
+    .unwrap();
+
+    // Wait for convergence
+    assert!(c1.wait_converged(Duration::from_secs(10)).await);
+    assert!(c2.wait_converged(Duration::from_secs(10)).await);
+
+    let initial_s1: HashSet<u32> = c1.owned_shards().await.into_iter().collect();
+    let initial_s2: HashSet<u32> = c2.owned_shards().await.into_iter().collect();
+
+    // Verify initial state
+    assert!(initial_s1.is_disjoint(&initial_s2), "no overlap initially");
+    let all: HashSet<u32> = initial_s1.iter().copied().chain(initial_s2.iter().copied()).collect();
+    let expected: HashSet<u32> = (0..num_shards).collect();
+    assert_eq!(all, expected, "all shards covered initially");
+
+    // Sample ownership multiple times over 3x TTL with NO membership changes
+    // Each sample should show stable ownership
+    for i in 0..3 {
+        tokio::time::sleep(Duration::from_secs(lease_ttl_secs as u64)).await;
+
+        let s1: HashSet<u32> = c1.owned_shards().await.into_iter().collect();
+        let s2: HashSet<u32> = c2.owned_shards().await.into_iter().collect();
+
+        assert_eq!(
+            s1, initial_s1,
+            "c1 ownership should be stable at sample {i}"
+        );
+        assert_eq!(
+            s2, initial_s2,
+            "c2 ownership should be stable at sample {i}"
+        );
+    }
+
+    c1.shutdown().await.unwrap();
+    c2.shutdown().await.unwrap();
+    h1.abort();
+    h2.abort();
+}
+
+/// Verifies that get_shard_owner_map reflects actual ownership accurately.
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shard_owner_map_matches_actual_ownership() {
+    let _guard = COORDINATION_TEST_MUTEX.lock().unwrap();
+    let prefix = unique_prefix();
+    let num_shards: u32 = 8;
+    let lease_ttl_secs: i64 = 3;
+
+    let cfg = silo::settings::AppConfig::load(None).expect("load");
+
+    let (c1, h1) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n1",
+        "http://127.0.0.1:50061",
+        num_shards,
+        lease_ttl_secs,
+        make_test_factory("n1"),
+    )
+    .await
+    .unwrap();
+
+    let (c2, h2) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n2",
+        "http://127.0.0.1:50062",
+        num_shards,
+        lease_ttl_secs,
+        make_test_factory("n2"),
+    )
+    .await
+    .unwrap();
+
+    assert!(c1.wait_converged(Duration::from_secs(10)).await);
+    assert!(c2.wait_converged(Duration::from_secs(10)).await);
+
+    // Get the shard owner map from c1's perspective
+    let owner_map = c1.get_shard_owner_map().await.expect("get owner map");
+
+    // Verify all shards have owners
+    assert_eq!(
+        owner_map.shard_to_addr.len(),
+        num_shards as usize,
+        "all shards should have owners in map"
+    );
+
+    // Verify owner map is consistent with actual ownership
+    let s1: HashSet<u32> = c1.owned_shards().await.into_iter().collect();
+    let s2: HashSet<u32> = c2.owned_shards().await.into_iter().collect();
+
+    for shard_id in 0..num_shards {
+        let addr = owner_map
+            .shard_to_addr
+            .get(&shard_id)
+            .expect("shard should have addr");
+
+        if s1.contains(&shard_id) {
+            assert_eq!(
+                addr, "http://127.0.0.1:50061",
+                "shard {shard_id} owned by c1 should map to c1's addr"
+            );
+        } else if s2.contains(&shard_id) {
+            assert_eq!(
+                addr, "http://127.0.0.1:50062",
+                "shard {shard_id} owned by c2 should map to c2's addr"
+            );
+        } else {
+            panic!("shard {shard_id} not owned by any node");
+        }
+    }
+
+    c1.shutdown().await.unwrap();
+    c2.shutdown().await.unwrap();
+    h1.abort();
+    h2.abort();
 }

@@ -15,13 +15,11 @@ jobs:
         with:
           cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - uses: Swatinem/rust-cache@v2
-      - uses: JarvusInnovations/background-action@v1
-        name: Run background processes
-        with:
-          run: dev --tui=false &
-          wait-on: |
-            tcp:localhost:2379
-          tail: true
+      - name: Run background processes
+        shell: bash
+        run: |
+          process-compose up --tui=false gubernator etcd &
+          sleep 2
       - name: Run cargo test
         shell: bash
         run: cargo test
@@ -73,7 +71,7 @@ jobs:
           set -euo pipefail
           
           echo "Running Alloy model verification..."
-          alloy6 exec -f -s lingeling.parallel specs/job_shard.als 2>&1 | tee alloy_output.txt
+          alloy6 exec -f -s glucose specs/job_shard.als 2>&1 | tee alloy_output.txt
           
           echo ""
           echo "Verifying results..."
@@ -108,8 +106,8 @@ jobs:
         shell: bash
         run: node scripts/validate-silo-tags.js
 
-  typescript-client:
-    name: TypeScript tests
+  typescript-client-lint:
+    name: TypeScript lints
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -121,36 +119,42 @@ jobs:
         shell: bash
         working-directory: typescript_client
         run: pnpm install --frozen-lockfile
-      - name: Generate proto code
-        shell: bash
-        working-directory: typescript_client
-        run: pnpm run generate
-      - name: Build TypeScript client
-        shell: bash
-        working-directory: typescript_client
-        run: pnpm run build
       - name: Lint
         shell: bash
         working-directory: typescript_client
         run: pnpm run lint
+      - name: Typecheck
+        shell: bash
+        working-directory: typescript_client
+        run: pnpm run typecheck
+
+  typescript-client-tests:
+    name: TypeScript tests
+    runs-on: ubuntu-latest-l
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-test-env
+        with:
+          cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install dependencies
+        shell: bash
+        working-directory: typescript_client
+        run: pnpm install --frozen-lockfile
       - name: Build silo server
         shell: bash
         run: cargo build
-      - name: Start etcd
+      - name: Run background processes
         shell: bash
         run: |
-          just etcd &
-          sleep 3
-      - name: Start silo server
-        shell: bash
-        run: |
-          ./target/debug/silo -c typescript_client/test/silo-test-config.toml &
+          process-compose up --tui=false &
           sleep 2
       - name: Run tests
         shell: bash
         working-directory: typescript_client
         env:
           CI: "true"
+          SILO_SERVERS: "localhost:50051,localhost:50052"
         run: pnpm test
 
   build-docker:

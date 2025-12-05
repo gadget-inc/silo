@@ -20,7 +20,7 @@ async fn open_fs_db_from_config() {
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
-    let mut factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
+    let factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
     let shard = factory.open(0).await.expect("open shard");
 
     shard.db().put(b"k", b"v").await.expect("put");

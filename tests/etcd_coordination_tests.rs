@@ -1,6 +1,10 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use silo::coordination::etcd::{EtcdConnection, EtcdShardGuard, ShardPhase};
+use silo::factory::ShardFactory;
+use silo::gubernator::MockGubernatorClient;
+use silo::settings::{Backend, DatabaseTemplate};
 
 fn unique_prefix() -> String {
     let nanos = SystemTime::now()
@@ -8,6 +12,18 @@ fn unique_prefix() -> String {
         .unwrap()
         .as_nanos();
     format!("test-sg-{}", nanos)
+}
+
+fn make_test_factory(prefix: &str) -> Arc<ShardFactory> {
+    let tmpdir = std::env::temp_dir().join(format!("silo-test-{}", prefix));
+    Arc::new(ShardFactory::new(
+        DatabaseTemplate {
+            backend: Backend::Memory,
+            path: tmpdir.join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+        },
+        MockGubernatorClient::new_arc(),
+    ))
 }
 
 async fn make_guard(
@@ -33,8 +49,9 @@ async fn make_guard(
     );
     let runner = guard.clone();
     let owned_arc = owned.clone();
+    let factory = make_test_factory(cluster_prefix);
     let handle = tokio::spawn(async move {
-        runner.run(owned_arc).await;
+        runner.run(owned_arc, factory).await;
     });
     (guard, owned, tx, handle)
 }

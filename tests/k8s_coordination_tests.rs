@@ -19,6 +19,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use silo::coordination::k8s::K8sShardGuard;
 use silo::coordination::{Coordinator, K8sCoordinator};
+use silo::factory::ShardFactory;
+use silo::gubernator::MockGubernatorClient;
+use silo::settings::{Backend, DatabaseTemplate};
 use tokio::sync::Mutex;
 
 // Atomic counter for truly unique prefixes even within the same nanosecond
@@ -36,6 +39,18 @@ fn unique_prefix() -> String {
 
 fn get_namespace() -> String {
     std::env::var("TEST_K8S_NAMESPACE").unwrap_or_else(|_| "default".to_string())
+}
+
+fn make_test_factory(node_id: &str) -> Arc<ShardFactory> {
+    let tmpdir = std::env::temp_dir().join(format!("silo-k8s-test-{}", node_id));
+    Arc::new(ShardFactory::new(
+        DatabaseTemplate {
+            backend: Backend::Memory,
+            path: tmpdir.join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+        },
+        MockGubernatorClient::new_arc(),
+    ))
 }
 
 /// Helper to wait for a condition with timeout
@@ -56,8 +71,9 @@ where
 
 /// Start a K8S coordinator, skipping the test if K8S is not available
 macro_rules! start_coordinator {
-    ($namespace:expr, $prefix:expr, $node_id:expr, $grpc_addr:expr, $num_shards:expr) => {
-        match K8sCoordinator::start($namespace, $prefix, $node_id, $grpc_addr, $num_shards, 10).await
+    ($namespace:expr, $prefix:expr, $node_id:expr, $grpc_addr:expr, $num_shards:expr) => {{
+        let factory = make_test_factory($node_id);
+        match K8sCoordinator::start($namespace, $prefix, $node_id, $grpc_addr, $num_shards, 10, factory).await
         {
             Ok(c) => c,
             Err(e) => {
@@ -65,7 +81,7 @@ macro_rules! start_coordinator {
                 return;
             }
         }
-    };
+    }};
 }
 
 // =============================================================================
@@ -110,7 +126,7 @@ async fn k8s_multiple_nodes_partition_shards() {
     // Small delay to let c1 start acquiring shards
     tokio::time::sleep(Duration::from_millis(100)).await;
     
-    let (c2, h2) = K8sCoordinator::start(&namespace, &prefix, "test-node-2", "http://127.0.0.1:50052", num_shards, 10)
+    let (c2, h2) = K8sCoordinator::start(&namespace, &prefix, "test-node-2", "http://127.0.0.1:50052", num_shards, 10, make_test_factory("test-node-2"))
         .await
         .expect("start c2");
 
@@ -151,7 +167,7 @@ async fn k8s_rebalances_on_membership_change() {
     assert_eq!(initial_owned, expected, "single node should own all initially");
 
     // Add second node
-    let (c2, h2) = K8sCoordinator::start(&namespace, &prefix, "test-node-2", "http://127.0.0.1:50052", num_shards, 10)
+    let (c2, h2) = K8sCoordinator::start(&namespace, &prefix, "test-node-2", "http://127.0.0.1:50052", num_shards, 10, make_test_factory("test-node-2"))
         .await
         .expect("start c2");
 
@@ -186,10 +202,10 @@ async fn k8s_three_nodes_even_distribution() {
     let namespace = get_namespace();
 
     let (c1, h1) = start_coordinator!(&namespace, &prefix, "node-1", "http://127.0.0.1:50051", num_shards);
-    let (c2, h2) = K8sCoordinator::start(&namespace, &prefix, "node-2", "http://127.0.0.1:50052", num_shards, 10)
+    let (c2, h2) = K8sCoordinator::start(&namespace, &prefix, "node-2", "http://127.0.0.1:50052", num_shards, 10, make_test_factory("node-2"))
         .await
         .expect("start c2");
-    let (c3, h3) = K8sCoordinator::start(&namespace, &prefix, "node-3", "http://127.0.0.1:50053", num_shards, 10)
+    let (c3, h3) = K8sCoordinator::start(&namespace, &prefix, "node-3", "http://127.0.0.1:50053", num_shards, 10, make_test_factory("node-3"))
         .await
         .expect("start c3");
 
@@ -240,10 +256,10 @@ async fn k8s_removing_node_rebalances() {
     let namespace = get_namespace();
 
     let (c1, h1) = start_coordinator!(&namespace, &prefix, "node-1", "http://127.0.0.1:50051", num_shards);
-    let (c2, h2) = K8sCoordinator::start(&namespace, &prefix, "node-2", "http://127.0.0.1:50052", num_shards, 10)
+    let (c2, h2) = K8sCoordinator::start(&namespace, &prefix, "node-2", "http://127.0.0.1:50052", num_shards, 10, make_test_factory("node-2"))
         .await
         .expect("start c2");
-    let (c3, h3) = K8sCoordinator::start(&namespace, &prefix, "node-3", "http://127.0.0.1:50053", num_shards, 10)
+    let (c3, h3) = K8sCoordinator::start(&namespace, &prefix, "node-3", "http://127.0.0.1:50053", num_shards, 10, make_test_factory("node-3"))
         .await
         .expect("start c3");
 
@@ -286,12 +302,12 @@ async fn k8s_rapid_membership_churn_converges() {
     let (c1, h1) = start_coordinator!(&namespace, &prefix, "node-1", "http://127.0.0.1:50051", num_shards);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let (c2, h2) = K8sCoordinator::start(&namespace, &prefix, "node-2", "http://127.0.0.1:50052", num_shards, 10)
+    let (c2, h2) = K8sCoordinator::start(&namespace, &prefix, "node-2", "http://127.0.0.1:50052", num_shards, 10, make_test_factory("node-2"))
         .await
         .expect("start c2");
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let (c3, h3) = K8sCoordinator::start(&namespace, &prefix, "node-3", "http://127.0.0.1:50053", num_shards, 10)
+    let (c3, h3) = K8sCoordinator::start(&namespace, &prefix, "node-3", "http://127.0.0.1:50053", num_shards, 10, make_test_factory("node-3"))
         .await
         .expect("start c3");
 
@@ -302,7 +318,7 @@ async fn k8s_rapid_membership_churn_converges() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Restart c2
-    let (c2b, h2b) = K8sCoordinator::start(&namespace, &prefix, "node-2", "http://127.0.0.1:50052", num_shards, 10)
+    let (c2b, h2b) = K8sCoordinator::start(&namespace, &prefix, "node-2", "http://127.0.0.1:50052", num_shards, 10, make_test_factory("node-2-restart"))
         .await
         .expect("restart c2");
 
@@ -341,7 +357,7 @@ async fn k8s_get_members_returns_correct_info() {
     let namespace = get_namespace();
 
     let (c1, h1) = start_coordinator!(&namespace, &prefix, "member-node-1", "http://10.0.0.1:50051", num_shards);
-    let (c2, h2) = K8sCoordinator::start(&namespace, &prefix, "member-node-2", "http://10.0.0.2:50052", num_shards, 10)
+    let (c2, h2) = K8sCoordinator::start(&namespace, &prefix, "member-node-2", "http://10.0.0.2:50052", num_shards, 10, make_test_factory("member-node-2"))
         .await
         .expect("start c2");
 
@@ -386,7 +402,7 @@ async fn k8s_get_shard_owner_map_accurate() {
     let namespace = get_namespace();
 
     let (c1, h1) = start_coordinator!(&namespace, &prefix, "map-node-1", "http://10.0.0.1:50051", num_shards);
-    let (c2, h2) = K8sCoordinator::start(&namespace, &prefix, "map-node-2", "http://10.0.0.2:50052", num_shards, 10)
+    let (c2, h2) = K8sCoordinator::start(&namespace, &prefix, "map-node-2", "http://10.0.0.2:50052", num_shards, 10, make_test_factory("map-node-2"))
         .await
         .expect("start c2");
 
@@ -466,8 +482,9 @@ async fn make_k8s_guard(
 
     let runner = guard.clone();
     let owned_arc = owned.clone();
+    let factory = make_test_factory(node_id);
     let handle = tokio::spawn(async move {
-        runner.run(owned_arc).await;
+        runner.run(owned_arc, factory).await;
     });
 
     Ok((guard, owned, tx, handle))
@@ -777,7 +794,7 @@ async fn k8s_no_split_brain_during_transitions() {
     let num_shards: u32 = 16;
 
     let (c1, h1) = start_coordinator!(&namespace, &prefix, "brain-node-1", "http://127.0.0.1:50051", num_shards);
-    let (c2, h2) = K8sCoordinator::start(&namespace, &prefix, "brain-node-2", "http://127.0.0.1:50052", num_shards, 10)
+    let (c2, h2) = K8sCoordinator::start(&namespace, &prefix, "brain-node-2", "http://127.0.0.1:50052", num_shards, 10, make_test_factory("brain-node-2"))
         .await
         .expect("start c2");
 
@@ -786,7 +803,7 @@ async fn k8s_no_split_brain_during_transitions() {
     assert!(c2.wait_converged(Duration::from_secs(15)).await);
 
     // Add a third node to trigger rebalancing
-    let (c3, h3) = K8sCoordinator::start(&namespace, &prefix, "brain-node-3", "http://127.0.0.1:50053", num_shards, 10)
+    let (c3, h3) = K8sCoordinator::start(&namespace, &prefix, "brain-node-3", "http://127.0.0.1:50053", num_shards, 10, make_test_factory("brain-node-3"))
         .await
         .expect("start c3");
 
@@ -843,7 +860,7 @@ async fn k8s_prompt_acquisition_after_node_departure() {
     let num_shards: u32 = 8;
 
     let (c1, h1) = start_coordinator!(&namespace, &prefix, "prompt-node-1", "http://127.0.0.1:50051", num_shards);
-    let (c2, h2) = K8sCoordinator::start(&namespace, &prefix, "prompt-node-2", "http://127.0.0.1:50052", num_shards, 10)
+    let (c2, h2) = K8sCoordinator::start(&namespace, &prefix, "prompt-node-2", "http://127.0.0.1:50052", num_shards, 10, make_test_factory("prompt-node-2"))
         .await
         .expect("start c2");
 
@@ -902,6 +919,7 @@ async fn k8s_multiple_add_remove_cycles() {
             "http://127.0.0.1:50052",
             num_shards,
             10,
+            make_test_factory(&format!("cycle-node-2-iter-{}", i)),
         )
         .await
         .expect("start c2");
@@ -944,15 +962,15 @@ async fn k8s_four_node_cluster() {
     
     // Stagger node starts to reduce contention
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let (c2, h2) = K8sCoordinator::start(&namespace, &prefix, "four-node-2", "http://127.0.0.1:50052", num_shards, 10)
+    let (c2, h2) = K8sCoordinator::start(&namespace, &prefix, "four-node-2", "http://127.0.0.1:50052", num_shards, 10, make_test_factory("four-node-2"))
         .await.expect("start c2");
     
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let (c3, h3) = K8sCoordinator::start(&namespace, &prefix, "four-node-3", "http://127.0.0.1:50053", num_shards, 10)
+    let (c3, h3) = K8sCoordinator::start(&namespace, &prefix, "four-node-3", "http://127.0.0.1:50053", num_shards, 10, make_test_factory("four-node-3"))
         .await.expect("start c3");
     
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let (c4, h4) = K8sCoordinator::start(&namespace, &prefix, "four-node-4", "http://127.0.0.1:50054", num_shards, 10)
+    let (c4, h4) = K8sCoordinator::start(&namespace, &prefix, "four-node-4", "http://127.0.0.1:50054", num_shards, 10, make_test_factory("four-node-4"))
         .await.expect("start c4");
 
     // Convergence with longer timeout for 4 nodes

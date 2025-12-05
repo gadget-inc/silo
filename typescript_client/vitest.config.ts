@@ -11,5 +11,9 @@ export default defineConfig({
     sequence: {
       concurrent: false,
     },
+    // Use threads pool instead of forks - grpc-js doesn't work well with fork termination
+    pool: "threads",
+    // Timeout for tearing down test environment
+    teardownTimeout: 1000,
   },
 });

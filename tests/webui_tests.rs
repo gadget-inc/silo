@@ -22,7 +22,7 @@ async fn setup_test_state() -> (tempfile::TempDir, AppState) {
     let tmp = tempfile::tempdir().unwrap();
 
     let rate_limiter = MockGubernatorClient::new_arc();
-    let mut factory = ShardFactory::new(
+    let factory = ShardFactory::new(
         DatabaseTemplate {
             backend: Backend::Fs,
             path: tmp.path().to_string_lossy().to_string(),
@@ -229,13 +229,13 @@ async fn test_queue_view_renders() {
 }
 
 #[silo::test]
-async fn test_shards_view_renders() {
+async fn test_cluster_view_renders() {
     let (_tmp, state) = setup_test_state().await;
 
-    let (status, body) = make_request(state, "GET", "/shards").await;
+    let (status, body) = make_request(state, "GET", "/cluster").await;
 
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("Shard"));
+    assert!(body.contains("Cluster"));
     assert!(body.contains("0")); // Shard 0 should be listed
 }
 
@@ -318,7 +318,7 @@ async fn setup_multi_shard_state(num_shards: usize) -> (tempfile::TempDir, AppSt
     let rate_limiter = MockGubernatorClient::new_arc();
     // Use {shard} placeholder so each shard gets its own subdirectory
     let path_with_shard = format!("{}/{{shard}}", tmp.path().to_string_lossy());
-    let mut factory = ShardFactory::new(
+    let factory = ShardFactory::new(
         DatabaseTemplate {
             backend: Backend::Fs,
             path: path_with_shard,
@@ -415,18 +415,18 @@ async fn test_index_shows_jobs_from_all_shards() {
 }
 
 #[silo::test]
-async fn test_shards_page_shows_all_shards() {
+async fn test_cluster_page_shows_all_shards() {
     // Create state with 3 shards
     let (_tmp, state) = setup_multi_shard_state(3).await;
 
-    // Request the shards page
-    let (status, body) = make_request(state, "GET", "/shards").await;
+    // Request the cluster page
+    let (status, body) = make_request(state, "GET", "/cluster").await;
 
     assert_eq!(status, StatusCode::OK);
     // Verify all shards are displayed
-    assert!(body.contains(">0<") || body.contains(">0</"), "shards page should show shard 0");
-    assert!(body.contains(">1<") || body.contains(">1</"), "shards page should show shard 1");
-    assert!(body.contains(">2<") || body.contains(">2</"), "shards page should show shard 2");
+    assert!(body.contains(">0<") || body.contains(">0</"), "cluster page should show shard 0");
+    assert!(body.contains(">1<") || body.contains(">1</"), "cluster page should show shard 1");
+    assert!(body.contains(">2<") || body.contains(">2</"), "cluster page should show shard 2");
 }
 
 #[silo::test]
@@ -513,8 +513,8 @@ async fn test_queues_page_shows_queues_from_all_shards() {
 
     // Dequeue to create holders (jobs will wait in concurrency queues)
     // Since max_concurrency is 1 and we enqueued, there should be holders or requesters
-    let _ = shard0.dequeue("-", "worker-0", 1).await;
-    let _ = shard1.dequeue("-", "worker-1", 1).await;
+    let _ = shard0.dequeue("worker-0", 1).await;
+    let _ = shard1.dequeue("worker-1", 1).await;
 
     // Request the queues page
     let (status, body) = make_request(state, "GET", "/queues").await;

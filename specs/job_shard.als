@@ -5,11 +5,8 @@
  *
  * Run verification with:
  * ```shell
- * alloy6 exec -f -s lingeling.parallel -o specs/output specs/job_shard.als
+ * alloy6 exec -f -s glucose -o specs/output specs/job_shard.als
  * ```
- * 
- * The lingeling.parallel solver uses multiple CPU cores and is ~10x faster than the default SAT4J.
- * Alternative solvers: sat4j (default, reliable), minisat, glucose
  */
 module job_shard
 

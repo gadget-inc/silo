@@ -86,7 +86,7 @@ async fn connect(address: &str) -> anyhow::Result<SiloClient<Channel>> {
 async fn worker_loop(
     client: SiloClient<Channel>,
     worker_id: String,
-    shards: Vec<String>,
+    shards: Vec<u32>,
     max_tasks: u32,
     running: Arc<AtomicBool>,
     completed_count: Arc<AtomicU64>,
@@ -99,14 +99,13 @@ async fn worker_loop(
 
     while running.load(Ordering::Relaxed) {
         // Round-robin across shards
-        let shard = &shards[shard_idx % shards.len()];
+        let shard = shards[shard_idx % shards.len()];
         shard_idx = shard_idx.wrapping_add(1);
 
         let request = LeaseTasksRequest {
-            shard: shard.clone(),
+            shard: Some(shard),
             worker_id: worker_id.clone(),
             max_tasks,
-            tenant: tenant.clone(),
         };
 
         poll_count.fetch_add(1, Ordering::Relaxed);
@@ -124,7 +123,7 @@ async fn worker_loop(
                 for task in tasks {
                     // Report success immediately (simulating instant task execution)
                     let outcome_request = ReportOutcomeRequest {
-                        shard: shard.clone(),
+                        shard: task.shard,
                         task_id: task.id.clone(),
                         tenant: tenant.clone(),
                         outcome: Some(Outcome::Success(JsonValueBytes {
@@ -154,7 +153,7 @@ async fn worker_loop(
 async fn enqueuer_loop(
     client: SiloClient<Channel>,
     enqueuer_id: String,
-    shards: Vec<String>,
+    shards: Vec<u32>,
     concurrency_key: String,
     max_concurrency: u32,
     running: Arc<AtomicBool>,
@@ -166,7 +165,7 @@ async fn enqueuer_loop(
     let mut job_counter = 0u64;
 
     while running.load(Ordering::Relaxed) {
-        let shard = &shards[shard_idx % shards.len()];
+        let shard = shards[shard_idx % shards.len()];
         shard_idx = shard_idx.wrapping_add(1);
 
         let payload = serde_json::json!({
@@ -176,7 +175,7 @@ async fn enqueuer_loop(
         });
 
         let request = EnqueueRequest {
-            shard: shard.clone(),
+            shard,
             id: String::new(), // Let server generate ID
             priority: (job_counter % 100) as u32,
             start_at_ms: now_ms(),
@@ -229,10 +228,10 @@ async fn main() -> anyhow::Result<()> {
     println!();
 
     // Determine which shards to target
-    let shards: Vec<String> = if args.shard == "all" {
-        (0..args.num_shards).map(|i| i.to_string()).collect()
+    let shards: Vec<u32> = if args.shard == "all" {
+        (0..args.num_shards).collect()
     } else {
-        vec![args.shard.clone()]
+        vec![args.shard.parse().expect("shard must be a number or 'all'")]
     };
     println!("Targeting shards: {:?}", shards);
 

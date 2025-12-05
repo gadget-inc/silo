@@ -192,7 +192,7 @@ async fn floating_concurrency_limit_dequeue_returns_refresh_tasks() {
         .expect("enqueue j2");
 
     // Dequeue should return the refresh task
-    let result = shard.dequeue("-", "worker-1", 10).await.expect("dequeue");
+    let result = shard.dequeue("worker-1", 10).await.expect("dequeue");
 
     // Should have job tasks and refresh tasks
     assert!(
@@ -266,7 +266,7 @@ async fn floating_limit_refresh_success_updates_state() {
         .expect("enqueue j2");
 
     // Dequeue to get the refresh task
-    let result = shard.dequeue("-", "worker-1", 10).await.expect("dequeue");
+    let result = shard.dequeue("worker-1", 10).await.expect("dequeue");
     assert!(!result.refresh_tasks.is_empty());
     let task_id = result.refresh_tasks[0].task_id.clone();
     let new_max = 10u32;
@@ -358,7 +358,7 @@ async fn floating_limit_refresh_failure_triggers_backoff() {
         .expect("enqueue j2");
 
     // Dequeue to get the refresh task
-    let result = shard.dequeue("-", "worker-1", 10).await.expect("dequeue");
+    let result = shard.dequeue("worker-1", 10).await.expect("dequeue");
     assert!(!result.refresh_tasks.is_empty());
     let task_id = result.refresh_tasks[0].task_id.clone();
 
@@ -548,7 +548,7 @@ async fn floating_limit_uses_dynamic_max_concurrency() {
     assert_eq!(j2_status.kind, JobStatusKind::Scheduled);
 
     // Dequeue j1
-    let result = shard.dequeue("-", "worker-1", 1).await.expect("dequeue");
+    let result = shard.dequeue("worker-1", 1).await.expect("dequeue");
     assert_eq!(result.tasks.len(), 1);
     let t1_id = result.tasks[0].attempt().task_id().to_string();
 
@@ -687,7 +687,7 @@ async fn floating_limit_multiple_retries_increase_backoff() {
         .expect("enqueue j2");
 
     // First failure
-    let result = shard.dequeue("-", "worker-1", 10).await.expect("dequeue");
+    let result = shard.dequeue("worker-1", 10).await.expect("dequeue");
     assert!(!result.refresh_tasks.is_empty());
     let task_id = result.refresh_tasks[0].task_id.clone();
 
@@ -712,7 +712,7 @@ async fn floating_limit_multiple_retries_increase_backoff() {
     tokio::time::advance(std::time::Duration::from_millis(10_000)).await;
 
     // Second failure
-    let result = shard.dequeue("-", "worker-1", 10).await.expect("dequeue 2");
+    let result = shard.dequeue("worker-1", 10).await.expect("dequeue 2");
     if !result.refresh_tasks.is_empty() {
         let task_id = result.refresh_tasks[0].task_id.clone();
         shard
@@ -794,7 +794,7 @@ async fn floating_limit_successful_refresh_resets_backoff() {
         .expect("enqueue j2");
 
     // First failure to set retry_count
-    let result = shard.dequeue("-", "worker-1", 10).await.expect("dequeue");
+    let result = shard.dequeue("worker-1", 10).await.expect("dequeue");
     let task_id = result.refresh_tasks[0].task_id.clone();
     shard
         .report_refresh_failure("-", &task_id, "test_error", "simulated failure")
@@ -814,7 +814,7 @@ async fn floating_limit_successful_refresh_resets_backoff() {
     // Advance time and succeed
     tokio::time::advance(std::time::Duration::from_millis(10_000)).await;
 
-    let result = shard.dequeue("-", "worker-1", 10).await.expect("dequeue 2");
+    let result = shard.dequeue("worker-1", 10).await.expect("dequeue 2");
     if !result.refresh_tasks.is_empty() {
         let task_id = result.refresh_tasks[0].task_id.clone();
         shard

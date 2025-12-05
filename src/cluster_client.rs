@@ -208,7 +208,7 @@ impl ClusterClient {
         let mut client = self.get_client(addr).await?;
 
         let request = QueryRequest {
-            shard: shard_id.to_string(),
+            shard: shard_id,
             sql: sql.to_string(),
             tenant: None,
         };
@@ -357,7 +357,7 @@ impl ClusterClient {
 
         let mut client = self.get_client(&addr).await?;
         let request = GetJobRequest {
-            shard: shard_name,
+            shard: shard_id,
             id: job_id.to_string(),
             tenant: Some(tenant.to_string()),
         };
@@ -402,7 +402,7 @@ impl ClusterClient {
 
         let mut client = self.get_client(&addr).await?;
         let request = CancelJobRequest {
-            shard: shard_name,
+            shard: shard_id,
             id: job_id.to_string(),
             tenant: Some(tenant.to_string()),
         };

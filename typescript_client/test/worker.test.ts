@@ -1,22 +1,28 @@
 import { describe, it, expect, vi } from "vitest";
 import { SiloWorker, type TaskHandler } from "../src/worker";
-import type { SiloGrpcClient } from "../src/client";
+import type { SiloGRPCClient } from "../src/client";
 import type { Task } from "../src/pb/silo";
 
 // Mock client for unit tests
 function createMockClient(options?: {
   leaseTasks?: (opts: unknown) => Promise<Task[]>;
   reportOutcome?: (opts: unknown) => Promise<void>;
-  heartbeat?: (shard: string, workerId: string, taskId: string) => Promise<void>;
-}): SiloGrpcClient {
+  heartbeat?: (
+    workerId: string,
+    taskId: string,
+    shard: number,
+    tenant?: string
+  ) => Promise<void>;
+}): SiloGRPCClient {
   return {
     leaseTasks: options?.leaseTasks ?? vi.fn().mockResolvedValue([]),
-    reportOutcome: options?.reportOutcome ?? vi.fn().mockResolvedValue(undefined),
+    reportOutcome:
+      options?.reportOutcome ?? vi.fn().mockResolvedValue(undefined),
     heartbeat: options?.heartbeat ?? vi.fn().mockResolvedValue(undefined),
-  } as unknown as SiloGrpcClient;
+  } as unknown as SiloGRPCClient;
 }
 
-function createTask(id: string, jobId: string): Task {
+function createTask(id: string, jobId: string, shard: number = 0): Task {
   return {
     id,
     jobId,
@@ -24,6 +30,7 @@ function createTask(id: string, jobId: string): Task {
     leaseMs: 30000n,
     payload: { data: new TextEncoder().encode('{"test":"data"}') },
     priority: 10,
+    shard,
   };
 }
 
@@ -31,11 +38,13 @@ describe("SiloWorker", () => {
   describe("constructor", () => {
     it("creates a worker with default options", () => {
       const client = createMockClient();
-      const handler: TaskHandler = async () => ({ type: "success", result: {} });
+      const handler: TaskHandler = async () => ({
+        type: "success",
+        result: {},
+      });
 
       const worker = new SiloWorker({
         client,
-        shard: "0",
         workerId: "test-worker",
         handler,
       });
@@ -46,11 +55,13 @@ describe("SiloWorker", () => {
 
     it("creates a worker with custom options", () => {
       const client = createMockClient();
-      const handler: TaskHandler = async () => ({ type: "success", result: {} });
+      const handler: TaskHandler = async () => ({
+        type: "success",
+        result: {},
+      });
 
       const worker = new SiloWorker({
         client,
-        shard: "0",
         workerId: "test-worker",
         handler,
         concurrentPollers: 3,
@@ -58,7 +69,6 @@ describe("SiloWorker", () => {
         tasksPerPoll: 5,
         pollIntervalMs: 500,
         heartbeatIntervalMs: 2000,
-        tenant: "tenant-1",
       });
 
       expect(worker.isRunning).toBe(false);
@@ -68,11 +78,13 @@ describe("SiloWorker", () => {
   describe("start and stop", () => {
     it("starts and stops the worker", async () => {
       const client = createMockClient();
-      const handler: TaskHandler = async () => ({ type: "success", result: {} });
+      const handler: TaskHandler = async () => ({
+        type: "success",
+        result: {},
+      });
 
       const worker = new SiloWorker({
         client,
-        shard: "0",
         workerId: "test-worker",
         handler,
         pollIntervalMs: 50,
@@ -98,11 +110,13 @@ describe("SiloWorker", () => {
     it("polls for tasks when started", async () => {
       const leaseTasks = vi.fn().mockResolvedValue([]);
       const client = createMockClient({ leaseTasks });
-      const handler: TaskHandler = async () => ({ type: "success", result: {} });
+      const handler: TaskHandler = async () => ({
+        type: "success",
+        result: {},
+      });
 
       const worker = new SiloWorker({
         client,
-        shard: "0",
         workerId: "test-worker",
         handler,
         pollIntervalMs: 10,
@@ -117,10 +131,8 @@ describe("SiloWorker", () => {
 
       expect(leaseTasks).toHaveBeenCalled();
       expect(leaseTasks).toHaveBeenCalledWith({
-        shard: "0",
         workerId: "test-worker",
         maxTasks: expect.any(Number),
-        tenant: undefined,
       });
     });
 
@@ -132,11 +144,13 @@ describe("SiloWorker", () => {
         return [];
       });
       const client = createMockClient({ leaseTasks });
-      const handler: TaskHandler = async () => ({ type: "success", result: {} });
+      const handler: TaskHandler = async () => ({
+        type: "success",
+        result: {},
+      });
 
       const worker = new SiloWorker({
         client,
-        shard: "0",
         workerId: "test-worker",
         handler,
         concurrentPollers: 3,
@@ -161,7 +175,10 @@ describe("SiloWorker", () => {
   describe("task execution", () => {
     it("executes tasks and reports success", async () => {
       const task = createTask("task-1", "job-1");
-      const leaseTasks = vi.fn().mockResolvedValueOnce([task]).mockResolvedValue([]);
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce([task])
+        .mockResolvedValue([]);
       const reportOutcome = vi.fn().mockResolvedValue(undefined);
       const client = createMockClient({ leaseTasks, reportOutcome });
 
@@ -172,7 +189,6 @@ describe("SiloWorker", () => {
 
       const worker = new SiloWorker({
         client,
-        shard: "0",
         workerId: "test-worker",
         handler,
         pollIntervalMs: 10,
@@ -188,22 +204,24 @@ describe("SiloWorker", () => {
       expect(handler).toHaveBeenCalledWith(
         expect.objectContaining({
           task,
-          shard: "0",
           workerId: "test-worker",
-        }),
+        })
       );
 
       expect(reportOutcome).toHaveBeenCalledWith({
-        shard: "0",
         taskId: "task-1",
         tenant: undefined,
         outcome: { type: "success", result: { processed: true } },
+        shard: 0,
       });
     });
 
     it("executes tasks and reports failure", async () => {
       const task = createTask("task-2", "job-2");
-      const leaseTasks = vi.fn().mockResolvedValueOnce([task]).mockResolvedValue([]);
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce([task])
+        .mockResolvedValue([]);
       const reportOutcome = vi.fn().mockResolvedValue(undefined);
       const client = createMockClient({ leaseTasks, reportOutcome });
 
@@ -215,7 +233,6 @@ describe("SiloWorker", () => {
 
       const worker = new SiloWorker({
         client,
-        shard: "0",
         workerId: "test-worker",
         handler,
         pollIntervalMs: 10,
@@ -226,7 +243,6 @@ describe("SiloWorker", () => {
       await worker.stop();
 
       expect(reportOutcome).toHaveBeenCalledWith({
-        shard: "0",
         taskId: "task-2",
         tenant: undefined,
         outcome: {
@@ -234,12 +250,16 @@ describe("SiloWorker", () => {
           code: "VALIDATION_ERROR",
           data: { field: "email" },
         },
+        shard: 0,
       });
     });
 
     it("reports failure when handler throws", async () => {
       const task = createTask("task-3", "job-3");
-      const leaseTasks = vi.fn().mockResolvedValueOnce([task]).mockResolvedValue([]);
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce([task])
+        .mockResolvedValue([]);
       const reportOutcome = vi.fn().mockResolvedValue(undefined);
       const client = createMockClient({ leaseTasks, reportOutcome });
 
@@ -249,7 +269,6 @@ describe("SiloWorker", () => {
 
       const worker = new SiloWorker({
         client,
-        shard: "0",
         workerId: "test-worker",
         handler,
         pollIntervalMs: 10,
@@ -261,7 +280,6 @@ describe("SiloWorker", () => {
       await worker.stop();
 
       expect(reportOutcome).toHaveBeenCalledWith({
-        shard: "0",
         taskId: "task-3",
         tenant: undefined,
         outcome: {
@@ -271,13 +289,20 @@ describe("SiloWorker", () => {
             message: "Something went wrong",
           }),
         },
+        shard: 0,
       });
     });
 
     it("respects maxConcurrentTasks limit", async () => {
       // Create tasks that will be returned in batches
-      const batch1 = [createTask("task-a", "job-a"), createTask("task-b", "job-b")];
-      const batch2 = [createTask("task-c", "job-c"), createTask("task-d", "job-d")];
+      const batch1 = [
+        createTask("task-a", "job-a"),
+        createTask("task-b", "job-b"),
+      ];
+      const batch2 = [
+        createTask("task-c", "job-c"),
+        createTask("task-d", "job-d"),
+      ];
       const batch3 = [createTask("task-e", "job-e")];
 
       let activeTasks = 0;
@@ -302,7 +327,6 @@ describe("SiloWorker", () => {
 
       const worker = new SiloWorker({
         client,
-        shard: "0",
         workerId: "test-worker",
         handler,
         maxConcurrentTasks: 2,
@@ -324,7 +348,10 @@ describe("SiloWorker", () => {
 
     it("tracks active task count", async () => {
       const task = createTask("task-x", "job-x");
-      const leaseTasks = vi.fn().mockResolvedValueOnce([task]).mockResolvedValue([]);
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce([task])
+        .mockResolvedValue([]);
       const reportOutcome = vi.fn().mockResolvedValue(undefined);
       const client = createMockClient({ leaseTasks, reportOutcome });
 
@@ -333,7 +360,6 @@ describe("SiloWorker", () => {
 
       const worker = new SiloWorker({
         client,
-        shard: "0",
         workerId: "test-worker",
         handler: async () => {
           activeCountDuringExecution = workerRef.activeTasks;
@@ -363,7 +389,10 @@ describe("SiloWorker", () => {
   describe("heartbeats", () => {
     it("sends heartbeats while task is executing", async () => {
       const task = createTask("task-hb", "job-hb");
-      const leaseTasks = vi.fn().mockResolvedValueOnce([task]).mockResolvedValue([]);
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce([task])
+        .mockResolvedValue([]);
       const reportOutcome = vi.fn().mockResolvedValue(undefined);
       const heartbeat = vi.fn().mockResolvedValue(undefined);
       const client = createMockClient({ leaseTasks, reportOutcome, heartbeat });
@@ -376,7 +405,6 @@ describe("SiloWorker", () => {
 
       const worker = new SiloWorker({
         client,
-        shard: "0",
         workerId: "test-worker",
         handler,
         pollIntervalMs: 10,
@@ -388,13 +416,22 @@ describe("SiloWorker", () => {
       await worker.stop();
 
       // Should have sent multiple heartbeats
-      expect(heartbeat).toHaveBeenCalledWith("0", "test-worker", "task-hb");
+      // heartbeat(workerId, taskId, shard, tenant)
+      expect(heartbeat).toHaveBeenCalledWith(
+        "test-worker",
+        "task-hb",
+        0,
+        undefined
+      );
       expect(heartbeat.mock.calls.length).toBeGreaterThanOrEqual(2);
     });
 
     it("stops heartbeats after task completes", async () => {
       const task = createTask("task-hb2", "job-hb2");
-      const leaseTasks = vi.fn().mockResolvedValueOnce([task]).mockResolvedValue([]);
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce([task])
+        .mockResolvedValue([]);
       const reportOutcome = vi.fn().mockResolvedValue(undefined);
       const heartbeat = vi.fn().mockResolvedValue(undefined);
       const client = createMockClient({ leaseTasks, reportOutcome, heartbeat });
@@ -406,7 +443,6 @@ describe("SiloWorker", () => {
 
       const worker = new SiloWorker({
         client,
-        shard: "0",
         workerId: "test-worker",
         handler,
         pollIntervalMs: 10,
@@ -432,15 +468,19 @@ describe("SiloWorker", () => {
 
   describe("error handling", () => {
     it("calls onError when polling fails", async () => {
-      const leaseTasks = vi.fn().mockRejectedValue(new Error("Connection failed"));
+      const leaseTasks = vi
+        .fn()
+        .mockRejectedValue(new Error("Connection failed"));
       const client = createMockClient({ leaseTasks });
       const onError = vi.fn();
 
-      const handler: TaskHandler = async () => ({ type: "success", result: {} });
+      const handler: TaskHandler = async () => ({
+        type: "success",
+        result: {},
+      });
 
       const worker = new SiloWorker({
         client,
-        shard: "0",
         workerId: "test-worker",
         handler,
         pollIntervalMs: 10,
@@ -452,15 +492,20 @@ describe("SiloWorker", () => {
       await worker.stop();
 
       expect(onError).toHaveBeenCalledWith(
-        expect.objectContaining({ message: "Connection failed" }),
+        expect.objectContaining({ message: "Connection failed" })
       );
     });
 
     it("calls onError when heartbeat fails", async () => {
       const task = createTask("task-err", "job-err");
-      const leaseTasks = vi.fn().mockResolvedValueOnce([task]).mockResolvedValue([]);
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce([task])
+        .mockResolvedValue([]);
       const reportOutcome = vi.fn().mockResolvedValue(undefined);
-      const heartbeat = vi.fn().mockRejectedValue(new Error("Heartbeat failed"));
+      const heartbeat = vi
+        .fn()
+        .mockRejectedValue(new Error("Heartbeat failed"));
       const onError = vi.fn();
       const client = createMockClient({ leaseTasks, reportOutcome, heartbeat });
 
@@ -471,7 +516,6 @@ describe("SiloWorker", () => {
 
       const worker = new SiloWorker({
         client,
-        shard: "0",
         workerId: "test-worker",
         handler,
         pollIntervalMs: 10,
@@ -485,7 +529,7 @@ describe("SiloWorker", () => {
 
       expect(onError).toHaveBeenCalledWith(
         expect.objectContaining({ message: "Heartbeat failed" }),
-        expect.objectContaining({ taskId: "task-err" }),
+        expect.objectContaining({ taskId: "task-err" })
       );
     });
 
@@ -510,11 +554,13 @@ describe("SiloWorker", () => {
       const reportOutcome = vi.fn().mockResolvedValue(undefined);
       const client = createMockClient({ leaseTasks, reportOutcome });
 
-      const handler: TaskHandler = async () => ({ type: "success", result: {} });
+      const handler: TaskHandler = async () => ({
+        type: "success",
+        result: {},
+      });
 
       const worker = new SiloWorker({
         client,
-        shard: "0",
         workerId: "test-worker",
         handler,
         pollIntervalMs: 10,
@@ -533,7 +579,10 @@ describe("SiloWorker", () => {
   describe("TaskContext", () => {
     it("provides abort signal in context", async () => {
       const task = createTask("task-sig", "job-sig");
-      const leaseTasks = vi.fn().mockResolvedValueOnce([task]).mockResolvedValue([]);
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce([task])
+        .mockResolvedValue([]);
       const reportOutcome = vi.fn().mockResolvedValue(undefined);
       const client = createMockClient({ leaseTasks, reportOutcome });
 
@@ -546,7 +595,6 @@ describe("SiloWorker", () => {
 
       const worker = new SiloWorker({
         client,
-        shard: "0",
         workerId: "test-worker",
         handler,
         pollIntervalMs: 10,

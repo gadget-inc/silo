@@ -22,7 +22,8 @@
     "lint:fix": "oxfmt && oxlint --type-aware --fix",
     "format": "oxfmt",
     "test:watch": "vitest",
-    "prepublishOnly": "pnpm run build"
+    "prepublishOnly": "pnpm run build",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@grpc/grpc-js": "^1.12.2",

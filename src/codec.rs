@@ -105,11 +105,13 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
     Ok(match archived {
         ArchivedTask::RunAttempt {
             id,
+            tenant,
             job_id,
             attempt_number,
             held_queues,
         } => Task::RunAttempt {
             id: id.as_str().to_string(),
+            tenant: tenant.as_str().to_string(),
             job_id: job_id.as_str().to_string(),
             attempt_number: *attempt_number,
             held_queues: held_queues
@@ -121,6 +123,7 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
             queue,
             start_time_ms,
             priority,
+            tenant,
             job_id,
             attempt_number,
             request_id,
@@ -128,12 +131,14 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
             queue: queue.as_str().to_string(),
             start_time_ms: *start_time_ms,
             priority: *priority,
+            tenant: tenant.as_str().to_string(),
             job_id: job_id.as_str().to_string(),
             attempt_number: *attempt_number,
             request_id: request_id.as_str().to_string(),
         },
         ArchivedTask::CheckRateLimit {
             task_id,
+            tenant,
             job_id,
             attempt_number,
             limit_index,
@@ -144,6 +149,7 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
             held_queues,
         } => Task::CheckRateLimit {
             task_id: task_id.as_str().to_string(),
+            tenant: tenant.as_str().to_string(),
             job_id: job_id.as_str().to_string(),
             attempt_number: *attempt_number,
             limit_index: *limit_index,
@@ -233,7 +239,17 @@ impl DecodedLease {
         }
     }
 
-    /// Extract job_id from the leased task (zero-copy). Returns None for RefreshFloatingLimit.
+    /// Extract tenant from the leased task (zero-copy).
+    pub fn tenant(&self) -> &str {
+        match self.archived_task() {
+            ArchivedTask::RunAttempt { tenant, .. } => tenant.as_str(),
+            ArchivedTask::RequestTicket { tenant, .. } => tenant.as_str(),
+            ArchivedTask::CheckRateLimit { tenant, .. } => tenant.as_str(),
+            ArchivedTask::RefreshFloatingLimit { tenant, .. } => tenant.as_str(),
+        }
+    }
+
+    /// Extract job_id from the leased task (zero-copy). Returns empty string for RefreshFloatingLimit.
     pub fn job_id(&self) -> &str {
         match self.archived_task() {
             ArchivedTask::RunAttempt { job_id, .. } => job_id.as_str(),
@@ -273,11 +289,13 @@ impl DecodedLease {
         match self.archived_task() {
             ArchivedTask::RunAttempt {
                 id,
+                tenant,
                 job_id,
                 attempt_number,
                 held_queues,
             } => Task::RunAttempt {
                 id: id.as_str().to_string(),
+                tenant: tenant.as_str().to_string(),
                 job_id: job_id.as_str().to_string(),
                 attempt_number: *attempt_number,
                 held_queues: held_queues.iter().map(|s| s.as_str().to_string()).collect(),
@@ -286,6 +304,7 @@ impl DecodedLease {
                 queue,
                 start_time_ms,
                 priority,
+                tenant,
                 job_id,
                 attempt_number,
                 request_id,
@@ -293,12 +312,14 @@ impl DecodedLease {
                 queue: queue.as_str().to_string(),
                 start_time_ms: *start_time_ms,
                 priority: *priority,
+                tenant: tenant.as_str().to_string(),
                 job_id: job_id.as_str().to_string(),
                 attempt_number: *attempt_number,
                 request_id: request_id.as_str().to_string(),
             },
             ArchivedTask::CheckRateLimit {
                 task_id,
+                tenant,
                 job_id,
                 attempt_number,
                 limit_index,
@@ -309,6 +330,7 @@ impl DecodedLease {
                 held_queues,
             } => Task::CheckRateLimit {
                 task_id: task_id.as_str().to_string(),
+                tenant: tenant.as_str().to_string(),
                 job_id: job_id.as_str().to_string(),
                 attempt_number: *attempt_number,
                 limit_index: *limit_index,

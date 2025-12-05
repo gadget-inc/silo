@@ -5,7 +5,10 @@
 
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
+
+use crate::factory::ShardFactory;
 
 use super::{CoordinationError, Coordinator, MemberInfo, ShardOwnerMap};
 
@@ -21,7 +24,21 @@ pub struct NoneCoordinator {
 
 impl NoneCoordinator {
     /// Create a new single-node coordinator.
-    pub fn new(node_id: impl Into<String>, grpc_addr: impl Into<String>, num_shards: u32) -> Self {
+    ///
+    /// Opens all shards immediately since this node owns everything.
+    pub async fn new(
+        node_id: impl Into<String>,
+        grpc_addr: impl Into<String>,
+        num_shards: u32,
+        factory: Arc<ShardFactory>,
+    ) -> Self {
+        // In single-node mode, we own all shards immediately - open them all
+        for shard_id in 0..num_shards {
+            if let Err(e) = factory.open(shard_id as usize).await {
+                tracing::error!(shard_id, error = %e, "failed to open shard");
+            }
+        }
+
         Self {
             node_id: node_id.into(),
             grpc_addr: grpc_addr.into(),
