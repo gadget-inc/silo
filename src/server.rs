@@ -149,13 +149,16 @@ impl SiloService {
     /// Get shard with async lookup of owner for redirect metadata.
     /// If the shard is not found locally, returns NOT_FOUND with metadata
     /// indicating which server owns the shard (if known).
+    ///
+    /// If this node is the computed owner but hasn't finished acquiring the shard,
+    /// returns UNAVAILABLE to signal the client should retry after a delay.
     async fn shard_with_redirect(&self, shard_id: u32) -> Result<Arc<JobStoreShard>, Status> {
         let name = shard_id.to_string();
         if let Some(shard) = self.factory.get(&name) {
             return Ok(shard);
         }
 
-        // Shard not found locally - build error with redirect info
+        // Shard not found locally - determine if we should redirect or signal unavailable
         let mut status = Status::not_found("shard not found");
 
         // Look up the owner if we have a coordinator
@@ -174,7 +177,26 @@ impl SiloService {
             }
         };
 
-        // Add redirect metadata
+        // Check if WE are the computed owner but haven't opened the shard yet.
+        // This happens during shard acquisition - the membership list says we own
+        // the shard, but we haven't finished acquiring the K8s lease and opening it.
+        // In this case, return UNAVAILABLE so clients know to retry with backoff,
+        // rather than NOT_FOUND with a redirect to ourselves (which causes loops).
+        let this_node_id = coord.node_id();
+        if let Some(computed_owner_node) = owner_map.shard_to_node.get(&shard_id) {
+            if computed_owner_node == this_node_id {
+                tracing::debug!(
+                    shard_id,
+                    node_id = %this_node_id,
+                    "shard not ready: this node is computed owner but shard not yet acquired"
+                );
+                return Err(Status::unavailable(
+                    "shard not ready: acquisition in progress",
+                ));
+            }
+        }
+
+        // Add redirect metadata - point to the actual computed owner
         let metadata = status.metadata_mut();
         if let Some(addr) = owner_map.shard_to_addr.get(&shard_id) {
             if let Ok(val) = addr.parse() {

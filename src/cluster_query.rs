@@ -262,7 +262,6 @@ impl TableProvider for ClusterTableProvider {
 
         Ok(Arc::new(ClusterExecutionPlan::new(
             output_schema,
-            Arc::clone(&self.schema),
             shard_configs,
             self.table_kind,
             filters.to_vec(),
@@ -287,8 +286,6 @@ impl TableProvider for ClusterTableProvider {
 struct ClusterExecutionPlan {
     /// Output schema (projected if applicable)
     schema: SchemaRef,
-    /// Full schema (for remote queries that return all columns)
-    full_schema: SchemaRef,
     shard_configs: Vec<ShardConfig>,
     table_kind: TableKind,
     filters: Vec<Expr>,
@@ -301,7 +298,6 @@ struct ClusterExecutionPlan {
 impl ClusterExecutionPlan {
     fn new(
         schema: SchemaRef,
-        full_schema: SchemaRef,
         shard_configs: Vec<ShardConfig>,
         table_kind: TableKind,
         filters: Vec<Expr>,
@@ -320,7 +316,6 @@ impl ClusterExecutionPlan {
 
         Self {
             schema,
-            full_schema,
             shard_configs,
             table_kind,
             filters,
@@ -481,7 +476,11 @@ impl DisplayAs for ClusterExecutionPlan {
     }
 }
 
-/// Query a remote shard via gRPC and return all batches
+/// Query a remote shard via gRPC and return all batches.
+///
+/// Includes retry logic for:
+/// - UNAVAILABLE: The target node is acquiring the shard, retry with backoff
+/// - NOT_FOUND with redirect: The shard moved, retry to the new address
 async fn query_remote_shard_batches(
     shard_id: u32,
     addr: &str,
@@ -497,60 +496,147 @@ async fn query_remote_shard_batches(
 
     let sql = build_sql_query(table_name, filters, limit);
 
-    // Ensure address has http:// scheme for gRPC connection
-    let full_addr = if addr.starts_with("http://") || addr.starts_with("https://") {
-        addr.to_string()
-    } else {
-        format!("http://{}", addr)
-    };
-    debug!(shard_id, addr = %full_addr, sql = %sql, "querying remote shard");
+    // Retry configuration
+    const MAX_RETRIES: u32 = 5;
+    const INITIAL_BACKOFF_MS: u64 = 50;
+    const MAX_BACKOFF_MS: u64 = 2000;
 
-    // Connect to remote node
-    let channel = Channel::from_shared(full_addr.clone())
-        .map_err(|e| {
-            DataFusionError::External(format!("invalid address '{}': {}", full_addr, e).into())
-        })?
-        .connect()
-        .await
-        .map_err(|e| {
-            DataFusionError::External(
-                format!(
-                    "failed to connect to shard {} at '{}': {}",
-                    shard_id, full_addr, e
-                )
-                .into(),
-            )
-        })?;
+    let mut current_addr = addr.to_string();
+    let mut attempt = 0u32;
 
-    let mut client = SiloClient::new(channel);
+    loop {
+        attempt += 1;
 
-    // Make streaming query
-    let request = QueryArrowRequest {
-        shard: shard_id,
-        sql,
-        tenant: None,
-    };
+        // Ensure address has http:// scheme for gRPC connection
+        let full_addr =
+            if current_addr.starts_with("http://") || current_addr.starts_with("https://") {
+                current_addr.clone()
+            } else {
+                format!("http://{}", current_addr)
+            };
+        debug!(shard_id, addr = %full_addr, sql = %sql, attempt, "querying remote shard");
 
-    let response = client
-        .query_arrow(request)
-        .await
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        // Connect to remote node
+        let channel = match Channel::from_shared(full_addr.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                return Err(DataFusionError::External(
+                    format!("invalid address '{}': {}", full_addr, e).into(),
+                ));
+            }
+        };
 
-    let mut stream = response.into_inner();
-    let mut all_batches = Vec::new();
+        let channel = match channel.connect().await {
+            Ok(c) => c,
+            Err(e) => {
+                if attempt >= MAX_RETRIES {
+                    return Err(DataFusionError::External(
+                        format!(
+                            "failed to connect to shard {} at '{}' after {} attempts: {}",
+                            shard_id, full_addr, attempt, e
+                        )
+                        .into(),
+                    ));
+                }
+                // Retry with backoff for connection errors
+                let backoff = std::cmp::min(
+                    INITIAL_BACKOFF_MS * (1 << attempt.saturating_sub(1)),
+                    MAX_BACKOFF_MS,
+                );
+                warn!(
+                    shard_id,
+                    addr = %full_addr,
+                    attempt,
+                    backoff_ms = backoff,
+                    error = %e,
+                    "connection failed, retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                continue;
+            }
+        };
 
-    // Process Arrow IPC messages
-    while let Some(msg) = stream
-        .message()
-        .await
-        .map_err(|e| DataFusionError::External(Box::new(e)))?
-    {
-        // Deserialize Arrow IPC to RecordBatches
-        let batches = ipc_to_batches_only(&msg.ipc_data)?;
-        all_batches.extend(batches);
+        let mut client = SiloClient::new(channel);
+
+        // Make streaming query
+        let request = QueryArrowRequest {
+            shard: shard_id,
+            sql: sql.clone(),
+            tenant: None,
+        };
+
+        let response = match client.query_arrow(request).await {
+            Ok(r) => r,
+            Err(status) => {
+                // Check if we should retry based on the error type
+                let should_retry = match status.code() {
+                    tonic::Code::Unavailable => {
+                        // Target node is acquiring the shard - retry with backoff
+                        debug!(
+                            shard_id,
+                            addr = %full_addr,
+                            attempt,
+                            "shard unavailable (acquisition in progress), will retry"
+                        );
+                        true
+                    }
+                    tonic::Code::NotFound => {
+                        // Check for redirect metadata
+                        let metadata = status.metadata();
+                        if let Some(new_addr) =
+                            metadata.get(crate::server::SHARD_OWNER_ADDR_METADATA_KEY)
+                        {
+                            if let Ok(new_addr_str) = new_addr.to_str() {
+                                // Redirect to new owner
+                                debug!(
+                                    shard_id,
+                                    old_addr = %full_addr,
+                                    new_addr = %new_addr_str,
+                                    attempt,
+                                    "shard moved, redirecting"
+                                );
+                                current_addr = new_addr_str.to_string();
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            // No redirect info - shard truly not found
+                            false
+                        }
+                    }
+                    _ => false,
+                };
+
+                if should_retry && attempt < MAX_RETRIES {
+                    let backoff = std::cmp::min(
+                        INITIAL_BACKOFF_MS * (1 << attempt.saturating_sub(1)),
+                        MAX_BACKOFF_MS,
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                    continue;
+                }
+
+                return Err(DataFusionError::External(Box::new(status)));
+            }
+        };
+
+        let mut stream = response.into_inner();
+        let mut all_batches = Vec::new();
+
+        // Process Arrow IPC messages
+        while let Some(msg) = stream
+            .message()
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+        {
+            // Deserialize Arrow IPC to RecordBatches
+            let batches = ipc_to_batches_only(&msg.ipc_data)?;
+            all_batches.extend(batches);
+        }
+
+        return Ok(all_batches);
     }
-
-    Ok(all_batches)
 }
 
 /// Build a SQL query string from filters and limit.
