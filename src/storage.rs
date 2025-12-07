@@ -22,10 +22,7 @@ pub struct ResolvedStore {
     pub canonical_path: String,
 }
 
-pub fn resolve_object_store(
-    backend: &Backend,
-    path: &str,
-) -> Result<ResolvedStore, StorageError> {
+pub fn resolve_object_store(backend: &Backend, path: &str) -> Result<ResolvedStore, StorageError> {
     match backend {
         Backend::Fs => {
             // Ensure the directory exists before creating the LocalFileSystem root
@@ -42,9 +39,8 @@ pub fn resolve_object_store(
             })?;
             let canonical_str = canonical_path.to_string_lossy().to_string();
             // Use slatedb's re-exported object_store to ensure trait compatibility
-            let fs =
-                slatedb::object_store::local::LocalFileSystem::new_with_prefix(&canonical_str)
-                    .map_err(|e| StorageError::InvalidUrl(format!("{}", e)))?;
+            let fs = slatedb::object_store::local::LocalFileSystem::new_with_prefix(&canonical_str)
+                .map_err(|e| StorageError::InvalidUrl(format!("{}", e)))?;
             Ok(ResolvedStore {
                 store: Arc::new(fs),
                 canonical_path: canonical_str,
@@ -54,8 +50,8 @@ pub fn resolve_object_store(
             store: Arc::new(slatedb::object_store::memory::InMemory::new()),
             canonical_path: path.to_string(),
         }),
-        Backend::S3 | Backend::Url => {
-            // Interpret path as a URL understood by SlateDB's resolver, e.g. s3://bucket/prefix
+        Backend::S3 | Backend::Gcs | Backend::Url => {
+            // Interpret path as a URL understood by SlateDB's resolver, e.g. s3://bucket/prefix or gs://bucket/prefix
             let store = Db::resolve_object_store(path)?;
             Ok(ResolvedStore {
                 store,

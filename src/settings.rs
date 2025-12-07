@@ -277,6 +277,7 @@ pub struct DatabaseConfig {
 pub enum Backend {
     Fs,
     S3,
+    Gcs,
     Memory,
     Url,
 }

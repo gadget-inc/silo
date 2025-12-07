@@ -183,11 +183,17 @@ impl SiloService {
         // In this case, return UNAVAILABLE so clients know to retry with backoff,
         // rather than NOT_FOUND with a redirect to ourselves (which causes loops).
         let this_node_id = coord.node_id();
+        let owned_shards = coord.owned_shards().await;
+        let members = coord.get_members().await.ok();
+
         if let Some(computed_owner_node) = owner_map.shard_to_node.get(&shard_id) {
             if computed_owner_node == this_node_id {
-                tracing::debug!(
+                // We're computed to own this shard but don't have it locally
+                tracing::warn!(
                     shard_id,
                     node_id = %this_node_id,
+                    owned_shards = ?owned_shards,
+                    members = ?members.as_ref().map(|m| m.iter().map(|mi| &mi.node_id).collect::<Vec<_>>()),
                     "shard not ready: this node is computed owner but shard not yet acquired"
                 );
                 return Err(Status::unavailable(
@@ -195,6 +201,17 @@ impl SiloService {
                 ));
             }
         }
+
+        // Log details about the routing mismatch to help diagnose production issues
+        tracing::warn!(
+            shard_id,
+            this_node_id = %this_node_id,
+            owned_shards = ?owned_shards,
+            computed_owner = ?owner_map.shard_to_node.get(&shard_id),
+            computed_addr = ?owner_map.shard_to_addr.get(&shard_id),
+            members = ?members.as_ref().map(|m| m.iter().map(|mi| (&mi.node_id, &mi.grpc_addr)).collect::<Vec<_>>()),
+            "shard not found: routing mismatch - another node sent us a request for a shard we don't own"
+        );
 
         // Add redirect metadata - point to the actual computed owner
         let metadata = status.metadata_mut();

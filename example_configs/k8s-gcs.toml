@@ -33,9 +33,9 @@ enabled = true
 addr = "0.0.0.0:50052"
 
 [database]
-# Use URL backend for GCS - SlateDB resolves gs:// URLs automatically
+# Use GCS backend for Google Cloud Storage
 # Credentials are read from GOOGLE_APPLICATION_CREDENTIALS or workload identity
-backend = "url"
+backend = "gcs"
 path = "gs://my-bucket/silo/data-%shard%"
 
 # Optional: Use local filesystem for WAL for lower write latency
