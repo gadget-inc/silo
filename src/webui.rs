@@ -31,6 +31,7 @@ pub struct AppState {
     pub coordinator: Option<Arc<dyn Coordinator>>,
     pub cluster_client: Arc<ClusterClient>,
     pub query_engine: Arc<ClusterQueryEngine>,
+    pub config: AppConfig,
 }
 
 #[derive(Clone)]
@@ -185,6 +186,13 @@ struct SqlResultTemplate {
 #[template(path = "status_badge.html")]
 struct StatusBadgeTemplate {
     status: String,
+}
+
+#[derive(Template)]
+#[template(path = "config.html")]
+struct ConfigTemplate {
+    nav_active: &'static str,
+    config_toml: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -1237,6 +1245,23 @@ fn array_value_to_string(array: &dyn datafusion::arrow::array::Array, index: usi
     }
 }
 
+async fn config_handler(State(state): State<AppState>) -> impl IntoResponse {
+    // Serialize the config to TOML for display
+    let config_toml = toml::to_string_pretty(&state.config)
+        .unwrap_or_else(|e| format!("# Error serializing config: {}", e));
+
+    let template = ConfigTemplate {
+        nav_active: "config",
+        config_toml,
+    };
+
+    Html(
+        template
+            .render()
+            .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
+}
+
 async fn not_found_handler() -> impl IntoResponse {
     Html(
         ErrorTemplate {
@@ -1260,6 +1285,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/cluster", get(cluster_handler))
         .route("/sql", get(sql_handler))
         .route("/sql/execute", get(sql_execute_handler))
+        .route("/config", get(config_handler))
         .fallback(not_found_handler)
         .with_state(state)
 }
@@ -1269,7 +1295,7 @@ pub async fn run_webui(
     addr: SocketAddr,
     factory: Arc<ShardFactory>,
     coordinator: Option<Arc<dyn Coordinator>>,
-    _cfg: AppConfig,
+    cfg: AppConfig,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cluster_client = Arc::new(ClusterClient::new(factory.clone(), coordinator.clone()));
@@ -1291,6 +1317,7 @@ pub async fn run_webui(
         coordinator,
         cluster_client,
         query_engine,
+        config: cfg,
     };
 
     let app = create_router(state);

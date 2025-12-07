@@ -1,9 +1,9 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AppConfig {
     #[serde(default)]
     pub server: ServerConfig,
@@ -21,7 +21,7 @@ pub struct AppConfig {
 }
 
 /// Logging configuration
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct LoggingConfig {
     /// Log output format: "text" (default) or "json"
     #[serde(default)]
@@ -29,7 +29,7 @@ pub struct LoggingConfig {
 }
 
 /// Log output format
-#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum LogFormat {
     /// Human-readable text format (default)
@@ -40,7 +40,7 @@ pub enum LogFormat {
 }
 
 /// Settings for Gubernator rate limiting service
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct GubernatorSettings {
     /// Gubernator server address (e.g., "http://localhost:1051")
     /// If not set, rate limiting will be disabled and rate limit tasks will fail.
@@ -79,7 +79,7 @@ fn default_apply_wal_on_close() -> bool {
     true
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DatabaseTemplate {
     pub backend: Backend,
     /// May contain "%shard%" placeholder that will be replaced with the shard number
@@ -100,7 +100,7 @@ pub struct DatabaseTemplate {
 }
 
 /// Configuration for a separate WAL object store
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct WalConfig {
     pub backend: Backend,
     /// May contain "%shard%" placeholder that will be replaced with the shard number
@@ -115,7 +115,7 @@ impl WalConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct ServerConfig {
     #[serde(default = "default_grpc_addr")]
     pub grpc_addr: String, // e.g. 127.0.0.1:50051
@@ -125,7 +125,7 @@ pub struct ServerConfig {
     pub dev_mode: bool,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct WebUiConfig {
     /// Enable web UI server
     #[serde(default = "default_webui_enabled")]
@@ -153,7 +153,7 @@ fn default_webui_addr() -> String {
 }
 
 /// Coordination backend type
-#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CoordinationBackend {
     /// No coordination - single node mode for local development
@@ -165,7 +165,7 @@ pub enum CoordinationBackend {
     K8s,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CoordinationConfig {
     /// Which coordination backend to use
     #[serde(default)]
@@ -235,7 +235,7 @@ fn default_k8s_namespace() -> String {
     "default".to_string()
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct TenancyConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -249,7 +249,7 @@ fn default_grpc_addr() -> String {
     "127.0.0.1:50051".to_string()
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DatabaseConfig {
     pub name: String,
     pub backend: Backend,
@@ -272,7 +272,7 @@ pub struct DatabaseConfig {
     pub apply_wal_on_close: bool,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum Backend {
     Fs,

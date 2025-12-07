@@ -14,7 +14,6 @@ grpc_addr = "0.0.0.0:50051"
 backend = "k8s"
 cluster_prefix = "silo-prod"
 lease_ttl_secs = 15
-k8s_namespace = "${NAMESPACE:-default}"
 
 # IMPORTANT: advertised_grpc_addr is the address other nodes use to connect.
 # In Kubernetes, use the pod IP (exposed via Downward API).

@@ -9,7 +9,7 @@ use silo::cluster_client::ClusterClient;
 use silo::cluster_query::ClusterQueryEngine;
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
-use silo::settings::{Backend, DatabaseTemplate};
+use silo::settings::{AppConfig, Backend, DatabaseTemplate};
 use silo::webui::{create_router, AppState};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -40,11 +40,14 @@ async fn setup_test_state() -> (tempfile::TempDir, AppState) {
             .expect("create query engine"),
     );
 
+    let config = AppConfig::load(None).expect("load default config");
+
     let state = AppState {
         factory,
         coordinator: None,
         cluster_client,
         query_engine,
+        config,
     };
 
     (tmp, state)
@@ -368,11 +371,14 @@ async fn setup_multi_shard_state(num_shards: usize) -> (tempfile::TempDir, AppSt
             .expect("create query engine"),
     );
 
+    let config = AppConfig::load(None).expect("load default config");
+
     let state = AppState {
         factory,
         coordinator: None,
         cluster_client,
         query_engine,
+        config,
     };
 
     (tmp, state)
