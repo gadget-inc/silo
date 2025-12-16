@@ -16,7 +16,10 @@ use silo::pb::{
     ConcurrencyLimit, EnqueueRequest, GetClusterInfoRequest, JsonValueBytes, LeaseTasksRequest,
     Limit, ReportOutcomeRequest,
 };
+use silo::settings::LogFormat;
+use silo::trace;
 use tonic::transport::Channel;
+use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
 #[command(name = "silo-bench")]
@@ -57,6 +60,10 @@ struct Args {
     /// Tenant ID for multi-tenant mode (required if server has tenancy enabled)
     #[arg(long, default_value = "-")]
     tenant: String,
+
+    /// Enable structured JSON logging
+    #[arg(long)]
+    structured_logging: bool,
 }
 
 fn now_ms() -> i64 {
@@ -172,13 +179,13 @@ async fn worker_loop(
                 connections.insert(addr, client);
             }
             Err(e) => {
-                eprintln!("Worker {} failed to connect to {}: {}", worker_id, addr, e);
+                error!(worker_id = %worker_id, address = %addr, error = %e, "Worker failed to connect");
             }
         }
     }
 
     if connections.is_empty() {
-        eprintln!("Worker {} has no active connections, exiting", worker_id);
+        error!(worker_id = %worker_id, "Worker has no active connections, exiting");
         return;
     }
 
@@ -260,14 +267,14 @@ async fn worker_loop(
                                 completed_count.fetch_add(1, Ordering::Relaxed);
                             }
                             Err(e) => {
-                                eprintln!("Worker {} failed to report outcome: {}", worker_id, e);
+                                warn!(worker_id = %worker_id, error = %e, "Worker failed to report outcome");
                             }
                         }
                     }
                 }
             }
             Err(e) => {
-                eprintln!("Worker {} poll failed: {}", worker_id, e);
+                warn!(worker_id = %worker_id, error = %e, "Worker poll failed");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }
@@ -294,19 +301,13 @@ async fn enqueuer_loop(
                 connections.insert(addr, client);
             }
             Err(e) => {
-                eprintln!(
-                    "Enqueuer {} failed to connect to {}: {}",
-                    enqueuer_id, addr, e
-                );
+                error!(enqueuer_id = %enqueuer_id, address = %addr, error = %e, "Enqueuer failed to connect");
             }
         }
     }
 
     if connections.is_empty() {
-        eprintln!(
-            "Enqueuer {} has no active connections, exiting",
-            enqueuer_id
-        );
+        error!(enqueuer_id = %enqueuer_id, "Enqueuer has no active connections, exiting");
         return;
     }
 
@@ -373,7 +374,7 @@ async fn enqueuer_loop(
                 job_counter = job_counter.wrapping_add(1);
             }
             Err(e) => {
-                eprintln!("Enqueuer {} failed to enqueue: {}", enqueuer_id, e);
+                warn!(enqueuer_id = %enqueuer_id, error = %e, "Enqueuer failed to enqueue");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }
@@ -389,34 +390,44 @@ async fn enqueuer_loop(
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    println!("Silo Benchmark Tool");
-    println!("===================");
-    println!("Initial server: {}", args.address);
-    println!("Workers: {}", args.workers);
-    println!("Enqueuers: {}", args.enqueuers);
-    println!("Duration: {}s", args.duration_secs);
-    println!("Tenant: {}", args.tenant);
-    println!("Concurrency key: {}", args.concurrency_key);
-    println!("Max concurrency: {}", args.max_concurrency);
-    println!();
+    // Initialize tracing with structured logging if requested
+    let log_format = if args.structured_logging {
+        LogFormat::Json
+    } else {
+        LogFormat::Text
+    };
+    trace::init(log_format)?;
+
+    info!("Silo Benchmark Tool");
+    info!(
+        initial_server = %args.address,
+        workers = args.workers,
+        enqueuers = args.enqueuers,
+        duration_secs = args.duration_secs,
+        tenant = %args.tenant,
+        concurrency_key = %args.concurrency_key,
+        max_concurrency = args.max_concurrency,
+        "Benchmark configuration"
+    );
 
     // Discover cluster topology
-    println!("Discovering cluster topology...");
+    info!("Discovering cluster topology...");
     let cluster_info = discover_cluster(&args.address).await?;
-    println!(
-        "Connected to node: {} ({})",
-        cluster_info.this_node_id, cluster_info.this_grpc_addr
+    info!(
+        node_id = %cluster_info.this_node_id,
+        grpc_addr = %cluster_info.this_grpc_addr,
+        "Connected to node"
     );
-    println!("Cluster has {} shards", cluster_info.num_shards);
-    println!("Shard owners:");
+    info!(num_shards = cluster_info.num_shards, "Cluster shard count");
     for owner in &cluster_info.shard_owners {
-        println!(
-            "  Shard {} -> {} ({})",
-            owner.shard_id, owner.grpc_addr, owner.node_id
+        info!(
+            shard_id = owner.shard_id,
+            grpc_addr = %owner.grpc_addr,
+            node_id = %owner.node_id,
+            "Shard owner"
         );
     }
-    println!("Unique servers: {:?}", cluster_info.all_addresses());
-    println!();
+    info!(servers = ?cluster_info.all_addresses(), "Unique servers");
 
     let cluster_info = Arc::new(cluster_info);
 
@@ -478,12 +489,14 @@ async fn main() -> anyhow::Result<()> {
     let mut last_enqueued = 0u64;
     let mut last_report = Instant::now();
 
-    println!("Starting benchmark...\n");
-    println!(
-        "{:>8} {:>12} {:>12} {:>12} {:>12} {:>12}",
-        "Elapsed", "Completed", "Rate/s", "Enqueued", "Enq Rate/s", "Empty Polls"
-    );
-    println!("{}", "-".repeat(72));
+    info!("Starting benchmark");
+    if !args.structured_logging {
+        println!(
+            "{:>8} {:>12} {:>12} {:>12} {:>12} {:>12}",
+            "Elapsed", "Completed", "Rate/s", "Enqueued", "Enq Rate/s", "Empty Polls"
+        );
+        println!("{}", "-".repeat(72));
+    }
 
     while start.elapsed() < Duration::from_secs(args.duration_secs) {
         tokio::time::sleep(report_interval).await;
@@ -499,15 +512,27 @@ async fn main() -> anyhow::Result<()> {
         let rate = completed_delta as f64 / interval_secs;
         let enqueue_rate = enqueued_delta as f64 / interval_secs;
 
-        println!(
-            "{:>7.1}s {:>12} {:>12.1} {:>12} {:>12.1} {:>12}",
-            elapsed.as_secs_f64(),
-            current_completed,
-            rate,
-            current_enqueued,
-            enqueue_rate,
-            current_empty_polls
+        info!(
+            elapsed_secs = elapsed.as_secs_f64(),
+            completed = current_completed,
+            completed_rate_per_sec = rate,
+            enqueued = current_enqueued,
+            enqueue_rate_per_sec = enqueue_rate,
+            empty_polls = current_empty_polls,
+            "Benchmark progress"
         );
+
+        if !args.structured_logging {
+            println!(
+                "{:>7.1}s {:>12} {:>12.1} {:>12} {:>12.1} {:>12}",
+                elapsed.as_secs_f64(),
+                current_completed,
+                rate,
+                current_enqueued,
+                enqueue_rate,
+                current_empty_polls
+            );
+        }
 
         last_completed = current_completed;
         last_enqueued = current_enqueued;
@@ -515,7 +540,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Stop workers
-    println!("\nStopping workers...");
+    info!("Stopping workers...");
     running.store(false, Ordering::Relaxed);
 
     // Wait for all workers to finish
@@ -530,30 +555,42 @@ async fn main() -> anyhow::Result<()> {
     let total_empty_polls = empty_poll_count.load(Ordering::Relaxed);
     let total_enqueued = enqueued_count.load(Ordering::Relaxed);
 
-    println!("\n===================");
-    println!("Final Results");
-    println!("===================");
-    println!("Total time: {:.2}s", total_elapsed.as_secs_f64());
-    println!("Total completed: {}", total_completed);
-    println!(
-        "Average rate: {:.1} tasks/sec",
-        total_completed as f64 / total_elapsed.as_secs_f64()
-    );
-    println!("Total polls: {}", total_polls);
-    println!(
-        "Empty polls: {} ({:.1}%)",
-        total_empty_polls,
-        if total_polls > 0 {
-            total_empty_polls as f64 / total_polls as f64 * 100.0
-        } else {
-            0.0
-        }
-    );
-    println!("Total enqueued: {}", total_enqueued);
-    println!(
-        "Average enqueue rate: {:.1} tasks/sec",
-        total_enqueued as f64 / total_elapsed.as_secs_f64()
+    let avg_rate = total_completed as f64 / total_elapsed.as_secs_f64();
+    let empty_poll_pct = if total_polls > 0 {
+        total_empty_polls as f64 / total_polls as f64 * 100.0
+    } else {
+        0.0
+    };
+    let avg_enqueue_rate = total_enqueued as f64 / total_elapsed.as_secs_f64();
+
+    info!(
+        total_time_secs = total_elapsed.as_secs_f64(),
+        total_completed = total_completed,
+        average_rate_per_sec = avg_rate,
+        total_polls = total_polls,
+        empty_polls = total_empty_polls,
+        empty_poll_percentage = empty_poll_pct,
+        total_enqueued = total_enqueued,
+        average_enqueue_rate_per_sec = avg_enqueue_rate,
+        "Final benchmark results"
     );
 
+    if !args.structured_logging {
+        println!("\n===================");
+        println!("Final Results");
+        println!("===================");
+        println!("Total time: {:.2}s", total_elapsed.as_secs_f64());
+        println!("Total completed: {}", total_completed);
+        println!("Average rate: {:.1} tasks/sec", avg_rate);
+        println!("Total polls: {}", total_polls);
+        println!(
+            "Empty polls: {} ({:.1}%)",
+            total_empty_polls, empty_poll_pct
+        );
+        println!("Total enqueued: {}", total_enqueued);
+        println!("Average enqueue rate: {:.1} tasks/sec", avg_enqueue_rate);
+    }
+
+    trace::shutdown();
     Ok(())
 }

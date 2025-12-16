@@ -67,6 +67,7 @@
           gubernator
           devScript
           nodejs_24 # For validation scripts
+          zx
           pnpm # Package manager for TypeScript client
           kubectl # for interacting with local K8S API server
           watchexec # Auto-reload for development
