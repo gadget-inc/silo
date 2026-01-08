@@ -13,6 +13,7 @@ use crate::codec::{
     decode_floating_limit_state, decode_job_cancellation, decode_job_status, decode_lease,
     decode_task, encode_attempt, encode_floating_limit_state, encode_job_cancellation,
     encode_job_info, encode_job_status, encode_lease, encode_task, CodecError,
+    DecodedFloatingLimitState,
 };
 use crate::concurrency::{
     ConcurrencyManager, MemoryEvent, RequestTicketOutcome, RequestTicketTaskOutcome,
@@ -305,7 +306,7 @@ impl JobStoreShard {
             metadata: metadata.unwrap_or_default(),
             limits: limits.clone(),
         };
-        let job_value = encode_job_info(&job).map_err(codec_error_to_shard_error)?;
+        let job_value = encode_job_info(&job)?;
 
         let first_task_id = Uuid::new_v4().to_string();
         let now_ms = now_epoch_ms();
@@ -391,9 +392,9 @@ impl JobStoreShard {
             }
             Some(Limit::FloatingConcurrency(fl)) => {
                 // First limit is a floating concurrency limit
-                // Get or create the floating limit state
-                let (state, _created) = self
-                    .get_or_create_floating_limit_state(&mut batch, tenant, fl, now_ms)
+                // Get or create the floating limit state (zero-copy for existing)
+                let state = self
+                    .get_or_create_floating_limit_state(&mut batch, tenant, fl)
                     .await?;
 
                 // Maybe schedule a refresh task if needed
@@ -402,7 +403,7 @@ impl JobStoreShard {
                 // Create a temporary ConcurrencyLimit with the current max concurrency
                 let temp_cl = crate::job::ConcurrencyLimit {
                     key: fl.key.clone(),
-                    max_concurrency: state.current_max_concurrency,
+                    max_concurrency: state.archived().current_max_concurrency,
                 };
 
                 // Use the concurrency system with the current floating limit value
@@ -574,20 +575,7 @@ impl JobStoreShard {
         let mut batch = WriteBatch::new();
         // Clean up secondary index entries if present
         if let Some(status) = self.get_job_status(tenant, id).await? {
-            let kind = status.kind;
-            let changed = status.changed_at_ms;
-            let timek = idx_status_time_key(
-                tenant,
-                match kind {
-                    JobStatusKind::Scheduled => "Scheduled",
-                    JobStatusKind::Running => "Running",
-                    JobStatusKind::Failed => "Failed",
-                    JobStatusKind::Cancelled => "Cancelled",
-                    JobStatusKind::Succeeded => "Succeeded",
-                },
-                changed,
-                id,
-            );
+            let timek = idx_status_time_key(tenant, status.kind.as_str(), status.changed_at_ms, id);
             batch.delete(timek.as_bytes());
         }
         // Clean up metadata index entries (load job info to enumerate metadata)
@@ -671,10 +659,7 @@ impl JobStoreShard {
             return Err(JobStoreShardError::JobNotFound(id.to_string()));
         };
 
-        let decoded = decode_job_status(&status_raw).map_err(codec_error_to_shard_error)?;
-        let mut des = rkyv::Infallible;
-        let status: JobStatus = RkyvDeserialize::deserialize(decoded.archived(), &mut des)
-            .unwrap_or_else(|_| unreachable!("infallible deserialization for JobStatus"));
+        let status = decode_job_status_owned(&status_raw)?;
 
         // Check if already cancelled within transaction
         let cancelled_key = job_cancelled_key(tenant, id);
@@ -695,8 +680,7 @@ impl JobStoreShard {
         let cancellation = JobCancellation {
             cancelled_at_ms: now_ms,
         };
-        let cancellation_value =
-            encode_job_cancellation(&cancellation).map_err(codec_error_to_shard_error)?;
+        let cancellation_value = encode_job_cancellation(&cancellation)?;
         txn.put(cancelled_key.as_bytes(), &cancellation_value)?;
 
         // [SILO-CXL-3] For Scheduled jobs, update status to Cancelled immediately
@@ -712,8 +696,7 @@ impl JobStoreShard {
 
             // Set status to Cancelled immediately since job never started
             let cancelled_status = JobStatus::cancelled(now_ms);
-            let status_value =
-                encode_job_status(&cancelled_status).map_err(codec_error_to_shard_error)?;
+            let status_value = encode_job_status(&cancelled_status)?;
             txn.put(status_key.as_bytes(), &status_value)?;
 
             // Insert new status index entry
@@ -752,13 +735,11 @@ impl JobStoreShard {
         id: &str,
     ) -> Result<Option<i64>, JobStoreShardError> {
         let key = job_cancelled_key(tenant, id);
-        let maybe_raw = self.db.get(key.as_bytes()).await?;
-        if let Some(raw) = maybe_raw {
-            let decoded = decode_job_cancellation(&raw).map_err(codec_error_to_shard_error)?;
-            Ok(Some(decoded.archived().cancelled_at_ms))
-        } else {
-            Ok(None)
-        }
+        let Some(raw) = self.db.get(key.as_bytes()).await? else {
+            return Ok(None);
+        };
+        let decoded = decode_job_cancellation(&raw)?;
+        Ok(Some(decoded.archived().cancelled_at_ms))
     }
 
     /// Fetch a job by id as a zero-copy archived view.
@@ -768,12 +749,12 @@ impl JobStoreShard {
         id: &str,
     ) -> Result<Option<JobView>, JobStoreShardError> {
         let key = job_info_key(tenant, id);
-        let maybe_raw = self.db.get(key.as_bytes()).await?;
-        if let Some(raw) = maybe_raw {
-            Ok(Some(JobView::new(raw)?))
-        } else {
-            Ok(None)
-        }
+        self.db
+            .get(key.as_bytes())
+            .await?
+            .map(JobView::new)
+            .transpose()
+            .map_err(Into::into)
     }
 
     /// Fetch multiple jobs by id concurrently. Returns a map of job_id -> JobView.
@@ -830,11 +811,7 @@ impl JobStoreShard {
             return Ok(None);
         };
 
-        let decoded = decode_job_status(&raw).map_err(codec_error_to_shard_error)?;
-        let mut des = rkyv::Infallible;
-        let status: JobStatus = RkyvDeserialize::deserialize(decoded.archived(), &mut des)
-            .unwrap_or_else(|_| unreachable!("infallible deserialization for JobStatus"));
-        Ok(Some(status))
+        Ok(Some(decode_job_status_owned(&raw)?))
     }
 
     /// Fetch multiple job statuses by id concurrently. Returns a map of job_id -> JobStatus.
@@ -856,12 +833,7 @@ impl JobStoreShard {
                 let Some(raw) = maybe_raw else {
                     return Ok::<_, JobStoreShardError>(None);
                 };
-
-                let decoded =
-                    decode_job_status(&raw).map_err(|e| JobStoreShardError::Rkyv(e.to_string()))?;
-                let mut des = rkyv::Infallible;
-                let status: JobStatus = RkyvDeserialize::deserialize(decoded.archived(), &mut des)
-                    .unwrap_or_else(|_| unreachable!("infallible deserialization for JobStatus"));
+                let status = decode_job_status_owned(&raw)?;
                 Ok(Some((id_clone, status)))
             });
             handles.push(handle);
@@ -891,12 +863,12 @@ impl JobStoreShard {
         attempt_number: u32,
     ) -> Result<Option<JobAttemptView>, JobStoreShardError> {
         let key = attempt_key(tenant, job_id, attempt_number);
-        let maybe_raw = self.db.get(key.as_bytes()).await?;
-        if let Some(raw) = maybe_raw {
-            Ok(Some(JobAttemptView::new(raw)?))
-        } else {
-            Ok(None)
-        }
+        self.db
+            .get(key.as_bytes())
+            .await?
+            .map(JobAttemptView::new)
+            .transpose()
+            .map_err(Into::into)
     }
 
     /// Peek up to `max_tasks` available tasks (time <= now), without deleting them.
@@ -1011,8 +983,7 @@ impl JobStoreShard {
                                     task: run,
                                     expiry_ms,
                                 };
-                                let leased_value =
-                                    encode_lease(&record).map_err(codec_error_to_shard_error)?;
+                                let leased_value = encode_lease(&record)?;
                                 batch.put(lease_key.as_bytes(), &leased_value);
 
                                 // Mark job as running
@@ -1031,8 +1002,7 @@ impl JobStoreShard {
                                         started_at_ms: now_ms,
                                     },
                                 };
-                                let attempt_val =
-                                    encode_attempt(&attempt).map_err(codec_error_to_shard_error)?;
+                                let attempt_val = encode_attempt(&attempt)?;
                                 let akey = attempt_key(&tenant, job_id, *attempt_number);
                                 batch.put(akey.as_bytes(), &attempt_val);
 
@@ -1163,7 +1133,7 @@ impl JobStoreShard {
                     }
                     Task::RefreshFloatingLimit {
                         task_id,
-                        tenant: task_tenant,
+                        tenant: _task_tenant,
                         queue_key,
                         current_max_concurrency,
                         last_refreshed_at_ms,
@@ -1176,8 +1146,7 @@ impl JobStoreShard {
                             task: task.clone(),
                             expiry_ms,
                         };
-                        let leased_value =
-                            encode_lease(&record).map_err(codec_error_to_shard_error)?;
+                        let leased_value = encode_lease(&record)?;
                         batch.put(lease_key.as_bytes(), &leased_value);
                         batch.delete(entry.key.as_bytes());
 
@@ -1189,7 +1158,6 @@ impl JobStoreShard {
                             metadata: metadata.clone(),
                         });
                         ack_keys.push(entry.key.clone());
-                        let _ = task_tenant; // suppress unused warning
                         continue;
                     }
                     Task::RunAttempt { .. } => {}
@@ -1264,7 +1232,7 @@ impl JobStoreShard {
                         task: task.clone(),
                         expiry_ms,
                     };
-                    let leased_value = encode_lease(&record).map_err(codec_error_to_shard_error)?;
+                    let leased_value = encode_lease(&record)?;
 
                     batch.put(lease_key.as_bytes(), &leased_value);
                     // [SILO-DEQ-3] Delete task from task queue
@@ -1284,8 +1252,7 @@ impl JobStoreShard {
                             started_at_ms: now_ms,
                         },
                     };
-                    let attempt_val =
-                        encode_attempt(&attempt).map_err(codec_error_to_shard_error)?;
+                    let attempt_val = encode_attempt(&attempt)?;
                     let akey = attempt_key(&tenant, &job_id, attempt_number);
                     batch.put(akey.as_bytes(), &attempt_val);
 
@@ -1425,7 +1392,7 @@ impl JobStoreShard {
             return Err(JobStoreShardError::LeaseNotFound(task_id.to_string()));
         };
 
-        let decoded = decode_lease(&value_bytes).map_err(codec_error_to_shard_error)?;
+        let decoded = decode_lease(&value_bytes)?;
 
         // [SILO-HB-1] Check worker id matches
         let current_owner = decoded.worker_id();
@@ -1447,7 +1414,7 @@ impl JobStoreShard {
             task: decoded.to_task(),
             expiry_ms: now_epoch_ms() + DEFAULT_LEASE_MS,
         };
-        let value = encode_lease(&record).map_err(codec_error_to_shard_error)?;
+        let value = encode_lease(&record)?;
 
         let mut batch = WriteBatch::new();
         batch.put(key.as_bytes(), &value);
@@ -1479,7 +1446,7 @@ impl JobStoreShard {
             return Err(JobStoreShardError::LeaseNotFound(task_id.to_string()));
         };
 
-        let decoded = decode_lease(&value_bytes).map_err(codec_error_to_shard_error)?;
+        let decoded = decode_lease(&value_bytes)?;
 
         // Extract fields using zero-copy accessors
         let job_id = decoded.job_id().to_string();
@@ -1507,7 +1474,7 @@ impl JobStoreShard {
             task_id: task_id.to_string(),
             status: attempt_status,
         };
-        let attempt_val = encode_attempt(&attempt).map_err(codec_error_to_shard_error)?;
+        let attempt_val = encode_attempt(&attempt)?;
         let attempt_key = attempt_key(tenant, &job_id, attempt_number);
 
         // Atomically update attempt and remove lease
@@ -1761,34 +1728,49 @@ impl JobStoreShard {
         }
     }
 
+    /// Generic helper for scanning keys with a given prefix and extracting items.
+    async fn scan_prefix<T, F>(
+        &self,
+        prefix: &str,
+        limit: usize,
+        extract: F,
+    ) -> Result<Vec<T>, JobStoreShardError>
+    where
+        F: Fn(&str) -> Option<T>,
+    {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let start = prefix.as_bytes().to_vec();
+        let mut end = start.clone();
+        end.push(0xFF);
+        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..=end).await?;
+        let mut out = Vec::with_capacity(limit);
+        while out.len() < limit {
+            let Some(kv) = iter.next().await? else {
+                break;
+            };
+            let key_str = String::from_utf8_lossy(&kv.key);
+            if let Some(item) = extract(&key_str) {
+                out.push(item);
+            }
+        }
+        Ok(out)
+    }
+
     /// Scan all jobs for a tenant ordered by job id (lexicographic), unfiltered.
     pub async fn scan_jobs(
         &self,
         tenant: &str,
         limit: usize,
     ) -> Result<Vec<String>, JobStoreShardError> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        // Prefix: jobs/<tenant>/
         let prefix = crate::keys::job_info_key(tenant, "");
-        let start = prefix.as_bytes().to_vec();
-        let mut end = start.clone();
-        end.push(0xFF);
-        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..=end).await?;
-        let mut out: Vec<String> = Vec::with_capacity(limit);
-        while out.len() < limit {
-            let maybe = iter.next().await?;
-            let Some(kv) = maybe else { break };
-            let key_str = String::from_utf8_lossy(&kv.key);
+        self.scan_prefix(&prefix, limit, |key| {
             // key format: jobs/<tenant>/<job-id>
-            if let Some(job_id) = key_str.rsplit('/').next() {
-                if !job_id.is_empty() {
-                    out.push(job_id.to_string());
-                }
-            }
-        }
-        Ok(out)
+            let job_id = key.rsplit('/').next()?;
+            (!job_id.is_empty()).then(|| job_id.to_string())
+        })
+        .await
     }
 
     /// Scan all jobs across ALL tenants, returning (tenant, job_id) pairs.
@@ -1797,31 +1779,17 @@ impl JobStoreShard {
         &self,
         limit: usize,
     ) -> Result<Vec<(String, String)>, JobStoreShardError> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        // Prefix: jobs/ (all tenants)
-        let prefix = "jobs/";
-        let start = prefix.as_bytes().to_vec();
-        let mut end = start.clone();
-        end.push(0xFF);
-        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..=end).await?;
-        let mut out: Vec<(String, String)> = Vec::with_capacity(limit);
-        while out.len() < limit {
-            let maybe = iter.next().await?;
-            let Some(kv) = maybe else { break };
-            let key_str = String::from_utf8_lossy(&kv.key);
+        self.scan_prefix("jobs/", limit, |key| {
             // key format: jobs/<tenant>/<job-id>
-            let parts: Vec<&str> = key_str.split('/').collect();
-            if parts.len() >= 3 && parts[0] == "jobs" {
+            let parts: Vec<&str> = key.split('/').collect();
+            if parts.len() >= 3 && parts[0] == "jobs" && !parts[2].is_empty() {
                 let tenant = crate::keys::decode_tenant(parts[1]);
-                let job_id = parts[2].to_string();
-                if !job_id.is_empty() {
-                    out.push((tenant, job_id));
-                }
+                Some((tenant, parts[2].to_string()))
+            } else {
+                None
             }
-        }
-        Ok(out)
+        })
+        .await
     }
 
     /// Scan newest-first job IDs by status using the time-ordered index.
@@ -1831,32 +1799,17 @@ impl JobStoreShard {
         status: JobStatusKind,
         limit: usize,
     ) -> Result<Vec<String>, JobStoreShardError> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
         let tenant_enc = crate::keys::job_info_key(tenant, "")
             .trim_start_matches("jobs/")
             .trim_end_matches('/')
             .to_string();
         let prefix = format!("idx/status_ts/{}/{}/", tenant_enc, status.as_str());
-        // Build range [prefix, prefix + 0xFF]
-        let start = prefix.as_bytes().to_vec();
-        let mut end = start.clone();
-        end.push(0xFF);
-        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..=end).await?;
-        let mut out: Vec<String> = Vec::with_capacity(limit);
-        while out.len() < limit {
-            let maybe = iter.next().await?;
-            let Some(kv) = maybe else { break };
-            let key_str = String::from_utf8_lossy(&kv.key);
+        self.scan_prefix(&prefix, limit, |key| {
             // key format: idx/status_ts/<tenant>/<status>/<inv_ts>/<job-id>
-            if let Some(job_id) = key_str.rsplit('/').next() {
-                if !job_id.is_empty() {
-                    out.push(job_id.to_string());
-                }
-            }
-        }
-        Ok(out)
+            let job_id = key.rsplit('/').next()?;
+            (!job_id.is_empty()).then(|| job_id.to_string())
+        })
+        .await
     }
 
     /// Scan newest-first job IDs by status across ALL tenants, returning (tenant, job_id) pairs.
@@ -1866,39 +1819,24 @@ impl JobStoreShard {
         status: JobStatusKind,
         limit: usize,
     ) -> Result<Vec<(String, String)>, JobStoreShardError> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        // Scan all tenants' status indexes: idx/status_ts/
-        // We need to scan each status across all tenants, so we use a broader prefix
-        let prefix = format!("idx/status_ts/");
-        let start = prefix.as_bytes().to_vec();
-        let mut end = start.clone();
-        end.push(0xFF);
-        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..=end).await?;
-        let mut out: Vec<(String, String)> = Vec::with_capacity(limit);
         let status_str = status.as_str();
-        while out.len() < limit {
-            let maybe = iter.next().await?;
-            let Some(kv) = maybe else { break };
-            let key_str = String::from_utf8_lossy(&kv.key);
+        self.scan_prefix("idx/status_ts/", limit, |key| {
             // key format: idx/status_ts/<tenant>/<status>/<inv_ts>/<job-id>
-            let parts: Vec<&str> = key_str.split('/').collect();
-            if parts.len() >= 5 && parts[0] == "idx" && parts[1] == "status_ts" {
-                let tenant_enc = parts[2];
-                let key_status = parts[3];
-                // Only include if status matches
-                if key_status == status_str {
-                    let tenant = crate::keys::decode_tenant(tenant_enc);
-                    if let Some(job_id) = parts.last() {
-                        if !job_id.is_empty() {
-                            out.push((tenant, job_id.to_string()));
-                        }
-                    }
+            let parts: Vec<&str> = key.split('/').collect();
+            if parts.len() >= 5
+                && parts[0] == "idx"
+                && parts[1] == "status_ts"
+                && parts[3] == status_str
+            {
+                let job_id = parts.last()?;
+                if !job_id.is_empty() {
+                    let tenant = crate::keys::decode_tenant(parts[2]);
+                    return Some((tenant, job_id.to_string()));
                 }
             }
-        }
-        Ok(out)
+            None
+        })
+        .await
     }
 
     /// Scan jobs by metadata key/value. Order is not specified.
@@ -1909,66 +1847,35 @@ impl JobStoreShard {
         value: &str,
         limit: usize,
     ) -> Result<Vec<String>, JobStoreShardError> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
         let prefix = idx_metadata_prefix(tenant, key, value);
-        let start = prefix.as_bytes().to_vec();
-        let mut end = start.clone();
-        end.push(0xFF);
-        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..=end).await?;
-        let mut out: Vec<String> = Vec::with_capacity(limit);
-        while out.len() < limit {
-            let maybe = iter.next().await?;
-            let Some(kv) = maybe else { break };
-            let key_str = String::from_utf8_lossy(&kv.key);
+        self.scan_prefix(&prefix, limit, |k| {
             // key format: idx/meta/<tenant>/<key>/<value>/<job-id>
-            if let Some(job_id) = key_str.rsplit('/').next() {
-                if !job_id.is_empty() {
-                    out.push(job_id.to_string());
-                }
-            }
-        }
-        Ok(out)
+            let job_id = k.rsplit('/').next()?;
+            (!job_id.is_empty()).then(|| job_id.to_string())
+        })
+        .await
     }
 
     /// Get or create the floating limit state for a given queue key.
-    /// Returns the state and whether it was newly created.
+    /// Returns a zero-copy decoded view. For the rare "just created" case,
+    /// we encode then decode to return the same type (extra decode is fine for cold path).
     async fn get_or_create_floating_limit_state(
         &self,
         batch: &mut WriteBatch,
         tenant: &str,
         fl: &FloatingConcurrencyLimit,
-        _now_ms: i64,
-    ) -> Result<(FloatingLimitState, bool), JobStoreShardError> {
+    ) -> Result<DecodedFloatingLimitState, JobStoreShardError> {
         let state_key = floating_limit_state_key(tenant, &fl.key);
-        let maybe_raw = self.db.get(state_key.as_bytes()).await?;
 
-        if let Some(raw) = maybe_raw {
-            let decoded = decode_floating_limit_state(&raw).map_err(codec_error_to_shard_error)?;
-            let archived = decoded.archived();
-            let metadata: Vec<(String, String)> = archived
-                .metadata
-                .iter()
-                .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
-                .collect();
-            let state = FloatingLimitState {
-                current_max_concurrency: archived.current_max_concurrency,
-                last_refreshed_at_ms: archived.last_refreshed_at_ms,
-                refresh_task_scheduled: archived.refresh_task_scheduled,
-                refresh_interval_ms: archived.refresh_interval_ms,
-                default_max_concurrency: archived.default_max_concurrency,
-                retry_count: archived.retry_count,
-                next_retry_at_ms: archived.next_retry_at_ms.as_ref().copied(),
-                metadata,
-            };
-            return Ok((state, false));
+        if let Some(raw) = self.db.get(state_key.as_bytes()).await? {
+            // Hot path: state exists, return zero-copy decoded view
+            return Ok(decode_floating_limit_state(&raw)?);
         }
 
-        // Create new state with default values
+        // Cold path: first time seeing this queue key, create and write new state
         let state = FloatingLimitState {
             current_max_concurrency: fl.default_max_concurrency,
-            last_refreshed_at_ms: 0, // Never refreshed
+            last_refreshed_at_ms: 0,
             refresh_task_scheduled: false,
             refresh_interval_ms: fl.refresh_interval_ms,
             default_max_concurrency: fl.default_max_concurrency,
@@ -1977,11 +1884,11 @@ impl JobStoreShard {
             metadata: fl.metadata.clone(),
         };
 
-        let state_value =
-            encode_floating_limit_state(&state).map_err(codec_error_to_shard_error)?;
-        batch.put(state_key.as_bytes(), &state_value);
+        let state_bytes = encode_floating_limit_state(&state)?;
+        batch.put(state_key.as_bytes(), &state_bytes);
 
-        Ok((state, true))
+        // Decode what we just encoded so we return the same type
+        Ok(decode_floating_limit_state(&state_bytes)?)
     }
 
     /// Check if a floating limit refresh is needed and schedule it if so.
@@ -1991,20 +1898,26 @@ impl JobStoreShard {
         batch: &mut WriteBatch,
         tenant: &str,
         fl: &FloatingConcurrencyLimit,
-        state: &FloatingLimitState,
+        state: &DecodedFloatingLimitState,
         now_ms: i64,
     ) -> Result<(), JobStoreShardError> {
+        let archived = state.archived();
+
         // Check if refresh is already scheduled
-        if state.refresh_task_scheduled {
+        if archived.refresh_task_scheduled {
             return Ok(());
         }
 
         // Check if we need to refresh based on interval
-        let next_refresh_due = state.last_refreshed_at_ms + state.refresh_interval_ms;
+        let next_refresh_due = archived.last_refreshed_at_ms + archived.refresh_interval_ms;
         let should_refresh = now_ms >= next_refresh_due;
 
         // Also check if we're in backoff from a failed refresh
-        let in_backoff = state.next_retry_at_ms.map(|t| now_ms < t).unwrap_or(false);
+        let in_backoff = archived
+            .next_retry_at_ms
+            .as_ref()
+            .map(|&t| now_ms < t)
+            .unwrap_or(false);
 
         if !should_refresh || in_backoff {
             return Ok(());
@@ -2016,13 +1929,17 @@ impl JobStoreShard {
             task_id: task_id.clone(),
             tenant: tenant.to_string(),
             queue_key: fl.key.clone(),
-            current_max_concurrency: state.current_max_concurrency,
-            last_refreshed_at_ms: state.last_refreshed_at_ms,
-            metadata: state.metadata.clone(),
+            current_max_concurrency: archived.current_max_concurrency,
+            last_refreshed_at_ms: archived.last_refreshed_at_ms,
+            metadata: archived
+                .metadata
+                .iter()
+                .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
+                .collect(),
         };
 
         // Use a synthetic task key based on the queue key to avoid collisions
-        let task_value = encode_task(&refresh_task).map_err(codec_error_to_shard_error)?;
+        let task_value = encode_task(&refresh_task)?;
         let task_key_str = format!(
             "tasks/{:020}/{:02}/floating_refresh/{}/{}",
             now_ms,
@@ -2032,18 +1949,29 @@ impl JobStoreShard {
         );
         batch.put(task_key_str.as_bytes(), &task_value);
 
-        // Update state to mark refresh as scheduled
-        let mut new_state = state.clone();
-        new_state.refresh_task_scheduled = true;
+        // Update state to mark refresh as scheduled - construct new state directly
+        let new_state = FloatingLimitState {
+            refresh_task_scheduled: true,
+            current_max_concurrency: archived.current_max_concurrency,
+            last_refreshed_at_ms: archived.last_refreshed_at_ms,
+            refresh_interval_ms: archived.refresh_interval_ms,
+            default_max_concurrency: archived.default_max_concurrency,
+            retry_count: archived.retry_count,
+            next_retry_at_ms: archived.next_retry_at_ms.as_ref().copied(),
+            metadata: archived
+                .metadata
+                .iter()
+                .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
+                .collect(),
+        };
         let state_key = floating_limit_state_key(tenant, &fl.key);
-        let state_value =
-            encode_floating_limit_state(&new_state).map_err(codec_error_to_shard_error)?;
+        let state_value = encode_floating_limit_state(&new_state)?;
         batch.put(state_key.as_bytes(), &state_value);
 
         tracing::debug!(
             queue_key = %fl.key,
-            current_max = state.current_max_concurrency,
-            last_refreshed = state.last_refreshed_at_ms,
+            current_max = archived.current_max_concurrency,
+            last_refreshed = archived.last_refreshed_at_ms,
             "scheduled floating limit refresh task"
         );
 
@@ -2065,7 +1993,7 @@ impl JobStoreShard {
             return Err(JobStoreShardError::LeaseNotFound(task_id.to_string()));
         };
 
-        let decoded = decode_lease(&value_bytes).map_err(codec_error_to_shard_error)?;
+        let decoded = decode_lease(&value_bytes)?;
         let queue_key = match decoded.to_task() {
             Task::RefreshFloatingLimit { queue_key, .. } => queue_key,
             _ => {
@@ -2078,43 +2006,36 @@ impl JobStoreShard {
         let now_ms = now_epoch_ms();
         let state_key = floating_limit_state_key(tenant, &queue_key);
 
-        // Load and update the state
+        // Load state and construct new state with updates (zero-copy read from archived)
         let maybe_state = self.db.get(state_key.as_bytes()).await?;
-        let mut state = if let Some(raw) = maybe_state {
-            let decoded = decode_floating_limit_state(&raw).map_err(codec_error_to_shard_error)?;
-            let archived = decoded.archived();
-            FloatingLimitState {
-                current_max_concurrency: archived.current_max_concurrency,
-                last_refreshed_at_ms: archived.last_refreshed_at_ms,
-                refresh_task_scheduled: archived.refresh_task_scheduled,
-                refresh_interval_ms: archived.refresh_interval_ms,
-                default_max_concurrency: archived.default_max_concurrency,
-                retry_count: archived.retry_count,
-                next_retry_at_ms: archived.next_retry_at_ms.as_ref().copied(),
-                metadata: archived
-                    .metadata
-                    .iter()
-                    .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
-                    .collect(),
-            }
-        } else {
-            // State doesn't exist - this shouldn't happen, but handle it gracefully
+        let Some(raw) = maybe_state else {
             return Err(JobStoreShardError::Rkyv(format!(
                 "floating limit state not found for queue {}",
                 queue_key
             )));
         };
+        let decoded = decode_floating_limit_state(&raw)?;
+        let archived = decoded.archived();
 
-        // Update state with new values
-        state.current_max_concurrency = new_max_concurrency;
-        state.last_refreshed_at_ms = now_ms;
-        state.refresh_task_scheduled = false;
-        state.retry_count = 0;
-        state.next_retry_at_ms = None;
+        // Construct new state directly - avoids intermediate owned allocation
+        let new_state = FloatingLimitState {
+            current_max_concurrency: new_max_concurrency,
+            last_refreshed_at_ms: now_ms,
+            refresh_task_scheduled: false,
+            retry_count: 0,
+            next_retry_at_ms: None,
+            // Preserve unchanged fields from archived view
+            refresh_interval_ms: archived.refresh_interval_ms,
+            default_max_concurrency: archived.default_max_concurrency,
+            metadata: archived
+                .metadata
+                .iter()
+                .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
+                .collect(),
+        };
 
         let mut batch = WriteBatch::new();
-        let state_value =
-            encode_floating_limit_state(&state).map_err(codec_error_to_shard_error)?;
+        let state_value = encode_floating_limit_state(&new_state)?;
         batch.put(state_key.as_bytes(), &state_value);
         batch.delete(lease_key.as_bytes());
 
@@ -2146,7 +2067,7 @@ impl JobStoreShard {
             return Err(JobStoreShardError::LeaseNotFound(task_id.to_string()));
         };
 
-        let decoded = decode_lease(&value_bytes).map_err(codec_error_to_shard_error)?;
+        let decoded = decode_lease(&value_bytes)?;
         let (queue_key, current_max_concurrency, last_refreshed_at_ms, metadata) =
             match decoded.to_task() {
                 Task::RefreshFloatingLimit {
@@ -2171,40 +2092,25 @@ impl JobStoreShard {
         let now_ms = now_epoch_ms();
         let state_key = floating_limit_state_key(tenant, &queue_key);
 
-        // Load and update the state
+        // Load state (zero-copy read from archived)
         let maybe_state = self.db.get(state_key.as_bytes()).await?;
-        let mut state = if let Some(raw) = maybe_state {
-            let decoded = decode_floating_limit_state(&raw).map_err(codec_error_to_shard_error)?;
-            let archived = decoded.archived();
-            FloatingLimitState {
-                current_max_concurrency: archived.current_max_concurrency,
-                last_refreshed_at_ms: archived.last_refreshed_at_ms,
-                refresh_task_scheduled: archived.refresh_task_scheduled,
-                refresh_interval_ms: archived.refresh_interval_ms,
-                default_max_concurrency: archived.default_max_concurrency,
-                retry_count: archived.retry_count,
-                next_retry_at_ms: archived.next_retry_at_ms.as_ref().copied(),
-                metadata: archived
-                    .metadata
-                    .iter()
-                    .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
-                    .collect(),
-            }
-        } else {
+        let Some(raw) = maybe_state else {
             return Err(JobStoreShardError::Rkyv(format!(
                 "floating limit state not found for queue {}",
                 queue_key
             )));
         };
+        let decoded = decode_floating_limit_state(&raw)?;
+        let archived = decoded.archived();
 
-        // Calculate exponential backoff
+        // Calculate exponential backoff using archived retry_count
         const INITIAL_BACKOFF_MS: i64 = 1000; // 1 second
         const MAX_BACKOFF_MS: i64 = 60_000; // 1 minute
         const BACKOFF_MULTIPLIER: f64 = 2.0;
 
-        let retry_count = state.retry_count + 1;
+        let new_retry_count = archived.retry_count + 1;
         let backoff_ms = ((INITIAL_BACKOFF_MS as f64)
-            * BACKOFF_MULTIPLIER.powi(state.retry_count as i32))
+            * BACKOFF_MULTIPLIER.powi(archived.retry_count as i32))
         .round() as i64;
         let capped_backoff_ms = backoff_ms.min(MAX_BACKOFF_MS);
         let next_retry_at = now_ms + capped_backoff_ms;
@@ -2220,7 +2126,7 @@ impl JobStoreShard {
             metadata,
         };
 
-        let task_value = encode_task(&refresh_task).map_err(codec_error_to_shard_error)?;
+        let task_value = encode_task(&refresh_task)?;
         let task_key_str = format!(
             "tasks/{:020}/{:02}/floating_refresh/{}/{}",
             next_retry_at,
@@ -2229,14 +2135,25 @@ impl JobStoreShard {
             new_task_id
         );
 
-        // Update state - keep refresh_task_scheduled true since we're re-enqueueing
-        state.retry_count = retry_count;
-        state.next_retry_at_ms = Some(next_retry_at);
-        state.refresh_task_scheduled = true;
+        // Construct new state directly - avoids intermediate owned allocation
+        let new_state = FloatingLimitState {
+            retry_count: new_retry_count,
+            next_retry_at_ms: Some(next_retry_at),
+            refresh_task_scheduled: true,
+            // Preserve unchanged fields from archived view
+            current_max_concurrency: archived.current_max_concurrency,
+            last_refreshed_at_ms: archived.last_refreshed_at_ms,
+            refresh_interval_ms: archived.refresh_interval_ms,
+            default_max_concurrency: archived.default_max_concurrency,
+            metadata: archived
+                .metadata
+                .iter()
+                .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
+                .collect(),
+        };
 
         let mut batch = WriteBatch::new();
-        let state_value =
-            encode_floating_limit_state(&state).map_err(codec_error_to_shard_error)?;
+        let state_value = encode_floating_limit_state(&new_state)?;
         batch.put(state_key.as_bytes(), &state_value);
         batch.put(task_key_str.as_bytes(), &task_value);
         batch.delete(lease_key.as_bytes());
@@ -2248,7 +2165,7 @@ impl JobStoreShard {
             queue_key = %queue_key,
             error_code = %error_code,
             error_message = %error_message,
-            retry_count = retry_count,
+            retry_count = new_retry_count,
             next_retry_at_ms = next_retry_at,
             "floating limit refresh failed, scheduled retry"
         );
@@ -2356,7 +2273,7 @@ fn put_job_status(
     job_id: &str,
     status: &JobStatus,
 ) -> Result<(), JobStoreShardError> {
-    let job_status_value = encode_job_status(status).map_err(codec_error_to_shard_error)?;
+    let job_status_value = encode_job_status(status)?;
     batch.put(job_status_key(tenant, job_id).as_bytes(), &job_status_value);
     Ok(())
 }
@@ -2370,7 +2287,7 @@ fn put_task(
     attempt: u32,
     task: &Task,
 ) -> Result<(), JobStoreShardError> {
-    let task_value = encode_task(task).map_err(codec_error_to_shard_error)?;
+    let task_value = encode_task(task)?;
     batch.put(
         task_key(time_ms, priority, job_id, attempt).as_bytes(),
         &task_value,
@@ -2378,6 +2295,16 @@ fn put_task(
     Ok(())
 }
 
-fn codec_error_to_shard_error(e: CodecError) -> JobStoreShardError {
-    JobStoreShardError::Rkyv(e.to_string())
+impl From<CodecError> for JobStoreShardError {
+    fn from(e: CodecError) -> Self {
+        JobStoreShardError::Rkyv(e.to_string())
+    }
+}
+
+/// Decode a `JobStatus` from raw rkyv bytes into an owned value.
+fn decode_job_status_owned(raw: &[u8]) -> Result<JobStatus, JobStoreShardError> {
+    let decoded = decode_job_status(raw)?;
+    let mut des = rkyv::Infallible;
+    Ok(RkyvDeserialize::deserialize(decoded.archived(), &mut des)
+        .unwrap_or_else(|_| unreachable!("infallible deserialization for JobStatus")))
 }
