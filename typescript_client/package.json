@@ -2,12 +2,12 @@
   "name": "@silo/client",
   "version": "0.0.1",
   "description": "TypeScript gRPC client for Silo job queue",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
   "exports": {
     ".": {
-      "require": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "types": "./dist/src/index.d.ts",
+      "require": "./dist/src/index.js"
     }
   },
   "files": [
@@ -23,7 +23,8 @@
     "format": "oxfmt",
     "test:watch": "vitest",
     "prepublishOnly": "pnpm run build",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prerelease": "gitpkg publish"
   },
   "dependencies": {
     "@grpc/grpc-js": "^1.12.2",
@@ -34,7 +35,10 @@
     "serialize-error": "7.0.1"
   },
   "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.2",
     "@protobuf-ts/plugin": "^2.9.4",
+    "execa": "^5.1.1",
+    "gitpkg": "github:airhorns/gitpkg#gitpkg-v1.0.0-beta.4-gitpkg-82083c3",
     "oxfmt": "^0.16.0",
     "oxlint": "^1.31.0",
     "oxlint-tsgolint": "^0.8.3",

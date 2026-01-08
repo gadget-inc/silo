@@ -149,6 +149,10 @@ jobs:
         run: |
           process-compose up --tui=false &
           sleep 2
+      - name: Build typescript package
+        shell: bash
+        working-directory: typescript_client
+        run: pnpm run build
       - name: Run tests
         shell: bash
         working-directory: typescript_client
