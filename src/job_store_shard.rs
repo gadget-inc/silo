@@ -33,32 +33,12 @@ use crate::query::ShardQueryEngine;
 use crate::retry::RetryPolicy;
 use crate::settings::DatabaseConfig;
 use crate::storage::{resolve_object_store, StorageError};
-use crate::task::GubernatorRateLimitData;
-use crate::task_broker::{BrokerTask, TaskBroker};
-use tracing::{debug, info_span};
-
-// Re-export commonly used types from task module for convenience
-pub use crate::task::{
-    ConcurrencyAction, HeartbeatResult, HolderRecord, LeaseRecord, LeasedTask, Task,
+use crate::task::{
+    GubernatorRateLimitData, HeartbeatResult, LeaseRecord, LeasedRefreshTask, LeasedTask, Task,
     DEFAULT_LEASE_MS,
 };
-
-/// A leased refresh task for floating concurrency limits
-#[derive(Debug, Clone)]
-pub struct LeasedRefreshTask {
-    pub task_id: String,
-    pub queue_key: String,
-    pub current_max_concurrency: u32,
-    pub last_refreshed_at_ms: i64,
-    pub metadata: Vec<(String, String)>,
-}
-
-/// Result of a dequeue operation - contains both job tasks and floating limit refresh tasks
-#[derive(Debug, Default)]
-pub struct DequeueResult {
-    pub tasks: Vec<LeasedTask>,
-    pub refresh_tasks: Vec<LeasedRefreshTask>,
-}
+use crate::task_broker::{BrokerTask, TaskBroker};
+use tracing::{debug, info_span};
 
 /// Configuration for WAL cleanup during shard close
 #[derive(Debug, Clone)]
@@ -67,6 +47,13 @@ pub struct WalCloseConfig {
     pub path: String,
     /// Whether to flush memtable to SST before closing
     pub flush_on_close: bool,
+}
+
+/// Result of a dequeue operation - contains both job tasks and floating limit refresh tasks
+#[derive(Debug, Default)]
+pub struct DequeueResult {
+    pub tasks: Vec<LeasedTask>,
+    pub refresh_tasks: Vec<LeasedRefreshTask>,
 }
 
 /// Represents a single shard of the system. Owns the SlateDB instance.

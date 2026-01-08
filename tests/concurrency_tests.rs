@@ -4,7 +4,7 @@ use rkyv::Archive;
 use silo::codec::{decode_lease, decode_task, encode_lease};
 use silo::job::{ConcurrencyLimit, Limit};
 use silo::job_attempt::{AttemptOutcome, AttemptStatus};
-use silo::job_store_shard::{LeaseRecord, Task};
+use silo::task::{LeaseRecord, Task};
 use silo::keys::concurrency_holder_key;
 use silo::retry::RetryPolicy;
 

@@ -158,3 +158,13 @@ pub struct HeartbeatResult {
     /// Timestamp when cancellation was requested, if cancelled
     pub cancelled_at_ms: Option<i64>,
 }
+
+/// A leased refresh task for floating concurrency limits
+#[derive(Debug, Clone)]
+pub struct LeasedRefreshTask {
+    pub task_id: String,
+    pub queue_key: String,
+    pub current_max_concurrency: u32,
+    pub last_refreshed_at_ms: i64,
+    pub metadata: Vec<(String, String)>,
+}
