@@ -6,6 +6,9 @@ import type { ServiceInfo } from "@protobuf-ts/runtime-rpc";
 import { Silo } from "./silo";
 import type { ResetShardsResponse } from "./silo";
 import type { ResetShardsRequest } from "./silo";
+import type { ArrowIpcMessage } from "./silo";
+import type { QueryArrowRequest } from "./silo";
+import type { ServerStreamingCall } from "@protobuf-ts/runtime-rpc";
 import type { QueryResponse } from "./silo";
 import type { QueryRequest } from "./silo";
 import type { HeartbeatResponse } from "./silo";
@@ -20,6 +23,8 @@ import type { CancelJobResponse } from "./silo";
 import type { CancelJobRequest } from "./silo";
 import type { DeleteJobResponse } from "./silo";
 import type { DeleteJobRequest } from "./silo";
+import type { GetJobResultResponse } from "./silo";
+import type { GetJobResultRequest } from "./silo";
 import type { GetJobResponse } from "./silo";
 import type { GetJobRequest } from "./silo";
 import type { EnqueueResponse } from "./silo";
@@ -48,6 +53,15 @@ export interface ISiloClient {
      */
     getJob(input: GetJobRequest, options?: RpcOptions): UnaryCall<GetJobRequest, GetJobResponse>;
     /**
+     * Get the result of a completed job.
+     * Returns NOT_FOUND if the job doesn't exist.
+     * Returns FAILED_PRECONDITION if the job is not yet in a terminal state (still scheduled or running).
+     * Returns the result/error/cancellation info if the job has completed.
+     *
+     * @generated from protobuf rpc: GetJobResult
+     */
+    getJobResult(input: GetJobResultRequest, options?: RpcOptions): UnaryCall<GetJobResultRequest, GetJobResultResponse>;
+    /**
      * @generated from protobuf rpc: DeleteJob
      */
     deleteJob(input: DeleteJobRequest, options?: RpcOptions): UnaryCall<DeleteJobRequest, DeleteJobResponse>;
@@ -75,6 +89,13 @@ export interface ISiloClient {
      * @generated from protobuf rpc: Query
      */
     query(input: QueryRequest, options?: RpcOptions): UnaryCall<QueryRequest, QueryResponse>;
+    /**
+     * Streaming query that returns Arrow IPC encoded record batches
+     * First message contains the schema, subsequent messages contain record batches
+     *
+     * @generated from protobuf rpc: QueryArrow
+     */
+    queryArrow(input: QueryArrowRequest, options?: RpcOptions): ServerStreamingCall<QueryArrowRequest, ArrowIpcMessage>;
     /**
      * Admin: Reset all shards owned by this server (dev mode only)
      * Clears all data - jobs, tasks, queues, etc.
@@ -116,53 +137,75 @@ export class SiloClient implements ISiloClient, ServiceInfo {
         return stackIntercept<GetJobRequest, GetJobResponse>("unary", this._transport, method, opt, input);
     }
     /**
+     * Get the result of a completed job.
+     * Returns NOT_FOUND if the job doesn't exist.
+     * Returns FAILED_PRECONDITION if the job is not yet in a terminal state (still scheduled or running).
+     * Returns the result/error/cancellation info if the job has completed.
+     *
+     * @generated from protobuf rpc: GetJobResult
+     */
+    getJobResult(input: GetJobResultRequest, options?: RpcOptions): UnaryCall<GetJobResultRequest, GetJobResultResponse> {
+        const method = this.methods[3], opt = this._transport.mergeOptions(options);
+        return stackIntercept<GetJobResultRequest, GetJobResultResponse>("unary", this._transport, method, opt, input);
+    }
+    /**
      * @generated from protobuf rpc: DeleteJob
      */
     deleteJob(input: DeleteJobRequest, options?: RpcOptions): UnaryCall<DeleteJobRequest, DeleteJobResponse> {
-        const method = this.methods[3], opt = this._transport.mergeOptions(options);
+        const method = this.methods[4], opt = this._transport.mergeOptions(options);
         return stackIntercept<DeleteJobRequest, DeleteJobResponse>("unary", this._transport, method, opt, input);
     }
     /**
      * @generated from protobuf rpc: CancelJob
      */
     cancelJob(input: CancelJobRequest, options?: RpcOptions): UnaryCall<CancelJobRequest, CancelJobResponse> {
-        const method = this.methods[4], opt = this._transport.mergeOptions(options);
+        const method = this.methods[5], opt = this._transport.mergeOptions(options);
         return stackIntercept<CancelJobRequest, CancelJobResponse>("unary", this._transport, method, opt, input);
     }
     /**
      * @generated from protobuf rpc: LeaseTasks
      */
     leaseTasks(input: LeaseTasksRequest, options?: RpcOptions): UnaryCall<LeaseTasksRequest, LeaseTasksResponse> {
-        const method = this.methods[5], opt = this._transport.mergeOptions(options);
+        const method = this.methods[6], opt = this._transport.mergeOptions(options);
         return stackIntercept<LeaseTasksRequest, LeaseTasksResponse>("unary", this._transport, method, opt, input);
     }
     /**
      * @generated from protobuf rpc: ReportOutcome
      */
     reportOutcome(input: ReportOutcomeRequest, options?: RpcOptions): UnaryCall<ReportOutcomeRequest, ReportOutcomeResponse> {
-        const method = this.methods[6], opt = this._transport.mergeOptions(options);
+        const method = this.methods[7], opt = this._transport.mergeOptions(options);
         return stackIntercept<ReportOutcomeRequest, ReportOutcomeResponse>("unary", this._transport, method, opt, input);
     }
     /**
      * @generated from protobuf rpc: ReportRefreshOutcome
      */
     reportRefreshOutcome(input: ReportRefreshOutcomeRequest, options?: RpcOptions): UnaryCall<ReportRefreshOutcomeRequest, ReportRefreshOutcomeResponse> {
-        const method = this.methods[7], opt = this._transport.mergeOptions(options);
+        const method = this.methods[8], opt = this._transport.mergeOptions(options);
         return stackIntercept<ReportRefreshOutcomeRequest, ReportRefreshOutcomeResponse>("unary", this._transport, method, opt, input);
     }
     /**
      * @generated from protobuf rpc: Heartbeat
      */
     heartbeat(input: HeartbeatRequest, options?: RpcOptions): UnaryCall<HeartbeatRequest, HeartbeatResponse> {
-        const method = this.methods[8], opt = this._transport.mergeOptions(options);
+        const method = this.methods[9], opt = this._transport.mergeOptions(options);
         return stackIntercept<HeartbeatRequest, HeartbeatResponse>("unary", this._transport, method, opt, input);
     }
     /**
      * @generated from protobuf rpc: Query
      */
     query(input: QueryRequest, options?: RpcOptions): UnaryCall<QueryRequest, QueryResponse> {
-        const method = this.methods[9], opt = this._transport.mergeOptions(options);
+        const method = this.methods[10], opt = this._transport.mergeOptions(options);
         return stackIntercept<QueryRequest, QueryResponse>("unary", this._transport, method, opt, input);
+    }
+    /**
+     * Streaming query that returns Arrow IPC encoded record batches
+     * First message contains the schema, subsequent messages contain record batches
+     *
+     * @generated from protobuf rpc: QueryArrow
+     */
+    queryArrow(input: QueryArrowRequest, options?: RpcOptions): ServerStreamingCall<QueryArrowRequest, ArrowIpcMessage> {
+        const method = this.methods[11], opt = this._transport.mergeOptions(options);
+        return stackIntercept<QueryArrowRequest, ArrowIpcMessage>("serverStreaming", this._transport, method, opt, input);
     }
     /**
      * Admin: Reset all shards owned by this server (dev mode only)
@@ -171,7 +214,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: ResetShards
      */
     resetShards(input: ResetShardsRequest, options?: RpcOptions): UnaryCall<ResetShardsRequest, ResetShardsResponse> {
-        const method = this.methods[10], opt = this._transport.mergeOptions(options);
+        const method = this.methods[12], opt = this._transport.mergeOptions(options);
         return stackIntercept<ResetShardsRequest, ResetShardsResponse>("unary", this._transport, method, opt, input);
     }
 }

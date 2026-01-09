@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import {
   SiloGRPCClient,
+  JobStatus,
   decodePayload,
   GubernatorAlgorithm,
 } from "../src/client";
@@ -58,18 +59,18 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       const tenant = "test-tenant-123";
       const payload = { task: "routing-test" };
 
-      const jobId = await client.enqueue({
+      const handle = await client.enqueue({
         tenant,
         payload,
         priority: 10,
       });
 
-      expect(jobId).toBeTruthy();
+      expect(handle.id).toBeTruthy();
 
       // Should be able to retrieve the job using the same tenant
-      const job = await client.getJob(jobId, tenant);
+      const job = await client.getJob(handle.id, tenant);
       expect(job).toBeDefined();
-      expect(job?.id).toBe(jobId);
+      expect(job?.id).toBe(handle.id);
     });
 
     it("getShardForTenant returns consistent shard", () => {
@@ -101,20 +102,20 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       const payload = { task: "send-email", to: "test@example.com" };
       const tenant = "test-tenant";
 
-      const jobId = await client.enqueue({
+      const handle = await client.enqueue({
         tenant,
         payload,
         priority: 10,
         metadata: { source: "integration-test" },
       });
 
-      expect(jobId).toBeTruthy();
-      expect(typeof jobId).toBe("string");
+      expect(handle.id).toBeTruthy();
+      expect(typeof handle.id).toBe("string");
 
       // Retrieve the job
-      const job = await client.getJob(jobId, tenant);
+      const job = await client.getJob(handle.id, tenant);
       expect(job).toBeDefined();
-      expect(job?.id).toBe(jobId);
+      expect(job?.id).toBe(handle.id);
       expect(job?.priority).toBe(10);
       expect(job?.metadata?.source).toBe("integration-test");
 
@@ -127,13 +128,13 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       const customId = `custom-${Date.now()}`;
       const tenant = "custom-id-tenant";
 
-      const jobId = await client.enqueue({
+      const handle = await client.enqueue({
         tenant,
         id: customId,
         payload: { data: "test" },
       });
 
-      expect(jobId).toBe(customId);
+      expect(handle.id).toBe(customId);
 
       const job = await client.getJob(customId, tenant);
       expect(job?.id).toBe(customId);
@@ -142,7 +143,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
     it("enqueues a job with retry policy", async () => {
       const tenant = "retry-tenant";
 
-      const jobId = await client.enqueue({
+      const handle = await client.enqueue({
         tenant,
         payload: { data: "retry-test" },
         retryPolicy: {
@@ -154,8 +155,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         },
       });
 
-      expect(jobId).toBeTruthy();
-      const job = await client.getJob(jobId, tenant);
+      expect(handle.id).toBeTruthy();
+      const job = await client.getJob(handle.id, tenant);
       expect(job?.retryPolicy?.retryCount).toBe(3);
       expect(job?.retryPolicy?.backoffFactor).toBe(2.0);
     });
@@ -163,14 +164,14 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
     it("enqueues a job with concurrency limits", async () => {
       const tenant = "concurrency-tenant";
 
-      const jobId = await client.enqueue({
+      const handle = await client.enqueue({
         tenant,
         payload: { data: "concurrency-test" },
         limits: [{ type: "concurrency", key: "user:123", maxConcurrency: 5 }],
       });
 
-      expect(jobId).toBeTruthy();
-      const job = await client.getJob(jobId, tenant);
+      expect(handle.id).toBeTruthy();
+      const job = await client.getJob(handle.id, tenant);
       expect(job?.limits).toHaveLength(1);
 
       const limit = job!.limits[0];
@@ -184,7 +185,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
     it("enqueues a job with rate limits", async () => {
       const tenant = "rate-limit-tenant";
 
-      const jobId = await client.enqueue({
+      const handle = await client.enqueue({
         tenant,
         payload: { data: "rate-limit-test" },
         limits: [
@@ -206,8 +207,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         ],
       });
 
-      expect(jobId).toBeTruthy();
-      const job = await client.getJob(jobId, tenant);
+      expect(handle.id).toBeTruthy();
+      const job = await client.getJob(handle.id, tenant);
       expect(job?.limits).toHaveLength(1);
 
       const limit = job!.limits[0];
@@ -229,7 +230,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
     it("enqueues a job with mixed limits", async () => {
       const tenant = "mixed-limits-tenant";
 
-      const jobId = await client.enqueue({
+      const handle = await client.enqueue({
         tenant,
         payload: { data: "mixed-limits-test" },
         limits: [
@@ -244,8 +245,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         ],
       });
 
-      expect(jobId).toBeTruthy();
-      const job = await client.getJob(jobId, tenant);
+      expect(handle.id).toBeTruthy();
+      const job = await client.getJob(handle.id, tenant);
       expect(job?.limits).toHaveLength(2);
 
       expect(job!.limits[0].type).toBe("concurrency");
@@ -259,7 +260,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       const tenant = "lease-tenant";
       const payload = { action: "process", value: 42 };
 
-      const jobId = await client.enqueue({
+      const handle = await client.enqueue({
         tenant,
         id: uniqueJobId,
         payload,
@@ -276,7 +277,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
           maxTasks: 50,
           shard,
         });
-        task = tasks.find((t) => t.jobId === jobId);
+        task = tasks.find((t) => t.jobId === handle.id);
         if (!task) {
           await new Promise((r) => setTimeout(r, 100));
         }
@@ -304,7 +305,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       const uniqueJobId = `fail-test-${Date.now()}`;
       const tenant = "fail-tenant";
 
-      const jobId = await client.enqueue({
+      const handle = await client.enqueue({
         tenant,
         id: uniqueJobId,
         payload: { action: "fail-test" },
@@ -321,7 +322,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
           maxTasks: 50,
           shard,
         });
-        task = tasks.find((t) => t.jobId === jobId);
+        task = tasks.find((t) => t.jobId === handle.id);
         if (!task) {
           await new Promise((r) => setTimeout(r, 100));
         }
@@ -346,7 +347,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
     it("extends a task lease via heartbeat", async () => {
       const tenant = "heartbeat-tenant";
 
-      const jobId = await client.enqueue({
+      const handle = await client.enqueue({
         tenant,
         payload: { action: "heartbeat-test" },
         priority: 1,
@@ -361,7 +362,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         shard,
       });
 
-      const task = tasks.find((t) => t.jobId === jobId);
+      const task = tasks.find((t) => t.jobId === handle.id);
       expect(task).toBeDefined();
 
       await client.heartbeat("test-worker-3", task!.id, task!.shard, tenant);
@@ -380,15 +381,15 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       const uniqueJobId = `delete-test-${Date.now()}`;
       const tenant = "delete-tenant";
 
-      const jobId = await client.enqueue({
+      const handle = await client.enqueue({
         tenant,
         id: uniqueJobId,
         payload: { action: "delete-test" },
         priority: 1,
       });
 
-      const job = await client.getJob(jobId, tenant);
-      expect(job?.id).toBe(jobId);
+      const job = await client.getJob(handle.id, tenant);
+      expect(job?.id).toBe(handle.id);
 
       // Get the shard for this tenant to poll from the correct server
       const shard = client.getShardForTenant(tenant);
@@ -400,7 +401,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
           maxTasks: 50,
           shard,
         });
-        task = tasks.find((t) => t.jobId === jobId);
+        task = tasks.find((t) => t.jobId === handle.id);
         if (!task) {
           await new Promise((r) => setTimeout(r, 100));
         }
@@ -414,7 +415,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         outcome: { type: "success", result: {} },
       });
 
-      await client.deleteJob(jobId, tenant);
+      await client.deleteJob(handle.id, tenant);
     });
   });
 
@@ -480,6 +481,239 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       expect(typeof row?.count).toBe("number");
     });
   });
+
+  describe("JobHandle", () => {
+    it("returns a JobHandle from enqueue", async () => {
+      const tenant = "handle-enqueue-tenant";
+
+      const handle = await client.enqueue({
+        tenant,
+        payload: { test: "handle-test" },
+      });
+
+      expect(handle).toBeDefined();
+      expect(handle.id).toBeTruthy();
+      expect(handle.tenant).toBe(tenant);
+    });
+
+    it("can get job details through handle", async () => {
+      const tenant = "handle-getjob-tenant";
+      const payload = { action: "test-action" };
+
+      const handle = await client.enqueue({
+        tenant,
+        payload,
+        priority: 15,
+      });
+
+      const job = await handle.getJob();
+      expect(job).toBeDefined();
+      expect(job?.id).toBe(handle.id);
+      expect(job?.priority).toBe(15);
+      expect(decodePayload(job?.payload?.data)).toEqual(payload);
+    });
+
+    it("can get job status through handle", async () => {
+      const tenant = "handle-status-tenant";
+
+      const handle = await client.enqueue({
+        tenant,
+        payload: { test: "status-test" },
+      });
+
+      const status = await handle.getStatus();
+      expect(status).toBe(JobStatus.Scheduled);
+    });
+
+    it("can cancel job through handle", async () => {
+      const tenant = "handle-cancel-tenant";
+
+      const handle = await client.enqueue({
+        tenant,
+        payload: { test: "cancel-test" },
+      });
+
+      // Verify job exists
+      const job = await handle.getJob();
+      expect(job).toBeDefined();
+
+      // Cancel the job
+      await handle.cancel();
+
+      // Check status is cancelled (may take a moment)
+      const status = await handle.getStatus();
+      expect(status).toBe(JobStatus.Cancelled);
+    });
+
+    it("can create handle from existing job ID", async () => {
+      const tenant = "handle-factory-tenant";
+
+      // First enqueue a job
+      const originalHandle = await client.enqueue({
+        tenant,
+        payload: { test: "factory-test" },
+      });
+
+      // Create a new handle from the job ID
+      const newHandle = client.handle(originalHandle.id, tenant);
+
+      expect(newHandle.id).toBe(originalHandle.id);
+      expect(newHandle.tenant).toBe(tenant);
+
+      // Should be able to get the same job
+      const job = await newHandle.getJob();
+      expect(job?.id).toBe(originalHandle.id);
+    });
+
+    it("can delete job through handle", async () => {
+      const uniqueJobId = `handle-delete-${Date.now()}`;
+      const tenant = "handle-delete-tenant";
+
+      const handle = await client.enqueue({
+        tenant,
+        id: uniqueJobId,
+        payload: { test: "delete-test" },
+      });
+
+      // Get the shard for this tenant to poll from the correct server
+      const shard = client.getShardForTenant(tenant);
+
+      // Lease and complete the task so we can delete the job
+      let task;
+      for (let i = 0; i < 5 && !task; i++) {
+        const tasks = await client.leaseTasks({
+          workerId: `handle-delete-worker-${Date.now()}`,
+          maxTasks: 50,
+          shard,
+        });
+        task = tasks.find((t) => t.jobId === handle.id);
+        if (!task) {
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      }
+      expect(task).toBeDefined();
+
+      await client.reportOutcome({
+        shard: task!.shard,
+        taskId: task!.id,
+        tenant,
+        outcome: { type: "success", result: {} },
+      });
+
+      // Delete through handle
+      await handle.delete();
+
+      // Job should no longer exist (or be in terminal state)
+      // Note: The exact behavior depends on server implementation
+    });
+
+    it("can await job result for successful job", async () => {
+      const tenant = "handle-await-success-tenant";
+      const resultData = { processed: true, count: 42 };
+
+      const handle = await client.enqueue({
+        tenant,
+        payload: { test: "await-test" },
+      });
+
+      // Get the shard for this tenant to poll from the correct server
+      const shard = client.getShardForTenant(tenant);
+
+      // Lease and complete the task
+      let task;
+      for (let i = 0; i < 5 && !task; i++) {
+        const tasks = await client.leaseTasks({
+          workerId: `handle-await-worker-${Date.now()}`,
+          maxTasks: 50,
+          shard,
+        });
+        task = tasks.find((t) => t.jobId === handle.id);
+        if (!task) {
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      }
+      expect(task).toBeDefined();
+
+      await client.reportOutcome({
+        shard: task!.shard,
+        taskId: task!.id,
+        tenant,
+        outcome: { type: "success", result: resultData },
+      });
+
+      // Await the result
+      const result = await handle.awaitResult<typeof resultData>({
+        pollIntervalMs: 100,
+        timeoutMs: 5000,
+      });
+
+      expect(result.status).toBe(JobStatus.Succeeded);
+      expect(result.result).toEqual(resultData);
+    });
+
+    it("can await job result for failed job", async () => {
+      const tenant = "handle-await-fail-tenant";
+
+      const handle = await client.enqueue({
+        tenant,
+        payload: { test: "await-fail-test" },
+      });
+
+      // Get the shard for this tenant to poll from the correct server
+      const shard = client.getShardForTenant(tenant);
+
+      // Lease and fail the task
+      let task;
+      for (let i = 0; i < 5 && !task; i++) {
+        const tasks = await client.leaseTasks({
+          workerId: `handle-await-fail-worker-${Date.now()}`,
+          maxTasks: 50,
+          shard,
+        });
+        task = tasks.find((t) => t.jobId === handle.id);
+        if (!task) {
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      }
+      expect(task).toBeDefined();
+
+      await client.reportOutcome({
+        shard: task!.shard,
+        taskId: task!.id,
+        tenant,
+        outcome: {
+          type: "failure",
+          code: "TEST_ERROR",
+          data: { reason: "test failure" },
+        },
+      });
+
+      // Await the result
+      const result = await handle.awaitResult({
+        pollIntervalMs: 100,
+        timeoutMs: 5000,
+      });
+
+      expect(result.status).toBe(JobStatus.Failed);
+      expect(result.errorCode).toBe("TEST_ERROR");
+    });
+
+    it("throws timeout error when job does not complete in time", async () => {
+      const tenant = "handle-await-timeout-tenant";
+
+      const handle = await client.enqueue({
+        tenant,
+        payload: { test: "timeout-test" },
+        // Schedule far in the future so it won't be leased
+        startAtMs: BigInt(Date.now() + 60000),
+      });
+
+      // Try to await with a short timeout - should fail
+      await expect(
+        handle.awaitResult({ pollIntervalMs: 50, timeoutMs: 200 })
+      ).rejects.toThrow(/Timeout/);
+    });
+  });
 });
 
 describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
@@ -503,11 +737,11 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
         await client.refreshTopology();
 
         // Now requests should work because we've discovered the actual topology
-        const jobId = await client.enqueue({
+        const handle = await client.enqueue({
           tenant: "wrong-shard-test",
           payload: { test: true },
         });
-        expect(jobId).toBeTruthy();
+        expect(handle.id).toBeTruthy();
       } finally {
         client.close();
       }
@@ -530,14 +764,14 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
         await client.refreshTopology();
 
         // Now operations should work
-        const jobId = await client.enqueue({
+        const handle = await client.enqueue({
           tenant: "retry-test-tenant",
           payload: { data: "retry test" },
         });
-        expect(jobId).toBeTruthy();
+        expect(handle.id).toBeTruthy();
 
-        const job = await client.getJob(jobId, "retry-test-tenant");
-        expect(job?.id).toBe(jobId);
+        const job = await client.getJob(handle.id, "retry-test-tenant");
+        expect(job?.id).toBe(handle.id);
       } finally {
         client.close();
       }
@@ -559,11 +793,11 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
         await client.refreshTopology();
 
         const tenants = ["tenant-a", "tenant-b", "tenant-c"];
-        const jobIds: Record<string, string> = {};
+        const handles: Record<string, { id: string }> = {};
 
         // Enqueue jobs for different tenants
         for (const tenant of tenants) {
-          jobIds[tenant] = await client.enqueue({
+          handles[tenant] = await client.enqueue({
             tenant,
             payload: { tenant },
           });
@@ -571,8 +805,8 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
 
         // Verify each job can be retrieved with its tenant
         for (const tenant of tenants) {
-          const job = await client.getJob(jobIds[tenant], tenant);
-          expect(job?.id).toBe(jobIds[tenant]);
+          const job = await client.getJob(handles[tenant].id, tenant);
+          expect(job?.id).toBe(handles[tenant].id);
 
           const payload = decodePayload<{ tenant: string }>(job?.payload?.data);
           expect(payload?.tenant).toBe(tenant);
@@ -601,11 +835,11 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
         // Enqueue jobs for many tenants
         for (let i = 0; i < numTenants; i++) {
           const tenant = `bulk-tenant-${i}`;
-          const jobId = await client.enqueue({
+          const handle = await client.enqueue({
             tenant,
             payload: { index: i },
           });
-          results.push({ tenant, jobId });
+          results.push({ tenant, jobId: handle.id });
         }
 
         // Verify random sample can be retrieved
@@ -665,7 +899,7 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
 
         // Enqueue before refresh
         await client.refreshTopology();
-        const jobId1 = await client.enqueue({
+        const handle1 = await client.enqueue({
           tenant,
           payload: { phase: "before" },
         });
@@ -674,17 +908,17 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
         await client.refreshTopology();
 
         // Enqueue after refresh
-        const jobId2 = await client.enqueue({
+        const handle2 = await client.enqueue({
           tenant,
           payload: { phase: "after" },
         });
 
         // Both jobs should be retrievable
-        const job1 = await client.getJob(jobId1, tenant);
-        const job2 = await client.getJob(jobId2, tenant);
+        const job1 = await client.getJob(handle1.id, tenant);
+        const job2 = await client.getJob(handle2.id, tenant);
 
-        expect(job1?.id).toBe(jobId1);
-        expect(job2?.id).toBe(jobId2);
+        expect(job1?.id).toBe(handle1.id);
+        expect(job2?.id).toBe(handle2.id);
       } finally {
         client.close();
       }
@@ -711,11 +945,11 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
         expect(topology.numShards).toBeGreaterThanOrEqual(1);
 
         // Operations should work
-        const jobId = await client.enqueue({
+        const handle = await client.enqueue({
           tenant: "multi-server-test",
           payload: { test: true },
         });
-        expect(jobId).toBeTruthy();
+        expect(handle.id).toBeTruthy();
       } finally {
         client.close();
       }
@@ -736,11 +970,11 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
       try {
         await client.refreshTopology();
 
-        const jobId = await client.enqueue({
+        const handle = await client.enqueue({
           tenant: "host-port-test",
           payload: { test: true },
         });
-        expect(jobId).toBeTruthy();
+        expect(handle.id).toBeTruthy();
       } finally {
         client.close();
       }

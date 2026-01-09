@@ -283,6 +283,107 @@ export interface GetJobResponse {
     metadata: {
         [key: string]: string;
     }; // arbitrary key/value metadata stored with the job
+    /**
+     * @generated from protobuf field: silo.v1.JobStatus status = 8
+     */
+    status: JobStatus; // current job status
+    /**
+     * @generated from protobuf field: int64 status_changed_at_ms = 9
+     */
+    statusChangedAtMs: bigint; // when the status last changed (epoch ms)
+}
+/**
+ * Get the result of a completed job.
+ * Returns the job's result data if succeeded, error info if failed, or an error if the job
+ * is not in a terminal state (still running/scheduled) or doesn't exist.
+ *
+ * @generated from protobuf message silo.v1.GetJobResultRequest
+ */
+export interface GetJobResultRequest {
+    /**
+     * @generated from protobuf field: uint32 shard = 1
+     */
+    shard: number;
+    /**
+     * @generated from protobuf field: string id = 2
+     */
+    id: string;
+    /**
+     * @generated from protobuf field: optional string tenant = 3
+     */
+    tenant?: string;
+}
+/**
+ * Response for GetJobResult - the result depends on the job's terminal state.
+ * Use the oneof to determine which outcome occurred.
+ *
+ * @generated from protobuf message silo.v1.GetJobResultResponse
+ */
+export interface GetJobResultResponse {
+    /**
+     * @generated from protobuf field: string id = 1
+     */
+    id: string;
+    /**
+     * @generated from protobuf field: silo.v1.JobStatus status = 2
+     */
+    status: JobStatus; // The terminal status: SUCCEEDED, FAILED, or CANCELLED
+    /**
+     * @generated from protobuf field: int64 finished_at_ms = 3
+     */
+    finishedAtMs: bigint; // When the job reached its terminal state (epoch ms)
+    /**
+     * The result data depends on the terminal status
+     *
+     * @generated from protobuf oneof: result
+     */
+    result: {
+        oneofKind: "successData";
+        /**
+         * @generated from protobuf field: silo.v1.JsonValueBytes success_data = 4
+         */
+        successData: JsonValueBytes; // Result data if status == SUCCEEDED
+    } | {
+        oneofKind: "failure";
+        /**
+         * @generated from protobuf field: silo.v1.JobFailure failure = 5
+         */
+        failure: JobFailure; // Error info if status == FAILED
+    } | {
+        oneofKind: "cancelled";
+        /**
+         * @generated from protobuf field: silo.v1.JobCancelled cancelled = 6
+         */
+        cancelled: JobCancelled; // Cancellation info if status == CANCELLED
+    } | {
+        oneofKind: undefined;
+    };
+}
+/**
+ * Information about a failed job
+ *
+ * @generated from protobuf message silo.v1.JobFailure
+ */
+export interface JobFailure {
+    /**
+     * @generated from protobuf field: string error_code = 1
+     */
+    errorCode: string; // Application-defined error code
+    /**
+     * @generated from protobuf field: bytes error_data = 2
+     */
+    errorData: Uint8Array; // Error details (typically JSON)
+}
+/**
+ * Information about a cancelled job
+ *
+ * @generated from protobuf message silo.v1.JobCancelled
+ */
+export interface JobCancelled {
+    /**
+     * @generated from protobuf field: int64 cancelled_at_ms = 1
+     */
+    cancelledAtMs: bigint; // When the job was cancelled (epoch ms)
 }
 /**
  * @generated from protobuf message silo.v1.DeleteJobRequest
@@ -597,7 +698,7 @@ export interface HeartbeatResponse {
     cancelledAtMs?: bigint;
 }
 /**
- * Execute SQL query against shard data
+ * Execute an arbitrary SQL query against shard data
  *
  * @generated from protobuf message silo.v1.QueryRequest
  */
@@ -648,6 +749,38 @@ export interface QueryResponse {
      * @generated from protobuf field: int32 row_count = 3
      */
     rowCount: number; // Number of rows returned
+}
+/**
+ * Execute SQL query with Arrow IPC streaming response
+ *
+ * @generated from protobuf message silo.v1.QueryArrowRequest
+ */
+export interface QueryArrowRequest {
+    /**
+     * @generated from protobuf field: uint32 shard = 1
+     */
+    shard: number;
+    /**
+     * @generated from protobuf field: string sql = 2
+     */
+    sql: string;
+    /**
+     * @generated from protobuf field: optional string tenant = 3
+     */
+    tenant?: string;
+}
+/**
+ * Arrow IPC encoded schema or record batch
+ *
+ * @generated from protobuf message silo.v1.ArrowIpcMessage
+ */
+export interface ArrowIpcMessage {
+    /**
+     * Arrow IPC stream format: first message is schema, subsequent are record batches
+     *
+     * @generated from protobuf field: bytes ipc_data = 1
+     */
+    ipcData: Uint8Array;
 }
 /**
  * Cluster topology information for client-side routing
@@ -773,6 +906,43 @@ export enum GubernatorBehavior {
      * @generated from protobuf enum value: GUBERNATOR_BEHAVIOR_DRAIN_OVER_LIMIT = 16;
      */
     DRAIN_OVER_LIMIT = 16
+}
+/**
+ * Job status enum representing the current state of a job
+ *
+ * @generated from protobuf enum silo.v1.JobStatus
+ */
+export enum JobStatus {
+    /**
+     * Job is waiting to be executed
+     *
+     * @generated from protobuf enum value: JOB_STATUS_SCHEDULED = 0;
+     */
+    SCHEDULED = 0,
+    /**
+     * Job is currently being processed by a worker
+     *
+     * @generated from protobuf enum value: JOB_STATUS_RUNNING = 1;
+     */
+    RUNNING = 1,
+    /**
+     * Job completed successfully
+     *
+     * @generated from protobuf enum value: JOB_STATUS_SUCCEEDED = 2;
+     */
+    SUCCEEDED = 2,
+    /**
+     * Job failed after exhausting all retries
+     *
+     * @generated from protobuf enum value: JOB_STATUS_FAILED = 3;
+     */
+    FAILED = 3,
+    /**
+     * Job was cancelled before completion
+     *
+     * @generated from protobuf enum value: JOB_STATUS_CANCELLED = 4;
+     */
+    CANCELLED = 4
 }
 // @generated message type with reflection information, may provide speed optimized methods
 class JsonValueBytes$Type extends MessageType<JsonValueBytes> {
@@ -1528,7 +1698,9 @@ class GetJobResponse$Type extends MessageType<GetJobResponse> {
             { no: 4, name: "payload", kind: "message", T: () => JsonValueBytes },
             { no: 5, name: "retry_policy", kind: "message", T: () => RetryPolicy },
             { no: 6, name: "limits", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => Limit },
-            { no: 7, name: "metadata", kind: "map", K: 9 /*ScalarType.STRING*/, V: { kind: "scalar", T: 9 /*ScalarType.STRING*/ } }
+            { no: 7, name: "metadata", kind: "map", K: 9 /*ScalarType.STRING*/, V: { kind: "scalar", T: 9 /*ScalarType.STRING*/ } },
+            { no: 8, name: "status", kind: "enum", T: () => ["silo.v1.JobStatus", JobStatus, "JOB_STATUS_"] },
+            { no: 9, name: "status_changed_at_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ }
         ]);
     }
     create(value?: PartialMessage<GetJobResponse>): GetJobResponse {
@@ -1538,6 +1710,8 @@ class GetJobResponse$Type extends MessageType<GetJobResponse> {
         message.enqueueTimeMs = 0n;
         message.limits = [];
         message.metadata = {};
+        message.status = 0;
+        message.statusChangedAtMs = 0n;
         if (value !== undefined)
             reflectionMergePartial<GetJobResponse>(this, message, value);
         return message;
@@ -1567,6 +1741,12 @@ class GetJobResponse$Type extends MessageType<GetJobResponse> {
                     break;
                 case /* map<string, string> metadata */ 7:
                     this.binaryReadMap7(message.metadata, reader, options);
+                    break;
+                case /* silo.v1.JobStatus status */ 8:
+                    message.status = reader.int32();
+                    break;
+                case /* int64 status_changed_at_ms */ 9:
+                    message.statusChangedAtMs = reader.int64().toBigInt();
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -1617,6 +1797,12 @@ class GetJobResponse$Type extends MessageType<GetJobResponse> {
         /* map<string, string> metadata = 7; */
         for (let k of globalThis.Object.keys(message.metadata))
             writer.tag(7, WireType.LengthDelimited).fork().tag(1, WireType.LengthDelimited).string(k).tag(2, WireType.LengthDelimited).string(message.metadata[k]).join();
+        /* silo.v1.JobStatus status = 8; */
+        if (message.status !== 0)
+            writer.tag(8, WireType.Varint).int32(message.status);
+        /* int64 status_changed_at_ms = 9; */
+        if (message.statusChangedAtMs !== 0n)
+            writer.tag(9, WireType.Varint).int64(message.statusChangedAtMs);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -1627,6 +1813,264 @@ class GetJobResponse$Type extends MessageType<GetJobResponse> {
  * @generated MessageType for protobuf message silo.v1.GetJobResponse
  */
 export const GetJobResponse = new GetJobResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class GetJobResultRequest$Type extends MessageType<GetJobResultRequest> {
+    constructor() {
+        super("silo.v1.GetJobResultRequest", [
+            { no: 1, name: "shard", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
+            { no: 2, name: "id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 3, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value?: PartialMessage<GetJobResultRequest>): GetJobResultRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.shard = 0;
+        message.id = "";
+        if (value !== undefined)
+            reflectionMergePartial<GetJobResultRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: GetJobResultRequest): GetJobResultRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* uint32 shard */ 1:
+                    message.shard = reader.uint32();
+                    break;
+                case /* string id */ 2:
+                    message.id = reader.string();
+                    break;
+                case /* optional string tenant */ 3:
+                    message.tenant = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: GetJobResultRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* uint32 shard = 1; */
+        if (message.shard !== 0)
+            writer.tag(1, WireType.Varint).uint32(message.shard);
+        /* string id = 2; */
+        if (message.id !== "")
+            writer.tag(2, WireType.LengthDelimited).string(message.id);
+        /* optional string tenant = 3; */
+        if (message.tenant !== undefined)
+            writer.tag(3, WireType.LengthDelimited).string(message.tenant);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.GetJobResultRequest
+ */
+export const GetJobResultRequest = new GetJobResultRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class GetJobResultResponse$Type extends MessageType<GetJobResultResponse> {
+    constructor() {
+        super("silo.v1.GetJobResultResponse", [
+            { no: 1, name: "id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "status", kind: "enum", T: () => ["silo.v1.JobStatus", JobStatus, "JOB_STATUS_"] },
+            { no: 3, name: "finished_at_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 4, name: "success_data", kind: "message", oneof: "result", T: () => JsonValueBytes },
+            { no: 5, name: "failure", kind: "message", oneof: "result", T: () => JobFailure },
+            { no: 6, name: "cancelled", kind: "message", oneof: "result", T: () => JobCancelled }
+        ]);
+    }
+    create(value?: PartialMessage<GetJobResultResponse>): GetJobResultResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.id = "";
+        message.status = 0;
+        message.finishedAtMs = 0n;
+        message.result = { oneofKind: undefined };
+        if (value !== undefined)
+            reflectionMergePartial<GetJobResultResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: GetJobResultResponse): GetJobResultResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string id */ 1:
+                    message.id = reader.string();
+                    break;
+                case /* silo.v1.JobStatus status */ 2:
+                    message.status = reader.int32();
+                    break;
+                case /* int64 finished_at_ms */ 3:
+                    message.finishedAtMs = reader.int64().toBigInt();
+                    break;
+                case /* silo.v1.JsonValueBytes success_data */ 4:
+                    message.result = {
+                        oneofKind: "successData",
+                        successData: JsonValueBytes.internalBinaryRead(reader, reader.uint32(), options, (message.result as any).successData)
+                    };
+                    break;
+                case /* silo.v1.JobFailure failure */ 5:
+                    message.result = {
+                        oneofKind: "failure",
+                        failure: JobFailure.internalBinaryRead(reader, reader.uint32(), options, (message.result as any).failure)
+                    };
+                    break;
+                case /* silo.v1.JobCancelled cancelled */ 6:
+                    message.result = {
+                        oneofKind: "cancelled",
+                        cancelled: JobCancelled.internalBinaryRead(reader, reader.uint32(), options, (message.result as any).cancelled)
+                    };
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: GetJobResultResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string id = 1; */
+        if (message.id !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.id);
+        /* silo.v1.JobStatus status = 2; */
+        if (message.status !== 0)
+            writer.tag(2, WireType.Varint).int32(message.status);
+        /* int64 finished_at_ms = 3; */
+        if (message.finishedAtMs !== 0n)
+            writer.tag(3, WireType.Varint).int64(message.finishedAtMs);
+        /* silo.v1.JsonValueBytes success_data = 4; */
+        if (message.result.oneofKind === "successData")
+            JsonValueBytes.internalBinaryWrite(message.result.successData, writer.tag(4, WireType.LengthDelimited).fork(), options).join();
+        /* silo.v1.JobFailure failure = 5; */
+        if (message.result.oneofKind === "failure")
+            JobFailure.internalBinaryWrite(message.result.failure, writer.tag(5, WireType.LengthDelimited).fork(), options).join();
+        /* silo.v1.JobCancelled cancelled = 6; */
+        if (message.result.oneofKind === "cancelled")
+            JobCancelled.internalBinaryWrite(message.result.cancelled, writer.tag(6, WireType.LengthDelimited).fork(), options).join();
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.GetJobResultResponse
+ */
+export const GetJobResultResponse = new GetJobResultResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class JobFailure$Type extends MessageType<JobFailure> {
+    constructor() {
+        super("silo.v1.JobFailure", [
+            { no: 1, name: "error_code", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "error_data", kind: "scalar", T: 12 /*ScalarType.BYTES*/ }
+        ]);
+    }
+    create(value?: PartialMessage<JobFailure>): JobFailure {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.errorCode = "";
+        message.errorData = new Uint8Array(0);
+        if (value !== undefined)
+            reflectionMergePartial<JobFailure>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: JobFailure): JobFailure {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string error_code */ 1:
+                    message.errorCode = reader.string();
+                    break;
+                case /* bytes error_data */ 2:
+                    message.errorData = reader.bytes();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: JobFailure, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string error_code = 1; */
+        if (message.errorCode !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.errorCode);
+        /* bytes error_data = 2; */
+        if (message.errorData.length)
+            writer.tag(2, WireType.LengthDelimited).bytes(message.errorData);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.JobFailure
+ */
+export const JobFailure = new JobFailure$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class JobCancelled$Type extends MessageType<JobCancelled> {
+    constructor() {
+        super("silo.v1.JobCancelled", [
+            { no: 1, name: "cancelled_at_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ }
+        ]);
+    }
+    create(value?: PartialMessage<JobCancelled>): JobCancelled {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.cancelledAtMs = 0n;
+        if (value !== undefined)
+            reflectionMergePartial<JobCancelled>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: JobCancelled): JobCancelled {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* int64 cancelled_at_ms */ 1:
+                    message.cancelledAtMs = reader.int64().toBigInt();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: JobCancelled, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* int64 cancelled_at_ms = 1; */
+        if (message.cancelledAtMs !== 0n)
+            writer.tag(1, WireType.Varint).int64(message.cancelledAtMs);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.JobCancelled
+ */
+export const JobCancelled = new JobCancelled$Type();
 // @generated message type with reflection information, may provide speed optimized methods
 class DeleteJobRequest$Type extends MessageType<DeleteJobRequest> {
     constructor() {
@@ -2893,6 +3337,115 @@ class QueryResponse$Type extends MessageType<QueryResponse> {
  */
 export const QueryResponse = new QueryResponse$Type();
 // @generated message type with reflection information, may provide speed optimized methods
+class QueryArrowRequest$Type extends MessageType<QueryArrowRequest> {
+    constructor() {
+        super("silo.v1.QueryArrowRequest", [
+            { no: 1, name: "shard", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
+            { no: 2, name: "sql", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 3, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value?: PartialMessage<QueryArrowRequest>): QueryArrowRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.shard = 0;
+        message.sql = "";
+        if (value !== undefined)
+            reflectionMergePartial<QueryArrowRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: QueryArrowRequest): QueryArrowRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* uint32 shard */ 1:
+                    message.shard = reader.uint32();
+                    break;
+                case /* string sql */ 2:
+                    message.sql = reader.string();
+                    break;
+                case /* optional string tenant */ 3:
+                    message.tenant = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: QueryArrowRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* uint32 shard = 1; */
+        if (message.shard !== 0)
+            writer.tag(1, WireType.Varint).uint32(message.shard);
+        /* string sql = 2; */
+        if (message.sql !== "")
+            writer.tag(2, WireType.LengthDelimited).string(message.sql);
+        /* optional string tenant = 3; */
+        if (message.tenant !== undefined)
+            writer.tag(3, WireType.LengthDelimited).string(message.tenant);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.QueryArrowRequest
+ */
+export const QueryArrowRequest = new QueryArrowRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class ArrowIpcMessage$Type extends MessageType<ArrowIpcMessage> {
+    constructor() {
+        super("silo.v1.ArrowIpcMessage", [
+            { no: 1, name: "ipc_data", kind: "scalar", T: 12 /*ScalarType.BYTES*/ }
+        ]);
+    }
+    create(value?: PartialMessage<ArrowIpcMessage>): ArrowIpcMessage {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.ipcData = new Uint8Array(0);
+        if (value !== undefined)
+            reflectionMergePartial<ArrowIpcMessage>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: ArrowIpcMessage): ArrowIpcMessage {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* bytes ipc_data */ 1:
+                    message.ipcData = reader.bytes();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: ArrowIpcMessage, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* bytes ipc_data = 1; */
+        if (message.ipcData.length)
+            writer.tag(1, WireType.LengthDelimited).bytes(message.ipcData);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.ArrowIpcMessage
+ */
+export const ArrowIpcMessage = new ArrowIpcMessage$Type();
+// @generated message type with reflection information, may provide speed optimized methods
 class GetClusterInfoRequest$Type extends MessageType<GetClusterInfoRequest> {
     constructor() {
         super("silo.v1.GetClusterInfoRequest", []);
@@ -3156,6 +3709,7 @@ export const Silo = new ServiceType("silo.v1.Silo", [
     { name: "GetClusterInfo", options: {}, I: GetClusterInfoRequest, O: GetClusterInfoResponse },
     { name: "Enqueue", options: {}, I: EnqueueRequest, O: EnqueueResponse },
     { name: "GetJob", options: {}, I: GetJobRequest, O: GetJobResponse },
+    { name: "GetJobResult", options: {}, I: GetJobResultRequest, O: GetJobResultResponse },
     { name: "DeleteJob", options: {}, I: DeleteJobRequest, O: DeleteJobResponse },
     { name: "CancelJob", options: {}, I: CancelJobRequest, O: CancelJobResponse },
     { name: "LeaseTasks", options: {}, I: LeaseTasksRequest, O: LeaseTasksResponse },
@@ -3163,5 +3717,6 @@ export const Silo = new ServiceType("silo.v1.Silo", [
     { name: "ReportRefreshOutcome", options: {}, I: ReportRefreshOutcomeRequest, O: ReportRefreshOutcomeResponse },
     { name: "Heartbeat", options: {}, I: HeartbeatRequest, O: HeartbeatResponse },
     { name: "Query", options: {}, I: QueryRequest, O: QueryResponse },
+    { name: "QueryArrow", serverStreaming: true, options: {}, I: QueryArrowRequest, O: ArrowIpcMessage },
     { name: "ResetShards", options: {}, I: ResetShardsRequest, O: ResetShardsResponse }
 ]);

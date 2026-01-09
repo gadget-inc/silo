@@ -1,13 +1,20 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   SiloGRPCClient,
+  JobStatus,
+  JobNotFoundError,
+  JobNotTerminalError,
+  TaskNotFoundError,
   encodePayload,
   decodePayload,
   fnv1a32,
   defaultTenantToShard,
   type EnqueueJobOptions,
   type SiloGRPCClientOptions,
+  type AwaitJobOptions,
+  type JobResult,
 } from "../src/client";
+import { JobHandle } from "../src/JobHandle";
 
 describe("fnv1a32", () => {
   it("returns consistent hash for same input", () => {
@@ -403,5 +410,175 @@ describe("SiloGRPCClient", () => {
         expect(topology.shardToServer).toBeInstanceOf(Map);
       });
     });
+
+    describe("handle factory", () => {
+      it("creates a JobHandle for an existing job ID", () => {
+        const client = createClient({
+          servers: "localhost:50051",
+          ...defaultOptions,
+        });
+
+        const handle = client.handle("job-123", "tenant-a");
+
+        expect(handle).toBeInstanceOf(JobHandle);
+        expect(handle.id).toBe("job-123");
+        expect(handle.tenant).toBe("tenant-a");
+      });
+
+      it("creates a JobHandle without tenant", () => {
+        const client = createClient({
+          servers: "localhost:50051",
+          ...defaultOptions,
+        });
+
+        const handle = client.handle("job-456");
+
+        expect(handle).toBeInstanceOf(JobHandle);
+        expect(handle.id).toBe("job-456");
+        expect(handle.tenant).toBeUndefined();
+      });
+    });
+  });
+});
+
+describe("JobStatus enum", () => {
+  it("has valid status values", () => {
+    const statuses: JobStatus[] = [
+      JobStatus.Scheduled,
+      JobStatus.Running,
+      JobStatus.Succeeded,
+      JobStatus.Failed,
+      JobStatus.Cancelled,
+    ];
+    expect(statuses).toHaveLength(5);
+  });
+
+  it("has string values matching the enum key", () => {
+    expect(JobStatus.Scheduled).toBe("Scheduled");
+    expect(JobStatus.Running).toBe("Running");
+    expect(JobStatus.Succeeded).toBe("Succeeded");
+    expect(JobStatus.Failed).toBe("Failed");
+    expect(JobStatus.Cancelled).toBe("Cancelled");
+  });
+});
+
+describe("JobResult type", () => {
+  it("represents successful result", () => {
+    const result: JobResult<{ count: number }> = {
+      status: JobStatus.Succeeded,
+      result: { count: 10 },
+    };
+    expect(result.status).toBe(JobStatus.Succeeded);
+    expect(result.result?.count).toBe(10);
+  });
+
+  it("represents failed result", () => {
+    const result: JobResult = {
+      status: JobStatus.Failed,
+      errorCode: "ERR_001",
+      errorData: { details: "Something went wrong" },
+    };
+    expect(result.status).toBe(JobStatus.Failed);
+    expect(result.errorCode).toBe("ERR_001");
+  });
+
+  it("represents cancelled result", () => {
+    const result: JobResult = {
+      status: JobStatus.Cancelled,
+    };
+    expect(result.status).toBe(JobStatus.Cancelled);
+  });
+});
+
+describe("AwaitJobOptions type", () => {
+  it("allows minimal options", () => {
+    const options: AwaitJobOptions = {};
+    expect(options.pollIntervalMs).toBeUndefined();
+    expect(options.timeoutMs).toBeUndefined();
+  });
+
+  it("allows full options", () => {
+    const options: AwaitJobOptions = {
+      pollIntervalMs: 100,
+      timeoutMs: 5000,
+    };
+    expect(options.pollIntervalMs).toBe(100);
+    expect(options.timeoutMs).toBe(5000);
+  });
+});
+
+describe("JobNotFoundError", () => {
+  it("formats error message with job id and tenant", () => {
+    const error = new JobNotFoundError("job-123", "tenant-abc");
+    expect(error.message).toBe(
+      'Job "job-123" not found in tenant "tenant-abc"'
+    );
+    expect(error.name).toBe("JobNotFoundError");
+    expect(error.code).toBe("SILO_JOB_NOT_FOUND");
+    expect(error.jobId).toBe("job-123");
+    expect(error.tenant).toBe("tenant-abc");
+  });
+
+  it("formats error message without tenant", () => {
+    const error = new JobNotFoundError("job-456");
+    expect(error.message).toBe('Job "job-456" not found');
+    expect(error.name).toBe("JobNotFoundError");
+    expect(error.jobId).toBe("job-456");
+    expect(error.tenant).toBeUndefined();
+  });
+
+  it("is an instance of Error", () => {
+    const error = new JobNotFoundError("job-789");
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toBeInstanceOf(JobNotFoundError);
+  });
+});
+
+describe("JobNotTerminalError", () => {
+  it("formats error message with job id, tenant, and status", () => {
+    const error = new JobNotTerminalError(
+      "job-123",
+      "tenant-abc",
+      JobStatus.Running
+    );
+    expect(error.message).toBe(
+      'Job "job-123" in tenant "tenant-abc" is not in a terminal state (current status: Running)'
+    );
+    expect(error.name).toBe("JobNotTerminalError");
+    expect(error.code).toBe("SILO_JOB_NOT_TERMINAL");
+    expect(error.jobId).toBe("job-123");
+    expect(error.tenant).toBe("tenant-abc");
+    expect(error.currentStatus).toBe(JobStatus.Running);
+  });
+
+  it("formats error message without tenant or status", () => {
+    const error = new JobNotTerminalError("job-456");
+    expect(error.message).toBe('Job "job-456" is not in a terminal state');
+    expect(error.name).toBe("JobNotTerminalError");
+    expect(error.jobId).toBe("job-456");
+    expect(error.tenant).toBeUndefined();
+    expect(error.currentStatus).toBeUndefined();
+  });
+
+  it("is an instance of Error", () => {
+    const error = new JobNotTerminalError("job-789");
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toBeInstanceOf(JobNotTerminalError);
+  });
+});
+
+describe("TaskNotFoundError", () => {
+  it("formats error message with task id", () => {
+    const error = new TaskNotFoundError("task-123");
+    expect(error.message).toBe('Task "task-123" not found');
+    expect(error.name).toBe("TaskNotFoundError");
+    expect(error.code).toBe("SILO_TASK_NOT_FOUND");
+    expect(error.taskId).toBe("task-123");
+  });
+
+  it("is an instance of Error", () => {
+    const error = new TaskNotFoundError("task-789");
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toBeInstanceOf(TaskNotFoundError);
   });
 });

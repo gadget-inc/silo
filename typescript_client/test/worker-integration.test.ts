@@ -1,4 +1,12 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
+import {
+  describe,
+  it,
+  expect,
+  beforeAll,
+  afterAll,
+  beforeEach,
+  afterEach,
+} from "vitest";
 import { SiloGRPCClient, decodePayload } from "../src/client";
 import {
   SiloWorker,
@@ -257,7 +265,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       const worker = createWorker(handler);
       worker.start();
 
-      const jobId = await client.enqueue({
+      const handle = await client.enqueue({
         tenant: DEFAULT_TENANT,
         payload: { action: "fail" },
         priority: 1,
@@ -267,7 +275,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       await waitFor(() => taskProcessed);
 
       // Job should still exist but task completed with failure
-      const job = await client.getJob(jobId, DEFAULT_TENANT);
+      const job = await client.getJob(handle.id, DEFAULT_TENANT);
       expect(job).toBeDefined();
     });
 
