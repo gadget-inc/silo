@@ -1,5 +1,9 @@
 export {
   SiloGRPCClient,
+  JobStatus,
+  JobNotFoundError,
+  JobNotTerminalError,
+  TaskNotFoundError,
   encodePayload,
   decodePayload,
   fnv1a32,
@@ -14,6 +18,8 @@ export {
   type FailureOutcome,
   type TaskOutcome,
   type Job,
+  type JobResult,
+  type AwaitJobOptions,
   type JobLimit,
   type ConcurrencyLimitConfig,
   type RateLimitConfig,
@@ -22,8 +28,17 @@ export {
   type TenantToShardFn,
   type ShardOwner,
 } from "./client";
-
-export { SiloWorker, type SiloWorkerOptions, type TaskContext, type TaskHandler } from "./worker";
-
-// Re-export useful types from generated code
-export type { QueryResponse, RetryPolicy, Task, ColumnInfo, Failure } from "./pb/silo";
+export {
+  SiloWorker,
+  type SiloWorkerOptions,
+  type TaskContext,
+  type TaskHandler,
+} from "./worker";
+export { JobHandle } from "./JobHandle";
+export type {
+  QueryResponse,
+  RetryPolicy,
+  Task,
+  ColumnInfo,
+  Failure,
+} from "./pb/silo";

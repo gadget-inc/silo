@@ -13,10 +13,77 @@ import type {
   Task,
   ShardOwner,
 } from "./pb/silo";
-import { GubernatorAlgorithm, GubernatorBehavior } from "./pb/silo";
+import {
+  GubernatorAlgorithm,
+  GubernatorBehavior,
+  JobStatus as ProtoJobStatus,
+} from "./pb/silo";
+import { JobHandle } from "./JobHandle";
 
 export type { QueryResponse, RetryPolicy, Task, ShardOwner };
 export { GubernatorAlgorithm, GubernatorBehavior };
+
+/**
+ * Error thrown when a job is not found.
+ */
+export class JobNotFoundError extends Error {
+  code = "SILO_JOB_NOT_FOUND";
+
+  /** The job ID that was not found */
+  public readonly jobId: string;
+  /** The tenant ID used for the lookup */
+  public readonly tenant?: string;
+
+  constructor(jobId: string, tenant?: string) {
+    const tenantMsg = tenant ? ` in tenant "${tenant}"` : "";
+    super(`Job "${jobId}" not found${tenantMsg}`);
+    this.name = "JobNotFoundError";
+    this.jobId = jobId;
+    this.tenant = tenant;
+  }
+}
+
+/**
+ * Error thrown when trying to get a job's result before it has reached a terminal state.
+ */
+export class JobNotTerminalError extends Error {
+  code = "SILO_JOB_NOT_TERMINAL";
+
+  /** The job ID */
+  public readonly jobId: string;
+  /** The tenant ID */
+  public readonly tenant?: string;
+  /** The current status of the job */
+  public readonly currentStatus?: JobStatus;
+
+  constructor(jobId: string, tenant?: string, currentStatus?: JobStatus) {
+    const statusMsg = currentStatus
+      ? ` (current status: ${currentStatus})`
+      : "";
+    const tenantMsg = tenant ? ` in tenant "${tenant}"` : "";
+    super(`Job "${jobId}"${tenantMsg} is not in a terminal state${statusMsg}`);
+    this.name = "JobNotTerminalError";
+    this.jobId = jobId;
+    this.tenant = tenant;
+    this.currentStatus = currentStatus;
+  }
+}
+
+/**
+ * Error thrown when a task (lease) is not found.
+ */
+export class TaskNotFoundError extends Error {
+  code = "SILO_TASK_NOT_FOUND";
+
+  /** The task ID that was not found */
+  public readonly taskId: string;
+
+  constructor(taskId: string) {
+    super(`Task "${taskId}" not found`);
+    this.name = "TaskNotFoundError";
+    this.taskId = taskId;
+  }
+}
 
 /**
  * FNV-1a hash constants for 32-bit hash.
@@ -213,6 +280,39 @@ export interface Job {
   limits: JobLimit[];
   /** Key/value metadata stored with the job */
   metadata: { [key: string]: string };
+  /** Current status of the job */
+  status: JobStatus;
+  /** Timestamp when the status last changed (epoch ms) */
+  statusChangedAtMs: bigint;
+}
+
+/** Possible job statuses */
+export enum JobStatus {
+  Scheduled = "Scheduled",
+  Running = "Running",
+  Succeeded = "Succeeded",
+  Failed = "Failed",
+  Cancelled = "Cancelled",
+}
+
+/** Result of awaiting a job completion */
+export interface JobResult<T = unknown> {
+  /** Final status of the job */
+  status: JobStatus.Succeeded | JobStatus.Failed | JobStatus.Cancelled;
+  /** Result data if the job succeeded */
+  result?: T;
+  /** Error code if the job failed */
+  errorCode?: string;
+  /** Error data if the job failed */
+  errorData?: unknown;
+}
+
+/** Options for awaiting a job result */
+export interface AwaitJobOptions {
+  /** Polling interval in ms. Defaults to 500ms. */
+  pollIntervalMs?: number;
+  /** Timeout in ms. If not set, waits indefinitely. */
+  timeoutMs?: number;
 }
 
 /**
@@ -387,12 +487,33 @@ function extractRedirectAddress(error: unknown): string | undefined {
  * Sleep for a given number of milliseconds.
  * @internal
  */
-function sleep(ms: number): Promise<void> {
+export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** Default tenant used when tenancy is not enabled */
 const DEFAULT_TENANT = "-";
+
+/**
+ * Convert proto JobStatus enum to public JobStatus enum.
+ * @internal
+ */
+function protoJobStatusToPublic(status: ProtoJobStatus): JobStatus {
+  switch (status) {
+    case ProtoJobStatus.SCHEDULED:
+      return JobStatus.Scheduled;
+    case ProtoJobStatus.RUNNING:
+      return JobStatus.Running;
+    case ProtoJobStatus.SUCCEEDED:
+      return JobStatus.Succeeded;
+    case ProtoJobStatus.FAILED:
+      return JobStatus.Failed;
+    case ProtoJobStatus.CANCELLED:
+      return JobStatus.Cancelled;
+    default:
+      throw new Error(`Unknown job status: ${status}`);
+  }
+}
 
 /** Connection to a single server */
 interface ServerConnection {
@@ -747,82 +868,235 @@ export class SiloGRPCClient {
   /**
    * Enqueue a job for processing.
    * @param options The options for the enqueue request.
-   * @returns The ID of the enqueued job.
+   * @returns A JobHandle for the enqueued job.
    */
-  public async enqueue(options: EnqueueJobOptions): Promise<string> {
-    return this._withWrongShardRetry(options.tenant, async (client, shard) => {
-      const call = client.enqueue(
-        {
-          shard,
-          id: options.id ?? "",
-          priority: options.priority ?? 50,
-          startAtMs: options.startAtMs ?? BigInt(Date.now()),
-          retryPolicy: options.retryPolicy,
-          payload: { data: encodePayload(options.payload) },
-          limits: options.limits?.map(toProtoLimit) ?? [],
-          tenant: options.tenant,
-          metadata: options.metadata ?? {},
-        },
-        this._rpcOptions()
-      );
+  public async enqueue(options: EnqueueJobOptions): Promise<JobHandle> {
+    const id = await this._withWrongShardRetry(
+      options.tenant,
+      async (client, shard) => {
+        const call = client.enqueue(
+          {
+            shard,
+            id: options.id ?? "",
+            priority: options.priority ?? 50,
+            startAtMs: options.startAtMs ?? BigInt(Date.now()),
+            retryPolicy: options.retryPolicy,
+            payload: { data: encodePayload(options.payload) },
+            limits: options.limits?.map(toProtoLimit) ?? [],
+            tenant: options.tenant,
+            metadata: options.metadata ?? {},
+          },
+          this._rpcOptions()
+        );
 
-      const response = await call.response;
-      return response.id;
-    });
+        const response = await call.response;
+        return response.id;
+      }
+    );
+    return new JobHandle(this, id, options.tenant);
   }
 
   /**
    * Get a job by ID.
    * @param id     The job ID.
    * @param tenant Tenant ID for routing to the correct shard. Uses default tenant if not provided.
-   * @returns The job details, or undefined if not found.
+   * @returns The job details.
+   * @throws JobNotFoundError if the job doesn't exist.
    */
-  public async getJob(id: string, tenant?: string): Promise<Job | undefined> {
-    return this._withWrongShardRetry(tenant, async (client, shard) => {
-      const call = client.getJob(
-        {
-          shard,
-          id,
-          tenant,
-        },
-        this._rpcOptions()
-      );
+  public async getJob(id: string, tenant?: string): Promise<Job> {
+    try {
+      return await this._withWrongShardRetry(tenant, async (client, shard) => {
+        const call = client.getJob(
+          {
+            shard,
+            id,
+            tenant,
+          },
+          this._rpcOptions()
+        );
 
-      const response = await call.response;
-      if (!response.id) {
-        return undefined;
+        const response = await call.response;
+
+        return {
+          id: response.id,
+          priority: response.priority,
+          enqueueTimeMs: response.enqueueTimeMs,
+          payload: response.payload,
+          retryPolicy: response.retryPolicy,
+          limits: response.limits
+            .map(fromProtoLimit)
+            .filter((l): l is JobLimit => l !== undefined),
+          metadata: response.metadata,
+          status: protoJobStatusToPublic(response.status),
+          statusChangedAtMs: response.statusChangedAtMs,
+        };
+      });
+    } catch (error) {
+      if (error instanceof RpcError && error.code === "NOT_FOUND") {
+        throw new JobNotFoundError(id, tenant);
       }
-
-      return {
-        id: response.id,
-        priority: response.priority,
-        enqueueTimeMs: response.enqueueTimeMs,
-        payload: response.payload,
-        retryPolicy: response.retryPolicy,
-        limits: response.limits
-          .map(fromProtoLimit)
-          .filter((l): l is JobLimit => l !== undefined),
-        metadata: response.metadata,
-      };
-    });
+      throw error;
+    }
   }
 
   /**
    * Delete a job by ID.
    * @param id     The job ID.
    * @param tenant Tenant ID for routing to the correct shard. Uses default tenant if not provided.
+   * @throws JobNotFoundError if the job doesn't exist.
    */
   public async deleteJob(id: string, tenant?: string): Promise<void> {
-    await this._withWrongShardRetry(tenant, async (client, shard) => {
-      await client.deleteJob(
-        {
-          shard,
-          id,
-          tenant,
-        },
-        this._rpcOptions()
-      );
-    });
+    try {
+      await this._withWrongShardRetry(tenant, async (client, shard) => {
+        await client.deleteJob(
+          {
+            shard,
+            id,
+            tenant,
+          },
+          this._rpcOptions()
+        );
+      });
+    } catch (error) {
+      if (error instanceof RpcError && error.code === "NOT_FOUND") {
+        throw new JobNotFoundError(id, tenant);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Cancel a job by ID.
+   * This marks the job for cancellation. Workers will be notified via heartbeat
+   * and should stop processing and report a cancelled outcome.
+   * @param id     The job ID.
+   * @param tenant Tenant ID for routing to the correct shard. Uses default tenant if not provided.
+   * @throws JobNotFoundError if the job doesn't exist.
+   */
+  public async cancelJob(id: string, tenant?: string): Promise<void> {
+    try {
+      await this._withWrongShardRetry(tenant, async (client, shard) => {
+        await client.cancelJob(
+          {
+            shard,
+            id,
+            tenant,
+          },
+          this._rpcOptions()
+        );
+      });
+    } catch (error) {
+      if (error instanceof RpcError && error.code === "NOT_FOUND") {
+        throw new JobNotFoundError(id, tenant);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Get the current status of a job.
+   * @param id     The job ID.
+   * @param tenant Tenant ID for routing to the correct shard. Uses default tenant if not provided.
+   * @returns The job status.
+   * @throws JobNotFoundError if the job doesn't exist.
+   */
+  public async getJobStatus(id: string, tenant?: string): Promise<JobStatus> {
+    const job = await this.getJob(id, tenant);
+    return job.status;
+  }
+
+  /**
+   * Get the result of a completed job.
+   * @param id     The job ID.
+   * @param tenant Tenant ID for routing to the correct shard. Uses default tenant if not provided.
+   * @returns The job result.
+   * @throws JobNotFoundError if the job doesn't exist.
+   * @throws JobNotTerminalError if the job is not yet in a terminal state.
+   * @internal
+   */
+  public async getJobResult<T = unknown>(
+    id: string,
+    tenant?: string
+  ): Promise<JobResult<T>> {
+    try {
+      return await this._withWrongShardRetry(tenant, async (client, shard) => {
+        const call = client.getJobResult(
+          {
+            shard,
+            id,
+            tenant,
+          },
+          this._rpcOptions()
+        );
+
+        const response = await call.response;
+        const status = protoJobStatusToPublic(response.status);
+
+        if (status === JobStatus.Cancelled) {
+          return { status: JobStatus.Cancelled };
+        }
+
+        if (status === JobStatus.Succeeded) {
+          let result: T | undefined;
+          if (
+            response.result.oneofKind === "successData" &&
+            response.result.successData.data.length > 0
+          ) {
+            result = decodePayload<T>(response.result.successData.data);
+          }
+          return { status: JobStatus.Succeeded, result };
+        }
+
+        if (status === JobStatus.Failed) {
+          let errorData: unknown;
+          if (
+            response.result.oneofKind === "failure" &&
+            response.result.failure.errorData.length > 0
+          ) {
+            errorData = decodePayload(response.result.failure.errorData);
+          }
+          return {
+            status: JobStatus.Failed,
+            errorCode:
+              response.result.oneofKind === "failure"
+                ? response.result.failure.errorCode
+                : undefined,
+            errorData,
+          };
+        }
+
+        // Should not reach here if server is behaving correctly
+        throw new JobNotTerminalError(id, tenant);
+      });
+    } catch (error) {
+      // NOT_FOUND means job doesn't exist
+      if (error instanceof RpcError && error.code === "NOT_FOUND") {
+        throw new JobNotFoundError(id, tenant);
+      }
+      // FAILED_PRECONDITION means job is not in a terminal state yet
+      if (error instanceof RpcError && error.code === "FAILED_PRECONDITION") {
+        // Try to get current status for better error message
+        try {
+          const job = await this.getJob(id, tenant);
+          throw new JobNotTerminalError(id, tenant, job.status);
+        } catch (e) {
+          if (e instanceof JobNotTerminalError) throw e;
+          throw new JobNotTerminalError(id, tenant);
+        }
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Create a job handle for an existing job ID.
+   * This allows you to interact with a job that was previously enqueued.
+   * @param id     The job ID.
+   * @param tenant Tenant ID for routing to the correct shard. Uses default tenant if not provided.
+   * @returns A JobHandle for the specified job.
+   */
+  public handle(id: string, tenant?: string): JobHandle {
+    return new JobHandle(this, id, tenant);
   }
 
   /**
@@ -861,6 +1135,7 @@ export class SiloGRPCClient {
   /**
    * Report the outcome of a task.
    * @param options The options for reporting the outcome.
+   * @throws TaskNotFoundError if the task (lease) doesn't exist.
    */
   public async reportOutcome(options: ReportOutcomeOptions): Promise<void> {
     const outcome =
@@ -880,17 +1155,24 @@ export class SiloGRPCClient {
             },
           };
 
-    // Route to the correct shard (from Task.shard)
-    const client = this._getClientForShard(options.shard);
-    await client.reportOutcome(
-      {
-        shard: options.shard,
-        taskId: options.taskId,
-        tenant: options.tenant,
-        outcome,
-      },
-      this._rpcOptions()
-    );
+    try {
+      // Route to the correct shard (from Task.shard)
+      const client = this._getClientForShard(options.shard);
+      await client.reportOutcome(
+        {
+          shard: options.shard,
+          taskId: options.taskId,
+          tenant: options.tenant,
+          outcome,
+        },
+        this._rpcOptions()
+      );
+    } catch (error) {
+      if (error instanceof RpcError && error.code === "NOT_FOUND") {
+        throw new TaskNotFoundError(options.taskId);
+      }
+      throw error;
+    }
   }
 
   /**
@@ -899,6 +1181,7 @@ export class SiloGRPCClient {
    * @param taskId   The task ID.
    * @param shard    The shard the task came from (from Task.shard).
    * @param tenant   The tenant ID (required when tenancy is enabled).
+   * @throws TaskNotFoundError if the task (lease) doesn't exist.
    */
   public async heartbeat(
     workerId: string,
@@ -906,16 +1189,23 @@ export class SiloGRPCClient {
     shard: number,
     tenant?: string
   ): Promise<void> {
-    const client = this._getClientForShard(shard);
-    await client.heartbeat(
-      {
-        shard,
-        workerId,
-        taskId,
-        tenant,
-      },
-      this._rpcOptions()
-    );
+    try {
+      const client = this._getClientForShard(shard);
+      await client.heartbeat(
+        {
+          shard,
+          workerId,
+          taskId,
+          tenant,
+        },
+        this._rpcOptions()
+      );
+    } catch (error) {
+      if (error instanceof RpcError && error.code === "NOT_FOUND") {
+        throw new TaskNotFoundError(taskId);
+      }
+      throw error;
+    }
   }
 
   /**
