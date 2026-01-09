@@ -342,7 +342,7 @@ impl Silo for SiloService {
         let limits: Vec<crate::job::Limit> = r
             .limits
             .into_iter()
-            .filter_map(|l| proto_limit_to_job_limit(l))
+            .filter_map(proto_limit_to_job_limit)
             .collect();
 
         // Validate metadata constraints: <=16 entries, key < 64 chars, value < u16::MAX
@@ -486,6 +486,7 @@ impl Silo for SiloService {
                 .await
                 .map_err(map_err)?;
 
+            let tasks_added = result.tasks.len();
             for lt in result.tasks {
                 let job = lt.job();
                 let attempt = lt.attempt();
@@ -513,7 +514,7 @@ impl Silo for SiloService {
                 });
             }
 
-            remaining = remaining.saturating_sub(all_tasks.len());
+            remaining = remaining.saturating_sub(tasks_added);
         }
 
         Ok(Response::new(LeaseTasksResponse {
@@ -762,79 +763,20 @@ impl Silo for SiloService {
 }
 
 /// Run the gRPC server and a periodic reaper task together until shutdown.
-pub async fn run_grpc_with_reaper(
+pub async fn run_server(
     listener: TcpListener,
     factory: Arc<ShardFactory>,
     coordinator: Option<Arc<dyn Coordinator>>,
     cfg: crate::settings::AppConfig,
-    mut shutdown: broadcast::Receiver<()>,
+    shutdown: broadcast::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let svc = SiloService::new(factory.clone(), coordinator, cfg);
-    let server = SiloServer::new(svc);
-
-    // Create health service for gRPC health probes
-    let (mut health_reporter, health_service) = health_reporter();
-    health_reporter
-        .set_serving::<SiloServer<SiloService>>()
-        .await;
-
-    // Periodic reaper that iterates all shards every second
-    let (tick_tx, mut tick_rx) = broadcast::channel::<()>(1);
-    let reaper_factory = factory.clone();
-    let reaper: JoinHandle<()> = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    // Iterate shards and reap (use default tenant "-" for system-level reaping)
-                    for shard in reaper_factory.instances().values() {
-                        let _ = shard.reap_expired_leases("-").await;
-                    }
-                }
-                _ = tick_rx.recv() => {
-                    break;
-                }
-            }
-        }
-    });
-
     let incoming = TcpListenerStream::new(listener);
-
-    // Create reflection service for grpcurl/debugging
-    let reflection_service = ReflectionBuilder::configure()
-        .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
-        .build_v1()
-        .expect("failed to build reflection service");
-
-    // Serve with graceful shutdown
-    let serve = tonic::transport::Server::builder()
-        .add_service(health_service)
-        .add_service(reflection_service)
-        .add_service(server)
-        .serve_with_incoming_shutdown(incoming, async move {
-            let _ = shutdown.recv().await;
-            info!("graceful shutdown signal received");
-            let _ = tick_tx.send(());
-        });
-
-    serve.await?;
-    info!("all connections drained, shutting down services");
-    // After server has stopped accepting connections, close all shards
-    match factory.close_all().await {
-        Ok(()) => info!("closed all shards"),
-        Err(CloseAllError { errors }) => {
-            for (name, err) in errors {
-                tracing::error!(shard = %name, error = %err, "failed to close shard");
-            }
-        }
-    }
-    reaper.await.ok();
-    Ok(())
+    run_server_with_incoming(incoming, factory, coordinator, cfg, shutdown).await
 }
 
 /// Generic variant that accepts any incoming stream of IOs (e.g., Turmoil TcpListener) and runs the server
 /// with a periodic reaper. Use this in simulations to inject custom accept loops.
-pub async fn run_grpc_with_reaper_incoming<S, IO>(
+pub async fn run_server_with_incoming<S, IO>(
     incoming: S,
     factory: Arc<ShardFactory>,
     coordinator: Option<Arc<dyn Coordinator>>,

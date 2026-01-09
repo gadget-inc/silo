@@ -5,7 +5,7 @@ use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::pb::silo_client::SiloClient;
 use silo::pb::*;
-use silo::server::run_grpc_with_reaper;
+use silo::server::run_server;
 use silo::settings::{Backend, DatabaseTemplate};
 use tokio::net::TcpListener;
 use tonic_health::pb::health_client::HealthClient;
@@ -39,7 +39,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
 
         // Start server
-        let server = tokio::spawn(run_grpc_with_reaper(
+        let server = tokio::spawn(run_server(
             listener,
             factory.clone(),
             None,
@@ -175,7 +175,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
             tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        let server = tokio::spawn(run_grpc_with_reaper(
+        let server = tokio::spawn(run_server(
             listener,
             factory.clone(),
             None,
@@ -308,7 +308,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
             tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        let server = tokio::spawn(run_grpc_with_reaper(
+        let server = tokio::spawn(run_server(
             listener,
             factory.clone(),
             None,
@@ -434,7 +434,7 @@ async fn grpc_server_query_errors() -> anyhow::Result<()> {
             tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        let server = tokio::spawn(run_grpc_with_reaper(
+        let server = tokio::spawn(run_server(
             listener,
             factory.clone(),
             None,
@@ -537,7 +537,7 @@ async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
             tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        let server = tokio::spawn(run_grpc_with_reaper(
+        let server = tokio::spawn(run_server(
             listener,
             factory.clone(),
             None,
@@ -635,7 +635,7 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
             tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        let server = tokio::spawn(run_grpc_with_reaper(
+        let server = tokio::spawn(run_server(
             listener,
             factory.clone(),
             None,
@@ -748,7 +748,7 @@ async fn grpc_server_query_without_tenant() -> anyhow::Result<()> {
             tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        let server = tokio::spawn(run_grpc_with_reaper(
+        let server = tokio::spawn(run_server(
             listener,
             factory.clone(),
             None,
@@ -851,7 +851,7 @@ async fn grpc_server_query_arrow_without_tenant() -> anyhow::Result<()> {
             tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        let server = tokio::spawn(run_grpc_with_reaper(
+        let server = tokio::spawn(run_server(
             listener,
             factory.clone(),
             None,
@@ -942,7 +942,7 @@ async fn grpc_health_check_returns_serving() -> anyhow::Result<()> {
             tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        let server = tokio::spawn(run_grpc_with_reaper(
+        let server = tokio::spawn(run_server(
             listener,
             factory.clone(),
             None,
@@ -980,6 +980,118 @@ async fn grpc_health_check_returns_serving() -> anyhow::Result<()> {
             resp.status,
             tonic_health::pb::health_check_response::ServingStatus::Serving as i32,
             "silo.v1.Silo service should be SERVING"
+        );
+
+        let _ = shutdown_tx.send(());
+        let join_result = server.await;
+        match join_result {
+            Ok(inner) => {
+                if let Err(e) = inner {
+                    return Err(anyhow::anyhow!(e.to_string()));
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        }
+        Ok(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// Test that lease_tasks correctly polls multiple shards when no shard filter is specified.
+/// This specifically tests that the `remaining` counter is decremented correctly across shards.
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_lease_tasks_multi_shard() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let tmp = tempfile::tempdir()?;
+        let template = DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+        };
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let factory = ShardFactory::new(template, rate_limiter);
+
+        // Open 3 shards
+        let _ = factory.open(0).await?;
+        let _ = factory.open(1).await?;
+        let _ = factory.open(2).await?;
+        let factory = Arc::new(factory);
+
+        let listener =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+        let server = tokio::spawn(run_server(
+            listener,
+            factory.clone(),
+            None,
+            silo::settings::AppConfig::load(None).unwrap(),
+            shutdown_rx,
+        ));
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint.clone())?
+            .connect()
+            .await?;
+        let mut client = SiloClient::new(channel);
+
+        // Enqueue 2 jobs into each shard (6 total)
+        for shard in 0..3 {
+            for i in 0..2 {
+                let enq = EnqueueRequest {
+                    shard,
+                    id: format!("job_s{}_i{}", shard, i),
+                    priority: 10,
+                    start_at_ms: 0,
+                    retry_policy: None,
+                    payload: Some(JsonValueBytes {
+                        data: b"{}".to_vec(),
+                    }),
+                    limits: vec![],
+                    tenant: None,
+                    metadata: std::collections::HashMap::new(),
+                };
+                let _ = client.enqueue(enq).await?;
+            }
+        }
+
+        // Lease 4 tasks WITHOUT specifying a shard (shard: None)
+        // This should poll all local shards and return up to 4 tasks
+        let lease_resp = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: None, // Poll all shards
+                worker_id: "multi_shard_worker".to_string(),
+                max_tasks: 4,
+            })
+            .await?
+            .into_inner();
+
+        // Should get exactly 4 tasks (bug would cause fewer due to wrong remaining calc)
+        assert_eq!(
+            lease_resp.tasks.len(),
+            4,
+            "expected 4 tasks when polling multiple shards, got {}",
+            lease_resp.tasks.len()
+        );
+
+        // Lease the remaining 2 tasks
+        let lease_resp2 = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: None,
+                worker_id: "multi_shard_worker".to_string(),
+                max_tasks: 10, // Ask for more than available
+            })
+            .await?
+            .into_inner();
+
+        assert_eq!(
+            lease_resp2.tasks.len(),
+            2,
+            "expected 2 remaining tasks, got {}",
+            lease_resp2.tasks.len()
         );
 
         let _ = shutdown_tx.send(());

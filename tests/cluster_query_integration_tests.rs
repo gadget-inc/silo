@@ -13,7 +13,7 @@ use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::pb::silo_client::SiloClient;
 use silo::pb::{EnqueueRequest, JsonValueBytes};
-use silo::server::run_grpc_with_reaper;
+use silo::server::run_server;
 use silo::settings::{Backend, DatabaseTemplate};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -195,7 +195,7 @@ async fn cluster_two_nodes_basic_query() {
     let (shutdown_tx1, shutdown_rx1) = tokio::sync::broadcast::channel(1);
     let (shutdown_tx2, shutdown_rx2) = tokio::sync::broadcast::channel(1);
 
-    let server1 = tokio::spawn(run_grpc_with_reaper(
+    let server1 = tokio::spawn(run_server(
         listener1,
         factory1.clone(),
         Some(coordinator1.clone()),
@@ -203,7 +203,7 @@ async fn cluster_two_nodes_basic_query() {
         shutdown_rx1,
     ));
 
-    let server2 = tokio::spawn(run_grpc_with_reaper(
+    let server2 = tokio::spawn(run_server(
         listener2,
         factory2.clone(),
         Some(coordinator2.clone()),
@@ -310,7 +310,7 @@ async fn cluster_two_nodes_status_filter_query() {
     let (shutdown_tx1, shutdown_rx1) = tokio::sync::broadcast::channel(1);
     let (shutdown_tx2, shutdown_rx2) = tokio::sync::broadcast::channel(1);
 
-    let server1 = tokio::spawn(run_grpc_with_reaper(
+    let server1 = tokio::spawn(run_server(
         listener1,
         factory1.clone(),
         Some(coordinator1.clone()),
@@ -318,7 +318,7 @@ async fn cluster_two_nodes_status_filter_query() {
         shutdown_rx1,
     ));
 
-    let server2 = tokio::spawn(run_grpc_with_reaper(
+    let server2 = tokio::spawn(run_server(
         listener2,
         factory2.clone(),
         Some(coordinator2.clone()),
@@ -423,7 +423,7 @@ async fn cluster_two_nodes_count_across_shards() {
     let (shutdown_tx1, shutdown_rx1) = tokio::sync::broadcast::channel(1);
     let (shutdown_tx2, shutdown_rx2) = tokio::sync::broadcast::channel(1);
 
-    let server1 = tokio::spawn(run_grpc_with_reaper(
+    let server1 = tokio::spawn(run_server(
         listener1,
         factory1.clone(),
         Some(coordinator1.clone()),
@@ -431,7 +431,7 @@ async fn cluster_two_nodes_count_across_shards() {
         shutdown_rx1,
     ));
 
-    let server2 = tokio::spawn(run_grpc_with_reaper(
+    let server2 = tokio::spawn(run_server(
         listener2,
         factory2.clone(),
         Some(coordinator2.clone()),
@@ -534,7 +534,7 @@ async fn cluster_two_nodes_queues_table() {
     let (shutdown_tx1, shutdown_rx1) = tokio::sync::broadcast::channel(1);
     let (shutdown_tx2, shutdown_rx2) = tokio::sync::broadcast::channel(1);
 
-    let server1 = tokio::spawn(run_grpc_with_reaper(
+    let server1 = tokio::spawn(run_server(
         listener1,
         factory1.clone(),
         Some(coordinator1.clone()),
@@ -542,7 +542,7 @@ async fn cluster_two_nodes_queues_table() {
         shutdown_rx1,
     ));
 
-    let server2 = tokio::spawn(run_grpc_with_reaper(
+    let server2 = tokio::spawn(run_server(
         listener2,
         factory2.clone(),
         Some(coordinator2.clone()),
@@ -628,7 +628,7 @@ async fn cluster_two_nodes_projection_remote_shards() {
     let (shutdown_tx1, shutdown_rx1) = tokio::sync::broadcast::channel(1);
     let (shutdown_tx2, shutdown_rx2) = tokio::sync::broadcast::channel(1);
 
-    let server1 = tokio::spawn(run_grpc_with_reaper(
+    let server1 = tokio::spawn(run_server(
         listener1,
         factory1.clone(),
         Some(coordinator1.clone()),
@@ -636,7 +636,7 @@ async fn cluster_two_nodes_projection_remote_shards() {
         shutdown_rx1,
     ));
 
-    let server2 = tokio::spawn(run_grpc_with_reaper(
+    let server2 = tokio::spawn(run_server(
         listener2,
         factory2.clone(),
         Some(coordinator2.clone()),
