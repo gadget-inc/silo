@@ -515,6 +515,10 @@ export interface RefreshFloatingLimitTask {
      * @generated from protobuf field: int64 lease_ms = 6
      */
     leaseMs: bigint; // how long to heartbeat in ms
+    /**
+     * @generated from protobuf field: uint32 shard = 7
+     */
+    shard: number; // which shard this task came from (for reporting outcomes)
 }
 /**
  * @generated from protobuf message silo.v1.LeaseTasksResponse
@@ -2436,7 +2440,8 @@ class RefreshFloatingLimitTask$Type extends MessageType<RefreshFloatingLimitTask
             { no: 3, name: "current_max_concurrency", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
             { no: 4, name: "last_refreshed_at_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
             { no: 5, name: "metadata", kind: "map", K: 9 /*ScalarType.STRING*/, V: { kind: "scalar", T: 9 /*ScalarType.STRING*/ } },
-            { no: 6, name: "lease_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ }
+            { no: 6, name: "lease_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 7, name: "shard", kind: "scalar", T: 13 /*ScalarType.UINT32*/ }
         ]);
     }
     create(value?: PartialMessage<RefreshFloatingLimitTask>): RefreshFloatingLimitTask {
@@ -2447,6 +2452,7 @@ class RefreshFloatingLimitTask$Type extends MessageType<RefreshFloatingLimitTask
         message.lastRefreshedAtMs = 0n;
         message.metadata = {};
         message.leaseMs = 0n;
+        message.shard = 0;
         if (value !== undefined)
             reflectionMergePartial<RefreshFloatingLimitTask>(this, message, value);
         return message;
@@ -2473,6 +2479,9 @@ class RefreshFloatingLimitTask$Type extends MessageType<RefreshFloatingLimitTask
                     break;
                 case /* int64 lease_ms */ 6:
                     message.leaseMs = reader.int64().toBigInt();
+                    break;
+                case /* uint32 shard */ 7:
+                    message.shard = reader.uint32();
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -2520,6 +2529,9 @@ class RefreshFloatingLimitTask$Type extends MessageType<RefreshFloatingLimitTask
         /* int64 lease_ms = 6; */
         if (message.leaseMs !== 0n)
             writer.tag(6, WireType.Varint).int64(message.leaseMs);
+        /* uint32 shard = 7; */
+        if (message.shard !== 0)
+            writer.tag(7, WireType.Varint).uint32(message.shard);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);

@@ -3,13 +3,16 @@
 use slatedb::{DbIterator, WriteBatch};
 use uuid::Uuid;
 
-use crate::codec::{decode_lease, encode_attempt, encode_lease};
+use crate::codec::{
+    decode_floating_limit_state, decode_lease, encode_attempt, encode_floating_limit_state,
+    encode_lease,
+};
 use crate::concurrency::MemoryEvent;
-use crate::job::{JobStatus, JobView};
+use crate::job::{FloatingLimitState, JobStatus, JobView};
 use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt};
 use crate::job_store_shard::helpers::{now_epoch_ms, put_task};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
-use crate::keys::{attempt_key, job_info_key, leased_task_key};
+use crate::keys::{attempt_key, floating_limit_state_key, job_info_key, leased_task_key};
 use crate::task::{HeartbeatResult, LeaseRecord, Task, DEFAULT_LEASE_MS};
 use tracing::{debug, info_span};
 
@@ -253,6 +256,7 @@ impl JobStoreShard {
     }
 
     /// Scan all held leases and mark any expired ones as failed with a WORKER_CRASHED error code, or as Cancelled if the job was cancelled.
+    /// For RefreshFloatingLimit tasks, resets the floating limit state so it can be retried on next periodic refresh.
     /// Returns the number of expired leases reaped.
     pub async fn reap_expired_leases(&self, tenant: &str) -> Result<usize, JobStoreShardError> {
         // Scan leases under lease/
@@ -281,7 +285,17 @@ impl JobStoreShard {
                 continue;
             }
 
-            // Get task_id and job_id using helper methods
+            // Handle RefreshFloatingLimit tasks separately
+            if let Some((task_id, queue_key)) = decoded.refresh_floating_limit_info() {
+                let task_tenant = decoded.tenant();
+                let _ = self
+                    .reap_expired_refresh_task(task_tenant, task_id, queue_key, &decoded)
+                    .await;
+                reaped += 1;
+                continue;
+            }
+
+            // Get task_id and job_id using helper methods (for RunAttempt tasks)
             let Some(task_id) = decoded.task_id() else {
                 continue; // Not a RunAttempt lease
             };
@@ -318,5 +332,77 @@ impl JobStoreShard {
         }
 
         Ok(reaped)
+    }
+
+    /// Handle expiry of a RefreshFloatingLimit task lease.
+    /// Resets the floating limit state so a new refresh can be scheduled on the next enqueue/dequeue.
+    async fn reap_expired_refresh_task(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        queue_key: &str,
+        decoded: &crate::codec::DecodedLease,
+    ) -> Result<(), JobStoreShardError> {
+        let now_ms = now_epoch_ms();
+        let lease_key = leased_task_key(task_id);
+        let state_key = floating_limit_state_key(tenant, queue_key);
+
+        // Load the floating limit state
+        let maybe_state = self.db.get(state_key.as_bytes()).await?;
+        let Some(raw) = maybe_state else {
+            // State doesn't exist, just delete the orphaned lease
+            tracing::warn!(
+                tenant = %tenant,
+                queue_key = %queue_key,
+                task_id = %task_id,
+                "refresh task lease expired but floating limit state not found, deleting orphaned lease"
+            );
+            let mut batch = WriteBatch::new();
+            batch.delete(lease_key.as_bytes());
+            self.db.write(batch).await?;
+            self.db.flush().await?;
+            return Ok(());
+        };
+
+        let decoded_state = decode_floating_limit_state(&raw)?;
+        let archived = decoded_state.archived();
+
+        // Reset the state to allow a new refresh to be scheduled
+        // We don't increment retry_count here - we rely on the normal periodic refresh mechanism
+        let new_state = FloatingLimitState {
+            refresh_task_scheduled: false, // Allow new refresh to be scheduled
+            // Preserve all other fields
+            current_max_concurrency: archived.current_max_concurrency,
+            last_refreshed_at_ms: archived.last_refreshed_at_ms,
+            refresh_interval_ms: archived.refresh_interval_ms,
+            default_max_concurrency: archived.default_max_concurrency,
+            retry_count: archived.retry_count,
+            next_retry_at_ms: archived.next_retry_at_ms.as_ref().copied(),
+            metadata: archived
+                .metadata
+                .iter()
+                .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
+                .collect(),
+        };
+
+        let mut batch = WriteBatch::new();
+        let state_value = encode_floating_limit_state(&new_state)?;
+        batch.put(state_key.as_bytes(), &state_value);
+        batch.delete(lease_key.as_bytes());
+
+        self.db.write(batch).await?;
+        self.db.flush().await?;
+
+        tracing::error!(
+            tenant = %tenant,
+            queue_key = %queue_key,
+            task_id = %task_id,
+            worker_id = %decoded.worker_id(),
+            expiry_ms = decoded.expiry_ms(),
+            now_ms = now_ms,
+            "floating limit refresh task lease expired, reset state to allow re-scheduling"
+        );
+
+        Ok(())
     }
 }

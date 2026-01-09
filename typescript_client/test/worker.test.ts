@@ -1,11 +1,11 @@
 import { describe, it, expect, vi } from "vitest";
 import { SiloWorker, type TaskHandler } from "../src/worker";
-import type { SiloGRPCClient } from "../src/client";
+import type { SiloGRPCClient, LeaseTasksResult } from "../src/client";
 import type { Task } from "../src/pb/silo";
 
 // Mock client for unit tests
 function createMockClient(options?: {
-  leaseTasks?: (opts: unknown) => Promise<Task[]>;
+  leaseTasks?: (opts: unknown) => Promise<LeaseTasksResult>;
   reportOutcome?: (opts: unknown) => Promise<void>;
   heartbeat?: (
     workerId: string,
@@ -15,11 +15,18 @@ function createMockClient(options?: {
   ) => Promise<void>;
 }): SiloGRPCClient {
   return {
-    leaseTasks: options?.leaseTasks ?? vi.fn().mockResolvedValue([]),
+    leaseTasks:
+      options?.leaseTasks ??
+      vi.fn().mockResolvedValue({ tasks: [], refreshTasks: [] }),
     reportOutcome:
       options?.reportOutcome ?? vi.fn().mockResolvedValue(undefined),
     heartbeat: options?.heartbeat ?? vi.fn().mockResolvedValue(undefined),
   } as unknown as SiloGRPCClient;
+}
+
+// Helper to wrap tasks array in LeaseTasksResult
+function tasksResult(tasks: Task[]): LeaseTasksResult {
+  return { tasks, refreshTasks: [] };
 }
 
 function createTask(id: string, jobId: string, shard: number = 0): Task {
@@ -108,7 +115,7 @@ describe("SiloWorker", () => {
     });
 
     it("polls for tasks when started", async () => {
-      const leaseTasks = vi.fn().mockResolvedValue([]);
+      const leaseTasks = vi.fn().mockResolvedValue(tasksResult([]));
       const client = createMockClient({ leaseTasks });
       const handler: TaskHandler = async () => ({
         type: "success",
@@ -141,7 +148,7 @@ describe("SiloWorker", () => {
       const leaseTasks = vi.fn().mockImplementation(async () => {
         pollCount++;
         await new Promise((resolve) => setTimeout(resolve, 20));
-        return [];
+        return tasksResult([]);
       });
       const client = createMockClient({ leaseTasks });
       const handler: TaskHandler = async () => ({
@@ -177,8 +184,8 @@ describe("SiloWorker", () => {
       const task = createTask("task-1", "job-1");
       const leaseTasks = vi
         .fn()
-        .mockResolvedValueOnce([task])
-        .mockResolvedValue([]);
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
       const reportOutcome = vi.fn().mockResolvedValue(undefined);
       const client = createMockClient({ leaseTasks, reportOutcome });
 
@@ -220,8 +227,8 @@ describe("SiloWorker", () => {
       const task = createTask("task-2", "job-2");
       const leaseTasks = vi
         .fn()
-        .mockResolvedValueOnce([task])
-        .mockResolvedValue([]);
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
       const reportOutcome = vi.fn().mockResolvedValue(undefined);
       const client = createMockClient({ leaseTasks, reportOutcome });
 
@@ -258,8 +265,8 @@ describe("SiloWorker", () => {
       const task = createTask("task-3", "job-3");
       const leaseTasks = vi
         .fn()
-        .mockResolvedValueOnce([task])
-        .mockResolvedValue([]);
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
       const reportOutcome = vi.fn().mockResolvedValue(undefined);
       const client = createMockClient({ leaseTasks, reportOutcome });
 
@@ -310,10 +317,10 @@ describe("SiloWorker", () => {
 
       const leaseTasks = vi
         .fn()
-        .mockResolvedValueOnce(batch1)
-        .mockResolvedValueOnce(batch2)
-        .mockResolvedValueOnce(batch3)
-        .mockResolvedValue([]);
+        .mockResolvedValueOnce(tasksResult(batch1))
+        .mockResolvedValueOnce(tasksResult(batch2))
+        .mockResolvedValueOnce(tasksResult(batch3))
+        .mockResolvedValue(tasksResult([]));
       const reportOutcome = vi.fn().mockResolvedValue(undefined);
       const client = createMockClient({ leaseTasks, reportOutcome });
 
@@ -350,8 +357,8 @@ describe("SiloWorker", () => {
       const task = createTask("task-x", "job-x");
       const leaseTasks = vi
         .fn()
-        .mockResolvedValueOnce([task])
-        .mockResolvedValue([]);
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
       const reportOutcome = vi.fn().mockResolvedValue(undefined);
       const client = createMockClient({ leaseTasks, reportOutcome });
 
@@ -391,8 +398,8 @@ describe("SiloWorker", () => {
       const task = createTask("task-hb", "job-hb");
       const leaseTasks = vi
         .fn()
-        .mockResolvedValueOnce([task])
-        .mockResolvedValue([]);
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
       const reportOutcome = vi.fn().mockResolvedValue(undefined);
       const heartbeat = vi.fn().mockResolvedValue(undefined);
       const client = createMockClient({ leaseTasks, reportOutcome, heartbeat });
@@ -430,8 +437,8 @@ describe("SiloWorker", () => {
       const task = createTask("task-hb2", "job-hb2");
       const leaseTasks = vi
         .fn()
-        .mockResolvedValueOnce([task])
-        .mockResolvedValue([]);
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
       const reportOutcome = vi.fn().mockResolvedValue(undefined);
       const heartbeat = vi.fn().mockResolvedValue(undefined);
       const client = createMockClient({ leaseTasks, reportOutcome, heartbeat });
@@ -500,8 +507,8 @@ describe("SiloWorker", () => {
       const task = createTask("task-err", "job-err");
       const leaseTasks = vi
         .fn()
-        .mockResolvedValueOnce([task])
-        .mockResolvedValue([]);
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
       const reportOutcome = vi.fn().mockResolvedValue(undefined);
       const heartbeat = vi
         .fn()
@@ -544,12 +551,12 @@ describe("SiloWorker", () => {
           throw new Error("First poll failed");
         }
         if (pollCount === 2) {
-          return [task1];
+          return tasksResult([task1]);
         }
         if (pollCount === 3) {
-          return [task2];
+          return tasksResult([task2]);
         }
-        return [];
+        return tasksResult([]);
       });
       const reportOutcome = vi.fn().mockResolvedValue(undefined);
       const client = createMockClient({ leaseTasks, reportOutcome });
@@ -581,8 +588,8 @@ describe("SiloWorker", () => {
       const task = createTask("task-sig", "job-sig");
       const leaseTasks = vi
         .fn()
-        .mockResolvedValueOnce([task])
-        .mockResolvedValue([]);
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
       const reportOutcome = vi.fn().mockResolvedValue(undefined);
       const client = createMockClient({ leaseTasks, reportOutcome });
 

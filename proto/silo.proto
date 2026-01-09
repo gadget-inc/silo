@@ -179,6 +179,7 @@ message RefreshFloatingLimitTask {
   int64 last_refreshed_at_ms = 4;         // when the value was last refreshed
   map<string, string> metadata = 5;       // opaque metadata from the limit definition
   int64 lease_ms = 6;                     // how long to heartbeat in ms
+  uint32 shard = 7;                       // which shard this task came from (for reporting outcomes)
 }
 
 message LeaseTasksResponse { 
