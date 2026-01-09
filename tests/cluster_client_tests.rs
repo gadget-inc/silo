@@ -312,9 +312,7 @@ async fn cluster_client_json_serialization_preserves_data() {
     assert_eq!(row_json["id"], "job-complex");
 
     // The payload should be a valid JSON string
-    let payload_str = row_json["payload"]
-        .as_str()
-        .expect("payload should be string");
+    let payload_str = row_json["payload"].as_str().expect("payload should be string");
     let payload: serde_json::Value =
         serde_json::from_str(payload_str).expect("payload should be valid JSON");
 

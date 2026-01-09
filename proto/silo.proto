@@ -90,15 +90,6 @@ message EnqueueResponse {
   string id = 1;
 }
 
-// Job status enum representing the current state of a job
-enum JobStatus {
-  JOB_STATUS_SCHEDULED = 0;    // Job is waiting to be executed
-  JOB_STATUS_RUNNING = 1;      // Job is currently being processed by a worker
-  JOB_STATUS_SUCCEEDED = 2;    // Job completed successfully
-  JOB_STATUS_FAILED = 3;       // Job failed after exhausting all retries
-  JOB_STATUS_CANCELLED = 4;    // Job was cancelled before completion
-}
-
 message GetJobRequest { uint32 shard = 1; string id = 2; optional string tenant = 3; }
 message GetJobResponse {
   string id = 1;
@@ -108,43 +99,6 @@ message GetJobResponse {
   optional RetryPolicy retry_policy = 5; // presence indicates some policy
   repeated Limit limits = 6; // declared limits
   map<string, string> metadata = 7; // arbitrary key/value metadata stored with the job
-  JobStatus status = 8; // current job status
-  int64 status_changed_at_ms = 9; // when the status last changed (epoch ms)
-}
-
-// Get the result of a completed job.
-// Returns the job's result data if succeeded, error info if failed, or an error if the job
-// is not in a terminal state (still running/scheduled) or doesn't exist.
-message GetJobResultRequest {
-  uint32 shard = 1;
-  string id = 2;
-  optional string tenant = 3;
-}
-
-// Response for GetJobResult - the result depends on the job's terminal state.
-// Use the oneof to determine which outcome occurred.
-message GetJobResultResponse {
-  string id = 1;
-  JobStatus status = 2; // The terminal status: SUCCEEDED, FAILED, or CANCELLED
-  int64 finished_at_ms = 3; // When the job reached its terminal state (epoch ms)
-  
-  // The result data depends on the terminal status
-  oneof result {
-    JsonValueBytes success_data = 4;  // Result data if status == SUCCEEDED
-    JobFailure failure = 5;           // Error info if status == FAILED
-    JobCancelled cancelled = 6;       // Cancellation info if status == CANCELLED
-  }
-}
-
-// Information about a failed job
-message JobFailure {
-  string error_code = 1;  // Application-defined error code
-  bytes error_data = 2;   // Error details (typically JSON)
-}
-
-// Information about a cancelled job
-message JobCancelled {
-  int64 cancelled_at_ms = 1; // When the job was cancelled (epoch ms)
 }
 
 message DeleteJobRequest { uint32 shard = 1; string id = 2; optional string tenant = 3; }
@@ -236,7 +190,7 @@ message HeartbeatResponse {
   optional int64 cancelled_at_ms = 2;
 }
 
-// Execute an arbitrary SQL query against shard data
+// Execute SQL query against shard data
 message QueryRequest { 
   uint32 shard = 1; 
   string sql = 2; 
@@ -299,13 +253,6 @@ service Silo {
   
   rpc Enqueue(EnqueueRequest) returns (EnqueueResponse);
   rpc GetJob(GetJobRequest) returns (GetJobResponse);
-  
-  // Get the result of a completed job.
-  // Returns NOT_FOUND if the job doesn't exist.
-  // Returns FAILED_PRECONDITION if the job is not yet in a terminal state (still scheduled or running).
-  // Returns the result/error/cancellation info if the job has completed.
-  rpc GetJobResult(GetJobResultRequest) returns (GetJobResultResponse);
-  
   rpc DeleteJob(DeleteJobRequest) returns (DeleteJobResponse);
   rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
   rpc LeaseTasks(LeaseTasksRequest) returns (LeaseTasksResponse);

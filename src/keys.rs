@@ -106,14 +106,6 @@ pub fn attempt_key(tenant: &str, job_id: &str, attempt: u32) -> String {
     format!("attempts/{}/{}/{}", escape_tenant(tenant), job_id, attempt)
 }
 
-/// Construct the prefix for scanning all attempts of a job
-/// attempts/<tenant>/<job-id>/
-pub fn attempt_prefix(tenant: &str, job_id: &str) -> String {
-    validate_tenant_len(tenant);
-    validate_id_len(job_id);
-    format!("attempts/{}/{}/", escape_tenant(tenant), job_id)
-}
-
 /// Concurrency request queue: requests/<tenant>/<queue-name>/<start_time_ms>/<priority>/<request_id>
 /// Ordered by start time (when job should run), then priority (lower = higher), then request ID
 pub fn concurrency_request_key(

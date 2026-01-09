@@ -16,8 +16,7 @@ use crate::coordination::{Coordinator, ShardOwnerMap};
 use crate::factory::ShardFactory;
 use crate::pb::silo_client::SiloClient;
 use crate::pb::{
-    CancelJobRequest, ColumnInfo, GetJobRequest, GetJobResponse, JobStatus, JsonValueBytes,
-    QueryRequest,
+    CancelJobRequest, ColumnInfo, GetJobRequest, GetJobResponse, JsonValueBytes, QueryRequest,
 };
 
 /// Error types for cluster client operations
@@ -338,23 +337,6 @@ impl ClusterClient {
                 backoff_factor: p.backoff_factor,
             });
 
-            // Get job status - should always exist if job exists
-            let job_status = shard
-                .get_job_status(tenant, job_id)
-                .await
-                .map_err(|e| ClusterClientError::QueryFailed(e.to_string()))?
-                .ok_or_else(|| {
-                    ClusterClientError::QueryFailed("job exists but has no status".to_string())
-                })?;
-            let status = match job_status.kind {
-                crate::job::JobStatusKind::Scheduled => JobStatus::Scheduled,
-                crate::job::JobStatusKind::Running => JobStatus::Running,
-                crate::job::JobStatusKind::Succeeded => JobStatus::Succeeded,
-                crate::job::JobStatusKind::Failed => JobStatus::Failed,
-                crate::job::JobStatusKind::Cancelled => JobStatus::Cancelled,
-            };
-            let status_changed_at_ms = job_status.changed_at_ms;
-
             return Ok(GetJobResponse {
                 id: job_view.id().to_string(),
                 priority: job_view.priority() as u32,
@@ -369,8 +351,6 @@ impl ClusterClient {
                     .map(crate::server::job_limit_to_proto_limit)
                     .collect(),
                 metadata: job_view.metadata().into_iter().collect(),
-                status: status.into(),
-                status_changed_at_ms,
             });
         }
 

@@ -9,7 +9,7 @@ use crate::codec::{
 };
 use crate::job::{FloatingConcurrencyLimit, FloatingLimitState};
 use crate::job_store_shard::helpers::now_epoch_ms;
-use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
+use crate::job_store_shard::{JobStoreShardError, JobStoreShard};
 use crate::keys::{floating_limit_state_key, leased_task_key};
 use crate::task::Task;
 

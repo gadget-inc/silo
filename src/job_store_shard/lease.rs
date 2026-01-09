@@ -8,7 +8,7 @@ use crate::concurrency::MemoryEvent;
 use crate::job::{JobStatus, JobView};
 use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt};
 use crate::job_store_shard::helpers::{now_epoch_ms, put_task};
-use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
+use crate::job_store_shard::{JobStoreShardError, JobStoreShard};
 use crate::keys::{attempt_key, job_info_key, leased_task_key};
 use crate::task::{HeartbeatResult, LeaseRecord, Task, DEFAULT_LEASE_MS};
 use tracing::{debug, info_span};

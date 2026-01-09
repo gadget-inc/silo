@@ -390,42 +390,6 @@ impl JobStoreShard {
         }
     }
 
-    /// Fetch all attempts for a job, ordered by attempt number (ascending).
-    /// Returns an empty vector if the job has no attempts.
-    pub async fn get_job_attempts(
-        &self,
-        tenant: &str,
-        job_id: &str,
-    ) -> Result<Vec<JobAttemptView>, JobStoreShardError> {
-        use slatedb::DbIterator;
-
-        let prefix = crate::keys::attempt_prefix(tenant, job_id);
-        let start = prefix.as_bytes().to_vec();
-        let mut end = start.clone();
-        end.push(0xFF);
-
-        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..=end).await?;
-        let mut attempts = Vec::new();
-
-        while let Some(kv) = iter.next().await? {
-            let view = JobAttemptView::new(&kv.value)?;
-            attempts.push(view);
-        }
-
-        Ok(attempts)
-    }
-
-    /// Get the latest (highest numbered) attempt for a job, if any.
-    /// This is typically the attempt that contains the final result for completed jobs.
-    pub async fn get_latest_job_attempt(
-        &self,
-        tenant: &str,
-        job_id: &str,
-    ) -> Result<Option<JobAttemptView>, JobStoreShardError> {
-        let attempts = self.get_job_attempts(tenant, job_id).await?;
-        Ok(attempts.into_iter().last())
-    }
-
     /// Delete a job by id.
     ///
     /// Returns an error if the job is currently running (has active leases/holders) or has pending tasks/requests. Jobs must finish or permanently fail before deletion.
@@ -446,12 +410,8 @@ impl JobStoreShard {
         let mut batch = WriteBatch::new();
         // Clean up secondary index entries if present
         if let Some(status) = self.get_job_status(tenant, id).await? {
-            let timek = crate::keys::idx_status_time_key(
-                tenant,
-                status.kind.as_str(),
-                status.changed_at_ms,
-                id,
-            );
+            let timek =
+                crate::keys::idx_status_time_key(tenant, status.kind.as_str(), status.changed_at_ms, id);
             batch.delete(timek.as_bytes());
         }
         // Clean up metadata index entries (load job info to enumerate metadata)
