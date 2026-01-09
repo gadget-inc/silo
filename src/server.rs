@@ -19,13 +19,24 @@ pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("silo
 
 use crate::coordination::Coordinator;
 use crate::factory::{CloseAllError, ShardFactory};
-use crate::job::{GubernatorAlgorithm, GubernatorRateLimit, RateLimitRetryPolicy};
+use crate::job::{GubernatorAlgorithm, GubernatorRateLimit, JobStatusKind, RateLimitRetryPolicy};
 use crate::job_attempt::AttemptOutcome;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::pb::silo_server::{Silo, SiloServer};
 use crate::pb::*;
 use crate::settings::AppConfig;
 use crate::task::DEFAULT_LEASE_MS;
+
+/// Convert a job::JobStatusKind to a proto JobStatus enum value
+fn job_status_kind_to_proto(kind: JobStatusKind) -> JobStatus {
+    match kind {
+        JobStatusKind::Scheduled => JobStatus::Scheduled,
+        JobStatusKind::Running => JobStatus::Running,
+        JobStatusKind::Succeeded => JobStatus::Succeeded,
+        JobStatusKind::Failed => JobStatus::Failed,
+        JobStatusKind::Cancelled => JobStatus::Cancelled,
+    }
+}
 
 /// gRPC metadata key for shard owner address on redirect
 pub const SHARD_OWNER_ADDR_METADATA_KEY: &str = "x-silo-shard-owner-addr";
@@ -394,6 +405,18 @@ impl Silo for SiloService {
         let Some(view) = shard.get_job(&tenant, &r.id).await.map_err(map_err)? else {
             return Err(Status::not_found("job not found"));
         };
+
+        // Get job status - should always exist if job exists
+        let Some(job_status) = shard
+            .get_job_status(&tenant, &r.id)
+            .await
+            .map_err(map_err)?
+        else {
+            return Err(Status::internal("job exists but has no status"));
+        };
+        let status = job_status_kind_to_proto(job_status.kind);
+        let status_changed_at_ms = job_status.changed_at_ms;
+
         let retry = view.retry_policy();
         let retry_policy = retry.map(|p| RetryPolicy {
             retry_count: p.retry_count,
@@ -416,8 +439,106 @@ impl Silo for SiloService {
                 .map(job_limit_to_proto_limit)
                 .collect(),
             metadata: view.metadata().into_iter().collect(),
+            status: status.into(),
+            status_changed_at_ms,
         };
         Ok(Response::new(resp))
+    }
+
+    async fn get_job_result(
+        &self,
+        req: Request<GetJobResultRequest>,
+    ) -> Result<Response<GetJobResultResponse>, Status> {
+        let r = req.into_inner();
+        let shard = self.shard_with_redirect(r.shard).await?;
+        let tenant = self.validate_tenant(r.tenant.as_deref())?;
+
+        // First check if job exists
+        let Some(_job_view) = shard.get_job(&tenant, &r.id).await.map_err(map_err)? else {
+            return Err(Status::not_found("job not found"));
+        };
+
+        // Get job status - must be in a terminal state
+        let Some(job_status) = shard
+            .get_job_status(&tenant, &r.id)
+            .await
+            .map_err(map_err)?
+        else {
+            return Err(Status::internal("job exists but has no status"));
+        };
+
+        // Check if job is in a terminal state
+        if !job_status.is_terminal() {
+            return Err(Status::failed_precondition(format!(
+                "job is not complete: status is {:?}",
+                job_status.kind
+            )));
+        }
+
+        // Get the latest attempt to retrieve the result
+        let Some(attempt) = shard
+            .get_latest_job_attempt(&tenant, &r.id)
+            .await
+            .map_err(map_err)?
+        else {
+            // Job is terminal but has no attempts - shouldn't happen normally
+            // but could happen for cancelled jobs that were never started
+            return Ok(Response::new(GetJobResultResponse {
+                id: r.id,
+                status: job_status_kind_to_proto(job_status.kind).into(),
+                finished_at_ms: job_status.changed_at_ms,
+                result: Some(get_job_result_response::Result::Cancelled(JobCancelled {
+                    cancelled_at_ms: job_status.changed_at_ms,
+                })),
+            }));
+        };
+
+        // Extract result based on attempt status
+        let attempt_state = attempt.state();
+        let result = match attempt_state {
+            crate::job_attempt::AttemptStatus::Succeeded {
+                finished_at_ms,
+                result,
+            } => Ok(Response::new(GetJobResultResponse {
+                id: r.id,
+                status: JobStatus::Succeeded.into(),
+                finished_at_ms,
+                result: Some(get_job_result_response::Result::SuccessData(
+                    JsonValueBytes { data: result },
+                )),
+            })),
+            crate::job_attempt::AttemptStatus::Failed {
+                finished_at_ms,
+                error_code,
+                error,
+            } => Ok(Response::new(GetJobResultResponse {
+                id: r.id,
+                status: JobStatus::Failed.into(),
+                finished_at_ms,
+                result: Some(get_job_result_response::Result::Failure(JobFailure {
+                    error_code,
+                    error_data: error,
+                })),
+            })),
+            crate::job_attempt::AttemptStatus::Cancelled { finished_at_ms } => {
+                Ok(Response::new(GetJobResultResponse {
+                    id: r.id,
+                    status: JobStatus::Cancelled.into(),
+                    finished_at_ms,
+                    result: Some(get_job_result_response::Result::Cancelled(JobCancelled {
+                        cancelled_at_ms: finished_at_ms,
+                    })),
+                }))
+            }
+            crate::job_attempt::AttemptStatus::Running { .. } => {
+                // This shouldn't happen - job status is terminal but attempt is still running
+                Err(Status::internal(
+                    "job status is terminal but attempt is still running",
+                ))
+            }
+        };
+
+        result
     }
 
     async fn delete_job(

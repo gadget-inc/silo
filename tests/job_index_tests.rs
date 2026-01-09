@@ -4,6 +4,7 @@ use rkyv::Archive;
 use silo::codec::{decode_lease, encode_lease};
 use silo::job::JobStatusKind;
 use silo::job_attempt::AttemptOutcome;
+use silo::task::{LeaseRecord, Task};
 use test_helpers::*;
 
 #[silo::test]
@@ -62,7 +63,8 @@ async fn status_index_failed_and_scheduled_then_order_newest_first() {
             now,
             None,
             serde_json::json!({"a":1}),
-            vec![], None,
+            vec![],
+            None,
         )
         .await
         .expect("enq a");
@@ -101,7 +103,8 @@ async fn status_index_failed_and_scheduled_then_order_newest_first() {
             now,
             Some(policy),
             serde_json::json!({"b":2}),
-            vec![], None,
+            vec![],
+            None,
         )
         .await
         .expect("enq b");
@@ -154,7 +157,8 @@ async fn retry_flow_running_to_scheduled_to_running_to_succeeded() {
             now,
             Some(policy),
             serde_json::json!({"j":1}),
-            vec![], None,
+            vec![],
+            None,
         )
         .await
         .expect("enqueue");
@@ -220,7 +224,8 @@ async fn reaper_without_retries_marks_failed_in_index() {
             now,
             None,
             serde_json::json!({"x":1}),
-            vec![], None,
+            vec![],
+            None,
         )
         .await
         .expect("enqueue");
@@ -233,7 +238,7 @@ async fn reaper_without_retries_marks_failed_in_index() {
     let (lease_key, lease_value) = first_kv_with_prefix(shard.db(), "lease/")
         .await
         .expect("lease present");
-    type ArchivedTask = <silo::task::Task as Archive>::Archived;
+    type ArchivedTask = <Task as Archive>::Archived;
     let decoded = decode_lease(&lease_value).expect("decode lease");
     let archived = decoded.archived();
     let task = match &archived.task {
@@ -243,7 +248,7 @@ async fn reaper_without_retries_marks_failed_in_index() {
             job_id,
             attempt_number,
             ..
-        } => silo::task::Task::RunAttempt {
+        } => Task::RunAttempt {
             id: id.as_str().to_string(),
             tenant: tenant.as_str().to_string(),
             job_id: job_id.as_str().to_string(),
@@ -252,7 +257,7 @@ async fn reaper_without_retries_marks_failed_in_index() {
         },
         _ => unreachable!(),
     };
-    let expired = silo::task::LeaseRecord {
+    let expired = LeaseRecord {
         worker_id: archived.worker_id.as_str().to_string(),
         task,
         expiry_ms: now_ms() - 1,
@@ -293,7 +298,8 @@ async fn reaper_with_retries_moves_to_scheduled_in_index() {
             now,
             Some(policy),
             serde_json::json!({"y":2}),
-            vec![], None,
+            vec![],
+            None,
         )
         .await
         .expect("enqueue");
@@ -305,7 +311,7 @@ async fn reaper_with_retries_moves_to_scheduled_in_index() {
     let (lease_key, lease_value) = first_kv_with_prefix(shard.db(), "lease/")
         .await
         .expect("lease present");
-    type ArchivedTask = <silo::task::Task as Archive>::Archived;
+    type ArchivedTask = <Task as Archive>::Archived;
     let decoded = decode_lease(&lease_value).expect("decode lease");
     let archived = decoded.archived();
     let task = match &archived.task {
@@ -315,7 +321,7 @@ async fn reaper_with_retries_moves_to_scheduled_in_index() {
             job_id,
             attempt_number,
             ..
-        } => silo::task::Task::RunAttempt {
+        } => Task::RunAttempt {
             id: id.as_str().to_string(),
             tenant: tenant.as_str().to_string(),
             job_id: job_id.as_str().to_string(),
@@ -324,7 +330,7 @@ async fn reaper_with_retries_moves_to_scheduled_in_index() {
         },
         _ => unreachable!(),
     };
-    let expired = silo::task::LeaseRecord {
+    let expired = LeaseRecord {
         worker_id: archived.worker_id.as_str().to_string(),
         task,
         expiry_ms: now_ms() - 1,
@@ -358,7 +364,8 @@ async fn delete_removes_from_index() {
             now,
             None,
             serde_json::json!({"z":3}),
-            vec![], None,
+            vec![],
+            None,
         )
         .await
         .expect("enqueue");
@@ -398,7 +405,8 @@ async fn cross_tenant_isolation_in_scans() {
             now,
             None,
             serde_json::json!({"t":"A"}),
-            vec![], None,
+            vec![],
+            None,
         )
         .await
         .unwrap();
@@ -410,7 +418,8 @@ async fn cross_tenant_isolation_in_scans() {
             now,
             None,
             serde_json::json!({"t":"B"}),
-            vec![], None,
+            vec![],
+            None,
         )
         .await
         .unwrap();
@@ -437,7 +446,8 @@ async fn pagination_and_ordering_newest_first() {
                 now + i,
                 None,
                 serde_json::json!({"i": i}),
-                vec![], None,
+                vec![],
+                None,
             )
             .await
             .unwrap();
@@ -471,7 +481,8 @@ async fn future_enqueue_is_in_scheduled_scan() {
             future,
             None,
             serde_json::json!({"f":1}),
-            vec![], None,
+            vec![],
+            None,
         )
         .await
         .unwrap();
@@ -637,7 +648,8 @@ async fn scan_jobs_unfiltered_basic_and_ordering() {
                 now,
                 None,
                 serde_json::json!({}),
-                vec![], None,
+                vec![],
+                None,
             )
             .await
             .expect("enqueue");
@@ -677,7 +689,8 @@ async fn scan_jobs_is_tenant_isolated_and_limit_zero_empty() {
             now,
             None,
             serde_json::json!({}),
-            vec![], None,
+            vec![],
+            None,
         )
         .await
         .unwrap();
@@ -689,7 +702,8 @@ async fn scan_jobs_is_tenant_isolated_and_limit_zero_empty() {
             now,
             None,
             serde_json::json!({}),
-            vec![], None,
+            vec![],
+            None,
         )
         .await
         .unwrap();

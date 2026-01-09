@@ -5,9 +5,9 @@ use silo::codec::{decode_lease, decode_task, encode_lease};
 use silo::job::JobStatusKind;
 use silo::job_attempt::{AttemptOutcome, AttemptStatus};
 use silo::job_store_shard::JobStoreShardError;
-use silo::task::{LeaseRecord, Task};
 use silo::keys::concurrency_holder_key;
 use silo::retry::{next_retry_time_ms, RetryPolicy};
+use silo::task::{LeaseRecord, Task};
 use std::collections::HashSet;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -1392,7 +1392,11 @@ async fn concurrent_dequeue_many_workers_no_duplicates() {
             handles.push(tokio::spawn(async move {
                 loop {
                     // debug: before_dequeue suppressed
-                    let tasks = shard_cl.dequeue(&worker_id, 1).await.expect("dequeue").tasks;
+                    let tasks = shard_cl
+                        .dequeue(&worker_id, 1)
+                        .await
+                        .expect("dequeue")
+                        .tasks;
                     if tasks.is_empty() {
                         if processed_cl.load(Ordering::Relaxed) >= total_jobs {
                             break;
@@ -1509,7 +1513,11 @@ async fn future_tasks_are_not_dequeued_under_concurrency() {
             let worker_id = format!("wf-{wi}");
             handles.push(tokio::spawn(async move {
                 loop {
-                    let tasks = shard_cl.dequeue(&worker_id, 4).await.expect("dequeue").tasks;
+                    let tasks = shard_cl
+                        .dequeue(&worker_id, 4)
+                        .await
+                        .expect("dequeue")
+                        .tasks;
                     if tasks.is_empty() {
                         if processed_cl.load(Ordering::Relaxed) >= ready_jobs {
                             break;
@@ -2148,7 +2156,9 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         },
         ArchivedTask::RequestTicket { .. } => panic!("unexpected RequestTicket in lease"),
         ArchivedTask::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in lease"),
-        ArchivedTask::RefreshFloatingLimit { .. } => panic!("unexpected RefreshFloatingLimit in lease"),
+        ArchivedTask::RefreshFloatingLimit { .. } => {
+            panic!("unexpected RefreshFloatingLimit in lease")
+        }
     };
     let expired_ms = now_ms() - 1;
     let new_record = LeaseRecord {
@@ -3467,4 +3477,3 @@ async fn cancelled_requests_are_cleaned_up_on_grant() {
         );
     });
 }
-
