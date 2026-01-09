@@ -26,3 +26,5 @@ RUN_INTEGRATION=true pnpm test
 The TypeScript integration tests require a running Silo server. Assume one is running. Don't run `dev` or `process-compose` yourself unless you are a cloud agent.
 
 Use the #[silo::test] macro for wrapping rust test cases (not tokio::test).
+
+Don't run the tests in the sandbox -- it often causes false positives with failed network accesses or SSL issues.

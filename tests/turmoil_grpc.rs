@@ -9,7 +9,7 @@ use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::pb::silo_client::SiloClient;
 use silo::pb::*;
-use silo::server::run_grpc_with_reaper_incoming;
+use silo::server::run_server_with_incoming;
 use silo::settings::{AppConfig, Backend, GubernatorSettings, LoggingConfig, WebUiConfig};
 use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -116,7 +116,7 @@ fn grpc_end_to_end_under_turmoil() {
             }
         };
         let (_tx, rx) = tokio::sync::broadcast::channel::<()>(1);
-        run_grpc_with_reaper_incoming(
+        run_server_with_incoming(
             incoming,
             factory,
             None,
@@ -277,7 +277,7 @@ fn grpc_fault_injection_with_partition() {
             }
         };
         let (_tx, rx) = tokio::sync::broadcast::channel::<()>(1);
-        run_grpc_with_reaper_incoming(
+        run_server_with_incoming(
             incoming,
             factory,
             None,
@@ -479,7 +479,7 @@ fn stress_multiple_workers_with_partitions() {
             }
         };
         let (_tx, rx) = tokio::sync::broadcast::channel::<()>(1);
-        run_grpc_with_reaper_incoming(
+        run_server_with_incoming(
             incoming,
             factory,
             None,
@@ -760,7 +760,7 @@ fn stress_duplicate_completion_idempotency() {
             }
         };
         let (_tx, rx) = tokio::sync::broadcast::channel::<()>(1);
-        run_grpc_with_reaper_incoming(
+        run_server_with_incoming(
             incoming,
             factory,
             None,
@@ -951,7 +951,7 @@ fn stress_lease_expiry_during_partition() {
             }
         };
         let (_tx, rx) = tokio::sync::broadcast::channel::<()>(1);
-        run_grpc_with_reaper_incoming(
+        run_server_with_incoming(
             incoming,
             factory,
             None,
@@ -1160,7 +1160,7 @@ fn stress_high_message_loss() {
             }
         };
         let (_tx, rx) = tokio::sync::broadcast::channel::<()>(1);
-        run_grpc_with_reaper_incoming(
+        run_server_with_incoming(
             incoming,
             factory,
             None,
@@ -1343,7 +1343,7 @@ fn concurrency_request_ready_without_release_fails() {
         }
         let incoming = async_stream::stream! { loop { let (s, _a) = listener.accept().await.unwrap(); yield Ok::<_, std::io::Error>(Accepted(s)); } };
         let (_tx, rx) = tokio::sync::broadcast::channel::<()>(1);
-        run_grpc_with_reaper_incoming(incoming, factory, None, silo::settings::AppConfig::load(None).unwrap(), rx).await.unwrap();
+        run_server_with_incoming(incoming, factory, None, silo::settings::AppConfig::load(None).unwrap(), rx).await.unwrap();
         Ok(())
     });
 

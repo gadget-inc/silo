@@ -5367,6 +5367,7 @@ dependencies = [
  "datafusion",
  "datafusion-sql",
  "etcd-client",
+ "futures",
  "http-body-util",
  "hyper 1.7.0",
  "hyper-util",
