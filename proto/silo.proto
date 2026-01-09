@@ -153,6 +153,11 @@ message DeleteJobResponse {}
 message CancelJobRequest { uint32 shard = 1; string id = 2; optional string tenant = 3; }
 message CancelJobResponse {}
 
+// Restart a cancelled or failed job, allowing it to be processed again.
+// The job will get a fresh set of retries according to its retry policy.
+message RestartJobRequest { uint32 shard = 1; string id = 2; optional string tenant = 3; }
+message RestartJobResponse {}
+
 // Lease tasks for processing from this server.
 // By default, leases from all shards this server owns (fair distribution).
 // If shard is specified, filters to only that shard.
@@ -309,6 +314,11 @@ service Silo {
   
   rpc DeleteJob(DeleteJobRequest) returns (DeleteJobResponse);
   rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
+  
+  // Restart a cancelled or failed job, allowing it to be processed again.
+  // Returns FAILED_PRECONDITION if the job is not in a restartable state.
+  // Returns NOT_FOUND if the job doesn't exist.
+  rpc RestartJob(RestartJobRequest) returns (RestartJobResponse);
   rpc LeaseTasks(LeaseTasksRequest) returns (LeaseTasksResponse);
   rpc ReportOutcome(ReportOutcomeRequest) returns (ReportOutcomeResponse);
   rpc ReportRefreshOutcome(ReportRefreshOutcomeRequest) returns (ReportRefreshOutcomeResponse);

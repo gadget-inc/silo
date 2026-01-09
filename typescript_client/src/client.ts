@@ -1110,6 +1110,34 @@ export class SiloGRPCClient {
   }
 
   /**
+   * Restart a cancelled or failed job, allowing it to be processed again.
+   * The job will get a fresh set of retries according to its retry policy.
+   * @param id     The job ID.
+   * @param tenant Tenant ID for routing to the correct shard. Uses default tenant if not provided.
+   * @throws JobNotFoundError if the job doesn't exist.
+   * @throws Error with FAILED_PRECONDITION if the job is not in a restartable state.
+   */
+  public async restartJob(id: string, tenant?: string): Promise<void> {
+    try {
+      await this._withWrongShardRetry(tenant, async (client, shard) => {
+        await client.restartJob(
+          {
+            shard,
+            id,
+            tenant,
+          },
+          this._rpcOptions()
+        );
+      });
+    } catch (error) {
+      if (error instanceof RpcError && error.code === "NOT_FOUND") {
+        throw new JobNotFoundError(id, tenant);
+      }
+      throw error;
+    }
+  }
+
+  /**
    * Get the current status of a job.
    * @param id     The job ID.
    * @param tenant Tenant ID for routing to the correct shard. Uses default tenant if not provided.

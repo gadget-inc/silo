@@ -178,11 +178,14 @@ fact wellFormed {
     -- so at the expiry time we have expiry = ltime (which means expired)
     all l: Lease | gte[l.lexpiresAt, l.ltime]
     
-    -- Cancellation is monotonic: once cancelled at time t, cancelled at all future times
-    all j: Job, t: Time - last | isCancelledAt[j, t] implies isCancelledAt[j, t.next]
+    -- Cancellation can be cleared by restart 
+    -- Removed: all j: Job, t: Time - last | isCancelledAt[j, t] implies isCancelledAt[j, t.next]
     
     -- At most one cancellation record per job per time
     all j: Job, t: Time | lone c: JobCancelled | c.cancelled_job = j and c.cancelled_time = t
+    
+    -- Cancellation records can only exist for jobs that exist
+    all c: JobCancelled | c.cancelled_job in jobExistsAt[c.cancelled_time]
     
     -- JobQueueRequirements are static (modeled implicitly by not having time)
     -- A job has at most one requirement per queue
@@ -962,6 +965,123 @@ pred cancelJob[j: Job, t: Time, tnext: Time] {
     concurrencyUnchanged[t, tnext]
 }
 
+-- Transition: RESTART_CANCELLED_JOB - Re-enable a cancelled job
+-- A cancelled job can be restarted if it hasn't completed (not terminal)
+-- and has no active tasks (cleaned up by dequeue).
+-- This clears the cancellation flag and creates a new task.
+pred restartCancelledJob[j: Job, newTid: TaskId, t: Time, tnext: Time] {
+    -- [SILO-RESTART-1] Pre: job exists and IS cancelled
+    j in jobExistsAt[t]
+    isCancelledAt[j, t]
+    
+    -- [SILO-RESTART-2] Pre: job is NOT terminal (can't restart completed jobs)
+    not isTerminal[statusAt[j, t]]
+    
+    -- [SILO-RESTART-3] Pre: no active tasks for this job (must be cleaned up first)
+    -- No task in DB queue, buffer, or leased for this job
+    no tid: TaskId | dbQueuedAt[tid, t] = j
+    no tid: TaskId | bufferedAt[tid, t] = j
+    no tid: TaskId | leaseJobAt[tid, t] = j
+    
+    -- Pre: new task ID is not in use
+    no dbQueuedAt[newTid, t]
+    no bufferedAt[newTid, t]
+    no leaseAt[newTid, t]
+    
+    -- [SILO-RESTART-4] Post: Clear cancellation (remove cancellation record)
+    not isCancelledAt[j, tnext]
+    
+    -- [SILO-RESTART-5] Post: Create new task in DB queue
+    one qt: DbQueuedTask | qt.db_qtask = newTid and qt.db_qjob = j and qt.db_qtime = tnext
+    
+    -- [SILO-RESTART-6] Post: Set status to Scheduled (job can run again)
+    statusAt[j, tnext] = Scheduled
+    
+    -- Frame: other DB queue entries unchanged
+    all tid2: TaskId | tid2 != newTid implies dbQueuedAt[tid2, tnext] = dbQueuedAt[tid2, t]
+    
+    -- Frame: buffer unchanged
+    all tid: TaskId | bufferedAt[tid, tnext] = bufferedAt[tid, t]
+    
+    -- Frame: leases unchanged
+    all tid: TaskId | {
+        leaseAt[tid, tnext] = leaseAt[tid, t]
+        leaseJobAt[tid, tnext] = leaseJobAt[tid, t]
+        leaseAttemptAt[tid, tnext] = leaseAttemptAt[tid, t]
+    }
+    
+    -- Frame: other jobs unchanged (status and cancellation)
+    all j2: Job | j2 in jobExistsAt[t] and j2 != j implies statusAt[j2, tnext] = statusAt[j2, t]
+    all j2: Job | j2 != j implies (isCancelledAt[j2, tnext] iff isCancelledAt[j2, t])
+    
+    -- Frame: job existence, attempts unchanged
+    jobExistsAt[tnext] = jobExistsAt[t]
+    attemptExistsAt[tnext] = attemptExistsAt[t]
+    all a: attemptExistsAt[t] | attemptStatusAt[a, tnext] = attemptStatusAt[a, t]
+    
+    -- Frame: Concurrency state unchanged
+    -- Note: If job had pending requests, they were cleaned up by cleanupCancelledRequest
+    -- before restart could happen (since job had no active tasks)
+    concurrencyUnchanged[t, tnext]
+}
+
+-- Transition: RESTART_FAILED_JOB - Re-enable a finally-failed job
+-- A job that has permanently failed (status = Failed) can be restarted.
+-- Mid-retry jobs (Scheduled with pending retry task) cannot use this - they have active tasks.
+-- This clears the Failed status and optionally cancellation, creating a new task.
+-- Note: Uses same SILO-RESTART-* sigils as restartCancelledJob since Rust handles both in one function.
+pred restartFailedJob[j: Job, newTid: TaskId, t: Time, tnext: Time] {
+    -- [SILO-RESTART-1] Pre: job exists and is in restartable state (Failed is restartable)
+    j in jobExistsAt[t]
+    statusAt[j, t] = Failed
+    
+    -- [SILO-RESTART-3] Pre: no active tasks for this job
+    -- This ensures we're not restarting a mid-retry job
+    no tid: TaskId | dbQueuedAt[tid, t] = j
+    no tid: TaskId | bufferedAt[tid, t] = j
+    no tid: TaskId | leaseJobAt[tid, t] = j
+    
+    -- Pre: new task ID is not in use
+    no dbQueuedAt[newTid, t]
+    no bufferedAt[newTid, t]
+    no leaseAt[newTid, t]
+    
+    -- [SILO-RESTART-4] Post: Clear cancellation if it was cancelled
+    -- (A job can be both Failed and cancelled if worker finished with failure after cancellation)
+    not isCancelledAt[j, tnext]
+    
+    -- [SILO-RESTART-5] Post: Create new task in DB queue
+    one qt: DbQueuedTask | qt.db_qtask = newTid and qt.db_qjob = j and qt.db_qtime = tnext
+    
+    -- [SILO-RESTART-6] Post: Set status to Scheduled (job can run again)
+    statusAt[j, tnext] = Scheduled
+    
+    -- Frame: other DB queue entries unchanged
+    all tid2: TaskId | tid2 != newTid implies dbQueuedAt[tid2, tnext] = dbQueuedAt[tid2, t]
+    
+    -- Frame: buffer unchanged
+    all tid: TaskId | bufferedAt[tid, tnext] = bufferedAt[tid, t]
+    
+    -- Frame: leases unchanged
+    all tid: TaskId | {
+        leaseAt[tid, tnext] = leaseAt[tid, t]
+        leaseJobAt[tid, tnext] = leaseJobAt[tid, t]
+        leaseAttemptAt[tid, tnext] = leaseAttemptAt[tid, t]
+    }
+    
+    -- Frame: other jobs unchanged (status and cancellation)
+    all j2: Job | j2 in jobExistsAt[t] and j2 != j implies statusAt[j2, tnext] = statusAt[j2, t]
+    all j2: Job | j2 != j implies (isCancelledAt[j2, tnext] iff isCancelledAt[j2, t])
+    
+    -- Frame: job existence, attempts unchanged
+    jobExistsAt[tnext] = jobExistsAt[t]
+    attemptExistsAt[tnext] = attemptExistsAt[t]
+    all a: attemptExistsAt[t] | attemptStatusAt[a, tnext] = attemptStatusAt[a, t]
+    
+    -- Frame: Concurrency state unchanged
+    concurrencyUnchanged[t, tnext]
+}
+
 -- Transition: HEARTBEAT - Worker extends lease expiry
 -- Note: Heartbeat ALWAYS renews the lease, even for cancelled jobs.
 -- The worker discovers cancellation from the heartbeat RESPONSE, but can keep heartbeating while gracefully winding down. Lease is only released on completion.
@@ -1094,6 +1214,8 @@ pred step[t: Time, tnext: Time] {
     or (some tid: TaskId, w: Worker | completeFailurePermanent[tid, w, t, tnext])
     or (some tid: TaskId, w: Worker, newTid: TaskId | completeFailureRetry[tid, w, newTid, t, tnext])
     or (some j: Job | cancelJob[j, t, tnext])
+    or (some j: Job, newTid: TaskId | restartCancelledJob[j, newTid, t, tnext])
+    or (some j: Job, newTid: TaskId | restartFailedJob[j, newTid, t, tnext])
     -- Concurrency ticket management
     or (some tid: TaskId, j: Job, q: Queue | enqueueWithConcurrencyGranted[tid, j, q, t, tnext])
     or (some tid: TaskId, j: Job, q: Queue | enqueueWithConcurrencyQueued[tid, j, q, t, tnext])
@@ -1160,9 +1282,10 @@ assert validTransitions {
     all t: Time - last, j: Job | j in jobExistsAt[t] implies {
         statusAt[j, t] = Scheduled implies statusAt[j, t.next] in (Scheduled + Running)
         statusAt[j, t] = Running implies statusAt[j, t.next] in (Running + Succeeded + Failed + Scheduled)
-        -- Succeeded and Failed are truly terminal
+        -- Succeeded is truly terminal (cannot be restarted)
         statusAt[j, t] = Succeeded implies statusAt[j, t.next] = Succeeded
-        statusAt[j, t] = Failed implies statusAt[j, t.next] = Failed
+        -- Failed can transition to Scheduled via restart
+        statusAt[j, t] = Failed implies statusAt[j, t.next] in (Failed + Scheduled)
     }
 }
 
@@ -1192,12 +1315,28 @@ assert noLeasesForTerminal {
 }
 
 /**
- * Cancellation is monotonic: once cancelled, always cancelled.
- * This is enforced by wellFormed, but we verify it here.
+ * Cancellation can only be cleared for restartable jobs.
+ * If a job is cancelled at t but not at t.next, the job must have been restartable:
+ * - Non-terminal (Scheduled/Running) via restartCancelledJob, OR
+ * - Failed via restartFailedJob
+ * Succeeded jobs cannot be restarted or have their cancellation cleared.
  */
-assert cancellationIsMonotonic {
+assert cancellationClearedRequiresRestartable {
     all j: Job, t: Time - last | 
-        isCancelledAt[j, t] implies isCancelledAt[j, t.next]
+        (isCancelledAt[j, t] and not isCancelledAt[j, t.next]) implies 
+            statusAt[j, t] != Succeeded
+}
+
+/**
+ * When cancellation is cleared, the job becomes Scheduled with a new task.
+ * This verifies the restart postconditions.
+ */
+assert restartedJobIsScheduledWithTask {
+    all j: Job, t: Time - last | 
+        (isCancelledAt[j, t] and not isCancelledAt[j, t.next]) implies {
+            statusAt[j, t.next] = Scheduled
+            some tid: TaskId | dbQueuedAt[tid, t.next] = j
+        }
 }
 
 /**
@@ -1484,6 +1623,236 @@ pred exampleLeaseExpiryReleasesTicket {
     }
 }
 
+/**
+ * Scenario: Cancelled job is restarted and completes successfully
+ * Job is enqueued, cancelled before running, cleaned up by dequeue,
+ * then restarted and successfully completes.
+ */
+pred exampleRestartCancelledJob {
+    some tid1, tid2: TaskId, j: Job, t1, t2, t3, t4, t5: Time | {
+        lt[t1, t2] and lt[t2, t3] and lt[t3, t4] and lt[t4, t5]
+        tid1 != tid2
+        -- t1: job enqueued and scheduled, NOT cancelled
+        j in jobExistsAt[t1]
+        statusAt[j, t1] = Scheduled
+        not isCancelledAt[j, t1]
+        some dbQueuedAt[tid1, t1]
+        dbQueuedAt[tid1, t1] = j
+        -- t2: job cancelled, task still exists (lazy cleanup)
+        isCancelledAt[j, t2]
+        statusAt[j, t2] = Scheduled
+        -- t3: task cleaned up (via dequeueCleanupCancelled), no active tasks
+        isCancelledAt[j, t3]
+        no tid: TaskId | dbQueuedAt[tid, t3] = j
+        no tid: TaskId | bufferedAt[tid, t3] = j
+        no tid: TaskId | leaseJobAt[tid, t3] = j
+        -- t4: job restarted, cancellation cleared, new task created
+        not isCancelledAt[j, t4]
+        statusAt[j, t4] = Scheduled
+        some dbQueuedAt[tid2, t4]
+        dbQueuedAt[tid2, t4] = j
+        -- t5: job completes successfully
+        statusAt[j, t5] = Succeeded
+        not isCancelledAt[j, t5]
+    }
+}
+
+/**
+ * Scenario: Running job cancelled, worker acknowledges via retry, then restarted and completes
+ * Job starts running, is cancelled mid-execution, worker discovers cancellation and 
+ * acknowledges by doing a "retry" (which sets status to Scheduled and creates a new task).
+ * The retry task is cleaned up by dequeueCleanupCancelled, leaving the job in a clean
+ * cancelled+Scheduled state. Then the job is restarted and completes successfully.
+ * 
+ * This demonstrates:
+ * 1. Cancellation during execution - worker discovers on heartbeat
+ * 2. Worker can acknowledge cancellation via retry (status → Scheduled)
+ * 3. Retry task gets cleaned up since job is cancelled
+ * 4. Cancelled non-terminal job can be restarted
+ * 5. Restarted job runs fresh and completes normally
+ */
+pred exampleCancelWhileRunningThenRestartAndComplete {
+    some tid1, tid2, tid3: TaskId, j: Job, a1, a2: Attempt, t1, t2, t3, t4, t5, t6, t7: Time | {
+        lt[t1, t2] and lt[t2, t3] and lt[t3, t4] and lt[t4, t5] and lt[t5, t6] and lt[t6, t7]
+        tid1 != tid2 and tid2 != tid3 and tid1 != tid3
+        a1 != a2
+        attemptJob[a1] = j
+        attemptJob[a2] = j
+        
+        -- t1: job is running (has lease), NOT cancelled
+        j in jobExistsAt[t1]
+        statusAt[j, t1] = Running
+        not isCancelledAt[j, t1]
+        some leaseAt[tid1, t1]
+        leaseJobAt[tid1, t1] = j
+        leaseAttemptAt[tid1, t1] = a1
+        attemptStatusAt[a1, t1] = AttemptRunning
+        
+        -- t2: job cancelled while still running (worker discovers on heartbeat)
+        isCancelledAt[j, t2]
+        statusAt[j, t2] = Running
+        some leaseAt[tid1, t2]  -- lease still active
+        leaseJobAt[tid1, t2] = j
+        attemptStatusAt[a1, t2] = AttemptRunning
+        
+        -- t3: worker acknowledges cancellation via retry (releases lease, creates retry task)
+        isCancelledAt[j, t3]  -- still cancelled
+        statusAt[j, t3] = Scheduled  -- retry sets status to Scheduled
+        no leaseAt[tid1, t3]  -- lease released
+        attemptStatusAt[a1, t3] = AttemptFailed  -- first attempt failed
+        some dbQueuedAt[tid2, t3]  -- retry task created
+        dbQueuedAt[tid2, t3] = j
+        
+        -- t4: retry task cleaned up (dequeueCleanupCancelled) since job is cancelled
+        isCancelledAt[j, t4]
+        statusAt[j, t4] = Scheduled  -- still Scheduled (non-terminal)
+        no tid: TaskId | dbQueuedAt[tid, t4] = j  -- no tasks in DB queue
+        no tid: TaskId | bufferedAt[tid, t4] = j  -- no tasks in buffer
+        no tid: TaskId | leaseJobAt[tid, t4] = j  -- no leases
+        
+        -- t5: job restarted (cancellation cleared, new task created)
+        not isCancelledAt[j, t5]  -- cancellation cleared
+        statusAt[j, t5] = Scheduled
+        some dbQueuedAt[tid3, t5]
+        dbQueuedAt[tid3, t5] = j
+        
+        -- t6: new task is running
+        statusAt[j, t6] = Running
+        not isCancelledAt[j, t6]
+        some leaseAt[tid3, t6]
+        leaseJobAt[tid3, t6] = j
+        leaseAttemptAt[tid3, t6] = a2
+        attemptStatusAt[a2, t6] = AttemptRunning
+        
+        -- t7: second execution completes successfully
+        statusAt[j, t7] = Succeeded
+        not isCancelledAt[j, t7]
+        no leaseAt[tid3, t7]
+        attemptStatusAt[a2, t7] = AttemptSucceeded
+        
+        -- Both attempts exist at the end
+        a1 in attemptExistsAt[t7]
+        a2 in attemptExistsAt[t7]
+    }
+}
+
+/**
+ * Scenario: Failed job is restarted and completes successfully
+ * Job runs, fails permanently (not a retry), then is restarted and completes.
+ * 
+ * This demonstrates:
+ * 1. Job reaches terminal Failed state
+ * 2. Failed job can be restarted (unlike Succeeded)
+ * 3. Restarted job runs fresh and completes normally
+ */
+pred exampleRestartFailedJob {
+    some tid1, tid2: TaskId, j: Job, a1, a2: Attempt, t1, t2, t3, t4, t5: Time | {
+        lt[t1, t2] and lt[t2, t3] and lt[t3, t4] and lt[t4, t5]
+        tid1 != tid2
+        a1 != a2
+        attemptJob[a1] = j
+        attemptJob[a2] = j
+        
+        -- t1: job is running
+        j in jobExistsAt[t1]
+        statusAt[j, t1] = Running
+        not isCancelledAt[j, t1]
+        some leaseAt[tid1, t1]
+        leaseJobAt[tid1, t1] = j
+        leaseAttemptAt[tid1, t1] = a1
+        attemptStatusAt[a1, t1] = AttemptRunning
+        
+        -- t2: job fails permanently (no retry)
+        statusAt[j, t2] = Failed
+        no leaseAt[tid1, t2]
+        attemptStatusAt[a1, t2] = AttemptFailed
+        not isCancelledAt[j, t2]
+        -- No active tasks (final failure, no retry task)
+        no tid: TaskId | dbQueuedAt[tid, t2] = j
+        no tid: TaskId | bufferedAt[tid, t2] = j
+        no tid: TaskId | leaseJobAt[tid, t2] = j
+        
+        -- t3: job is restarted (restartFailedJob transition)
+        statusAt[j, t3] = Scheduled
+        not isCancelledAt[j, t3]
+        some dbQueuedAt[tid2, t3]
+        dbQueuedAt[tid2, t3] = j
+        
+        -- t4: new task is running
+        statusAt[j, t4] = Running
+        not isCancelledAt[j, t4]
+        some leaseAt[tid2, t4]
+        leaseJobAt[tid2, t4] = j
+        leaseAttemptAt[tid2, t4] = a2
+        attemptStatusAt[a2, t4] = AttemptRunning
+        
+        -- t5: job completes successfully
+        statusAt[j, t5] = Succeeded
+        not isCancelledAt[j, t5]
+        no leaseAt[tid2, t5]
+        attemptStatusAt[a2, t5] = AttemptSucceeded
+        
+        -- Both attempts exist at the end
+        a1 in attemptExistsAt[t5]
+        a2 in attemptExistsAt[t5]
+    }
+}
+
+/**
+ * Scenario: Failed+cancelled job is restarted
+ * Job runs, is cancelled while running, fails (worker finishes with failure),
+ * then is restarted (clearing both Failed status and cancellation).
+ */
+pred exampleRestartFailedAndCancelledJob {
+    some tid1, tid2: TaskId, j: Job, a1, a2: Attempt, t1, t2, t3, t4, t5, t6: Time | {
+        lt[t1, t2] and lt[t2, t3] and lt[t3, t4] and lt[t4, t5] and lt[t5, t6]
+        tid1 != tid2
+        a1 != a2
+        attemptJob[a1] = j
+        attemptJob[a2] = j
+        
+        -- t1: job is running, not cancelled
+        j in jobExistsAt[t1]
+        statusAt[j, t1] = Running
+        not isCancelledAt[j, t1]
+        some leaseAt[tid1, t1]
+        leaseJobAt[tid1, t1] = j
+        
+        -- t2: job cancelled while running
+        statusAt[j, t2] = Running
+        isCancelledAt[j, t2]
+        some leaseAt[tid1, t2]
+        
+        -- t3: worker finishes with failure (despite cancellation)
+        statusAt[j, t3] = Failed
+        isCancelledAt[j, t3]  -- still cancelled
+        no leaseAt[tid1, t3]
+        attemptStatusAt[a1, t3] = AttemptFailed
+        -- No active tasks
+        no tid: TaskId | dbQueuedAt[tid, t3] = j
+        no tid: TaskId | leaseJobAt[tid, t3] = j
+        
+        -- t4: job is restarted (clears both Failed and cancellation)
+        statusAt[j, t4] = Scheduled
+        not isCancelledAt[j, t4]  -- cancellation cleared!
+        some dbQueuedAt[tid2, t4]
+        dbQueuedAt[tid2, t4] = j
+        
+        -- t5: new task is running
+        statusAt[j, t5] = Running
+        not isCancelledAt[j, t5]
+        some leaseAt[tid2, t5]
+        leaseJobAt[tid2, t5] = j
+        leaseAttemptAt[tid2, t5] = a2
+        
+        -- t6: job completes successfully
+        statusAt[j, t6] = Succeeded
+        not isCancelledAt[j, t6]
+        no leaseAt[tid2, t6]
+        attemptStatusAt[a2, t6] = AttemptSucceeded
+    }
+}
+
 -- Note: JobState count = Jobs × Times where job exists (not all times)
 -- AttemptExists and JobExists need 1 per Time
 -- JobCancelled: needs entries for times when job is cancelled
@@ -1511,6 +1880,18 @@ run exampleHeartbeat for 3 but exactly 1 Job, 1 Worker, 2 TaskId, 2 Attempt, 8 T
 
 run exampleLeaseExpiry for 3 but exactly 1 Job, 1 Worker, 2 TaskId, 2 Attempt, 8 Time,
     8 JobState, 8 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 2 JobAttemptRelation, 8 JobCancelled
+
+run exampleRestartCancelledJob for 3 but exactly 1 Job, 1 Worker, 3 TaskId, 2 Attempt, 12 Time,
+    12 JobState, 12 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 12 AttemptExists, 12 JobExists, 2 JobAttemptRelation, 12 JobCancelled
+
+run exampleCancelWhileRunningThenRestartAndComplete for 3 but exactly 1 Job, 1 Worker, 4 TaskId, 3 Attempt, 14 Time,
+    14 JobState, 14 AttemptState, 8 DbQueuedTask, 8 BufferedTask, 6 Lease, 14 AttemptExists, 14 JobExists, 3 JobAttemptRelation, 14 JobCancelled
+
+run exampleRestartFailedJob for 3 but exactly 1 Job, 1 Worker, 3 TaskId, 3 Attempt, 12 Time,
+    12 JobState, 12 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 12 AttemptExists, 12 JobExists, 3 JobAttemptRelation, 12 JobCancelled
+
+run exampleRestartFailedAndCancelledJob for 3 but exactly 1 Job, 1 Worker, 3 TaskId, 3 Attempt, 14 Time,
+    14 JobState, 14 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 14 AttemptExists, 14 JobExists, 3 JobAttemptRelation, 14 JobCancelled
 
 -- Concurrency examples need Queue, TicketRequest, TicketHolder, JobQueueRequirement
 run exampleConcurrencyGrantedImmediately for 3 but exactly 1 Job, 1 Worker, 2 TaskId, 2 Attempt, 8 Time, 1 Queue,
@@ -1563,8 +1944,10 @@ check noQueuedTasksForTerminal for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8
     16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 12 JobCancelled
 check noLeasesForTerminal for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
     16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 12 JobCancelled
-check cancellationIsMonotonic for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
-    16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 12 JobCancelled
+check cancellationClearedRequiresRestartable for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
+    16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 16 JobCancelled
+check restartedJobIsScheduledWithTask for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
+    16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 16 JobCancelled
 
 -- Concurrency ticket assertions (with Queue, TicketRequest, TicketHolder, JobQueueRequirement bounds)
 check queueLimitEnforced for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time, 2 Queue,

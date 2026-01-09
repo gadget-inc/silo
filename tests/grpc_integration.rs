@@ -1908,7 +1908,9 @@ async fn grpc_server_tenant_validation_when_enabled() -> anyhow::Result<()> {
                 priority: 5,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(JsonValueBytes { data: b"{}".to_vec() }),
+                payload: Some(JsonValueBytes {
+                    data: b"{}".to_vec(),
+                }),
                 limits: vec![],
                 tenant: None, // Missing!
                 metadata: std::collections::HashMap::new(),
@@ -1935,7 +1937,9 @@ async fn grpc_server_tenant_validation_when_enabled() -> anyhow::Result<()> {
                 priority: 5,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(JsonValueBytes { data: b"{}".to_vec() }),
+                payload: Some(JsonValueBytes {
+                    data: b"{}".to_vec(),
+                }),
                 limits: vec![],
                 tenant: Some("".to_string()), // Empty!
                 metadata: std::collections::HashMap::new(),
@@ -1957,7 +1961,9 @@ async fn grpc_server_tenant_validation_when_enabled() -> anyhow::Result<()> {
                 priority: 5,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(JsonValueBytes { data: b"{}".to_vec() }),
+                payload: Some(JsonValueBytes {
+                    data: b"{}".to_vec(),
+                }),
                 limits: vec![],
                 tenant: Some("x".repeat(65)), // Too long!
                 metadata: std::collections::HashMap::new(),
@@ -1984,7 +1990,9 @@ async fn grpc_server_tenant_validation_when_enabled() -> anyhow::Result<()> {
                 priority: 5,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(JsonValueBytes { data: b"{}".to_vec() }),
+                payload: Some(JsonValueBytes {
+                    data: b"{}".to_vec(),
+                }),
                 limits: vec![],
                 tenant: Some("my-tenant".to_string()),
                 metadata: std::collections::HashMap::new(),
@@ -2126,7 +2134,9 @@ async fn grpc_server_reset_shards_works_in_dev_mode() -> anyhow::Result<()> {
                 priority: 5,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(JsonValueBytes { data: b"{}".to_vec() }),
+                payload: Some(JsonValueBytes {
+                    data: b"{}".to_vec(),
+                }),
                 limits: vec![],
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
@@ -2293,7 +2303,9 @@ async fn grpc_server_get_job_result_for_non_terminal_job() -> anyhow::Result<()>
                 priority: 5,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(JsonValueBytes { data: b"{}".to_vec() }),
+                payload: Some(JsonValueBytes {
+                    data: b"{}".to_vec(),
+                }),
                 limits: vec![],
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
@@ -2380,7 +2392,9 @@ async fn grpc_server_enqueue_with_rate_limit() -> anyhow::Result<()> {
                 priority: 5,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(JsonValueBytes { data: b"{}".to_vec() }),
+                payload: Some(JsonValueBytes {
+                    data: b"{}".to_vec(),
+                }),
                 limits: vec![Limit {
                     limit: Some(limit::Limit::RateLimit(silo::pb::GubernatorRateLimit {
                         name: "my-rate-limit".to_string(),
@@ -2497,6 +2511,768 @@ async fn grpc_server_report_refresh_outcome_missing_outcome() -> anyhow::Result<
                     status.message()
                 );
             }
+        }
+
+        let _ = shutdown_tx.send(());
+        let join_result = server.await;
+        match join_result {
+            Ok(inner) => {
+                if let Err(e) = inner {
+                    return Err(anyhow::anyhow!(e.to_string()));
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        }
+        Ok(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// Test that enqueue fails with a clear error when tenancy is enabled but no tenant is specified
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_enqueue_requires_tenant_when_tenancy_enabled() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let tmp = tempfile::tempdir()?;
+        let template = DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+        };
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let factory = ShardFactory::new(template, rate_limiter);
+        let _ = factory.open(0).await?;
+        let factory = Arc::new(factory);
+
+        let listener =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
+        // Create a config with tenancy enabled
+        let mut config = silo::settings::AppConfig::load(None).unwrap();
+        config.tenancy.enabled = true;
+
+        let server = tokio::spawn(run_server(
+            listener,
+            factory.clone(),
+            None,
+            config,
+            shutdown_rx,
+        ));
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint.clone())?
+            .connect()
+            .await?;
+        let mut client = SiloClient::new(channel);
+
+        // Test 1: Enqueue without tenant (None)
+        let req = EnqueueRequest {
+            shard: 0,
+            id: "".to_string(),
+            priority: 1,
+            start_at_ms: 0,
+            retry_policy: None,
+            payload: Some(JsonValueBytes {
+                data: b"{}".to_vec(),
+            }),
+            limits: vec![],
+            tenant: None,
+            metadata: std::collections::HashMap::new(),
+        };
+        let res = client.enqueue(req).await;
+        match res {
+            Ok(_) => panic!("expected error when tenant is missing with tenancy enabled"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::InvalidArgument);
+                assert!(
+                    status.message().contains("tenant") && status.message().contains("required"),
+                    "error message should mention tenant is required, got: {}",
+                    status.message()
+                );
+            }
+        }
+
+        // Test 2: Enqueue with empty tenant string
+        let req = EnqueueRequest {
+            shard: 0,
+            id: "".to_string(),
+            priority: 1,
+            start_at_ms: 0,
+            retry_policy: None,
+            payload: Some(JsonValueBytes {
+                data: b"{}".to_vec(),
+            }),
+            limits: vec![],
+            tenant: Some("".to_string()),
+            metadata: std::collections::HashMap::new(),
+        };
+        let res = client.enqueue(req).await;
+        match res {
+            Ok(_) => panic!("expected error when tenant is empty with tenancy enabled"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::InvalidArgument);
+                assert!(
+                    status.message().contains("tenant") && status.message().contains("required"),
+                    "error message should mention tenant is required for empty string, got: {}",
+                    status.message()
+                );
+            }
+        }
+
+        // Test 3: Enqueue WITH a valid tenant should succeed
+        let req = EnqueueRequest {
+            shard: 0,
+            id: "".to_string(),
+            priority: 1,
+            start_at_ms: 0,
+            retry_policy: None,
+            payload: Some(JsonValueBytes {
+                data: b"{}".to_vec(),
+            }),
+            limits: vec![],
+            tenant: Some("my-tenant".to_string()),
+            metadata: std::collections::HashMap::new(),
+        };
+        let res = client.enqueue(req).await;
+        assert!(res.is_ok(), "enqueue with valid tenant should succeed");
+
+        let _ = shutdown_tx.send(());
+        let join_result = server.await;
+        match join_result {
+            Ok(inner) => {
+                if let Err(e) = inner {
+                    return Err(anyhow::anyhow!(e.to_string()));
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        }
+        Ok(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+// =============================================================================
+// RestartJob gRPC Integration Tests
+// =============================================================================
+
+/// Test restarting a cancelled job via gRPC
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_restart_cancelled_job() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
+        let tmp = tempfile::tempdir()?;
+        let template = DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+        };
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let factory = ShardFactory::new(template, rate_limiter);
+        let _ = factory.open(0).await?;
+        let factory = Arc::new(factory);
+
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
+        let server = tokio::spawn(run_server(
+            listener,
+            factory.clone(),
+            None,
+            silo::settings::AppConfig::load(None).unwrap(),
+            shutdown_rx,
+        ));
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint.clone())?
+            .connect()
+            .await?;
+        let mut client = SiloClient::new(channel);
+
+        // Enqueue a job
+        let enq_resp = client
+            .enqueue(EnqueueRequest {
+                shard: 0,
+                id: "restart-test-job".to_string(),
+                priority: 10,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(JsonValueBytes {
+                    data: b"{\"test\": true}".to_vec(),
+                }),
+                limits: vec![],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+            })
+            .await?
+            .into_inner();
+        let job_id = enq_resp.id;
+
+        // Verify job is scheduled
+        let job = client
+            .get_job(GetJobRequest {
+                shard: 0,
+                id: job_id.clone(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+        assert_eq!(job.status, JobStatus::Scheduled as i32);
+
+        // Cancel the job
+        client
+            .cancel_job(CancelJobRequest {
+                shard: 0,
+                id: job_id.clone(),
+                tenant: None,
+            })
+            .await?;
+
+        // Verify job is cancelled
+        let job = client
+            .get_job(GetJobRequest {
+                shard: 0,
+                id: job_id.clone(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+        assert_eq!(job.status, JobStatus::Cancelled as i32);
+
+        // Restart the job
+        client
+            .restart_job(RestartJobRequest {
+                shard: 0,
+                id: job_id.clone(),
+                tenant: None,
+            })
+            .await?;
+
+        // Verify job is scheduled again
+        let job = client
+            .get_job(GetJobRequest {
+                shard: 0,
+                id: job_id.clone(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+        assert_eq!(job.status, JobStatus::Scheduled as i32);
+
+        // Lease and complete the restarted job
+        let lease_resp = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: Some(0),
+                worker_id: "worker-1".to_string(),
+                max_tasks: 1,
+            })
+            .await?
+            .into_inner();
+        assert_eq!(lease_resp.tasks.len(), 1);
+        let task = &lease_resp.tasks[0];
+
+        client
+            .report_outcome(ReportOutcomeRequest {
+                shard: 0,
+                task_id: task.id.clone(),
+                tenant: None,
+                outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
+                    data: b"\"done\"".to_vec(),
+                })),
+            })
+            .await?;
+
+        // Verify job succeeded
+        let job = client
+            .get_job(GetJobRequest {
+                shard: 0,
+                id: job_id.clone(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+        assert_eq!(job.status, JobStatus::Succeeded as i32);
+
+        let _ = shutdown_tx.send(());
+        let join_result = server.await;
+        match join_result {
+            Ok(inner) => {
+                if let Err(e) = inner {
+                    return Err(anyhow::anyhow!(e.to_string()));
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        }
+        Ok(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// Test restarting a failed job via gRPC
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_restart_failed_job() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
+        let tmp = tempfile::tempdir()?;
+        let template = DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+        };
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let factory = ShardFactory::new(template, rate_limiter);
+        let _ = factory.open(0).await?;
+        let factory = Arc::new(factory);
+
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
+        let server = tokio::spawn(run_server(
+            listener,
+            factory.clone(),
+            None,
+            silo::settings::AppConfig::load(None).unwrap(),
+            shutdown_rx,
+        ));
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint.clone())?
+            .connect()
+            .await?;
+        let mut client = SiloClient::new(channel);
+
+        // Enqueue a job without retry policy (will fail permanently on error)
+        let enq_resp = client
+            .enqueue(EnqueueRequest {
+                shard: 0,
+                id: "restart-failed-job".to_string(),
+                priority: 10,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(JsonValueBytes {
+                    data: b"{\"test\": true}".to_vec(),
+                }),
+                limits: vec![],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+            })
+            .await?
+            .into_inner();
+        let job_id = enq_resp.id;
+
+        // Lease and fail the job
+        let lease_resp = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: Some(0),
+                worker_id: "worker-1".to_string(),
+                max_tasks: 1,
+            })
+            .await?
+            .into_inner();
+        assert_eq!(lease_resp.tasks.len(), 1);
+        let task = &lease_resp.tasks[0];
+
+        client
+            .report_outcome(ReportOutcomeRequest {
+                shard: 0,
+                task_id: task.id.clone(),
+                tenant: None,
+                outcome: Some(report_outcome_request::Outcome::Failure(Failure {
+                    code: "TEST_ERROR".to_string(),
+                    data: b"test failure".to_vec(),
+                })),
+            })
+            .await?;
+
+        // Verify job is failed
+        let job = client
+            .get_job(GetJobRequest {
+                shard: 0,
+                id: job_id.clone(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+        assert_eq!(job.status, JobStatus::Failed as i32);
+
+        // Restart the failed job
+        client
+            .restart_job(RestartJobRequest {
+                shard: 0,
+                id: job_id.clone(),
+                tenant: None,
+            })
+            .await?;
+
+        // Verify job is scheduled again
+        let job = client
+            .get_job(GetJobRequest {
+                shard: 0,
+                id: job_id.clone(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+        assert_eq!(job.status, JobStatus::Scheduled as i32);
+
+        // Complete the restarted job successfully
+        let lease_resp = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: Some(0),
+                worker_id: "worker-2".to_string(),
+                max_tasks: 1,
+            })
+            .await?
+            .into_inner();
+        assert_eq!(lease_resp.tasks.len(), 1);
+        let task = &lease_resp.tasks[0];
+
+        client
+            .report_outcome(ReportOutcomeRequest {
+                shard: 0,
+                task_id: task.id.clone(),
+                tenant: None,
+                outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
+                    data: b"\"success after restart\"".to_vec(),
+                })),
+            })
+            .await?;
+
+        // Verify job succeeded
+        let job = client
+            .get_job(GetJobRequest {
+                shard: 0,
+                id: job_id.clone(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+        assert_eq!(job.status, JobStatus::Succeeded as i32);
+
+        let _ = shutdown_tx.send(());
+        let join_result = server.await;
+        match join_result {
+            Ok(inner) => {
+                if let Err(e) = inner {
+                    return Err(anyhow::anyhow!(e.to_string()));
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        }
+        Ok(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// Test restart returns NOT_FOUND for non-existent job
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_restart_nonexistent_job() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let tmp = tempfile::tempdir()?;
+        let template = DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+        };
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let factory = ShardFactory::new(template, rate_limiter);
+        let _ = factory.open(0).await?;
+        let factory = Arc::new(factory);
+
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
+        let server = tokio::spawn(run_server(
+            listener,
+            factory.clone(),
+            None,
+            silo::settings::AppConfig::load(None).unwrap(),
+            shutdown_rx,
+        ));
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint.clone())?
+            .connect()
+            .await?;
+        let mut client = SiloClient::new(channel);
+
+        // Try to restart non-existent job
+        let result = client
+            .restart_job(RestartJobRequest {
+                shard: 0,
+                id: "does-not-exist".to_string(),
+                tenant: None,
+            })
+            .await;
+
+        match result {
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::NotFound);
+            }
+            Ok(_) => panic!("expected NOT_FOUND error"),
+        }
+
+        let _ = shutdown_tx.send(());
+        let join_result = server.await;
+        match join_result {
+            Ok(inner) => {
+                if let Err(e) = inner {
+                    return Err(anyhow::anyhow!(e.to_string()));
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        }
+        Ok(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// Test restart returns FAILED_PRECONDITION for running job
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_restart_running_job_fails() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
+        let tmp = tempfile::tempdir()?;
+        let template = DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+        };
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let factory = ShardFactory::new(template, rate_limiter);
+        let _ = factory.open(0).await?;
+        let factory = Arc::new(factory);
+
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
+        let server = tokio::spawn(run_server(
+            listener,
+            factory.clone(),
+            None,
+            silo::settings::AppConfig::load(None).unwrap(),
+            shutdown_rx,
+        ));
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint.clone())?
+            .connect()
+            .await?;
+        let mut client = SiloClient::new(channel);
+
+        // Enqueue a job
+        let enq_resp = client
+            .enqueue(EnqueueRequest {
+                shard: 0,
+                id: "running-job".to_string(),
+                priority: 10,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(JsonValueBytes {
+                    data: b"{}".to_vec(),
+                }),
+                limits: vec![],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+            })
+            .await?
+            .into_inner();
+        let job_id = enq_resp.id;
+
+        // Lease the job to make it Running
+        let lease_resp = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: Some(0),
+                worker_id: "worker-1".to_string(),
+                max_tasks: 1,
+            })
+            .await?
+            .into_inner();
+        assert_eq!(lease_resp.tasks.len(), 1);
+        let task = &lease_resp.tasks[0];
+
+        // Verify job is running
+        let job = client
+            .get_job(GetJobRequest {
+                shard: 0,
+                id: job_id.clone(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+        assert_eq!(job.status, JobStatus::Running as i32);
+
+        // Try to restart - should fail
+        let result = client
+            .restart_job(RestartJobRequest {
+                shard: 0,
+                id: job_id.clone(),
+                tenant: None,
+            })
+            .await;
+
+        match result {
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+                assert!(
+                    status.message().contains("in progress"),
+                    "error message should indicate job is in progress, got: {}",
+                    status.message()
+                );
+            }
+            Ok(_) => panic!("expected FAILED_PRECONDITION error"),
+        }
+
+        // Clean up - complete the job
+        client
+            .report_outcome(ReportOutcomeRequest {
+                shard: 0,
+                task_id: task.id.clone(),
+                tenant: None,
+                outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
+                    data: b"{}".to_vec(),
+                })),
+            })
+            .await?;
+
+        let _ = shutdown_tx.send(());
+        let join_result = server.await;
+        match join_result {
+            Ok(inner) => {
+                if let Err(e) = inner {
+                    return Err(anyhow::anyhow!(e.to_string()));
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        }
+        Ok(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// Test restart returns FAILED_PRECONDITION for succeeded job
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_restart_succeeded_job_fails() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
+        let tmp = tempfile::tempdir()?;
+        let template = DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+        };
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let factory = ShardFactory::new(template, rate_limiter);
+        let _ = factory.open(0).await?;
+        let factory = Arc::new(factory);
+
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
+        let server = tokio::spawn(run_server(
+            listener,
+            factory.clone(),
+            None,
+            silo::settings::AppConfig::load(None).unwrap(),
+            shutdown_rx,
+        ));
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint.clone())?
+            .connect()
+            .await?;
+        let mut client = SiloClient::new(channel);
+
+        // Enqueue and complete a job
+        let enq_resp = client
+            .enqueue(EnqueueRequest {
+                shard: 0,
+                id: "succeeded-job".to_string(),
+                priority: 10,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(JsonValueBytes {
+                    data: b"{}".to_vec(),
+                }),
+                limits: vec![],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+            })
+            .await?
+            .into_inner();
+        let job_id = enq_resp.id;
+
+        // Lease and complete
+        let lease_resp = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: Some(0),
+                worker_id: "worker-1".to_string(),
+                max_tasks: 1,
+            })
+            .await?
+            .into_inner();
+        let task = &lease_resp.tasks[0];
+
+        client
+            .report_outcome(ReportOutcomeRequest {
+                shard: 0,
+                task_id: task.id.clone(),
+                tenant: None,
+                outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
+                    data: b"{}".to_vec(),
+                })),
+            })
+            .await?;
+
+        // Verify job succeeded
+        let job = client
+            .get_job(GetJobRequest {
+                shard: 0,
+                id: job_id.clone(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+        assert_eq!(job.status, JobStatus::Succeeded as i32);
+
+        // Try to restart - should fail
+        let result = client
+            .restart_job(RestartJobRequest {
+                shard: 0,
+                id: job_id.clone(),
+                tenant: None,
+            })
+            .await;
+
+        match result {
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+                assert!(
+                    status.message().contains("succeeded"),
+                    "error message should indicate job already succeeded, got: {}",
+                    status.message()
+                );
+            }
+            Ok(_) => panic!("expected FAILED_PRECONDITION error"),
         }
 
         let _ = shutdown_tx.send(());

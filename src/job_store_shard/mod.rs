@@ -19,7 +19,10 @@ mod floating;
 mod helpers;
 mod lease;
 mod rate_limit;
+mod restart;
 mod scan;
+
+pub use restart::JobNotRestartableError;
 
 pub use helpers::now_epoch_ms;
 
@@ -95,6 +98,8 @@ pub enum JobStoreShardError {
     JobAlreadyCancelled(String),
     #[error("cannot cancel job {0}: job is already in terminal state {1:?}")]
     JobAlreadyTerminal(String, JobStatusKind),
+    #[error("cannot restart job: {0}")]
+    JobNotRestartable(#[from] JobNotRestartableError),
     #[error("transaction conflict during {0}, exceeded max retries")]
     TransactionConflict(String),
 }

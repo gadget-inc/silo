@@ -10,3 +10,9 @@ alloy6 exec -f -o specs/output specs/<some-spec>.als
 ```
 
 Don't use `| head` or `| tail` commands when running alloy verifications -- they are slow and these piped commands make it hard to see if the command is working or not.
+
+### Alloy sigils
+
+We use text-based sigils to ensure that the invariants and assertions in the Alloy model have clear corresponding Rust code that enforces them. They look like `SILO-SOMETHING-123`.
+
+CI validates that all the sigils in the Alloy model are present in the Rust implementation. If changing the Alloy model to add new key invariants or assertions, complete your work on the Alloy model, then ensure you update the Rust code to make sure the sigils match. If the change to the Alloy model is large, ask if we should do the Rust work first, but if it is small, don't ask and just update the Rust code right away.
