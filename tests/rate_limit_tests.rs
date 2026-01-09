@@ -64,7 +64,7 @@ async fn dequeue_repeatedly(
     max_tasks: usize,
     max_attempts: usize,
     delay_ms: u64,
-) -> Vec<silo::job_store_shard::LeasedTask> {
+) -> Vec<silo::task::LeasedTask> {
     for attempt in 0..max_attempts {
         let tasks = shard
             .dequeue(worker_id, max_tasks)

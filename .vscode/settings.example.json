@@ -1,0 +1,4 @@
+{
+  "editor.formatOnSave": true,
+  "rust-analyzer.server.path": "/nix/store/kmcbcki6k3kdvy2j248b8g2k3y1x90na-rust-default-1.89.0/bin/rust-analyzer"
+}

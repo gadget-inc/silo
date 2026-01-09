@@ -233,7 +233,7 @@ async fn reaper_without_retries_marks_failed_in_index() {
     let (lease_key, lease_value) = first_kv_with_prefix(shard.db(), "lease/")
         .await
         .expect("lease present");
-    type ArchivedTask = <silo::job_store_shard::Task as Archive>::Archived;
+    type ArchivedTask = <silo::task::Task as Archive>::Archived;
     let decoded = decode_lease(&lease_value).expect("decode lease");
     let archived = decoded.archived();
     let task = match &archived.task {
@@ -243,7 +243,7 @@ async fn reaper_without_retries_marks_failed_in_index() {
             job_id,
             attempt_number,
             ..
-        } => silo::job_store_shard::Task::RunAttempt {
+        } => silo::task::Task::RunAttempt {
             id: id.as_str().to_string(),
             tenant: tenant.as_str().to_string(),
             job_id: job_id.as_str().to_string(),
@@ -252,7 +252,7 @@ async fn reaper_without_retries_marks_failed_in_index() {
         },
         _ => unreachable!(),
     };
-    let expired = silo::job_store_shard::LeaseRecord {
+    let expired = silo::task::LeaseRecord {
         worker_id: archived.worker_id.as_str().to_string(),
         task,
         expiry_ms: now_ms() - 1,
@@ -305,7 +305,7 @@ async fn reaper_with_retries_moves_to_scheduled_in_index() {
     let (lease_key, lease_value) = first_kv_with_prefix(shard.db(), "lease/")
         .await
         .expect("lease present");
-    type ArchivedTask = <silo::job_store_shard::Task as Archive>::Archived;
+    type ArchivedTask = <silo::task::Task as Archive>::Archived;
     let decoded = decode_lease(&lease_value).expect("decode lease");
     let archived = decoded.archived();
     let task = match &archived.task {
@@ -315,7 +315,7 @@ async fn reaper_with_retries_moves_to_scheduled_in_index() {
             job_id,
             attempt_number,
             ..
-        } => silo::job_store_shard::Task::RunAttempt {
+        } => silo::task::Task::RunAttempt {
             id: id.as_str().to_string(),
             tenant: tenant.as_str().to_string(),
             job_id: job_id.as_str().to_string(),
@@ -324,7 +324,7 @@ async fn reaper_with_retries_moves_to_scheduled_in_index() {
         },
         _ => unreachable!(),
     };
-    let expired = silo::job_store_shard::LeaseRecord {
+    let expired = silo::task::LeaseRecord {
         worker_id: archived.worker_id.as_str().to_string(),
         task,
         expiry_ms: now_ms() - 1,

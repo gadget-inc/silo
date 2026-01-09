@@ -7,7 +7,7 @@ use silo::codec::{
 };
 use silo::job::{JobStatus, JobStatusKind};
 use silo::job_attempt::{AttemptStatus, JobAttempt};
-use silo::job_store_shard::{ConcurrencyAction, HolderRecord, LeaseRecord, Task};
+use silo::task::{ConcurrencyAction, HolderRecord, LeaseRecord, Task};
 
 #[test]
 fn test_task_roundtrip() {

@@ -8,7 +8,7 @@ mod test_helpers;
 
 use silo::job::JobStatusKind;
 use silo::job_attempt::AttemptOutcome;
-use silo::job_store_shard::Task;
+use silo::task::Task;
 
 use test_helpers::*;
 
