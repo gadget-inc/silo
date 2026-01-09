@@ -1,0 +1,43 @@
+---
+title: Deployment
+---
+
+To use Silo for job execution, you must set up two things:
+
+- the Silo server, which will store your jobs and broker tasks
+- some workers listening to this Silo server that actually run tasks.
+
+Your worker instances will poll the Silo server for new tasks to run, run them locally, and report the outcome back to Silo. On failure, the job will be re-attempted in the future according to the job's retry schedule.
+
+If you want to run multiple Silo instances in a cluster to spread out your load, you must also configure a cluster membership system for Silo. Currently, etcd and Kubernetes API based cluster membership providers are available.
+
+## Object storage vs local disk
+
+Silo's main thing is storing job data in object storage, which avoids the need for stateful compute nodes. Everything gets easier as an operator when you can treat a service like cattle instead of pets, and Silo intends to be cattle.
+
+Object storage has some drawbacks, however -- you must accept either high costs and low latency, or low costs and high latency.
+
+## Shard count
+
+### Impact of shard count on costs
+
+TODO -- more shards means fewer writes per shard
+
+### Impact of shard count on throughput
+
+TODO -- more shards means more throughput, but too much per shard overhead, extra object storage writes / compaction overhead
+
+### Tenants need to be small enough to fit in one shard and not create hotspots
+
+
+### Using local disk for WAL
+
+TODO
+
+## Using etcd for cluster membership
+
+TODO
+
+## Using Kubernetes for cluster membership
+
+TODO

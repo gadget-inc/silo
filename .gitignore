@@ -7,3 +7,8 @@
 /specs/output
 /typescript_client/dist
 /typescript_client/node_modules
+
+# Auto-generated docs (built from proto files)
+/docs/src/content/docs/reference/rpc-reference.mdx
+/docs/dist
+/docs/node_modules

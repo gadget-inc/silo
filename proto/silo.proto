@@ -2,155 +2,185 @@ syntax = "proto3";
 
 package silo.v1;
 
-// Core job messages
+// Container for arbitrary JSON data stored as raw bytes.
+// Used for job payloads and results to allow flexible data structures.
 message JsonValueBytes {
-  bytes data = 1; // raw JSON bytes
+  bytes data = 1; // Raw JSON bytes. Callers should serialize/deserialize JSON as needed.
 }
 
+// Configuration for automatic job retry on failure.
+// When a job attempt fails, Silo will automatically retry according to this policy.
 message RetryPolicy {
-  uint32 retry_count = 1;
-  int64 initial_interval_ms = 2;
-  int64 max_interval_ms = 3;
-  bool randomize_interval = 4;
-  double backoff_factor = 5;
+  uint32 retry_count = 1;          // Maximum number of retry attempts after the initial attempt fails.
+  int64 initial_interval_ms = 2;   // Initial delay in milliseconds before the first retry.
+  int64 max_interval_ms = 3;       // Maximum delay between retries (caps exponential backoff).
+  bool randomize_interval = 4;     // If true, adds jitter to retry intervals to prevent thundering herd.
+  double backoff_factor = 5;       // Multiplier for exponential backoff (e.g., 2.0 doubles delay each retry).
 }
 
-// Per-job concurrency limit declaration
+// Static concurrency limit that restricts how many jobs with the same key can run simultaneously.
+// Jobs sharing the same key will queue up if max_concurrency is reached.
 message ConcurrencyLimit {
-  string key = 1;             // grouping key; jobs with same key share a limit
-  uint32 max_concurrency = 2; // maximum concurrent running jobs for this key
+  string key = 1;             // Grouping key - jobs with the same key share this limit.
+  uint32 max_concurrency = 2; // Maximum number of jobs with this key that can run at once.
 }
 
-// Floating concurrency limit - max concurrency is dynamic and refreshed by workers
+// Dynamic concurrency limit where the max_concurrency value is computed by workers.
+// Useful when concurrency should be based on external factors like API rate limits.
+// Workers periodically receive refresh tasks to update the limit.
 message FloatingConcurrencyLimit {
-  string key = 1;                        // grouping key; jobs with same key share a limit
-  uint32 default_max_concurrency = 2;    // initial max concurrency value used until first refresh
-  int64 refresh_interval_ms = 3;         // how often to refresh the max concurrency value
-  map<string, string> metadata = 4;      // arbitrary key/value metadata passed to workers during refresh
+  string key = 1;                     // Grouping key - jobs with the same key share this limit.
+  uint32 default_max_concurrency = 2; // Initial max concurrency used until first worker refresh.
+  int64 refresh_interval_ms = 3;      // How often workers receive refresh tasks (milliseconds).
+  map<string, string> metadata = 4;   // Arbitrary data passed to workers during refresh (e.g., API credentials).
 }
 
-// Gubernator rate limiting algorithm
+// Rate limiting algorithm for Gubernator-based limits.
 enum GubernatorAlgorithm {
-  GUBERNATOR_ALGORITHM_TOKEN_BUCKET = 0;  // Token bucket algorithm
-  GUBERNATOR_ALGORITHM_LEAKY_BUCKET = 1;  // Leaky bucket algorithm
+  GUBERNATOR_ALGORITHM_TOKEN_BUCKET = 0; // Token bucket: tokens refill at steady rate, requests consume tokens.
+  GUBERNATOR_ALGORITHM_LEAKY_BUCKET = 1; // Leaky bucket: requests processed at fixed rate, excess queued.
 }
 
-// Gubernator behavior flags (can be combined via bitwise OR)
+// Behavior flags for Gubernator rate limits. Can be combined via bitwise OR.
 enum GubernatorBehavior {
-  GUBERNATOR_BEHAVIOR_BATCHING = 0;           // Default: batch requests to peers
-  GUBERNATOR_BEHAVIOR_NO_BATCHING = 1;        // Disable batching
-  GUBERNATOR_BEHAVIOR_GLOBAL = 2;             // Global rate limit across all peers
-  GUBERNATOR_BEHAVIOR_DURATION_IS_GREGORIAN = 4; // Duration resets on calendar boundaries
-  GUBERNATOR_BEHAVIOR_RESET_REMAINING = 8;    // Reset the rate limit on this request
-  GUBERNATOR_BEHAVIOR_DRAIN_OVER_LIMIT = 16;  // Drain remaining counter on over limit
+  GUBERNATOR_BEHAVIOR_BATCHING = 0;           // Default: batch rate limit checks to peers for efficiency.
+  GUBERNATOR_BEHAVIOR_NO_BATCHING = 1;        // Send each rate limit check immediately (lower latency, higher load).
+  GUBERNATOR_BEHAVIOR_GLOBAL = 2;             // Synchronize rate limit globally across all Gubernator peers.
+  GUBERNATOR_BEHAVIOR_DURATION_IS_GREGORIAN = 4; // Reset duration on calendar boundaries (minute, hour, day).
+  GUBERNATOR_BEHAVIOR_RESET_REMAINING = 8;    // Force reset the remaining counter on this request.
+  GUBERNATOR_BEHAVIOR_DRAIN_OVER_LIMIT = 16;  // Set remaining to zero on first over-limit event.
 }
 
-// Retry policy specifically for rate limit check retries (when rate limit is exceeded)
+// Retry policy for when a job is blocked by a rate limit.
+// Configures how long workers should wait before retrying the rate limit check.
 message RateLimitRetryPolicy {
-  int64 initial_backoff_ms = 1;  // Initial backoff time when rate limited
-  int64 max_backoff_ms = 2;      // Maximum backoff time
-  double backoff_multiplier = 3; // Multiplier for exponential backoff (default 2.0)
-  uint32 max_retries = 4;        // Maximum number of retries (0 = infinite until reset_time)
+  int64 initial_backoff_ms = 1;  // Initial wait time in milliseconds when rate limited.
+  int64 max_backoff_ms = 2;      // Maximum wait time between retries.
+  double backoff_multiplier = 3; // Multiplier for exponential backoff (default 2.0).
+  uint32 max_retries = 4;        // Max retries before failing the job (0 = infinite until reset_time).
 }
 
-// Gubernator-based rate limit declaration
+// Rate limit backed by the Gubernator distributed rate limiting service.
+// Allows controlling job throughput based on request rates.
 message GubernatorRateLimit {
-  string name = 1;              // Name identifying this rate limit (for debugging/metrics)
-  string unique_key = 2;        // Unique key for this specific rate limit instance
-  int64 limit = 3;              // Maximum requests allowed in the duration
-  int64 duration_ms = 4;        // Duration window in milliseconds
-  int32 hits = 5;               // Number of hits to consume (usually 1)
-  GubernatorAlgorithm algorithm = 6;  // Rate limiting algorithm
-  int32 behavior = 7;           // Behavior flags (bitwise OR of GubernatorBehavior)
-  RateLimitRetryPolicy retry_policy = 8; // How to retry when rate limited
+  string name = 1;                        // Human-readable name for debugging and metrics.
+  string unique_key = 2;                  // Unique identifier for this rate limit instance (e.g., user ID).
+  int64 limit = 3;                        // Maximum number of requests allowed within the duration.
+  int64 duration_ms = 4;                  // Time window in milliseconds for the rate limit.
+  int32 hits = 5;                         // Number of hits this job consumes (usually 1).
+  GubernatorAlgorithm algorithm = 6;      // Algorithm for rate limiting (token bucket or leaky bucket).
+  int32 behavior = 7;                     // Behavior flags - combine GubernatorBehavior values with OR.
+  RateLimitRetryPolicy retry_policy = 8;  // Policy for retrying when rate limited.
 }
 
-// A single limit that can be either a concurrency limit, rate limit, or floating concurrency limit
+// Union type representing any kind of limit that can be applied to a job.
+// Jobs can have multiple limits; all must be satisfied before execution.
 message Limit {
   oneof limit {
-    ConcurrencyLimit concurrency = 1;
-    GubernatorRateLimit rate_limit = 2;
-    FloatingConcurrencyLimit floating_concurrency = 3;
+    ConcurrencyLimit concurrency = 1;             // Static concurrency limit.
+    GubernatorRateLimit rate_limit = 2;           // Gubernator-based rate limit.
+    FloatingConcurrencyLimit floating_concurrency = 3; // Dynamic worker-computed concurrency limit.
   }
 }
 
+// Request to enqueue a new job for processing.
 message EnqueueRequest {
-  uint32 shard = 1; // shard id
-  string id = 2; // optional
-  uint32 priority = 3; // 0..99, 0 highest
-  int64 start_at_ms = 4; // epoch ms
-  optional RetryPolicy retry_policy = 5; // optional
-  JsonValueBytes payload = 6; // JSON
-  repeated Limit limits = 7; // ordered list of limits to check before execution
-  optional string tenant = 8; // optional tenant id when tenancy is enabled
-  map<string, string> metadata = 9; // arbitrary key/value metadata stored with the job
+  uint32 shard = 1;                      // Shard ID where the job should be stored.
+  string id = 2;                         // Optional job ID. If empty, a random UUID is generated.
+  uint32 priority = 3;                   // Priority from 0-99. Lower is higher priority (0 = highest).
+  int64 start_at_ms = 4;                 // Unix timestamp (ms) for future scheduling. 0 = run immediately.
+  optional RetryPolicy retry_policy = 5; // Retry configuration. If absent, job fails on first error.
+  JsonValueBytes payload = 6;            // Opaque JSON payload passed to workers.
+  repeated Limit limits = 7;             // Ordered list of limits checked before execution.
+  optional string tenant = 8;            // Tenant ID for multi-tenant deployments. Optional.
+  map<string, string> metadata = 9;      // Arbitrary key/value metadata stored with the job.
 }
 
+// Response after successfully enqueueing a job.
 message EnqueueResponse {
-  string id = 1;
+  string id = 1; // The job's ID (either provided or auto-generated).
 }
 
-// Job status enum representing the current state of a job
+// Current state of a job in its lifecycle.
 enum JobStatus {
-  JOB_STATUS_SCHEDULED = 0;    // Job is waiting to be executed
-  JOB_STATUS_RUNNING = 1;      // Job is currently being processed by a worker
-  JOB_STATUS_SUCCEEDED = 2;    // Job completed successfully
-  JOB_STATUS_FAILED = 3;       // Job failed after exhausting all retries
-  JOB_STATUS_CANCELLED = 4;    // Job was cancelled before completion
+  JOB_STATUS_SCHEDULED = 0;  // Job is waiting to be executed (queued or scheduled for future).
+  JOB_STATUS_RUNNING = 1;    // Job is currently being processed by a worker.
+  JOB_STATUS_SUCCEEDED = 2;  // Job completed successfully.
+  JOB_STATUS_FAILED = 3;     // Job failed after exhausting all retry attempts.
+  JOB_STATUS_CANCELLED = 4;  // Job was cancelled before completion.
 }
 
-message GetJobRequest { uint32 shard = 1; string id = 2; optional string tenant = 3; }
+// Request to retrieve details about a specific job.
+message GetJobRequest {
+  uint32 shard = 1;          // Shard ID where the job is stored.
+  string id = 2;             // The job's unique ID.
+  optional string tenant = 3; // Tenant ID if multi-tenancy is enabled.
+}
+
+// Full details of a job including its current state.
 message GetJobResponse {
-  string id = 1;
-  uint32 priority = 2;
-  int64 enqueue_time_ms = 3;
-  JsonValueBytes payload = 4;
-  optional RetryPolicy retry_policy = 5; // presence indicates some policy
-  repeated Limit limits = 6; // declared limits
-  map<string, string> metadata = 7; // arbitrary key/value metadata stored with the job
-  JobStatus status = 8; // current job status
-  int64 status_changed_at_ms = 9; // when the status last changed (epoch ms)
+  string id = 1;                         // The job's unique ID.
+  uint32 priority = 2;                   // Job priority (0 = highest, 99 = lowest).
+  int64 enqueue_time_ms = 3;             // Unix timestamp (ms) when job was enqueued.
+  JsonValueBytes payload = 4;            // The job's payload data.
+  optional RetryPolicy retry_policy = 5; // Retry policy if configured.
+  repeated Limit limits = 6;             // Limits declared on this job.
+  map<string, string> metadata = 7;      // Metadata key/value pairs.
+  JobStatus status = 8;                  // Current job status.
+  int64 status_changed_at_ms = 9;        // Unix timestamp (ms) of last status change.
 }
 
-// Get the result of a completed job.
-// Returns the job's result data if succeeded, error info if failed, or an error if the job
-// is not in a terminal state (still running/scheduled) or doesn't exist.
+// Request to get the result of a completed job.
+// Only succeeds if the job has reached a terminal state (succeeded, failed, or cancelled).
 message GetJobResultRequest {
-  uint32 shard = 1;
-  string id = 2;
-  optional string tenant = 3;
+  uint32 shard = 1;          // Shard ID where the job is stored.
+  string id = 2;             // The job's unique ID.
+  optional string tenant = 3; // Tenant ID if multi-tenancy is enabled.
 }
 
-// Response for GetJobResult - the result depends on the job's terminal state.
-// Use the oneof to determine which outcome occurred.
+// Result of a completed job. Check status to determine which result field is populated.
 message GetJobResultResponse {
-  string id = 1;
-  JobStatus status = 2; // The terminal status: SUCCEEDED, FAILED, or CANCELLED
-  int64 finished_at_ms = 3; // When the job reached its terminal state (epoch ms)
+  string id = 1;             // The job's unique ID.
+  JobStatus status = 2;      // Terminal status: SUCCEEDED, FAILED, or CANCELLED.
+  int64 finished_at_ms = 3;  // Unix timestamp (ms) when job reached terminal state.
   
-  // The result data depends on the terminal status
+  // The result depends on the terminal status.
   oneof result {
-    JsonValueBytes success_data = 4;  // Result data if status == SUCCEEDED
-    JobFailure failure = 5;           // Error info if status == FAILED
-    JobCancelled cancelled = 6;       // Cancellation info if status == CANCELLED
+    JsonValueBytes success_data = 4; // Present if status == SUCCEEDED. Contains job result.
+    JobFailure failure = 5;          // Present if status == FAILED. Contains error details.
+    JobCancelled cancelled = 6;      // Present if status == CANCELLED. Contains cancellation info.
   }
 }
 
-// Information about a failed job
+// Error information for a failed job.
 message JobFailure {
-  string error_code = 1;  // Application-defined error code
-  bytes error_data = 2;   // Error details (typically JSON)
+  string error_code = 1; // Application-defined error code.
+  bytes error_data = 2;  // Error details, typically JSON-encoded.
 }
 
-// Information about a cancelled job
+// Information about a cancelled job.
 message JobCancelled {
-  int64 cancelled_at_ms = 1; // When the job was cancelled (epoch ms)
+  int64 cancelled_at_ms = 1; // Unix timestamp (ms) when cancellation was requested.
 }
 
-message DeleteJobRequest { uint32 shard = 1; string id = 2; optional string tenant = 3; }
+// Request to permanently delete a job and all its data.
+message DeleteJobRequest {
+  uint32 shard = 1;          // Shard ID where the job is stored.
+  string id = 2;             // The job's unique ID.
+  optional string tenant = 3; // Tenant ID if multi-tenancy is enabled.
+}
+
+// Response confirming job deletion.
 message DeleteJobResponse {}
 
-message CancelJobRequest { uint32 shard = 1; string id = 2; optional string tenant = 3; }
+// Request to cancel a job. Running jobs will be notified via heartbeat response.
+message CancelJobRequest {
+  uint32 shard = 1;          // Shard ID where the job is stored.
+  string id = 2;             // The job's unique ID.
+  optional string tenant = 3; // Tenant ID if multi-tenancy is enabled.
+}
+
+// Response confirming cancellation was requested.
 message CancelJobResponse {}
 
 // Restart a cancelled or failed job, allowing it to be processed again.
@@ -166,172 +196,222 @@ message LeaseTasksRequest {
   string worker_id = 2; 
   uint32 max_tasks = 3; 
 }
+
+// A task representing a single job attempt leased to a worker.
 message Task {
-  string id = 1;              // task id
-  string job_id = 2;
-  uint32 attempt_number = 3;
-  int64 lease_ms = 4;         // how long to heartbeat in ms
-  JsonValueBytes payload = 5; // job payload for convenience
-  uint32 priority = 6;
-  uint32 shard = 7;           // which shard this task came from (for reporting outcomes)
+  string id = 1;              // Unique task ID (different from job ID).
+  string job_id = 2;          // ID of the job this task belongs to.
+  uint32 attempt_number = 3;  // Which attempt this is (1 = first attempt).
+  int64 lease_ms = 4;         // How long the lease lasts. Heartbeat before this expires.
+  JsonValueBytes payload = 5; // The job's payload for the worker to process.
+  uint32 priority = 6;        // Job priority (for informational purposes).
+  uint32 shard = 7;           // Shard this task came from (needed for reporting outcome).
 }
 
-// Task for refreshing a floating concurrency limit - workers compute new max concurrency
+// Task for refreshing a floating concurrency limit.
+// Workers compute the new max_concurrency and report back.
 message RefreshFloatingLimitTask {
-  string id = 1;                          // task id
-  string queue_key = 2;                   // the floating limit queue key
-  uint32 current_max_concurrency = 3;     // the current max concurrency value
-  int64 last_refreshed_at_ms = 4;         // when the value was last refreshed
-  map<string, string> metadata = 5;       // opaque metadata from the limit definition
-  int64 lease_ms = 6;                     // how long to heartbeat in ms
-  uint32 shard = 7;                       // which shard this task came from (for reporting outcomes)
+  string id = 1;                       // Unique task ID for this refresh.
+  string queue_key = 2;                // The floating limit key being refreshed.
+  uint32 current_max_concurrency = 3;  // Current max concurrency value.
+  int64 last_refreshed_at_ms = 4;      // Unix timestamp (ms) of last refresh.
+  map<string, string> metadata = 5;    // Metadata from the limit definition.
+  int64 lease_ms = 6;                  // How long the lease lasts. Heartbeat before this expires.
+  uint32 shard = 7;                    // Shard this task came from (needed for reporting outcome).
 }
 
-message LeaseTasksResponse { 
-  repeated Task tasks = 1;
-  repeated RefreshFloatingLimitTask refresh_tasks = 2;  // floating limit refresh tasks
+// Response containing tasks leased to a worker.
+message LeaseTasksResponse {
+  repeated Task tasks = 1;                         // Job execution tasks.
+  repeated RefreshFloatingLimitTask refresh_tasks = 2; // Floating limit refresh tasks.
 }
 
-// Report the outcome of a job attempt task from a worker back to the server
+// Request to report the outcome of a completed task.
 message ReportOutcomeRequest {
-  uint32 shard = 1;
-  string task_id = 2;
-  optional string tenant = 5;
+  uint32 shard = 1;          // Shard the task came from.
+  string task_id = 2;        // The task's unique ID.
+  optional string tenant = 5; // Tenant ID if multi-tenancy is enabled.
   oneof outcome {
-    JsonValueBytes success = 3;
-    Failure failure = 4;
-    Cancelled cancelled = 6; // Worker acknowledges cancellation
+    JsonValueBytes success = 3; // Job succeeded. Contains result data.
+    Failure failure = 4;        // Job failed. Contains error details.
+    Cancelled cancelled = 6;    // Worker acknowledges job was cancelled.
   }
 }
-message Failure { string code = 1; bytes data = 2; }
-message Cancelled {} // Empty marker for cancelled outcome
+
+// Error details for a failed task.
+message Failure {
+  string code = 1;  // Application-defined error code.
+  bytes data = 2;   // Error details, typically JSON-encoded.
+}
+
+// Marker indicating the worker acknowledges the job was cancelled.
+message Cancelled {}
+
+// Response confirming outcome was recorded.
 message ReportOutcomeResponse {}
 
-// Report the outcome of a floating limit refresh task from a worker back to the server
+// Request to report the outcome of a floating limit refresh task.
 message ReportRefreshOutcomeRequest {
-  uint32 shard = 1;
-  string task_id = 2;
-  optional string tenant = 3;
+  uint32 shard = 1;          // Shard the task came from.
+  string task_id = 2;        // The task's unique ID.
+  optional string tenant = 3; // Tenant ID if multi-tenancy is enabled.
   oneof outcome {
-    RefreshSuccess success = 4;
-    RefreshFailure failure = 5;
+    RefreshSuccess success = 4; // Refresh succeeded with new max concurrency.
+    RefreshFailure failure = 5; // Refresh failed.
   }
 }
 
+// Successful floating limit refresh with the new computed value.
 message RefreshSuccess {
-  uint32 new_max_concurrency = 1;  // the new max concurrency value computed by the worker
+  uint32 new_max_concurrency = 1; // New max concurrency computed by the worker.
 }
 
+// Error during floating limit refresh.
 message RefreshFailure {
-  string code = 1;    // error code
-  string message = 2; // error message
+  string code = 1;    // Error code.
+  string message = 2; // Human-readable error message.
 }
 
+// Response confirming refresh outcome was recorded.
 message ReportRefreshOutcomeResponse {}
 
-message HeartbeatRequest { 
-  uint32 shard = 1; 
-  string worker_id = 2; 
-  string task_id = 3; 
-  optional string tenant = 4;
+// Request to extend a task lease and check for cancellation.
+// Workers must heartbeat before lease_ms expires to keep the task.
+message HeartbeatRequest {
+  uint32 shard = 1;          // Shard the task came from.
+  string worker_id = 2;      // Worker ID that holds the lease.
+  string task_id = 3;        // The task's unique ID.
+  optional string tenant = 4; // Tenant ID if multi-tenancy is enabled.
 }
+
+// Response indicating if the lease was extended and if the job was cancelled.
 message HeartbeatResponse {
-  // True if the job has been cancelled. Worker should stop work and report Cancelled outcome.
-  bool cancelled = 1;
-  // Timestamp (epoch ms) when cancellation was requested, if cancelled
-  optional int64 cancelled_at_ms = 2;
+  bool cancelled = 1;               // True if job was cancelled. Worker should stop and report Cancelled.
+  optional int64 cancelled_at_ms = 2; // Unix timestamp (ms) when cancellation was requested, if cancelled.
 }
 
-// Execute an arbitrary SQL query against shard data
-message QueryRequest { 
-  uint32 shard = 1; 
-  string sql = 2; 
-  optional string tenant = 3; 
+// Request to execute an arbitrary SQL query against shard data.
+// Useful for ad-hoc inspection and debugging.
+message QueryRequest {
+  uint32 shard = 1;          // Shard to query.
+  string sql = 2;            // SQL query string.
+  optional string tenant = 3; // Tenant ID to scope results, if multi-tenancy is enabled.
 }
 
-// Column metadata for the result schema
+// Metadata about a column in query results.
 message ColumnInfo {
-  string name = 1;
-  string data_type = 2; // Arrow/DataFusion type as string (e.g. "Utf8", "Int64", "UInt8")
+  string name = 1;      // Column name.
+  string data_type = 2; // Arrow/DataFusion type as string (e.g., "Utf8", "Int64").
 }
 
-// Query result row as JSON object
+// Query results in JSON format.
 message QueryResponse {
-  repeated ColumnInfo columns = 1; // Schema information
-  repeated JsonValueBytes rows = 2; // Each row is a JSON object
-  int32 row_count = 3; // Number of rows returned
+  repeated ColumnInfo columns = 1;  // Schema information for the result columns.
+  repeated JsonValueBytes rows = 2; // Each row as a JSON object.
+  int32 row_count = 3;              // Total number of rows returned.
 }
 
-// Execute SQL query with Arrow IPC streaming response
+// Request to execute SQL query with Arrow IPC streaming response.
+// More efficient than QueryResponse for large result sets.
 message QueryArrowRequest {
-  uint32 shard = 1;
-  string sql = 2;
-  optional string tenant = 3;
+  uint32 shard = 1;          // Shard to query.
+  string sql = 2;            // SQL query string.
+  optional string tenant = 3; // Tenant ID to scope results, if multi-tenancy is enabled.
 }
 
-// Arrow IPC encoded schema or record batch
+// Arrow IPC encoded message. Part of a streaming response.
 message ArrowIpcMessage {
-  // Arrow IPC stream format: first message is schema, subsequent are record batches
-  bytes ipc_data = 1;
+  bytes ipc_data = 1; // Arrow IPC stream data. First message is schema, subsequent are record batches.
 }
 
-// Cluster topology information for client-side routing
+// Request to get cluster topology for client-side routing.
 message GetClusterInfoRequest {}
 
+// Information about which node owns a specific shard.
 message ShardOwner {
-  uint32 shard_id = 1;
-  string grpc_addr = 2;  // The gRPC address of the server owning this shard
-  string node_id = 3;    // The node ID of the owner
+  uint32 shard_id = 1;  // The shard ID.
+  string grpc_addr = 2; // gRPC address of the node owning this shard.
+  string node_id = 3;   // Unique identifier of the owning node.
 }
 
+// Cluster topology information.
 message GetClusterInfoResponse {
-  uint32 num_shards = 1;                    // Total number of shards in the cluster
-  repeated ShardOwner shard_owners = 2;     // Mapping of shards to their owners
-  string this_node_id = 3;                  // The node ID of the server responding
-  string this_grpc_addr = 4;                // The gRPC address of the server responding
+  uint32 num_shards = 1;                // Total number of shards in the cluster.
+  repeated ShardOwner shard_owners = 2; // Mapping of each shard to its owner.
+  string this_node_id = 3;              // Node ID of the server responding.
+  string this_grpc_addr = 4;            // gRPC address of the server responding.
 }
 
-// Admin request to reset all shards (dev mode only)
-// This clears all data from all shards owned by this server.
-// WARNING: This is a destructive operation intended only for testing.
+// Request to reset all shards owned by this server.
+// WARNING: Destructive operation. Only available in dev mode.
 message ResetShardsRequest {}
+
+// Response confirming shards were reset.
 message ResetShardsResponse {
-  uint32 shards_reset = 1;  // Number of shards that were reset
+  uint32 shards_reset = 1; // Number of shards that were cleared.
 }
 
+// The Silo job queue service.
 service Silo {
-  // Get cluster topology for client-side routing
+  // Get cluster topology for client-side routing.
+  // Returns shard ownership information so clients can route requests to the correct node.
   rpc GetClusterInfo(GetClusterInfoRequest) returns (GetClusterInfoResponse);
   
+  // Enqueue a new job for processing.
+  // The job will be scheduled according to its start_at_ms and processed when limits allow.
   rpc Enqueue(EnqueueRequest) returns (EnqueueResponse);
+  
+  // Get full details of a job including its current status.
   rpc GetJob(GetJobRequest) returns (GetJobResponse);
   
   // Get the result of a completed job.
   // Returns NOT_FOUND if the job doesn't exist.
-  // Returns FAILED_PRECONDITION if the job is not yet in a terminal state (still scheduled or running).
-  // Returns the result/error/cancellation info if the job has completed.
+  // Returns FAILED_PRECONDITION if the job hasn't reached a terminal state.
   rpc GetJobResult(GetJobResultRequest) returns (GetJobResultResponse);
   
+  // Permanently delete a job and all its data.
+  // Running jobs should be cancelled first.
   rpc DeleteJob(DeleteJobRequest) returns (DeleteJobResponse);
+  
+  // Cancel a job. Running jobs will be notified via heartbeat.
+  // Jobs in any state can be cancelled.
   rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
   
-  // Restart a cancelled or failed job, allowing it to be processed again.
-  // Returns FAILED_PRECONDITION if the job is not in a restartable state.
+  // Restart a cancelled or failed job for another attempt.
+  // Returns FAILED_PRECONDITION if job is not in a restartable state.
   // Returns NOT_FOUND if the job doesn't exist.
   rpc RestartJob(RestartJobRequest) returns (RestartJobResponse);
+  
+  // Lease tasks for a worker to process.
+  // Workers should call this periodically to get work.
+  // Returns both job tasks and floating limit refresh tasks.
   rpc LeaseTasks(LeaseTasksRequest) returns (LeaseTasksResponse);
+  
+  // Report the outcome of a completed job task.
+  // Must be called before the task lease expires.
   rpc ReportOutcome(ReportOutcomeRequest) returns (ReportOutcomeResponse);
+  
+  // Report the outcome of a floating limit refresh task.
+  // Workers compute new max_concurrency and report here.
   rpc ReportRefreshOutcome(ReportRefreshOutcomeRequest) returns (ReportRefreshOutcomeResponse);
+  
+  // Extend a task lease and check for cancellation.
+  // Workers must heartbeat before lease expires to keep tasks.
+  // Returns cancelled=true if the job was cancelled.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  
+  // Execute an SQL query against shard data.
+  // Returns results as JSON rows.
   rpc Query(QueryRequest) returns (QueryResponse);
   
-  // Streaming query that returns Arrow IPC encoded record batches
-  // First message contains the schema, subsequent messages contain record batches
+  // Execute an SQL query with Arrow IPC streaming response.
+  // More efficient for large result sets.
+  // First message contains schema, subsequent messages contain record batches.
   rpc QueryArrow(QueryArrowRequest) returns (stream ArrowIpcMessage);
   
-  // Admin: Reset all shards owned by this server (dev mode only)
-  // Clears all data - jobs, tasks, queues, etc.
+  // Reset all shards owned by this server.
+  // WARNING: Destructive operation. Only available in dev mode.
+  // Clears all jobs, tasks, queues, and other data.
   rpc ResetShards(ResetShardsRequest) returns (ResetShardsResponse);
 }
-
 
