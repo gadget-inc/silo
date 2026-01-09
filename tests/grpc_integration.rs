@@ -1861,3 +1861,657 @@ async fn grpc_get_job_result_cancelled_while_running() -> anyhow::Result<()> {
     .expect("test timed out")?;
     Ok(())
 }
+
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_tenant_validation_when_enabled() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let tmp = tempfile::tempdir()?;
+        let template = DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+        };
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let factory = ShardFactory::new(template, rate_limiter);
+        let _ = factory.open(0).await?;
+        let factory = Arc::new(factory);
+
+        let listener =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
+        // Enable tenancy in config
+        let mut cfg = silo::settings::AppConfig::load(None).unwrap();
+        cfg.tenancy.enabled = true;
+
+        let server = tokio::spawn(run_server(
+            listener,
+            factory.clone(),
+            None,
+            cfg,
+            shutdown_rx,
+        ));
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint.clone())?
+            .connect()
+            .await?;
+        let mut client = SiloClient::new(channel);
+
+        // Test 1: Missing tenant when required - should fail
+        let res = client
+            .enqueue(EnqueueRequest {
+                shard: 0,
+                id: "test-job".to_string(),
+                priority: 5,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(JsonValueBytes { data: b"{}".to_vec() }),
+                limits: vec![],
+                tenant: None, // Missing!
+                metadata: std::collections::HashMap::new(),
+            })
+            .await;
+
+        match res {
+            Ok(_) => panic!("expected error for missing tenant"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::InvalidArgument);
+                assert!(
+                    status.message().contains("tenant"),
+                    "error should mention tenant: {}",
+                    status.message()
+                );
+            }
+        }
+
+        // Test 2: Empty tenant string when required - should fail
+        let res = client
+            .enqueue(EnqueueRequest {
+                shard: 0,
+                id: "test-job".to_string(),
+                priority: 5,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(JsonValueBytes { data: b"{}".to_vec() }),
+                limits: vec![],
+                tenant: Some("".to_string()), // Empty!
+                metadata: std::collections::HashMap::new(),
+            })
+            .await;
+
+        match res {
+            Ok(_) => panic!("expected error for empty tenant"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::InvalidArgument);
+            }
+        }
+
+        // Test 3: Tenant ID too long (>64 chars) - should fail
+        let res = client
+            .enqueue(EnqueueRequest {
+                shard: 0,
+                id: "test-job".to_string(),
+                priority: 5,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(JsonValueBytes { data: b"{}".to_vec() }),
+                limits: vec![],
+                tenant: Some("x".repeat(65)), // Too long!
+                metadata: std::collections::HashMap::new(),
+            })
+            .await;
+
+        match res {
+            Ok(_) => panic!("expected error for long tenant"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::InvalidArgument);
+                assert!(
+                    status.message().contains("tenant"),
+                    "error should mention tenant: {}",
+                    status.message()
+                );
+            }
+        }
+
+        // Test 4: Valid tenant - should succeed
+        let res = client
+            .enqueue(EnqueueRequest {
+                shard: 0,
+                id: "test-job-valid".to_string(),
+                priority: 5,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(JsonValueBytes { data: b"{}".to_vec() }),
+                limits: vec![],
+                tenant: Some("my-tenant".to_string()),
+                metadata: std::collections::HashMap::new(),
+            })
+            .await;
+
+        assert!(res.is_ok(), "valid tenant should succeed");
+
+        let _ = shutdown_tx.send(());
+        let join_result = server.await;
+        match join_result {
+            Ok(inner) => {
+                if let Err(e) = inner {
+                    return Err(anyhow::anyhow!(e.to_string()));
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        }
+        Ok(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_reset_shards_requires_dev_mode() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let tmp = tempfile::tempdir()?;
+        let template = DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+        };
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let factory = ShardFactory::new(template, rate_limiter);
+        let _ = factory.open(0).await?;
+        let factory = Arc::new(factory);
+
+        let listener =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
+        // dev_mode = false (default)
+        let mut cfg = silo::settings::AppConfig::load(None).unwrap();
+        cfg.server.dev_mode = false;
+
+        let server = tokio::spawn(run_server(
+            listener,
+            factory.clone(),
+            None,
+            cfg,
+            shutdown_rx,
+        ));
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint.clone())?
+            .connect()
+            .await?;
+        let mut client = SiloClient::new(channel);
+
+        // reset_shards should fail in non-dev mode
+        let res = client.reset_shards(ResetShardsRequest {}).await;
+
+        match res {
+            Ok(_) => panic!("expected permission denied error"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::PermissionDenied);
+                assert!(
+                    status.message().contains("dev mode"),
+                    "error should mention dev mode: {}",
+                    status.message()
+                );
+            }
+        }
+
+        let _ = shutdown_tx.send(());
+        let join_result = server.await;
+        match join_result {
+            Ok(inner) => {
+                if let Err(e) = inner {
+                    return Err(anyhow::anyhow!(e.to_string()));
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        }
+        Ok(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_reset_shards_works_in_dev_mode() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let tmp = tempfile::tempdir()?;
+        let template = DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+        };
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let factory = ShardFactory::new(template, rate_limiter);
+        let _ = factory.open(0).await?;
+        let factory = Arc::new(factory);
+
+        let listener =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
+        // Enable dev mode
+        let mut cfg = silo::settings::AppConfig::load(None).unwrap();
+        cfg.server.dev_mode = true;
+
+        let server = tokio::spawn(run_server(
+            listener,
+            factory.clone(),
+            None,
+            cfg,
+            shutdown_rx,
+        ));
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint.clone())?
+            .connect()
+            .await?;
+        let mut client = SiloClient::new(channel);
+
+        // First enqueue a job
+        let _ = client
+            .enqueue(EnqueueRequest {
+                shard: 0,
+                id: "job-to-reset".to_string(),
+                priority: 5,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(JsonValueBytes { data: b"{}".to_vec() }),
+                limits: vec![],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+            })
+            .await?;
+
+        // Verify job exists
+        let query_resp = client
+            .query(QueryRequest {
+                shard: 0,
+                sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+        let count_row: serde_json::Value = serde_json::from_slice(&query_resp.rows[0].data)?;
+        assert_eq!(count_row["count"], 1, "should have 1 job before reset");
+
+        // Reset shards should succeed in dev mode
+        let res = client.reset_shards(ResetShardsRequest {}).await?;
+        assert_eq!(res.into_inner().shards_reset, 1, "should reset 1 shard");
+
+        // Verify job is gone after reset
+        let query_resp = client
+            .query(QueryRequest {
+                shard: 0,
+                sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+        let count_row: serde_json::Value = serde_json::from_slice(&query_resp.rows[0].data)?;
+        assert_eq!(count_row["count"], 0, "should have 0 jobs after reset");
+
+        let _ = shutdown_tx.send(());
+        let join_result = server.await;
+        match join_result {
+            Ok(inner) => {
+                if let Err(e) = inner {
+                    return Err(anyhow::anyhow!(e.to_string()));
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        }
+        Ok(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_report_outcome_missing_outcome() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let tmp = tempfile::tempdir()?;
+        let template = DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+        };
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let factory = ShardFactory::new(template, rate_limiter);
+        let _ = factory.open(0).await?;
+        let factory = Arc::new(factory);
+
+        let listener =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
+        let server = tokio::spawn(run_server(
+            listener,
+            factory.clone(),
+            None,
+            silo::settings::AppConfig::load(None).unwrap(),
+            shutdown_rx,
+        ));
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint.clone())?
+            .connect()
+            .await?;
+        let mut client = SiloClient::new(channel);
+
+        // report_outcome with missing outcome field should fail
+        let res = client
+            .report_outcome(ReportOutcomeRequest {
+                shard: 0,
+                task_id: "fake-task".to_string(),
+                tenant: None,
+                outcome: None, // Missing!
+            })
+            .await;
+
+        match res {
+            Ok(_) => panic!("expected error for missing outcome"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::InvalidArgument);
+                assert!(
+                    status.message().contains("outcome"),
+                    "error should mention outcome: {}",
+                    status.message()
+                );
+            }
+        }
+
+        let _ = shutdown_tx.send(());
+        let join_result = server.await;
+        match join_result {
+            Ok(inner) => {
+                if let Err(e) = inner {
+                    return Err(anyhow::anyhow!(e.to_string()));
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        }
+        Ok(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_get_job_result_for_non_terminal_job() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let tmp = tempfile::tempdir()?;
+        let template = DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+        };
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let factory = ShardFactory::new(template, rate_limiter);
+        let _ = factory.open(0).await?;
+        let factory = Arc::new(factory);
+
+        let listener =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
+        let server = tokio::spawn(run_server(
+            listener,
+            factory.clone(),
+            None,
+            silo::settings::AppConfig::load(None).unwrap(),
+            shutdown_rx,
+        ));
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint.clone())?
+            .connect()
+            .await?;
+        let mut client = SiloClient::new(channel);
+
+        // Enqueue a job
+        let _ = client
+            .enqueue(EnqueueRequest {
+                shard: 0,
+                id: "non-terminal-job".to_string(),
+                priority: 5,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(JsonValueBytes { data: b"{}".to_vec() }),
+                limits: vec![],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+            })
+            .await?;
+
+        // Get result for scheduled (non-terminal) job - should fail
+        let res = client
+            .get_job_result(GetJobResultRequest {
+                shard: 0,
+                id: "non-terminal-job".to_string(),
+                tenant: None,
+            })
+            .await;
+
+        match res {
+            Ok(_) => panic!("expected error for non-terminal job"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+                assert!(
+                    status.message().contains("not complete"),
+                    "error should mention not complete: {}",
+                    status.message()
+                );
+            }
+        }
+
+        let _ = shutdown_tx.send(());
+        let join_result = server.await;
+        match join_result {
+            Ok(inner) => {
+                if let Err(e) = inner {
+                    return Err(anyhow::anyhow!(e.to_string()));
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        }
+        Ok(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_enqueue_with_rate_limit() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let tmp = tempfile::tempdir()?;
+        let template = DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+        };
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let factory = ShardFactory::new(template, rate_limiter);
+        let _ = factory.open(0).await?;
+        let factory = Arc::new(factory);
+
+        let listener =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
+        let server = tokio::spawn(run_server(
+            listener,
+            factory.clone(),
+            None,
+            silo::settings::AppConfig::load(None).unwrap(),
+            shutdown_rx,
+        ));
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint.clone())?
+            .connect()
+            .await?;
+        let mut client = SiloClient::new(channel);
+
+        // Enqueue a job with a rate limit
+        let enq_resp = client
+            .enqueue(EnqueueRequest {
+                shard: 0,
+                id: "rate-limited-job".to_string(),
+                priority: 5,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(JsonValueBytes { data: b"{}".to_vec() }),
+                limits: vec![Limit {
+                    limit: Some(limit::Limit::RateLimit(silo::pb::GubernatorRateLimit {
+                        name: "my-rate-limit".to_string(),
+                        unique_key: "user-123".to_string(),
+                        limit: 100,
+                        duration_ms: 60000,
+                        hits: 1,
+                        algorithm: 0, // TokenBucket
+                        behavior: 0,
+                        retry_policy: Some(silo::pb::RateLimitRetryPolicy {
+                            initial_backoff_ms: 100,
+                            max_backoff_ms: 5000,
+                            backoff_multiplier: 2.0,
+                            max_retries: 3,
+                        }),
+                    })),
+                }],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+            })
+            .await?
+            .into_inner();
+
+        assert!(!enq_resp.id.is_empty());
+
+        // Verify job was created with rate limit via get_job
+        let job_resp = client
+            .get_job(GetJobRequest {
+                shard: 0,
+                id: "rate-limited-job".to_string(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+
+        assert_eq!(job_resp.limits.len(), 1);
+        match &job_resp.limits[0].limit {
+            Some(limit::Limit::RateLimit(rl)) => {
+                assert_eq!(rl.name, "my-rate-limit");
+                assert_eq!(rl.unique_key, "user-123");
+                assert_eq!(rl.limit, 100);
+            }
+            _ => panic!("expected rate limit, got {:?}", job_resp.limits[0]),
+        }
+
+        let _ = shutdown_tx.send(());
+        let join_result = server.await;
+        match join_result {
+            Ok(inner) => {
+                if let Err(e) = inner {
+                    return Err(anyhow::anyhow!(e.to_string()));
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        }
+        Ok(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_report_refresh_outcome_missing_outcome() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let tmp = tempfile::tempdir()?;
+        let template = DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+        };
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let factory = ShardFactory::new(template, rate_limiter);
+        let _ = factory.open(0).await?;
+        let factory = Arc::new(factory);
+
+        let listener =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
+        let server = tokio::spawn(run_server(
+            listener,
+            factory.clone(),
+            None,
+            silo::settings::AppConfig::load(None).unwrap(),
+            shutdown_rx,
+        ));
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint.clone())?
+            .connect()
+            .await?;
+        let mut client = SiloClient::new(channel);
+
+        // report_refresh_outcome with missing outcome field should fail
+        let res = client
+            .report_refresh_outcome(ReportRefreshOutcomeRequest {
+                shard: 0,
+                task_id: "fake-refresh-task".to_string(),
+                tenant: None,
+                outcome: None, // Missing!
+            })
+            .await;
+
+        match res {
+            Ok(_) => panic!("expected error for missing outcome"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::InvalidArgument);
+                assert!(
+                    status.message().contains("outcome"),
+                    "error should mention outcome: {}",
+                    status.message()
+                );
+            }
+        }
+
+        let _ = shutdown_tx.send(());
+        let join_result = server.await;
+        match join_result {
+            Ok(inner) => {
+                if let Err(e) = inner {
+                    return Err(anyhow::anyhow!(e.to_string()));
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        }
+        Ok(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}

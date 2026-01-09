@@ -5,6 +5,7 @@ use silo::settings::{
     expand_env_vars_for_test, AppConfig, Backend, DatabaseConfig, DatabaseTemplate,
     GubernatorSettings, LoggingConfig, WalConfig, WebUiConfig,
 };
+use silo::storage::resolve_object_store;
 
 #[silo::test]
 async fn open_fs_db_from_config() {
@@ -422,4 +423,43 @@ fn expand_env_vars_real_k8s_example() {
     let input = "${POD_IP}:50051";
     assert_eq!(expand_env_vars_for_test(input), "10.0.0.5:50051");
     std::env::remove_var("POD_IP");
+}
+
+// =============================================================================
+// Storage Tests
+// =============================================================================
+
+#[test]
+fn resolve_object_store_fs_creates_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("new_subdir");
+
+    // Directory doesn't exist yet
+    assert!(!path.exists());
+
+    let result = resolve_object_store(&Backend::Fs, &path.to_string_lossy());
+    assert!(result.is_ok());
+
+    // Directory should now exist
+    assert!(path.exists());
+}
+
+#[test]
+fn resolve_object_store_fs_canonicalizes_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().to_string_lossy().to_string();
+
+    let result = resolve_object_store(&Backend::Fs, &path).unwrap();
+
+    // Canonical path should not contain ".." or "." and should be absolute
+    assert!(result.canonical_path.starts_with('/'));
+    assert!(!result.canonical_path.contains(".."));
+}
+
+#[test]
+fn resolve_object_store_memory_returns_same_path() {
+    let result = resolve_object_store(&Backend::Memory, "my-test-path").unwrap();
+
+    // Memory backend should return the path as-is
+    assert_eq!(result.canonical_path, "my-test-path");
 }
