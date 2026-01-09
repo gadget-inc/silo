@@ -1743,6 +1743,133 @@ async fn grpc_get_job_result_cancelled() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Test that enqueue fails with a clear error when tenancy is enabled but no tenant is specified
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_enqueue_requires_tenant_when_tenancy_enabled() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let tmp = tempfile::tempdir()?;
+        let template = DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+        };
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let factory = ShardFactory::new(template, rate_limiter);
+        let _ = factory.open(0).await?;
+        let factory = Arc::new(factory);
+
+        let listener =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
+        // Create a config with tenancy enabled
+        let mut config = silo::settings::AppConfig::load(None).unwrap();
+        config.tenancy.enabled = true;
+
+        let server = tokio::spawn(run_server(
+            listener,
+            factory.clone(),
+            None,
+            config,
+            shutdown_rx,
+        ));
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint.clone())?
+            .connect()
+            .await?;
+        let mut client = SiloClient::new(channel);
+
+        // Test 1: Enqueue without tenant (None)
+        let req = EnqueueRequest {
+            shard: 0,
+            id: "".to_string(),
+            priority: 1,
+            start_at_ms: 0,
+            retry_policy: None,
+            payload: Some(JsonValueBytes {
+                data: b"{}".to_vec(),
+            }),
+            limits: vec![],
+            tenant: None,
+            metadata: std::collections::HashMap::new(),
+        };
+        let res = client.enqueue(req).await;
+        match res {
+            Ok(_) => panic!("expected error when tenant is missing with tenancy enabled"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::InvalidArgument);
+                assert!(
+                    status.message().contains("tenant") && status.message().contains("required"),
+                    "error message should mention tenant is required, got: {}",
+                    status.message()
+                );
+            }
+        }
+
+        // Test 2: Enqueue with empty tenant string
+        let req = EnqueueRequest {
+            shard: 0,
+            id: "".to_string(),
+            priority: 1,
+            start_at_ms: 0,
+            retry_policy: None,
+            payload: Some(JsonValueBytes {
+                data: b"{}".to_vec(),
+            }),
+            limits: vec![],
+            tenant: Some("".to_string()),
+            metadata: std::collections::HashMap::new(),
+        };
+        let res = client.enqueue(req).await;
+        match res {
+            Ok(_) => panic!("expected error when tenant is empty with tenancy enabled"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::InvalidArgument);
+                assert!(
+                    status.message().contains("tenant") && status.message().contains("required"),
+                    "error message should mention tenant is required for empty string, got: {}",
+                    status.message()
+                );
+            }
+        }
+
+        // Test 3: Enqueue WITH a valid tenant should succeed
+        let req = EnqueueRequest {
+            shard: 0,
+            id: "".to_string(),
+            priority: 1,
+            start_at_ms: 0,
+            retry_policy: None,
+            payload: Some(JsonValueBytes {
+                data: b"{}".to_vec(),
+            }),
+            limits: vec![],
+            tenant: Some("my-tenant".to_string()),
+            metadata: std::collections::HashMap::new(),
+        };
+        let res = client.enqueue(req).await;
+        assert!(res.is_ok(), "enqueue with valid tenant should succeed");
+
+        let _ = shutdown_tx.send(());
+        let join_result = server.await;
+        match join_result {
+            Ok(inner) => {
+                if let Err(e) = inner {
+                    return Err(anyhow::anyhow!(e.to_string()));
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        }
+        Ok(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
 /// Test GetJobResult for a running job that gets cancelled
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_get_job_result_cancelled_while_running() -> anyhow::Result<()> {
