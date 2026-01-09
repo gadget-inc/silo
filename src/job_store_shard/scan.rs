@@ -3,7 +3,7 @@
 use slatedb::DbIterator;
 
 use crate::job::JobStatusKind;
-use crate::job_store_shard::{JobStoreShardError, JobStoreShard};
+use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::idx_metadata_prefix;
 
 impl JobStoreShard {

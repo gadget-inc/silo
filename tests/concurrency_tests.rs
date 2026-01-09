@@ -4,9 +4,9 @@ use rkyv::Archive;
 use silo::codec::{decode_lease, decode_task, encode_lease};
 use silo::job::{ConcurrencyLimit, Limit};
 use silo::job_attempt::{AttemptOutcome, AttemptStatus};
-use silo::task::{LeaseRecord, Task};
 use silo::keys::concurrency_holder_key;
 use silo::retry::RetryPolicy;
+use silo::task::{LeaseRecord, Task};
 
 use test_helpers::*;
 
@@ -25,7 +25,11 @@ async fn concurrency_immediate_grant_enqueues_task_and_writes_holder() {
             now,
             None,
             payload,
-            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue");
@@ -63,7 +67,11 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
             now,
             None,
             serde_json::json!({"j": 1}),
-            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue1");
@@ -80,7 +88,11 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
             now,
             None,
             serde_json::json!({"j": 2}),
-            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue2");
@@ -129,7 +141,11 @@ async fn concurrency_held_queues_propagate_across_retries_and_release_on_finish(
                 backoff_factor: 1.0,
             }),
             serde_json::json!({"j": 3}),
-            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue");
@@ -183,7 +199,11 @@ async fn concurrency_tickets_are_tenant_scoped() {
             now,
             None,
             serde_json::json!({"t": "A"}),
-            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue A");
@@ -199,7 +219,11 @@ async fn concurrency_tickets_are_tenant_scoped() {
             now,
             None,
             serde_json::json!({"t": "B"}),
-            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue B");
@@ -232,7 +256,11 @@ async fn concurrency_retry_releases_original_holder() {
                 backoff_factor: 1.0,
             }),
             serde_json::json!({"j": 33}),
-            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue");
@@ -287,7 +315,11 @@ async fn concurrency_no_overgrant_after_release() {
             now,
             None,
             serde_json::json!({"a": true}),
-            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue a");
@@ -304,7 +336,11 @@ async fn concurrency_no_overgrant_after_release() {
             now,
             None,
             serde_json::json!({"b": true}),
-            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue b");
@@ -325,7 +361,11 @@ async fn concurrency_no_overgrant_after_release() {
             now,
             None,
             serde_json::json!({"c": true}),
-            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue c");
@@ -356,7 +396,11 @@ async fn stress_single_queue_no_double_grant() {
                 now,
                 None,
                 serde_json::json!({"i": i}),
-                vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+                vec![Limit::Concurrency(ConcurrencyLimit {
+                    key: queue.clone(),
+                    max_concurrency: 1,
+                })],
+                None,
             )
             .await
             .expect("enqueue");
@@ -403,7 +447,11 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
             now,
             None,
             serde_json::json!({"first": true}),
-            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue1");
@@ -422,7 +470,11 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
                 now,
                 None,
                 serde_json::json!({"i": i}),
-                vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+                vec![Limit::Concurrency(ConcurrencyLimit {
+                    key: queue.clone(),
+                    max_concurrency: 1,
+                })],
+                None,
             )
             .await
             .expect("enqueue add");
@@ -491,7 +543,9 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         },
         ArchivedTask::RequestTicket { .. } => panic!("unexpected RequestTicket in lease"),
         ArchivedTask::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in lease"),
-        ArchivedTask::RefreshFloatingLimit { .. } => panic!("unexpected RefreshFloatingLimit in lease"),
+        ArchivedTask::RefreshFloatingLimit { .. } => {
+            panic!("unexpected RefreshFloatingLimit in lease")
+        }
     };
     let expired_ms = now_ms() - 1;
     let new_record = LeaseRecord {
@@ -610,7 +664,11 @@ async fn concurrency_multiple_holders_max_greater_than_one() {
                 now,
                 None,
                 serde_json::json!({"i": i}),
-                vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 3 })], None,
+                vec![Limit::Concurrency(ConcurrencyLimit {
+                    key: queue.clone(),
+                    max_concurrency: 3,
+                })],
+                None,
             )
             .await
             .expect("enqueue");
@@ -695,8 +753,14 @@ async fn concurrency_multiple_queues_per_job() {
             None,
             serde_json::json!({"task": "needs both"}),
             vec![
-                Limit::Concurrency(ConcurrencyLimit { key: q1.clone(), max_concurrency: 2 }),
-                Limit::Concurrency(ConcurrencyLimit { key: q2.clone(), max_concurrency: 2 }),
+                Limit::Concurrency(ConcurrencyLimit {
+                    key: q1.clone(),
+                    max_concurrency: 2,
+                }),
+                Limit::Concurrency(ConcurrencyLimit {
+                    key: q2.clone(),
+                    max_concurrency: 2,
+                }),
             ],
             None,
         )
@@ -757,7 +821,11 @@ async fn concurrency_future_request_waits_until_ready() {
             now,
             None,
             serde_json::json!({"j": 1}),
-            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue1");
@@ -773,7 +841,11 @@ async fn concurrency_future_request_waits_until_ready() {
             future,
             None,
             serde_json::json!({"j": 2}),
-            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue2");
@@ -826,7 +898,11 @@ async fn concurrency_request_priority_ordering() {
             now,
             None,
             serde_json::json!({"j": 1}),
-            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue1");
@@ -842,7 +918,11 @@ async fn concurrency_request_priority_ordering() {
             now,
             None,
             serde_json::json!({"j": 2}),
-            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue2");
@@ -856,7 +936,11 @@ async fn concurrency_request_priority_ordering() {
             now,
             None,
             serde_json::json!({"j": 3}),
-            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue3");
@@ -907,7 +991,11 @@ async fn concurrency_permanent_failure_releases_holder() {
             now,
             None,
             serde_json::json!({"j": 1}),
-            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue1");
@@ -923,7 +1011,11 @@ async fn concurrency_permanent_failure_releases_holder() {
             now,
             None,
             serde_json::json!({"j": 2}),
-            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue2");
@@ -980,7 +1072,11 @@ async fn concurrency_reap_expired_lease_releases_holder() {
                 backoff_factor: 1.0,
             }),
             serde_json::json!({"j": 1}),
-            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue1");
@@ -996,7 +1092,11 @@ async fn concurrency_reap_expired_lease_releases_holder() {
             now,
             None,
             serde_json::json!({"j": 2}),
-            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue2");
@@ -1084,7 +1184,11 @@ async fn concurrency_future_request_granted_after_time_passes() {
             now,
             None,
             serde_json::json!({"j": 1}),
-            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue1");
@@ -1101,7 +1205,11 @@ async fn concurrency_future_request_granted_after_time_passes() {
             future,
             None,
             serde_json::json!({"j": 2}),
-            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue2");
@@ -1165,7 +1273,11 @@ async fn cannot_delete_job_with_future_request_ticket() {
             now,
             None,
             serde_json::json!({"j": 1}),
-            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue1");
@@ -1181,7 +1293,11 @@ async fn cannot_delete_job_with_future_request_ticket() {
             future,
             None,
             serde_json::json!({"j": 2}),
-            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue2");
@@ -1238,7 +1354,11 @@ async fn cannot_delete_job_with_pending_request() {
             now,
             None,
             serde_json::json!({"j": 1}),
-            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue1");
@@ -1254,7 +1374,11 @@ async fn cannot_delete_job_with_pending_request() {
             now,
             None,
             serde_json::json!({"j": 2}),
-            vec![Limit::Concurrency(ConcurrencyLimit { key: queue.clone(), max_concurrency: 1 })], None,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
         )
         .await
         .expect("enqueue2");

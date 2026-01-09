@@ -7,7 +7,7 @@ use crate::concurrency::{MemoryEvent, RequestTicketTaskOutcome};
 use crate::job::{JobStatus, JobView};
 use crate::job_attempt::{AttemptStatus, JobAttempt};
 use crate::job_store_shard::helpers::now_epoch_ms;
-use crate::job_store_shard::{DequeueResult, JobStoreShardError, JobStoreShard};
+use crate::job_store_shard::{DequeueResult, JobStoreShard, JobStoreShardError};
 use crate::keys::{attempt_key, job_info_key, leased_task_key};
 use crate::task::{LeaseRecord, LeasedRefreshTask, LeasedTask, Task, DEFAULT_LEASE_MS};
 use crate::task_broker::BrokerTask;

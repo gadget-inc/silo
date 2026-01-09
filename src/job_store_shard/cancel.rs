@@ -6,7 +6,7 @@ use slatedb::IsolationLevel;
 use crate::codec::{decode_job_cancellation, encode_job_cancellation, encode_job_status};
 use crate::job::{JobCancellation, JobStatus, JobStatusKind};
 use crate::job_store_shard::helpers::{decode_job_status_owned, now_epoch_ms};
-use crate::job_store_shard::{JobStoreShardError, JobStoreShard};
+use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{idx_status_time_key, job_cancelled_key, job_status_key};
 use tracing::debug;
 

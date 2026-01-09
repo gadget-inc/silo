@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::gubernator::{GubernatorError, RateLimitResult};
 use crate::job_store_shard::helpers::put_task;
-use crate::job_store_shard::{JobStoreShardError, JobStoreShard};
+use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::task::{GubernatorRateLimitData, Task};
 
 impl JobStoreShard {
