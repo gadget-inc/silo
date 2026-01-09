@@ -417,12 +417,12 @@ describe("Shard Routing", () => {
         conn.client.enqueue = mockEnqueue;
         (client as any).refreshTopology = vi.fn().mockResolvedValue(undefined);
 
-        const jobId = await client.enqueue({
+        const handle = await client.enqueue({
           tenant: "test-tenant",
           payload: { test: true },
         });
 
-        expect(jobId).toBe("job-123");
+        expect(handle.id).toBe("job-123");
         expect(mockEnqueue).toHaveBeenCalledTimes(2);
       });
 
@@ -495,12 +495,12 @@ describe("Shard Routing", () => {
         });
         (client as any)._getOrCreateConnection = getOrCreateSpy;
 
-        const jobId = await client.enqueue({
+        const handle = await client.enqueue({
           tenant: "test-tenant",
           payload: { test: true },
         });
 
-        expect(jobId).toBe("job-456");
+        expect(handle.id).toBe("job-456");
         expect(getOrCreateSpy).toHaveBeenCalledWith("new-server:50051");
       });
     });
@@ -526,12 +526,12 @@ describe("Shard Routing", () => {
         const refreshSpy = vi.fn().mockResolvedValue(undefined);
         (client as any).refreshTopology = refreshSpy;
 
-        const jobId = await client.enqueue({
+        const handle = await client.enqueue({
           tenant: "test-tenant",
           payload: { test: true },
         });
 
-        expect(jobId).toBe("job-789");
+        expect(handle.id).toBe("job-789");
         expect(refreshSpy).toHaveBeenCalled();
       });
 
@@ -557,12 +557,12 @@ describe("Shard Routing", () => {
         const refreshSpy = vi.fn().mockResolvedValue(undefined);
         (client as any).refreshTopology = refreshSpy;
 
-        const jobId = await client.enqueue({
+        const handle = await client.enqueue({
           tenant: "test-tenant",
           payload: { test: true },
         });
 
-        expect(jobId).toBe("job-abc");
+        expect(handle.id).toBe("job-abc");
         expect(refreshSpy).not.toHaveBeenCalled();
       });
     });
