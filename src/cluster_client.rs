@@ -7,11 +7,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use futures::future::join_all;
 use tokio::sync::RwLock;
 use tonic::transport::Channel;
 use tracing::{debug, warn};
 
-use crate::coordination::{CoordinationError, Coordinator, ShardOwnerMap};
+use crate::coordination::{Coordinator, ShardOwnerMap};
 use crate::factory::ShardFactory;
 use crate::pb::silo_client::SiloClient;
 use crate::pb::{
@@ -77,7 +78,7 @@ impl ClusterClient {
             format!("http://{}", addr)
         };
 
-        // Check cache first
+        // Check cache first (fast path with read lock)
         {
             let cache = self.connections.read().await;
             if let Some(client) = cache.get(&full_addr) {
@@ -95,11 +96,13 @@ impl ClusterClient {
 
         let client = SiloClient::new(channel);
 
-        // Cache the connection
-        {
-            let mut cache = self.connections.write().await;
-            cache.insert(full_addr, client.clone());
+        // Cache the connection (double-check after acquiring write lock to avoid race)
+        let mut cache = self.connections.write().await;
+        if let Some(existing) = cache.get(&full_addr) {
+            // Another task created the connection while we were connecting
+            return Ok(existing.clone());
         }
+        cache.insert(full_addr, client.clone());
 
         Ok(client)
     }
@@ -119,21 +122,9 @@ impl ClusterClient {
         }
 
         // Shard is not local, need to query remote node
-        let Some(coordinator) = &self.coordinator else {
-            return Err(ClusterClientError::NoCoordinator);
-        };
-
-        let owner_map = coordinator
-            .get_shard_owner_map()
-            .await
-            .map_err(|e: CoordinationError| ClusterClientError::QueryFailed(e.to_string()))?;
-
-        let Some(addr) = owner_map.shard_to_addr.get(&shard_id) else {
-            return Err(ClusterClientError::ShardNotFound(shard_id));
-        };
-
+        let addr = self.get_shard_addr(shard_id).await?;
         debug!(shard_id = shard_id, addr = %addr, "querying remote shard");
-        self.query_remote_shard(shard_id, addr, sql).await
+        self.query_remote_shard(shard_id, &addr, sql).await
     }
 
     /// Query a local shard directly
@@ -150,18 +141,16 @@ impl ClusterClient {
             .await
             .map_err(|e| ClusterClientError::QueryFailed(format!("SQL error: {}", e)))?;
 
-        let schema = Arc::new(dataframe.schema().as_arrow().clone());
+        let fallback_schema = Arc::new(dataframe.schema().as_arrow().clone());
 
         let batches = dataframe.collect().await.map_err(|e| {
             ClusterClientError::QueryFailed(format!("Query execution failed: {}", e))
         })?;
 
-        // Use schema from dataframe or first batch
-        let schema = if let Some(batch) = batches.first() {
-            batch.schema()
-        } else {
-            schema
-        };
+        let schema = batches
+            .first()
+            .map(|b| b.schema())
+            .unwrap_or(fallback_schema);
 
         let columns: Vec<ColumnInfo> = schema
             .fields()
@@ -172,7 +161,7 @@ impl ClusterClient {
             })
             .collect();
 
-        // Convert batches to JSON rows
+        // Convert batches to JSON rows using RawValue to avoid double-serialization
         let mut rows = Vec::new();
         for batch in batches {
             let mut buf = Vec::new();
@@ -184,14 +173,14 @@ impl ClusterClient {
                 ClusterClientError::QueryFailed(format!("Serialization error: {}", e))
             })?;
 
-            let json_array: Vec<serde_json::Value> = serde_json::from_slice(&buf)
+            // Parse as raw JSON values to avoid deserialize + serialize round-trip
+            let json_array: Vec<Box<serde_json::value::RawValue>> = serde_json::from_slice(&buf)
                 .map_err(|e| ClusterClientError::QueryFailed(format!("JSON parse error: {}", e)))?;
 
-            for row_value in json_array {
-                let row_bytes = serde_json::to_vec(&row_value).map_err(|e| {
-                    ClusterClientError::QueryFailed(format!("JSON serialize error: {}", e))
-                })?;
-                rows.push(JsonValueBytes { data: row_bytes });
+            for row_raw in json_array {
+                rows.push(JsonValueBytes {
+                    data: row_raw.get().as_bytes().to_vec(),
+                });
             }
         }
 
@@ -241,17 +230,24 @@ impl ClusterClient {
         sql: &str,
     ) -> Result<Vec<QueryResult>, ClusterClientError> {
         let shard_ids = self.get_all_shard_ids().await?;
-        let mut results = Vec::new();
 
-        for shard_id in shard_ids {
-            match self.query_shard(shard_id, sql).await {
-                Ok(result) => results.push(result),
+        // Query all shards in parallel
+        let futures: Vec<_> = shard_ids
+            .into_iter()
+            .map(|shard_id| async move { (shard_id, self.query_shard(shard_id, sql).await) })
+            .collect();
+
+        let results: Vec<_> = join_all(futures)
+            .await
+            .into_iter()
+            .filter_map(|(shard_id, result)| match result {
+                Ok(r) => Some(r),
                 Err(e) => {
                     warn!(shard_id = shard_id, error = %e, "failed to query shard");
-                    // Continue with other shards even if one fails
+                    None
                 }
-            }
-        }
+            })
+            .collect();
 
         Ok(results)
     }
@@ -262,7 +258,7 @@ impl ClusterClient {
             let owner_map = coordinator
                 .get_shard_owner_map()
                 .await
-                .map_err(|e: CoordinationError| ClusterClientError::QueryFailed(e.to_string()))?;
+                .map_err(|e| ClusterClientError::QueryFailed(e.to_string()))?;
             Ok((0..owner_map.num_shards).collect())
         } else {
             // No coordinator, just return local shard IDs
@@ -285,7 +281,7 @@ impl ClusterClient {
         coordinator
             .get_shard_owner_map()
             .await
-            .map_err(|e: CoordinationError| ClusterClientError::QueryFailed(e.to_string()))
+            .map_err(|e| ClusterClientError::QueryFailed(e.to_string()))
     }
 
     /// Check if this node owns a specific shard
@@ -302,7 +298,7 @@ impl ClusterClient {
         let owner_map = coordinator
             .get_shard_owner_map()
             .await
-            .map_err(|e: CoordinationError| ClusterClientError::QueryFailed(e.to_string()))?;
+            .map_err(|e| ClusterClientError::QueryFailed(e.to_string()))?;
 
         owner_map
             .shard_to_addr
