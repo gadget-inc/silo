@@ -85,6 +85,17 @@ export class JobHandle {
   }
 
   /**
+   * Restart the job if it was cancelled or failed.
+   * This allows the job to be processed again with a fresh set of retries
+   * according to its retry policy.
+   * @throws JobNotFoundError if the job doesn't exist.
+   * @throws Error if the job is not in a restartable state (must be Cancelled or Failed).
+   */
+  public async restart(): Promise<void> {
+    return this._client.restartJob(this.id, this.tenant);
+  }
+
+  /**
    * Delete the job.
    * @throws JobNotFoundError if the job doesn't exist.
    */

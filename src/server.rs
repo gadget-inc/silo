@@ -132,6 +132,15 @@ pub fn job_limit_to_proto_limit(job_limit: crate::job::Limit) -> Limit {
 fn map_err(e: JobStoreShardError) -> Status {
     match e {
         JobStoreShardError::JobNotFound(_) => Status::not_found("job not found"),
+        JobStoreShardError::JobAlreadyCancelled(_) => {
+            Status::failed_precondition("job is already cancelled")
+        }
+        JobStoreShardError::JobAlreadyTerminal(_, _) => {
+            Status::failed_precondition("job is already in terminal state")
+        }
+        JobStoreShardError::JobNotRestartable(ref e) => {
+            Status::failed_precondition(e.to_string())
+        }
         other => Status::internal(other.to_string()),
     }
 }
@@ -561,6 +570,17 @@ impl Silo for SiloService {
         let tenant = self.validate_tenant(r.tenant.as_deref())?;
         shard.cancel_job(&tenant, &r.id).await.map_err(map_err)?;
         Ok(Response::new(CancelJobResponse {}))
+    }
+
+    async fn restart_job(
+        &self,
+        req: Request<RestartJobRequest>,
+    ) -> Result<Response<RestartJobResponse>, Status> {
+        let r = req.into_inner();
+        let shard = self.shard_with_redirect(r.shard).await?;
+        let tenant = self.validate_tenant(r.tenant.as_deref())?;
+        shard.restart_job(&tenant, &r.id).await.map_err(map_err)?;
+        Ok(Response::new(RestartJobResponse {}))
     }
 
     async fn lease_tasks(

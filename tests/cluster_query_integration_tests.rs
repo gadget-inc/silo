@@ -154,12 +154,18 @@ async fn cluster_two_nodes_basic_query() {
     let factory1 = make_test_factory("query-n1");
     let factory2 = make_test_factory("query-n2");
 
-    // Start node 1
+    // Bind listeners first to get available ports
+    let listener1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr1 = listener1.local_addr().unwrap().to_string();
+    let addr2 = listener2.local_addr().unwrap().to_string();
+
+    // Start node 1 with the actual address
     let (coordinator1, h1) = EtcdCoordinator::start(
         &cfg.coordination.etcd_endpoints,
         &prefix,
         "n1",
-        "127.0.0.1:50161",
+        &addr1,
         NUM_SHARDS,
         10,
         factory1.clone(),
@@ -168,12 +174,12 @@ async fn cluster_two_nodes_basic_query() {
     .expect("start coordinator 1");
     let coordinator1 = Arc::new(coordinator1);
 
-    // Start node 2
+    // Start node 2 with the actual address
     let (coordinator2, h2) = EtcdCoordinator::start(
         &cfg.coordination.etcd_endpoints,
         &prefix,
         "n2",
-        "127.0.0.1:50162",
+        &addr2,
         NUM_SHARDS,
         10,
         factory2.clone(),
@@ -188,9 +194,7 @@ async fn cluster_two_nodes_basic_query() {
         "cluster did not converge"
     );
 
-    // Start gRPC servers
-    let listener1 = TcpListener::bind("127.0.0.1:50161").await.unwrap();
-    let listener2 = TcpListener::bind("127.0.0.1:50162").await.unwrap();
+    // Start gRPC servers with the already-bound listeners
 
     let (shutdown_tx1, shutdown_rx1) = tokio::sync::broadcast::channel(1);
     let (shutdown_tx2, shutdown_rx2) = tokio::sync::broadcast::channel(1);
@@ -215,8 +219,7 @@ async fn cluster_two_nodes_basic_query() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Set up cluster clients with shard routing
-    let mut clients =
-        ClusterClients::new("127.0.0.1:50161", "127.0.0.1:50162", &coordinator1).await;
+    let mut clients = ClusterClients::new(&addr1, &addr2, &coordinator1).await;
 
     // Get shards owned by each node
     let shard1 = clients.shard_on_node1();
@@ -274,12 +277,18 @@ async fn cluster_two_nodes_status_filter_query() {
     let factory1 = make_test_factory("status-n1");
     let factory2 = make_test_factory("status-n2");
 
-    // Start nodes
+    // Bind listeners first to get available ports
+    let listener1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr1 = listener1.local_addr().unwrap().to_string();
+    let addr2 = listener2.local_addr().unwrap().to_string();
+
+    // Start nodes with the actual addresses
     let (coordinator1, h1) = EtcdCoordinator::start(
         &cfg.coordination.etcd_endpoints,
         &prefix,
         "n1",
-        "127.0.0.1:50181",
+        &addr1,
         NUM_SHARDS,
         10,
         factory1.clone(),
@@ -292,7 +301,7 @@ async fn cluster_two_nodes_status_filter_query() {
         &cfg.coordination.etcd_endpoints,
         &prefix,
         "n2",
-        "127.0.0.1:50182",
+        &addr2,
         NUM_SHARDS,
         10,
         factory2.clone(),
@@ -303,9 +312,7 @@ async fn cluster_two_nodes_status_filter_query() {
 
     assert!(coordinator1.wait_converged(Duration::from_secs(30)).await);
 
-    // Start gRPC servers
-    let listener1 = TcpListener::bind("127.0.0.1:50181").await.unwrap();
-    let listener2 = TcpListener::bind("127.0.0.1:50182").await.unwrap();
+    // Start gRPC servers with the already-bound listeners
 
     let (shutdown_tx1, shutdown_rx1) = tokio::sync::broadcast::channel(1);
     let (shutdown_tx2, shutdown_rx2) = tokio::sync::broadcast::channel(1);
@@ -329,8 +336,7 @@ async fn cluster_two_nodes_status_filter_query() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Set up cluster clients with shard routing
-    let mut clients =
-        ClusterClients::new("127.0.0.1:50181", "127.0.0.1:50182", &coordinator1).await;
+    let mut clients = ClusterClients::new(&addr1, &addr2, &coordinator1).await;
 
     // Enqueue some jobs, routing to the correct node for each shard
     for i in 0..5u32 {
@@ -387,12 +393,18 @@ async fn cluster_two_nodes_count_across_shards() {
     let factory1 = make_test_factory("groupby-n1");
     let factory2 = make_test_factory("groupby-n2");
 
-    // Start nodes
+    // Bind listeners first to get available ports
+    let listener1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr1 = listener1.local_addr().unwrap().to_string();
+    let addr2 = listener2.local_addr().unwrap().to_string();
+
+    // Start nodes with the actual addresses
     let (coordinator1, h1) = EtcdCoordinator::start(
         &cfg.coordination.etcd_endpoints,
         &prefix,
         "n1",
-        "127.0.0.1:50191",
+        &addr1,
         NUM_SHARDS,
         10,
         factory1.clone(),
@@ -405,7 +417,7 @@ async fn cluster_two_nodes_count_across_shards() {
         &cfg.coordination.etcd_endpoints,
         &prefix,
         "n2",
-        "127.0.0.1:50192",
+        &addr2,
         NUM_SHARDS,
         10,
         factory2.clone(),
@@ -416,9 +428,7 @@ async fn cluster_two_nodes_count_across_shards() {
 
     assert!(coordinator1.wait_converged(Duration::from_secs(30)).await);
 
-    // Start gRPC servers
-    let listener1 = TcpListener::bind("127.0.0.1:50191").await.unwrap();
-    let listener2 = TcpListener::bind("127.0.0.1:50192").await.unwrap();
+    // Start gRPC servers with the already-bound listeners
 
     let (shutdown_tx1, shutdown_rx1) = tokio::sync::broadcast::channel(1);
     let (shutdown_tx2, shutdown_rx2) = tokio::sync::broadcast::channel(1);
@@ -442,8 +452,7 @@ async fn cluster_two_nodes_count_across_shards() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Set up cluster clients with shard routing
-    let mut clients =
-        ClusterClients::new("127.0.0.1:50191", "127.0.0.1:50192", &coordinator1).await;
+    let mut clients = ClusterClients::new(&addr1, &addr2, &coordinator1).await;
 
     // Enqueue jobs to different shards, routing to the correct node
     for i in 0..20u32 {
@@ -498,12 +507,18 @@ async fn cluster_two_nodes_queues_table() {
     let factory1 = make_test_factory("queues-n1");
     let factory2 = make_test_factory("queues-n2");
 
-    // Start nodes
+    // Bind listeners first to get available ports
+    let listener1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr1 = listener1.local_addr().unwrap().to_string();
+    let addr2 = listener2.local_addr().unwrap().to_string();
+
+    // Start nodes with the actual addresses
     let (coordinator1, h1) = EtcdCoordinator::start(
         &cfg.coordination.etcd_endpoints,
         &prefix,
         "n1",
-        "127.0.0.1:50201",
+        &addr1,
         NUM_SHARDS,
         10,
         factory1.clone(),
@@ -516,7 +531,7 @@ async fn cluster_two_nodes_queues_table() {
         &cfg.coordination.etcd_endpoints,
         &prefix,
         "n2",
-        "127.0.0.1:50202",
+        &addr2,
         NUM_SHARDS,
         10,
         factory2.clone(),
@@ -527,9 +542,7 @@ async fn cluster_two_nodes_queues_table() {
 
     assert!(coordinator1.wait_converged(Duration::from_secs(30)).await);
 
-    // Start gRPC servers
-    let listener1 = TcpListener::bind("127.0.0.1:50201").await.unwrap();
-    let listener2 = TcpListener::bind("127.0.0.1:50202").await.unwrap();
+    // Start gRPC servers with the already-bound listeners
 
     let (shutdown_tx1, shutdown_rx1) = tokio::sync::broadcast::channel(1);
     let (shutdown_tx2, shutdown_rx2) = tokio::sync::broadcast::channel(1);
@@ -592,12 +605,18 @@ async fn cluster_two_nodes_projection_remote_shards() {
     let factory1 = make_test_factory("proj-n1");
     let factory2 = make_test_factory("proj-n2");
 
-    // Start nodes
+    // Bind listeners first to get available ports
+    let listener1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr1 = listener1.local_addr().unwrap().to_string();
+    let addr2 = listener2.local_addr().unwrap().to_string();
+
+    // Start nodes with the actual addresses
     let (coordinator1, h1) = EtcdCoordinator::start(
         &cfg.coordination.etcd_endpoints,
         &prefix,
         "n1",
-        "127.0.0.1:50211",
+        &addr1,
         NUM_SHARDS,
         10,
         factory1.clone(),
@@ -610,7 +629,7 @@ async fn cluster_two_nodes_projection_remote_shards() {
         &cfg.coordination.etcd_endpoints,
         &prefix,
         "n2",
-        "127.0.0.1:50212",
+        &addr2,
         NUM_SHARDS,
         10,
         factory2.clone(),
@@ -621,9 +640,7 @@ async fn cluster_two_nodes_projection_remote_shards() {
 
     assert!(coordinator1.wait_converged(Duration::from_secs(30)).await);
 
-    // Start gRPC servers
-    let listener1 = TcpListener::bind("127.0.0.1:50211").await.unwrap();
-    let listener2 = TcpListener::bind("127.0.0.1:50212").await.unwrap();
+    // Start gRPC servers with the already-bound listeners
 
     let (shutdown_tx1, shutdown_rx1) = tokio::sync::broadcast::channel(1);
     let (shutdown_tx2, shutdown_rx2) = tokio::sync::broadcast::channel(1);
@@ -647,8 +664,7 @@ async fn cluster_two_nodes_projection_remote_shards() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Set up cluster clients with shard routing
-    let mut clients =
-        ClusterClients::new("127.0.0.1:50211", "127.0.0.1:50212", &coordinator1).await;
+    let mut clients = ClusterClients::new(&addr1, &addr2, &coordinator1).await;
 
     // Enqueue jobs to different shards, ensuring some go to each node
     for i in 0..10u32 {

@@ -8,8 +8,10 @@
 - [x] GRPC layer for invoking functions
 - [ ] limits on payload, error, result size
 - [x] cancel api
-- [ ] get job info api
-- [ ] list jobs api
+  - [ ] restart cancelled api
+- [ ] run next attempt now RPC
+- [x] get job info api
+- [x] list jobs api
 - [x] clustering
   - [x] etcd leasing
   - [x] integration tests of some sort
@@ -17,6 +19,12 @@
   - [ ] think through if failing open when control plane is down is ok with write fencing
   - [ ] add new coordination mode for persistent disk wal storage and k8s restarts
     - if using persistent disk for the wal, the wal only exists there, and we dont have full compute/storage separation. instead, let's expect any crashed nodes to come back, and rely on cloud provider persistent disk implementations to make that disk available elsewhere. the lease must thusly _not_ expire when a pod goes away, and instead must be explicitly released when it is ready to release it.
+- [ ] floating concurrency limits
+  - [x] basics
+  - [ ] typescript client implementation
+  - [ ] failure to refresh handling
+  - [ ] performance optimization to not refresh if no jobs currently enqueued with limit
+- [ ] review what happened with the check-if-cancelled-on-dequeue thing happened, if alloy model matches rust impl
 - [x] webui / operator tooling
   - [] use / refine
 - [x] /healthz endpoint
@@ -33,3 +41,6 @@
 - [ ] once transaction support, make enqueue idempotency not a read-then-write but some sort of conditional write
 - [ ] validate that concurrency queues can reach 0
 - [ ] validate GRPC typescript client retry configuration with toxiproxy
+- [ ] waiting state? that matches the gadget ui, but we dont have it modeled because it changes in time without anything else changing
+  - [ ] do we need to be able to query for it in the SQL layer? probably
+- [ ] worker <=> server GRPC auth

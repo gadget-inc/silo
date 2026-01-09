@@ -19,6 +19,8 @@ import type { ReportOutcomeResponse } from "./silo";
 import type { ReportOutcomeRequest } from "./silo";
 import type { LeaseTasksResponse } from "./silo";
 import type { LeaseTasksRequest } from "./silo";
+import type { RestartJobResponse } from "./silo";
+import type { RestartJobRequest } from "./silo";
 import type { CancelJobResponse } from "./silo";
 import type { CancelJobRequest } from "./silo";
 import type { DeleteJobResponse } from "./silo";
@@ -69,6 +71,14 @@ export interface ISiloClient {
      * @generated from protobuf rpc: CancelJob
      */
     cancelJob(input: CancelJobRequest, options?: RpcOptions): UnaryCall<CancelJobRequest, CancelJobResponse>;
+    /**
+     * Restart a cancelled or failed job, allowing it to be processed again.
+     * Returns FAILED_PRECONDITION if the job is not in a restartable state.
+     * Returns NOT_FOUND if the job doesn't exist.
+     *
+     * @generated from protobuf rpc: RestartJob
+     */
+    restartJob(input: RestartJobRequest, options?: RpcOptions): UnaryCall<RestartJobRequest, RestartJobResponse>;
     /**
      * @generated from protobuf rpc: LeaseTasks
      */
@@ -163,38 +173,49 @@ export class SiloClient implements ISiloClient, ServiceInfo {
         return stackIntercept<CancelJobRequest, CancelJobResponse>("unary", this._transport, method, opt, input);
     }
     /**
+     * Restart a cancelled or failed job, allowing it to be processed again.
+     * Returns FAILED_PRECONDITION if the job is not in a restartable state.
+     * Returns NOT_FOUND if the job doesn't exist.
+     *
+     * @generated from protobuf rpc: RestartJob
+     */
+    restartJob(input: RestartJobRequest, options?: RpcOptions): UnaryCall<RestartJobRequest, RestartJobResponse> {
+        const method = this.methods[6], opt = this._transport.mergeOptions(options);
+        return stackIntercept<RestartJobRequest, RestartJobResponse>("unary", this._transport, method, opt, input);
+    }
+    /**
      * @generated from protobuf rpc: LeaseTasks
      */
     leaseTasks(input: LeaseTasksRequest, options?: RpcOptions): UnaryCall<LeaseTasksRequest, LeaseTasksResponse> {
-        const method = this.methods[6], opt = this._transport.mergeOptions(options);
+        const method = this.methods[7], opt = this._transport.mergeOptions(options);
         return stackIntercept<LeaseTasksRequest, LeaseTasksResponse>("unary", this._transport, method, opt, input);
     }
     /**
      * @generated from protobuf rpc: ReportOutcome
      */
     reportOutcome(input: ReportOutcomeRequest, options?: RpcOptions): UnaryCall<ReportOutcomeRequest, ReportOutcomeResponse> {
-        const method = this.methods[7], opt = this._transport.mergeOptions(options);
+        const method = this.methods[8], opt = this._transport.mergeOptions(options);
         return stackIntercept<ReportOutcomeRequest, ReportOutcomeResponse>("unary", this._transport, method, opt, input);
     }
     /**
      * @generated from protobuf rpc: ReportRefreshOutcome
      */
     reportRefreshOutcome(input: ReportRefreshOutcomeRequest, options?: RpcOptions): UnaryCall<ReportRefreshOutcomeRequest, ReportRefreshOutcomeResponse> {
-        const method = this.methods[8], opt = this._transport.mergeOptions(options);
+        const method = this.methods[9], opt = this._transport.mergeOptions(options);
         return stackIntercept<ReportRefreshOutcomeRequest, ReportRefreshOutcomeResponse>("unary", this._transport, method, opt, input);
     }
     /**
      * @generated from protobuf rpc: Heartbeat
      */
     heartbeat(input: HeartbeatRequest, options?: RpcOptions): UnaryCall<HeartbeatRequest, HeartbeatResponse> {
-        const method = this.methods[9], opt = this._transport.mergeOptions(options);
+        const method = this.methods[10], opt = this._transport.mergeOptions(options);
         return stackIntercept<HeartbeatRequest, HeartbeatResponse>("unary", this._transport, method, opt, input);
     }
     /**
      * @generated from protobuf rpc: Query
      */
     query(input: QueryRequest, options?: RpcOptions): UnaryCall<QueryRequest, QueryResponse> {
-        const method = this.methods[10], opt = this._transport.mergeOptions(options);
+        const method = this.methods[11], opt = this._transport.mergeOptions(options);
         return stackIntercept<QueryRequest, QueryResponse>("unary", this._transport, method, opt, input);
     }
     /**
@@ -204,7 +225,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: QueryArrow
      */
     queryArrow(input: QueryArrowRequest, options?: RpcOptions): ServerStreamingCall<QueryArrowRequest, ArrowIpcMessage> {
-        const method = this.methods[11], opt = this._transport.mergeOptions(options);
+        const method = this.methods[12], opt = this._transport.mergeOptions(options);
         return stackIntercept<QueryArrowRequest, ArrowIpcMessage>("serverStreaming", this._transport, method, opt, input);
     }
     /**
@@ -214,7 +235,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: ResetShards
      */
     resetShards(input: ResetShardsRequest, options?: RpcOptions): UnaryCall<ResetShardsRequest, ResetShardsResponse> {
-        const method = this.methods[12], opt = this._transport.mergeOptions(options);
+        const method = this.methods[13], opt = this._transport.mergeOptions(options);
         return stackIntercept<ResetShardsRequest, ResetShardsResponse>("unary", this._transport, method, opt, input);
     }
 }
