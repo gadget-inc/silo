@@ -532,10 +532,6 @@ pub fn decode_concurrency_action(bytes: &[u8]) -> Result<DecodedConcurrencyActio
     Ok(DecodedConcurrencyAction { data })
 }
 
-// ============================================================================
-// JobCancellation encoding/decoding
-// ============================================================================
-
 #[inline]
 pub fn encode_job_cancellation(cancellation: &JobCancellation) -> Result<Vec<u8>, CodecError> {
     let data = rkyv::to_bytes::<JobCancellation, 64>(cancellation)
@@ -564,10 +560,6 @@ pub fn decode_job_cancellation(bytes: &[u8]) -> Result<DecodedJobCancellation, C
         .map_err(|e| CodecError::Rkyv(e.to_string()))?;
     Ok(DecodedJobCancellation { data })
 }
-
-// ============================================================================
-// FloatingLimitState encoding/decoding
-// ============================================================================
 
 use crate::job::FloatingLimitState;
 

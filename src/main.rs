@@ -7,7 +7,7 @@ use tracing::{error, info};
 use silo::coordination::{create_coordinator, Coordinator};
 use silo::factory::ShardFactory;
 use silo::gubernator::{GubernatorClient, NullGubernatorClient, RateLimitClient};
-use silo::server::run_grpc_with_reaper;
+use silo::server::run_server;
 use silo::settings::{self, CoordinationBackend};
 use silo::webui::run_webui;
 use tokio::net::TcpListener;
@@ -130,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let server = tokio::spawn(run_grpc_with_reaper(
+    let server = tokio::spawn(run_server(
         listener,
         factory.clone(),
         coordinator.clone(),
