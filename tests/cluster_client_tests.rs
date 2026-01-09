@@ -339,3 +339,162 @@ async fn cluster_client_get_shard_owner_map_without_coordinator() {
         err
     );
 }
+
+#[silo::test]
+async fn cluster_client_query_local_shard_sql_error() {
+    let factory = make_test_factory();
+    factory.open(0).await.expect("open shard");
+
+    let client = ClusterClient::new(factory.clone(), None);
+
+    // Query with invalid SQL should fail
+    let result = client.query_shard(0, "SELECT FROM WHERE INVALID").await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, silo::cluster_client::ClusterClientError::QueryFailed(_)),
+        "expected QueryFailed error, got {:?}",
+        err
+    );
+}
+
+#[silo::test]
+async fn cluster_client_query_local_shard_invalid_column() {
+    let factory = make_test_factory();
+    factory.open(0).await.expect("open shard");
+
+    let client = ClusterClient::new(factory.clone(), None);
+
+    // Query with non-existent column should fail
+    let result = client
+        .query_shard(0, "SELECT nonexistent_column FROM jobs")
+        .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, silo::cluster_client::ClusterClientError::QueryFailed(_)),
+        "expected QueryFailed error, got {:?}",
+        err
+    );
+}
+
+#[silo::test]
+async fn cluster_client_cancel_nonexistent_job() {
+    let factory = make_test_factory();
+    factory.open(0).await.expect("open shard");
+
+    let client = ClusterClient::new(factory.clone(), None);
+
+    // Cancel a job that doesn't exist - should return an error
+    let result = client.cancel_job(0, "test-tenant", "nonexistent-job").await;
+
+    // cancel_job returns error for non-existent jobs
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, silo::cluster_client::ClusterClientError::QueryFailed(_)),
+        "expected QueryFailed error for non-existent job, got {:?}",
+        err
+    );
+}
+
+#[silo::test]
+async fn cluster_client_cancel_job_on_remote_shard_without_coordinator() {
+    let factory = make_test_factory();
+    factory.open(0).await.expect("open shard 0");
+    // Note: Shard 999 is NOT opened
+
+    let client = ClusterClient::new(factory.clone(), None);
+
+    // Try to cancel job on shard we don't own (without coordinator)
+    let result = client
+        .cancel_job(999, "test-tenant", "some-job")
+        .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, silo::cluster_client::ClusterClientError::NoCoordinator),
+        "expected NoCoordinator error, got {:?}",
+        err
+    );
+}
+
+#[silo::test]
+async fn cluster_client_get_job_on_remote_shard_without_coordinator() {
+    let factory = make_test_factory();
+    factory.open(0).await.expect("open shard 0");
+    // Note: Shard 999 is NOT opened
+
+    let client = ClusterClient::new(factory.clone(), None);
+
+    // Try to get job on shard we don't own (without coordinator)
+    let result = client
+        .get_job(999, "test-tenant", "some-job")
+        .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, silo::cluster_client::ClusterClientError::NoCoordinator),
+        "expected NoCoordinator error, got {:?}",
+        err
+    );
+}
+
+#[silo::test]
+async fn cluster_client_query_all_local_shards_with_mixed_results() {
+    let factory = make_test_factory();
+    factory.open(0).await.expect("open shard 0");
+    factory.open(1).await.expect("open shard 1");
+    factory.open(2).await.expect("open shard 2");
+
+    // Only add jobs to shards 0 and 2
+    let shard0 = factory.get("0").unwrap();
+    shard0
+        .enqueue(
+            "test-tenant",
+            Some("job-0".to_string()),
+            5,
+            test_helpers::now_ms(),
+            None,
+            serde_json::json!({}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("enqueue on shard 0");
+
+    let shard2 = factory.get("2").unwrap();
+    shard2
+        .enqueue(
+            "test-tenant",
+            Some("job-2".to_string()),
+            5,
+            test_helpers::now_ms(),
+            None,
+            serde_json::json!({}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("enqueue on shard 2");
+
+    // Shard 1 has no jobs (empty result)
+
+    let client = ClusterClient::new(factory.clone(), None);
+
+    let results = client
+        .query_all_shards("SELECT id FROM jobs")
+        .await
+        .expect("query all should succeed");
+
+    // All 3 shards should return results (even empty ones)
+    assert_eq!(results.len(), 3, "should have results from all 3 shards");
+
+    // Total should be 2 jobs
+    let total_rows: i32 = results.iter().map(|r| r.row_count).sum();
+    assert_eq!(total_rows, 2, "should have 2 jobs total");
+}
