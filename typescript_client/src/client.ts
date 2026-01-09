@@ -261,8 +261,40 @@ export interface RateLimitConfig {
   retryPolicy?: RateLimitRetryPolicyConfig;
 }
 
-/** A limit that can be either a concurrency limit or a rate limit */
-export type JobLimit = ConcurrencyLimitConfig | RateLimitConfig;
+/**
+ * Floating concurrency limit configuration.
+ *
+ * Unlike regular concurrency limits, floating limits have a dynamic max concurrency
+ * that is periodically refreshed by workers. This is useful for adaptive rate limiting
+ * based on external factors like API quotas or system load.
+ *
+ * When the limit becomes stale (based on refreshIntervalMs), the server schedules
+ * a refresh task that workers can handle to compute a new max concurrency value.
+ */
+export interface FloatingConcurrencyLimitConfig {
+  type: "floatingConcurrency";
+  /** Grouping key; jobs with the same key share the limit */
+  key: string;
+  /**
+   * Initial max concurrency value used until the first refresh completes.
+   * Also used as fallback if refreshes fail.
+   */
+  defaultMaxConcurrency: number;
+  /** How often to refresh the max concurrency value (in milliseconds) */
+  refreshIntervalMs: bigint;
+  /**
+   * Arbitrary key/value metadata passed to workers during refresh.
+   * Use this to provide context needed to compute the new max concurrency,
+   * such as organization IDs, API keys, or resource identifiers.
+   */
+  metadata?: Record<string, string>;
+}
+
+/** A limit that can be a concurrency limit, rate limit, or floating concurrency limit */
+export type JobLimit =
+  | ConcurrencyLimitConfig
+  | RateLimitConfig
+  | FloatingConcurrencyLimitConfig;
 
 /** Job details returned from getJob */
 export interface Job {
@@ -330,6 +362,18 @@ function toProtoLimit(limit: JobLimit): Limit {
         },
       },
     };
+  } else if (limit.type === "floatingConcurrency") {
+    return {
+      limit: {
+        oneofKind: "floatingConcurrency",
+        floatingConcurrency: {
+          key: limit.key,
+          defaultMaxConcurrency: limit.defaultMaxConcurrency,
+          refreshIntervalMs: limit.refreshIntervalMs,
+          metadata: limit.metadata ?? {},
+        },
+      },
+    };
   } else {
     return {
       limit: {
@@ -366,6 +410,16 @@ function fromProtoLimit(limit: Limit): JobLimit | undefined {
       type: "concurrency",
       key: limit.limit.concurrency.key,
       maxConcurrency: limit.limit.concurrency.maxConcurrency,
+    };
+  } else if (limit.limit.oneofKind === "floatingConcurrency") {
+    const fl = limit.limit.floatingConcurrency;
+    return {
+      type: "floatingConcurrency",
+      key: fl.key,
+      defaultMaxConcurrency: fl.defaultMaxConcurrency,
+      refreshIntervalMs: fl.refreshIntervalMs,
+      metadata:
+        Object.keys(fl.metadata).length > 0 ? { ...fl.metadata } : undefined,
     };
   } else if (limit.limit.oneofKind === "rateLimit") {
     const rl = limit.limit.rateLimit;
@@ -452,6 +506,68 @@ export interface ReportOutcomeOptions {
   outcome: TaskOutcome;
   /** Tenant ID. Required when server has tenancy enabled. */
   tenant?: string;
+}
+
+/**
+ * A floating limit refresh task.
+ *
+ * Workers receive these tasks when a floating concurrency limit needs its
+ * max concurrency value refreshed. The worker should compute the new value
+ * based on external factors (API quotas, system load, etc.) and report the result.
+ */
+export interface RefreshTask {
+  /** Unique task ID */
+  id: string;
+  /** The floating limit queue key to refresh */
+  queueKey: string;
+  /** Current max concurrency value */
+  currentMaxConcurrency: number;
+  /** When the value was last refreshed (epoch ms) */
+  lastRefreshedAtMs: bigint;
+  /** Metadata from the floating limit definition */
+  metadata: Record<string, string>;
+  /** How long to heartbeat in ms */
+  leaseMs: bigint;
+  /** Which shard this task came from (for reporting outcomes) */
+  shard: number;
+}
+
+/** Outcome for reporting refresh task success */
+export interface RefreshSuccessOutcome {
+  type: "success";
+  /** The new max concurrency value computed by the worker */
+  newMaxConcurrency: number;
+}
+
+/** Outcome for reporting refresh task failure */
+export interface RefreshFailureOutcome {
+  type: "failure";
+  /** Error code */
+  code: string;
+  /** Error message */
+  message: string;
+}
+
+export type RefreshOutcome = RefreshSuccessOutcome | RefreshFailureOutcome;
+
+/** Options for reporting refresh task outcome */
+export interface ReportRefreshOutcomeOptions {
+  /** The refresh task ID to report outcome for */
+  taskId: string;
+  /** The shard the task came from (from RefreshTask.shard) */
+  shard: number;
+  /** The outcome of the refresh */
+  outcome: RefreshOutcome;
+  /** Tenant ID. Required when server has tenancy enabled. */
+  tenant?: string;
+}
+
+/** Result from leasing tasks - includes both job tasks and refresh tasks */
+export interface LeaseTasksResult {
+  /** Regular job execution tasks */
+  tasks: Task[];
+  /** Floating limit refresh tasks */
+  refreshTasks: RefreshTask[];
 }
 
 /**
@@ -1105,13 +1221,16 @@ export class SiloGRPCClient {
    * By default, leases tasks from all shards the contacted server owns.
    * If `shard` is specified, filters to only that shard.
    *
-   * Each returned Task includes a `shard` field indicating which shard it came from,
+   * Returns both regular job tasks and floating limit refresh tasks.
+   * Each returned task includes a `shard` field indicating which shard it came from,
    * which must be used when reporting outcomes or sending heartbeats.
    *
    * @param options The options for the lease request.
-   * @returns The leased tasks (each with a `shard` field).
+   * @returns Object containing both job tasks and refresh tasks.
    */
-  public async leaseTasks(options: LeaseTasksOptions): Promise<Task[]> {
+  public async leaseTasks(
+    options: LeaseTasksOptions
+  ): Promise<LeaseTasksResult> {
     // If shard is specified, route to that shard's server
     // Otherwise, use any available server (it will poll all its local shards)
     const client =
@@ -1129,7 +1248,22 @@ export class SiloGRPCClient {
     );
 
     const response = await call.response;
-    return response.tasks;
+
+    // Convert proto refresh tasks to our RefreshTask type
+    const refreshTasks: RefreshTask[] = response.refreshTasks.map((rt) => ({
+      id: rt.id,
+      queueKey: rt.queueKey,
+      currentMaxConcurrency: rt.currentMaxConcurrency,
+      lastRefreshedAtMs: rt.lastRefreshedAtMs,
+      metadata: { ...rt.metadata },
+      leaseMs: rt.leaseMs,
+      shard: rt.shard,
+    }));
+
+    return {
+      tasks: response.tasks,
+      refreshTasks,
+    };
   }
 
   /**
@@ -1159,6 +1293,55 @@ export class SiloGRPCClient {
       // Route to the correct shard (from Task.shard)
       const client = this._getClientForShard(options.shard);
       await client.reportOutcome(
+        {
+          shard: options.shard,
+          taskId: options.taskId,
+          tenant: options.tenant,
+          outcome,
+        },
+        this._rpcOptions()
+      );
+    } catch (error) {
+      if (error instanceof RpcError && error.code === "NOT_FOUND") {
+        throw new TaskNotFoundError(options.taskId);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Report the outcome of a floating limit refresh task.
+   *
+   * Workers that handle refresh tasks should call this to report either:
+   * - A new max concurrency value (success)
+   * - An error explaining why the refresh failed (failure)
+   *
+   * On success, the floating limit's max concurrency is updated immediately.
+   * On failure, the server schedules a retry with exponential backoff.
+   *
+   * @param options The options for reporting the refresh outcome.
+   * @throws TaskNotFoundError if the refresh task (lease) doesn't exist.
+   */
+  public async reportRefreshOutcome(
+    options: ReportRefreshOutcomeOptions
+  ): Promise<void> {
+    const outcome =
+      options.outcome.type === "success"
+        ? {
+            oneofKind: "success" as const,
+            success: { newMaxConcurrency: options.outcome.newMaxConcurrency },
+          }
+        : {
+            oneofKind: "failure" as const,
+            failure: {
+              code: options.outcome.code,
+              message: options.outcome.message,
+            },
+          };
+
+    try {
+      const client = this._getClientForShard(options.shard);
+      await client.reportRefreshOutcome(
         {
           shard: options.shard,
           taskId: options.taskId,

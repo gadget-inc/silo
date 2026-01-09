@@ -239,6 +239,16 @@ impl DecodedLease {
         }
     }
 
+    /// Extract refresh floating limit task info (zero-copy). Returns (task_id, queue_key) if this is a RefreshFloatingLimit task.
+    pub fn refresh_floating_limit_info(&self) -> Option<(&str, &str)> {
+        match self.archived_task() {
+            ArchivedTask::RefreshFloatingLimit {
+                task_id, queue_key, ..
+            } => Some((task_id.as_str(), queue_key.as_str())),
+            _ => None,
+        }
+    }
+
     /// Extract tenant from the leased task (zero-copy).
     pub fn tenant(&self) -> &str {
         match self.archived_task() {

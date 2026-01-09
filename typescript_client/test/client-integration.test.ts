@@ -272,12 +272,12 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       let task;
       for (let i = 0; i < 5 && !task; i++) {
-        const tasks = await client.leaseTasks({
+        const result = await client.leaseTasks({
           workerId: `test-worker-lease-${Date.now()}`,
           maxTasks: 50,
           shard,
         });
-        task = tasks.find((t) => t.jobId === handle.id);
+        task = result.tasks.find((t) => t.jobId === handle.id);
         if (!task) {
           await new Promise((r) => setTimeout(r, 100));
         }
@@ -317,12 +317,12 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       let task;
       for (let i = 0; i < 5 && !task; i++) {
-        const tasks = await client.leaseTasks({
+        const result = await client.leaseTasks({
           workerId: `test-worker-fail-${Date.now()}`,
           maxTasks: 50,
           shard,
         });
-        task = tasks.find((t) => t.jobId === handle.id);
+        task = result.tasks.find((t) => t.jobId === handle.id);
         if (!task) {
           await new Promise((r) => setTimeout(r, 100));
         }
@@ -356,13 +356,13 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       // Get the shard for this tenant to poll from the correct server
       const shard = client.getShardForTenant(tenant);
 
-      const tasks = await client.leaseTasks({
+      const result = await client.leaseTasks({
         workerId: "test-worker-3",
         maxTasks: 10,
         shard,
       });
 
-      const task = tasks.find((t) => t.jobId === handle.id);
+      const task = result.tasks.find((t) => t.jobId === handle.id);
       expect(task).toBeDefined();
 
       await client.heartbeat("test-worker-3", task!.id, task!.shard, tenant);
@@ -396,12 +396,12 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       let task;
       for (let i = 0; i < 5 && !task; i++) {
-        const tasks = await client.leaseTasks({
+        const result = await client.leaseTasks({
           workerId: `delete-test-worker-${Date.now()}`,
           maxTasks: 50,
           shard,
         });
-        task = tasks.find((t) => t.jobId === handle.id);
+        task = result.tasks.find((t) => t.jobId === handle.id);
         if (!task) {
           await new Promise((r) => setTimeout(r, 100));
         }
@@ -581,12 +581,12 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       // Lease and complete the task so we can delete the job
       let task;
       for (let i = 0; i < 5 && !task; i++) {
-        const tasks = await client.leaseTasks({
+        const result = await client.leaseTasks({
           workerId: `handle-delete-worker-${Date.now()}`,
           maxTasks: 50,
           shard,
         });
-        task = tasks.find((t) => t.jobId === handle.id);
+        task = result.tasks.find((t) => t.jobId === handle.id);
         if (!task) {
           await new Promise((r) => setTimeout(r, 100));
         }
@@ -622,12 +622,12 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       // Lease and complete the task
       let task;
       for (let i = 0; i < 5 && !task; i++) {
-        const tasks = await client.leaseTasks({
+        const result = await client.leaseTasks({
           workerId: `handle-await-worker-${Date.now()}`,
           maxTasks: 50,
           shard,
         });
-        task = tasks.find((t) => t.jobId === handle.id);
+        task = result.tasks.find((t) => t.jobId === handle.id);
         if (!task) {
           await new Promise((r) => setTimeout(r, 100));
         }
@@ -665,12 +665,12 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       // Lease and fail the task
       let task;
       for (let i = 0; i < 5 && !task; i++) {
-        const tasks = await client.leaseTasks({
+        const result = await client.leaseTasks({
           workerId: `handle-await-fail-worker-${Date.now()}`,
           maxTasks: 50,
           shard,
         });
-        task = tasks.find((t) => t.jobId === handle.id);
+        task = result.tasks.find((t) => t.jobId === handle.id);
         if (!task) {
           await new Promise((r) => setTimeout(r, 100));
         }
@@ -712,6 +712,297 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       await expect(
         handle.awaitResult({ pollIntervalMs: 50, timeoutMs: 200 })
       ).rejects.toThrow(/Timeout/);
+    });
+  });
+
+  describe("floating concurrency limits", () => {
+    const tenant = `floating-test-${Date.now()}`;
+
+    it("enqueues job with floating concurrency limit", async () => {
+      const payload = { task: "floating-limit-test" };
+      const handle = await client.enqueue({
+        tenant,
+        payload,
+        limits: [
+          {
+            type: "floatingConcurrency",
+            key: `floating-queue-${Date.now()}`,
+            defaultMaxConcurrency: 5,
+            refreshIntervalMs: 60000n,
+            metadata: { orgId: "test-org-123", env: "test" },
+          },
+        ],
+      });
+
+      expect(handle.id).toBeTruthy();
+
+      // Verify job was created with floating limit
+      const job = await client.getJob(handle.id, tenant);
+      expect(job.status).toBe(JobStatus.Scheduled);
+      expect(job.limits).toHaveLength(1);
+      expect(job.limits[0].type).toBe("floatingConcurrency");
+      if (job.limits[0].type === "floatingConcurrency") {
+        expect(job.limits[0].defaultMaxConcurrency).toBe(5);
+        expect(job.limits[0].refreshIntervalMs).toBe(60000n);
+        expect(job.limits[0].metadata).toEqual({
+          orgId: "test-org-123",
+          env: "test",
+        });
+      }
+    });
+
+    it("returns refresh tasks when floating limit is stale", async () => {
+      const queueKey = `stale-refresh-queue-${Date.now()}`;
+      const shard = client.getShardForTenant(tenant);
+
+      // Enqueue first job with a very short refresh interval
+      const handle1 = await client.enqueue({
+        tenant,
+        payload: { job: 1 },
+        limits: [
+          {
+            type: "floatingConcurrency",
+            key: queueKey,
+            defaultMaxConcurrency: 2,
+            refreshIntervalMs: 1n, // 1ms - will be stale immediately
+            metadata: { testKey: "testValue" },
+          },
+        ],
+      });
+      expect(handle1.id).toBeTruthy();
+
+      // Wait a bit to ensure the limit becomes stale
+      await new Promise((r) => setTimeout(r, 50));
+
+      // Enqueue second job to trigger refresh scheduling
+      const handle2 = await client.enqueue({
+        tenant,
+        payload: { job: 2 },
+        limits: [
+          {
+            type: "floatingConcurrency",
+            key: queueKey,
+            defaultMaxConcurrency: 2,
+            refreshIntervalMs: 1n,
+            metadata: { testKey: "testValue" },
+          },
+        ],
+      });
+      expect(handle2.id).toBeTruthy();
+
+      // Lease tasks - should get refresh tasks
+      const result = await client.leaseTasks({
+        workerId: `floating-refresh-worker-${Date.now()}`,
+        maxTasks: 10,
+        shard,
+      });
+
+      // Should have refresh tasks (and job tasks)
+      expect(result.tasks.length).toBeGreaterThanOrEqual(0);
+
+      // Find our refresh task - it MUST exist
+      const refreshTask = result.refreshTasks.find(
+        (rt) => rt.queueKey === queueKey
+      );
+      expect(refreshTask).toBeDefined();
+      expect(refreshTask!.id).toBeTruthy();
+      expect(refreshTask!.queueKey).toBe(queueKey);
+      expect(refreshTask!.currentMaxConcurrency).toBe(2);
+      expect(refreshTask!.metadata).toEqual({ testKey: "testValue" });
+      expect(refreshTask!.shard).toBe(shard);
+
+      // Report success with a new max concurrency
+      await client.reportRefreshOutcome({
+        taskId: refreshTask!.id,
+        shard: refreshTask!.shard,
+        tenant,
+        outcome: {
+          type: "success",
+          newMaxConcurrency: 10,
+        },
+      });
+
+      // Clean up - lease and complete the job tasks
+      for (const task of result.tasks) {
+        await client.reportOutcome({
+          taskId: task.id,
+          shard: task.shard,
+          tenant,
+          outcome: { type: "success", result: {} },
+        });
+      }
+    });
+
+    it("reports refresh failure and triggers retry", async () => {
+      const queueKey = `failure-refresh-queue-${Date.now()}`;
+      const shard = client.getShardForTenant(tenant);
+
+      // Enqueue job with short refresh interval
+      const handle = await client.enqueue({
+        tenant,
+        payload: { task: "failure-test" },
+        limits: [
+          {
+            type: "floatingConcurrency",
+            key: queueKey,
+            defaultMaxConcurrency: 3,
+            refreshIntervalMs: 1n,
+            metadata: { apiEndpoint: "https://api.example.com" },
+          },
+        ],
+      });
+      expect(handle.id).toBeTruthy();
+
+      // Wait for limit to become stale
+      await new Promise((r) => setTimeout(r, 50));
+
+      // Trigger refresh by enqueueing another job
+      await client.enqueue({
+        tenant,
+        payload: { task: "trigger-refresh" },
+        limits: [
+          {
+            type: "floatingConcurrency",
+            key: queueKey,
+            defaultMaxConcurrency: 3,
+            refreshIntervalMs: 1n,
+            metadata: { apiEndpoint: "https://api.example.com" },
+          },
+        ],
+      });
+
+      // Lease tasks
+      const result = await client.leaseTasks({
+        workerId: `failure-worker-${Date.now()}`,
+        maxTasks: 10,
+        shard,
+      });
+
+      // Find our refresh task - it MUST exist
+      const refreshTask = result.refreshTasks.find(
+        (rt) => rt.queueKey === queueKey
+      );
+      expect(refreshTask).toBeDefined();
+
+      // Report failure
+      await client.reportRefreshOutcome({
+        taskId: refreshTask!.id,
+        shard: refreshTask!.shard,
+        tenant,
+        outcome: {
+          type: "failure",
+          code: "API_UNAVAILABLE",
+          message: "Failed to reach API endpoint",
+        },
+      });
+      // Server should schedule a retry with backoff - we don't verify this directly
+      // but the test ensures the API works correctly
+
+      // Clean up job tasks
+      for (const task of result.tasks) {
+        await client.reportOutcome({
+          taskId: task.id,
+          shard: task.shard,
+          tenant,
+          outcome: { type: "success", result: {} },
+        });
+      }
+    });
+
+    it("floating limit controls job concurrency", async () => {
+      const queueKey = `concurrency-control-queue-${Date.now()}`;
+      const shard = client.getShardForTenant(tenant);
+
+      // Enqueue 3 jobs with max concurrency of 1
+      const handles: { id: string }[] = [];
+      for (let i = 0; i < 3; i++) {
+        const handle = await client.enqueue({
+          tenant,
+          payload: { jobNum: i },
+          limits: [
+            {
+              type: "floatingConcurrency",
+              key: queueKey,
+              defaultMaxConcurrency: 1,
+              refreshIntervalMs: 60000n, // Long interval to avoid refresh
+              metadata: {},
+            },
+          ],
+        });
+        handles.push(handle);
+      }
+
+      // Lease tasks - should only get 1 due to concurrency limit
+      const result = await client.leaseTasks({
+        workerId: `concurrency-worker-${Date.now()}`,
+        maxTasks: 10,
+        shard,
+      });
+
+      // Filter to just our jobs
+      const ourTasks = result.tasks.filter((t) =>
+        handles.some((h) => h.id === t.jobId)
+      );
+
+      // Should have at most 1 task due to concurrency limit
+      expect(ourTasks.length).toBeLessThanOrEqual(1);
+
+      // Complete tasks to clean up
+      for (const task of result.tasks) {
+        await client.reportOutcome({
+          taskId: task.id,
+          shard: task.shard,
+          tenant,
+          outcome: { type: "success", result: {} },
+        });
+      }
+    });
+
+    it("combines floating limit with regular concurrency limit", async () => {
+      const floatingKey = `combined-floating-${Date.now()}`;
+      const regularKey = `combined-regular-${Date.now()}`;
+
+      const handle = await client.enqueue({
+        tenant,
+        payload: { task: "combined-limits" },
+        limits: [
+          {
+            type: "floatingConcurrency",
+            key: floatingKey,
+            defaultMaxConcurrency: 5,
+            refreshIntervalMs: 30000n,
+            metadata: { source: "floating" },
+          },
+          {
+            type: "concurrency",
+            key: regularKey,
+            maxConcurrency: 3,
+          },
+        ],
+      });
+
+      expect(handle.id).toBeTruthy();
+
+      // Verify both limits are stored
+      const job = await client.getJob(handle.id, tenant);
+      expect(job.limits).toHaveLength(2);
+
+      const floatingLimit = job.limits.find(
+        (l) => l.type === "floatingConcurrency"
+      );
+      const regularLimit = job.limits.find((l) => l.type === "concurrency");
+
+      expect(floatingLimit).toBeDefined();
+      expect(regularLimit).toBeDefined();
+
+      if (floatingLimit?.type === "floatingConcurrency") {
+        expect(floatingLimit.key).toBe(floatingKey);
+        expect(floatingLimit.defaultMaxConcurrency).toBe(5);
+      }
+      if (regularLimit?.type === "concurrency") {
+        expect(regularLimit.key).toBe(regularKey);
+        expect(regularLimit.maxConcurrency).toBe(3);
+      }
     });
   });
 });

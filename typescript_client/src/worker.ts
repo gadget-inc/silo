@@ -1,7 +1,12 @@
 import PQueue from "p-queue";
 import { serializeError } from "serialize-error";
 import type { Task } from "./pb/silo";
-import type { SiloGRPCClient, TaskOutcome } from "./client";
+import type {
+  SiloGRPCClient,
+  TaskOutcome,
+  RefreshTask,
+  RefreshOutcome,
+} from "./client";
 
 export { Task };
 
@@ -25,6 +30,43 @@ export interface TaskContext {
 export type TaskHandler = (context: TaskContext) => Promise<TaskOutcome>;
 
 /**
+ * Context passed to refresh handlers for floating concurrency limit refreshes.
+ */
+export interface RefreshTaskContext {
+  /** The refresh task being executed */
+  task: RefreshTask;
+  /** The shard the task is from (for reference) */
+  shard: number;
+  /** The worker ID processing this task */
+  workerId: string;
+  /** Signal that is aborted when the worker is stopping */
+  signal: AbortSignal;
+}
+
+/**
+ * Function that handles a floating limit refresh task.
+ *
+ * The handler receives context about the floating limit that needs refreshing,
+ * including the current max concurrency, when it was last refreshed, and any
+ * metadata from the limit definition.
+ *
+ * The handler should compute and return the new max concurrency value.
+ * If the handler throws an error, it will be reported as a refresh failure
+ * and the server will schedule a retry with exponential backoff.
+ *
+ * @example
+ * ```typescript
+ * const refreshHandler: RefreshHandler = async (ctx) => {
+ *   // Use metadata to determine which API to query
+ *   const orgId = ctx.task.metadata.orgId;
+ *   const quota = await getApiQuota(orgId);
+ *   return quota.maxConcurrentRequests;
+ * };
+ * ```
+ */
+export type RefreshHandler = (context: RefreshTaskContext) => Promise<number>;
+
+/**
  * Options for configuring a {@link SiloWorker}.
  */
 export interface SiloWorkerOptions {
@@ -34,6 +76,26 @@ export interface SiloWorkerOptions {
   workerId: string;
   /** The function that will handle each task */
   handler: TaskHandler;
+  /**
+   * Optional handler for floating limit refresh tasks.
+   *
+   * If your jobs use floating concurrency limits, you should provide this handler
+   * to compute updated max concurrency values. The handler receives context about
+   * the limit and should return the new max concurrency value.
+   *
+   * If not provided, refresh tasks will be ignored (and will eventually expire,
+   * causing the server to retry with exponential backoff).
+   *
+   * @example
+   * ```typescript
+   * refreshHandler: async (ctx) => {
+   *   const orgId = ctx.task.metadata.orgId;
+   *   const quota = await getApiQuota(orgId);
+   *   return quota.maxConcurrentRequests;
+   * }
+   * ```
+   */
+  refreshHandler?: RefreshHandler;
   /**
    * Tenant ID for this worker. Required when the server has tenancy enabled.
    * The worker will only process tasks for this tenant.
@@ -92,6 +154,12 @@ export interface SiloWorkerOptions {
  *     // Process the task...
  *     return { type: "success", result: { processed: true } };
  *   },
+ *   // Optional: handle floating limit refreshes
+ *   refreshHandler: async (ctx) => {
+ *     // Compute new max concurrency based on external factors
+ *     const quota = await checkApiQuota(ctx.task.metadata.orgId);
+ *     return quota.rateLimit;
+ *   },
  * });
  *
  * worker.start();
@@ -103,6 +171,7 @@ export class SiloWorker {
   private readonly _client: SiloGRPCClient;
   private readonly _workerId: string;
   private readonly _handler: TaskHandler;
+  private readonly _refreshHandler: RefreshHandler | undefined;
   private readonly _tenant: string | undefined;
   private readonly _concurrentPollers: number;
   private readonly _maxConcurrentTasks: number;
@@ -125,6 +194,7 @@ export class SiloWorker {
     this._client = options.client;
     this._workerId = options.workerId;
     this._handler = options.handler;
+    this._refreshHandler = options.refreshHandler;
     this._tenant = options.tenant;
     this._concurrentPollers = options.concurrentPollers ?? 1;
     this._maxConcurrentTasks = options.maxConcurrentTasks ?? 10;
@@ -267,14 +337,27 @@ export class SiloWorker {
     const tasksToRequest = Math.min(availableQueueSlots, this._tasksPerPoll);
 
     // Lease tasks from the server (server handles multi-shard polling)
-    const tasks = await this._client.leaseTasks({
+    const result = await this._client.leaseTasks({
       workerId: this._workerId,
       maxTasks: tasksToRequest,
     });
 
-    // Add each task to the queue
-    for (const task of tasks) {
+    // Add regular job tasks to the queue
+    for (const task of result.tasks) {
       this._enqueueTask(task);
+    }
+
+    // Handle refresh tasks
+    if (result.refreshTasks.length > 0) {
+      if (!this._refreshHandler) {
+        throw new Error(
+          `Worker received ${result.refreshTasks.length} floating limit refresh task(s) but no refreshHandler is configured. ` +
+            `Configure a refreshHandler in SiloWorkerOptions to handle floating concurrency limits.`
+        );
+      }
+      for (const refreshTask of result.refreshTasks) {
+        this._enqueueRefreshTask(refreshTask);
+      }
     }
   }
 
@@ -322,6 +405,48 @@ export class SiloWorker {
   }
 
   /**
+   * Add a refresh task to the execution queue.
+   */
+  private _enqueueRefreshTask(task: RefreshTask): void {
+    const shard = task.shard;
+
+    // Start heartbeat for this refresh task
+    const heartbeatInterval = setInterval(() => {
+      this._sendHeartbeat(task.id, shard).catch((error) => {
+        this._onError(
+          error instanceof Error ? error : new Error(String(error)),
+          {
+            taskId: task.id,
+          }
+        );
+      });
+    }, this._heartbeatIntervalMs);
+    this._heartbeatIntervals.set(task.id, heartbeatInterval);
+
+    // Add to the queue for execution
+    this._taskQueue
+      .add(async () => {
+        await this._executeRefreshTask(task, shard);
+      })
+      .catch((error) => {
+        this._onError(
+          error instanceof Error ? error : new Error(String(error)),
+          {
+            taskId: task.id,
+          }
+        );
+      })
+      .finally(() => {
+        // Stop heartbeat
+        const interval = this._heartbeatIntervals.get(task.id);
+        if (interval) {
+          clearInterval(interval);
+          this._heartbeatIntervals.delete(task.id);
+        }
+      });
+  }
+
+  /**
    * Execute a single task and report its outcome.
    */
   private async _executeTask(task: Task, shard: number): Promise<void> {
@@ -346,6 +471,48 @@ export class SiloWorker {
 
     // Report the outcome to the correct shard
     await this._client.reportOutcome({
+      taskId: task.id,
+      shard,
+      outcome,
+      tenant: this._tenant,
+    });
+  }
+
+  /**
+   * Execute a refresh task and report its outcome.
+   */
+  private async _executeRefreshTask(
+    task: RefreshTask,
+    shard: number
+  ): Promise<void> {
+    const context: RefreshTaskContext = {
+      task,
+      shard,
+      workerId: this._workerId,
+      signal: this._abortController?.signal ?? new AbortController().signal,
+    };
+
+    let outcome: RefreshOutcome;
+    try {
+      // The refresh handler should return the new max concurrency
+      const newMaxConcurrency = await this._refreshHandler!(context);
+      outcome = {
+        type: "success",
+        newMaxConcurrency,
+      };
+    } catch (error) {
+      // Handler threw an error, report as failure
+      const errorObj =
+        error instanceof Error ? error : new Error(String(error));
+      outcome = {
+        type: "failure",
+        code: "REFRESH_HANDLER_ERROR",
+        message: errorObj.message,
+      };
+    }
+
+    // Report the refresh outcome
+    await this._client.reportRefreshOutcome({
       taskId: task.id,
       shard,
       outcome,

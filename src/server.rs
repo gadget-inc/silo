@@ -632,6 +632,7 @@ impl Silo for SiloService {
                     last_refreshed_at_ms: rt.last_refreshed_at_ms,
                     metadata: rt.metadata.into_iter().collect(),
                     lease_ms: DEFAULT_LEASE_MS,
+                    shard: shard_id,
                 });
             }
 

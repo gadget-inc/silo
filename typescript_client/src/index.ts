@@ -13,10 +13,16 @@ export {
   type SiloGRPCClientOptions,
   type EnqueueJobOptions,
   type LeaseTasksOptions,
+  type LeaseTasksResult,
   type ReportOutcomeOptions,
   type SuccessOutcome,
   type FailureOutcome,
   type TaskOutcome,
+  type RefreshTask,
+  type RefreshSuccessOutcome,
+  type RefreshFailureOutcome,
+  type RefreshOutcome,
+  type ReportRefreshOutcomeOptions,
   type Job,
   type JobResult,
   type AwaitJobOptions,
@@ -24,6 +30,7 @@ export {
   type ConcurrencyLimitConfig,
   type RateLimitConfig,
   type RateLimitRetryPolicyConfig,
+  type FloatingConcurrencyLimitConfig,
   type ShardRoutingConfig,
   type TenantToShardFn,
   type ShardOwner,
@@ -33,6 +40,8 @@ export {
   type SiloWorkerOptions,
   type TaskContext,
   type TaskHandler,
+  type RefreshTaskContext,
+  type RefreshHandler,
 } from "./worker";
 export { JobHandle } from "./JobHandle";
 export type {

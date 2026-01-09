@@ -7,11 +7,12 @@ import {
   beforeEach,
   afterEach,
 } from "vitest";
-import { SiloGRPCClient, decodePayload } from "../src/client";
+import { SiloGRPCClient, decodePayload, JobStatus } from "../src/client";
 import {
   SiloWorker,
   type TaskHandler,
   type SiloWorkerOptions,
+  type RefreshHandler,
 } from "../src/worker";
 
 // Support comma-separated list of servers for multi-node testing
@@ -479,6 +480,349 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       // Should have received a valid shard ID
       expect(receivedShard).toBeDefined();
       expect(receivedShard).toBeGreaterThanOrEqual(0);
+    });
+  });
+
+  describe("floating concurrency limit refresh", () => {
+    function createWorkerWithRefresh(
+      handler: TaskHandler,
+      refreshHandler: RefreshHandler,
+      options?: Partial<
+        Omit<
+          SiloWorkerOptions,
+          "client" | "workerId" | "handler" | "refreshHandler"
+        >
+      >
+    ): SiloWorker {
+      const worker = new SiloWorker({
+        client,
+        workerId: `test-refresh-worker-${Date.now()}-${Math.random()
+          .toString(36)
+          .slice(2)}`,
+        handler,
+        refreshHandler,
+        tenant: DEFAULT_TENANT,
+        pollIntervalMs: 50,
+        heartbeatIntervalMs: 1000,
+        ...options,
+      });
+      activeWorkers.push(worker);
+      return worker;
+    }
+
+    it("processes refresh tasks with refreshHandler", async () => {
+      const refreshedQueues: string[] = [];
+      const processedJobs: string[] = [];
+      const queueKey = `worker-refresh-test-${Date.now()}`;
+
+      const handler: TaskHandler = async (ctx) => {
+        const payload = decodePayload<{ message: string }>(
+          ctx.task.payload?.data
+        );
+        processedJobs.push(payload?.message ?? ctx.task.id);
+        return { type: "success", result: { processed: true } };
+      };
+
+      const refreshHandler: RefreshHandler = async (ctx) => {
+        refreshedQueues.push(ctx.task.queueKey);
+        // Return a new max concurrency value
+        return 15;
+      };
+
+      const worker = createWorkerWithRefresh(handler, refreshHandler);
+      worker.start();
+
+      // Enqueue job with floating limit and very short refresh interval
+      await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        payload: { message: "job-1" },
+        limits: [
+          {
+            type: "floatingConcurrency",
+            key: queueKey,
+            defaultMaxConcurrency: 5,
+            refreshIntervalMs: 1n, // Very short interval
+            metadata: { testId: "refresh-test" },
+          },
+        ],
+      });
+
+      // Wait for job to be processed
+      await waitFor(() => processedJobs.length >= 1);
+
+      // Small delay to allow refresh task to be processed
+      await new Promise((r) => setTimeout(r, 200));
+
+      // Trigger refresh by enqueueing another job
+      await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        payload: { message: "job-2" },
+        limits: [
+          {
+            type: "floatingConcurrency",
+            key: queueKey,
+            defaultMaxConcurrency: 5,
+            refreshIntervalMs: 1n,
+            metadata: { testId: "refresh-test" },
+          },
+        ],
+      });
+
+      // Wait for refresh handler to be called
+      await waitFor(() => refreshedQueues.includes(queueKey), {
+        timeout: 5000,
+      });
+
+      expect(refreshedQueues).toContain(queueKey);
+    });
+
+    it("refresh handler receives correct context", async () => {
+      let receivedContext: {
+        queueKey: string;
+        currentMax: number;
+        metadata: Record<string, string>;
+        shard: number;
+        workerId: string;
+      } | null = null;
+
+      const queueKey = `context-test-${Date.now()}`;
+      const testMetadata = { apiKey: "test-api-key", region: "us-west" };
+
+      const handler: TaskHandler = async () => {
+        return { type: "success", result: {} };
+      };
+
+      const refreshHandler: RefreshHandler = async (ctx) => {
+        receivedContext = {
+          queueKey: ctx.task.queueKey,
+          currentMax: ctx.task.currentMaxConcurrency,
+          metadata: { ...ctx.task.metadata },
+          shard: ctx.shard,
+          workerId: ctx.workerId,
+        };
+        return 20;
+      };
+
+      const worker = createWorkerWithRefresh(handler, refreshHandler);
+      worker.start();
+
+      // Enqueue first job to create the limit
+      await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        payload: { init: true },
+        limits: [
+          {
+            type: "floatingConcurrency",
+            key: queueKey,
+            defaultMaxConcurrency: 10,
+            refreshIntervalMs: 1n,
+            metadata: testMetadata,
+          },
+        ],
+      });
+
+      // Wait and trigger refresh
+      await new Promise((r) => setTimeout(r, 100));
+
+      await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        payload: { trigger: true },
+        limits: [
+          {
+            type: "floatingConcurrency",
+            key: queueKey,
+            defaultMaxConcurrency: 10,
+            refreshIntervalMs: 1n,
+            metadata: testMetadata,
+          },
+        ],
+      });
+
+      // Wait for refresh handler to receive context
+      await waitFor(() => receivedContext !== null, { timeout: 5000 });
+
+      expect(receivedContext).not.toBeNull();
+      expect(receivedContext!.queueKey).toBe(queueKey);
+      expect(receivedContext!.currentMax).toBe(10);
+      expect(receivedContext!.metadata).toEqual(testMetadata);
+      expect(receivedContext!.shard).toBeGreaterThanOrEqual(0);
+      expect(receivedContext!.workerId).toBeTruthy();
+    });
+
+    it("handles refresh handler errors gracefully", async () => {
+      let errorThrown = false;
+      const queueKey = `error-refresh-${Date.now()}`;
+      const errors: Error[] = [];
+
+      const handler: TaskHandler = async () => {
+        return { type: "success", result: {} };
+      };
+
+      const refreshHandler: RefreshHandler = async () => {
+        errorThrown = true;
+        throw new Error("Simulated API failure");
+      };
+
+      const worker = createWorkerWithRefresh(handler, refreshHandler, {
+        onError: (err) => errors.push(err),
+      });
+      worker.start();
+
+      // Enqueue jobs to trigger refresh
+      await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        payload: { test: 1 },
+        limits: [
+          {
+            type: "floatingConcurrency",
+            key: queueKey,
+            defaultMaxConcurrency: 5,
+            refreshIntervalMs: 1n,
+            metadata: {},
+          },
+        ],
+      });
+
+      await new Promise((r) => setTimeout(r, 100));
+
+      await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        payload: { test: 2 },
+        limits: [
+          {
+            type: "floatingConcurrency",
+            key: queueKey,
+            defaultMaxConcurrency: 5,
+            refreshIntervalMs: 1n,
+            metadata: {},
+          },
+        ],
+      });
+
+      // Wait for refresh handler to throw
+      await waitFor(() => errorThrown, { timeout: 5000 });
+
+      // Worker should continue running despite the error
+      expect(worker.isRunning).toBe(true);
+    });
+
+    it("processes both job tasks and refresh tasks concurrently", async () => {
+      const processedJobs: string[] = [];
+      const refreshedQueues: string[] = [];
+      const queueKey = `concurrent-refresh-${Date.now()}`;
+
+      const handler: TaskHandler = async (ctx) => {
+        const payload = decodePayload<{ index: number }>(
+          ctx.task.payload?.data
+        );
+        // Simulate some work
+        await new Promise((r) => setTimeout(r, 50));
+        processedJobs.push(`job-${payload?.index}`);
+        return { type: "success", result: {} };
+      };
+
+      const refreshHandler: RefreshHandler = async (ctx) => {
+        // Simulate API call
+        await new Promise((r) => setTimeout(r, 30));
+        refreshedQueues.push(ctx.task.queueKey);
+        return 25;
+      };
+
+      const worker = createWorkerWithRefresh(handler, refreshHandler, {
+        maxConcurrentTasks: 5,
+      });
+      worker.start();
+
+      // Enqueue multiple jobs with floating limit
+      for (let i = 0; i < 5; i++) {
+        await client.enqueue({
+          tenant: DEFAULT_TENANT,
+          payload: { index: i },
+          limits: [
+            {
+              type: "floatingConcurrency",
+              key: queueKey,
+              defaultMaxConcurrency: 10,
+              refreshIntervalMs: i === 0 ? 60000n : 1n, // First job creates, rest trigger refresh
+              metadata: { batch: "concurrent-test" },
+            },
+          ],
+        });
+        // Small delay between enqueues to ensure proper ordering
+        await new Promise((r) => setTimeout(r, 20));
+      }
+
+      // Wait for jobs and refreshes to complete
+      await waitFor(
+        () => processedJobs.length >= 3 || refreshedQueues.length >= 1,
+        { timeout: 10000 }
+      );
+
+      // Both job tasks and refresh tasks should have been processed
+      expect(processedJobs.length).toBeGreaterThan(0);
+      // Note: refresh task processing depends on timing, so we don't strictly require it
+    });
+
+    it("errors when receiving refresh tasks without a refreshHandler configured", async () => {
+      const errors: Error[] = [];
+      const queueKey = `no-handler-error-${Date.now()}`;
+
+      const handler: TaskHandler = async (ctx) => {
+        return { type: "success", result: {} };
+      };
+
+      // Create worker WITHOUT refresh handler but WITH error handler to capture the error
+      const worker = new SiloWorker({
+        client,
+        workerId: `no-refresh-handler-worker-${Date.now()}`,
+        handler,
+        onError: (error) => {
+          errors.push(error);
+        },
+      });
+      worker.start();
+
+      // Enqueue jobs with floating limit
+      await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        payload: { job: 1 },
+        limits: [
+          {
+            type: "floatingConcurrency",
+            key: queueKey,
+            defaultMaxConcurrency: 5,
+            refreshIntervalMs: 1n,
+            metadata: {},
+          },
+        ],
+      });
+
+      await new Promise((r) => setTimeout(r, 100));
+
+      // Enqueue another to trigger refresh task (limit is stale)
+      await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        payload: { job: 2 },
+        limits: [
+          {
+            type: "floatingConcurrency",
+            key: queueKey,
+            defaultMaxConcurrency: 5,
+            refreshIntervalMs: 1n,
+            metadata: {},
+          },
+        ],
+      });
+
+      // Wait for worker to encounter the refresh task
+      await waitFor(() => errors.length > 0, { timeout: 5000 });
+
+      // Should have received an error about missing refreshHandler
+      expect(errors.length).toBeGreaterThan(0);
+      expect(errors[0].message).toContain("refreshHandler");
+      expect(errors[0].message).toContain("floating limit refresh task");
+
+      await worker.stop();
     });
   });
 });

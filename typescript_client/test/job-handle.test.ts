@@ -119,12 +119,12 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
       // Lease the task
       let task;
       for (let i = 0; i < 5 && !task; i++) {
-        const tasks = await client.leaseTasks({
+        const result = await client.leaseTasks({
           workerId: `handle-running-worker-${Date.now()}`,
           maxTasks: 50,
           shard,
         });
-        task = tasks.find((t) => t.jobId === handle.id);
+        task = result.tasks.find((t) => t.jobId === handle.id);
         if (!task) await new Promise((r) => setTimeout(r, 100));
       }
       expect(task).toBeDefined();
@@ -188,12 +188,12 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
       // Lease and complete the task
       let task;
       for (let i = 0; i < 5 && !task; i++) {
-        const tasks = await client.leaseTasks({
+        const result = await client.leaseTasks({
           workerId: `handle-delete-worker-${Date.now()}`,
           maxTasks: 50,
           shard,
         });
-        task = tasks.find((t) => t.jobId === handle.id);
+        task = result.tasks.find((t) => t.jobId === handle.id);
         if (!task) await new Promise((r) => setTimeout(r, 100));
       }
       expect(task).toBeDefined();
@@ -235,12 +235,12 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
       // Lease and complete the task
       let task;
       for (let i = 0; i < 5 && !task; i++) {
-        const tasks = await client.leaseTasks({
+        const result = await client.leaseTasks({
           workerId: `handle-await-success-worker-${Date.now()}`,
           maxTasks: 50,
           shard,
         });
-        task = tasks.find((t) => t.jobId === handle.id);
+        task = result.tasks.find((t) => t.jobId === handle.id);
         if (!task) await new Promise((r) => setTimeout(r, 100));
       }
       expect(task).toBeDefined();
@@ -275,12 +275,12 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
       // Lease and fail the task
       let task;
       for (let i = 0; i < 5 && !task; i++) {
-        const tasks = await client.leaseTasks({
+        const result = await client.leaseTasks({
           workerId: `handle-await-fail-worker-${Date.now()}`,
           maxTasks: 50,
           shard,
         });
-        task = tasks.find((t) => t.jobId === handle.id);
+        task = result.tasks.find((t) => t.jobId === handle.id);
         if (!task) await new Promise((r) => setTimeout(r, 100));
       }
       expect(task).toBeDefined();
