@@ -12,6 +12,7 @@ pub mod job_store_shard;
 pub mod keys;
 pub mod query;
 pub mod retry;
+pub mod routing;
 pub mod settings;
 pub mod storage;
 pub mod task;

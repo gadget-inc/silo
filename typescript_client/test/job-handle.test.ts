@@ -114,7 +114,7 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
         payload: { test: "running" },
       });
 
-      const shard = client.getShardForTenant(tenant);
+      const shard = client.getShardForJob(handle.id);
 
       // Lease the task
       let task;
@@ -183,7 +183,7 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
         payload: { test: "delete" },
       });
 
-      const shard = client.getShardForTenant(tenant);
+      const shard = client.getShardForJob(handle.id);
 
       // Lease and complete the task
       let task;
@@ -230,7 +230,7 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
         payload: { test: "await-success" },
       });
 
-      const shard = client.getShardForTenant(tenant);
+      const shard = client.getShardForJob(handle.id);
 
       // Lease and complete the task
       let task;
@@ -270,7 +270,7 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
         payload: { test: "await-fail" },
       });
 
-      const shard = client.getShardForTenant(tenant);
+      const shard = client.getShardForJob(handle.id);
 
       // Lease and fail the task
       let task;

@@ -17,7 +17,8 @@ use crate::factory::ShardFactory;
 use crate::pb::silo_client::SiloClient;
 use crate::pb::{
     CancelJobRequest, ColumnInfo, GetJobRequest, GetJobResponse, JobStatus, JsonValueBytes,
-    QueryRequest,
+    NotifyConcurrencyTicketGrantedRequest, QueryRequest, ReleaseConcurrencyTicketRequest,
+    RequestConcurrencyTicketRequest,
 };
 
 /// Error types for cluster client operations
@@ -432,6 +433,229 @@ impl ClusterClient {
 
         client
             .cancel_job(request)
+            .await
+            .map_err(|e| ClusterClientError::RpcFailed(e.to_string()))?;
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Internal cross-shard concurrency coordination RPCs
+    // ========================================================================
+
+    /// Request a concurrency ticket from a queue owner shard.
+    /// Called by job shard when a job needs a ticket from a remote queue.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_concurrency_ticket(
+        &self,
+        queue_owner_shard: u32,
+        tenant: &str,
+        queue_key: &str,
+        job_id: &str,
+        job_shard: u32,
+        request_id: &str,
+        attempt_number: u32,
+        priority: u8,
+        start_time_ms: i64,
+        max_concurrency: u32,
+        floating_limit: Option<&crate::task::FloatingConcurrencyLimitData>,
+    ) -> Result<bool, ClusterClientError> {
+        let shard_name = queue_owner_shard.to_string();
+
+        // Check if shard is local first
+        if let Some(shard) = self.factory.get(&shard_name) {
+            debug!(
+                queue_owner_shard = queue_owner_shard,
+                queue_key = queue_key,
+                job_id = job_id,
+                has_floating_limit = floating_limit.is_some(),
+                "requesting ticket from local queue owner"
+            );
+            let granted = shard
+                .receive_remote_ticket_request(
+                    tenant,
+                    queue_key,
+                    job_id,
+                    job_shard,
+                    request_id,
+                    attempt_number,
+                    priority,
+                    start_time_ms,
+                    max_concurrency,
+                    floating_limit,
+                )
+                .await
+                .map_err(|e| ClusterClientError::RpcFailed(e.to_string()))?;
+            return Ok(granted);
+        }
+
+        // Shard is not local, need to call remote node
+        let addr = self.get_shard_addr(queue_owner_shard).await?;
+        debug!(
+            queue_owner_shard = queue_owner_shard,
+            addr = %addr,
+            queue_key = queue_key,
+            job_id = job_id,
+            has_floating_limit = floating_limit.is_some(),
+            "requesting ticket from remote queue owner"
+        );
+
+        let mut client = self.get_client(&addr).await?;
+
+        // Convert floating limit to protobuf format if present
+        let floating_limit_pb = floating_limit.map(|fl| crate::pb::FloatingConcurrencyLimitInfo {
+            default_max_concurrency: fl.default_max_concurrency,
+            refresh_interval_ms: fl.refresh_interval_ms,
+            metadata: fl
+                .metadata
+                .iter()
+                .map(|(k, v)| crate::pb::FloatingLimitMetadata {
+                    key: k.clone(),
+                    value: v.clone(),
+                })
+                .collect(),
+        });
+
+        let request = RequestConcurrencyTicketRequest {
+            queue_owner_shard,
+            tenant: tenant.to_string(),
+            queue_key: queue_key.to_string(),
+            job_id: job_id.to_string(),
+            job_shard,
+            request_id: request_id.to_string(),
+            attempt_number,
+            priority: priority as u32,
+            start_time_ms,
+            max_concurrency,
+            floating_limit: floating_limit_pb,
+        };
+
+        let response = client
+            .request_concurrency_ticket(request)
+            .await
+            .map_err(|e| ClusterClientError::RpcFailed(e.to_string()))?;
+
+        // registered=true means queued (not granted), registered=false means granted immediately
+        Ok(!response.into_inner().registered)
+    }
+
+    /// Notify a job shard that a ticket has been granted.
+    /// Called by queue owner when a ticket becomes available for a waiting request.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn notify_concurrency_ticket_granted(
+        &self,
+        job_shard: u32,
+        tenant: &str,
+        job_id: &str,
+        queue_key: &str,
+        request_id: &str,
+        holder_task_id: &str,
+        queue_owner_shard: u32,
+        attempt_number: u32,
+    ) -> Result<(), ClusterClientError> {
+        let shard_name = job_shard.to_string();
+
+        // Check if shard is local first
+        if let Some(shard) = self.factory.get(&shard_name) {
+            debug!(
+                job_shard = job_shard,
+                job_id = job_id,
+                queue_key = queue_key,
+                "notifying local job shard of ticket grant"
+            );
+            shard
+                .receive_remote_ticket_grant(
+                    tenant,
+                    job_id,
+                    queue_key,
+                    request_id,
+                    holder_task_id,
+                    queue_owner_shard,
+                    attempt_number,
+                )
+                .await
+                .map_err(|e| ClusterClientError::RpcFailed(e.to_string()))?;
+            return Ok(());
+        }
+
+        // Shard is not local, need to call remote node
+        let addr = self.get_shard_addr(job_shard).await?;
+        debug!(
+            job_shard = job_shard,
+            addr = %addr,
+            job_id = job_id,
+            queue_key = queue_key,
+            "notifying remote job shard of ticket grant"
+        );
+
+        let mut client = self.get_client(&addr).await?;
+        let request = NotifyConcurrencyTicketGrantedRequest {
+            job_shard,
+            tenant: tenant.to_string(),
+            job_id: job_id.to_string(),
+            queue_key: queue_key.to_string(),
+            request_id: request_id.to_string(),
+            holder_task_id: holder_task_id.to_string(),
+            queue_owner_shard,
+            attempt_number,
+        };
+
+        client
+            .notify_concurrency_ticket_granted(request)
+            .await
+            .map_err(|e| ClusterClientError::RpcFailed(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Release a concurrency ticket back to the queue owner.
+    /// Called by job shard when a job completes (success/failure/cancel).
+    pub async fn release_concurrency_ticket(
+        &self,
+        queue_owner_shard: u32,
+        tenant: &str,
+        queue_key: &str,
+        job_id: &str,
+        holder_task_id: &str,
+    ) -> Result<(), ClusterClientError> {
+        let shard_name = queue_owner_shard.to_string();
+
+        // Check if shard is local first
+        if let Some(shard) = self.factory.get(&shard_name) {
+            debug!(
+                queue_owner_shard = queue_owner_shard,
+                queue_key = queue_key,
+                job_id = job_id,
+                "releasing ticket to local queue owner"
+            );
+            shard
+                .release_remote_ticket(tenant, queue_key, job_id, holder_task_id)
+                .await
+                .map_err(|e| ClusterClientError::RpcFailed(e.to_string()))?;
+            return Ok(());
+        }
+
+        // Shard is not local, need to call remote node
+        let addr = self.get_shard_addr(queue_owner_shard).await?;
+        debug!(
+            queue_owner_shard = queue_owner_shard,
+            addr = %addr,
+            queue_key = queue_key,
+            job_id = job_id,
+            "releasing ticket to remote queue owner"
+        );
+
+        let mut client = self.get_client(&addr).await?;
+        let request = ReleaseConcurrencyTicketRequest {
+            queue_owner_shard,
+            tenant: tenant.to_string(),
+            queue_key: queue_key.to_string(),
+            job_id: job_id.to_string(),
+            holder_task_id: holder_task_id.to_string(),
+        };
+
+        client
+            .release_concurrency_ticket(request)
             .await
             .map_err(|e| ClusterClientError::RpcFailed(e.to_string()))?;
 

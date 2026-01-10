@@ -17,11 +17,12 @@ use crate::arrow_ipc::batch_to_ipc;
 /// File descriptor set for gRPC reflection
 pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("silo_descriptor");
 
+use crate::cluster_client::ClusterClient;
 use crate::coordination::Coordinator;
 use crate::factory::{CloseAllError, ShardFactory};
 use crate::job::{GubernatorAlgorithm, GubernatorRateLimit, JobStatusKind, RateLimitRetryPolicy};
 use crate::job_attempt::AttemptOutcome;
-use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
+use crate::job_store_shard::{JobStoreShard, JobStoreShardError, PendingCrossShardTask};
 use crate::pb::silo_server::{Silo, SiloServer};
 use crate::pb::*;
 use crate::settings::AppConfig;
@@ -151,6 +152,8 @@ pub struct SiloService {
     factory: Arc<ShardFactory>,
     coordinator: Option<Arc<dyn Coordinator>>,
     cfg: AppConfig,
+    /// Internal cluster client for cross-shard RPC (concurrency coordination)
+    cluster_client: Arc<ClusterClient>,
 }
 
 impl SiloService {
@@ -159,10 +162,12 @@ impl SiloService {
         coordinator: Option<Arc<dyn Coordinator>>,
         cfg: AppConfig,
     ) -> Self {
+        let cluster_client = Arc::new(ClusterClient::new(factory.clone(), coordinator.clone()));
         Self {
             factory,
             coordinator,
             cfg,
+            cluster_client,
         }
     }
 
@@ -271,6 +276,135 @@ impl SiloService {
             // When tenancy is disabled, accept but ignore any provided tenant
             (false, Some(_)) => Ok("-".to_string()),
             (false, None) => Ok("-".to_string()),
+        }
+    }
+
+    /// Process a cross-shard task by making the appropriate RPC.
+    /// On success, deletes the task from the shard's DB.
+    /// On failure, returns an error (task will be retried on next dequeue).
+    async fn process_cross_shard_task(
+        &self,
+        shard: &Arc<JobStoreShard>,
+        local_shard_id: u32,
+        task: PendingCrossShardTask,
+    ) -> Result<(), Status> {
+        match task {
+            PendingCrossShardTask::RequestRemoteTicket {
+                queue_owner_shard,
+                tenant,
+                queue_key,
+                job_id,
+                request_id,
+                attempt_number,
+                priority,
+                start_time_ms,
+                max_concurrency,
+                task_key,
+                floating_limit,
+            } => {
+                tracing::debug!(
+                    local_shard = local_shard_id,
+                    queue_owner_shard = queue_owner_shard,
+                    job_id = %job_id,
+                    queue_key = %queue_key,
+                    has_floating_limit = floating_limit.is_some(),
+                    "processing RequestRemoteTicket task"
+                );
+                self.cluster_client
+                    .request_concurrency_ticket(
+                        queue_owner_shard,
+                        &tenant,
+                        &queue_key,
+                        &job_id,
+                        local_shard_id,
+                        &request_id,
+                        attempt_number,
+                        priority,
+                        start_time_ms,
+                        max_concurrency,
+                        floating_limit.as_ref(),
+                    )
+                    .await
+                    .map_err(|e| Status::internal(format!("RPC failed: {}", e)))?;
+
+                // RPC succeeded, delete the task
+                shard
+                    .delete_cross_shard_task(&task_key)
+                    .await
+                    .map_err(map_err)?;
+                Ok(())
+            }
+            PendingCrossShardTask::NotifyRemoteTicketGrant {
+                job_shard,
+                tenant,
+                job_id,
+                queue_key,
+                request_id,
+                holder_task_id,
+                attempt_number,
+                task_key,
+            } => {
+                tracing::debug!(
+                    local_shard = local_shard_id,
+                    job_shard = job_shard,
+                    job_id = %job_id,
+                    queue_key = %queue_key,
+                    "processing NotifyRemoteTicketGrant task"
+                );
+                self.cluster_client
+                    .notify_concurrency_ticket_granted(
+                        job_shard,
+                        &tenant,
+                        &job_id,
+                        &queue_key,
+                        &request_id,
+                        &holder_task_id,
+                        local_shard_id, // queue_owner_shard is the local shard
+                        attempt_number,
+                    )
+                    .await
+                    .map_err(|e| Status::internal(format!("RPC failed: {}", e)))?;
+
+                // RPC succeeded, delete the task
+                shard
+                    .delete_cross_shard_task(&task_key)
+                    .await
+                    .map_err(map_err)?;
+                Ok(())
+            }
+            PendingCrossShardTask::ReleaseRemoteTicket {
+                queue_owner_shard,
+                tenant,
+                queue_key,
+                job_id,
+                holder_task_id,
+                task_key,
+            } => {
+                tracing::debug!(
+                    local_shard = local_shard_id,
+                    queue_owner_shard = queue_owner_shard,
+                    job_id = %job_id,
+                    queue_key = %queue_key,
+                    "processing ReleaseRemoteTicket task"
+                );
+                self.cluster_client
+                    .release_concurrency_ticket(
+                        queue_owner_shard,
+                        &tenant,
+                        &queue_key,
+                        &job_id,
+                        &holder_task_id,
+                    )
+                    .await
+                    .map_err(|e| Status::internal(format!("RPC failed: {}", e)))?;
+
+                // RPC succeeded, delete the task
+                shard
+                    .delete_cross_shard_task(&task_key)
+                    .await
+                    .map_err(map_err)?;
+                Ok(())
+            }
         }
     }
 }
@@ -656,6 +790,24 @@ impl Silo for SiloService {
                 });
             }
 
+            // Process cross-shard tasks internally (not sent to workers)
+            for cst in result.cross_shard_tasks {
+                match self
+                    .process_cross_shard_task(&shard, shard_id, cst)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(e) => {
+                        // Log and continue - task will be retried on next dequeue
+                        tracing::warn!(
+                            shard_id = shard_id,
+                            error = %e,
+                            "failed to process cross-shard task, will retry"
+                        );
+                    }
+                }
+            }
+
             remaining = remaining.saturating_sub(tasks_added);
         }
 
@@ -900,6 +1052,95 @@ impl Silo for SiloService {
         tracing::info!(shards_reset = reset_count, "reset all shards successfully");
         Ok(Response::new(ResetShardsResponse {
             shards_reset: reset_count,
+        }))
+    }
+
+    // ============================================================================
+    // INTERNAL RPC - Cross-shard concurrency coordination
+    // ============================================================================
+
+    async fn request_concurrency_ticket(
+        &self,
+        req: Request<RequestConcurrencyTicketRequest>,
+    ) -> Result<Response<RequestConcurrencyTicketResponse>, Status> {
+        let r = req.into_inner();
+        let shard = self.shard_with_redirect(r.queue_owner_shard).await?;
+        let tenant = self.validate_tenant(Some(&r.tenant))?;
+
+        // Convert protobuf floating limit to internal type if present
+        let floating_limit = r.floating_limit.as_ref().map(|fl| {
+            crate::task::FloatingConcurrencyLimitData {
+                default_max_concurrency: fl.default_max_concurrency,
+                refresh_interval_ms: fl.refresh_interval_ms,
+                metadata: fl.metadata.iter().map(|m| (m.key.clone(), m.value.clone())).collect(),
+            }
+        });
+
+        // Store the ticket request on the queue owner shard
+        let granted = shard
+            .receive_remote_ticket_request(
+                &tenant,
+                &r.queue_key,
+                &r.job_id,
+                r.job_shard,
+                &r.request_id,
+                r.attempt_number,
+                r.priority as u8,
+                r.start_time_ms,
+                r.max_concurrency,
+                floating_limit.as_ref(),
+            )
+            .await
+            .map_err(map_err)?;
+
+        Ok(Response::new(RequestConcurrencyTicketResponse {
+            registered: !granted, // registered=true means queued, registered=false means granted immediately
+        }))
+    }
+
+    async fn notify_concurrency_ticket_granted(
+        &self,
+        req: Request<NotifyConcurrencyTicketGrantedRequest>,
+    ) -> Result<Response<NotifyConcurrencyTicketGrantedResponse>, Status> {
+        let r = req.into_inner();
+        let shard = self.shard_with_redirect(r.job_shard).await?;
+        let tenant = self.validate_tenant(Some(&r.tenant))?;
+
+        // Job shard receives notification that ticket was granted
+        shard
+            .receive_remote_ticket_grant(
+                &tenant,
+                &r.job_id,
+                &r.queue_key,
+                &r.request_id,
+                &r.holder_task_id,
+                r.queue_owner_shard,
+                r.attempt_number,
+            )
+            .await
+            .map_err(map_err)?;
+
+        Ok(Response::new(NotifyConcurrencyTicketGrantedResponse {
+            acknowledged: true,
+        }))
+    }
+
+    async fn release_concurrency_ticket(
+        &self,
+        req: Request<ReleaseConcurrencyTicketRequest>,
+    ) -> Result<Response<ReleaseConcurrencyTicketResponse>, Status> {
+        let r = req.into_inner();
+        let shard = self.shard_with_redirect(r.queue_owner_shard).await?;
+        let tenant = self.validate_tenant(Some(&r.tenant))?;
+
+        // Queue owner receives notification to release a ticket
+        shard
+            .release_remote_ticket(&tenant, &r.queue_key, &r.job_id, &r.holder_task_id)
+            .await
+            .map_err(map_err)?;
+
+        Ok(Response::new(ReleaseConcurrencyTicketResponse {
+            released: true,
         }))
     }
 }

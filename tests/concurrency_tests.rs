@@ -107,6 +107,9 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
             Task::RequestTicket { .. } => {}
             Task::CheckRateLimit { .. } => {}
             Task::RefreshFloatingLimit { .. } => {}
+            Task::RequestRemoteTicket { .. }
+            | Task::NotifyRemoteTicketGrant { .. }
+            | Task::ReleaseRemoteTicket { .. } => {}
         }
     }
 
@@ -487,6 +490,9 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
             Task::RequestTicket { .. } => {}
             Task::CheckRateLimit { .. } => {}
             Task::RefreshFloatingLimit { .. } => {}
+            Task::RequestRemoteTicket { .. }
+            | Task::NotifyRemoteTicketGrant { .. }
+            | Task::ReleaseRemoteTicket { .. } => {}
         }
     }
 
@@ -546,6 +552,11 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         ArchivedTask::RefreshFloatingLimit { .. } => {
             panic!("unexpected RefreshFloatingLimit in lease")
         }
+        ArchivedTask::RequestRemoteTicket { .. }
+        | ArchivedTask::NotifyRemoteTicketGrant { .. }
+        | ArchivedTask::ReleaseRemoteTicket { .. } => {
+            panic!("unexpected remote ticket task in lease")
+        }
     };
     let expired_ms = now_ms() - 1;
     let new_record = LeaseRecord {
@@ -600,6 +611,11 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         }
         Task::RefreshFloatingLimit { .. } => {
             panic!("unexpected RefreshFloatingLimit in tasks/ for this test")
+        }
+        Task::RequestRemoteTicket { .. }
+        | Task::NotifyRemoteTicketGrant { .. }
+        | Task::ReleaseRemoteTicket { .. } => {
+            panic!("unexpected remote ticket task in tasks/ for this test")
         }
     };
     assert_eq!(attempt2, 2);
@@ -767,35 +783,39 @@ async fn concurrency_multiple_queues_per_job() {
         .await
         .expect("enqueue");
 
-    // Should get ticket for first queue immediately (api)
+    // Job should acquire ALL limits before being returned to worker
     let tasks = shard.dequeue("w", 1).await.expect("deq").tasks;
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].job().id(), job_id);
 
-    // Should have holder for api queue only (first limit)
+    // Should have holders for BOTH queues (all limits must be acquired)
+    let task_id = tasks[0].attempt().task_id();
     let api_holder = shard
         .db()
-        .get(concurrency_holder_key("-", &q1, tasks[0].attempt().task_id()).as_bytes())
+        .get(concurrency_holder_key("-", &q1, task_id).as_bytes())
         .await
         .expect("get api holder");
     assert!(api_holder.is_some(), "should have api holder");
 
-    // Should NOT have db holder yet (only first limit is gated)
     let db_holder = shard
         .db()
-        .get(concurrency_holder_key("-", &q2, tasks[0].attempt().task_id()).as_bytes())
+        .get(concurrency_holder_key("-", &q2, task_id).as_bytes())
         .await
         .expect("get db holder");
-    assert!(
-        db_holder.is_none(),
-        "should not have db holder (only first limit gated)"
+    assert!(db_holder.is_some(), "should have db holder (all limits acquired)");
+
+    // Verify we have exactly 2 holders
+    assert_eq!(
+        count_with_prefix(shard.db(), "holders/").await,
+        2,
+        "should have holders for both queues"
     );
 
-    // Complete job -> should release api holder
+    // Complete job -> should release BOTH holders
     shard
         .report_attempt_outcome(
             "-",
-            tasks[0].attempt().task_id(),
+            task_id,
             AttemptOutcome::Success { result: vec![] },
         )
         .await
@@ -1125,6 +1145,11 @@ async fn concurrency_reap_expired_lease_releases_holder() {
         ArchivedTask::RequestTicket { .. } => panic!("unexpected RequestTicket"),
         ArchivedTask::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit"),
         ArchivedTask::RefreshFloatingLimit { .. } => panic!("unexpected RefreshFloatingLimit"),
+        ArchivedTask::RequestRemoteTicket { .. }
+        | ArchivedTask::NotifyRemoteTicketGrant { .. }
+        | ArchivedTask::ReleaseRemoteTicket { .. } => {
+            panic!("unexpected remote ticket task")
+        }
     };
     let expired_record = LeaseRecord {
         worker_id: archived.worker_id.as_str().to_string(),

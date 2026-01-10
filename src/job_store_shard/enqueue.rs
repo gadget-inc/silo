@@ -4,15 +4,15 @@ use serde_json::Value as JsonValue;
 use slatedb::WriteBatch;
 use uuid::Uuid;
 
-use crate::codec::{encode_job_info, encode_job_status};
+use crate::codec::{encode_held_ticket_state, encode_job_info, encode_job_status};
 use crate::concurrency::{MemoryEvent, RequestTicketOutcome};
 use crate::job::{JobInfo, JobStatus, Limit};
-use crate::job_store_shard::helpers::{now_epoch_ms, put_task};
-use crate::job_store_shard::JobStoreShardError;
-use crate::job_store_shard::JobStoreShard;
-use crate::keys::{idx_metadata_key, idx_status_time_key, job_info_key, job_status_key};
+use crate::job_store_shard::helpers::{self, now_epoch_ms, put_task};
+use crate::job_store_shard::{JobStoreShardError, JobStoreShard};
+use crate::keys::{held_ticket_state_key, idx_metadata_key, idx_status_time_key, job_info_key, job_status_key};
 use crate::retry::RetryPolicy;
-use crate::task::{GubernatorRateLimitData, Task};
+use crate::routing::queue_to_shard;
+use crate::task::{GubernatorRateLimitData, HeldTicketState, Task};
 use tracing::info_span;
 
 impl JobStoreShard {
@@ -85,37 +85,68 @@ impl JobStoreShard {
                 put_task(&mut batch, start_at_ms, priority, &job_id, 1, &first_task)?;
             }
             Some(Limit::Concurrency(cl)) => {
-                // First limit is a concurrency limit - use existing logic
-                concurrency_outcome = self
-                    .concurrency
-                    .handle_enqueue(
-                        &mut batch,
-                        tenant,
-                        &first_task_id,
-                        &job_id,
-                        priority,
-                        start_at_ms,
-                        now_ms,
-                        std::slice::from_ref(cl),
-                    )
-                    .map_err(JobStoreShardError::Rkyv)?;
+                // Check if the queue is local or remote
+                let queue_shard = queue_to_shard(tenant, &cl.key, self.num_shards);
+                let is_local = queue_shard == self.shard_number;
 
-                // If no concurrency limits blocked, check if there are more limits
-                if concurrency_outcome.is_none() {
-                    // Granted immediately, but we need to proceed to next limit
-                    self.enqueue_next_limit_task(
-                        &mut batch,
-                        tenant,
-                        &first_task_id,
-                        &job_id,
-                        1, // attempt number
-                        0, // current limit index
-                        &limits,
+                if is_local {
+                    // Local queue - use existing concurrency logic
+                    concurrency_outcome = self
+                        .concurrency
+                        .handle_enqueue(
+                            &mut batch,
+                            tenant,
+                            &first_task_id,
+                            &job_id,
+                            priority,
+                            start_at_ms,
+                            now_ms,
+                            std::slice::from_ref(cl),
+                        )
+                        .map_err(JobStoreShardError::Rkyv)?;
+
+                    // If concurrency was granted immediately, we need to proceed to next limit
+                    // (if any). Note: handle_enqueue returns Some(GrantedImmediately{...}) when
+                    // granted, not None. The GrantedImmediately case writes a RunAttempt task
+                    // which we need to replace with the next limit task if there are more limits.
+                    if let Some(RequestTicketOutcome::GrantedImmediately { .. }) = &concurrency_outcome
+                    {
+                        self.enqueue_next_limit_task(
+                            &mut batch,
+                            tenant,
+                            &first_task_id,
+                            &job_id,
+                            1, // attempt number
+                            0, // current limit index
+                            &limits,
+                            priority,
+                            start_at_ms,
+                            now_ms,
+                            vec![cl.key.clone()], // held queues
+                        )?;
+                    }
+                } else {
+                    // Remote queue - create RequestRemoteTicket task to send to queue owner
+                    // Regular ConcurrencyLimit, not floating
+                    let request_id = Uuid::new_v4().to_string();
+                    let request_task = Task::RequestRemoteTicket {
+                        task_id: first_task_id.clone(),
+                        queue_owner_shard: queue_shard,
+                        tenant: tenant.to_string(),
+                        queue_key: cl.key.clone(),
+                        job_id: job_id.clone(),
+                        attempt_number: 1,
                         priority,
-                        start_at_ms,
-                        now_ms,
-                        vec![cl.key.clone()], // held queues
-                    )?;
+                        start_time_ms: start_at_ms,
+                        request_id: request_id.clone(),
+                        floating_limit: None, // Not a floating limit
+                    };
+                    put_task(&mut batch, start_at_ms, priority, &job_id, 1, &request_task)?;
+
+                    // Store held ticket state with current held_queues (empty for first limit)
+                    let state = HeldTicketState { held_queues: Vec::new() };
+                    let state_key = held_ticket_state_key(&job_id, 1, &request_id);
+                    batch.put(state_key.as_bytes(), &encode_held_ticket_state(&state)?);
                 }
             }
             Some(Limit::RateLimit(rl)) => {
@@ -135,52 +166,80 @@ impl JobStoreShard {
                 put_task(&mut batch, start_at_ms, priority, &job_id, 1, &check_task)?;
             }
             Some(Limit::FloatingConcurrency(fl)) => {
-                // First limit is a floating concurrency limit
-                // Get or create the floating limit state (zero-copy for existing)
-                let state = self
-                    .get_or_create_floating_limit_state(&mut batch, tenant, fl)
-                    .await?;
+                // Check if the queue is local or remote
+                let queue_shard = queue_to_shard(tenant, &fl.key, self.num_shards);
+                let is_local = queue_shard == self.shard_number;
 
-                // Maybe schedule a refresh task if needed
-                self.maybe_schedule_floating_limit_refresh(&mut batch, tenant, fl, &state, now_ms)?;
+                if is_local {
+                    // Local queue - use existing floating concurrency logic
+                    // Get or create the floating limit state (zero-copy for existing)
+                    let state = self
+                        .get_or_create_floating_limit_state(&mut batch, tenant, fl)
+                        .await?;
 
-                // Create a temporary ConcurrencyLimit with the current max concurrency
-                let temp_cl = crate::job::ConcurrencyLimit {
-                    key: fl.key.clone(),
-                    max_concurrency: state.archived().current_max_concurrency,
-                };
+                    // Maybe schedule a refresh task if needed
+                    self.maybe_schedule_floating_limit_refresh(&mut batch, tenant, fl, &state, now_ms)?;
 
-                // Use the concurrency system with the current floating limit value
-                concurrency_outcome = self
-                    .concurrency
-                    .handle_enqueue(
-                        &mut batch,
-                        tenant,
-                        &first_task_id,
-                        &job_id,
+                    // Create a temporary ConcurrencyLimit with the current max concurrency
+                    let temp_cl = crate::job::ConcurrencyLimit {
+                        key: fl.key.clone(),
+                        max_concurrency: state.archived().current_max_concurrency,
+                    };
+
+                    // Use the concurrency system with the current floating limit value
+                    concurrency_outcome = self
+                        .concurrency
+                        .handle_enqueue(
+                            &mut batch,
+                            tenant,
+                            &first_task_id,
+                            &job_id,
+                            priority,
+                            start_at_ms,
+                            now_ms,
+                            std::slice::from_ref(&temp_cl),
+                        )
+                        .map_err(JobStoreShardError::Rkyv)?;
+
+                    // If no concurrency limits blocked, check if there are more limits
+                    if concurrency_outcome.is_none() {
+                        // Granted immediately, but we need to proceed to next limit
+                        self.enqueue_next_limit_task(
+                            &mut batch,
+                            tenant,
+                            &first_task_id,
+                            &job_id,
+                            1, // attempt number
+                            0, // current limit index
+                            &limits,
+                            priority,
+                            start_at_ms,
+                            now_ms,
+                            vec![fl.key.clone()], // held queues
+                        )?;
+                    }
+                } else {
+                    // Remote queue - create RequestRemoteTicket task to send to queue owner
+                    // Include the full floating limit definition so queue owner can create state
+                    let request_id = Uuid::new_v4().to_string();
+                    let request_task = Task::RequestRemoteTicket {
+                        task_id: first_task_id.clone(),
+                        queue_owner_shard: queue_shard,
+                        tenant: tenant.to_string(),
+                        queue_key: fl.key.clone(),
+                        job_id: job_id.clone(),
+                        attempt_number: 1,
                         priority,
-                        start_at_ms,
-                        now_ms,
-                        std::slice::from_ref(&temp_cl),
-                    )
-                    .map_err(JobStoreShardError::Rkyv)?;
+                        start_time_ms: start_at_ms,
+                        request_id: request_id.clone(),
+                        floating_limit: Some(crate::task::FloatingConcurrencyLimitData::from(fl)),
+                    };
+                    put_task(&mut batch, start_at_ms, priority, &job_id, 1, &request_task)?;
 
-                // If no concurrency limits blocked, check if there are more limits
-                if concurrency_outcome.is_none() {
-                    // Granted immediately, but we need to proceed to next limit
-                    self.enqueue_next_limit_task(
-                        &mut batch,
-                        tenant,
-                        &first_task_id,
-                        &job_id,
-                        1, // attempt number
-                        0, // current limit index
-                        &limits,
-                        priority,
-                        start_at_ms,
-                        now_ms,
-                        vec![fl.key.clone()], // held queues
-                    )?;
+                    // Store held ticket state with current held_queues (empty for first limit)
+                    let state = HeldTicketState { held_queues: Vec::new() };
+                    let state_key = held_ticket_state_key(&job_id, 1, &request_id);
+                    batch.put(state_key.as_bytes(), &encode_held_ticket_state(&state)?);
                 }
             }
         }
@@ -259,18 +318,29 @@ impl JobStoreShard {
         }
 
         // Enqueue task for the next limit
-        let next_task = match &limits[next_index as usize] {
-            Limit::Concurrency(cl) => Task::RequestTicket {
-                queue: cl.key.clone(),
-                start_time_ms: start_at_ms,
-                priority,
-                tenant: tenant.to_string(),
-                job_id: job_id.to_string(),
-                attempt_number,
-                request_id: Uuid::new_v4().to_string(),
-            },
+        // IMPORTANT: We use the same task_id for all holders in this attempt chain.
+        // This ensures that when the job completes and releases held_queues, we can
+        // find all the holders by the same task_id.
+        let next_limit = &limits[next_index as usize];
+        let next_task = match next_limit {
+            // Concurrency limits (fixed and floating) use the same routing logic
+            Limit::Concurrency(_) | Limit::FloatingConcurrency(_) => {
+                helpers::create_ticket_request_task_with_batch(
+                    batch,
+                    next_limit,
+                    tenant,
+                    job_id,
+                    attempt_number,
+                    priority,
+                    start_at_ms,
+                    task_id,
+                    held_queues,
+                    self.shard_number,
+                    self.num_shards,
+                )?
+            }
             Limit::RateLimit(rl) => Task::CheckRateLimit {
-                task_id: Uuid::new_v4().to_string(),
+                task_id: task_id.to_string(),
                 tenant: tenant.to_string(),
                 job_id: job_id.to_string(),
                 attempt_number,
@@ -280,16 +350,6 @@ impl JobStoreShard {
                 started_at_ms: now_ms,
                 priority,
                 held_queues,
-            },
-            // Floating concurrency limits use the same RequestTicket mechanism as regular concurrency limits
-            Limit::FloatingConcurrency(fl) => Task::RequestTicket {
-                queue: fl.key.clone(),
-                start_time_ms: start_at_ms,
-                priority,
-                tenant: tenant.to_string(),
-                job_id: job_id.to_string(),
-                attempt_number,
-                request_id: Uuid::new_v4().to_string(),
             },
         };
         put_task(

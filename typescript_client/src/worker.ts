@@ -7,6 +7,7 @@ import type {
   RefreshTask,
   RefreshOutcome,
 } from "./client";
+import { TaskNotFoundError } from "./client";
 
 export { Task };
 
@@ -189,6 +190,8 @@ export class SiloWorker {
   private _taskQueue: PQueue;
   private _heartbeatIntervals: Map<string, ReturnType<typeof setInterval>> =
     new Map();
+  /** Per-task abort controllers - aborted when heartbeat fails (lease lost) */
+  private _taskAbortControllers: Map<string, AbortController> = new Map();
 
   public constructor(options: SiloWorkerOptions) {
     this._client = options.client;
@@ -270,6 +273,11 @@ export class SiloWorker {
     this._running = false;
     this._abortController?.abort();
 
+    // Abort all per-task abort controllers so task handlers know to stop
+    for (const controller of this._taskAbortControllers.values()) {
+      controller.abort();
+    }
+
     // Wait for all pollers to stop
     await Promise.all(this._pollerPromises);
     this._pollerPromises = [];
@@ -289,6 +297,9 @@ export class SiloWorker {
       clearInterval(interval);
     }
     this._heartbeatIntervals.clear();
+
+    // Clear per-task abort controllers
+    this._taskAbortControllers.clear();
 
     this._abortController = null;
   }
@@ -368,9 +379,27 @@ export class SiloWorker {
     // Shard is now a number from the proto
     const shard = task.shard;
 
+    // Create per-task abort controller - aborted when lease is lost
+    const taskAbortController = new AbortController();
+    this._taskAbortControllers.set(task.id, taskAbortController);
+
     // Start heartbeat for this task immediately
     const heartbeatInterval = setInterval(() => {
+      // Skip if task is already cleaned up (race between heartbeat and task completion)
+      if (!this._taskAbortControllers.has(task.id)) {
+        return;
+      }
       this._sendHeartbeat(task.id, shard).catch((error) => {
+        // Skip if task was cleaned up while heartbeat was in flight
+        if (!this._taskAbortControllers.has(task.id)) {
+          return;
+        }
+        // If lease is not found, the task has been completed/reaped elsewhere
+        // Abort this task execution so the handler stops working on it
+        if (error instanceof TaskNotFoundError) {
+          this._abortTask(task.id, error);
+          return;
+        }
         this._onError(
           error instanceof Error ? error : new Error(String(error)),
           {
@@ -384,7 +413,7 @@ export class SiloWorker {
     // Add task to the queue for execution
     this._taskQueue
       .add(async () => {
-        await this._executeTask(task, shard);
+        await this._executeTask(task, shard, taskAbortController.signal);
       })
       .catch((error) => {
         this._onError(
@@ -395,12 +424,8 @@ export class SiloWorker {
         );
       })
       .finally(() => {
-        // Stop heartbeat for this task
-        const interval = this._heartbeatIntervals.get(task.id);
-        if (interval) {
-          clearInterval(interval);
-          this._heartbeatIntervals.delete(task.id);
-        }
+        // Clean up heartbeat and abort controller for this task
+        this._cleanupTask(task.id);
       });
   }
 
@@ -410,9 +435,27 @@ export class SiloWorker {
   private _enqueueRefreshTask(task: RefreshTask): void {
     const shard = task.shard;
 
+    // Create per-task abort controller - aborted when lease is lost
+    const taskAbortController = new AbortController();
+    this._taskAbortControllers.set(task.id, taskAbortController);
+
     // Start heartbeat for this refresh task
     const heartbeatInterval = setInterval(() => {
+      // Skip if task is already cleaned up (race between heartbeat and task completion)
+      if (!this._taskAbortControllers.has(task.id)) {
+        return;
+      }
       this._sendHeartbeat(task.id, shard).catch((error) => {
+        // Skip if task was cleaned up while heartbeat was in flight
+        if (!this._taskAbortControllers.has(task.id)) {
+          return;
+        }
+        // If lease is not found, the task has been completed/reaped elsewhere
+        // Abort this task execution so the handler stops working on it
+        if (error instanceof TaskNotFoundError) {
+          this._abortTask(task.id, error);
+          return;
+        }
         this._onError(
           error instanceof Error ? error : new Error(String(error)),
           {
@@ -426,7 +469,7 @@ export class SiloWorker {
     // Add to the queue for execution
     this._taskQueue
       .add(async () => {
-        await this._executeRefreshTask(task, shard);
+        await this._executeRefreshTask(task, shard, taskAbortController.signal);
       })
       .catch((error) => {
         this._onError(
@@ -437,36 +480,45 @@ export class SiloWorker {
         );
       })
       .finally(() => {
-        // Stop heartbeat
-        const interval = this._heartbeatIntervals.get(task.id);
-        if (interval) {
-          clearInterval(interval);
-          this._heartbeatIntervals.delete(task.id);
-        }
+        // Clean up heartbeat and abort controller for this task
+        this._cleanupTask(task.id);
       });
   }
 
   /**
    * Execute a single task and report its outcome.
    */
-  private async _executeTask(task: Task, shard: number): Promise<void> {
+  private async _executeTask(
+    task: Task,
+    shard: number,
+    signal: AbortSignal
+  ): Promise<void> {
     const context: TaskContext = {
       task,
       shard,
       workerId: this._workerId,
-      signal: this._abortController?.signal ?? new AbortController().signal,
+      signal,
     };
 
     let outcome: TaskOutcome;
     try {
       outcome = await this._handler(context);
     } catch (error) {
+      // If aborted due to lease loss, don't report outcome
+      if (signal.aborted) {
+        return;
+      }
       // Handler threw an error, report as failure
       outcome = {
         type: "failure",
         code: "HANDLER_ERROR",
         data: serializeError(error),
       };
+    }
+
+    // If aborted due to lease loss, don't report outcome - we lost the lease
+    if (signal.aborted) {
+      return;
     }
 
     // Report the outcome to the correct shard
@@ -483,13 +535,14 @@ export class SiloWorker {
    */
   private async _executeRefreshTask(
     task: RefreshTask,
-    shard: number
+    shard: number,
+    signal: AbortSignal
   ): Promise<void> {
     const context: RefreshTaskContext = {
       task,
       shard,
       workerId: this._workerId,
-      signal: this._abortController?.signal ?? new AbortController().signal,
+      signal,
     };
 
     let outcome: RefreshOutcome;
@@ -501,6 +554,10 @@ export class SiloWorker {
         newMaxConcurrency,
       };
     } catch (error) {
+      // If aborted due to lease loss, don't report outcome
+      if (signal.aborted) {
+        return;
+      }
       // Handler threw an error, report as failure
       const errorObj =
         error instanceof Error ? error : new Error(String(error));
@@ -509,6 +566,11 @@ export class SiloWorker {
         code: "REFRESH_HANDLER_ERROR",
         message: errorObj.message,
       };
+    }
+
+    // If aborted due to lease loss, don't report outcome - we lost the lease
+    if (signal.aborted) {
+      return;
     }
 
     // Report the refresh outcome
@@ -522,9 +584,44 @@ export class SiloWorker {
 
   /**
    * Send a heartbeat for a task.
+   * Throws TaskNotFoundError if the lease is gone (handled by caller to abort the task).
    */
   private async _sendHeartbeat(taskId: string, shard: number): Promise<void> {
     await this._client.heartbeat(this._workerId, taskId, shard, this._tenant);
+  }
+
+  /**
+   * Abort a task execution due to lease loss.
+   * Stops the heartbeat, aborts the task's signal, and reports the error.
+   */
+  private _abortTask(taskId: string, error: Error): void {
+    // Abort the task's abort controller to signal the handler to stop
+    const abortController = this._taskAbortControllers.get(taskId);
+    if (abortController) {
+      abortController.abort();
+    }
+
+    // Clear the heartbeat interval - no point continuing to heartbeat
+    const interval = this._heartbeatIntervals.get(taskId);
+    if (interval) {
+      clearInterval(interval);
+      this._heartbeatIntervals.delete(taskId);
+    }
+
+    // Report the error so the user knows why this task was aborted
+    this._onError(error, { taskId });
+  }
+
+  /**
+   * Clean up heartbeat interval and abort controller for a task.
+   */
+  private _cleanupTask(taskId: string): void {
+    const interval = this._heartbeatIntervals.get(taskId);
+    if (interval) {
+      clearInterval(interval);
+      this._heartbeatIntervals.delete(taskId);
+    }
+    this._taskAbortControllers.delete(taskId);
   }
 
   /**

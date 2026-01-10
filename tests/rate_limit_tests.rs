@@ -49,7 +49,7 @@ async fn open_shard_with_gubernator(
         wal: None,
         apply_wal_on_close: true,
     };
-    let shard = JobStoreShard::open_with_rate_limiter(&cfg, gubernator.clone())
+    let shard = JobStoreShard::open_with_rate_limiter(&cfg, gubernator.clone(), 0, 1)
         .await
         .expect("open shard");
     (tmp, shard, gubernator)
@@ -525,5 +525,102 @@ async fn rate_limit_counts_hits_correctly() {
     assert!(
         !result.under_limit,
         "rate limit should be exhausted after 5 jobs"
+    );
+}
+
+/// This test exposes a bug where rate limits are skipped when concurrency is granted immediately.
+///
+/// The bug: In enqueue.rs, when a job has [Concurrency, RateLimit] and the concurrency
+/// is granted immediately, the condition `if concurrency_outcome.is_none()` is wrong.
+/// handle_enqueue returns Some(GrantedImmediately{...}), not None, so the next limit
+/// task is never created and the rate limit is completely skipped.
+#[silo::test]
+async fn concurrency_granted_should_still_check_rate_limit() {
+    let (_tmp, shard, gubernator) = open_shard_with_gubernator().await;
+
+    let now = now_ms();
+    let rate_key = unique_key("bug_test_rate");
+
+    // First, exhaust the rate limit by calling gubernator directly
+    // Set limit=1, consume 1 hit -> limit is now exhausted
+    let result = gubernator
+        .check_rate_limit(
+            "api",
+            &rate_key,
+            1, // hits to consume
+            1, // limit
+            60_000,
+            silo::pb::gubernator::Algorithm::TokenBucket,
+            0,
+        )
+        .await
+        .expect("exhaust rate limit");
+    assert!(result.under_limit, "first call should be under limit");
+
+    // Verify limit is now exhausted
+    let result2 = gubernator
+        .check_rate_limit(
+            "api",
+            &rate_key,
+            1,
+            1,
+            60_000,
+            silo::pb::gubernator::Algorithm::TokenBucket,
+            0,
+        )
+        .await
+        .expect("check exhausted");
+    assert!(!result2.under_limit, "rate limit should be exhausted");
+
+    // Now enqueue a job with concurrency (will grant) then rate limit (exhausted)
+    let concurrency = ConcurrencyLimit {
+        key: unique_key("pool"),
+        max_concurrency: 10, // High limit so it grants immediately
+    };
+    let rate_limit = GubernatorRateLimit {
+        name: "api".to_string(),
+        unique_key: rate_key.clone(),
+        limit: 1, // Already exhausted above
+        duration_ms: 60_000,
+        hits: 1,
+        algorithm: GubernatorAlgorithm::TokenBucket,
+        behavior: 0,
+        retry_policy: RateLimitRetryPolicy {
+            initial_backoff_ms: 10,
+            max_backoff_ms: 100,
+            backoff_multiplier: 2.0,
+            max_retries: 3,
+        },
+    };
+
+    let _job_id = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            serde_json::json!({"task": "should_be_blocked"}),
+            vec![
+                Limit::Concurrency(concurrency),
+                Limit::RateLimit(rate_limit),
+            ],
+            None,
+        )
+        .await
+        .expect("enqueue");
+
+    // If the bug exists: we'll get a task (rate limit was skipped)
+    // If the bug is fixed: no task (rate limit correctly blocks)
+    let tasks = shard.dequeue("worker1", 1).await.expect("dequeue").tasks;
+
+    // The rate limit is exhausted, so we should NOT get any tasks
+    // This assertion will fail if the bug exists
+    assert_eq!(
+        tasks.len(),
+        0,
+        "should NOT get task when rate limit is exhausted, \
+         but got {} task(s) - this means rate limit was skipped!",
+        tasks.len()
     );
 }

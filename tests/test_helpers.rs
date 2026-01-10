@@ -33,7 +33,8 @@ pub async fn open_temp_shard() -> (tempfile::TempDir, std::sync::Arc<JobStoreSha
     open_temp_shard_with_rate_limiter(rate_limiter).await
 }
 
-/// Open a temp shard with a custom rate limiter (useful for testing rate limit behavior)
+/// Open a temp shard with a custom rate limiter (useful for testing rate limit behavior).
+/// Uses single-shard mode (shard 0 of 1) by default.
 pub async fn open_temp_shard_with_rate_limiter(
     rate_limiter: Arc<dyn RateLimitClient>,
 ) -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>) {
@@ -47,7 +48,8 @@ pub async fn open_temp_shard_with_rate_limiter(
         wal: None,
         apply_wal_on_close: true,
     };
-    let shard = JobStoreShard::open_with_rate_limiter(&cfg, rate_limiter)
+    // Default to single-shard mode (shard 0 of 1)
+    let shard = JobStoreShard::open_with_rate_limiter(&cfg, rate_limiter, 0, 1)
         .await
         .expect("open shard");
     (tmp, shard)
@@ -68,7 +70,8 @@ pub async fn open_temp_shard_with_local_wal(
     open_temp_shard_with_local_wal_and_rate_limiter(rate_limiter, flush_on_close).await
 }
 
-/// Open a temp shard with separate local WAL directory and custom rate limiter
+/// Open a temp shard with separate local WAL directory and custom rate limiter.
+/// Uses single-shard mode (shard 0 of 1) by default.
 pub async fn open_temp_shard_with_local_wal_and_rate_limiter(
     rate_limiter: Arc<dyn RateLimitClient>,
     flush_on_close: bool,
@@ -90,7 +93,8 @@ pub async fn open_temp_shard_with_local_wal_and_rate_limiter(
         apply_wal_on_close: flush_on_close,
     };
 
-    let shard = JobStoreShard::open_with_rate_limiter(&cfg, rate_limiter)
+    // Default to single-shard mode (shard 0 of 1)
+    let shard = JobStoreShard::open_with_rate_limiter(&cfg, rate_limiter, 0, 1)
         .await
         .expect("open shard with local WAL");
 

@@ -15,7 +15,9 @@ use silo::gubernator::MockGubernatorClient;
 use silo::settings::{Backend, DatabaseTemplate};
 use test_helpers::now_ms;
 
-/// Helper to create a multi-shard factory with temp directories
+/// Helper to create a multi-shard factory with temp directories.
+/// Each shard knows it's in a cluster with the specified number of shards,
+/// enabling correct queue routing decisions.
 async fn create_multi_shard_factory(
     num_shards: usize,
 ) -> (Vec<tempfile::TempDir>, Arc<ShardFactory>) {
@@ -32,7 +34,11 @@ async fn create_multi_shard_factory(
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
-    let factory = Arc::new(ShardFactory::new(template, rate_limiter));
+    let factory = Arc::new(ShardFactory::new(
+        template,
+        rate_limiter,
+        num_shards as u32,
+    ));
 
     // Open all shards
     for i in 0..num_shards {
@@ -644,21 +650,42 @@ async fn cluster_query_multi_shard_limit() {
 
 #[silo::test]
 async fn cluster_query_queues_table_multi_shard() {
+    use silo::routing::queue_to_shard;
+
     let (_temps, factory) = create_multi_shard_factory(2).await;
     let now = now_ms();
+    let num_shards = 2u32;
+    let tenant = "-";
 
-    // Create concurrency queues in both shards
+    // Find queue names that route to specific shards
+    // This ensures queues are local to the shard that creates them
+    let mut queue_for_shard0 = String::new();
+    let mut queue_for_shard1 = String::new();
+    for i in 0..1000 {
+        let queue = format!("queue-{}", i);
+        let shard = queue_to_shard(tenant, &queue, num_shards);
+        if shard == 0 && queue_for_shard0.is_empty() {
+            queue_for_shard0 = queue;
+        } else if shard == 1 && queue_for_shard1.is_empty() {
+            queue_for_shard1 = queue;
+        }
+        if !queue_for_shard0.is_empty() && !queue_for_shard1.is_empty() {
+            break;
+        }
+    }
+
+    // Create concurrency queues in both shards - each queue is local to its shard
     let shard0 = factory.get("0").unwrap();
     shard0
         .enqueue(
-            "-",
+            tenant,
             Some("s0_job".to_string()),
             10,
             now,
             None,
             serde_json::json!({}),
             vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
-                key: "queue-a".to_string(),
+                key: queue_for_shard0.clone(),
                 max_concurrency: 1,
             })],
             None,
@@ -670,14 +697,14 @@ async fn cluster_query_queues_table_multi_shard() {
     let shard1 = factory.get("1").unwrap();
     shard1
         .enqueue(
-            "-",
+            tenant,
             Some("s1_job".to_string()),
             10,
             now,
             None,
             serde_json::json!({}),
             vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
-                key: "queue-b".to_string(),
+                key: queue_for_shard1.clone(),
                 max_concurrency: 1,
             })],
             None,
@@ -699,8 +726,8 @@ async fn cluster_query_queues_table_multi_shard() {
 
     // Should see queues from both shards
     assert_eq!(queue_names.len(), 2);
-    assert!(queue_names.contains(&"queue-a".to_string()));
-    assert!(queue_names.contains(&"queue-b".to_string()));
+    assert!(queue_names.contains(&queue_for_shard0));
+    assert!(queue_names.contains(&queue_for_shard1));
 }
 
 // =============================================================================

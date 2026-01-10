@@ -64,6 +64,7 @@ processes:
         condition: process_healthy
       gubernator:
         condition: process_healthy
+    log_location: ./tmp/silo-1.log
     shutdown:
       timeout_seconds: 1
     availability:
@@ -89,6 +90,7 @@ processes:
         condition: process_healthy
       gubernator:
         condition: process_healthy
+    log_location: ./tmp/silo-2.log
     shutdown:
       timeout_seconds: 1
     availability:

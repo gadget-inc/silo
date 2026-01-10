@@ -351,7 +351,79 @@ message ResetShardsResponse {
   uint32 shards_reset = 1; // Number of shards that were cleared.
 }
 
-// The Silo job queue service.
+// ============================================================================
+// INTERNAL RPC - Cross-shard concurrency ticket coordination
+// These RPCs are used between shards for distributed concurrency management.
+// Jobs are hashed to shards by job_id, queues are owned by shards by hash(tenant, queue_key).
+// When a job needs a ticket from a queue on a different shard, these RPCs coordinate.
+// ============================================================================
+
+// Floating concurrency limit info passed in ticket requests.
+// Allows queue owner to create/update floating limit state for remote jobs.
+message FloatingConcurrencyLimitInfo {
+  uint32 default_max_concurrency = 1;   // Initial max concurrency until first refresh
+  int64 refresh_interval_ms = 2;        // How often to refresh the max concurrency value
+  repeated FloatingLimitMetadata metadata = 3;  // Arbitrary metadata for refresh workers
+}
+
+// Key-value metadata for floating limits
+message FloatingLimitMetadata {
+  string key = 1;
+  string value = 2;
+}
+
+// Request a concurrency ticket from the queue owner shard.
+// Called by the job shard when a job needs a ticket from a remote queue.
+message RequestConcurrencyTicketRequest {
+  uint32 queue_owner_shard = 1;   // The shard that owns this queue
+  string tenant = 2;              // Tenant ID
+  string queue_key = 3;           // Queue key (e.g., "api-limit")
+  string job_id = 4;              // Job requesting the ticket
+  uint32 job_shard = 5;           // Shard where the job lives (for callback)
+  string request_id = 6;          // Unique ID for this request (for correlation)
+  uint32 attempt_number = 7;      // Which attempt this is for
+  uint32 priority = 8;            // Job priority (0=highest)
+  int64 start_time_ms = 9;        // When the job should start (for queue ordering)
+  uint32 max_concurrency = 10;    // Max concurrent tickets for this queue
+  // For floating limits, includes the full definition so queue owner can create state.
+  // If present, this is a floating limit; otherwise it's a regular concurrency limit.
+  optional FloatingConcurrencyLimitInfo floating_limit = 11;
+}
+
+message RequestConcurrencyTicketResponse {
+  bool registered = 1;            // True if request was registered successfully
+}
+
+// Notify the job shard that a ticket has been granted.
+// Called by the queue owner when a ticket becomes available for a waiting request.
+message NotifyConcurrencyTicketGrantedRequest {
+  uint32 job_shard = 1;           // The shard where the job lives
+  string tenant = 2;              // Tenant ID
+  string job_id = 3;              // Job that was granted the ticket
+  string queue_key = 4;           // Queue that granted the ticket
+  string request_id = 5;          // Request ID (for correlation with original request)
+  string holder_task_id = 6;      // Task ID to use as the holder (for release)
+  uint32 queue_owner_shard = 7;   // The shard that owns the queue (for release)
+  uint32 attempt_number = 8;      // Attempt number for the job (needed to create correct RunAttempt)
+}
+
+message NotifyConcurrencyTicketGrantedResponse {
+  bool acknowledged = 1;          // True if the grant was acknowledged
+}
+
+// Release a concurrency ticket back to the queue owner.
+// Called by the job shard when a job completes (success/failure/cancel).
+message ReleaseConcurrencyTicketRequest {
+  uint32 queue_owner_shard = 1;   // The shard that owns this queue
+  string tenant = 2;              // Tenant ID
+  string queue_key = 3;           // Queue key
+  string job_id = 4;              // Job releasing the ticket
+  string holder_task_id = 5;      // Task ID that held the ticket
+}
+
+message ReleaseConcurrencyTicketResponse {
+  bool released = 1;              // True if the ticket was released successfully
+}
 service Silo {
   // Get cluster topology for client-side routing.
   // Returns shard ownership information so clients can route requests to the correct node.
@@ -413,5 +485,25 @@ service Silo {
   // WARNING: Destructive operation. Only available in dev mode.
   // Clears all jobs, tasks, queues, and other data.
   rpc ResetShards(ResetShardsRequest) returns (ResetShardsResponse);
+  
+  // ============================================================================
+  // INTERNAL RPC - Cross-shard concurrency coordination
+  // These should only be called between silo nodes, not by external clients.
+  // ============================================================================
+  
+  // Request a concurrency ticket from the queue owner shard.
+  // Called by job shard -> queue owner shard when job needs a remote ticket.
+  rpc RequestConcurrencyTicket(RequestConcurrencyTicketRequest) 
+      returns (RequestConcurrencyTicketResponse);
+  
+  // Notify the job shard that a ticket has been granted.
+  // Called by queue owner shard -> job shard when ticket becomes available.
+  rpc NotifyConcurrencyTicketGranted(NotifyConcurrencyTicketGrantedRequest) 
+      returns (NotifyConcurrencyTicketGrantedResponse);
+  
+  // Release a concurrency ticket back to the queue owner.
+  // Called by job shard -> queue owner shard when job completes.
+  rpc ReleaseConcurrencyTicket(ReleaseConcurrencyTicketRequest) 
+      returns (ReleaseConcurrencyTicketResponse);
 }
 

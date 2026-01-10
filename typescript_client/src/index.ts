@@ -8,6 +8,7 @@ export {
   decodePayload,
   fnv1a32,
   defaultTenantToShard,
+  defaultJobToShard,
   GubernatorAlgorithm,
   GubernatorBehavior,
   type SiloGRPCClientOptions,
@@ -33,6 +34,7 @@ export {
   type FloatingConcurrencyLimitConfig,
   type ShardRoutingConfig,
   type TenantToShardFn,
+  type JobToShardFn,
   type ShardOwner,
 } from "./client";
 export {

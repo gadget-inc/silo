@@ -2,7 +2,10 @@ use rkyv::{AlignedVec, Archive};
 
 use crate::job::{JobCancellation, JobInfo, JobStatus};
 use crate::job_attempt::JobAttempt;
-use crate::task::{ConcurrencyAction, GubernatorRateLimitData, HolderRecord, LeaseRecord, Task};
+use crate::task::{
+    ConcurrencyAction, GubernatorRateLimitData, HeldTicketState, HolderRecord, LeaseRecord,
+    RemoteConcurrencyRequest, RemoteHolderRecord, Task,
+};
 
 /// Error type for versioned codec operations
 #[derive(Debug, Clone)]
@@ -127,6 +130,7 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
             job_id,
             attempt_number,
             request_id,
+            held_queues,
         } => Task::RequestTicket {
             queue: queue.as_str().to_string(),
             start_time_ms: *start_time_ms,
@@ -135,6 +139,10 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
             job_id: job_id.as_str().to_string(),
             attempt_number: *attempt_number,
             request_id: request_id.as_str().to_string(),
+            held_queues: held_queues
+                .iter()
+                .map(|s| s.as_str().to_string())
+                .collect::<Vec<String>>(),
         },
         ArchivedTask::CheckRateLimit {
             task_id,
@@ -191,6 +199,73 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
                 .iter()
                 .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
                 .collect(),
+        },
+        ArchivedTask::RequestRemoteTicket {
+            task_id,
+            queue_owner_shard,
+            tenant,
+            queue_key,
+            job_id,
+            attempt_number,
+            priority,
+            start_time_ms,
+            request_id,
+            floating_limit,
+        } => Task::RequestRemoteTicket {
+            task_id: task_id.as_str().to_string(),
+            queue_owner_shard: *queue_owner_shard,
+            tenant: tenant.as_str().to_string(),
+            queue_key: queue_key.as_str().to_string(),
+            job_id: job_id.as_str().to_string(),
+            attempt_number: *attempt_number,
+            priority: *priority,
+            start_time_ms: *start_time_ms,
+            request_id: request_id.as_str().to_string(),
+            floating_limit: floating_limit.as_ref().map(|fl| {
+                crate::task::FloatingConcurrencyLimitData {
+                    default_max_concurrency: fl.default_max_concurrency,
+                    refresh_interval_ms: fl.refresh_interval_ms,
+                    metadata: fl
+                        .metadata
+                        .iter()
+                        .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
+                        .collect(),
+                }
+            }),
+        },
+        ArchivedTask::NotifyRemoteTicketGrant {
+            task_id,
+            job_shard,
+            tenant,
+            job_id,
+            queue_key,
+            request_id,
+            holder_task_id,
+            attempt_number,
+        } => Task::NotifyRemoteTicketGrant {
+            task_id: task_id.as_str().to_string(),
+            job_shard: *job_shard,
+            tenant: tenant.as_str().to_string(),
+            job_id: job_id.as_str().to_string(),
+            queue_key: queue_key.as_str().to_string(),
+            request_id: request_id.as_str().to_string(),
+            holder_task_id: holder_task_id.as_str().to_string(),
+            attempt_number: *attempt_number,
+        },
+        ArchivedTask::ReleaseRemoteTicket {
+            task_id,
+            queue_owner_shard,
+            tenant,
+            queue_key,
+            job_id,
+            holder_task_id,
+        } => Task::ReleaseRemoteTicket {
+            task_id: task_id.as_str().to_string(),
+            queue_owner_shard: *queue_owner_shard,
+            tenant: tenant.as_str().to_string(),
+            queue_key: queue_key.as_str().to_string(),
+            job_id: job_id.as_str().to_string(),
+            holder_task_id: holder_task_id.as_str().to_string(),
         },
     })
 }
@@ -256,6 +331,9 @@ impl DecodedLease {
             ArchivedTask::RequestTicket { tenant, .. } => tenant.as_str(),
             ArchivedTask::CheckRateLimit { tenant, .. } => tenant.as_str(),
             ArchivedTask::RefreshFloatingLimit { tenant, .. } => tenant.as_str(),
+            ArchivedTask::RequestRemoteTicket { tenant, .. } => tenant.as_str(),
+            ArchivedTask::NotifyRemoteTicketGrant { tenant, .. } => tenant.as_str(),
+            ArchivedTask::ReleaseRemoteTicket { tenant, .. } => tenant.as_str(),
         }
     }
 
@@ -266,6 +344,9 @@ impl DecodedLease {
             ArchivedTask::RequestTicket { job_id, .. } => job_id.as_str(),
             ArchivedTask::CheckRateLimit { job_id, .. } => job_id.as_str(),
             ArchivedTask::RefreshFloatingLimit { .. } => "",
+            ArchivedTask::RequestRemoteTicket { job_id, .. } => job_id.as_str(),
+            ArchivedTask::NotifyRemoteTicketGrant { job_id, .. } => job_id.as_str(),
+            ArchivedTask::ReleaseRemoteTicket { job_id, .. } => job_id.as_str(),
         }
     }
 
@@ -276,6 +357,9 @@ impl DecodedLease {
             ArchivedTask::RequestTicket { attempt_number, .. } => *attempt_number,
             ArchivedTask::CheckRateLimit { attempt_number, .. } => *attempt_number,
             ArchivedTask::RefreshFloatingLimit { .. } => 0,
+            ArchivedTask::RequestRemoteTicket { attempt_number, .. } => *attempt_number,
+            ArchivedTask::NotifyRemoteTicketGrant { .. } => 0,
+            ArchivedTask::ReleaseRemoteTicket { .. } => 0,
         }
     }
 
@@ -288,9 +372,11 @@ impl DecodedLease {
             ArchivedTask::CheckRateLimit { held_queues, .. } => {
                 held_queues.iter().map(|s| s.as_str().to_string()).collect()
             }
-            ArchivedTask::RequestTicket { .. } | ArchivedTask::RefreshFloatingLimit { .. } => {
-                Vec::new()
-            }
+            ArchivedTask::RequestTicket { .. }
+            | ArchivedTask::RefreshFloatingLimit { .. }
+            | ArchivedTask::RequestRemoteTicket { .. }
+            | ArchivedTask::NotifyRemoteTicketGrant { .. }
+            | ArchivedTask::ReleaseRemoteTicket { .. } => Vec::new(),
         }
     }
 
@@ -318,6 +404,7 @@ impl DecodedLease {
                 job_id,
                 attempt_number,
                 request_id,
+                held_queues,
             } => Task::RequestTicket {
                 queue: queue.as_str().to_string(),
                 start_time_ms: *start_time_ms,
@@ -326,6 +413,7 @@ impl DecodedLease {
                 job_id: job_id.as_str().to_string(),
                 attempt_number: *attempt_number,
                 request_id: request_id.as_str().to_string(),
+                held_queues: held_queues.iter().map(|s| s.as_str().to_string()).collect(),
             },
             ArchivedTask::CheckRateLimit {
                 task_id,
@@ -379,6 +467,73 @@ impl DecodedLease {
                     .iter()
                     .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
                     .collect(),
+            },
+            ArchivedTask::RequestRemoteTicket {
+                task_id,
+                queue_owner_shard,
+                tenant,
+                queue_key,
+                job_id,
+                attempt_number,
+                priority,
+                start_time_ms,
+                request_id,
+                floating_limit,
+            } => Task::RequestRemoteTicket {
+                task_id: task_id.as_str().to_string(),
+                queue_owner_shard: *queue_owner_shard,
+                tenant: tenant.as_str().to_string(),
+                queue_key: queue_key.as_str().to_string(),
+                job_id: job_id.as_str().to_string(),
+                attempt_number: *attempt_number,
+                priority: *priority,
+                start_time_ms: *start_time_ms,
+                request_id: request_id.as_str().to_string(),
+                floating_limit: floating_limit.as_ref().map(|fl| {
+                    crate::task::FloatingConcurrencyLimitData {
+                        default_max_concurrency: fl.default_max_concurrency,
+                        refresh_interval_ms: fl.refresh_interval_ms,
+                        metadata: fl
+                            .metadata
+                            .iter()
+                            .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
+                            .collect(),
+                    }
+                }),
+            },
+            ArchivedTask::NotifyRemoteTicketGrant {
+                task_id,
+                job_shard,
+                tenant,
+                job_id,
+                queue_key,
+                request_id,
+                holder_task_id,
+                attempt_number,
+            } => Task::NotifyRemoteTicketGrant {
+                task_id: task_id.as_str().to_string(),
+                job_shard: *job_shard,
+                tenant: tenant.as_str().to_string(),
+                job_id: job_id.as_str().to_string(),
+                queue_key: queue_key.as_str().to_string(),
+                request_id: request_id.as_str().to_string(),
+                holder_task_id: holder_task_id.as_str().to_string(),
+                attempt_number: *attempt_number,
+            },
+            ArchivedTask::ReleaseRemoteTicket {
+                task_id,
+                queue_owner_shard,
+                tenant,
+                queue_key,
+                job_id,
+                holder_task_id,
+            } => Task::ReleaseRemoteTicket {
+                task_id: task_id.as_str().to_string(),
+                queue_owner_shard: *queue_owner_shard,
+                tenant: tenant.as_str().to_string(),
+                queue_key: queue_key.as_str().to_string(),
+                job_id: job_id.as_str().to_string(),
+                holder_task_id: holder_task_id.as_str().to_string(),
             },
         }
     }
@@ -603,4 +758,150 @@ pub fn decode_floating_limit_state(bytes: &[u8]) -> Result<DecodedFloatingLimitS
     let _ = rkyv::check_archived_root::<FloatingLimitState>(&data)
         .map_err(|e| CodecError::Rkyv(e.to_string()))?;
     Ok(DecodedFloatingLimitState { data })
+}
+
+// ============================================================================
+// Remote concurrency request/holder encoding (for cross-shard coordination)
+// ============================================================================
+
+/// Version for RemoteConcurrencyRequest serialization format
+pub const REMOTE_CONCURRENCY_REQUEST_VERSION: u8 = 1;
+/// Version for RemoteHolderRecord serialization format
+pub const REMOTE_HOLDER_RECORD_VERSION: u8 = 1;
+
+#[inline]
+pub fn encode_remote_concurrency_request(
+    request: &RemoteConcurrencyRequest,
+) -> Result<Vec<u8>, CodecError> {
+    let data = rkyv::to_bytes::<RemoteConcurrencyRequest, 256>(request)
+        .map_err(|e| CodecError::Rkyv(e.to_string()))?;
+    Ok(prepend_version(REMOTE_CONCURRENCY_REQUEST_VERSION, data))
+}
+
+/// Decoded remote concurrency request that owns its aligned data
+#[derive(Clone)]
+pub struct DecodedRemoteConcurrencyRequest {
+    data: AlignedVec,
+}
+
+impl DecodedRemoteConcurrencyRequest {
+    pub fn archived(&self) -> &<RemoteConcurrencyRequest as Archive>::Archived {
+        // SAFETY: data was validated at construction in decode_remote_concurrency_request
+        unsafe { rkyv::archived_root::<RemoteConcurrencyRequest>(&self.data) }
+    }
+
+    pub fn source_shard(&self) -> u32 {
+        self.archived().source_shard
+    }
+
+    pub fn job_id(&self) -> &str {
+        self.archived().job_id.as_str()
+    }
+
+    pub fn request_id(&self) -> &str {
+        self.archived().request_id.as_str()
+    }
+
+    pub fn attempt_number(&self) -> u32 {
+        self.archived().attempt_number
+    }
+
+    pub fn holder_task_id(&self) -> &str {
+        self.archived().holder_task_id.as_str()
+    }
+}
+
+#[inline]
+pub fn decode_remote_concurrency_request(
+    bytes: &[u8],
+) -> Result<DecodedRemoteConcurrencyRequest, CodecError> {
+    let data = strip_version(REMOTE_CONCURRENCY_REQUEST_VERSION, bytes)?;
+    // Validate the data
+    let _ = rkyv::check_archived_root::<RemoteConcurrencyRequest>(&data)
+        .map_err(|e| CodecError::Rkyv(e.to_string()))?;
+    Ok(DecodedRemoteConcurrencyRequest { data })
+}
+
+#[inline]
+pub fn encode_remote_holder_record(holder: &RemoteHolderRecord) -> Result<Vec<u8>, CodecError> {
+    let data = rkyv::to_bytes::<RemoteHolderRecord, 256>(holder)
+        .map_err(|e| CodecError::Rkyv(e.to_string()))?;
+    Ok(prepend_version(REMOTE_HOLDER_RECORD_VERSION, data))
+}
+
+/// Decoded remote holder record that owns its aligned data
+#[derive(Clone)]
+pub struct DecodedRemoteHolderRecord {
+    data: AlignedVec,
+}
+
+impl DecodedRemoteHolderRecord {
+    pub fn archived(&self) -> &<RemoteHolderRecord as Archive>::Archived {
+        // SAFETY: data was validated at construction in decode_remote_holder_record
+        unsafe { rkyv::archived_root::<RemoteHolderRecord>(&self.data) }
+    }
+
+    pub fn granted_at_ms(&self) -> i64 {
+        self.archived().granted_at_ms
+    }
+
+    pub fn source_shard(&self) -> u32 {
+        self.archived().source_shard
+    }
+
+    pub fn job_id(&self) -> &str {
+        self.archived().job_id.as_str()
+    }
+}
+
+#[inline]
+pub fn decode_remote_holder_record(bytes: &[u8]) -> Result<DecodedRemoteHolderRecord, CodecError> {
+    let data = strip_version(REMOTE_HOLDER_RECORD_VERSION, bytes)?;
+    // Validate the data
+    let _ = rkyv::check_archived_root::<RemoteHolderRecord>(&data)
+        .map_err(|e| CodecError::Rkyv(e.to_string()))?;
+    Ok(DecodedRemoteHolderRecord { data })
+}
+
+/// Version for HeldTicketState serialization format
+pub const HELD_TICKET_STATE_VERSION: u8 = 1;
+
+#[inline]
+pub fn encode_held_ticket_state(
+    state: &HeldTicketState,
+) -> Result<Vec<u8>, CodecError> {
+    let data = rkyv::to_bytes::<HeldTicketState, 256>(state)
+        .map_err(|e| CodecError::Rkyv(e.to_string()))?;
+    Ok(prepend_version(HELD_TICKET_STATE_VERSION, data))
+}
+
+/// Decoded held ticket state that owns its aligned data
+#[derive(Clone)]
+pub struct DecodedHeldTicketState {
+    data: AlignedVec,
+}
+
+impl DecodedHeldTicketState {
+    pub fn archived(&self) -> &<HeldTicketState as Archive>::Archived {
+        // SAFETY: data was validated at construction in decode_held_ticket_state
+        unsafe { rkyv::archived_root::<HeldTicketState>(&self.data) }
+    }
+
+    /// Extract held_queues as owned strings
+    pub fn held_queues(&self) -> Vec<String> {
+        self.archived()
+            .held_queues
+            .iter()
+            .map(|s| s.as_str().to_string())
+            .collect()
+    }
+}
+
+#[inline]
+pub fn decode_held_ticket_state(bytes: &[u8]) -> Result<DecodedHeldTicketState, CodecError> {
+    let data = strip_version(HELD_TICKET_STATE_VERSION, bytes)?;
+    // Validate the data
+    let _ = rkyv::check_archived_root::<HeldTicketState>(&data)
+        .map_err(|e| CodecError::Rkyv(e.to_string()))?;
+    Ok(DecodedHeldTicketState { data })
 }

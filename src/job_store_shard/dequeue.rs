@@ -7,9 +7,13 @@ use crate::concurrency::{MemoryEvent, RequestTicketTaskOutcome};
 use crate::job::{JobStatus, JobView};
 use crate::job_attempt::{AttemptStatus, JobAttempt};
 use crate::job_store_shard::helpers::now_epoch_ms;
-use crate::job_store_shard::{DequeueResult, JobStoreShard, JobStoreShardError};
+use crate::job_store_shard::{DequeueResult, JobStoreShard, JobStoreShardError, PendingCrossShardTask};
 use crate::keys::{attempt_key, job_info_key, leased_task_key};
-use crate::task::{LeaseRecord, LeasedRefreshTask, LeasedTask, Task, DEFAULT_LEASE_MS};
+use crate::routing::queue_to_shard;
+use crate::task::{
+    partition_held_queues, LeaseRecord, LeasedRefreshTask, LeasedTask, RemoteQueueRef, Task,
+    DEFAULT_LEASE_MS,
+};
 use crate::task_broker::BrokerTask;
 
 impl JobStoreShard {
@@ -27,12 +31,14 @@ impl JobStoreShard {
             return Ok(DequeueResult {
                 tasks: Vec::new(),
                 refresh_tasks: Vec::new(),
+                cross_shard_tasks: Vec::new(),
             });
         }
 
         let mut out: Vec<LeasedTask> = Vec::new();
         let mut refresh_out: Vec<LeasedRefreshTask> = Vec::new();
         let mut pending_attempts: Vec<(String, JobView, String, u32)> = Vec::new();
+        let mut cross_shard_out: Vec<PendingCrossShardTask> = Vec::new();
 
         // Loop to process internal tasks until we have tasks that are destined for the worker, or no more ready tasks at all.
         const MAX_INTERNAL_ITERATIONS: usize = 10;
@@ -67,10 +73,26 @@ impl JobStoreShard {
                         job_id,
                         attempt_number,
                         request_id,
+                        held_queues,
                     } => {
                         // Process ticket request internally
                         processed_internal = true;
                         let tenant = tenant.to_string();
+
+                        // Debug assertion: RequestTicket tasks are for LOCAL queues only.
+                        // If the queue routes to a different shard, a RequestRemoteTicket
+                        // task should have been created instead.
+                        debug_assert_eq!(
+                            queue_to_shard(&tenant, queue, self.num_shards),
+                            self.shard_number,
+                            "RequestTicket task for remote queue detected: queue '{}' for tenant '{}' \
+                             routes to shard {}, but this is shard {}. \
+                             A RequestRemoteTicket task should have been created instead.",
+                            queue,
+                            tenant,
+                            queue_to_shard(&tenant, queue, self.num_shards),
+                            self.shard_number
+                        );
 
                         // [SILO-DEQ-CXL] Check if job is cancelled - if so, skip and clean up task
                         if self.is_job_cancelled(&tenant, job_id).await? {
@@ -105,57 +127,101 @@ impl JobStoreShard {
 
                         match outcome {
                             RequestTicketTaskOutcome::Granted { request_id, queue } => {
-                                // Create lease and attempt records
-                                let run = Task::RunAttempt {
-                                    id: request_id.clone(),
-                                    tenant: tenant.clone(),
-                                    job_id: job_id.clone(),
-                                    attempt_number: *attempt_number,
-                                    held_queues: vec![queue.clone()],
-                                };
-                                let lease_key = leased_task_key(&request_id);
-                                let record = LeaseRecord {
-                                    worker_id: worker_id.to_string(),
-                                    task: run,
-                                    expiry_ms,
-                                };
-                                let leased_value = encode_lease(&record)?;
-                                batch.put(lease_key.as_bytes(), &leased_value);
+                                // Accumulate previously held queues with the newly granted queue
+                                let mut all_held_queues = held_queues.clone();
+                                all_held_queues.push(queue.clone());
 
-                                // Mark job as running
-                                let job_status = JobStatus::running(now_ms);
-                                self.set_job_status_with_index(
-                                    &mut batch, &tenant, job_id, job_status,
-                                )
-                                .await?;
-
-                                // Attempt record
-                                let attempt = JobAttempt {
-                                    job_id: job_id.clone(),
-                                    attempt_number: *attempt_number,
-                                    task_id: request_id.clone(),
-                                    status: AttemptStatus::Running {
-                                        started_at_ms: now_ms,
-                                    },
-                                };
-                                let attempt_val = encode_attempt(&attempt)?;
-                                let akey = attempt_key(&tenant, job_id, *attempt_number);
-                                batch.put(akey.as_bytes(), &attempt_val);
-
-                                // Track for response and in-memory counts
-                                let view = job_view.unwrap();
-                                pending_attempts.push((
-                                    tenant.clone(),
-                                    view,
-                                    job_id.clone(),
-                                    *attempt_number,
-                                ));
-                                ack_keys.push(entry.key.clone());
+                                // Record the grant in memory
                                 self.concurrency.counts().record_grant(
                                     &tenant,
                                     &queue,
                                     &request_id,
                                 );
+
+                                // Get the job's limits to check if there are more
+                                let view = job_view.unwrap();
+                                let limits = view.limits();
+
+                                // Find the current limit index by matching queue
+                                let current_limit_index = limits
+                                    .iter()
+                                    .position(|l| match l {
+                                        crate::job::Limit::Concurrency(cl) => cl.key == queue,
+                                        crate::job::Limit::FloatingConcurrency(fl) => fl.key == queue,
+                                        crate::job::Limit::RateLimit(_) => false,
+                                    })
+                                    .unwrap_or(0) as u32;
+
+                                // Check if there are more limits to process
+                                if (current_limit_index + 1) < limits.len() as u32 {
+                                    // More limits - enqueue the next limit task
+                                    self.enqueue_next_limit_task(
+                                        &mut batch,
+                                        &tenant,
+                                        &request_id, // Use same task_id for holder consistency
+                                        job_id,
+                                        *attempt_number,
+                                        current_limit_index,
+                                        &limits,
+                                        view.priority(),
+                                        view.enqueue_time_ms(),
+                                        now_ms,
+                                        all_held_queues,
+                                    )?;
+                                    ack_keys.push(entry.key.clone());
+                                    tracing::debug!(
+                                        job_id = %job_id,
+                                        queue = %queue,
+                                        current_limit_index = current_limit_index,
+                                        "dequeue RequestTicket: more limits to process"
+                                    );
+                                } else {
+                                    // All limits satisfied - create lease and attempt records
+                                    let run = Task::RunAttempt {
+                                        id: request_id.clone(),
+                                        tenant: tenant.clone(),
+                                        job_id: job_id.clone(),
+                                        attempt_number: *attempt_number,
+                                        held_queues: all_held_queues,
+                                    };
+                                    let lease_key = leased_task_key(&request_id);
+                                    let record = LeaseRecord {
+                                        worker_id: worker_id.to_string(),
+                                        task: run,
+                                        expiry_ms,
+                                    };
+                                    let leased_value = encode_lease(&record)?;
+                                    batch.put(lease_key.as_bytes(), &leased_value);
+
+                                    // Mark job as running
+                                    let job_status = JobStatus::running(now_ms);
+                                    self.set_job_status_with_index(
+                                        &mut batch, &tenant, job_id, job_status,
+                                    )
+                                    .await?;
+
+                                    // Attempt record
+                                    let attempt = JobAttempt {
+                                        job_id: job_id.clone(),
+                                        attempt_number: *attempt_number,
+                                        task_id: request_id.clone(),
+                                        status: AttemptStatus::Running {
+                                            started_at_ms: now_ms,
+                                        },
+                                    };
+                                    let attempt_val = encode_attempt(&attempt)?;
+                                    let akey = attempt_key(&tenant, job_id, *attempt_number);
+                                    batch.put(akey.as_bytes(), &attempt_val);
+
+                                    // Track for response
+                                    pending_attempts.push((
+                                        tenant.clone(),
+                                        view,
+                                        job_id.clone(),
+                                        *attempt_number,
+                                    ));
+                                    ack_keys.push(entry.key.clone());
+                                }
                             }
                             RequestTicketTaskOutcome::Requested
                             | RequestTicketTaskOutcome::JobMissing => {
@@ -297,6 +363,100 @@ impl JobStoreShard {
                         continue;
                     }
                     Task::RunAttempt { .. } => {}
+                    // Cross-shard concurrency tasks - extract and return for caller to process via RPC
+                    Task::RequestRemoteTicket {
+                        task_id: _,
+                        queue_owner_shard,
+                        tenant,
+                        queue_key,
+                        job_id,
+                        attempt_number,
+                        priority,
+                        start_time_ms,
+                        request_id,
+                        floating_limit,
+                    } => {
+                        // Need to get max_concurrency from the job
+                        // This works for both ConcurrencyLimit and FloatingConcurrencyLimit
+                        let job_key = job_info_key(tenant, job_id);
+                        let maybe_job = self.db.get(job_key.as_bytes()).await?;
+                        let max_concurrency = if let Some(bytes) = maybe_job {
+                            if let Ok(view) = JobView::new(bytes) {
+                                view.max_concurrency_for_queue(queue_key).unwrap_or(1)
+                            } else {
+                                1
+                            }
+                        } else {
+                            // Job missing, clean up task
+                            batch.delete(entry.key.as_bytes());
+                            ack_keys.push(entry.key.clone());
+                            continue;
+                        };
+
+                        cross_shard_out.push(PendingCrossShardTask::RequestRemoteTicket {
+                            queue_owner_shard: *queue_owner_shard,
+                            tenant: tenant.clone(),
+                            queue_key: queue_key.clone(),
+                            job_id: job_id.clone(),
+                            request_id: request_id.clone(),
+                            attempt_number: *attempt_number,
+                            priority: *priority,
+                            start_time_ms: *start_time_ms,
+                            max_concurrency,
+                            task_key: entry.key.clone(),
+                            floating_limit: floating_limit.clone(),
+                        });
+                        // Don't delete task yet - caller will delete after successful RPC
+                        ack_keys.push(entry.key.clone());
+                        processed_internal = true;
+                        continue;
+                    }
+                    Task::NotifyRemoteTicketGrant {
+                        task_id: _,
+                        job_shard,
+                        tenant,
+                        job_id,
+                        queue_key,
+                        request_id,
+                        holder_task_id,
+                        attempt_number,
+                    } => {
+                        cross_shard_out.push(PendingCrossShardTask::NotifyRemoteTicketGrant {
+                            job_shard: *job_shard,
+                            tenant: tenant.clone(),
+                            job_id: job_id.clone(),
+                            queue_key: queue_key.clone(),
+                            request_id: request_id.clone(),
+                            holder_task_id: holder_task_id.clone(),
+                            attempt_number: *attempt_number,
+                            task_key: entry.key.clone(),
+                        });
+                        // Don't delete task yet - caller will delete after successful RPC
+                        ack_keys.push(entry.key.clone());
+                        processed_internal = true;
+                        continue;
+                    }
+                    Task::ReleaseRemoteTicket {
+                        task_id: _,
+                        queue_owner_shard,
+                        tenant,
+                        queue_key,
+                        job_id,
+                        holder_task_id,
+                    } => {
+                        cross_shard_out.push(PendingCrossShardTask::ReleaseRemoteTicket {
+                            queue_owner_shard: *queue_owner_shard,
+                            tenant: tenant.clone(),
+                            queue_key: queue_key.clone(),
+                            job_id: job_id.clone(),
+                            holder_task_id: holder_task_id.clone(),
+                            task_key: entry.key.clone(),
+                        });
+                        // Don't delete task yet - caller will delete after successful RPC
+                        ack_keys.push(entry.key.clone());
+                        processed_internal = true;
+                        continue;
+                    }
                 }
                 let (task_id, tenant, job_id, attempt_number) = match task {
                     Task::RunAttempt {
@@ -313,7 +473,10 @@ impl JobStoreShard {
                     ),
                     Task::RequestTicket { .. }
                     | Task::CheckRateLimit { .. }
-                    | Task::RefreshFloatingLimit { .. } => unreachable!(),
+                    | Task::RefreshFloatingLimit { .. }
+                    | Task::RequestRemoteTicket { .. }
+                    | Task::NotifyRemoteTicketGrant { .. }
+                    | Task::ReleaseRemoteTicket { .. } => unreachable!(),
                 };
 
                 // [SILO-DEQ-2] Look up job info; if missing, delete the task and skip
@@ -330,25 +493,56 @@ impl JobStoreShard {
                         let held_queues = match task {
                             Task::RunAttempt { held_queues, .. } => held_queues.clone(),
                             Task::CheckRateLimit { held_queues, .. } => held_queues.clone(),
-                            Task::RequestTicket { .. } | Task::RefreshFloatingLimit { .. } => {
-                                Vec::new()
-                            }
+                            Task::RequestTicket { .. }
+                            | Task::RefreshFloatingLimit { .. }
+                            | Task::RequestRemoteTicket { .. }
+                            | Task::NotifyRemoteTicketGrant { .. }
+                            | Task::ReleaseRemoteTicket { .. } => Vec::new(),
                         };
                         if !held_queues.is_empty() {
+                            // Separate local and remote queues
+                            let (local_queues, remote_queues) =
+                                partition_held_queues(&held_queues);
+
+                            // Release LOCAL tickets directly
                             let release_events = self
                                 .concurrency
                                 .release_and_grant_next(
                                     &self.db,
                                     &mut batch,
                                     &tenant,
-                                    &held_queues,
+                                    &local_queues,
                                     &task_id,
                                     now_ms,
                                 )
                                 .await
                                 .map_err(JobStoreShardError::Rkyv)?;
                             self.apply_concurrency_events(&tenant, release_events);
-                            tracing::debug!(job_id = %job_id, queues = ?held_queues, "dequeue: released tickets for cancelled job task");
+
+                            // Create ReleaseRemoteTicket tasks for REMOTE tickets
+                            for remote_queue in &remote_queues {
+                                let Some(remote_ref) = RemoteQueueRef::parse(remote_queue) else {
+                                    tracing::warn!(
+                                        remote_queue = %remote_queue,
+                                        "malformed remote queue format, skipping release"
+                                    );
+                                    continue;
+                                };
+
+                                let release_task = Task::ReleaseRemoteTicket {
+                                    task_id: uuid::Uuid::new_v4().to_string(),
+                                    queue_owner_shard: remote_ref.queue_owner_shard,
+                                    tenant: tenant.clone(),
+                                    queue_key: remote_ref.queue_key,
+                                    job_id: job_id.clone(),
+                                    holder_task_id: remote_ref.holder_task_id,
+                                };
+                                let release_val = crate::codec::encode_task(&release_task)?;
+                                let release_key = crate::keys::task_key(now_ms, 0, &job_id, 0);
+                                batch.put(release_key.as_bytes(), &release_val);
+                            }
+
+                            tracing::debug!(job_id = %job_id, local = local_queues.len(), remote = remote_queues.len(), "dequeue: released tickets for cancelled job task");
                         }
 
                         tracing::debug!(job_id = %job_id, "dequeue: skipping cancelled job task");
@@ -448,11 +642,13 @@ impl JobStoreShard {
             worker_id = %worker_id,
             returned = out.len(),
             refresh_tasks = refresh_out.len(),
+            cross_shard_tasks = cross_shard_out.len(),
             "dequeue: completed"
         );
         Ok(DequeueResult {
             tasks: out,
             refresh_tasks: refresh_out,
+            cross_shard_tasks: cross_shard_out,
         })
     }
 

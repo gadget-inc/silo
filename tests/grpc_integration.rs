@@ -26,7 +26,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         // Open shard 0 so the server can find it
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
@@ -167,7 +167,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -300,7 +300,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -426,7 +426,7 @@ async fn grpc_server_query_errors() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -529,7 +529,7 @@ async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -627,7 +627,7 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -740,7 +740,7 @@ async fn grpc_server_query_without_tenant() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -843,7 +843,7 @@ async fn grpc_server_query_arrow_without_tenant() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -934,7 +934,7 @@ async fn grpc_health_check_returns_serving() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -1012,7 +1012,7 @@ async fn grpc_server_lease_tasks_multi_shard() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
 
         // Open 3 shards
         let _ = factory.open(0).await?;
@@ -1123,7 +1123,7 @@ async fn grpc_get_job_includes_status() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -1256,7 +1256,7 @@ async fn grpc_get_job_result_not_found() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -1320,7 +1320,7 @@ async fn grpc_get_job_result_not_terminal() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -1425,7 +1425,7 @@ async fn grpc_get_job_result_success() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -1537,7 +1537,7 @@ async fn grpc_get_job_result_failure() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -1658,7 +1658,7 @@ async fn grpc_get_job_result_cancelled() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -1755,7 +1755,7 @@ async fn grpc_get_job_result_cancelled_while_running() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -1873,7 +1873,7 @@ async fn grpc_server_tenant_validation_when_enabled() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -2029,7 +2029,7 @@ async fn grpc_server_reset_shards_requires_dev_mode() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -2099,7 +2099,7 @@ async fn grpc_server_reset_shards_works_in_dev_mode() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -2199,7 +2199,7 @@ async fn grpc_server_report_outcome_missing_outcome() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -2272,7 +2272,7 @@ async fn grpc_server_get_job_result_for_non_terminal_job() -> anyhow::Result<()>
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -2361,7 +2361,7 @@ async fn grpc_server_enqueue_with_rate_limit() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -2468,7 +2468,7 @@ async fn grpc_server_report_refresh_outcome_missing_outcome() -> anyhow::Result<
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -2542,7 +2542,7 @@ async fn grpc_enqueue_requires_tenant_when_tenancy_enabled() -> anyhow::Result<(
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -2673,7 +2673,7 @@ async fn grpc_restart_cancelled_job() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -2828,7 +2828,7 @@ async fn grpc_restart_failed_job() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -2987,7 +2987,7 @@ async fn grpc_restart_nonexistent_job() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -3054,7 +3054,7 @@ async fn grpc_restart_running_job_fails() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 
@@ -3180,7 +3180,7 @@ async fn grpc_restart_succeeded_job_fails() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, 1);
         let _ = factory.open(0).await?;
         let factory = Arc::new(factory);
 

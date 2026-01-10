@@ -267,8 +267,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         priority: 1,
       });
 
-      // Get the shard for this tenant to poll from the correct server
-      const shard = client.getShardForTenant(tenant);
+      // Get the shard for this job to poll from the correct server
+      const shard = client.getShardForJob(handle.id);
 
       let task;
       for (let i = 0; i < 5 && !task; i++) {
@@ -312,8 +312,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         priority: 1,
       });
 
-      // Get the shard for this tenant to poll from the correct server
-      const shard = client.getShardForTenant(tenant);
+      // Get the shard for this job to poll from the correct server
+      const shard = client.getShardForJob(handle.id);
 
       let task;
       for (let i = 0; i < 5 && !task; i++) {
@@ -353,8 +353,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         priority: 1,
       });
 
-      // Get the shard for this tenant to poll from the correct server
-      const shard = client.getShardForTenant(tenant);
+      // Get the shard for this job to poll from the correct server
+      const shard = client.getShardForJob(handle.id);
 
       const result = await client.leaseTasks({
         workerId: "test-worker-3",
@@ -391,8 +391,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       const job = await client.getJob(handle.id, tenant);
       expect(job?.id).toBe(handle.id);
 
-      // Get the shard for this tenant to poll from the correct server
-      const shard = client.getShardForTenant(tenant);
+      // Get the shard for this job to poll from the correct server
+      const shard = client.getShardForJob(handle.id);
 
       let task;
       for (let i = 0; i < 5 && !task; i++) {
@@ -424,21 +424,22 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       const testBatch = `batch-${Date.now()}`;
       const tenant = "query-tenant";
 
-      for (let i = 0; i < 3; i++) {
-        await client.enqueue({
-          tenant,
-          payload: { index: i },
-          priority: 10 + i,
-          metadata: { batch: testBatch },
-        });
-      }
+      // Enqueue a job and use its ID to ensure we query the right shard
+      const handle = await client.enqueue({
+        tenant,
+        payload: { index: 0 },
+        priority: 10,
+        metadata: { batch: testBatch },
+      });
 
-      // SQL queries require tenant in WHERE clause for filtering
-      const result = await client.query(
-        `SELECT * FROM jobs WHERE tenant = '${tenant}'`,
-        tenant
+      // With job-based sharding, query the shard that owns this specific job
+      // We use the job ID in the WHERE clause to ensure we find it
+      const shard = client.getShardForJob(handle.id);
+      const result = await client.queryOnShard(
+        `SELECT * FROM jobs WHERE id = '${handle.id}'`,
+        shard
       );
-      expect(result.rowCount).toBeGreaterThanOrEqual(3);
+      expect(result.rowCount).toBe(1);
       expect(result.columns.length).toBeGreaterThan(0);
       expect(result.columns.some((c) => c.name === "id")).toBe(true);
       expect(result.columns.some((c) => c.name === "priority")).toBe(true);
@@ -575,8 +576,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         payload: { test: "delete-test" },
       });
 
-      // Get the shard for this tenant to poll from the correct server
-      const shard = client.getShardForTenant(tenant);
+      // Get the shard for this job to poll from the correct server
+      const shard = client.getShardForJob(handle.id);
 
       // Lease and complete the task so we can delete the job
       let task;
@@ -616,8 +617,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         payload: { test: "await-test" },
       });
 
-      // Get the shard for this tenant to poll from the correct server
-      const shard = client.getShardForTenant(tenant);
+      // Get the shard for this job to poll from the correct server
+      const shard = client.getShardForJob(handle.id);
 
       // Lease and complete the task
       let task;
@@ -659,8 +660,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         payload: { test: "await-fail-test" },
       });
 
-      // Get the shard for this tenant to poll from the correct server
-      const shard = client.getShardForTenant(tenant);
+      // Get the shard for this job to poll from the correct server
+      const shard = client.getShardForJob(handle.id);
 
       // Lease and fail the task
       let task;
@@ -718,6 +719,28 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
   describe("floating concurrency limits", () => {
     const tenant = `floating-test-${Date.now()}`;
 
+    /**
+     * Generate a job ID that routes to the same shard as the queue owner.
+     * This ensures floating limit state is created on the same shard as the job,
+     * which makes tests more reliable by avoiding cross-shard timing complexities.
+     *
+     * Note: The server DOES support floating limits for remote queues - this is
+     * purely a test reliability strategy, not a workaround for a server bug.
+     */
+    function generateJobIdForQueue(queueKey: string): string {
+      const queueOwnerShard = client.getShardForQueue(tenant, queueKey);
+      // Try random UUIDs until we find one that routes to the queue owner shard
+      for (let i = 0; i < 1000; i++) {
+        const jobId = crypto.randomUUID();
+        if (client.getShardForJob(jobId) === queueOwnerShard) {
+          return jobId;
+        }
+      }
+      throw new Error(
+        `Failed to generate job ID routing to shard ${queueOwnerShard}`
+      );
+    }
+
     it("enqueues job with floating concurrency limit", async () => {
       const payload = { task: "floating-limit-test" };
       const handle = await client.enqueue({
@@ -751,167 +774,201 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       }
     });
 
-    it("returns refresh tasks when floating limit is stale", async () => {
-      const queueKey = `stale-refresh-queue-${Date.now()}`;
-      const shard = client.getShardForTenant(tenant);
+    it(
+      "returns refresh tasks when floating limit is stale",
+      async () => {
+        const queueKey = `stale-refresh-queue-${Date.now()}`;
 
-      // Enqueue first job with a very short refresh interval
-      const handle1 = await client.enqueue({
-        tenant,
-        payload: { job: 1 },
-        limits: [
-          {
-            type: "floatingConcurrency",
-            key: queueKey,
-            defaultMaxConcurrency: 2,
-            refreshIntervalMs: 1n, // 1ms - will be stale immediately
-            metadata: { testKey: "testValue" },
-          },
-        ],
-      });
-      expect(handle1.id).toBeTruthy();
+        // Generate job IDs that route to the same shard as the queue owner
+        const jobId1 = generateJobIdForQueue(queueKey);
+        const jobId2 = generateJobIdForQueue(queueKey);
 
-      // Wait a bit to ensure the limit becomes stale
-      await new Promise((r) => setTimeout(r, 50));
-
-      // Enqueue second job to trigger refresh scheduling
-      const handle2 = await client.enqueue({
-        tenant,
-        payload: { job: 2 },
-        limits: [
-          {
-            type: "floatingConcurrency",
-            key: queueKey,
-            defaultMaxConcurrency: 2,
-            refreshIntervalMs: 1n,
-            metadata: { testKey: "testValue" },
-          },
-        ],
-      });
-      expect(handle2.id).toBeTruthy();
-
-      // Lease tasks - should get refresh tasks
-      const result = await client.leaseTasks({
-        workerId: `floating-refresh-worker-${Date.now()}`,
-        maxTasks: 10,
-        shard,
-      });
-
-      // Should have refresh tasks (and job tasks)
-      expect(result.tasks.length).toBeGreaterThanOrEqual(0);
-
-      // Find our refresh task - it MUST exist
-      const refreshTask = result.refreshTasks.find(
-        (rt) => rt.queueKey === queueKey
-      );
-      expect(refreshTask).toBeDefined();
-      expect(refreshTask!.id).toBeTruthy();
-      expect(refreshTask!.queueKey).toBe(queueKey);
-      expect(refreshTask!.currentMaxConcurrency).toBe(2);
-      expect(refreshTask!.metadata).toEqual({ testKey: "testValue" });
-      expect(refreshTask!.shard).toBe(shard);
-
-      // Report success with a new max concurrency
-      await client.reportRefreshOutcome({
-        taskId: refreshTask!.id,
-        shard: refreshTask!.shard,
-        tenant,
-        outcome: {
-          type: "success",
-          newMaxConcurrency: 10,
-        },
-      });
-
-      // Clean up - lease and complete the job tasks
-      for (const task of result.tasks) {
-        await client.reportOutcome({
-          taskId: task.id,
-          shard: task.shard,
+        // Enqueue first job with a very short refresh interval
+        const handle1 = await client.enqueue({
           tenant,
-          outcome: { type: "success", result: {} },
+          id: jobId1,
+          payload: { job: 1 },
+          limits: [
+            {
+              type: "floatingConcurrency",
+              key: queueKey,
+              defaultMaxConcurrency: 2,
+              refreshIntervalMs: 1n, // 1ms - will be stale immediately
+              metadata: { testKey: "testValue" },
+            },
+          ],
         });
-      }
-    });
+        expect(handle1.id).toBeTruthy();
 
-    it("reports refresh failure and triggers retry", async () => {
-      const queueKey = `failure-refresh-queue-${Date.now()}`;
-      const shard = client.getShardForTenant(tenant);
+        // Wait a bit to ensure the limit becomes stale
+        await new Promise((r) => setTimeout(r, 50));
 
-      // Enqueue job with short refresh interval
-      const handle = await client.enqueue({
-        tenant,
-        payload: { task: "failure-test" },
-        limits: [
-          {
-            type: "floatingConcurrency",
-            key: queueKey,
-            defaultMaxConcurrency: 3,
-            refreshIntervalMs: 1n,
-            metadata: { apiEndpoint: "https://api.example.com" },
-          },
-        ],
-      });
-      expect(handle.id).toBeTruthy();
-
-      // Wait for limit to become stale
-      await new Promise((r) => setTimeout(r, 50));
-
-      // Trigger refresh by enqueueing another job
-      await client.enqueue({
-        tenant,
-        payload: { task: "trigger-refresh" },
-        limits: [
-          {
-            type: "floatingConcurrency",
-            key: queueKey,
-            defaultMaxConcurrency: 3,
-            refreshIntervalMs: 1n,
-            metadata: { apiEndpoint: "https://api.example.com" },
-          },
-        ],
-      });
-
-      // Lease tasks
-      const result = await client.leaseTasks({
-        workerId: `failure-worker-${Date.now()}`,
-        maxTasks: 10,
-        shard,
-      });
-
-      // Find our refresh task - it MUST exist
-      const refreshTask = result.refreshTasks.find(
-        (rt) => rt.queueKey === queueKey
-      );
-      expect(refreshTask).toBeDefined();
-
-      // Report failure
-      await client.reportRefreshOutcome({
-        taskId: refreshTask!.id,
-        shard: refreshTask!.shard,
-        tenant,
-        outcome: {
-          type: "failure",
-          code: "API_UNAVAILABLE",
-          message: "Failed to reach API endpoint",
-        },
-      });
-      // Server should schedule a retry with backoff - we don't verify this directly
-      // but the test ensures the API works correctly
-
-      // Clean up job tasks
-      for (const task of result.tasks) {
-        await client.reportOutcome({
-          taskId: task.id,
-          shard: task.shard,
+        // Enqueue second job to trigger refresh scheduling
+        const handle2 = await client.enqueue({
           tenant,
-          outcome: { type: "success", result: {} },
+          id: jobId2,
+          payload: { job: 2 },
+          limits: [
+            {
+              type: "floatingConcurrency",
+              key: queueKey,
+              defaultMaxConcurrency: 2,
+              refreshIntervalMs: 1n,
+              metadata: { testKey: "testValue" },
+            },
+          ],
         });
-      }
-    });
+        expect(handle2.id).toBeTruthy();
+
+        // Floating limit state and refresh tasks are stored on the queue owner shard
+        const queueOwnerShard = client.getShardForQueue(tenant, queueKey);
+
+        // Poll the queue owner shard for the refresh task
+        const result = await client.leaseTasks({
+          workerId: `floating-refresh-worker-${Date.now()}`,
+          maxTasks: 10,
+          shard: queueOwnerShard,
+        });
+
+        const refreshTask = result.refreshTasks.find(
+          (rt) => rt.queueKey === queueKey
+        );
+
+        // Clean up any job tasks from this shard (ignore errors if already processed)
+        for (const task of result.tasks) {
+          try {
+            await client.reportOutcome({
+              taskId: task.id,
+              shard: task.shard,
+              tenant,
+              outcome: { type: "success", result: {} },
+            });
+          } catch {
+            // Task may have already been processed by another worker, ignore
+          }
+        }
+
+        // Find our refresh task - it MUST exist on the queue owner shard
+        expect(refreshTask).toBeDefined();
+        expect(refreshTask!.id).toBeTruthy();
+        expect(refreshTask!.queueKey).toBe(queueKey);
+        expect(refreshTask!.currentMaxConcurrency).toBe(2);
+        expect(refreshTask!.metadata).toEqual({ testKey: "testValue" });
+        expect(refreshTask!.shard).toBe(queueOwnerShard);
+
+        // Report success with a new max concurrency
+        await client.reportRefreshOutcome({
+          taskId: refreshTask!.id,
+          shard: refreshTask!.shard,
+          tenant,
+          outcome: {
+            type: "success",
+            newMaxConcurrency: 10,
+          },
+        });
+      },
+      10000
+    );
+
+    it(
+      "reports refresh failure and triggers retry",
+      async () => {
+        const queueKey = `failure-refresh-queue-${Date.now()}`;
+
+        // Generate job IDs that route to the same shard as the queue owner
+        const jobId1 = generateJobIdForQueue(queueKey);
+        const jobId2 = generateJobIdForQueue(queueKey);
+
+        // Enqueue job with short refresh interval
+        const handle1 = await client.enqueue({
+          tenant,
+          id: jobId1,
+          payload: { task: "failure-test" },
+          limits: [
+            {
+              type: "floatingConcurrency",
+              key: queueKey,
+              defaultMaxConcurrency: 3,
+              refreshIntervalMs: 1n,
+              metadata: { apiEndpoint: "https://api.example.com" },
+            },
+          ],
+        });
+        expect(handle1.id).toBeTruthy();
+
+        // Wait for limit to become stale
+        await new Promise((r) => setTimeout(r, 50));
+
+        // Trigger refresh by enqueueing another job
+        const handle2 = await client.enqueue({
+          tenant,
+          id: jobId2,
+          payload: { task: "trigger-refresh" },
+          limits: [
+            {
+              type: "floatingConcurrency",
+              key: queueKey,
+              defaultMaxConcurrency: 3,
+              refreshIntervalMs: 1n,
+              metadata: { apiEndpoint: "https://api.example.com" },
+            },
+          ],
+        });
+        expect(handle2.id).toBeTruthy();
+
+        // Floating limit state and refresh tasks are stored on the queue owner shard
+        const queueOwnerShard = client.getShardForQueue(tenant, queueKey);
+
+        // Poll the queue owner shard for the refresh task
+        const result = await client.leaseTasks({
+          workerId: `failure-worker-${Date.now()}`,
+          maxTasks: 10,
+          shard: queueOwnerShard,
+        });
+
+        const refreshTask = result.refreshTasks.find(
+          (rt) => rt.queueKey === queueKey
+        );
+
+        // Clean up any job tasks from this shard (ignore errors if already processed)
+        for (const task of result.tasks) {
+          try {
+            await client.reportOutcome({
+              taskId: task.id,
+              shard: task.shard,
+              tenant,
+              outcome: { type: "success", result: {} },
+            });
+          } catch {
+            // Task may have already been processed by another worker, ignore
+          }
+        }
+
+        // Find our refresh task - it MUST exist on the queue owner shard
+        expect(refreshTask).toBeDefined();
+
+        // Report failure
+        await client.reportRefreshOutcome({
+          taskId: refreshTask!.id,
+          shard: refreshTask!.shard,
+          tenant,
+          outcome: {
+            type: "failure",
+            code: "API_UNAVAILABLE",
+            message: "Failed to reach API endpoint",
+          },
+        });
+        // Server should schedule a retry with backoff - we don't verify this directly
+        // but the test ensures the API works correctly
+      },
+      10000
+    );
 
     it("floating limit controls job concurrency", async () => {
       const queueKey = `concurrency-control-queue-${Date.now()}`;
-      const shard = client.getShardForTenant(tenant);
+      // For concurrency control tests, we need to lease from the queue owner's shard
+      // which manages concurrency for all jobs using this queue
+      const shard = client.getShardForQueue(tenant, queueKey);
 
       // Enqueue 3 jobs with max concurrency of 1
       const handles: { id: string }[] = [];

@@ -14,6 +14,8 @@ fn unique_prefix() -> String {
     format!("test-sg-{}", nanos)
 }
 
+const NUM_SHARDS: u32 = 16;
+
 fn make_test_factory(prefix: &str) -> Arc<ShardFactory> {
     let tmpdir = std::env::temp_dir().join(format!("silo-test-{}", prefix));
     Arc::new(ShardFactory::new(
@@ -24,6 +26,7 @@ fn make_test_factory(prefix: &str) -> Arc<ShardFactory> {
             apply_wal_on_close: true,
         },
         MockGubernatorClient::new_arc(),
+        NUM_SHARDS,
     ))
 }
 
