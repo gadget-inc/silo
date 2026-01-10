@@ -27,11 +27,12 @@ use std::sync::Mutex;
 use slatedb::{Db, DbIterator, WriteBatch};
 
 use crate::codec::{
-    decode_concurrency_action, encode_concurrency_action, encode_holder, encode_task,
+    decode_concurrency_action, decode_remote_concurrency_request, encode_concurrency_action,
+    encode_holder, encode_remote_holder_record, encode_task,
 };
 use crate::job::{ConcurrencyLimit, JobView};
 use crate::keys::{concurrency_holder_key, concurrency_request_key, job_cancelled_key, task_key};
-use crate::task::{ConcurrencyAction, HolderRecord, Task};
+use crate::task::{ConcurrencyAction, HolderRecord, RemoteHolderRecord, Task};
 
 #[derive(Debug, Clone)]
 pub enum MemoryEvent {
@@ -236,6 +237,7 @@ impl ConcurrencyManager {
                 job_id: job_id.to_string(),
                 attempt_number: 1,
                 request_id: request_id.clone(),
+                held_queues: Vec::new(), // First limit, no prior held queues
             };
             let ticket_value = encode_task(&ticket)?;
             batch.put(
@@ -258,8 +260,8 @@ impl ConcurrencyManager {
         tenant: &str,
         queue: &str,
         request_id: &str,
-        _job_id: &str,
-        _attempt_number: u32,
+        job_id: &str,
+        attempt_number: u32,
         now_ms: i64,
         job_view: Option<&JobView>,
     ) -> Result<RequestTicketTaskOutcome, String> {
@@ -270,16 +272,26 @@ impl ConcurrencyManager {
         };
 
         // Determine max concurrency for this queue
-        let mut max_allowed: usize = 1;
-        for lim in view.concurrency_limits() {
-            if lim.key == queue {
-                max_allowed = lim.max_concurrency as usize;
-                break;
-            }
-        }
+        // This handles both ConcurrencyLimit and FloatingConcurrencyLimit
+        let max_allowed: usize = view.max_concurrency_for_queue(queue).unwrap_or(1) as usize;
 
         // Check if can grant
         if !self.counts.can_grant(tenant, queue, max_allowed) {
+            // Queue is full - create a request record so this job will be granted later
+            let priority = view.priority();
+            let start_time_ms = view.enqueue_time_ms();
+            append_request_edits(
+                batch,
+                tenant,
+                queue,
+                now_ms,
+                start_time_ms,
+                priority,
+                job_id,
+                attempt_number,
+            )?;
+            // Delete the RequestTicket task since we've created the request record
+            batch.delete(task_key.as_bytes());
             return Ok(RequestTicketTaskOutcome::Requested);
         }
 
@@ -385,6 +397,26 @@ fn append_request_edits(
     Ok(())
 }
 
+/// Represents a pending concurrency request (either local or remote)
+enum PendingRequest {
+    /// Local request - job is on this shard
+    Local {
+        start_time_ms: i64,
+        priority: u8,
+        job_id: String,
+        attempt_number: u32,
+        request_id: String,
+    },
+    /// Remote request - job is on a different shard
+    Remote {
+        source_shard: u32,
+        job_id: String,
+        request_id: String,
+        attempt_number: u32,
+        holder_task_id: String,
+    },
+}
+
 async fn append_release_and_grant_next(
     db: &Db,
     batch: &mut WriteBatch,
@@ -413,20 +445,69 @@ async fn append_release_and_grant_next(
             .map_err(|e| e.to_string())?;
 
         while let Some(kv) = iter.next().await.map_err(|e| e.to_string())? {
-            type ArchivedAction = <ConcurrencyAction as rkyv::Archive>::Archived;
-            let decoded = decode_concurrency_action(&kv.value)?;
-            let a: &ArchivedAction = decoded.archived();
-            match a {
-                ArchivedAction::EnqueueTask {
+            // Parse the key to extract start_time_ms for ordering check
+            // Key format: requests/<tenant>/<queue>/<start_time_ms>/<priority>/<request_id>
+            let req_key_str = String::from_utf8_lossy(&kv.key).to_string();
+            let parts: Vec<&str> = req_key_str.split('/').collect();
+            if parts.len() < 6 {
+                tracing::warn!(key = %req_key_str, "grant_next: malformed request key");
+                continue;
+            }
+            let key_start_time_ms: i64 = parts[3].parse().unwrap_or(0);
+            let _key_priority: u8 = parts[4].parse().unwrap_or(99);
+            let key_request_id = parts[5].to_string();
+
+            if key_start_time_ms > now_ms {
+                // Not ready yet; leave request for later and stop searching
+                // (requests are ordered by time, so subsequent ones are also not ready)
+                break;
+            }
+
+            // Try to decode as local ConcurrencyAction first, then as RemoteConcurrencyRequest
+            let pending_request: PendingRequest =
+                if let Ok(decoded) = decode_concurrency_action(&kv.value) {
+                    type ArchivedAction = <ConcurrencyAction as rkyv::Archive>::Archived;
+                    let a: &ArchivedAction = decoded.archived();
+                    match a {
+                        ArchivedAction::EnqueueTask {
+                            start_time_ms,
+                            priority,
+                            job_id,
+                            attempt_number,
+                        } => PendingRequest::Local {
+                            start_time_ms: *start_time_ms,
+                            priority: *priority,
+                            job_id: job_id.as_str().to_string(),
+                            attempt_number: *attempt_number,
+                            request_id: key_request_id.clone(),
+                        },
+                    }
+                } else if let Ok(decoded) = decode_remote_concurrency_request(&kv.value) {
+                    PendingRequest::Remote {
+                        source_shard: decoded.source_shard(),
+                        job_id: decoded.job_id().to_string(),
+                        request_id: decoded.request_id().to_string(),
+                        attempt_number: decoded.attempt_number(),
+                        holder_task_id: decoded.holder_task_id().to_string(),
+                    }
+                } else {
+                    tracing::warn!(
+                        key = %req_key_str,
+                        "grant_next: unable to decode request as local or remote"
+                    );
+                    continue;
+                };
+
+            match pending_request {
+                PendingRequest::Local {
                     start_time_ms,
                     priority,
                     job_id,
                     attempt_number,
+                    request_id,
                 } => {
-                    let job_id_str = job_id.as_str();
-
                     // [SILO-GRANT-CXL] Check if job is cancelled - if so, delete request and continue
-                    let cancelled_key = job_cancelled_key(tenant, job_id_str);
+                    let cancelled_key = job_cancelled_key(tenant, &job_id);
                     let is_cancelled = db
                         .get(cancelled_key.as_bytes())
                         .await
@@ -437,20 +518,11 @@ async fn append_release_and_grant_next(
                         // [SILO-GRANT-CXL-2] Delete the cancelled request without granting
                         batch.delete(&kv.key);
                         tracing::debug!(
-                            job_id = %job_id_str,
+                            job_id = %job_id,
                             queue = %queue,
                             "grant_next: skipping cancelled job request"
                         );
                         continue;
-                    }
-
-                    let req_key_str = String::from_utf8_lossy(&kv.key).to_string();
-                    let request_id = req_key_str.split('/').next_back().unwrap_or("").to_string();
-
-                    if *start_time_ms > now_ms {
-                        // Not ready yet; leave request for later and stop searching
-                        // (requests are ordered by time, so subsequent ones are also not ready)
-                        break;
                     }
 
                     // [SILO-GRANT-3] Create holder for this task/queue
@@ -467,19 +539,79 @@ async fn append_release_and_grant_next(
                     let task = Task::RunAttempt {
                         id: request_id.clone(),
                         tenant: tenant.to_string(),
-                        job_id: job_id_str.to_string(),
-                        attempt_number: *attempt_number,
+                        job_id: job_id.clone(),
+                        attempt_number,
                         held_queues: vec![queue.clone()],
                     };
                     let tval = encode_task(&task)?;
                     batch.put(
-                        task_key(*start_time_ms, *priority, job_id_str, *attempt_number).as_bytes(),
+                        task_key(start_time_ms, priority, &job_id, attempt_number).as_bytes(),
                         &tval,
                     );
                     batch.delete(&kv.key);
                     events.push(MemoryEvent::Granted {
                         queue: queue.clone(),
                         task_id: request_id,
+                    });
+
+                    // Only grant one request per release
+                    break;
+                }
+                PendingRequest::Remote {
+                    source_shard,
+                    job_id,
+                    request_id,
+                    attempt_number,
+                    holder_task_id,
+                } => {
+                    // For remote requests, we don't check cancellation locally
+                    // (the job shard will handle that when it receives the grant notification)
+
+                    // Create remote holder record
+                    let holder = RemoteHolderRecord {
+                        granted_at_ms: now_ms,
+                        source_shard,
+                        job_id: job_id.clone(),
+                    };
+                    let holder_val = encode_remote_holder_record(&holder)?;
+                    batch.put(
+                        concurrency_holder_key(tenant, queue, &holder_task_id).as_bytes(),
+                        &holder_val,
+                    );
+
+                    // Create NotifyRemoteTicketGrant task to inform the job shard
+                    // Note: held_queues are tracked on the job shard side, not passed through RPC
+                    let notify_task = Task::NotifyRemoteTicketGrant {
+                        task_id: uuid::Uuid::new_v4().to_string(),
+                        job_shard: source_shard,
+                        tenant: tenant.to_string(),
+                        job_id: job_id.clone(),
+                        queue_key: queue.clone(),
+                        request_id: request_id.clone(),
+                        holder_task_id: holder_task_id.clone(),
+                        attempt_number,
+                    };
+                    let tval = encode_task(&notify_task)?;
+                    // Schedule notification task immediately (priority 0 for internal tasks)
+                    batch.put(
+                        task_key(now_ms, 0, &holder_task_id, 0).as_bytes(),
+                        &tval,
+                    );
+                    batch.delete(&kv.key);
+
+                    tracing::debug!(
+                        tenant = %tenant,
+                        queue = %queue,
+                        job_id = %job_id,
+                        source_shard = source_shard,
+                        request_id = %request_id,
+                        holder_task_id = %holder_task_id,
+                        "grant_next: granting to remote request"
+                    );
+
+                    events.push(MemoryEvent::Granted {
+                        queue: queue.clone(),
+                        task_id: holder_task_id,
                     });
 
                     // Only grant one request per release

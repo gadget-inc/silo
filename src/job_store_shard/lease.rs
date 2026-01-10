@@ -10,7 +10,7 @@ use crate::codec::{
 use crate::concurrency::MemoryEvent;
 use crate::job::{FloatingLimitState, JobStatus, JobView};
 use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt};
-use crate::job_store_shard::helpers::{now_epoch_ms, put_task};
+use crate::job_store_shard::helpers::{self, now_epoch_ms, put_task, release_held_tickets};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{attempt_key, floating_limit_state_key, job_info_key, leased_task_key};
 use crate::task::{HeartbeatResult, LeaseRecord, Task, DEFAULT_LEASE_MS};
@@ -154,19 +154,56 @@ impl JobStoreShard {
                     let view = JobView::new(jbytes)?;
                     let priority = view.priority();
                     let failures_so_far = attempt_number;
+                    let limits = view.limits();
+
+                    // Check if the job has concurrency limits
+                    let has_concurrency_limit = limits.iter().any(|l| {
+                        matches!(
+                            l,
+                            crate::job::Limit::Concurrency(_)
+                                | crate::job::Limit::FloatingConcurrency(_)
+                        )
+                    });
+
                     if let Some(policy_rt) = view.retry_policy() {
                         if let Some(next_time) =
                             crate::retry::next_retry_time_ms(now_ms, failures_so_far, &policy_rt)
                         {
                             // [SILO-RETRY-5] Enqueue new task to DB queue for retry
                             let next_attempt_number = attempt_number + 1;
-                            let next_task = Task::RunAttempt {
-                                id: Uuid::new_v4().to_string(),
-                                tenant: tenant.to_string(),
-                                job_id: job_id.clone(),
-                                attempt_number: next_attempt_number,
-                                held_queues: held_queues_local.clone(),
+                            let next_task_id = Uuid::new_v4().to_string();
+
+                            // If the job has concurrency limits, create a RequestTicket or
+                            // RequestRemoteTicket task so the concurrency system properly
+                            // re-acquires a ticket. The previous attempt's ticket will be
+                            // released by release_and_grant_next below, so the retry must
+                            // compete for a new ticket.
+                            let next_task = if has_concurrency_limit {
+                                let first_limit = limits.first().unwrap();
+                                helpers::create_ticket_request_task_with_batch(
+                                    &mut batch,
+                                    first_limit,
+                                    tenant,
+                                    &job_id,
+                                    next_attempt_number,
+                                    priority,
+                                    next_time,
+                                    &next_task_id,
+                                    Vec::new(), // New attempt starts with no held queues
+                                    self.shard_number,
+                                    self.num_shards,
+                                )?
+                            } else {
+                                // No concurrency limits - create RunAttempt directly
+                                Task::RunAttempt {
+                                    id: next_task_id.clone(),
+                                    tenant: tenant.to_string(),
+                                    job_id: job_id.clone(),
+                                    attempt_number: next_attempt_number,
+                                    held_queues: Vec::new(),
+                                }
                             };
+
                             put_task(
                                 &mut batch,
                                 next_time,
@@ -198,18 +235,17 @@ impl JobStoreShard {
 
         // [SILO-REL-1] Release any held concurrency tickets
         // This also handles [SILO-GRANT-*] granting to next waiting request
-        let release_events: Vec<MemoryEvent> = self
-            .concurrency
-            .release_and_grant_next(
-                &self.db,
-                &mut batch,
-                tenant,
-                &held_queues_local,
-                task_id,
-                now_ms,
-            )
-            .await
-            .map_err(JobStoreShardError::Rkyv)?;
+        let release_events: Vec<MemoryEvent> = release_held_tickets(
+            &self.db,
+            &mut batch,
+            &self.concurrency,
+            tenant,
+            &job_id,
+            task_id,
+            &held_queues_local,
+            now_ms,
+        )
+        .await?;
 
         self.db.write(batch).await?;
         self.db.flush().await?;

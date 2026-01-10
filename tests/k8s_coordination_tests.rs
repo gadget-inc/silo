@@ -41,7 +41,7 @@ fn get_namespace() -> String {
     std::env::var("TEST_K8S_NAMESPACE").unwrap_or_else(|_| "default".to_string())
 }
 
-fn make_test_factory(node_id: &str) -> Arc<ShardFactory> {
+fn make_test_factory(node_id: &str, num_shards: u32) -> Arc<ShardFactory> {
     let tmpdir = std::env::temp_dir().join(format!("silo-k8s-test-{}", node_id));
     Arc::new(ShardFactory::new(
         DatabaseTemplate {
@@ -51,6 +51,7 @@ fn make_test_factory(node_id: &str) -> Arc<ShardFactory> {
             apply_wal_on_close: true,
         },
         MockGubernatorClient::new_arc(),
+        num_shards,
     ))
 }
 
@@ -73,7 +74,7 @@ where
 /// Start a K8S coordinator, skipping the test if K8S is not available
 macro_rules! start_coordinator {
     ($namespace:expr, $prefix:expr, $node_id:expr, $grpc_addr:expr, $num_shards:expr) => {{
-        let factory = make_test_factory($node_id);
+        let factory = make_test_factory($node_id, $num_shards);
         match K8sCoordinator::start(
             $namespace,
             $prefix,
@@ -155,7 +156,7 @@ async fn k8s_multiple_nodes_partition_shards() {
         "http://127.0.0.1:50052",
         num_shards,
         10,
-        make_test_factory("test-node-2"),
+        make_test_factory("test-node-2", num_shards),
     )
     .await
     .expect("start c2");
@@ -219,7 +220,7 @@ async fn k8s_rebalances_on_membership_change() {
         "http://127.0.0.1:50052",
         num_shards,
         10,
-        make_test_factory("test-node-2"),
+        make_test_factory("test-node-2", num_shards),
     )
     .await
     .expect("start c2");
@@ -271,7 +272,7 @@ async fn k8s_three_nodes_even_distribution() {
         "http://127.0.0.1:50052",
         num_shards,
         10,
-        make_test_factory("node-2"),
+        make_test_factory("node-2", num_shards),
     )
     .await
     .expect("start c2");
@@ -282,7 +283,7 @@ async fn k8s_three_nodes_even_distribution() {
         "http://127.0.0.1:50053",
         num_shards,
         10,
-        make_test_factory("node-3"),
+        make_test_factory("node-3", num_shards),
     )
     .await
     .expect("start c3");
@@ -353,7 +354,7 @@ async fn k8s_removing_node_rebalances() {
         "http://127.0.0.1:50052",
         num_shards,
         10,
-        make_test_factory("node-2"),
+        make_test_factory("node-2", num_shards),
     )
     .await
     .expect("start c2");
@@ -364,7 +365,7 @@ async fn k8s_removing_node_rebalances() {
         "http://127.0.0.1:50053",
         num_shards,
         10,
-        make_test_factory("node-3"),
+        make_test_factory("node-3", num_shards),
     )
     .await
     .expect("start c3");
@@ -430,7 +431,7 @@ async fn k8s_rapid_membership_churn_converges() {
         "http://127.0.0.1:50052",
         num_shards,
         10,
-        make_test_factory("node-2"),
+        make_test_factory("node-2", num_shards),
     )
     .await
     .expect("start c2");
@@ -443,7 +444,7 @@ async fn k8s_rapid_membership_churn_converges() {
         "http://127.0.0.1:50053",
         num_shards,
         10,
-        make_test_factory("node-3"),
+        make_test_factory("node-3", num_shards),
     )
     .await
     .expect("start c3");
@@ -462,7 +463,7 @@ async fn k8s_rapid_membership_churn_converges() {
         "http://127.0.0.1:50052",
         num_shards,
         10,
-        make_test_factory("node-2-restart"),
+        make_test_factory("node-2-restart", num_shards),
     )
     .await
     .expect("restart c2");
@@ -529,7 +530,7 @@ async fn k8s_get_members_returns_correct_info() {
         "http://10.0.0.2:50052",
         num_shards,
         10,
-        make_test_factory("member-node-2"),
+        make_test_factory("member-node-2", num_shards),
     )
     .await
     .expect("start c2");
@@ -594,7 +595,7 @@ async fn k8s_get_shard_owner_map_accurate() {
         "http://10.0.0.2:50052",
         num_shards,
         10,
-        make_test_factory("map-node-2"),
+        make_test_factory("map-node-2", num_shards),
     )
     .await
     .expect("start c2");
@@ -675,6 +676,9 @@ async fn make_k8s_guard(
     ),
     String,
 > {
+    // Use a reasonable default num_shards for shard guard tests
+    const TEST_NUM_SHARDS: u32 = 256;
+
     let client = kube::Client::try_default()
         .await
         .map_err(|e| format!("K8S not available: {}", e))?;
@@ -694,7 +698,7 @@ async fn make_k8s_guard(
 
     let runner = guard.clone();
     let owned_arc = owned.clone();
-    let factory = make_test_factory(node_id);
+    let factory = make_test_factory(node_id, TEST_NUM_SHARDS);
     let handle = tokio::spawn(async move {
         runner.run(owned_arc, factory).await;
     });
@@ -1054,7 +1058,7 @@ async fn k8s_no_split_brain_during_transitions() {
         "http://127.0.0.1:50052",
         num_shards,
         10,
-        make_test_factory("brain-node-2"),
+        make_test_factory("brain-node-2", num_shards),
     )
     .await
     .expect("start c2");
@@ -1071,7 +1075,7 @@ async fn k8s_no_split_brain_during_transitions() {
         "http://127.0.0.1:50053",
         num_shards,
         10,
-        make_test_factory("brain-node-3"),
+        make_test_factory("brain-node-3", num_shards),
     )
     .await
     .expect("start c3");
@@ -1145,7 +1149,7 @@ async fn k8s_prompt_acquisition_after_node_departure() {
         "http://127.0.0.1:50052",
         num_shards,
         10,
-        make_test_factory("prompt-node-2"),
+        make_test_factory("prompt-node-2", num_shards),
     )
     .await
     .expect("start c2");
@@ -1219,7 +1223,7 @@ async fn k8s_multiple_add_remove_cycles() {
             "http://127.0.0.1:50052",
             num_shards,
             10,
-            make_test_factory(&format!("cycle-node-2-iter-{}", i)),
+            make_test_factory(&format!("cycle-node-2-iter-{}", i), num_shards),
         )
         .await
         .expect("start c2");
@@ -1287,7 +1291,7 @@ async fn k8s_four_node_cluster() {
         "http://127.0.0.1:50052",
         num_shards,
         10,
-        make_test_factory("four-node-2"),
+        make_test_factory("four-node-2", num_shards),
     )
     .await
     .expect("start c2");
@@ -1300,7 +1304,7 @@ async fn k8s_four_node_cluster() {
         "http://127.0.0.1:50053",
         num_shards,
         10,
-        make_test_factory("four-node-3"),
+        make_test_factory("four-node-3", num_shards),
     )
     .await
     .expect("start c3");
@@ -1313,7 +1317,7 @@ async fn k8s_four_node_cluster() {
         "http://127.0.0.1:50054",
         num_shards,
         10,
-        make_test_factory("four-node-4"),
+        make_test_factory("four-node-4", num_shards),
     )
     .await
     .expect("start c4");
@@ -1610,7 +1614,7 @@ async fn k8s_node_restart_same_id() {
         "http://127.0.0.1:50051",
         num_shards,
         10,
-        make_test_factory("restart-node-2"),
+        make_test_factory("restart-node-2", num_shards),
     )
     .await
     .expect("restart node");
@@ -1668,7 +1672,7 @@ async fn k8s_simultaneous_node_additions() {
         "http://127.0.0.1:50051",
         num_shards,
         10,
-        make_test_factory("simul-1"),
+        make_test_factory("simul-1", num_shards),
     );
     let f2 = K8sCoordinator::start(
         &namespace,
@@ -1677,7 +1681,7 @@ async fn k8s_simultaneous_node_additions() {
         "http://127.0.0.1:50052",
         num_shards,
         10,
-        make_test_factory("simul-2"),
+        make_test_factory("simul-2", num_shards),
     );
     let f3 = K8sCoordinator::start(
         &namespace,
@@ -1686,7 +1690,7 @@ async fn k8s_simultaneous_node_additions() {
         "http://127.0.0.1:50053",
         num_shards,
         10,
-        make_test_factory("simul-3"),
+        make_test_factory("simul-3", num_shards),
     );
 
     let (r1, r2, r3) = tokio::join!(f1, f2, f3);
@@ -1758,7 +1762,7 @@ async fn k8s_concurrent_shutdown_multiple_nodes() {
         "http://127.0.0.1:50052",
         num_shards,
         10,
-        make_test_factory("conc-shut-2"),
+        make_test_factory("conc-shut-2", num_shards),
     )
     .await
     .expect("c2");
@@ -1769,7 +1773,7 @@ async fn k8s_concurrent_shutdown_multiple_nodes() {
         "http://127.0.0.1:50053",
         num_shards,
         10,
-        make_test_factory("conc-shut-3"),
+        make_test_factory("conc-shut-3", num_shards),
     )
     .await
     .expect("c3");
@@ -1819,7 +1823,7 @@ async fn k8s_short_lease_ttl() {
         "http://127.0.0.1:50051",
         num_shards,
         short_ttl,
-        make_test_factory("short-ttl-1"),
+        make_test_factory("short-ttl-1", num_shards),
     )
     .await
     {
@@ -1956,7 +1960,7 @@ async fn k8s_ownership_stability_during_steady_state() {
         "http://127.0.0.1:50052",
         num_shards,
         10,
-        make_test_factory("stable-2"),
+        make_test_factory("stable-2", num_shards),
     )
     .await
     .expect("c2");
@@ -2071,7 +2075,7 @@ async fn k8s_graceful_shutdown_releases_shards_promptly() {
         "http://127.0.0.1:50051",
         num_shards,
         short_ttl,
-        make_test_factory("graceful-1"),
+        make_test_factory("graceful-1", num_shards),
     )
     .await
     {
@@ -2088,7 +2092,7 @@ async fn k8s_graceful_shutdown_releases_shards_promptly() {
         "http://127.0.0.1:50052",
         num_shards,
         short_ttl,
-        make_test_factory("graceful-2"),
+        make_test_factory("graceful-2", num_shards),
     )
     .await
     .expect("c2");

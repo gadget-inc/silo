@@ -160,3 +160,10 @@ pub fn floating_limit_state_key(tenant: &str, queue_key: &str) -> String {
         escape_segment(queue_key)
     )
 }
+
+/// The KV store key for tracking tickets already acquired while acquiring more via remote RPCs.
+/// This stores held_queues locally so we don't need to pass them through RPCs.
+/// Key format: held_tickets/<job-id>/<attempt>/<request_id>
+pub fn held_ticket_state_key(job_id: &str, attempt: u32, request_id: &str) -> String {
+    format!("held_tickets/{}/{}/{}", job_id, attempt, request_id)
+}

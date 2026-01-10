@@ -44,3 +44,7 @@
 - [ ] waiting state? that matches the gadget ui, but we dont have it modeled because it changes in time without anything else changing
   - [ ] do we need to be able to query for it in the SQL layer? probably
 - [ ] worker <=> server GRPC auth
+- [ ] explore widely distributed task processing
+  - [ ] rpcs for ticket acquisition and release
+  - [ ] query layer needs to query all shards
+- [ ] explore if we need multiple top level task queues or not

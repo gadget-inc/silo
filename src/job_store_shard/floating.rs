@@ -11,7 +11,7 @@ use crate::job::{FloatingConcurrencyLimit, FloatingLimitState};
 use crate::job_store_shard::helpers::now_epoch_ms;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{floating_limit_state_key, leased_task_key};
-use crate::task::Task;
+use crate::task::{FloatingConcurrencyLimitData, Task};
 
 impl JobStoreShard {
     /// Get or create the floating limit state for a given queue key.
@@ -47,6 +47,104 @@ impl JobStoreShard {
 
         // Decode what we just encoded so we return the same type
         Ok(decode_floating_limit_state(&state_bytes)?)
+    }
+
+    /// Handle floating limit state for a remote ticket request.
+    ///
+    /// This is called by `receive_remote_ticket_request` when a job on another shard
+    /// requests a ticket from a floating limit queue owned by this shard.
+    ///
+    /// Returns the effective max_concurrency to use for the can_grant check.
+    pub(crate) async fn ensure_floating_limit_state_for_remote(
+        &self,
+        batch: &mut WriteBatch,
+        tenant: &str,
+        queue_key: &str,
+        fl: &FloatingConcurrencyLimitData,
+        now_ms: i64,
+    ) -> Result<u32, JobStoreShardError> {
+        let state_key = floating_limit_state_key(tenant, queue_key);
+        let maybe_state = self.db.get(state_key.as_bytes()).await?;
+
+        let (effective_max, needs_refresh_scheduling) = if let Some(state_bytes) = maybe_state {
+            // State exists - use current value and check if refresh needed
+            if let Ok(decoded) = decode_floating_limit_state(&state_bytes) {
+                let archived = decoded.archived();
+                let stale = (now_ms - archived.last_refreshed_at_ms) > fl.refresh_interval_ms;
+                let needs_schedule = stale && !archived.refresh_task_scheduled;
+
+                // If we need to schedule a refresh, update the state to mark it scheduled
+                if needs_schedule {
+                    let updated_state = FloatingLimitState {
+                        current_max_concurrency: archived.current_max_concurrency,
+                        default_max_concurrency: archived.default_max_concurrency,
+                        refresh_interval_ms: archived.refresh_interval_ms,
+                        last_refreshed_at_ms: archived.last_refreshed_at_ms,
+                        refresh_task_scheduled: true,
+                        retry_count: archived.retry_count,
+                        next_retry_at_ms: archived.next_retry_at_ms.as_ref().copied(),
+                        metadata: archived
+                            .metadata
+                            .iter()
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect(),
+                    };
+                    let state_val = encode_floating_limit_state(&updated_state)?;
+                    batch.put(state_key.as_bytes(), &state_val);
+                    (updated_state.current_max_concurrency, true)
+                } else {
+                    (archived.current_max_concurrency, false)
+                }
+            } else {
+                // Failed to decode, treat as missing - use default
+                (fl.default_max_concurrency, false)
+            }
+        } else {
+            // No state exists - create it from the floating limit definition
+            tracing::info!(
+                tenant = tenant,
+                queue_key = queue_key,
+                default_max_concurrency = fl.default_max_concurrency,
+                "creating floating limit state for remote queue"
+            );
+            let new_state = FloatingLimitState {
+                current_max_concurrency: fl.default_max_concurrency,
+                default_max_concurrency: fl.default_max_concurrency,
+                refresh_interval_ms: fl.refresh_interval_ms,
+                last_refreshed_at_ms: now_ms,
+                refresh_task_scheduled: false,
+                retry_count: 0,
+                next_retry_at_ms: None,
+                metadata: fl.metadata.clone(),
+            };
+            let state_val = encode_floating_limit_state(&new_state)?;
+            batch.put(state_key.as_bytes(), &state_val);
+            (fl.default_max_concurrency, false)
+        };
+
+        // Schedule refresh task if needed
+        if needs_refresh_scheduling {
+            let refresh_task = Task::RefreshFloatingLimit {
+                task_id: Uuid::new_v4().to_string(),
+                tenant: tenant.to_string(),
+                queue_key: queue_key.to_string(),
+                current_max_concurrency: effective_max,
+                last_refreshed_at_ms: now_ms,
+                metadata: fl.metadata.clone(),
+            };
+            let task_val = encode_task(&refresh_task)?;
+            batch.put(
+                crate::keys::task_key(now_ms, 0, &format!("refresh-{}", queue_key), 0).as_bytes(),
+                &task_val,
+            );
+            tracing::debug!(
+                tenant = tenant,
+                queue_key = queue_key,
+                "scheduled floating limit refresh task for remote queue"
+            );
+        }
+
+        Ok(effective_max)
     }
 
     /// Check if a floating limit refresh is needed and schedule it if so.

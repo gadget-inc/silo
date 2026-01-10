@@ -16,14 +16,27 @@ pub struct ShardFactory {
     instances: RwLock<HashMap<String, Arc<JobStoreShard>>>,
     template: DatabaseTemplate,
     rate_limiter: Arc<dyn RateLimitClient>,
+    /// Total number of shards in the cluster
+    num_shards: u32,
 }
 
 impl ShardFactory {
-    pub fn new(template: DatabaseTemplate, rate_limiter: Arc<dyn RateLimitClient>) -> Self {
+    /// Create a new ShardFactory.
+    ///
+    /// # Arguments
+    /// * `template` - Database configuration template (path may contain %shard% placeholder)
+    /// * `rate_limiter` - Rate limit client implementation
+    /// * `num_shards` - Total number of shards in the cluster
+    pub fn new(
+        template: DatabaseTemplate,
+        rate_limiter: Arc<dyn RateLimitClient>,
+        num_shards: u32,
+    ) -> Self {
         Self {
             instances: RwLock::new(HashMap::new()),
             template,
             rate_limiter,
+            num_shards,
         }
     }
 
@@ -71,8 +84,13 @@ impl ShardFactory {
             wal,
             apply_wal_on_close: self.template.apply_wal_on_close,
         };
-        let shard_arc =
-            JobStoreShard::open_with_rate_limiter(&cfg, Arc::clone(&self.rate_limiter)).await?;
+        let shard_arc = JobStoreShard::open_with_rate_limiter(
+            &cfg,
+            Arc::clone(&self.rate_limiter),
+            shard_number as u32,
+            self.num_shards,
+        )
+        .await?;
 
         let mut instances = self.instances.write().await;
         instances.insert(cfg.name.clone(), Arc::clone(&shard_arc));

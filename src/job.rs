@@ -161,6 +161,37 @@ pub enum Limit {
     FloatingConcurrency(FloatingConcurrencyLimit),
 }
 
+impl Limit {
+    /// Returns true if this is a concurrency-based limit (fixed or floating).
+    pub fn is_concurrency(&self) -> bool {
+        matches!(
+            self,
+            Limit::Concurrency(_) | Limit::FloatingConcurrency(_)
+        )
+    }
+
+    /// Get the queue key for a concurrency limit (fixed or floating).
+    /// Returns None for rate limits.
+    pub fn queue_key(&self) -> Option<&str> {
+        match self {
+            Limit::Concurrency(cl) => Some(&cl.key),
+            Limit::FloatingConcurrency(fl) => Some(&fl.key),
+            Limit::RateLimit(_) => None,
+        }
+    }
+
+    /// Get the max concurrency for a concurrency limit.
+    /// For FloatingConcurrency, returns the default_max_concurrency.
+    /// Returns None for rate limits.
+    pub fn max_concurrency(&self) -> Option<u32> {
+        match self {
+            Limit::Concurrency(cl) => Some(cl.max_concurrency),
+            Limit::FloatingConcurrency(fl) => Some(fl.default_max_concurrency),
+            Limit::RateLimit(_) => None,
+        }
+    }
+}
+
 /// Discriminant for job status kinds
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize, PartialEq, Eq, Copy)]
 #[archive(check_bytes)]
@@ -309,6 +340,27 @@ impl JobView {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Get the max_concurrency for a given queue key.
+    /// This checks both fixed ConcurrencyLimit and FloatingConcurrencyLimit.
+    /// For FloatingConcurrencyLimit, returns the default_max_concurrency since
+    /// the actual current value is stored separately in the floating limit state.
+    ///
+    /// Returns None if no limit with the given queue key is found.
+    pub fn max_concurrency_for_queue(&self, queue_key: &str) -> Option<u32> {
+        for l in self.limits() {
+            match l {
+                Limit::Concurrency(c) if c.key == queue_key => {
+                    return Some(c.max_concurrency);
+                }
+                Limit::FloatingConcurrency(fl) if fl.key == queue_key => {
+                    return Some(fl.default_max_concurrency);
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Return metadata as owned key/value string pairs

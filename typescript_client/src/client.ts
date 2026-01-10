@@ -114,6 +114,7 @@ export function fnv1a32(str: string): number {
  * @param tenantId The tenant identifier
  * @param numShards Total number of shards in the system
  * @returns The shard ID (0 to numShards-1)
+ * @deprecated Use job-based routing instead. This is only used for backward compatibility.
  */
 export function defaultTenantToShard(
   tenantId: string,
@@ -127,9 +128,64 @@ export function defaultTenantToShard(
 }
 
 /**
+ * Default function to map a job ID to a shard ID.
+ * Uses FNV-1a hash for fast, well-distributed results.
+ * Jobs are distributed across all shards based on their job ID, regardless of tenant.
+ * @param jobId The job identifier
+ * @param numShards Total number of shards in the system
+ * @returns The shard ID (0 to numShards-1)
+ */
+export function defaultJobToShard(jobId: string, numShards: number): number {
+  if (numShards <= 0) {
+    throw new Error("numShards must be positive");
+  }
+  const hash = fnv1a32(jobId);
+  return hash % numShards;
+}
+
+/**
+ * Default function to map a concurrency queue to its owner shard.
+ * Uses FNV-1a hash of (tenant + '\0' + queueKey) for well-distributed results.
+ * Queue ownership is determined by tenant and queue key, keeping queues from
+ * the same tenant together while distributing across shards.
+ * @param tenant The tenant identifier
+ * @param queueKey The concurrency queue key
+ * @param numShards Total number of shards in the system
+ * @returns The shard ID (0 to numShards-1)
+ */
+export function defaultQueueToShard(
+  tenant: string,
+  queueKey: string,
+  numShards: number
+): number {
+  if (numShards <= 0) {
+    throw new Error("numShards must be positive");
+  }
+  // Match server-side queue_to_shard: hash(tenant + '\0' + queue_key)
+  const combined = `${tenant}\x00${queueKey}`;
+  const hash = fnv1a32(combined);
+  return hash % numShards;
+}
+
+/**
  * Function type for mapping tenant IDs to shard IDs.
+ * @deprecated Use JobToShardFn instead. This is only used for backward compatibility.
  */
 export type TenantToShardFn = (tenantId: string, numShards: number) => number;
+
+/**
+ * Function type for mapping job IDs to shard IDs.
+ */
+export type JobToShardFn = (jobId: string, numShards: number) => number;
+
+/**
+ * Function type for mapping concurrency queues to their owner shard.
+ */
+export type QueueToShardFn = (
+  tenant: string,
+  queueKey: string,
+  numShards: number
+) => number;
 
 /** gRPC metadata key for shard owner address on redirect */
 const SHARD_OWNER_ADDR_METADATA_KEY = "x-silo-shard-owner-addr";
@@ -147,8 +203,16 @@ export interface ShardRoutingConfig {
   /**
    * Custom function to map tenant IDs to shard IDs.
    * If not provided, uses FNV-1a hash (see {@link defaultTenantToShard}).
+   * @deprecated Use jobToShard instead. Tenant-based routing is only used for backward compatibility.
    */
   tenantToShard?: TenantToShardFn;
+
+  /**
+   * Custom function to map job IDs to shard IDs.
+   * If not provided, uses FNV-1a hash (see {@link defaultJobToShard}).
+   * Jobs are distributed across all shards based on their job ID, regardless of tenant.
+   */
+  jobToShard?: JobToShardFn;
 
   /**
    * Maximum number of retries when receiving a "wrong shard" error.
@@ -664,6 +728,9 @@ export class SiloGRPCClient {
   private readonly _tenantToShard: TenantToShardFn;
 
   /** @internal */
+  private readonly _jobToShard: JobToShardFn;
+
+  /** @internal */
   private readonly _maxWrongShardRetries: number;
 
   /** @internal */
@@ -752,6 +819,7 @@ export class SiloGRPCClient {
     // Shard routing configuration
     this._tenantToShard =
       options.shardRouting?.tenantToShard ?? defaultTenantToShard;
+    this._jobToShard = options.shardRouting?.jobToShard ?? defaultJobToShard;
     this._maxWrongShardRetries =
       options.shardRouting?.maxWrongShardRetries ?? 5;
     this._wrongShardRetryDelayMs =
@@ -825,6 +893,7 @@ export class SiloGRPCClient {
   /**
    * Compute the shard ID from tenant.
    * @internal
+   * @deprecated Use _resolveShardForJob instead. Tenant-based routing is only for backward compatibility.
    */
   private _resolveShard(tenant: string | undefined): number {
     const tenantId = tenant ?? DEFAULT_TENANT;
@@ -834,6 +903,20 @@ export class SiloGRPCClient {
       );
     }
     return this._tenantToShard(tenantId, this._numShards);
+  }
+
+  /**
+   * Compute the shard ID from job ID.
+   * Jobs are distributed across all shards based on their job ID.
+   * @internal
+   */
+  private _resolveShardForJob(jobId: string): number {
+    if (this._numShards <= 0) {
+      throw new Error(
+        "Cluster topology not discovered yet. Call refreshTopology() first."
+      );
+    }
+    return this._jobToShard(jobId, this._numShards);
   }
 
   /**
@@ -871,6 +954,7 @@ export class SiloGRPCClient {
   /**
    * Get the client for a tenant.
    * @internal
+   * @deprecated Use _getClientForJob instead. Tenant-based routing is only for backward compatibility.
    */
   private _getClientForTenant(tenant: string | undefined): {
     client: SiloClient;
@@ -884,8 +968,26 @@ export class SiloGRPCClient {
   }
 
   /**
-   * Execute an operation with retry logic for wrong shard errors.
+   * Get the client for a job ID.
+   * Jobs are routed based on their job ID, not tenant.
    * @internal
+   */
+  private _getClientForJob(jobId: string): {
+    client: SiloClient;
+    shard: number;
+  } {
+    const shardId = this._resolveShardForJob(jobId);
+    return {
+      client: this._getClientForShard(shardId),
+      shard: shardId,
+    };
+  }
+
+  /**
+   * Execute an operation with retry logic for wrong shard errors.
+   * Uses tenant-based routing.
+   * @internal
+   * @deprecated Use _withWrongShardRetryJob instead. Tenant-based routing is only for backward compatibility.
    */
   private async _withWrongShardRetry<T>(
     tenant: string | undefined,
@@ -913,6 +1015,53 @@ export class SiloGRPCClient {
             // No redirect info, try refreshing topology
             await this.refreshTopology();
             const result = this._getClientForTenant(tenant);
+            client = result.client;
+            shard = result.shard;
+          }
+
+          // Wait with exponential backoff before retrying
+          await sleep(delay);
+          delay = Math.min(delay * 2, 5000); // Cap at 5 seconds
+          continue;
+        }
+        throw error;
+      }
+    }
+    // Should not reach here, but throw last error if we do
+    throw lastError;
+  }
+
+  /**
+   * Execute an operation with retry logic for wrong shard errors.
+   * Uses job ID-based routing.
+   * @internal
+   */
+  private async _withWrongShardRetryJob<T>(
+    jobId: string,
+    operation: (client: SiloClient, shard: number) => Promise<T>
+  ): Promise<T> {
+    let lastError: unknown;
+    let delay = this._wrongShardRetryDelayMs;
+    let { client, shard } = this._getClientForJob(jobId);
+
+    for (let attempt = 0; attempt <= this._maxWrongShardRetries; attempt++) {
+      try {
+        return await operation(client, shard);
+      } catch (error) {
+        if (isWrongShardError(error) && attempt < this._maxWrongShardRetries) {
+          lastError = error;
+
+          // Check for redirect address in metadata
+          const redirectAddr = extractRedirectAddress(error);
+          if (redirectAddr) {
+            // Update routing and create connection to new server
+            this._shardToServer.set(shard, redirectAddr);
+            const conn = this._getOrCreateConnection(redirectAddr);
+            client = conn.client;
+          } else {
+            // No redirect info, try refreshing topology
+            await this.refreshTopology();
+            const result = this._getClientForJob(jobId);
             client = result.client;
             shard = result.shard;
           }
@@ -983,17 +1132,22 @@ export class SiloGRPCClient {
 
   /**
    * Enqueue a job for processing.
+   * Jobs are routed to shards based on their job ID.
+   * If no ID is provided, a UUID is generated client-side to enable proper routing.
    * @param options The options for the enqueue request.
    * @returns A JobHandle for the enqueued job.
    */
   public async enqueue(options: EnqueueJobOptions): Promise<JobHandle> {
-    const id = await this._withWrongShardRetry(
-      options.tenant,
+    // Generate job ID client-side if not provided to enable proper routing
+    const jobId = options.id ?? crypto.randomUUID();
+
+    const id = await this._withWrongShardRetryJob(
+      jobId,
       async (client, shard) => {
         const call = client.enqueue(
           {
             shard,
-            id: options.id ?? "",
+            id: jobId,
             priority: options.priority ?? 50,
             startAtMs: options.startAtMs ?? BigInt(Date.now()),
             retryPolicy: options.retryPolicy,
@@ -1014,14 +1168,15 @@ export class SiloGRPCClient {
 
   /**
    * Get a job by ID.
+   * Jobs are routed to shards based on their job ID.
    * @param id     The job ID.
-   * @param tenant Tenant ID for routing to the correct shard. Uses default tenant if not provided.
+   * @param tenant Tenant ID for authorization. Not used for routing.
    * @returns The job details.
    * @throws JobNotFoundError if the job doesn't exist.
    */
   public async getJob(id: string, tenant?: string): Promise<Job> {
     try {
-      return await this._withWrongShardRetry(tenant, async (client, shard) => {
+      return await this._withWrongShardRetryJob(id, async (client, shard) => {
         const call = client.getJob(
           {
             shard,
@@ -1057,13 +1212,14 @@ export class SiloGRPCClient {
 
   /**
    * Delete a job by ID.
+   * Jobs are routed to shards based on their job ID.
    * @param id     The job ID.
-   * @param tenant Tenant ID for routing to the correct shard. Uses default tenant if not provided.
+   * @param tenant Tenant ID for authorization. Not used for routing.
    * @throws JobNotFoundError if the job doesn't exist.
    */
   public async deleteJob(id: string, tenant?: string): Promise<void> {
     try {
-      await this._withWrongShardRetry(tenant, async (client, shard) => {
+      await this._withWrongShardRetryJob(id, async (client, shard) => {
         await client.deleteJob(
           {
             shard,
@@ -1085,13 +1241,14 @@ export class SiloGRPCClient {
    * Cancel a job by ID.
    * This marks the job for cancellation. Workers will be notified via heartbeat
    * and should stop processing and report a cancelled outcome.
+   * Jobs are routed to shards based on their job ID.
    * @param id     The job ID.
-   * @param tenant Tenant ID for routing to the correct shard. Uses default tenant if not provided.
+   * @param tenant Tenant ID for authorization. Not used for routing.
    * @throws JobNotFoundError if the job doesn't exist.
    */
   public async cancelJob(id: string, tenant?: string): Promise<void> {
     try {
-      await this._withWrongShardRetry(tenant, async (client, shard) => {
+      await this._withWrongShardRetryJob(id, async (client, shard) => {
         await client.cancelJob(
           {
             shard,
@@ -1112,14 +1269,15 @@ export class SiloGRPCClient {
   /**
    * Restart a cancelled or failed job, allowing it to be processed again.
    * The job will get a fresh set of retries according to its retry policy.
+   * Jobs are routed to shards based on their job ID.
    * @param id     The job ID.
-   * @param tenant Tenant ID for routing to the correct shard. Uses default tenant if not provided.
+   * @param tenant Tenant ID for authorization. Not used for routing.
    * @throws JobNotFoundError if the job doesn't exist.
    * @throws Error with FAILED_PRECONDITION if the job is not in a restartable state.
    */
   public async restartJob(id: string, tenant?: string): Promise<void> {
     try {
-      await this._withWrongShardRetry(tenant, async (client, shard) => {
+      await this._withWrongShardRetryJob(id, async (client, shard) => {
         await client.restartJob(
           {
             shard,
@@ -1151,8 +1309,9 @@ export class SiloGRPCClient {
 
   /**
    * Get the result of a completed job.
+   * Jobs are routed to shards based on their job ID.
    * @param id     The job ID.
-   * @param tenant Tenant ID for routing to the correct shard. Uses default tenant if not provided.
+   * @param tenant Tenant ID for authorization. Not used for routing.
    * @returns The job result.
    * @throws JobNotFoundError if the job doesn't exist.
    * @throws JobNotTerminalError if the job is not yet in a terminal state.
@@ -1163,7 +1322,7 @@ export class SiloGRPCClient {
     tenant?: string
   ): Promise<JobResult<T>> {
     try {
-      return await this._withWrongShardRetry(tenant, async (client, shard) => {
+      return await this._withWrongShardRetryJob(id, async (client, shard) => {
         const call = client.getJobResult(
           {
             shard,
@@ -1421,9 +1580,11 @@ export class SiloGRPCClient {
 
   /**
    * Execute a SQL query against the shard data.
+   * Routes to a shard based on tenant (for backward compatibility).
    * @param sql    The SQL query to execute.
    * @param tenant Tenant ID for routing to the correct shard. Uses default tenant if not provided.
    * @returns The query results.
+   * @deprecated Use queryOnShard instead for job-based routing.
    */
   public async query(sql: string, tenant?: string): Promise<QueryResponse> {
     return this._withWrongShardRetry(tenant, async (client, shard) => {
@@ -1441,13 +1602,62 @@ export class SiloGRPCClient {
   }
 
   /**
+   * Execute a SQL query against a specific shard.
+   * With job-based routing, jobs are distributed by job_id, so use getShardForJob()
+   * to determine which shard to query.
+   * @param sql   The SQL query to execute.
+   * @param shard The shard ID to query.
+   * @returns The query results.
+   */
+  public async queryOnShard(
+    sql: string,
+    shard: number
+  ): Promise<QueryResponse> {
+    const client = this._getClientForShard(shard);
+    const call = client.query(
+      {
+        shard,
+        sql,
+        tenant: undefined,
+      },
+      this._rpcOptions()
+    );
+
+    return await call.response;
+  }
+
+  /**
    * Compute the shard ID for a given tenant.
    * Useful for debugging or when you need to know which shard a tenant maps to.
    * @param tenant The tenant ID
    * @returns The shard ID
+   * @deprecated Use getShardForJob instead. Tenant-based routing is only for backward compatibility.
    */
   public getShardForTenant(tenant: string): number {
     return this._resolveShard(tenant);
+  }
+
+  /**
+   * Compute the shard ID for a given job ID.
+   * Jobs are distributed across all shards based on their job ID.
+   * Useful for debugging or when you need to know which shard a job maps to.
+   * @param jobId The job ID
+   * @returns The shard ID
+   */
+  public getShardForJob(jobId: string): number {
+    return this._resolveShardForJob(jobId);
+  }
+
+  /**
+   * Compute the owner shard ID for a concurrency queue.
+   * Queue ownership is determined by hashing (tenant + queue_key).
+   * Useful for knowing which shard to poll for refresh tasks.
+   * @param tenant The tenant ID
+   * @param queueKey The concurrency queue key
+   * @returns The shard ID
+   */
+  public getShardForQueue(tenant: string, queueKey: string): number {
+    return defaultQueueToShard(tenant, queueKey, this._numShards);
   }
 
   /**

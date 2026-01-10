@@ -62,7 +62,7 @@ fn grpc_end_to_end_under_turmoil() {
         };
 
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
+        let factory = ShardFactory::new(cfg.database.clone(), rate_limiter, 1);
         let _ = factory.open(0).await.unwrap();
         let factory = Arc::new(factory);
 
@@ -223,7 +223,7 @@ fn grpc_fault_injection_with_partition() {
         };
 
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
+        let factory = ShardFactory::new(cfg.database.clone(), rate_limiter, 1);
         let _ = factory.open(0).await.unwrap();
         let factory = Arc::new(factory);
 
@@ -425,7 +425,7 @@ fn stress_multiple_workers_with_partitions() {
         };
 
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
+        let factory = ShardFactory::new(cfg.database.clone(), rate_limiter, 1);
         let _ = factory.open(0).await.unwrap();
         let factory = Arc::new(factory);
 
@@ -706,7 +706,7 @@ fn stress_duplicate_completion_idempotency() {
         };
 
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
+        let factory = ShardFactory::new(cfg.database.clone(), rate_limiter, 1);
         let _ = factory.open(0).await.unwrap();
         let factory = Arc::new(factory);
 
@@ -897,7 +897,7 @@ fn stress_lease_expiry_during_partition() {
         };
 
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
+        let factory = ShardFactory::new(cfg.database.clone(), rate_limiter, 1);
         let _ = factory.open(0).await.unwrap();
         let factory = Arc::new(factory);
 
@@ -1106,7 +1106,7 @@ fn stress_high_message_loss() {
         };
 
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
+        let factory = ShardFactory::new(cfg.database.clone(), rate_limiter, 1);
         let _ = factory.open(0).await.unwrap();
         let factory = Arc::new(factory);
 
@@ -1323,7 +1323,7 @@ fn concurrency_request_ready_without_release_fails() {
             },
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
+        let factory = ShardFactory::new(cfg.database.clone(), rate_limiter, 1);
         let _ = factory.open(0).await.unwrap();
         let factory = Arc::new(factory);
         let addr = (IpAddr::from(Ipv4Addr::UNSPECIFIED), 9996);

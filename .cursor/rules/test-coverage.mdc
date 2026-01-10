@@ -1,0 +1,40 @@
+---
+description: How to collect test coverage for Rust code
+globs: ["**/*.rs", "tests/**"]
+---
+
+# Test Coverage Collection
+
+Use `cargo-llvm-cov` to collect test coverage. The toolchain includes `llvm-tools-preview` but you must set env vars to point to the correct binaries.
+
+## Quick Command
+
+```bash
+LLVM_COV=~/.rustup/toolchains/1.89.0-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/llvm-cov \
+LLVM_PROFDATA=~/.rustup/toolchains/1.89.0-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/llvm-profdata \
+cargo llvm-cov --lib --test <test_name> --summary-only
+```
+
+## Output Modes
+
+- `--summary-only`: Per-file coverage percentages (fast)
+- `--text`: Line-by-line coverage with hit counts (verbose)
+- `--html`: HTML report in `target/llvm-cov/html/`
+
+## Example: Run specific tests with coverage
+
+```bash
+LLVM_COV=~/.rustup/toolchains/1.89.0-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/llvm-cov \
+LLVM_PROFDATA=~/.rustup/toolchains/1.89.0-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/llvm-profdata \
+cargo llvm-cov --lib \
+  --test codec_tests \
+  --test concurrency_tests \
+  --test job_store_shard_tests \
+  --summary-only
+```
+
+## Notes
+
+- Coverage builds use a separate target dir (`target/llvm-cov-target/`)
+- Run `cargo clean -p silo --target-dir target/llvm-cov-target` if you get stale build issues
+- The `--lib` flag includes library code; without it only test code is measured

@@ -21,8 +21,10 @@ mod lease;
 mod rate_limit;
 mod restart;
 mod scan;
+mod start_now;
 
 pub use restart::JobNotRestartableError;
+pub use start_now::JobNotStartableError;
 
 pub use helpers::now_epoch_ms;
 
@@ -51,16 +53,69 @@ pub struct WalCloseConfig {
     pub flush_on_close: bool,
 }
 
+/// A cross-shard RPC task that needs to be executed by the caller.
+/// These are returned from dequeue because they require network calls that
+/// the JobStoreShard layer doesn't handle directly.
+#[derive(Debug, Clone)]
+pub enum PendingCrossShardTask {
+    /// Request a concurrency ticket from a remote queue owner
+    RequestRemoteTicket {
+        queue_owner_shard: u32,
+        tenant: String,
+        queue_key: String,
+        job_id: String,
+        request_id: String,
+        attempt_number: u32,
+        priority: u8,
+        start_time_ms: i64,
+        max_concurrency: u32,
+        /// Key to delete from DB on successful RPC
+        task_key: String,
+        /// For floating limits, includes the full definition so queue owner can create state.
+        /// None for regular ConcurrencyLimit.
+        floating_limit: Option<crate::task::FloatingConcurrencyLimitData>,
+    },
+    /// Notify a remote job shard that a ticket was granted
+    NotifyRemoteTicketGrant {
+        job_shard: u32,
+        tenant: String,
+        job_id: String,
+        queue_key: String,
+        request_id: String,
+        holder_task_id: String,
+        attempt_number: u32,
+        /// Key to delete from DB on successful RPC
+        task_key: String,
+    },
+    /// Release a ticket back to a remote queue owner
+    ReleaseRemoteTicket {
+        queue_owner_shard: u32,
+        tenant: String,
+        queue_key: String,
+        job_id: String,
+        holder_task_id: String,
+        /// Key to delete from DB on successful RPC
+        task_key: String,
+    },
+}
+
 /// Result of a dequeue operation - contains both job tasks and floating limit refresh tasks
 #[derive(Debug, Default)]
 pub struct DequeueResult {
     pub tasks: Vec<LeasedTask>,
     pub refresh_tasks: Vec<LeasedRefreshTask>,
+    /// Cross-shard tasks that need to be processed by the caller via RPC.
+    /// These are returned because they require network calls.
+    pub cross_shard_tasks: Vec<PendingCrossShardTask>,
 }
 
 /// Represents a single shard of the system. Owns the SlateDB instance.
 pub struct JobStoreShard {
     pub(crate) name: String,
+    /// This shard's number in the cluster (0-indexed)
+    pub(crate) shard_number: u32,
+    /// Total number of shards in the cluster
+    pub(crate) num_shards: u32,
     pub(crate) db: Arc<Db>,
     pub(crate) broker: Arc<TaskBroker>,
     pub(crate) concurrency: Arc<ConcurrencyManager>,
@@ -100,6 +155,8 @@ pub enum JobStoreShardError {
     JobAlreadyTerminal(String, JobStatusKind),
     #[error("cannot restart job: {0}")]
     JobNotRestartable(#[from] JobNotRestartableError),
+    #[error("cannot start job now: {0}")]
+    JobNotStartable(#[from] JobNotStartableError),
     #[error("transaction conflict during {0}, exceeded max retries")]
     TransactionConflict(String),
 }
@@ -111,15 +168,24 @@ impl From<CodecError> for JobStoreShardError {
 }
 
 impl JobStoreShard {
-    /// Open a shard with a NullGubernatorClient (rate limits will error)
+    /// Open a shard with a NullGubernatorClient (rate limits will error).
+    /// Uses single-shard mode (shard 0 of 1) for backwards compatibility.
     pub async fn open(cfg: &DatabaseConfig) -> Result<Arc<Self>, JobStoreShardError> {
-        Self::open_with_rate_limiter(cfg, NullGubernatorClient::new()).await
+        Self::open_with_rate_limiter(cfg, NullGubernatorClient::new(), 0, 1).await
     }
 
-    /// Open a shard with a rate limit client
+    /// Open a shard with a rate limit client and cluster configuration.
+    ///
+    /// # Arguments
+    /// * `cfg` - Database configuration
+    /// * `rate_limiter` - Rate limit client implementation
+    /// * `shard_number` - This shard's number in the cluster (0-indexed)
+    /// * `num_shards` - Total number of shards in the cluster
     pub async fn open_with_rate_limiter(
         cfg: &DatabaseConfig,
         rate_limiter: Arc<dyn RateLimitClient>,
+        shard_number: u32,
+        num_shards: u32,
     ) -> Result<Arc<Self>, JobStoreShardError> {
         let resolved = resolve_object_store(&cfg.backend, &cfg.path)?;
 
@@ -162,6 +228,8 @@ impl JobStoreShard {
 
         let shard = Arc::new(Self {
             name: cfg.name.clone(),
+            shard_number,
+            num_shards,
             db,
             broker,
             concurrency,
@@ -264,6 +332,16 @@ impl JobStoreShard {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Returns this shard's number in the cluster (0-indexed).
+    pub fn shard_number(&self) -> u32 {
+        self.shard_number
+    }
+
+    /// Returns the total number of shards in the cluster.
+    pub fn num_shards(&self) -> u32 {
+        self.num_shards
     }
 
     pub fn db(&self) -> &Db {
@@ -473,6 +551,390 @@ impl JobStoreShard {
         batch.delete(crate::keys::job_cancelled_key(tenant, id).as_bytes());
         self.db.write(batch).await?;
         self.db.flush().await?;
+        Ok(())
+    }
+
+    // ============================================================================
+    // Cross-shard concurrency ticket coordination methods
+    // ============================================================================
+
+    /// Receive a remote ticket request from another shard (queue owner perspective).
+    /// This stores the request and potentially grants it immediately if there's capacity.
+    /// For floating limits, also creates/updates the floating limit state on this shard.
+    ///
+    /// Returns true if the ticket was granted immediately.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn receive_remote_ticket_request(
+        &self,
+        tenant: &str,
+        queue_key: &str,
+        job_id: &str,
+        job_shard: u32,
+        request_id: &str,
+        attempt_number: u32,
+        priority: u8,
+        start_time_ms: i64,
+        max_concurrency: u32,
+        floating_limit: Option<&crate::task::FloatingConcurrencyLimitData>,
+    ) -> Result<bool, JobStoreShardError> {
+        use crate::codec::{
+            decode_floating_limit_state, encode_remote_concurrency_request,
+            encode_remote_holder_record,
+        };
+        use crate::keys::{concurrency_request_key, floating_limit_state_key};
+        use crate::routing::queue_to_shard;
+        use crate::task::{RemoteConcurrencyRequest, RemoteHolderRecord, Task};
+        use slatedb::WriteBatch;
+
+        // Debug assertion: verify this shard owns the queue
+        debug_assert_eq!(
+            queue_to_shard(tenant, queue_key, self.num_shards),
+            self.shard_number,
+            "receive_remote_ticket_request called on wrong shard: queue '{}' for tenant '{}' \
+             routes to shard {}, but this is shard {}",
+            queue_key,
+            tenant,
+            queue_to_shard(tenant, queue_key, self.num_shards),
+            self.shard_number
+        );
+
+        let now_ms = helpers::now_epoch_ms();
+
+        // Generate a unique holder task ID for this request
+        let holder_task_id = uuid::Uuid::new_v4().to_string();
+
+        let mut batch = WriteBatch::new();
+
+        // Determine effective max concurrency, handling floating limits
+        let effective_max_concurrency = if let Some(fl) = floating_limit {
+            // Floating limit - ensure state exists and potentially schedule refresh
+            self.ensure_floating_limit_state_for_remote(&mut batch, tenant, queue_key, fl, now_ms)
+                .await?
+        } else {
+            // Not a floating limit - check if there's existing floating state anyway
+            // (could happen if same queue is used with both limit types)
+            let state_key = floating_limit_state_key(tenant, queue_key);
+            if let Some(state_bytes) = self.db.get(state_key.as_bytes()).await? {
+                if let Ok(decoded) = decode_floating_limit_state(&state_bytes) {
+                    decoded.archived().current_max_concurrency
+                } else {
+                    max_concurrency
+                }
+            } else {
+                max_concurrency
+            }
+        };
+
+        // Check if we can grant immediately
+        let can_grant = self
+            .concurrency
+            .counts()
+            .can_grant(tenant, queue_key, effective_max_concurrency as usize);
+
+        if can_grant && start_time_ms <= now_ms {
+            // Grant immediately:
+            // 1. Create RemoteHolderRecord
+            // 2. Create NotifyRemoteTicketGrant task
+            // Note: held_queues are tracked on the job shard side, not passed through RPC
+
+            // Create holder record
+            let holder = RemoteHolderRecord {
+                granted_at_ms: now_ms,
+                source_shard: job_shard,
+                job_id: job_id.to_string(),
+            };
+            let holder_val = encode_remote_holder_record(&holder)?;
+            batch.put(
+                crate::keys::concurrency_holder_key(tenant, queue_key, &holder_task_id).as_bytes(),
+                &holder_val,
+            );
+
+            // Create notification task to inform job shard of grant
+            let notify_task = Task::NotifyRemoteTicketGrant {
+                task_id: uuid::Uuid::new_v4().to_string(),
+                job_shard,
+                tenant: tenant.to_string(),
+                job_id: job_id.to_string(),
+                queue_key: queue_key.to_string(),
+                request_id: request_id.to_string(),
+                holder_task_id: holder_task_id.clone(),
+                attempt_number,
+            };
+            let task_val = crate::codec::encode_task(&notify_task)?;
+            batch.put(
+                crate::keys::task_key(now_ms, 0, &holder_task_id, 0).as_bytes(),
+                &task_val,
+            );
+
+            // Update in-memory counts
+            self.concurrency
+                .counts()
+                .record_grant(tenant, queue_key, &holder_task_id);
+
+            self.db.write(batch).await?;
+
+            tracing::debug!(
+                tenant = tenant,
+                queue_key = queue_key,
+                job_id = job_id,
+                job_shard = job_shard,
+                request_id = request_id,
+                holder_task_id = holder_task_id,
+                "receive_remote_ticket_request: granted immediately"
+            );
+
+            Ok(true)
+        } else {
+            // No capacity or future start time: store request for later
+            let request = RemoteConcurrencyRequest {
+                source_shard: job_shard,
+                job_id: job_id.to_string(),
+                request_id: request_id.to_string(),
+                attempt_number,
+                holder_task_id: holder_task_id.clone(),
+                max_concurrency,
+            };
+            let request_val = encode_remote_concurrency_request(&request)?;
+
+            // Store under requests/<tenant>/<queue>/<start_time_ms>/<priority>/<request_id>
+            let req_key = concurrency_request_key(tenant, queue_key, start_time_ms, priority, request_id);
+            batch.put(req_key.as_bytes(), &request_val);
+
+            self.db.write(batch).await?;
+
+            tracing::debug!(
+                tenant = tenant,
+                queue_key = queue_key,
+                job_id = job_id,
+                job_shard = job_shard,
+                request_id = request_id,
+                start_time_ms = start_time_ms,
+                can_grant = can_grant,
+                "receive_remote_ticket_request: queued for later"
+            );
+
+            Ok(false)
+        }
+    }
+
+    /// Receive notification that a remote ticket was granted (job shard perspective).
+    /// This creates a RunAttempt task or continues to the next limit.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn receive_remote_ticket_grant(
+        &self,
+        tenant: &str,
+        job_id: &str,
+        queue_key: &str,
+        request_id: &str,
+        holder_task_id: &str,
+        queue_owner_shard: u32,
+        attempt_number: u32,
+    ) -> Result<(), JobStoreShardError> {
+        use crate::codec::decode_held_ticket_state;
+        use crate::job::Limit;
+        use crate::keys::held_ticket_state_key;
+        use crate::routing::{job_to_shard, queue_to_shard};
+        use crate::task::Task;
+        use slatedb::WriteBatch;
+
+        // Debug assertion: verify this shard owns the job
+        debug_assert_eq!(
+            job_to_shard(job_id, self.num_shards),
+            self.shard_number,
+            "receive_remote_ticket_grant called on wrong shard: job '{}' \
+             routes to shard {}, but this is shard {}",
+            job_id,
+            job_to_shard(job_id, self.num_shards),
+            self.shard_number
+        );
+
+        // Debug assertion: verify the queue is NOT on this shard (it's remote)
+        debug_assert_ne!(
+            queue_to_shard(tenant, queue_key, self.num_shards),
+            self.shard_number,
+            "receive_remote_ticket_grant called for local queue: queue '{}' for tenant '{}' \
+             routes to shard {} (same as this shard). This should use local concurrency handling.",
+            queue_key,
+            tenant,
+            queue_to_shard(tenant, queue_key, self.num_shards)
+        );
+
+        let now_ms = helpers::now_epoch_ms();
+
+        // Load pending ticket state from local storage to get held_queues
+        let state_key = held_ticket_state_key(job_id, attempt_number, request_id);
+        let held_queues = if let Some(state_bytes) = self.db.get(state_key.as_bytes()).await? {
+            let state = decode_held_ticket_state(&state_bytes)?;
+            state.held_queues()
+        } else {
+            // No state found - this is the first limit (no prior held queues)
+            Vec::new()
+        };
+
+        // Look up the job to get priority, limits, and other info
+        let job = self
+            .get_job(tenant, job_id)
+            .await?
+            .ok_or_else(|| JobStoreShardError::JobNotFound(job_id.to_string()))?;
+
+        let priority = job.priority();
+        let start_at_ms = job.enqueue_time_ms();
+        let limits = job.limits();
+
+        // Track this remote queue in the held_queues format.
+        // This allows report_attempt_outcome to know to send a release RPC for remote queues.
+        let mut all_held_queues = held_queues;
+        all_held_queues.push(crate::task::RemoteQueueRef::format(
+            queue_owner_shard,
+            queue_key,
+            holder_task_id,
+        ));
+
+        // Find the index of the current limit by matching queue_key
+        let current_limit_index = limits
+            .iter()
+            .position(|l| match l {
+                Limit::Concurrency(cl) => cl.key == queue_key,
+                Limit::FloatingConcurrency(fl) => fl.key == queue_key,
+                Limit::RateLimit(_) => false,
+            })
+            .unwrap_or(0) as u32;
+
+        let mut batch = WriteBatch::new();
+
+        // Delete the pending ticket state (we've consumed it)
+        batch.delete(state_key.as_bytes());
+
+        // Check if there are more limits to process
+        if (current_limit_index + 1) < limits.len() as u32 {
+            // More limits to process - enqueue the next limit task
+            self.enqueue_next_limit_task(
+                &mut batch,
+                tenant,
+                request_id, // Use same task_id for holder consistency
+                job_id,
+                attempt_number,
+                current_limit_index,
+                &limits,
+                priority,
+                start_at_ms,
+                now_ms,
+                all_held_queues,
+            )?;
+
+            tracing::debug!(
+                tenant = tenant,
+                job_id = job_id,
+                queue_key = queue_key,
+                current_limit_index = current_limit_index,
+                next_limit_index = current_limit_index + 1,
+                "receive_remote_ticket_grant: more limits to process, enqueued next limit task"
+            );
+        } else {
+            // This was the last limit - create RunAttempt
+            let task = Task::RunAttempt {
+                id: request_id.to_string(),
+                tenant: tenant.to_string(),
+                job_id: job_id.to_string(),
+                attempt_number,
+                held_queues: all_held_queues,
+            };
+
+            let task_val = crate::codec::encode_task(&task)?;
+            let task_key_str = crate::keys::task_key(now_ms, priority, job_id, attempt_number);
+            batch.put(task_key_str.as_bytes(), &task_val);
+
+            tracing::debug!(
+                tenant = tenant,
+                job_id = job_id,
+                queue_key = queue_key,
+                request_id = request_id,
+                holder_task_id = holder_task_id,
+                queue_owner_shard = queue_owner_shard,
+                task_key = task_key_str,
+                "receive_remote_ticket_grant: all limits satisfied, created RunAttempt task"
+            );
+        }
+
+        self.db.write(batch).await?;
+        Ok(())
+    }
+
+    /// Delete a task key after a cross-shard RPC has been successfully processed.
+    /// Called by the caller after processing a PendingCrossShardTask.
+    pub async fn delete_cross_shard_task(&self, task_key: &str) -> Result<(), JobStoreShardError> {
+        use slatedb::WriteBatch;
+        let mut batch = WriteBatch::new();
+        batch.delete(task_key.as_bytes());
+        self.db.write(batch).await?;
+        Ok(())
+    }
+
+    /// Release a remote ticket (queue owner perspective).
+    /// This removes the holder and potentially grants to the next requester.
+    pub async fn release_remote_ticket(
+        &self,
+        tenant: &str,
+        queue_key: &str,
+        job_id: &str,
+        holder_task_id: &str,
+    ) -> Result<(), JobStoreShardError> {
+        use crate::routing::queue_to_shard;
+        use slatedb::WriteBatch;
+
+        // Debug assertion: verify this shard owns the queue
+        debug_assert_eq!(
+            queue_to_shard(tenant, queue_key, self.num_shards),
+            self.shard_number,
+            "release_remote_ticket called on wrong shard: queue '{}' for tenant '{}' \
+             routes to shard {}, but this is shard {}",
+            queue_key,
+            tenant,
+            queue_to_shard(tenant, queue_key, self.num_shards),
+            self.shard_number
+        );
+
+        let now_ms = helpers::now_epoch_ms();
+        let mut batch = WriteBatch::new();
+
+        // Release the holder and grant to the next request
+        // This reuses the existing release_and_grant_next logic
+        let events = self
+            .concurrency
+            .release_and_grant_next(
+                &self.db,
+                &mut batch,
+                tenant,
+                &[queue_key.to_string()],
+                holder_task_id,
+                now_ms,
+            )
+            .await
+            .map_err(|e| JobStoreShardError::Rkyv(e))?;
+
+        self.db.write(batch).await?;
+
+        // Update in-memory counts
+        for event in &events {
+            match event {
+                crate::concurrency::MemoryEvent::Released { queue, task_id } => {
+                    self.concurrency.counts().record_release(tenant, queue, task_id);
+                }
+                crate::concurrency::MemoryEvent::Granted { queue, task_id } => {
+                    self.concurrency.counts().record_grant(tenant, queue, task_id);
+                }
+            }
+        }
+
+        tracing::debug!(
+            tenant = tenant,
+            queue_key = queue_key,
+            job_id = job_id,
+            holder_task_id = holder_task_id,
+            events_count = events.len(),
+            "release_remote_ticket: released and granted next"
+        );
+
         Ok(())
     }
 }

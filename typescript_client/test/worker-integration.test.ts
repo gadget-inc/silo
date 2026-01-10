@@ -484,6 +484,28 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
   });
 
   describe("floating concurrency limit refresh", () => {
+    /**
+     * Generate a job ID that routes to the same shard as the queue owner.
+     * This ensures floating limit state is created on the same shard as the job,
+     * which makes tests more reliable by avoiding cross-shard timing complexities.
+     *
+     * Note: The server DOES support floating limits for remote queues - this is
+     * purely a test reliability strategy, not a workaround for a server bug.
+     */
+    function generateJobIdForQueue(queueKey: string): string {
+      const queueOwnerShard = client.getShardForQueue(DEFAULT_TENANT, queueKey);
+      // Try random UUIDs until we find one that routes to the queue owner shard
+      for (let i = 0; i < 1000; i++) {
+        const jobId = crypto.randomUUID();
+        if (client.getShardForJob(jobId) === queueOwnerShard) {
+          return jobId;
+        }
+      }
+      throw new Error(
+        `Failed to generate job ID routing to shard ${queueOwnerShard}`
+      );
+    }
+
     function createWorkerWithRefresh(
       handler: TaskHandler,
       refreshHandler: RefreshHandler,
@@ -515,6 +537,10 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       const processedJobs: string[] = [];
       const queueKey = `worker-refresh-test-${Date.now()}`;
 
+      // Generate job IDs that route to the same shard as the queue owner
+      const jobId1 = generateJobIdForQueue(queueKey);
+      const jobId2 = generateJobIdForQueue(queueKey);
+
       const handler: TaskHandler = async (ctx) => {
         const payload = decodePayload<{ message: string }>(
           ctx.task.payload?.data
@@ -535,6 +561,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       // Enqueue job with floating limit and very short refresh interval
       await client.enqueue({
         tenant: DEFAULT_TENANT,
+        id: jobId1,
         payload: { message: "job-1" },
         limits: [
           {
@@ -556,6 +583,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       // Trigger refresh by enqueueing another job
       await client.enqueue({
         tenant: DEFAULT_TENANT,
+        id: jobId2,
         payload: { message: "job-2" },
         limits: [
           {
@@ -588,6 +616,10 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       const queueKey = `context-test-${Date.now()}`;
       const testMetadata = { apiKey: "test-api-key", region: "us-west" };
 
+      // Generate job IDs that route to the same shard as the queue owner
+      const jobId1 = generateJobIdForQueue(queueKey);
+      const jobId2 = generateJobIdForQueue(queueKey);
+
       const handler: TaskHandler = async () => {
         return { type: "success", result: {} };
       };
@@ -609,6 +641,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       // Enqueue first job to create the limit
       await client.enqueue({
         tenant: DEFAULT_TENANT,
+        id: jobId1,
         payload: { init: true },
         limits: [
           {
@@ -626,6 +659,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
 
       await client.enqueue({
         tenant: DEFAULT_TENANT,
+        id: jobId2,
         payload: { trigger: true },
         limits: [
           {
@@ -654,6 +688,10 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       const queueKey = `error-refresh-${Date.now()}`;
       const errors: Error[] = [];
 
+      // Generate job IDs that route to the same shard as the queue owner
+      const jobId1 = generateJobIdForQueue(queueKey);
+      const jobId2 = generateJobIdForQueue(queueKey);
+
       const handler: TaskHandler = async () => {
         return { type: "success", result: {} };
       };
@@ -671,6 +709,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       // Enqueue jobs to trigger refresh
       await client.enqueue({
         tenant: DEFAULT_TENANT,
+        id: jobId1,
         payload: { test: 1 },
         limits: [
           {
@@ -687,6 +726,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
 
       await client.enqueue({
         tenant: DEFAULT_TENANT,
+        id: jobId2,
         payload: { test: 2 },
         limits: [
           {
@@ -710,6 +750,11 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       const processedJobs: string[] = [];
       const refreshedQueues: string[] = [];
       const queueKey = `concurrent-refresh-${Date.now()}`;
+
+      // Generate job IDs that route to the same shard as the queue owner
+      const jobIds = Array.from({ length: 5 }, () =>
+        generateJobIdForQueue(queueKey)
+      );
 
       const handler: TaskHandler = async (ctx) => {
         const payload = decodePayload<{ index: number }>(
@@ -737,6 +782,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       for (let i = 0; i < 5; i++) {
         await client.enqueue({
           tenant: DEFAULT_TENANT,
+          id: jobIds[i],
           payload: { index: i },
           limits: [
             {
@@ -767,7 +813,11 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       const errors: Error[] = [];
       const queueKey = `no-handler-error-${Date.now()}`;
 
-      const handler: TaskHandler = async (ctx) => {
+      // Generate job IDs that route to the same shard as the queue owner
+      const jobId1 = generateJobIdForQueue(queueKey);
+      const jobId2 = generateJobIdForQueue(queueKey);
+
+      const handler: TaskHandler = async () => {
         return { type: "success", result: {} };
       };
 
@@ -785,6 +835,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       // Enqueue jobs with floating limit
       await client.enqueue({
         tenant: DEFAULT_TENANT,
+        id: jobId1,
         payload: { job: 1 },
         limits: [
           {
@@ -802,6 +853,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       // Enqueue another to trigger refresh task (limit is stale)
       await client.enqueue({
         tenant: DEFAULT_TENANT,
+        id: jobId2,
         payload: { job: 2 },
         limits: [
           {

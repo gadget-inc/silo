@@ -40,6 +40,7 @@ fn make_test_factory(node_id: &str) -> Arc<ShardFactory> {
             apply_wal_on_close: true,
         },
         MockGubernatorClient::new_arc(),
+        NUM_SHARDS,
     ))
 }
 

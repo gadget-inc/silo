@@ -27,7 +27,7 @@ async fn open_fs_db_from_config() {
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
-    let factory = ShardFactory::new(cfg.database.clone(), rate_limiter);
+    let factory = ShardFactory::new(cfg.database.clone(), rate_limiter, 1);
     let shard = factory.open(0).await.expect("open shard");
 
     shard.db().put(b"k", b"v").await.expect("put");
@@ -70,7 +70,7 @@ async fn shard_with_local_wal_has_wal_close_config() {
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
-    let shard = JobStoreShard::open_with_rate_limiter(&cfg, rate_limiter)
+    let shard = JobStoreShard::open_with_rate_limiter(&cfg, rate_limiter, 0, 1)
         .await
         .expect("open shard");
 
@@ -102,7 +102,7 @@ async fn shard_without_local_wal_has_no_wal_close_config() {
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
-    let shard = JobStoreShard::open_with_rate_limiter(&cfg, rate_limiter)
+    let shard = JobStoreShard::open_with_rate_limiter(&cfg, rate_limiter, 0, 1)
         .await
         .expect("open shard");
 
@@ -132,7 +132,7 @@ async fn close_with_flush_wal_removes_local_wal_directory() {
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
-    let shard = JobStoreShard::open_with_rate_limiter(&cfg, rate_limiter)
+    let shard = JobStoreShard::open_with_rate_limiter(&cfg, rate_limiter, 0, 1)
         .await
         .expect("open shard");
 
@@ -179,7 +179,7 @@ async fn close_without_flush_wal_preserves_local_wal_directory() {
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
-    let shard = JobStoreShard::open_with_rate_limiter(&cfg, rate_limiter)
+    let shard = JobStoreShard::open_with_rate_limiter(&cfg, rate_limiter, 0, 1)
         .await
         .expect("open shard");
 
@@ -225,7 +225,7 @@ async fn data_persists_after_close_with_flush_and_reopen() {
         };
 
         let rate_limiter = MockGubernatorClient::new_arc();
-        let shard = JobStoreShard::open_with_rate_limiter(&cfg, rate_limiter)
+        let shard = JobStoreShard::open_with_rate_limiter(&cfg, rate_limiter, 0, 1)
             .await
             .expect("open shard");
 
@@ -257,7 +257,7 @@ async fn data_persists_after_close_with_flush_and_reopen() {
         };
 
         let rate_limiter = MockGubernatorClient::new_arc();
-        let shard = JobStoreShard::open_with_rate_limiter(&cfg, rate_limiter)
+        let shard = JobStoreShard::open_with_rate_limiter(&cfg, rate_limiter, 0, 1)
             .await
             .expect("reopen shard");
 
@@ -293,7 +293,7 @@ async fn factory_close_all_flushes_all_shards_wal() {
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
-    let factory = ShardFactory::new(template, rate_limiter);
+    let factory = ShardFactory::new(template, rate_limiter, 2);
 
     // Open multiple shards
     let shard0 = factory.open(0).await.expect("open shard 0");

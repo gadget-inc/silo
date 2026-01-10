@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::codec::encode_job_status;
 use crate::job::{JobStatus, JobStatusKind};
-use crate::job_store_shard::helpers::{decode_job_status_owned, now_epoch_ms};
+use crate::job_store_shard::helpers::{self, decode_job_status_owned, now_epoch_ms};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{idx_status_time_key, job_cancelled_key, job_status_key};
 use crate::task::Task;
@@ -155,7 +155,7 @@ impl JobStoreShard {
         txn.put(new_time.as_bytes(), [])?;
 
         // [SILO-RESTART-5] Post: Create new task in DB queue with attempt 1 (fresh retries)
-        // We need to get the job info to know the priority
+        // We need to get the job info to know the priority and limits
         let job_info_key = crate::keys::job_info_key(tenant, id);
         let maybe_job_raw = txn.get(job_info_key.as_bytes()).await?;
         let Some(job_raw) = maybe_job_raw else {
@@ -165,15 +165,53 @@ impl JobStoreShard {
         let job_view = crate::job::JobView::new(job_raw)?;
         let priority = job_view.priority();
         let start_at_ms = job_view.enqueue_time_ms().max(now_ms);
+        let limits = job_view.limits();
+
+        // Check if the job has concurrency limits
+        let has_concurrency_limit = limits.iter().any(|l| {
+            matches!(
+                l,
+                crate::job::Limit::Concurrency(_) | crate::job::Limit::FloatingConcurrency(_)
+            )
+        });
 
         // Create a new task with attempt_number = 1 for fresh retry count
         let new_task_id = Uuid::new_v4().to_string();
-        let new_task = Task::RunAttempt {
-            id: new_task_id,
-            tenant: tenant.to_string(),
-            job_id: id.to_string(),
-            attempt_number: 1, // Fresh start - retry counter reset
-            held_queues: Vec::new(),
+
+        let new_task = if has_concurrency_limit {
+            // Job has concurrency limits - create a ticket request task so the
+            // concurrency system properly acquires a ticket before the job runs.
+            // This ensures the job respects concurrency limits when restarted.
+            let first_limit = limits.first().unwrap();
+            
+            let result = helpers::create_ticket_request_task(
+                first_limit,
+                tenant,
+                id,
+                1, // Fresh start - retry counter reset
+                priority,
+                start_at_ms,
+                &new_task_id,
+                Vec::new(), // Fresh restart starts with no held queues
+                self.shard_number,
+                self.num_shards,
+            )?;
+            
+            // Write HeldTicketState to transaction if present (for remote queues)
+            if let Some((key, value)) = result.held_state_write {
+                txn.put(key.as_bytes(), &value)?;
+            }
+            
+            result.task
+        } else {
+            // No concurrency limits - create RunAttempt directly
+            Task::RunAttempt {
+                id: new_task_id.clone(),
+                tenant: tenant.to_string(),
+                job_id: id.to_string(),
+                attempt_number: 1, // Fresh start - retry counter reset
+                held_queues: Vec::new(),
+            }
         };
 
         // Use a temporary WriteBatch to encode the task, then extract and put via txn

@@ -287,6 +287,15 @@ async fn dequeue_moves_tasks_to_leased_with_uuid() {
             ArchivedTask::RefreshFloatingLimit { .. } => {
                 panic!("unexpected RefreshFloatingLimit in lease")
             }
+            ArchivedTask::RequestRemoteTicket { .. } => {
+                panic!("unexpected RequestRemoteTicket in lease")
+            }
+            ArchivedTask::NotifyRemoteTicketGrant { .. } => {
+                panic!("unexpected NotifyRemoteTicketGrant in lease")
+            }
+            ArchivedTask::ReleaseRemoteTicket { .. } => {
+                panic!("unexpected ReleaseRemoteTicket in lease")
+            }
         }
 
         // Ensure original task queue is empty now
@@ -547,6 +556,15 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
             Task::RefreshFloatingLimit { .. } => {
                 panic!("unexpected RefreshFloatingLimit in tasks/ for this test")
             }
+            Task::RequestRemoteTicket { .. } => {
+                panic!("unexpected RequestRemoteTicket in tasks/ for this test")
+            }
+            Task::NotifyRemoteTicketGrant { .. } => {
+                panic!("unexpected NotifyRemoteTicketGrant in tasks/ for this test")
+            }
+            Task::ReleaseRemoteTicket { .. } => {
+                panic!("unexpected ReleaseRemoteTicket in tasks/ for this test")
+            }
         };
         assert_eq!(attempt, 2);
 
@@ -580,6 +598,15 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
             }
             Task::RefreshFloatingLimit { .. } => {
                 panic!("unexpected RefreshFloatingLimit in tasks/ for this test")
+            }
+            Task::RequestRemoteTicket { .. } => {
+                panic!("unexpected RequestRemoteTicket in tasks/ for this test")
+            }
+            Task::NotifyRemoteTicketGrant { .. } => {
+                panic!("unexpected NotifyRemoteTicketGrant in tasks/ for this test")
+            }
+            Task::ReleaseRemoteTicket { .. } => {
+                panic!("unexpected ReleaseRemoteTicket in tasks/ for this test")
             }
         };
         assert_eq!(attempt3, 3);
@@ -865,6 +892,15 @@ async fn retry_count_one_boundary_enqueues_attempt2_then_stops_on_second_error()
         Task::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in tasks/ for this test"),
         Task::RefreshFloatingLimit { .. } => {
             panic!("unexpected RefreshFloatingLimit in tasks/ for this test")
+        }
+        Task::RequestRemoteTicket { .. } => {
+            panic!("unexpected RequestRemoteTicket in tasks/ for this test")
+        }
+        Task::NotifyRemoteTicketGrant { .. } => {
+            panic!("unexpected NotifyRemoteTicketGrant in tasks/ for this test")
+        }
+        Task::ReleaseRemoteTicket { .. } => {
+            panic!("unexpected ReleaseRemoteTicket in tasks/ for this test")
         }
     };
     assert_eq!(attempt2, 2);
@@ -1771,6 +1807,9 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
             Task::RequestTicket { .. } => {}
             Task::CheckRateLimit { .. } => {}
             Task::RefreshFloatingLimit { .. } => {}
+            Task::RequestRemoteTicket { .. } => {}
+            Task::NotifyRemoteTicketGrant { .. } => {}
+            Task::ReleaseRemoteTicket { .. } => {}
         }
     }
 
@@ -2100,6 +2139,9 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
             Task::RequestTicket { .. } => {}
             Task::CheckRateLimit { .. } => {}
             Task::RefreshFloatingLimit { .. } => {}
+            Task::RequestRemoteTicket { .. } => {}
+            Task::NotifyRemoteTicketGrant { .. } => {}
+            Task::ReleaseRemoteTicket { .. } => {}
         }
     }
 
@@ -2159,6 +2201,15 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         ArchivedTask::RefreshFloatingLimit { .. } => {
             panic!("unexpected RefreshFloatingLimit in lease")
         }
+        ArchivedTask::RequestRemoteTicket { .. } => {
+            panic!("unexpected RequestRemoteTicket in lease")
+        }
+        ArchivedTask::NotifyRemoteTicketGrant { .. } => {
+            panic!("unexpected NotifyRemoteTicketGrant in lease")
+        }
+        ArchivedTask::ReleaseRemoteTicket { .. } => {
+            panic!("unexpected ReleaseRemoteTicket in lease")
+        }
     };
     let expired_ms = now_ms() - 1;
     let new_record = LeaseRecord {
@@ -2211,6 +2262,15 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         Task::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in tasks/ for this test"),
         Task::RefreshFloatingLimit { .. } => {
             panic!("unexpected RefreshFloatingLimit in tasks/ for this test")
+        }
+        Task::RequestRemoteTicket { .. } => {
+            panic!("unexpected RequestRemoteTicket in tasks/ for this test")
+        }
+        Task::NotifyRemoteTicketGrant { .. } => {
+            panic!("unexpected NotifyRemoteTicketGrant in tasks/ for this test")
+        }
+        Task::ReleaseRemoteTicket { .. } => {
+            panic!("unexpected ReleaseRemoteTicket in tasks/ for this test")
         }
     };
     assert_eq!(attempt2, 2);
@@ -2706,6 +2766,15 @@ async fn reap_expired_lease_cancelled_job_sets_cancelled_status() {
             ArchivedTask::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in lease"),
             ArchivedTask::RefreshFloatingLimit { .. } => {
                 panic!("unexpected RefreshFloatingLimit in lease")
+            }
+            ArchivedTask::RequestRemoteTicket { .. } => {
+                panic!("unexpected RequestRemoteTicket in lease")
+            }
+            ArchivedTask::NotifyRemoteTicketGrant { .. } => {
+                panic!("unexpected NotifyRemoteTicketGrant in lease")
+            }
+            ArchivedTask::ReleaseRemoteTicket { .. } => {
+                panic!("unexpected ReleaseRemoteTicket in lease")
             }
         };
         let expired_ms = now_ms() - 1;
@@ -3512,7 +3581,10 @@ async fn restart_cancelled_scheduled_job() {
             .expect("get status")
             .expect("exists");
         assert_eq!(status.kind, JobStatusKind::Cancelled);
-        assert!(shard.is_job_cancelled("-", &job_id).await.expect("is_cancelled"));
+        assert!(shard
+            .is_job_cancelled("-", &job_id)
+            .await
+            .expect("is_cancelled"));
 
         // [SILO-RESTART-*] Restart the job
         shard.restart_job("-", &job_id).await.expect("restart_job");
@@ -3531,7 +3603,10 @@ async fn restart_cancelled_scheduled_job() {
 
         // [SILO-RESTART-4] Verify cancellation flag is cleared
         assert!(
-            !shard.is_job_cancelled("-", &job_id).await.expect("is_cancelled"),
+            !shard
+                .is_job_cancelled("-", &job_id)
+                .await
+                .expect("is_cancelled"),
             "cancellation flag should be cleared after restart"
         );
 
@@ -3540,9 +3615,16 @@ async fn restart_cancelled_scheduled_job() {
         assert!(!tasks.is_empty(), "new task should exist after restart");
         let new_task = &tasks[0];
         match new_task {
-            Task::RunAttempt { job_id: jid, attempt_number, .. } => {
+            Task::RunAttempt {
+                job_id: jid,
+                attempt_number,
+                ..
+            } => {
                 assert_eq!(jid, &job_id);
-                assert_eq!(*attempt_number, 1, "restart should reset attempt number to 1");
+                assert_eq!(
+                    *attempt_number, 1,
+                    "restart should reset attempt number to 1"
+                );
             }
             _ => panic!("expected RunAttempt task, got {:?}", new_task),
         }
@@ -3606,9 +3688,16 @@ async fn restart_failed_job() {
         let tasks = shard.peek_tasks(10).await.expect("peek");
         assert!(!tasks.is_empty(), "new task should exist after restart");
         match &tasks[0] {
-            Task::RunAttempt { job_id: jid, attempt_number, .. } => {
+            Task::RunAttempt {
+                job_id: jid,
+                attempt_number,
+                ..
+            } => {
                 assert_eq!(jid, &job_id);
-                assert_eq!(*attempt_number, 1, "restart should reset attempt number to 1 for fresh retries");
+                assert_eq!(
+                    *attempt_number, 1,
+                    "restart should reset attempt number to 1 for fresh retries"
+                );
             }
             _ => panic!("expected RunAttempt task"),
         }
@@ -3618,7 +3707,13 @@ async fn restart_failed_job() {
         assert_eq!(tasks2.len(), 1);
         let task_id2 = tasks2[0].attempt().task_id().to_string();
         shard
-            .report_attempt_outcome("-", &task_id2, AttemptOutcome::Success { result: b"{}".to_vec() })
+            .report_attempt_outcome(
+                "-",
+                &task_id2,
+                AttemptOutcome::Success {
+                    result: b"{}".to_vec(),
+                },
+            )
             .await
             .expect("report success");
 
@@ -3648,7 +3743,13 @@ async fn restart_succeeded_job_returns_error() {
         let tasks = shard.dequeue("worker-1", 1).await.expect("dequeue").tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
-            .report_attempt_outcome("-", &task_id, AttemptOutcome::Success { result: b"{}".to_vec() })
+            .report_attempt_outcome(
+                "-",
+                &task_id,
+                AttemptOutcome::Success {
+                    result: b"{}".to_vec(),
+                },
+            )
             .await
             .expect("report success");
 
@@ -3719,7 +3820,13 @@ async fn restart_running_job_returns_error() {
         // Clean up - complete the job
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
-            .report_attempt_outcome("-", &task_id, AttemptOutcome::Success { result: b"{}".to_vec() })
+            .report_attempt_outcome(
+                "-",
+                &task_id,
+                AttemptOutcome::Success {
+                    result: b"{}".to_vec(),
+                },
+            )
             .await
             .expect("report success");
     });
@@ -3796,7 +3903,16 @@ async fn restart_failed_job_with_retry_policy_resets_retries() {
         };
 
         let job_id = shard
-            .enqueue("-", None, 10u8, now_ms(), Some(retry_policy), payload, vec![], None)
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                Some(retry_policy),
+                payload,
+                vec![],
+                None,
+            )
             .await
             .expect("enqueue");
 
@@ -3832,7 +3948,10 @@ async fn restart_failed_job_with_retry_policy_resets_retries() {
         assert_eq!(status.kind, JobStatusKind::Failed);
 
         // Verify we had 3 attempts
-        let attempts = shard.get_job_attempts("-", &job_id).await.expect("get attempts");
+        let attempts = shard
+            .get_job_attempts("-", &job_id)
+            .await
+            .expect("get attempts");
         assert_eq!(attempts.len(), 3, "should have 3 failed attempts");
 
         // Restart the job
@@ -3849,9 +3968,16 @@ async fn restart_failed_job_with_retry_policy_resets_retries() {
         // Verify new task has attempt number 1 (fresh start)
         let tasks = shard.peek_tasks(10).await.expect("peek");
         match &tasks[0] {
-            Task::RunAttempt { job_id: jid, attempt_number, .. } => {
+            Task::RunAttempt {
+                job_id: jid,
+                attempt_number,
+                ..
+            } => {
                 assert_eq!(jid, &job_id);
-                assert_eq!(*attempt_number, 1, "restart should reset to attempt 1 for fresh retries");
+                assert_eq!(
+                    *attempt_number, 1,
+                    "restart should reset to attempt 1 for fresh retries"
+                );
             }
             _ => panic!("expected RunAttempt task"),
         }
@@ -3860,7 +3986,13 @@ async fn restart_failed_job_with_retry_policy_resets_retries() {
         let tasks = shard.dequeue("worker-1", 1).await.expect("dequeue").tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
-            .report_attempt_outcome("-", &task_id, AttemptOutcome::Success { result: b"ok".to_vec() })
+            .report_attempt_outcome(
+                "-",
+                &task_id,
+                AttemptOutcome::Success {
+                    result: b"ok".to_vec(),
+                },
+            )
             .await
             .expect("report success");
 
@@ -3895,8 +4027,14 @@ async fn restart_cancelled_running_job_after_acknowledgement() {
         shard.cancel_job("-", &job_id).await.expect("cancel_job");
 
         // Worker discovers cancellation via heartbeat
-        let hb_result = shard.heartbeat_task("-", "worker-1", &task_id).await.expect("heartbeat");
-        assert!(hb_result.cancelled, "heartbeat should indicate cancellation");
+        let hb_result = shard
+            .heartbeat_task("-", "worker-1", &task_id)
+            .await
+            .expect("heartbeat");
+        assert!(
+            hb_result.cancelled,
+            "heartbeat should indicate cancellation"
+        );
 
         // Worker acknowledges cancellation
         shard
@@ -3923,7 +4061,10 @@ async fn restart_cancelled_running_job_after_acknowledgement() {
             .expect("exists");
         assert_eq!(status_after.kind, JobStatusKind::Scheduled);
         assert!(
-            !shard.is_job_cancelled("-", &job_id).await.expect("is_cancelled"),
+            !shard
+                .is_job_cancelled("-", &job_id)
+                .await
+                .expect("is_cancelled"),
             "cancellation should be cleared"
         );
 
@@ -3931,7 +4072,13 @@ async fn restart_cancelled_running_job_after_acknowledgement() {
         let tasks = shard.dequeue("worker-2", 1).await.expect("dequeue").tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
-            .report_attempt_outcome("-", &task_id, AttemptOutcome::Success { result: b"{}".to_vec() })
+            .report_attempt_outcome(
+                "-",
+                &task_id,
+                AttemptOutcome::Success {
+                    result: b"{}".to_vec(),
+                },
+            )
             .await
             .expect("report success");
 
@@ -3973,17 +4120,27 @@ async fn multiple_restarts_of_same_job() {
                 .expect("report error");
 
             // Verify failed
-            let status = shard.get_job_status("-", &job_id).await.expect("status").expect("exists");
+            let status = shard
+                .get_job_status("-", &job_id)
+                .await
+                .expect("status")
+                .expect("exists");
             assert_eq!(status.kind, JobStatusKind::Failed);
 
             // Restart
             shard.restart_job("-", &job_id).await.expect("restart_job");
 
             // Verify scheduled
-            let status_after = shard.get_job_status("-", &job_id).await.expect("status").expect("exists");
+            let status_after = shard
+                .get_job_status("-", &job_id)
+                .await
+                .expect("status")
+                .expect("exists");
             assert_eq!(
-                status_after.kind, JobStatusKind::Scheduled,
-                "iteration {} should be Scheduled after restart", iteration
+                status_after.kind,
+                JobStatusKind::Scheduled,
+                "iteration {} should be Scheduled after restart",
+                iteration
             );
         }
 
@@ -3991,11 +4148,21 @@ async fn multiple_restarts_of_same_job() {
         let tasks = shard.dequeue("worker-1", 1).await.expect("dequeue").tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
-            .report_attempt_outcome("-", &task_id, AttemptOutcome::Success { result: b"done".to_vec() })
+            .report_attempt_outcome(
+                "-",
+                &task_id,
+                AttemptOutcome::Success {
+                    result: b"done".to_vec(),
+                },
+            )
             .await
             .expect("report success");
 
-        let final_status = shard.get_job_status("-", &job_id).await.expect("status").expect("exists");
+        let final_status = shard
+            .get_job_status("-", &job_id)
+            .await
+            .expect("status")
+            .expect("exists");
         assert_eq!(final_status.kind, JobStatusKind::Succeeded);
     });
 }
