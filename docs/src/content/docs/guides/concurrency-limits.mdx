@@ -1,0 +1,409 @@
+---
+title: Concurrency Limits
+description: Understanding the different types of concurrency limits in Silo and how they work
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Silo provides three types of limits to control job execution: **concurrency limits**, **floating concurrency limits**, and **rate limits**. These limits can be attached to jobs when enqueueing and are checked in order before the job executes.
+
+This guide focuses on the two concurrency-based limits. For rate limits, see the [Enqueueing guide](/guides/enqueueing#rate-limits).
+
+## Concurrency Limits
+
+Concurrency limits restrict how many jobs with the same key can run simultaneously. Jobs that share a limit key compete for available "slots" in a queue.
+
+### Basic Usage
+
+```typescript
+await client.enqueue({
+  payload: { task: "process-upload", userId: 123 },
+  limits: [
+    {
+      type: "concurrency",
+      key: "user:123",           // Jobs with same key share the limit
+      maxConcurrency: 5          // Max 5 concurrent jobs for this user
+    }
+  ]
+});
+```
+
+### How It Works
+
+When you enqueue a job with a concurrency limit, Silo:
+
+1. **Checks capacity**: If fewer than `maxConcurrency` jobs are running for that key, the job is granted a "ticket" immediately
+2. **Queues if full**: If the limit is at capacity, the job waits in a request queue ordered by priority and start time
+3. **Grants on completion**: When a running job finishes, the next waiting job in the queue is automatically granted a ticket
+
+Jobs with granted tickets proceed to any additional limit checks (if configured) or directly to execution.
+
+### Common Use Cases
+
+**Per-user limits:**
+```typescript
+{
+  type: "concurrency",
+  key: `user:${userId}`,
+  maxConcurrency: 10
+}
+```
+
+**Per-tenant limits:**
+```typescript
+{
+  type: "concurrency", 
+  key: `tenant:${tenantId}`,
+  maxConcurrency: 100
+}
+```
+
+**Resource protection:**
+```typescript
+{
+  type: "concurrency",
+  key: "database:analytics",  // Protect a shared resource
+  maxConcurrency: 50
+}
+```
+
+## Floating Concurrency Limits
+
+Sometimes, fixed concurrency limits aren't appropriate, because the value of the limit needs to change over time. 
+
+Floating concurrency limits are dynamic concurrency limits where the maximum concurrency value is **computed by your worker code** and refreshed periodically. This enables adaptive concurrency based on external factors like system load, quota availability, or business logic -- its up to you!
+
+### Basic Usage
+
+```typescript
+await client.enqueue({
+  payload: { task: "api-call", endpoint: "https://api.example.com" },
+  limits: [
+    {
+      type: "floatingConcurrency",
+      key: "external-api",
+      defaultMaxConcurrency: 10,        // Initial value until first refresh
+      refreshIntervalMs: 60000n,        // Refresh every 60 seconds
+      metadata: {
+        apiEndpoint: "https://api.example.com",
+        apiKey: "key-123"
+      }
+    }
+  ]
+});
+```
+
+### How It Works
+
+Floating limits combine the mechanics of regular concurrency limits with worker-driven refresh tasks:
+
+1. **Initial state**: When first created, the limit starts at `defaultMaxConcurrency`
+2. **Lazy refresh scheduling**: When a job with a floating limit is enqueued (or dequeued) and the refresh interval has elapsed, Silo schedules a refresh task to run on a worker
+3. **Worker processing**: Some worker receives the refresh task and processes it just like regular job tasks
+4. **Computing new values**: The worker executes custom logic registered client side to compute the new `maxConcurrency` value
+5. **Reporting back**: The worker reports the new value to Silo
+6. **State update**: Silo updates the limit's current max concurrency, which affects all future jobs (until the next refresh)
+
+Between refreshes, the floating limit behaves exactly like a regular concurrency limit, using the most recently reported `maxConcurrency` value.
+
+### Worker Implementation
+
+Workers must handle `RefreshFloatingLimitTask` items returned from `LeaseTasks()`:
+
+```typescript
+// TypeScript example (conceptual)
+const response = await client.leaseTasks({
+  workerId: "worker-1",
+  maxTasks: 10
+});
+
+// Process regular job tasks
+for (const task of response.tasks) {
+  // ... handle job execution
+}
+
+// Process floating limit refresh tasks
+for (const refreshTask of response.refreshTasks) {
+  try {
+    // Compute the new max concurrency based on your logic
+    const newMaxConcurrency = await computeMaxConcurrency(
+      refreshTask.queueKey,
+      refreshTask.currentMaxConcurrency,
+      refreshTask.metadata
+    );
+    
+    // Report success with the new value
+    await client.reportRefreshOutcome({
+      shard: /* shard id */,
+      taskId: refreshTask.id,
+      success: {
+        newMaxConcurrency: newMaxConcurrency
+      }
+    });
+  } catch (error) {
+    // Report failure - Silo will retry with exponential backoff
+    await client.reportRefreshOutcome({
+      shard: /* shard id */,
+      taskId: refreshTask.id,
+      failure: {
+        code: "REFRESH_ERROR",
+        message: error.message
+      }
+    });
+  }
+}
+```
+
+### Computing Max Concurrency
+
+Workers have complete freedom in how they compute the new concurrency value. Examples:
+
+**External API rate limits:**
+```typescript
+async function computeMaxConcurrency(queueKey, currentMax, metadata) {
+  // Query an external API for current quota/limits
+  const apiStatus = await fetch(metadata.apiEndpoint + '/status', {
+    headers: { 'Authorization': `Bearer ${metadata.apiKey}` }
+  });
+  
+  const quota = await apiStatus.json();
+  
+  // Set concurrency based on available quota
+  return Math.floor(quota.remaining / 100);
+}
+```
+
+**System metrics:**
+```typescript
+async function computeMaxConcurrency(queueKey, currentMax, metadata) {
+  // Check system load, memory, etc.
+  const cpuUsage = await getSystemCPUUsage();
+  
+  if (cpuUsage > 0.8) {
+    // Reduce concurrency under high load
+    return Math.max(1, Math.floor(currentMax * 0.5));
+  } else if (cpuUsage < 0.3) {
+    // Increase concurrency when idle
+    return Math.min(100, currentMax + 5);
+  }
+  
+  return currentMax; // Keep current level
+}
+```
+
+**Time-based:**
+```typescript
+async function computeMaxConcurrency(queueKey, currentMax, metadata) {
+  const hour = new Date().getHours();
+  
+  // More concurrency during business hours
+  if (hour >= 9 && hour <= 17) {
+    return 50;
+  }
+  
+  // Less during off-hours
+  return 10;
+}
+```
+
+### Boundaries and Constraints
+
+The computed `maxConcurrency` value must satisfy:
+
+- **Minimum**: Must be at least `1` (Silo enforces this as a `uint32`)
+- **Maximum**: Limited by `uint32` max value (4,294,967,295), but practical limits depend on your system resources
+- **Responsiveness**: The refresh task should complete quickly (seconds, not minutes) to avoid blocking worker capacity
+
+<Aside type="caution">
+Workers must report either success or failure for every refresh task they lease. Failing to report an outcome will cause the task to expire and be retried, similar to regular job tasks.
+</Aside>
+
+### Refresh Failures and Backoff
+
+If a worker reports a refresh failure, Silo:
+
+1. Keeps using the current `maxConcurrency` value
+2. Schedules a retry with exponential backoff:
+   - Initial backoff: 1 second
+   - Maximum backoff: 60 seconds  
+   - Multiplier: 2.0
+3. Increments the retry counter on the floating limit state
+4. Resets the retry counter to 0 when a refresh succeeds
+
+This ensures transient failures (network issues, API downtime) don't permanently break the limit.
+
+### Metadata Usage
+
+The `metadata` map is opaque to Silo - it's passed through to workers unchanged. Use it to provide context for computing the new max concurrency:
+
+```typescript
+{
+  type: "floatingConcurrency",
+  key: "stripe-api",
+  defaultMaxConcurrency: 20,
+  refreshIntervalMs: 30000n,
+  metadata: {
+    apiKey: "sk_test_...",
+    apiEndpoint: "https://api.stripe.com",
+    accountId: "acct_123",
+    // Any other data your worker needs
+  }
+}
+```
+
+## Handling Limit Changes
+
+When you enqueue a new job with a different limit value for the same key, Silo's behavior depends on the limit type:
+
+### Regular Concurrency Limits
+
+For regular concurrency limits, **each job carries its own limit definition**. When granting tickets:
+
+1. Silo checks the in-memory count of currently running jobs for that key
+2. It compares against the `maxConcurrency` value **from the job being granted**
+3. If capacity is available, the job is granted
+
+This means:
+- Different jobs with the same key can specify different `maxConcurrency` values
+- The limit check at grant time uses the **incoming job's limit value**
+- Currently running jobs are not affected by new enqueues with different limits
+- As older jobs complete, newer jobs with their own limit values will be granted
+
+**Example scenario:**
+```typescript
+// Enqueue job A with maxConcurrency=5
+await client.enqueue({
+  payload: { id: "A" },
+  limits: [{ type: "concurrency", key: "queue-1", maxConcurrency: 5 }]
+});
+
+// Later, enqueue job B with maxConcurrency=10 
+await client.enqueue({
+  payload: { id: "B" },
+  limits: [{ type: "concurrency", key: "queue-1", maxConcurrency: 10 }]
+});
+```
+
+Job B's grant check will use `maxConcurrency=10` when determining if it can run. This allows you to adjust limits per-job based on changing conditions.
+
+<Aside type="tip">
+If you want all jobs for a key to use the same limit, use a **floating concurrency limit** - the shared state ensures consistency.
+</Aside>
+
+### Floating Concurrency Limits
+
+For floating concurrency limits, there is **shared state** stored per key:
+
+1. The first job to use a floating limit key creates the state with `defaultMaxConcurrency`
+2. Subsequent jobs with the same key share that state
+3. The `defaultMaxConcurrency` value in later enqueue requests is **ignored** - the stored state takes precedence
+4. Workers update the shared state via refresh tasks
+5. All grant decisions use the `currentMaxConcurrency` from the shared state
+
+This means:
+- Changing `defaultMaxConcurrency` in new enqueue requests has no effect on existing limits
+- The only way to change the max concurrency is via worker-driven refreshes
+- All jobs using the same floating limit key see the same, consistent max concurrency value
+- The limit evolves over time as workers report new values
+
+**Example scenario:**
+```typescript
+// First job creates state with defaultMaxConcurrency=5
+await client.enqueue({
+  payload: { id: "A" },
+  limits: [{
+    type: "floatingConcurrency",
+    key: "dynamic-queue",
+    defaultMaxConcurrency: 5,
+    refreshIntervalMs: 60000n,
+    metadata: {}
+  }]
+});
+
+// Later job tries to use defaultMaxConcurrency=10 - this is ignored!
+await client.enqueue({
+  payload: { id: "B" },
+  limits: [{
+    type: "floatingConcurrency", 
+    key: "dynamic-queue",          // Same key
+    defaultMaxConcurrency: 10,     // Ignored - state already exists
+    refreshIntervalMs: 60000n,
+    metadata: {}
+  }]
+});
+```
+
+Both jobs will use the same floating limit state with the original `defaultMaxConcurrency=5` (until a refresh task updates it).
+
+### Changing Metadata and Refresh Interval
+
+For floating limits, `metadata` and `refreshIntervalMs` are also stored in the shared state:
+
+- First job's values are saved
+- Subsequent jobs' values are ignored
+- To change these, you would need to delete the old floating limit state (not currently exposed in the API) or use a different key
+
+## Multiple Limits
+
+Jobs can have multiple limits that are checked sequentially:
+
+```typescript
+await client.enqueue({
+  payload: { task: "expensive-op" },
+  limits: [
+    // Checked first
+    {
+      type: "concurrency",
+      key: "tenant:abc", 
+      maxConcurrency: 10
+    },
+    // Checked second (only if first passes)
+    {
+      type: "floatingConcurrency",
+      key: "external-api",
+      defaultMaxConcurrency: 5,
+      refreshIntervalMs: 30000n,
+      metadata: {}
+    },
+    // Checked third
+    {
+      type: "rateLimit",
+      name: "tenant-hourly",
+      uniqueKey: "tenant:abc",
+      limit: 1000n,
+      durationMs: 3600000n
+    }
+  ]
+});
+```
+
+The job proceeds to the next limit only after passing the current one. If a limit blocks (at capacity or rate limited), the job waits until that limit clears.
+
+## Best Practices
+
+1. **Choose the right limit type**:
+   - Use regular concurrency limits when the max concurrency is static and known upfront
+   - Use floating limits when you need dynamic adjustment based on external factors
+   - Use rate limits when you care about requests-per-time-window rather than concurrency
+
+2. **Keep refresh intervals reasonable**:
+   - Shorter intervals (10-60s) for rapidly changing systems
+   - Longer intervals (5-15min) for slower-changing external quotas
+   - Balance freshness against worker overhead
+
+3. **Handle refresh failures gracefully**:
+   - Implement retries in your refresh logic for transient errors
+   - Log failures for debugging
+   - Consider falling back to safe defaults in your computation logic
+
+4. **Use descriptive keys**:
+   - Include entity type: `user:123`, `tenant:abc`, `api:stripe`
+   - Make keys meaningful for debugging and monitoring
+
+5. **Monitor limit utilization**:
+   - Use Silo's query API to track how many jobs are waiting on limits
+   - Watch for persistent queues that may indicate limits are too restrictive
+
+6. **Limit ordering matters**:
+   - Put cheaper checks first (e.g., concurrency before expensive rate limit API calls)
+   - Order by specificity (per-user limits before global limits)

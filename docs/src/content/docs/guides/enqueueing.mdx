@@ -1,0 +1,321 @@
+---
+title: Enqueueing Jobs
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+New jobs must be enqueued into Silo with an API call using the Silo client. This guide covers all the options available when enqueueing jobs.
+
+## Basic Usage
+
+You can enqueue a job by enqueuing a payload:
+
+```typescript
+import { SiloGRPCClient } from "@silo-ai/client";
+
+const client = new SiloGRPCClient({
+  servers: ["localhost:50051"],
+});
+
+// Enqueue a simple job - returns a JobHandle
+const handle = await client.enqueue({
+  payload: { task: "send-email", to: "user@example.com" }
+});
+
+console.log(`Enqueued job: ${handle.id}`);
+
+// Use the handle to interact with the job
+const status = await handle.getStatus();
+console.log(`Job status: ${status}`);
+```
+
+## Client Initialization
+
+Before enqueueing jobs, you need to create a `SiloGRPCClient` instance:
+
+```typescript
+const client = new SiloGRPCClient({
+  // Required: one or more server addresses
+  servers: "localhost:50051",
+  // or multiple servers: ["server1:50051", "server2:50051"]
+  // or as object: { host: "localhost", port: 50051 }
+  
+  // Optional: use TLS (default: true)
+  useTls: false,
+  
+  // Optional: authentication token
+  token: "your-api-token",
+  // or as function: async () => "your-api-token"
+  
+  // Optional: shard routing configuration
+  shardRouting: {
+    numShards: 16,
+    topologyRefreshIntervalMs: 60000, // 0 to disable auto-refresh
+  }
+});
+
+// Discover cluster topology (recommended)
+await client.refreshTopology();
+```
+
+
+## Enqueue Options
+
+The `enqueue()` method accepts an options object with the following fields:
+
+### payload (required)
+
+The job data as any JSON-serializable value. This will be passed to your worker when the job is processed.
+
+```typescript
+await client.enqueue({
+  payload: {
+    userId: 123,
+    action: "generate-report",
+    reportType: "monthly"
+  }
+});
+```
+
+### `id` (optional)
+
+A custom job ID. If not provided, Silo will autogenerate a job id. If a job with this ID already exists, the enqueue will fail.
+
+```typescript
+const handle = await client.enqueue({
+  payload: { task: "cleanup" },
+  id: "cleanup-2024-01-08"
+});
+
+console.log(handle.id); // "cleanup-2024-01-08"
+```
+
+<Aside type="caution" title="Job ID must be unique">
+If you provide a job ID, it must be unique. If a job with this ID already exists, the enqueue call will fail. This is useful for deduplication and/or idempotency.
+</Aside>
+
+### `priority` (optional)
+
+Priority from 0-99, where **0 is highest priority**. Defaults to 50.
+
+```typescript
+const urgentHandle = await client.enqueue({
+  payload: { task: "urgent-notification" },
+  priority: 0  // Highest priority
+});
+
+const backgroundHandle = await client.enqueue({
+  payload: { task: "background-sync" },
+  priority: 90  // Lower priority
+});
+```
+
+### `startAtMs` (optional)
+
+Unix timestamp in milliseconds when the job should start. Defaults to `Date.now()`. Use this to schedule jobs in the future.
+
+```typescript
+// Schedule job 1 hour from now
+const oneHourLater = BigInt(Date.now() + 60 * 60 * 1000);
+
+const handle = await client.enqueue({
+  payload: { task: "scheduled-reminder" },
+  startAtMs: oneHourLater
+});
+```
+
+### `tenant` (optional)
+
+Tenant ID for multi-tenancy. Jobs with the same tenant are routed to the same shard. If not provided, uses the default tenant.
+
+```typescript
+const handle = await client.enqueue({
+  payload: { task: "process-order" },
+  tenant: "customer-123"
+});
+
+// The tenant is stored in the handle for future operations
+console.log(handle.tenant); // "customer-123"
+```
+
+<Aside type="caution" title="Tenant may be required">
+When tenancy is enabled server-side, you __must__ provide the `tenant` for every job you enqueue. If you don't provide a tenant ID, the enqueue call will fail.
+</Aside>
+
+### `metadata` (optional)
+
+Arbitrary key-value pairs stored with the job. Metadata pairs are useful for tracking, filtering, or debugging, as jobs can later be queried by these metadata keys. 
+
+```typescript
+const handle = await client.enqueue({
+  payload: { task: "process-image" },
+  metadata: {
+    source: "api",
+    userId: "user-456",
+    environment: "production"
+  }
+});
+```
+
+Metadata must meet these constraints:
+- Maximum of 16 metadata entries per job
+- Keys must be less than 64 bytes
+- Values must be less than 65,535 bytes
+
+### `retryPolicy` (optional)
+
+Configure automatic retries if the job fails:
+
+```typescript
+const handle = await client.enqueue({
+  payload: { task: "api-call" },
+  retryPolicy: {
+    retryCount: 3,                    // Maximum number of retries
+    initialIntervalMs: 1000n,         // Initial backoff (1 second)
+    maxIntervalMs: 30000n,            // Maximum backoff (30 seconds)
+    backoffFactor: 2.0,               // Exponential backoff multiplier
+    randomizeInterval: true           // Add jitter to prevent thundering herd
+  }
+});
+```
+
+#### Retry behavior
+
+- If a job fails, it will be retried up to `retryCount` times
+- Each retry waits `initialIntervalMs * (backoffFactor ^ attempt)` milliseconds
+- Wait time is capped at `maxIntervalMs`
+- If `randomizeInterval` is true, a random jitter is added to the wait time
+
+### `limits` (optional)
+
+An array of limits that control job execution. Limits are checked in order before the job runs.
+
+#### Concurrency Limits
+
+Limit how many jobs with the same key can run concurrently:
+
+```typescript
+const handle = await client.enqueue({
+  payload: { task: "process-user-upload", userId: 123 },
+  limits: [
+    {
+      type: "concurrency",
+      key: "user:123",           // Jobs with same key share the limit
+      maxConcurrency: 5          // Max 5 concurrent jobs for this user
+    }
+  ]
+});
+```
+
+Common use cases:
+- Per-user rate limiting: `key: "user:${userId}"`
+- Per-tenant limits: `key: "tenant:${tenantId}"`
+- Resource protection: `key: "database:main"`
+
+#### Rate Limits
+
+Limit how many jobs can execute within a time window using the Gubernator distributed rate limiting algorithm:
+
+```typescript
+import { GubernatorAlgorithm } from "@silo-ai/client";
+
+const handle = await client.enqueue({
+  payload: { task: "api-request" },
+  limits: [
+    {
+      type: "rateLimit",
+      name: "api-rate-limit",              // Name for debugging/metrics
+      uniqueKey: "user:456",               // Unique key for this limit instance
+      limit: 100n,                         // Max 100 requests
+      durationMs: 60000n,                  // Per 60 seconds (1 minute)
+      hits: 1,                             // Each job consumes 1 "hit" (default)
+      algorithm: GubernatorAlgorithm.TOKEN_BUCKET,  // TOKEN_BUCKET or LEAKY_BUCKET
+      retryPolicy: {
+        initialBackoffMs: 100n,            // Initial retry backoff
+        maxBackoffMs: 5000n,               // Max retry backoff
+        backoffMultiplier: 2.0,            // Exponential backoff multiplier
+        maxRetries: 10                     // Max retries (0 = infinite until reset)
+      }
+    }
+  ]
+});
+```
+
+**Rate limit algorithms:**
+- `TOKEN_BUCKET` (default): Allows bursts up to the limit
+- `LEAKY_BUCKET`: Smooths out requests over time
+
+**Rate limit retry behavior:**
+When a rate limit is hit, the job is automatically retried according to the retry policy. If `maxRetries` is 0, retries continue until the rate limit resets.
+
+#### Multiple Limits
+
+You can combine multiple limits. They are checked in order, and all must pass before the job executes:
+
+```typescript
+const handle = await client.enqueue({
+  payload: { task: "expensive-operation", tenantId: "abc" },
+  limits: [
+    // First check: tenant concurrency limit
+    {
+      type: "concurrency",
+      key: "tenant:abc",
+      maxConcurrency: 10
+    },
+    // Then check: tenant rate limit
+    {
+      type: "rateLimit",
+      name: "tenant-hourly-limit",
+      uniqueKey: "tenant:abc",
+      limit: 1000n,
+      durationMs: 3600000n  // 1 hour
+    }
+  ]
+});
+```
+
+## Job Handles
+
+The `enqueue()` method returns a `JobHandle` object that provides convenient methods to interact with the job:
+
+```typescript
+const handle = await client.enqueue({
+  payload: { task: "process-data" }
+});
+
+// Access the job ID
+console.log(handle.id);
+
+// Get full job details
+const job = await handle.getJob();
+
+// Get just the status
+const status = await handle.getStatus();
+
+// Cancel the job
+await handle.cancel();
+
+// Delete the job
+await handle.delete();
+
+// Wait for the job to complete
+const result = await handle.awaitResult({ timeoutMs: 30000 });
+console.log(result.outcome); // "succeeded", "failed", or "cancelled"
+```
+
+You can also create a handle for an existing job:
+
+```typescript
+// Create a handle from a job ID
+const handle = client.handle("job-123");
+
+// Or with a tenant
+const handle = client.handle("job-456", "customer-123");
+```
+
+## Next Steps
+
+After enqueueing jobs, you'll need to:
+1. [Run workers](/guides/running-workers) to process the jobs
+2. Set up [observability](/guides/observability) to monitor job execution
+3. Configure [server settings](/guides/server-configuration) for production
