@@ -289,6 +289,7 @@ impl SiloService {
         task: PendingCrossShardTask,
     ) -> Result<(), Status> {
         match task {
+            // [SILO-PROC-REQ-1] Pre: RequestRemoteTicketTask exists in DB queue
             PendingCrossShardTask::RequestRemoteTicket {
                 queue_owner_shard,
                 tenant,
@@ -302,6 +303,7 @@ impl SiloService {
                 task_key,
                 floating_limit,
             } => {
+                // [SILO-PROC-REQ-2] Pre: Job exists and is not cancelled (checked by queue owner)
                 tracing::debug!(
                     local_shard = local_shard_id,
                     queue_owner_shard = queue_owner_shard,
@@ -310,6 +312,7 @@ impl SiloService {
                     has_floating_limit = floating_limit.is_some(),
                     "processing RequestRemoteTicket task"
                 );
+                // [SILO-PROC-REQ-5] Post: Create request record on queue owner (via RPC)
                 self.cluster_client
                     .request_concurrency_ticket(
                         queue_owner_shard,
@@ -327,13 +330,15 @@ impl SiloService {
                     .await
                     .map_err(|e| Status::internal(format!("RPC failed: {}", e)))?;
 
-                // RPC succeeded, delete the task
+                // [SILO-PROC-REQ-3] Post: Delete the RequestRemoteTicket task from DB queue
+                // [SILO-PROC-REQ-4] Post: Task record deleted after successful RPC
                 shard
                     .delete_cross_shard_task(&task_key)
                     .await
                     .map_err(map_err)?;
                 Ok(())
             }
+            // [SILO-PROC-GRANT-1] Pre: NotifyRemoteTicketGrantTask exists in DB queue
             PendingCrossShardTask::NotifyRemoteTicketGrant {
                 job_shard,
                 tenant,
@@ -344,6 +349,7 @@ impl SiloService {
                 attempt_number,
                 task_key,
             } => {
+                // [SILO-PROC-GRANT-2] Pre: Job exists and is not cancelled (checked by job shard)
                 tracing::debug!(
                     local_shard = local_shard_id,
                     job_shard = job_shard,
@@ -351,6 +357,8 @@ impl SiloService {
                     queue_key = %queue_key,
                     "processing NotifyRemoteTicketGrant task"
                 );
+                // [SILO-PROC-GRANT-3] holder_task_id correlates holder to RunAttempt task
+                // [SILO-PROC-GRANT-6] Post: Create RunAttempt task on job shard (via RPC)
                 self.cluster_client
                     .notify_concurrency_ticket_granted(
                         job_shard,
@@ -365,13 +373,15 @@ impl SiloService {
                     .await
                     .map_err(|e| Status::internal(format!("RPC failed: {}", e)))?;
 
-                // RPC succeeded, delete the task
+                // [SILO-PROC-GRANT-4] Post: Delete NotifyRemoteTicketGrant task from DB queue
+                // [SILO-PROC-GRANT-5] Post: Task record deleted after successful RPC
                 shard
                     .delete_cross_shard_task(&task_key)
                     .await
                     .map_err(map_err)?;
                 Ok(())
             }
+            // [SILO-PROC-REL-1] Pre: ReleaseRemoteTicketTask exists in DB queue
             PendingCrossShardTask::ReleaseRemoteTicket {
                 queue_owner_shard,
                 tenant,
@@ -380,6 +390,7 @@ impl SiloService {
                 holder_task_id,
                 task_key,
             } => {
+                // [SILO-PROC-REL-2] Pre: Holder exists on queue owner
                 tracing::debug!(
                     local_shard = local_shard_id,
                     queue_owner_shard = queue_owner_shard,
@@ -387,6 +398,7 @@ impl SiloService {
                     queue_key = %queue_key,
                     "processing ReleaseRemoteTicket task"
                 );
+                // [SILO-PROC-REL-5] Post: Release the holder on queue owner (via RPC)
                 self.cluster_client
                     .release_concurrency_ticket(
                         queue_owner_shard,
@@ -398,7 +410,8 @@ impl SiloService {
                     .await
                     .map_err(|e| Status::internal(format!("RPC failed: {}", e)))?;
 
-                // RPC succeeded, delete the task
+                // [SILO-PROC-REL-3] Post: Delete the ReleaseRemoteTicket task from DB queue
+                // [SILO-PROC-REL-4] Post: Task record deleted after successful RPC
                 shard
                     .delete_cross_shard_task(&task_key)
                     .await

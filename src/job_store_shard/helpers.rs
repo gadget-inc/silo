@@ -115,6 +115,7 @@ pub(crate) fn create_ticket_request_task(
         })
     } else {
         // Remote queue - use RequestRemoteTicket
+        // [SILO-ENQ-REMOTE-1] No RunAttempt task created yet (must wait for remote grant)
         let request_id = Uuid::new_v4().to_string();
 
         // Prepare held ticket state for caller to write
@@ -122,6 +123,8 @@ pub(crate) fn create_ticket_request_task(
         let state_key = held_ticket_state_key(job_id, attempt_number, &request_id);
         let state_value = encode_held_ticket_state(&state)?;
 
+        // [SILO-ENQ-REMOTE-2] Create RequestRemoteTicket task in DB queue
+        // [SILO-ENQ-REMOTE-3] Task contains all info needed to request ticket from queue owner
         Ok(TicketRequestTaskResult {
             task: Task::RequestRemoteTicket {
                 task_id: task_id.to_string(),
@@ -203,7 +206,8 @@ pub(crate) async fn release_held_tickets(
         .await
         .map_err(JobStoreShardError::Rkyv)?;
 
-    // Create ReleaseRemoteTicket tasks for REMOTE tickets
+    // [SILO-CREATE-REL-1] Create ReleaseRemoteTicket tasks for REMOTE tickets
+    // [SILO-CREATE-REL-2] Only for queues remote from job's shard
     for remote_queue in &remote_queues {
         let Some(remote_ref) = RemoteQueueRef::parse(remote_queue) else {
             tracing::warn!(
@@ -213,6 +217,9 @@ pub(crate) async fn release_held_tickets(
             continue;
         };
 
+        // [SILO-CREATE-REL-3] Holder exists on queue owner (we're releasing it)
+        // [SILO-CREATE-REL-4] Create ReleaseRemoteTicket task in DB queue
+        // [SILO-CREATE-REL-5] Task contains holder_task_id for correlation
         let release_task = Task::ReleaseRemoteTicket {
             task_id: Uuid::new_v4().to_string(),
             queue_owner_shard: remote_ref.queue_owner_shard,

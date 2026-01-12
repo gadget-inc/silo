@@ -122,16 +122,16 @@ impl JobStoreShard {
 
         // Atomically update attempt and remove lease
         let mut batch = WriteBatch::new();
-        // [SILO-SUCC-4][SILO-FAIL-4][SILO-RETRY-4] Update attempt status
+        // [SILO-SUCC-4][SILO-SUCC-REMOTE-4][SILO-FAIL-4][SILO-RETRY-4] Update attempt status
         batch.put(attempt_key.as_bytes(), &attempt_val);
-        // [SILO-SUCC-2][SILO-FAIL-2][SILO-RETRY-2] Release lease
+        // [SILO-SUCC-2][SILO-SUCC-REMOTE-2][SILO-FAIL-2][SILO-RETRY-2] Release lease
         batch.delete(leased_task_key.as_bytes());
 
         let mut job_missing_error: Option<JobStoreShardError> = None;
         let mut followup_next_time: Option<i64> = None;
 
         match &outcome {
-            // [SILO-SUCC-3] If success: mark job succeeded now (pure write)
+            // [SILO-SUCC-3][SILO-SUCC-REMOTE-3] If success: mark job succeeded now (pure write)
             AttemptOutcome::Success { .. } => {
                 let job_status = JobStatus::succeeded(now_ms);
                 self.set_job_status_with_index(&mut batch, tenant, &job_id, job_status)
@@ -235,6 +235,9 @@ impl JobStoreShard {
 
         // [SILO-REL-1] Release any held concurrency tickets
         // This also handles [SILO-GRANT-*] granting to next waiting request
+        // For REMOTE tickets: [SILO-SUCC-REMOTE-1] task holds remote queue tickets
+        // [SILO-SUCC-REMOTE-5][SILO-SUCC-REMOTE-6] Creates ReleaseRemoteTicketTask
+        // (holder stays until release RPC is processed - see SILO-CREATE-REL-*)
         let release_events: Vec<MemoryEvent> = release_held_tickets(
             &self.db,
             &mut batch,

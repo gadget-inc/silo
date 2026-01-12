@@ -980,7 +980,7 @@ pred completeSuccessReleaseTicket[tid: TaskId, w: Worker, q: Queue, t: Time, tne
 pred completeSuccessCreateRemoteRelease[tid: TaskId, w: Worker, q: Queue, releaseTid: TaskId, t: Time, tnext: Time] {
     completePreConditions[tid, w, t]
     
-    -- Pre: Task holds a ticket for this REMOTE queue
+    -- [SILO-SUCC-REMOTE-1] Pre: Task holds a ticket for this REMOTE queue
     some h: TicketHolder | h.th_task = tid and h.th_queue = q and h.th_time = t
     let j = leaseJobAt[tid, t] | queueIsRemote[j, q]
     
@@ -991,19 +991,20 @@ pred completeSuccessCreateRemoteRelease[tid: TaskId, w: Worker, q: Queue, releas
     no leaseAt[releaseTid, t]
     
     let j = leaseJobAt[tid, t], a = leaseAttemptAt[tid, t] | {
-        -- Post: release lease
+        -- [SILO-SUCC-REMOTE-2] Post: release lease
         no leaseAt[tid, tnext]
-        -- Post: set job status to Succeeded
+        -- [SILO-SUCC-REMOTE-3] Post: set job status to Succeeded
         statusAt[j, tnext] = Succeeded
-        -- Post: set attempt status to AttemptSucceeded
+        -- [SILO-SUCC-REMOTE-4] Post: set attempt status to AttemptSucceeded
         attemptStatusAt[a, tnext] = AttemptSucceeded
         -- Frame: other jobs unchanged
         all j2: Job | j2 in jobExistsAt[t] and j2 != j implies statusAt[j2, tnext] = statusAt[j2, t]
         attemptExistsAt[tnext] = attemptExistsAt[t]
         all a2: attemptExistsAt[t] - a | attemptStatusAt[a2, tnext] = attemptStatusAt[a2, t]
         
-        -- Post: Create ReleaseRemoteTicketTask (holder stays until release is processed)
+        -- [SILO-SUCC-REMOTE-5] Post: Create ReleaseRemoteTicketTask (holder stays until release is processed)
         one qt: DbQueuedTask | qt.db_qtask = releaseTid and qt.db_qjob = j and qt.db_qtime = tnext
+        -- [SILO-SUCC-REMOTE-6] Post: Create ReleaseRemoteTicketTask record
         one relt: ReleaseRemoteTicketTask |
             relt.relt_task = releaseTid and relt.relt_job = j and relt.relt_queue = q and
             relt.relt_holder_task = tid and relt.relt_time = tnext
@@ -1517,23 +1518,23 @@ pred reapExpiredLeaseReleaseTicket[tid: TaskId, q: Queue, t: Time, tnext: Time] 
  * 4. RPC returns success, job shard deletes the task
  */
 pred processRemoteTicketRequest[requestTid: TaskId, runTid: TaskId, j: Job, q: Queue, t: Time, tnext: Time] {
-    -- Pre: RequestRemoteTicketTask exists in DB queue
+    -- [SILO-PROC-REQ-1] Pre: RequestRemoteTicketTask exists in DB queue
     some rrt: RequestRemoteTicketTask | 
         rrt.rrt_task = requestTid and rrt.rrt_job = j and rrt.rrt_queue = q and rrt.rrt_time = t
     dbQueuedAt[requestTid, t] = j
     
-    -- Pre: Job exists and is not cancelled
+    -- [SILO-PROC-REQ-2] Pre: Job exists and is not cancelled
     j in jobExistsAt[t]
     not isCancelledAt[j, t]
     
-    -- Post: Delete the RequestRemoteTicket task from DB queue
+    -- [SILO-PROC-REQ-3] Post: Delete the RequestRemoteTicket task from DB queue
     no dbQueuedAt[requestTid, tnext]
     
-    -- Post: Delete the RequestRemoteTicketTask record
+    -- [SILO-PROC-REQ-4] Post: Delete the RequestRemoteTicketTask record
     no rrt: RequestRemoteTicketTask | 
         rrt.rrt_task = requestTid and rrt.rrt_job = j and rrt.rrt_queue = q and rrt.rrt_time = tnext
     
-    -- Post: Create request record on queue owner (models RPC effect)
+    -- [SILO-PROC-REQ-5] Post: Create request record on queue owner (models RPC effect)
     one r: TicketRequest | r.tr_job = j and r.tr_queue = q and r.tr_task = runTid and r.tr_time = tnext
     
     -- Frame: other DB queue entries unchanged
@@ -1578,18 +1579,18 @@ pred processRemoteTicketRequest[requestTid: TaskId, runTid: TaskId, j: Job, q: Q
  * This extends grantNextRequest for remote jobs.
  */
 pred grantRemoteTicket[q: Queue, reqTid: TaskId, notifyTid: TaskId, t: Time, tnext: Time] {
-    -- Pre: Queue has capacity
+    -- [SILO-GRANT-REMOTE-1] Pre: Queue has capacity
     queueHasCapacity[q, t]
     
-    -- Pre: There is a pending request for this queue
+    -- [SILO-GRANT-REMOTE-2] Pre: There is a pending request for this queue
     some r: TicketRequest | r.tr_queue = q and r.tr_time = t and r.tr_task = reqTid
     let r = { req: TicketRequest | req.tr_queue = q and req.tr_time = t and req.tr_task = reqTid } | {
         one r
         let j = r.tr_job | {
-            -- Pre: Job is NOT cancelled
+            -- [SILO-GRANT-REMOTE-3] Pre: Job is NOT cancelled
             not isCancelledAt[j, t]
             
-            -- Pre: Queue is REMOTE from job's shard
+            -- [SILO-GRANT-REMOTE-4] Pre: Queue is REMOTE from job's shard
             queueIsRemote[j, q]
             
             -- Pre: notifyTid is a fresh task ID
@@ -1597,16 +1598,16 @@ pred grantRemoteTicket[q: Queue, reqTid: TaskId, notifyTid: TaskId, t: Time, tne
             no bufferedAt[notifyTid, t]
             no leaseAt[notifyTid, t]
             
-            -- Post: Create holder for this task/queue (on queue owner)
+            -- [SILO-GRANT-REMOTE-5] Post: Create holder for this task/queue (on queue owner)
             holdersAt[q, tnext] = reqTid
             
-            -- Post: Remove the request
+            -- [SILO-GRANT-REMOTE-6] Post: Remove the request
             requestTasksAt[q, tnext] = requestTasksAt[q, t] - reqTid
             
-            -- Post: Create NotifyRemoteTicketGrant task in DB queue (on queue owner)
+            -- [SILO-GRANT-REMOTE-7] Post: Create NotifyRemoteTicketGrant task in DB queue (on queue owner)
             one qt: DbQueuedTask | qt.db_qtask = notifyTid and qt.db_qjob = j and qt.db_qtime = tnext
             
-            -- Post: Create NotifyRemoteTicketGrantTask record
+            -- [SILO-GRANT-REMOTE-8] Post: Create NotifyRemoteTicketGrantTask record
             one nrt: NotifyRemoteTicketGrantTask |
                 nrt.nrt_task = notifyTid and nrt.nrt_job = j and nrt.nrt_queue = q and 
                 nrt.nrt_request_task = reqTid and nrt.nrt_time = tnext
@@ -1653,12 +1654,12 @@ pred grantRemoteTicket[q: Queue, reqTid: TaskId, notifyTid: TaskId, t: Time, tne
  * On success, the job shard creates a RunAttempt task, and we delete the notification task.
  */
 pred processRemoteTicketGrant[notifyTid: TaskId, runTid: TaskId, j: Job, q: Queue, t: Time, tnext: Time] {
-    -- Pre: NotifyRemoteTicketGrantTask exists in DB queue
+    -- [SILO-PROC-GRANT-1] Pre: NotifyRemoteTicketGrantTask exists in DB queue
     some nrt: NotifyRemoteTicketGrantTask |
         nrt.nrt_task = notifyTid and nrt.nrt_job = j and nrt.nrt_queue = q and nrt.nrt_time = t
     dbQueuedAt[notifyTid, t] = j
     
-    -- Pre: Job exists and is not cancelled
+    -- [SILO-PROC-GRANT-2] Pre: Job exists and is not cancelled
     j in jobExistsAt[t]
     not isCancelledAt[j, t]
     
@@ -1671,18 +1672,18 @@ pred processRemoteTicketGrant[notifyTid: TaskId, runTid: TaskId, j: Job, q: Queu
     let nrt = { n: NotifyRemoteTicketGrantTask | n.nrt_task = notifyTid and n.nrt_job = j and n.nrt_queue = q and n.nrt_time = t },
         holderTid = nrt.nrt_request_task | {
         
-        -- Pre: runTid must equal the holder task ID from the notification
+        -- [SILO-PROC-GRANT-3] Pre: runTid must equal the holder task ID from the notification
         -- This ensures the RunAttempt task created has the same ID as the holder
         runTid = holderTid
         
-        -- Post: Delete the NotifyRemoteTicketGrant task from DB queue (on queue owner)
+        -- [SILO-PROC-GRANT-4] Post: Delete the NotifyRemoteTicketGrant task from DB queue (on queue owner)
         no dbQueuedAt[notifyTid, tnext]
         
-        -- Post: Delete the NotifyRemoteTicketGrantTask record
+        -- [SILO-PROC-GRANT-5] Post: Delete the NotifyRemoteTicketGrantTask record
         no n: NotifyRemoteTicketGrantTask |
             n.nrt_task = notifyTid and n.nrt_job = j and n.nrt_queue = q and n.nrt_time = tnext
         
-        -- Post: Create RunAttempt task on job shard (models RPC effect)
+        -- [SILO-PROC-GRANT-6] Post: Create RunAttempt task on job shard (models RPC effect)
         -- Uses holderTid (= runTid) so the holder now has a task in DB queue
         one qt: DbQueuedTask | qt.db_qtask = holderTid and qt.db_qjob = j and qt.db_qtime = tnext
     }
@@ -1721,13 +1722,13 @@ pred processRemoteTicketGrant[notifyTid: TaskId, runTid: TaskId, j: Job, q: Queu
  * This is called as part of job completion when the job held remote queue tickets.
  */
 pred createRemoteTicketRelease[releaseTid: TaskId, runTid: TaskId, j: Job, q: Queue, t: Time, tnext: Time] {
-    -- Pre: Job exists
+    -- [SILO-CREATE-REL-1] Pre: Job exists
     j in jobExistsAt[t]
     
-    -- Pre: Queue is remote from job's shard
+    -- [SILO-CREATE-REL-2] Pre: Queue is remote from job's shard
     queueIsRemote[j, q]
     
-    -- Pre: There's a holder for this task on the queue owner
+    -- [SILO-CREATE-REL-3] Pre: There's a holder for this task on the queue owner
     some h: TicketHolder | h.th_task = runTid and h.th_queue = q and h.th_time = t
     
     -- Pre: releaseTid is fresh
@@ -1735,10 +1736,10 @@ pred createRemoteTicketRelease[releaseTid: TaskId, runTid: TaskId, j: Job, q: Qu
     no bufferedAt[releaseTid, t]
     no leaseAt[releaseTid, t]
     
-    -- Post: Create ReleaseRemoteTicket task in DB queue
+    -- [SILO-CREATE-REL-4] Post: Create ReleaseRemoteTicket task in DB queue
     one qt: DbQueuedTask | qt.db_qtask = releaseTid and qt.db_qjob = j and qt.db_qtime = tnext
     
-    -- Post: Create ReleaseRemoteTicketTask record
+    -- [SILO-CREATE-REL-5] Post: Create ReleaseRemoteTicketTask record
     one relt: ReleaseRemoteTicketTask |
         relt.relt_task = releaseTid and relt.relt_job = j and relt.relt_queue = q and
         relt.relt_holder_task = runTid and relt.relt_time = tnext
@@ -1777,23 +1778,23 @@ pred createRemoteTicketRelease[releaseTid: TaskId, runTid: TaskId, j: Job, q: Qu
  * On success, the queue owner releases the holder, and we delete the release task.
  */
 pred processRemoteTicketRelease[releaseTid: TaskId, holderTid: TaskId, j: Job, q: Queue, t: Time, tnext: Time] {
-    -- Pre: ReleaseRemoteTicketTask exists in DB queue
+    -- [SILO-PROC-REL-1] Pre: ReleaseRemoteTicketTask exists in DB queue
     some relt: ReleaseRemoteTicketTask |
         relt.relt_task = releaseTid and relt.relt_job = j and relt.relt_queue = q and 
         relt.relt_holder_task = holderTid and relt.relt_time = t
     dbQueuedAt[releaseTid, t] = j
     
-    -- Pre: Holder exists on queue owner
+    -- [SILO-PROC-REL-2] Pre: Holder exists on queue owner
     some h: TicketHolder | h.th_task = holderTid and h.th_queue = q and h.th_time = t
     
-    -- Post: Delete the ReleaseRemoteTicket task from DB queue
+    -- [SILO-PROC-REL-3] Post: Delete the ReleaseRemoteTicket task from DB queue
     no dbQueuedAt[releaseTid, tnext]
     
-    -- Post: Delete the ReleaseRemoteTicketTask record
+    -- [SILO-PROC-REL-4] Post: Delete the ReleaseRemoteTicketTask record
     no relt: ReleaseRemoteTicketTask |
         relt.relt_task = releaseTid and relt.relt_job = j and relt.relt_queue = q and relt.relt_time = tnext
     
-    -- Post: Release the holder on queue owner (models RPC effect)
+    -- [SILO-PROC-REL-5] Post: Release the holder on queue owner (models RPC effect)
     holdersAt[q, tnext] = holdersAt[q, t] - holderTid
     
     -- Frame: other holders unchanged

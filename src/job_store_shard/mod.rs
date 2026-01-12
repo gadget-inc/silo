@@ -665,19 +665,22 @@ impl JobStoreShard {
             }
         };
 
-        // Check if we can grant immediately
+        // [SILO-GRANT-REMOTE-1] Check if we can grant immediately (queue has capacity)
         let can_grant = self
             .concurrency
             .counts()
             .can_grant(tenant, queue_key, effective_max_concurrency as usize);
 
+        // [SILO-GRANT-REMOTE-2] Check if there is a pending request (this is the request)
+        // [SILO-GRANT-REMOTE-3] Job cancellation is checked via gRPC layer/job shard
+        // [SILO-GRANT-REMOTE-4] Queue is remote from job's shard (caller verified this)
         if can_grant && start_time_ms <= now_ms {
             // Grant immediately:
             // 1. Create RemoteHolderRecord
             // 2. Create NotifyRemoteTicketGrant task
             // Note: held_queues are tracked on the job shard side, not passed through RPC
 
-            // Create holder record
+            // [SILO-GRANT-REMOTE-5] Create holder for this task/queue (on queue owner)
             let holder = RemoteHolderRecord {
                 granted_at_ms: now_ms,
                 source_shard: job_shard,
@@ -689,7 +692,8 @@ impl JobStoreShard {
                 &holder_val,
             );
 
-            // Create notification task to inform job shard of grant
+            // [SILO-GRANT-REMOTE-6] Remove the request (it's being granted inline, no stored request)
+            // [SILO-GRANT-REMOTE-7] Create NotifyRemoteTicketGrant task in DB queue
             let notify_task = Task::NotifyRemoteTicketGrant {
                 task_id: uuid::Uuid::new_v4().to_string(),
                 job_shard,
@@ -700,6 +704,7 @@ impl JobStoreShard {
                 holder_task_id: holder_task_id.clone(),
                 attempt_number,
             };
+            // [SILO-GRANT-REMOTE-8] Create NotifyRemoteTicketGrantTask record
             let task_val = crate::codec::encode_task(&notify_task)?;
             batch.put(
                 crate::keys::task_key(now_ms, 0, &holder_task_id, 0).as_bytes(),
