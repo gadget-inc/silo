@@ -397,8 +397,8 @@ impl JobStoreShard {
                             task_key: entry.key.clone(),
                             floating_limit: floating_limit.clone(),
                         });
-                        // Don't delete task yet - caller will delete after successful RPC
-                        ack_keys.push(entry.key.clone());
+                        // Don't delete task yet, and don't ack - task stays in inflight until
+                        // delete_cross_shard_task is called after successful RPC
                         processed_internal = true;
                         continue;
                     }
@@ -422,8 +422,8 @@ impl JobStoreShard {
                             attempt_number: *attempt_number,
                             task_key: entry.key.clone(),
                         });
-                        // Don't delete task yet - caller will delete after successful RPC
-                        ack_keys.push(entry.key.clone());
+                        // Don't delete task yet, and don't ack - task stays in inflight until
+                        // delete_cross_shard_task is called after successful RPC
                         processed_internal = true;
                         continue;
                     }
@@ -443,8 +443,8 @@ impl JobStoreShard {
                             holder_task_id: holder_task_id.clone(),
                             task_key: entry.key.clone(),
                         });
-                        // Don't delete task yet - caller will delete after successful RPC
-                        ack_keys.push(entry.key.clone());
+                        // Don't delete task yet, and don't ack - task stays in inflight until
+                        // delete_cross_shard_task is called after successful RPC
                         processed_internal = true;
                         continue;
                     }

@@ -506,6 +506,25 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       );
     }
 
+    /**
+     * Generate a job ID that routes to a DIFFERENT shard than the queue owner.
+     * This tests the cross-shard floating concurrency limit scenario where the
+     * job shard must communicate with the queue owner shard for limit state.
+     */
+    function generateJobIdForDifferentShard(queueKey: string): string {
+      const queueOwnerShard = client.getShardForQueue(DEFAULT_TENANT, queueKey);
+      // Try random UUIDs until we find one that routes to a different shard
+      for (let i = 0; i < 1000; i++) {
+        const jobId = crypto.randomUUID();
+        if (client.getShardForJob(jobId) !== queueOwnerShard) {
+          return jobId;
+        }
+      }
+      throw new Error(
+        `Failed to generate job ID routing to different shard than ${queueOwnerShard}`
+      );
+    }
+
     function createWorkerWithRefresh(
       handler: TaskHandler,
       refreshHandler: RefreshHandler,
@@ -876,5 +895,94 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
 
       await worker.stop();
     });
+
+    it("processes refresh tasks for jobs on different shard than queue owner", async () => {
+      const refreshedQueues: string[] = [];
+      const processedJobs: string[] = [];
+      const queueKey = `cross-shard-refresh-test-${Date.now()}`;
+
+      // Generate job IDs that route to a DIFFERENT shard than the queue owner
+      // This tests the cross-shard communication path for floating limits
+      const jobId1 = generateJobIdForDifferentShard(queueKey);
+      const jobId2 = generateJobIdForDifferentShard(queueKey);
+
+      const queueShard = client.getShardForQueue(DEFAULT_TENANT, queueKey);
+      const job1Shard = client.getShardForJob(jobId1);
+      const job2Shard = client.getShardForJob(jobId2);
+
+      // Verify we actually have cross-shard scenario
+      expect(job1Shard).not.toBe(queueShard);
+      expect(job2Shard).not.toBe(queueShard);
+
+      const handler: TaskHandler = async (ctx) => {
+        const payload = decodePayload<{ message: string }>(
+          ctx.task.payload?.data
+        );
+        processedJobs.push(payload?.message ?? ctx.task.id);
+        return { type: "success", result: { processed: true } };
+      };
+
+      const refreshHandler: RefreshHandler = async (ctx) => {
+        refreshedQueues.push(ctx.task.queueKey);
+        return 20;
+      };
+
+      const worker = createWorkerWithRefresh(handler, refreshHandler);
+      worker.start();
+
+      // Enqueue first job with floating limit
+      await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        id: jobId1,
+        payload: { message: "cross-shard-job-1" },
+        limits: [
+          {
+            type: "floatingConcurrency",
+            key: queueKey,
+            defaultMaxConcurrency: 5,
+            refreshIntervalMs: 1n,
+            metadata: { testType: "cross-shard" },
+          },
+        ],
+      });
+
+      // Wait for first job to be processed
+      await waitFor(
+        () => processedJobs.some((j) => j === "cross-shard-job-1"),
+        { timeout: 10000 }
+      );
+
+      // Small delay to allow refresh interval to expire
+      await new Promise((r) => setTimeout(r, 200));
+
+      // Enqueue second job to trigger refresh
+      await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        id: jobId2,
+        payload: { message: "cross-shard-job-2" },
+        limits: [
+          {
+            type: "floatingConcurrency",
+            key: queueKey,
+            defaultMaxConcurrency: 5,
+            refreshIntervalMs: 1n,
+            metadata: { testType: "cross-shard" },
+          },
+        ],
+      });
+
+      // Wait for refresh handler and job-2 to be processed
+      await waitFor(() => refreshedQueues.includes(queueKey), {
+        timeout: 10000,
+      });
+      await waitFor(
+        () => processedJobs.some((j) => j === "cross-shard-job-2"),
+        { timeout: 10000 }
+      );
+
+      expect(refreshedQueues).toContain(queueKey);
+      expect(processedJobs).toContain("cross-shard-job-1");
+      expect(processedJobs).toContain("cross-shard-job-2");
+    }, 30000);
   });
 });

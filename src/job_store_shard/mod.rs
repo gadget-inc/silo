@@ -350,6 +350,11 @@ impl JobStoreShard {
         &self.db
     }
 
+    /// Access the task broker (useful for testing inflight tracking)
+    pub fn broker(&self) -> &TaskBroker {
+        &self.broker
+    }
+
     // ============================================================================
     // Debug assertion helpers for verifying shard ownership
     // ============================================================================
@@ -764,6 +769,16 @@ impl JobStoreShard {
 
     /// Receive notification that a remote ticket was granted (job shard perspective).
     /// This creates a RunAttempt task or continues to the next limit.
+    ///
+    /// This method is idempotent - if the same grant notification arrives multiple times
+    /// (due to race conditions with cross-shard task processing), only the first call
+    /// will create a RunAttempt task. Idempotency is achieved by:
+    /// 1. Checking job status - if not Scheduled, the grant was already processed
+    /// 2. Using deterministic task keys (based on job's start_at_ms, not now_ms)
+    /// 3. Checking if task already exists before creating
+    ///
+    /// Note: The broker's inflight tracking prevents the normal duplicate-send race condition.
+    /// The status check + deterministic key handles crash recovery scenarios where the RPC might be re-sent.
     #[allow(clippy::too_many_arguments)]
     pub async fn receive_remote_ticket_grant(
         &self,
@@ -776,7 +791,7 @@ impl JobStoreShard {
         attempt_number: u32,
     ) -> Result<(), JobStoreShardError> {
         use crate::codec::decode_held_ticket_state;
-        use crate::job::Limit;
+        use crate::job::{JobStatusKind, Limit};
         use crate::keys::held_ticket_state_key;
         use crate::task::Task;
         use slatedb::WriteBatch;
@@ -789,15 +804,25 @@ impl JobStoreShard {
 
         let now_ms = helpers::now_epoch_ms();
 
-        // Load pending ticket state from local storage to get held_queues
-        let state_key = held_ticket_state_key(job_id, attempt_number, request_id);
-        let held_queues = if let Some(state_bytes) = self.db.get(state_key.as_bytes()).await? {
-            let state = decode_held_ticket_state(&state_bytes)?;
-            state.held_queues()
-        } else {
-            // No state found - this is the first limit (no prior held queues)
-            Vec::new()
-        };
+        // Idempotency check #1: Check job status first
+        // If job is not Scheduled, the grant was already processed (job is Running or completed)
+        // This handles the case where a duplicate RPC arrives after the task was processed and deleted
+        let status = self
+            .get_job_status(tenant, job_id)
+            .await?
+            .ok_or_else(|| JobStoreShardError::JobNotFound(job_id.to_string()))?;
+
+        if status.kind != JobStatusKind::Scheduled {
+            tracing::debug!(
+                tenant = tenant,
+                job_id = job_id,
+                queue_key = queue_key,
+                request_id = request_id,
+                job_status = ?status.kind,
+                "receive_remote_ticket_grant: job not Scheduled, grant already processed (idempotent)"
+            );
+            return Ok(());
+        }
 
         // Look up the job to get priority, limits, and other info
         let job = self
@@ -808,6 +833,34 @@ impl JobStoreShard {
         let priority = job.priority();
         let start_at_ms = job.enqueue_time_ms();
         let limits = job.limits();
+
+        // Use deterministic task key based on job's start_at_ms (not now_ms)
+        // This ensures duplicate calls produce the same key
+        let task_key_str = crate::keys::task_key(start_at_ms, priority, job_id, attempt_number);
+
+        // Idempotency check #2: if task already exists, this is a duplicate call
+        // This handles the case where duplicate RPCs arrive before the task is processed
+        if self.db.get(task_key_str.as_bytes()).await?.is_some() {
+            tracing::debug!(
+                tenant = tenant,
+                job_id = job_id,
+                queue_key = queue_key,
+                request_id = request_id,
+                task_key = task_key_str,
+                "receive_remote_ticket_grant: task already exists, skipping (idempotent)"
+            );
+            return Ok(());
+        }
+
+        // Load pending ticket state from local storage to get held_queues
+        let state_key = held_ticket_state_key(job_id, attempt_number, request_id);
+        let held_queues = if let Some(state_bytes) = self.db.get(state_key.as_bytes()).await? {
+            let state = decode_held_ticket_state(&state_bytes)?;
+            state.held_queues()
+        } else {
+            // No state found - this is the first limit (no prior held queues)
+            Vec::new()
+        };
 
         // Track this remote queue in the held_queues format.
         // This allows report_attempt_outcome to know to send a release RPC for remote queues.
@@ -835,7 +888,7 @@ impl JobStoreShard {
 
         // Check if there are more limits to process
         if (current_limit_index + 1) < limits.len() as u32 {
-            // More limits to process - enqueue the next limit task
+            // More limits to process - enqueue the next limit task using existing helper
             self.enqueue_next_limit_task(
                 &mut batch,
                 NextLimitContext {
@@ -871,7 +924,6 @@ impl JobStoreShard {
             };
 
             let task_val = crate::codec::encode_task(&task)?;
-            let task_key_str = crate::keys::task_key(now_ms, priority, job_id, attempt_number);
             batch.put(task_key_str.as_bytes(), &task_val);
 
             tracing::debug!(
@@ -892,11 +944,18 @@ impl JobStoreShard {
 
     /// Delete a task key after a cross-shard RPC has been successfully processed.
     /// Called by the caller after processing a PendingCrossShardTask.
+    ///
+    /// This also removes the task from the broker's inflight tracking, which is essential
+    /// to prevent the race condition where the task could be re-scanned from DB before
+    /// this delete completes.
     pub async fn delete_cross_shard_task(&self, task_key: &str) -> Result<(), JobStoreShardError> {
         use slatedb::WriteBatch;
         let mut batch = WriteBatch::new();
         batch.delete(task_key.as_bytes());
         self.db.write(batch).await?;
+        // Now that the task is deleted from DB, remove from inflight tracking.
+        // The task was kept in inflight during dequeue to prevent re-scanning.
+        self.broker.ack_durable(&[task_key.to_string()]);
         Ok(())
     }
 

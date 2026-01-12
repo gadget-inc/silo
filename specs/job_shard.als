@@ -296,6 +296,14 @@ fact wellFormed {
     all t: Time, tid: TaskId, q: Queue | 
         tid in holdersAt[q, t] implies tid not in requestTasksAt[q, t]
     
+    -- A job can have at most one task interacting with each queue at any time
+    -- (either via request or via holder associated with the job)
+    all j: Job, q: Queue, t: Time | 
+        lone tid: TaskId | 
+            (some r: TicketRequest | r.tr_job = j and r.tr_queue = q and r.tr_task = tid and r.tr_time = t) or
+            (some h: TicketHolder | h.th_queue = q and h.th_task = tid and h.th_time = t and 
+                (dbQueuedAt[tid, t] = j or bufferedAt[tid, t] = j or leaseJobAt[tid, t] = j))
+    
     -- === DISTRIBUTED CONCURRENCY CONSTRAINTS ===
     
     -- Each job has exactly one shard assignment (static, determined at enqueue)
@@ -320,6 +328,12 @@ fact wellFormed {
     all rrt: RequestRemoteTicketTask | rrt.rrt_job in jobExistsAt[rrt.rrt_time]
     all nrt: NotifyRemoteTicketGrantTask | nrt.nrt_job in jobExistsAt[nrt.nrt_time]
     all relt: ReleaseRemoteTicketTask | relt.relt_job in jobExistsAt[relt.relt_time]
+
+    -- Non-release DB tasks only exist for scheduled jobs.
+    -- ReleaseRemoteTicketTask is allowed for terminal jobs.
+    all qt: DbQueuedTask |
+        (some relt: ReleaseRemoteTicketTask | relt.relt_task = qt.db_qtask and relt.relt_time = qt.db_qtime) or
+        statusAt[qt.db_qjob, qt.db_qtime] = Scheduled
 }
 
 /** Check if a job is cancelled at time t */
@@ -2096,12 +2110,15 @@ assert remoteReleaseTasksOnlyForRemoteQueues {
 /**
  * A job can have at most one active ticket lifecycle state per queue.
  * Either: requesting, holding, or releasing - but not multiple.
+ * If a job has a pending request, it shouldn't also have a holder for the same queue.
  */
 assert oneTicketStatePerJobQueue {
     all j: Job, q: Queue, t: Time | {
         -- Can't have both a request and a holder for the same job/queue
+        -- A holder is "for" job j if its task is associated with j (via DB queue, buffer, or lease)
         (some r: TicketRequest | r.tr_job = j and r.tr_queue = q and r.tr_time = t) implies
-            no h: TicketHolder | (some l: Lease | l.ljob = j and l.ltask = h.th_task and l.ltime = t) and h.th_queue = q and h.th_time = t
+            no h: TicketHolder | h.th_queue = q and h.th_time = t and 
+                (dbQueuedAt[h.th_task, t] = j or bufferedAt[h.th_task, t] = j or leaseJobAt[h.th_task, t] = j)
     }
 }
 
@@ -2657,25 +2674,27 @@ pred exampleRemoteTicketFlow {
         -- t1: Job enqueued, RequestRemoteTicket task created
         j in jobExistsAt[t1]
         statusAt[j, t1] = Scheduled
-        some rrt: RequestRemoteTicketTask | rrt.rrt_job = j and rrt.rrt_queue = q and rrt.rrt_time = t1
-        some dbQueuedAt[reqTid, t1]
+        some rrt: RequestRemoteTicketTask |
+            rrt.rrt_task = reqTid and rrt.rrt_job = j and rrt.rrt_queue = q and rrt.rrt_time = t1
+        dbQueuedAt[reqTid, t1] = j
         
         -- t2: Request task processed, request stored on queue owner
-        no rrt: RequestRemoteTicketTask | rrt.rrt_job = j and rrt.rrt_queue = q and rrt.rrt_time = t2
-        some r: TicketRequest | r.tr_job = j and r.tr_queue = q and r.tr_time = t2
+        no rrt: RequestRemoteTicketTask | rrt.rrt_task = reqTid and rrt.rrt_time = t2
+        no dbQueuedAt[reqTid, t2]
+        some r: TicketRequest | r.tr_job = j and r.tr_queue = q and r.tr_task = runTid and r.tr_time = t2
         
         -- t3: Queue grants ticket, creates NotifyRemoteTicketGrant task
-        some nrt: NotifyRemoteTicketGrantTask | nrt.nrt_job = j and nrt.nrt_queue = q and nrt.nrt_time = t3
-        some h: TicketHolder | h.th_queue = q and h.th_time = t3
+        some nrt: NotifyRemoteTicketGrantTask |
+            nrt.nrt_job = j and nrt.nrt_queue = q and nrt.nrt_request_task = runTid and nrt.nrt_time = t3
+        some h: TicketHolder | h.th_task = runTid and h.th_queue = q and h.th_time = t3
         
         -- t4: Notification processed, RunAttempt task created on job shard
-        no nrt: NotifyRemoteTicketGrantTask | nrt.nrt_job = j and nrt.nrt_queue = q and nrt.nrt_time = t4
-        some dbQueuedAt[runTid, t4]
+        no nrt: NotifyRemoteTicketGrantTask | nrt.nrt_request_task = runTid and nrt.nrt_time = t4
         dbQueuedAt[runTid, t4] = j
         
         -- t5: Job is running
         statusAt[j, t5] = Running
-        some leaseAt[runTid, t5]
+        leaseJobAt[runTid, t5] = j
         
         -- t6/t7: Job completes successfully
         statusAt[j, t7] = Succeeded
@@ -2721,29 +2740,30 @@ pred exampleRemoteTicketRelease {
  * Demonstrates global concurrency enforcement across shards.
  */
 pred exampleCrossShardConcurrency {
-    some j1, j2: Job, q: Queue, s1, s2, sqo: Shard, t1, t2, t3: Time | {
+    some j1, j2: Job, q: Queue, s1, s2: Shard, t1, t2, t3: Time | {
         lt[t1, t2] and lt[t2, t3]
         j1 != j2
         s1 != s2
-        -- sqo could be either s1, s2, or a third shard
         
         -- Setup: jobs on different shards, same queue requirement
         jobShardOf[j1] = s1
         jobShardOf[j2] = s2
-        queueOwnerOf[q] = sqo
+        queueOwnerOf[q] = s1
         q in jobQueues[j1]
         q in jobQueues[j2]
         
         -- t1: j1 holds the queue, j2 is waiting
-        some h: TicketHolder | h.th_queue = q and h.th_time = t1
-        (some r: TicketRequest | r.tr_job = j2 and r.tr_queue = q and r.tr_time = t1) or
-        (some rrt: RequestRemoteTicketTask | rrt.rrt_job = j2 and rrt.rrt_queue = q and rrt.rrt_time = t1)
+        statusAt[j1, t1] = Running
+        some h1: TicketHolder | h1.th_queue = q and h1.th_time = t1 and
+            leaseJobAt[h1.th_task, t1] = j1
+        some r: TicketRequest | r.tr_job = j2 and r.tr_queue = q and r.tr_time = t1
         
         -- t2: j1 completes
         statusAt[j1, t2] = Succeeded
         
         -- t3: j2 now holds the queue
-        some h: TicketHolder | h.th_queue = q and h.th_time = t3
+        some h2: TicketHolder | h2.th_queue = q and h2.th_time = t3 and
+            dbQueuedAt[h2.th_task, t3] = j2
     }
 }
 
@@ -2840,7 +2860,7 @@ run exampleRemoteTicketRelease for 4 but exactly 1 Job, 1 Worker, 3 TaskId, 2 At
     1 JobQueueRequirement, 10 TicketRequest, 10 TicketHolder, 1 JobShard, 1 QueueOwner,
     10 RequestRemoteTicketTask, 10 NotifyRemoteTicketGrantTask, 10 ReleaseRemoteTicketTask
 
-run exampleCrossShardConcurrency for 5 but exactly 2 Job, 1 Worker, 4 TaskId, 3 Attempt, 10 Time, 1 Queue, 3 Shard,
+run exampleCrossShardConcurrency for 5 but exactly 2 Job, 1 Worker, 4 TaskId, 3 Attempt, 10 Time, 1 Queue, 2 Shard,
     20 JobState, 10 AttemptState, 8 DbQueuedTask, 8 BufferedTask, 4 Lease, 10 AttemptExists, 10 JobExists, 3 JobAttemptRelation, 20 JobCancelled,
     2 JobQueueRequirement, 10 TicketRequest, 10 TicketHolder, 2 JobShard, 1 QueueOwner,
     10 RequestRemoteTicketTask, 10 NotifyRemoteTicketGrantTask, 10 ReleaseRemoteTicketTask

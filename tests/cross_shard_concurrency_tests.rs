@@ -796,6 +796,8 @@ async fn remote_grant_preserves_attempt_number() {
     // so that the RunAttempt task is created with the correct attempt number.
     //
     // Use 2-shard factory so routing is respected
+    use silo::job::{ConcurrencyLimit, Limit};
+
     let (_tmp, factory) = make_test_factory_with_shards(2);
     factory.open(0).await.expect("open shard 0");
     factory.open(1).await.expect("open shard 1");
@@ -809,7 +811,9 @@ async fn remote_grant_preserves_attempt_number() {
     let job_id = find_job_for_shard(0, 2);
     let (tenant, queue_key) = find_queue_for_shard(1, 2);
 
-    // Create a job on shard 0 that we'll pretend is on its second attempt
+    // Create a job on shard 0 with a remote concurrency limit
+    // This keeps the job in Scheduled state (not Running) because
+    // the concurrency ticket needs to be acquired first
     shard0
         .enqueue(
             &tenant,
@@ -818,21 +822,31 @@ async fn remote_grant_preserves_attempt_number() {
             now,
             None,
             serde_json::json!({"test": "data"}),
-            vec![],
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue_key.clone(),
+                max_concurrency: 1,
+            })],
             None,
         )
         .await
         .expect("enqueue");
 
-    // First dequeue to get the job's initial RunAttempt task (clears it out)
+    // Dequeue to get the RequestRemoteTicket task (job stays Scheduled)
     let initial_result = shard0.dequeue("worker", 10).await.expect("initial dequeue");
-    assert_eq!(
-        initial_result.tasks.len(),
-        1,
-        "should have initial RunAttempt"
+    assert!(
+        !initial_result.cross_shard_tasks.is_empty(),
+        "should have RequestRemoteTicket"
     );
 
+    // Delete the RequestRemoteTicket task (we'll simulate a different attempt_number flow)
+    if let Some(task) = initial_result.cross_shard_tasks.first() {
+        if let silo::job_store_shard::PendingCrossShardTask::RequestRemoteTicket { task_key, .. } = task {
+            shard0.delete_cross_shard_task(task_key).await.expect("delete");
+        }
+    }
+
     // Simulate: request ticket for attempt 2 (this is a retry) on shard 1 (queue owner)
+    // In a real retry, this would happen after the first attempt failed
     let attempt_number = 2u32;
     let granted = client
         .request_concurrency_ticket(
@@ -862,12 +876,13 @@ async fn remote_grant_preserves_attempt_number() {
     });
     assert!(notify.is_some(), "should have notify task");
 
-    let (holder_task_id, req_id) = match notify.unwrap() {
+    let (notify_task_key, holder_task_id, req_id) = match notify.unwrap() {
         silo::job_store_shard::PendingCrossShardTask::NotifyRemoteTicketGrant {
+            task_key,
             holder_task_id,
             request_id,
             ..
-        } => (holder_task_id.clone(), request_id.clone()),
+        } => (task_key.clone(), holder_task_id.clone(), request_id.clone()),
         _ => unreachable!(),
     };
 
@@ -886,6 +901,8 @@ async fn remote_grant_preserves_attempt_number() {
         )
         .await
         .expect("notify grant");
+
+    shard1.delete_cross_shard_task(&notify_task_key).await.expect("delete notify");
 
     // Dequeue the RunAttempt task from shard 0 and check attempt_number
     let result2 = shard0.dequeue("worker", 10).await.expect("dequeue");
