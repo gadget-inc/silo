@@ -15,6 +15,21 @@ use crate::routing::queue_to_shard;
 use crate::task::{GubernatorRateLimitData, Task};
 use tracing::info_span;
 
+/// Context for creating the next limit task in a job's limit chain.
+/// Groups related parameters to reduce argument count in `enqueue_next_limit_task`.
+pub(crate) struct NextLimitContext<'a> {
+    pub tenant: &'a str,
+    pub task_id: &'a str,
+    pub job_id: &'a str,
+    pub attempt_number: u32,
+    pub current_limit_index: u32,
+    pub limits: &'a [Limit],
+    pub priority: u8,
+    pub start_at_ms: i64,
+    pub now_ms: i64,
+    pub held_queues: Vec<String>,
+}
+
 impl JobStoreShard {
     /// Enqueue a new job with optional limits (concurrency and/or rate limits).
     #[allow(clippy::too_many_arguments)]
@@ -113,16 +128,18 @@ impl JobStoreShard {
                     {
                         self.enqueue_next_limit_task(
                             &mut batch,
-                            tenant,
-                            &first_task_id,
-                            &job_id,
-                            1, // attempt number
-                            0, // current limit index
-                            &limits,
-                            priority,
-                            start_at_ms,
-                            now_ms,
-                            vec![cl.key.clone()], // held queues
+                            NextLimitContext {
+                                tenant,
+                                task_id: &first_task_id,
+                                job_id: &job_id,
+                                attempt_number: 1,
+                                current_limit_index: 0,
+                                limits: &limits,
+                                priority,
+                                start_at_ms,
+                                now_ms,
+                                held_queues: vec![cl.key.clone()],
+                            },
                         )?;
                     }
                 } else {
@@ -200,16 +217,18 @@ impl JobStoreShard {
                         // Granted immediately, but we need to proceed to next limit
                         self.enqueue_next_limit_task(
                             &mut batch,
-                            tenant,
-                            &first_task_id,
-                            &job_id,
-                            1, // attempt number
-                            0, // current limit index
-                            &limits,
-                            priority,
-                            start_at_ms,
-                            now_ms,
-                            vec![fl.key.clone()], // held queues
+                            NextLimitContext {
+                                tenant,
+                                task_id: &first_task_id,
+                                job_id: &job_id,
+                                attempt_number: 1,
+                                current_limit_index: 0,
+                                limits: &limits,
+                                priority,
+                                start_at_ms,
+                                now_ms,
+                                held_queues: vec![fl.key.clone()],
+                            },
                         )?;
                     }
                 } else {
@@ -268,39 +287,30 @@ impl JobStoreShard {
         Ok(job_id)
     }
 
-    /// Helper to enqueue the next limit check task after passing a limit
-    #[allow(clippy::too_many_arguments)]
+    /// Helper to enqueue the next limit check task after passing a limit.
+    /// Uses `NextLimitContext` to group related parameters.
     pub(crate) fn enqueue_next_limit_task(
         &self,
         batch: &mut WriteBatch,
-        tenant: &str,
-        task_id: &str,
-        job_id: &str,
-        attempt_number: u32,
-        current_limit_index: u32,
-        limits: &[Limit],
-        priority: u8,
-        start_at_ms: i64,
-        now_ms: i64,
-        held_queues: Vec<String>,
+        ctx: NextLimitContext<'_>,
     ) -> Result<(), JobStoreShardError> {
-        let next_index = current_limit_index + 1;
+        let next_index = ctx.current_limit_index + 1;
 
-        if next_index as usize >= limits.len() {
+        if next_index as usize >= ctx.limits.len() {
             // No more limits - enqueue RunAttempt
             let run_task = Task::RunAttempt {
-                id: task_id.to_string(),
-                tenant: tenant.to_string(),
-                job_id: job_id.to_string(),
-                attempt_number,
-                held_queues,
+                id: ctx.task_id.to_string(),
+                tenant: ctx.tenant.to_string(),
+                job_id: ctx.job_id.to_string(),
+                attempt_number: ctx.attempt_number,
+                held_queues: ctx.held_queues,
             };
             return put_task(
                 batch,
-                start_at_ms,
-                priority,
-                job_id,
-                attempt_number,
+                ctx.start_at_ms,
+                ctx.priority,
+                ctx.job_id,
+                ctx.attempt_number,
                 &run_task,
             );
         }
@@ -309,43 +319,43 @@ impl JobStoreShard {
         // IMPORTANT: We use the same task_id for all holders in this attempt chain.
         // This ensures that when the job completes and releases held_queues, we can
         // find all the holders by the same task_id.
-        let next_limit = &limits[next_index as usize];
+        let next_limit = &ctx.limits[next_index as usize];
         let next_task = match next_limit {
             // Concurrency limits (fixed and floating) use the same routing logic
             Limit::Concurrency(_) | Limit::FloatingConcurrency(_) => {
                 helpers::create_ticket_request_task_with_batch(
                     batch,
                     next_limit,
-                    tenant,
-                    job_id,
-                    attempt_number,
-                    priority,
-                    start_at_ms,
-                    task_id,
-                    held_queues,
+                    ctx.tenant,
+                    ctx.job_id,
+                    ctx.attempt_number,
+                    ctx.priority,
+                    ctx.start_at_ms,
+                    ctx.task_id,
+                    ctx.held_queues,
                     self.shard_number,
                     self.num_shards,
                 )?
             }
             Limit::RateLimit(rl) => Task::CheckRateLimit {
-                task_id: task_id.to_string(),
-                tenant: tenant.to_string(),
-                job_id: job_id.to_string(),
-                attempt_number,
+                task_id: ctx.task_id.to_string(),
+                tenant: ctx.tenant.to_string(),
+                job_id: ctx.job_id.to_string(),
+                attempt_number: ctx.attempt_number,
                 limit_index: next_index,
                 rate_limit: GubernatorRateLimitData::from(rl),
                 retry_count: 0,
-                started_at_ms: now_ms,
-                priority,
-                held_queues,
+                started_at_ms: ctx.now_ms,
+                priority: ctx.priority,
+                held_queues: ctx.held_queues,
             },
         };
         put_task(
             batch,
-            start_at_ms,
-            priority,
-            job_id,
-            attempt_number,
+            ctx.start_at_ms,
+            ctx.priority,
+            ctx.job_id,
+            ctx.attempt_number,
             &next_task,
         )
     }

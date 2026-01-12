@@ -57,6 +57,50 @@ pub struct FloatingLimitState {
     pub metadata: Vec<(String, String)>,
 }
 
+/// Optional field updates for creating a new FloatingLimitState from an archived view.
+/// Fields that are `None` will be copied from the archived state.
+#[derive(Debug, Default)]
+pub struct FloatingLimitStateUpdates {
+    pub current_max_concurrency: Option<u32>,
+    pub last_refreshed_at_ms: Option<i64>,
+    pub refresh_task_scheduled: Option<bool>,
+    pub retry_count: Option<u32>,
+    pub next_retry_at_ms: Option<Option<i64>>,
+}
+
+impl FloatingLimitState {
+    /// Create a new state from an archived view, applying optional field updates.
+    /// Fields not specified in `updates` are copied from the archived state.
+    /// This avoids repetitive boilerplate when only updating a few fields.
+    pub fn from_archived_with_updates(
+        archived: &<FloatingLimitState as Archive>::Archived,
+        updates: FloatingLimitStateUpdates,
+    ) -> Self {
+        Self {
+            current_max_concurrency: updates
+                .current_max_concurrency
+                .unwrap_or(archived.current_max_concurrency),
+            last_refreshed_at_ms: updates
+                .last_refreshed_at_ms
+                .unwrap_or(archived.last_refreshed_at_ms),
+            refresh_task_scheduled: updates
+                .refresh_task_scheduled
+                .unwrap_or(archived.refresh_task_scheduled),
+            refresh_interval_ms: archived.refresh_interval_ms,
+            default_max_concurrency: archived.default_max_concurrency,
+            retry_count: updates.retry_count.unwrap_or(archived.retry_count),
+            next_retry_at_ms: updates
+                .next_retry_at_ms
+                .unwrap_or_else(|| archived.next_retry_at_ms.as_ref().copied()),
+            metadata: archived
+                .metadata
+                .iter()
+                .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
+                .collect(),
+        }
+    }
+}
+
 /// Rate limiting algorithm used by Gubernator
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, RkyvSerialize, RkyvDeserialize)]
 #[archive(check_bytes)]

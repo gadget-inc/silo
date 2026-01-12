@@ -16,6 +16,8 @@ mod cancel;
 mod dequeue;
 mod enqueue;
 mod floating;
+
+pub(crate) use enqueue::NextLimitContext;
 mod helpers;
 mod lease;
 mod rate_limit;
@@ -348,6 +350,54 @@ impl JobStoreShard {
         &self.db
     }
 
+    // ============================================================================
+    // Debug assertion helpers for verifying shard ownership
+    // ============================================================================
+
+    /// Debug assertion: verify this shard owns the given queue.
+    /// Panics in debug builds if the queue routes to a different shard.
+    #[inline]
+    pub(crate) fn debug_assert_owns_queue(&self, tenant: &str, queue_key: &str) {
+        debug_assert_eq!(
+            crate::routing::queue_to_shard(tenant, queue_key, self.num_shards),
+            self.shard_number,
+            "Queue '{}' for tenant '{}' routes to shard {}, but this is shard {}",
+            queue_key,
+            tenant,
+            crate::routing::queue_to_shard(tenant, queue_key, self.num_shards),
+            self.shard_number
+        );
+    }
+
+    /// Debug assertion: verify this shard owns the given job.
+    /// Panics in debug builds if the job routes to a different shard.
+    #[inline]
+    pub(crate) fn debug_assert_owns_job(&self, job_id: &str) {
+        debug_assert_eq!(
+            crate::routing::job_to_shard(job_id, self.num_shards),
+            self.shard_number,
+            "Job '{}' routes to shard {}, but this is shard {}",
+            job_id,
+            crate::routing::job_to_shard(job_id, self.num_shards),
+            self.shard_number
+        );
+    }
+
+    /// Debug assertion: verify this shard does NOT own the given queue (it's remote).
+    /// Panics in debug builds if the queue routes to this shard.
+    #[inline]
+    pub(crate) fn debug_assert_queue_is_remote(&self, tenant: &str, queue_key: &str) {
+        debug_assert_ne!(
+            crate::routing::queue_to_shard(tenant, queue_key, self.num_shards),
+            self.shard_number,
+            "Queue '{}' for tenant '{}' routes to shard {} (same as this shard). \
+             Expected a remote queue.",
+            queue_key,
+            tenant,
+            crate::routing::queue_to_shard(tenant, queue_key, self.num_shards)
+        );
+    }
+
     /// Fetch a job by id as a zero-copy archived view.
     pub async fn get_job(
         &self,
@@ -582,21 +632,11 @@ impl JobStoreShard {
             encode_remote_holder_record,
         };
         use crate::keys::{concurrency_request_key, floating_limit_state_key};
-        use crate::routing::queue_to_shard;
         use crate::task::{RemoteConcurrencyRequest, RemoteHolderRecord, Task};
         use slatedb::WriteBatch;
 
         // Debug assertion: verify this shard owns the queue
-        debug_assert_eq!(
-            queue_to_shard(tenant, queue_key, self.num_shards),
-            self.shard_number,
-            "receive_remote_ticket_request called on wrong shard: queue '{}' for tenant '{}' \
-             routes to shard {}, but this is shard {}",
-            queue_key,
-            tenant,
-            queue_to_shard(tenant, queue_key, self.num_shards),
-            self.shard_number
-        );
+        self.debug_assert_owns_queue(tenant, queue_key);
 
         let now_ms = helpers::now_epoch_ms();
 
@@ -733,31 +773,14 @@ impl JobStoreShard {
         use crate::codec::decode_held_ticket_state;
         use crate::job::Limit;
         use crate::keys::held_ticket_state_key;
-        use crate::routing::{job_to_shard, queue_to_shard};
         use crate::task::Task;
         use slatedb::WriteBatch;
 
         // Debug assertion: verify this shard owns the job
-        debug_assert_eq!(
-            job_to_shard(job_id, self.num_shards),
-            self.shard_number,
-            "receive_remote_ticket_grant called on wrong shard: job '{}' \
-             routes to shard {}, but this is shard {}",
-            job_id,
-            job_to_shard(job_id, self.num_shards),
-            self.shard_number
-        );
+        self.debug_assert_owns_job(job_id);
 
         // Debug assertion: verify the queue is NOT on this shard (it's remote)
-        debug_assert_ne!(
-            queue_to_shard(tenant, queue_key, self.num_shards),
-            self.shard_number,
-            "receive_remote_ticket_grant called for local queue: queue '{}' for tenant '{}' \
-             routes to shard {} (same as this shard). This should use local concurrency handling.",
-            queue_key,
-            tenant,
-            queue_to_shard(tenant, queue_key, self.num_shards)
-        );
+        self.debug_assert_queue_is_remote(tenant, queue_key);
 
         let now_ms = helpers::now_epoch_ms();
 
@@ -810,16 +833,18 @@ impl JobStoreShard {
             // More limits to process - enqueue the next limit task
             self.enqueue_next_limit_task(
                 &mut batch,
-                tenant,
-                request_id, // Use same task_id for holder consistency
-                job_id,
-                attempt_number,
-                current_limit_index,
-                &limits,
-                priority,
-                start_at_ms,
-                now_ms,
-                all_held_queues,
+                NextLimitContext {
+                    tenant,
+                    task_id: request_id, // Use same task_id for holder consistency
+                    job_id,
+                    attempt_number,
+                    current_limit_index,
+                    limits: &limits,
+                    priority,
+                    start_at_ms,
+                    now_ms,
+                    held_queues: all_held_queues,
+                },
             )?;
 
             tracing::debug!(
@@ -879,20 +904,10 @@ impl JobStoreShard {
         job_id: &str,
         holder_task_id: &str,
     ) -> Result<(), JobStoreShardError> {
-        use crate::routing::queue_to_shard;
         use slatedb::WriteBatch;
 
         // Debug assertion: verify this shard owns the queue
-        debug_assert_eq!(
-            queue_to_shard(tenant, queue_key, self.num_shards),
-            self.shard_number,
-            "release_remote_ticket called on wrong shard: queue '{}' for tenant '{}' \
-             routes to shard {}, but this is shard {}",
-            queue_key,
-            tenant,
-            queue_to_shard(tenant, queue_key, self.num_shards),
-            self.shard_number
-        );
+        self.debug_assert_owns_queue(tenant, queue_key);
 
         let now_ms = helpers::now_epoch_ms();
         let mut batch = WriteBatch::new();

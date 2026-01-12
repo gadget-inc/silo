@@ -9,8 +9,8 @@ use crate::job_attempt::{AttemptStatus, JobAttempt};
 use crate::job_store_shard::helpers::{now_epoch_ms, release_held_tickets};
 use crate::job_store_shard::{DequeueResult, JobStoreShard, JobStoreShardError, PendingCrossShardTask};
 use crate::keys::{attempt_key, job_info_key, leased_task_key};
-use crate::routing::queue_to_shard;
 use crate::task::{LeaseRecord, LeasedRefreshTask, LeasedTask, Task, DEFAULT_LEASE_MS};
+use crate::job_store_shard::enqueue::NextLimitContext;
 use crate::task_broker::BrokerTask;
 
 impl JobStoreShard {
@@ -79,17 +79,7 @@ impl JobStoreShard {
                         // Debug assertion: RequestTicket tasks are for LOCAL queues only.
                         // If the queue routes to a different shard, a RequestRemoteTicket
                         // task should have been created instead.
-                        debug_assert_eq!(
-                            queue_to_shard(&tenant, queue, self.num_shards),
-                            self.shard_number,
-                            "RequestTicket task for remote queue detected: queue '{}' for tenant '{}' \
-                             routes to shard {}, but this is shard {}. \
-                             A RequestRemoteTicket task should have been created instead.",
-                            queue,
-                            tenant,
-                            queue_to_shard(&tenant, queue, self.num_shards),
-                            self.shard_number
-                        );
+                        self.debug_assert_owns_queue(&tenant, queue);
 
                         // [SILO-DEQ-CXL] Check if job is cancelled - if so, skip and clean up task
                         if self.is_job_cancelled(&tenant, job_id).await? {
@@ -154,16 +144,18 @@ impl JobStoreShard {
                                     // More limits - enqueue the next limit task
                                     self.enqueue_next_limit_task(
                                         &mut batch,
-                                        &tenant,
-                                        &request_id, // Use same task_id for holder consistency
-                                        job_id,
-                                        *attempt_number,
-                                        current_limit_index,
-                                        &limits,
-                                        view.priority(),
-                                        view.enqueue_time_ms(),
-                                        now_ms,
-                                        all_held_queues,
+                                        NextLimitContext {
+                                            tenant: &tenant,
+                                            task_id: &request_id, // Use same task_id for holder consistency
+                                            job_id,
+                                            attempt_number: *attempt_number,
+                                            current_limit_index,
+                                            limits: &limits,
+                                            priority: view.priority(),
+                                            start_at_ms: view.enqueue_time_ms(),
+                                            now_ms,
+                                            held_queues: all_held_queues,
+                                        },
                                     )?;
                                     ack_keys.push(entry.key.clone());
                                     tracing::debug!(
@@ -265,16 +257,18 @@ impl JobStoreShard {
                                 // Rate limit passed! Proceed to next limit or RunAttempt
                                 self.enqueue_next_limit_task(
                                     &mut batch,
-                                    &tenant,
-                                    check_task_id,
-                                    job_id,
-                                    *attempt_number,
-                                    *limit_index,
-                                    &job_view.limits(),
-                                    *priority,
-                                    now_ms,
-                                    now_ms,
-                                    held_queues.clone(),
+                                    NextLimitContext {
+                                        tenant: &tenant,
+                                        task_id: check_task_id,
+                                        job_id,
+                                        attempt_number: *attempt_number,
+                                        current_limit_index: *limit_index,
+                                        limits: &job_view.limits(),
+                                        priority: *priority,
+                                        start_at_ms: now_ms,
+                                        now_ms,
+                                        held_queues: held_queues.clone(),
+                                    },
                                 )?;
                             }
                             Ok(result) => {

@@ -8,7 +8,7 @@ use crate::codec::{
     encode_lease,
 };
 use crate::concurrency::MemoryEvent;
-use crate::job::{FloatingLimitState, JobStatus, JobView};
+use crate::job::{FloatingLimitState, FloatingLimitStateUpdates, JobStatus, JobView};
 use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt};
 use crate::job_store_shard::helpers::{self, now_epoch_ms, put_task, release_held_tickets};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
@@ -405,21 +405,13 @@ impl JobStoreShard {
 
         // Reset the state to allow a new refresh to be scheduled
         // We don't increment retry_count here - we rely on the normal periodic refresh mechanism
-        let new_state = FloatingLimitState {
-            refresh_task_scheduled: false, // Allow new refresh to be scheduled
-            // Preserve all other fields
-            current_max_concurrency: archived.current_max_concurrency,
-            last_refreshed_at_ms: archived.last_refreshed_at_ms,
-            refresh_interval_ms: archived.refresh_interval_ms,
-            default_max_concurrency: archived.default_max_concurrency,
-            retry_count: archived.retry_count,
-            next_retry_at_ms: archived.next_retry_at_ms.as_ref().copied(),
-            metadata: archived
-                .metadata
-                .iter()
-                .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
-                .collect(),
-        };
+        let new_state = FloatingLimitState::from_archived_with_updates(
+            archived,
+            FloatingLimitStateUpdates {
+                refresh_task_scheduled: Some(false), // Allow new refresh to be scheduled
+                ..Default::default()
+            },
+        );
 
         let mut batch = WriteBatch::new();
         let state_value = encode_floating_limit_state(&new_state)?;

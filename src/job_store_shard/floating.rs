@@ -7,7 +7,7 @@ use crate::codec::{
     decode_floating_limit_state, decode_lease, encode_floating_limit_state, encode_task,
     DecodedFloatingLimitState,
 };
-use crate::job::{FloatingConcurrencyLimit, FloatingLimitState};
+use crate::job::{FloatingConcurrencyLimit, FloatingLimitState, FloatingLimitStateUpdates};
 use crate::job_store_shard::helpers::now_epoch_ms;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{floating_limit_state_key, leased_task_key};
@@ -75,20 +75,13 @@ impl JobStoreShard {
 
                 // If we need to schedule a refresh, update the state to mark it scheduled
                 if needs_schedule {
-                    let updated_state = FloatingLimitState {
-                        current_max_concurrency: archived.current_max_concurrency,
-                        default_max_concurrency: archived.default_max_concurrency,
-                        refresh_interval_ms: archived.refresh_interval_ms,
-                        last_refreshed_at_ms: archived.last_refreshed_at_ms,
-                        refresh_task_scheduled: true,
-                        retry_count: archived.retry_count,
-                        next_retry_at_ms: archived.next_retry_at_ms.as_ref().copied(),
-                        metadata: archived
-                            .metadata
-                            .iter()
-                            .map(|(k, v)| (k.to_string(), v.to_string()))
-                            .collect(),
-                    };
+                    let updated_state = FloatingLimitState::from_archived_with_updates(
+                        archived,
+                        FloatingLimitStateUpdates {
+                            refresh_task_scheduled: Some(true),
+                            ..Default::default()
+                        },
+                    );
                     let state_val = encode_floating_limit_state(&updated_state)?;
                     batch.put(state_key.as_bytes(), &state_val);
                     (updated_state.current_max_concurrency, true)
@@ -205,21 +198,14 @@ impl JobStoreShard {
         );
         batch.put(task_key_str.as_bytes(), &task_value);
 
-        // Update state to mark refresh as scheduled - construct new state directly
-        let new_state = FloatingLimitState {
-            refresh_task_scheduled: true,
-            current_max_concurrency: archived.current_max_concurrency,
-            last_refreshed_at_ms: archived.last_refreshed_at_ms,
-            refresh_interval_ms: archived.refresh_interval_ms,
-            default_max_concurrency: archived.default_max_concurrency,
-            retry_count: archived.retry_count,
-            next_retry_at_ms: archived.next_retry_at_ms.as_ref().copied(),
-            metadata: archived
-                .metadata
-                .iter()
-                .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
-                .collect(),
-        };
+        // Update state to mark refresh as scheduled
+        let new_state = FloatingLimitState::from_archived_with_updates(
+            archived,
+            FloatingLimitStateUpdates {
+                refresh_task_scheduled: Some(true),
+                ..Default::default()
+            },
+        );
         let state_key = floating_limit_state_key(tenant, &fl.key);
         let state_value = encode_floating_limit_state(&new_state)?;
         batch.put(state_key.as_bytes(), &state_value);
@@ -273,22 +259,17 @@ impl JobStoreShard {
         let decoded = decode_floating_limit_state(&raw)?;
         let archived = decoded.archived();
 
-        // Construct new state directly - avoids intermediate owned allocation
-        let new_state = FloatingLimitState {
-            current_max_concurrency: new_max_concurrency,
-            last_refreshed_at_ms: now_ms,
-            refresh_task_scheduled: false,
-            retry_count: 0,
-            next_retry_at_ms: None,
-            // Preserve unchanged fields from archived view
-            refresh_interval_ms: archived.refresh_interval_ms,
-            default_max_concurrency: archived.default_max_concurrency,
-            metadata: archived
-                .metadata
-                .iter()
-                .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
-                .collect(),
-        };
+        // Update state with new values from successful refresh
+        let new_state = FloatingLimitState::from_archived_with_updates(
+            archived,
+            FloatingLimitStateUpdates {
+                current_max_concurrency: Some(new_max_concurrency),
+                last_refreshed_at_ms: Some(now_ms),
+                refresh_task_scheduled: Some(false),
+                retry_count: Some(0),
+                next_retry_at_ms: Some(None),
+            },
+        );
 
         let mut batch = WriteBatch::new();
         let state_value = encode_floating_limit_state(&new_state)?;
@@ -391,22 +372,16 @@ impl JobStoreShard {
             new_task_id
         );
 
-        // Construct new state directly - avoids intermediate owned allocation
-        let new_state = FloatingLimitState {
-            retry_count: new_retry_count,
-            next_retry_at_ms: Some(next_retry_at),
-            refresh_task_scheduled: true,
-            // Preserve unchanged fields from archived view
-            current_max_concurrency: archived.current_max_concurrency,
-            last_refreshed_at_ms: archived.last_refreshed_at_ms,
-            refresh_interval_ms: archived.refresh_interval_ms,
-            default_max_concurrency: archived.default_max_concurrency,
-            metadata: archived
-                .metadata
-                .iter()
-                .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
-                .collect(),
-        };
+        // Update state with retry information
+        let new_state = FloatingLimitState::from_archived_with_updates(
+            archived,
+            FloatingLimitStateUpdates {
+                retry_count: Some(new_retry_count),
+                next_retry_at_ms: Some(Some(next_retry_at)),
+                refresh_task_scheduled: Some(true),
+                ..Default::default()
+            },
+        );
 
         let mut batch = WriteBatch::new();
         let state_value = encode_floating_limit_state(&new_state)?;

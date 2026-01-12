@@ -454,7 +454,7 @@ async fn append_release_and_grant_next(
                 continue;
             }
             let key_start_time_ms: i64 = parts[3].parse().unwrap_or(0);
-            let _key_priority: u8 = parts[4].parse().unwrap_or(99);
+            // parts[4] is priority, which is used for ordering but not needed here
             let key_request_id = parts[5].to_string();
 
             if key_start_time_ms > now_ms {
