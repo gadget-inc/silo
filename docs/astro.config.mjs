@@ -5,6 +5,7 @@ import protoDocs from './integrations/proto-docs.ts';
 
 // https://astro.build/config
 export default defineConfig({
+	base: '/silo',
 	integrations: [
 		protoDocs({
 			protoDir: '../proto',
