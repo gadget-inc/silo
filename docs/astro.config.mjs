@@ -12,7 +12,11 @@ export default defineConfig({
 			outputPath: 'src/content/docs/reference/rpc-reference.mdx',
 		}),
 		starlight({
-			title: 'Silo',
+			title: '',
+			logo: {
+				src: './src/assets/logo.svg',
+				alt: 'Silo',
+			},
 			social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/gadget-inc/silo' }],
 			sidebar: [
 				{

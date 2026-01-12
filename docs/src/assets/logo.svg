@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 115 44" fill="currentColor">
+  <style>
+    text {
+      font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', Consolas, monospace;
+      font-size: 14px;
+      fill: #10b981;
+      white-space: pre;
+    }
+  </style>
+  <text x="0" y="12" xml:space="preserve">╔═╗╦╦  ╔═╗</text>
+  <text x="0" y="26" xml:space="preserve">╚═╗║║  ║ ║</text>
+  <text x="0" y="40" xml:space="preserve">╚═╝╩╩═╝╚═╝</text>
+</svg>
