@@ -193,15 +193,7 @@ impl ConcurrencyManager {
         if self.counts.can_grant(tenant, queue, max_allowed) {
             // Grant immediately: [SILO-ENQ-CONC-2] create holder, [SILO-ENQ-CONC-3] create task
             let events = append_grant_edits(
-                batch,
-                now_ms,
-                tenant,
-                queue,
-                task_id,
-                start_at_ms,
-                priority,
-                job_id,
-                1,
+                batch, now_ms, tenant, queue, task_id, start_at_ms, job_id, 1,
             )?;
             Ok(Some(RequestTicketOutcome::GrantedImmediately {
                 task_id: task_id.to_string(),
@@ -239,7 +231,7 @@ impl ConcurrencyManager {
             };
             let ticket_value = encode_task(&ticket)?;
             batch.put(
-                task_key(start_at_ms, priority, job_id, 1).as_bytes(),
+                task_key(start_at_ms, job_id, 1).as_bytes(),
                 &ticket_value,
             );
             Ok(Some(RequestTicketOutcome::FutureRequestTaskWritten {
@@ -324,7 +316,6 @@ fn append_grant_edits(
     queue: &str,
     task_id: &str,
     start_time_ms: i64,
-    priority: u8,
     job_id: &str,
     attempt_number: u32,
 ) -> Result<Vec<MemoryEvent>, String> {
@@ -346,7 +337,7 @@ fn append_grant_edits(
     };
     let task_value = encode_task(&task)?;
     batch.put(
-        task_key(start_time_ms, priority, job_id, attempt_number).as_bytes(),
+        task_key(start_time_ms, job_id, attempt_number).as_bytes(),
         &task_value,
     );
 
@@ -419,7 +410,7 @@ async fn append_release_and_grant_next(
             match a {
                 ArchivedAction::EnqueueTask {
                     start_time_ms,
-                    priority,
+                    priority: _,
                     job_id,
                     attempt_number,
                 } => {
@@ -448,9 +439,9 @@ async fn append_release_and_grant_next(
                     let request_id = req_key_str.split('/').next_back().unwrap_or("").to_string();
 
                     if *start_time_ms > now_ms {
-                        // Not ready yet; leave request for later and stop searching
-                        // (requests are ordered by time, so subsequent ones are also not ready)
-                        break;
+                        // Not ready yet; continue searching as lower-priority requests may be ready
+                        // (requests are ordered by priority first, then time)
+                        continue;
                     }
 
                     // [SILO-GRANT-3] Create holder for this task/queue
@@ -473,7 +464,7 @@ async fn append_release_and_grant_next(
                     };
                     let tval = encode_task(&task)?;
                     batch.put(
-                        task_key(*start_time_ms, *priority, job_id_str, *attempt_number).as_bytes(),
+                        task_key(*start_time_ms, job_id_str, *attempt_number).as_bytes(),
                         &tval,
                     );
                     batch.delete(&kv.key);

@@ -37,14 +37,7 @@ impl JobStoreShard {
             priority,
             held_queues: held_queues.to_vec(),
         };
-        put_task(
-            batch,
-            retry_at_ms,
-            priority,
-            job_id,
-            attempt_number,
-            &retry_task,
-        )
+        put_task(batch, retry_at_ms, job_id, attempt_number, &retry_task)
     }
 
     /// Check a rate limit via the rate limit client

@@ -62,7 +62,6 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       const handle = await client.enqueue({
         tenant,
         payload,
-        priority: 10,
       });
 
       expect(handle.id).toBeTruthy();
@@ -105,7 +104,6 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       const handle = await client.enqueue({
         tenant,
         payload,
-        priority: 10,
         metadata: { source: "integration-test" },
       });
 
@@ -116,7 +114,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       const job = await client.getJob(handle.id, tenant);
       expect(job).toBeDefined();
       expect(job?.id).toBe(handle.id);
-      expect(job?.priority).toBe(10);
+      expect(job?.priority).toBe(50); // Default priority
       expect(job?.metadata?.source).toBe("integration-test");
 
       // Decode and verify payload
@@ -180,6 +178,24 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         expect(limit.key).toBe("user:123");
         expect(limit.maxConcurrency).toBe(5);
       }
+    });
+
+    it("enqueues a job with non-default priority and concurrency limit", async () => {
+      const tenant = "priority-concurrency-tenant";
+
+      // Non-default priority (10) requires a concurrency limit
+      const handle = await client.enqueue({
+        tenant,
+        payload: { data: "priority-test" },
+        priority: 10,
+        limits: [{ type: "concurrency", key: "priority-queue", maxConcurrency: 3 }],
+      });
+
+      expect(handle.id).toBeTruthy();
+      const job = await client.getJob(handle.id, tenant);
+      expect(job?.priority).toBe(10);
+      expect(job?.limits).toHaveLength(1);
+      expect(job?.limits[0].type).toBe("concurrency");
     });
 
     it("enqueues a job with rate limits", async () => {
@@ -264,7 +280,6 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         tenant,
         id: uniqueJobId,
         payload,
-        priority: 1,
       });
 
       // Get the shard for this tenant to poll from the correct server
@@ -285,7 +300,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       expect(task).toBeDefined();
       expect(task?.attemptNumber).toBe(1);
-      expect(task?.priority).toBe(1);
+      expect(task?.priority).toBe(50); // Default priority
 
       const taskPayload = decodePayload(task?.payload?.data);
       expect(taskPayload).toEqual(payload);
@@ -309,7 +324,6 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         tenant,
         id: uniqueJobId,
         payload: { action: "fail-test" },
-        priority: 1,
       });
 
       // Get the shard for this tenant to poll from the correct server
@@ -350,7 +364,6 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       const handle = await client.enqueue({
         tenant,
         payload: { action: "heartbeat-test" },
-        priority: 1,
       });
 
       // Get the shard for this tenant to poll from the correct server
@@ -385,7 +398,6 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         tenant,
         id: uniqueJobId,
         payload: { action: "delete-test" },
-        priority: 1,
       });
 
       const job = await client.getJob(handle.id, tenant);
@@ -428,7 +440,6 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         await client.enqueue({
           tenant,
           payload: { index: i },
-          priority: 10 + i,
           metadata: { batch: testBatch },
         });
       }
@@ -451,11 +462,10 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       await client.enqueue({
         tenant,
         payload: { test: true },
-        priority: 5,
       });
 
       const result = await client.query(
-        "SELECT id, priority FROM jobs WHERE priority < 20",
+        "SELECT id, priority FROM jobs WHERE priority < 100",
         tenant
       );
       expect(result.columns.length).toBe(2);
@@ -503,13 +513,12 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       const handle = await client.enqueue({
         tenant,
         payload,
-        priority: 15,
       });
 
       const job = await handle.getJob();
       expect(job).toBeDefined();
       expect(job?.id).toBe(handle.id);
-      expect(job?.priority).toBe(15);
+      expect(job?.priority).toBe(50); // Default priority
       expect(decodePayload(job?.payload?.data)).toEqual(payload);
     });
 

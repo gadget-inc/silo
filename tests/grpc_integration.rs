@@ -62,7 +62,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
         let enq = EnqueueRequest {
             shard: 0,
             id: "".to_string(),
-            priority: 10,
+            priority: 50,
             start_at_ms: 0,
             retry_policy: None,
             payload: Some(JsonValueBytes {
@@ -214,7 +214,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
             let req = EnqueueRequest {
                 shard: 0,
                 id: "".to_string(),
-                priority: 1,
+                priority: 50,
                 start_at_ms: 0,
                 retry_policy: None,
                 payload: Some(JsonValueBytes {
@@ -235,7 +235,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
             let req = EnqueueRequest {
                 shard: 0,
                 id: "".to_string(),
-                priority: 1,
+                priority: 50,
                 start_at_ms: 0,
                 retry_policy: None,
                 payload: Some(JsonValueBytes {
@@ -259,7 +259,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
             let req = EnqueueRequest {
                 shard: 0,
                 id: "".to_string(),
-                priority: 1,
+                priority: 50,
                 start_at_ms: 0,
                 retry_policy: None,
                 payload: Some(JsonValueBytes {
@@ -270,6 +270,48 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
                 metadata: md,
             };
             expect_invalid_arg(&mut client, req, "value too long").await;
+        }
+
+        // 4) Non-default priority without concurrency limit
+        {
+            let req = EnqueueRequest {
+                shard: 0,
+                id: "".to_string(),
+                priority: 10, // Non-default priority
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(JsonValueBytes {
+                    data: b"{}".to_vec(),
+                }),
+                limits: vec![], // No concurrency limit
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+            };
+            expect_invalid_arg(&mut client, req, "priority requires a concurrency limit").await;
+        }
+
+        // 5) Non-default priority WITH concurrency limit should succeed
+        {
+            let req = EnqueueRequest {
+                shard: 0,
+                id: "".to_string(),
+                priority: 10, // Non-default priority
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(JsonValueBytes {
+                    data: b"{}".to_vec(),
+                }),
+                limits: vec![Limit {
+                    limit: Some(limit::Limit::Concurrency(ConcurrencyLimit {
+                        key: "test-queue".to_string(),
+                        max_concurrency: 10,
+                    })),
+                }],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+            };
+            let res = client.enqueue(req).await;
+            assert!(res.is_ok(), "priority with concurrency limit should succeed");
         }
 
         let _ = shutdown_tx.send(());
@@ -332,7 +374,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
             let enq = EnqueueRequest {
                 shard: 0,
                 id: format!("job{}", i),
-                priority: (10 + i) as u32,
+                priority: 50,
                 start_at_ms: 0,
                 retry_policy: None,
                 payload: Some(JsonValueBytes {
@@ -571,7 +613,7 @@ async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
         let enq = EnqueueRequest {
             shard: 0,
             id: "test_job".to_string(),
-            priority: 10,
+            priority: 50,
             start_at_ms: 0,
             retry_policy: None,
             payload: Some(JsonValueBytes {
@@ -662,7 +704,7 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
         let enq = EnqueueRequest {
             shard: 0,
             id: "complex_job".to_string(),
-            priority: 5,
+            priority: 50,
             start_at_ms: 1234567890,
             retry_policy: None,
             payload: Some(JsonValueBytes {
@@ -701,7 +743,7 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
         // Verify row is valid JSON that TypeScript can deserialize
         let row: serde_json::Value = serde_json::from_slice(&query_resp.rows[0].data)?;
         assert_eq!(row["id"], "complex_job");
-        assert_eq!(row["priority"], 5);
+        assert_eq!(row["priority"], 50);
         assert_eq!(row["enqueue_time_ms"], 1234567890);
 
         // Verify payload is a JSON string that can be parsed again
@@ -767,7 +809,7 @@ async fn grpc_server_query_without_tenant() -> anyhow::Result<()> {
             let enq = EnqueueRequest {
                 shard: 0,
                 id: format!("job{}", i),
-                priority: 10,
+                priority: 50,
                 start_at_ms: 0,
                 retry_policy: None,
                 payload: Some(JsonValueBytes {
@@ -870,7 +912,7 @@ async fn grpc_server_query_arrow_without_tenant() -> anyhow::Result<()> {
             let enq = EnqueueRequest {
                 shard: 0,
                 id: format!("arrow_job{}", i),
-                priority: 10,
+                priority: 50,
                 start_at_ms: 0,
                 retry_policy: None,
                 payload: Some(JsonValueBytes {
@@ -1044,7 +1086,7 @@ async fn grpc_server_lease_tasks_multi_shard() -> anyhow::Result<()> {
                 let enq = EnqueueRequest {
                     shard,
                     id: format!("job_s{}_i{}", shard, i),
-                    priority: 10,
+                    priority: 50,
                     start_at_ms: 0,
                     retry_policy: None,
                     payload: Some(JsonValueBytes {
@@ -1149,7 +1191,7 @@ async fn grpc_get_job_includes_status() -> anyhow::Result<()> {
         let enq = EnqueueRequest {
             shard: 0,
             id: "status_test_job".to_string(),
-            priority: 10,
+            priority: 50,
             start_at_ms: 0,
             retry_policy: None,
             payload: Some(JsonValueBytes {
@@ -1346,7 +1388,7 @@ async fn grpc_get_job_result_not_terminal() -> anyhow::Result<()> {
         let enq = EnqueueRequest {
             shard: 0,
             id: "scheduled_job".to_string(),
-            priority: 10,
+            priority: 50,
             start_at_ms: 0,
             retry_policy: None,
             payload: Some(JsonValueBytes {
@@ -1451,7 +1493,7 @@ async fn grpc_get_job_result_success() -> anyhow::Result<()> {
         let enq = EnqueueRequest {
             shard: 0,
             id: "success_job".to_string(),
-            priority: 10,
+            priority: 50,
             start_at_ms: 0,
             retry_policy: None,
             payload: Some(JsonValueBytes {
@@ -1563,7 +1605,7 @@ async fn grpc_get_job_result_failure() -> anyhow::Result<()> {
         let enq = EnqueueRequest {
             shard: 0,
             id: "failed_job".to_string(),
-            priority: 10,
+            priority: 50,
             start_at_ms: 0,
             retry_policy: Some(RetryPolicy {
                 retry_count: 0, // No retries
@@ -1684,7 +1726,7 @@ async fn grpc_get_job_result_cancelled() -> anyhow::Result<()> {
         let enq = EnqueueRequest {
             shard: 0,
             id: "cancelled_job".to_string(),
-            priority: 10,
+            priority: 50,
             start_at_ms: 0,
             retry_policy: None,
             payload: Some(JsonValueBytes {
@@ -1781,7 +1823,7 @@ async fn grpc_get_job_result_cancelled_while_running() -> anyhow::Result<()> {
         let enq = EnqueueRequest {
             shard: 0,
             id: "cancel_running_job".to_string(),
-            priority: 10,
+            priority: 50,
             start_at_ms: 0,
             retry_policy: None,
             payload: Some(JsonValueBytes {
@@ -1905,7 +1947,7 @@ async fn grpc_server_tenant_validation_when_enabled() -> anyhow::Result<()> {
             .enqueue(EnqueueRequest {
                 shard: 0,
                 id: "test-job".to_string(),
-                priority: 5,
+                priority: 50,
                 start_at_ms: 0,
                 retry_policy: None,
                 payload: Some(JsonValueBytes {
@@ -1934,7 +1976,7 @@ async fn grpc_server_tenant_validation_when_enabled() -> anyhow::Result<()> {
             .enqueue(EnqueueRequest {
                 shard: 0,
                 id: "test-job".to_string(),
-                priority: 5,
+                priority: 50,
                 start_at_ms: 0,
                 retry_policy: None,
                 payload: Some(JsonValueBytes {
@@ -1958,7 +2000,7 @@ async fn grpc_server_tenant_validation_when_enabled() -> anyhow::Result<()> {
             .enqueue(EnqueueRequest {
                 shard: 0,
                 id: "test-job".to_string(),
-                priority: 5,
+                priority: 50,
                 start_at_ms: 0,
                 retry_policy: None,
                 payload: Some(JsonValueBytes {
@@ -1987,7 +2029,7 @@ async fn grpc_server_tenant_validation_when_enabled() -> anyhow::Result<()> {
             .enqueue(EnqueueRequest {
                 shard: 0,
                 id: "test-job-valid".to_string(),
-                priority: 5,
+                priority: 50,
                 start_at_ms: 0,
                 retry_policy: None,
                 payload: Some(JsonValueBytes {
@@ -2131,7 +2173,7 @@ async fn grpc_server_reset_shards_works_in_dev_mode() -> anyhow::Result<()> {
             .enqueue(EnqueueRequest {
                 shard: 0,
                 id: "job-to-reset".to_string(),
-                priority: 5,
+                priority: 50,
                 start_at_ms: 0,
                 retry_policy: None,
                 payload: Some(JsonValueBytes {
@@ -2300,7 +2342,7 @@ async fn grpc_server_get_job_result_for_non_terminal_job() -> anyhow::Result<()>
             .enqueue(EnqueueRequest {
                 shard: 0,
                 id: "non-terminal-job".to_string(),
-                priority: 5,
+                priority: 50,
                 start_at_ms: 0,
                 retry_policy: None,
                 payload: Some(JsonValueBytes {
@@ -2389,7 +2431,7 @@ async fn grpc_server_enqueue_with_rate_limit() -> anyhow::Result<()> {
             .enqueue(EnqueueRequest {
                 shard: 0,
                 id: "rate-limited-job".to_string(),
-                priority: 5,
+                priority: 50,
                 start_at_ms: 0,
                 retry_policy: None,
                 payload: Some(JsonValueBytes {
@@ -2573,7 +2615,7 @@ async fn grpc_enqueue_requires_tenant_when_tenancy_enabled() -> anyhow::Result<(
         let req = EnqueueRequest {
             shard: 0,
             id: "".to_string(),
-            priority: 1,
+            priority: 50,
             start_at_ms: 0,
             retry_policy: None,
             payload: Some(JsonValueBytes {
@@ -2600,7 +2642,7 @@ async fn grpc_enqueue_requires_tenant_when_tenancy_enabled() -> anyhow::Result<(
         let req = EnqueueRequest {
             shard: 0,
             id: "".to_string(),
-            priority: 1,
+            priority: 50,
             start_at_ms: 0,
             retry_policy: None,
             payload: Some(JsonValueBytes {
@@ -2627,7 +2669,7 @@ async fn grpc_enqueue_requires_tenant_when_tenancy_enabled() -> anyhow::Result<(
         let req = EnqueueRequest {
             shard: 0,
             id: "".to_string(),
-            priority: 1,
+            priority: 50,
             start_at_ms: 0,
             retry_policy: None,
             payload: Some(JsonValueBytes {
@@ -2700,7 +2742,7 @@ async fn grpc_restart_cancelled_job() -> anyhow::Result<()> {
             .enqueue(EnqueueRequest {
                 shard: 0,
                 id: "restart-test-job".to_string(),
-                priority: 10,
+                priority: 50,
                 start_at_ms: 0,
                 retry_policy: None,
                 payload: Some(JsonValueBytes {
@@ -2855,7 +2897,7 @@ async fn grpc_restart_failed_job() -> anyhow::Result<()> {
             .enqueue(EnqueueRequest {
                 shard: 0,
                 id: "restart-failed-job".to_string(),
-                priority: 10,
+                priority: 50,
                 start_at_ms: 0,
                 retry_policy: None,
                 payload: Some(JsonValueBytes {
@@ -3081,7 +3123,7 @@ async fn grpc_restart_running_job_fails() -> anyhow::Result<()> {
             .enqueue(EnqueueRequest {
                 shard: 0,
                 id: "running-job".to_string(),
-                priority: 10,
+                priority: 50,
                 start_at_ms: 0,
                 retry_policy: None,
                 payload: Some(JsonValueBytes {
@@ -3207,7 +3249,7 @@ async fn grpc_restart_succeeded_job_fails() -> anyhow::Result<()> {
             .enqueue(EnqueueRequest {
                 shard: 0,
                 id: "succeeded-job".to_string(),
-                priority: 10,
+                priority: 50,
                 start_at_ms: 0,
                 retry_policy: None,
                 payload: Some(JsonValueBytes {

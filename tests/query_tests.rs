@@ -581,7 +581,8 @@ async fn sql_filter_succeeded_status() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
 
-    enqueue_job(&shard, "success1", 5, now).await; // higher priority to be dequeued first
+    // Use earlier start time to ensure success1 is dequeued first (tasks are ordered by time, then job_id)
+    enqueue_job(&shard, "success1", 10, now - 1000).await;
     enqueue_job(&shard, "other", 10, now).await;
 
     // Dequeue and complete success1

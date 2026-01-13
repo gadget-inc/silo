@@ -101,14 +101,22 @@ Priority from 0-99, where **0 is highest priority**. Defaults to 50.
 ```typescript
 const urgentHandle = await client.enqueue({
   payload: { task: "urgent-notification" },
-  priority: 0  // Highest priority
+  priority: 0,  // Highest priority
+  limits: [{ type: "concurrency", key: "notifications", maxConcurrency: 10 }]
 });
 
 const backgroundHandle = await client.enqueue({
   payload: { task: "background-sync" },
-  priority: 90  // Lower priority
+  priority: 90,  // Lower priority
+  limits: [{ type: "concurrency", key: "notifications", maxConcurrency: 10 }]
 });
 ```
+
+<Aside type="caution" title="Priority requires a concurrency limit">
+Priority only affects ordering within concurrency queues. Without concurrency limits, tasks are processed in time order (earliest `startAtMs` first). If you specify a non-default priority without a concurrency limit, the enqueue will fail.
+
+To use priority-based ordering, add a concurrency limit to your job. Jobs waiting for the same concurrency queue will be granted slots in priority order.
+</Aside>
 
 ### `startAtMs` (optional)
 
@@ -211,6 +219,10 @@ Common use cases:
 - Per-user rate limiting: `key: "user:${userId}"`
 - Per-tenant limits: `key: "tenant:${tenantId}"`
 - Resource protection: `key: "database:main"`
+
+<Aside type="tip" title="Priority ordering">
+When multiple jobs are waiting for the same concurrency queue, they are granted slots in **priority order** (lower priority number first). This is the only way to implement priority-based scheduling in Silo. See the [priority option](#priority-optional) above.
+</Aside>
 
 #### Rate Limits
 

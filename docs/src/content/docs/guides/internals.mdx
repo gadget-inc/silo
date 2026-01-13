@@ -30,7 +30,7 @@ All of Silo is built to house job data for multiple tenants, if necessary. Stora
 
 - `jobs/<tenant-id>/<job-id>` - stores job payloads
 - `attempts/<tenant-id>/<job-id>/<attempt-number>` - stores attempt details
-- `tasks/<start-time>/<priority>/<job-id>/<attempt-number>` - stores the work items that need accomplishing in task order. Each stored task has a system-generated UUID.
+- `tasks/<start-time>/<job-id>/<attempt-number>` - stores the work items that need accomplishing in task order. Each stored task has a system-generated UUID. Priority ordering is handled by concurrency queues, not task key ordering.
 - `lease/<task-id>` - during leasing, dequeued tasks are written here keyed by task id. The value stores a LeaseRecord `{ worker_id, task, expiry_ms }`. Workers must heartbeat/complete before expiry to retain ownership. Expired lease detection scans this prefix and inspects `expiry_ms`.
 
 Secondary indexes are also mapped as ordered keys in the k/v store:

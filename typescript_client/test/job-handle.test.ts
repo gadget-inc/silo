@@ -72,14 +72,13 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
       const handle = await client.enqueue({
         tenant,
         payload,
-        priority: 25,
         metadata: { source: "job-handle-test" },
       });
 
       const job = await handle.getJob();
 
       expect(job.id).toBe(handle.id);
-      expect(job.priority).toBe(25);
+      expect(job.priority).toBe(50); // Default priority
       expect(job.status).toBe(JobStatus.Scheduled);
       expect(job.metadata?.source).toBe("job-handle-test");
       expect(decodePayload(job.payload?.data)).toEqual(payload);

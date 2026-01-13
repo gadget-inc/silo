@@ -99,11 +99,8 @@ impl JobStoreShard {
         // Use a synthetic task key based on the queue key to avoid collisions
         let task_value = encode_task(&refresh_task)?;
         let task_key_str = format!(
-            "tasks/{:020}/{:02}/floating_refresh/{}/{}",
-            now_ms,
-            0, // highest priority for refresh tasks
-            fl.key,
-            task_id
+            "tasks/{:020}/floating_refresh/{}/{}",
+            now_ms, fl.key, task_id
         );
         batch.put(task_key_str.as_bytes(), &task_value);
 
@@ -286,11 +283,8 @@ impl JobStoreShard {
 
         let task_value = encode_task(&refresh_task)?;
         let task_key_str = format!(
-            "tasks/{:020}/{:02}/floating_refresh/{}/{}",
-            next_retry_at,
-            0, // highest priority
-            queue_key,
-            new_task_id
+            "tasks/{:020}/floating_refresh/{}/{}",
+            next_retry_at, queue_key, new_task_id
         );
 
         // Construct new state directly - avoids intermediate owned allocation

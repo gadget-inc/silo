@@ -81,13 +81,12 @@ pub fn idx_metadata_prefix(tenant: &str, key: &str, value: &str) -> String {
 }
 
 /// Construct the key for a task, ordered by start time.
-pub fn task_key(start_time_ms: i64, priority: u8, job_id: &str, attempt: u32) -> String {
-    // Zero-pad time to 20 digits and priority to 2 digits; 00 is highest, 99 lowest
-    // Lexicographic order: time asc, then priority asc (so higher priority first)
+/// Priority ordering is handled by concurrency queues, not by task key ordering.
+pub fn task_key(start_time_ms: i64, job_id: &str, attempt: u32) -> String {
+    // Zero-pad time to 20 digits for lexicographic ordering by time
     format!(
-        "tasks/{:020}/{:02}/{}/{}",
+        "tasks/{:020}/{}/{}",
         start_time_ms.max(0) as u64,
-        priority,
         job_id,
         attempt
     )
@@ -114,8 +113,9 @@ pub fn attempt_prefix(tenant: &str, job_id: &str) -> String {
     format!("attempts/{}/{}/", escape_tenant(tenant), job_id)
 }
 
-/// Concurrency request queue: requests/<tenant>/<queue-name>/<start_time_ms>/<priority>/<request_id>
-/// Ordered by start time (when job should run), then priority (lower = higher), then request ID
+/// Concurrency request queue: requests/<tenant>/<queue-name>/<priority>/<start_time_ms>/<request_id>
+/// Ordered by priority (lower = higher), then start time (when job should run), then request ID.
+/// This ensures high-priority jobs get tickets before low-priority jobs, regardless of enqueue order.
 pub fn concurrency_request_key(
     tenant: &str,
     queue: &str,
@@ -126,11 +126,11 @@ pub fn concurrency_request_key(
     validate_tenant_len(tenant);
     validate_id_len(queue);
     format!(
-        "requests/{}/{}/{:020}/{:02}/{}",
+        "requests/{}/{}/{:02}/{:020}/{}",
         escape_tenant(tenant),
         queue,
-        start_time_ms.max(0) as u64,
         priority,
+        start_time_ms.max(0) as u64,
         request_id
     )
 }

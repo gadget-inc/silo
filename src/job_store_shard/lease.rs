@@ -152,7 +152,6 @@ impl JobStoreShard {
                 let maybe_job = self.db.get(job_info_key.as_bytes()).await?;
                 if let Some(jbytes) = maybe_job {
                     let view = JobView::new(jbytes)?;
-                    let priority = view.priority();
                     let failures_so_far = attempt_number;
                     if let Some(policy_rt) = view.retry_policy() {
                         if let Some(next_time) =
@@ -170,7 +169,6 @@ impl JobStoreShard {
                             put_task(
                                 &mut batch,
                                 next_time,
-                                priority,
                                 &job_id,
                                 next_attempt_number,
                                 &next_task,

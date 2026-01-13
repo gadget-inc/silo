@@ -115,7 +115,7 @@ pub struct HolderRecord {
     pub granted_at_ms: i64,
 }
 
-/// Action stored at requests/<queue>/<time>/<request-id>
+/// Action stored at requests/<tenant>/<queue>/<priority>/<time>/<request-id>
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
 #[archive(check_bytes)]
 pub enum ConcurrencyAction {

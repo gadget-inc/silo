@@ -122,7 +122,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       await client.enqueue({
         tenant: DEFAULT_TENANT,
         payload: { message: "hello-worker" },
-        priority: 1,
+        priority: 50, // Default priority (no concurrency limit needed)
       });
 
       // Wait until job is processed
@@ -156,7 +156,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         await client.enqueue({
           tenant: DEFAULT_TENANT,
           payload: { index: i },
-          priority: 1,
+          priority: 50, // Default priority (no concurrency limit needed)
         });
       }
 
@@ -195,7 +195,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
           client.enqueue({
             tenant: DEFAULT_TENANT,
             payload: { index: i },
-            priority: 1,
+            priority: 50, // Default priority (no concurrency limit needed)
           })
         )
       );
@@ -234,7 +234,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
           client.enqueue({
             tenant: DEFAULT_TENANT,
             payload: { label },
-            priority: 1,
+            priority: 50, // Default priority (no concurrency limit needed)
           })
         )
       );
@@ -269,7 +269,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       const handle = await client.enqueue({
         tenant: DEFAULT_TENANT,
         payload: { action: "fail" },
-        priority: 1,
+        priority: 50, // Default priority (no concurrency limit needed)
       });
 
       // Wait until task is processed
@@ -294,7 +294,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       await client.enqueue({
         tenant: DEFAULT_TENANT,
         payload: { action: "throw" },
-        priority: 1,
+        priority: 50, // Default priority (no concurrency limit needed)
       });
 
       // Wait until task is processed (even though it throws)
@@ -323,7 +323,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       await client.enqueue({
         tenant: DEFAULT_TENANT,
         payload: { action: "slow" },
-        priority: 1,
+        priority: 50, // Default priority (no concurrency limit needed)
       });
 
       // Wait for task to start (may take longer due to poll interval)
@@ -359,7 +359,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       await client.enqueue({
         tenant: DEFAULT_TENANT,
         payload: { run: 1 },
-        priority: 1,
+        priority: 50, // Default priority (no concurrency limit needed)
       });
       await waitFor(() => processCount >= 1);
       await worker.stop();
@@ -372,7 +372,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       await client.enqueue({
         tenant: DEFAULT_TENANT,
         payload: { run: 2 },
-        priority: 1,
+        priority: 50, // Default priority (no concurrency limit needed)
       });
       await waitFor(() => processCount > firstCount);
       await worker.stop();
@@ -403,7 +403,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
           client.enqueue({
             tenant: DEFAULT_TENANT,
             payload: { index: i },
-            priority: 1,
+            priority: 50, // Default priority (no concurrency limit needed)
           })
         )
       );
@@ -438,7 +438,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       await client.enqueue({
         tenant: DEFAULT_TENANT,
         payload: { action: "long" },
-        priority: 1,
+        priority: 50, // Default priority (no concurrency limit needed)
       });
 
       // Wait for task to start
@@ -471,7 +471,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       await client.enqueue({
         tenant: DEFAULT_TENANT,
         payload: { test: true },
-        priority: 1,
+        priority: 50, // Default priority (no concurrency limit needed)
       });
 
       // Wait until task is processed

@@ -139,7 +139,7 @@ fn grpc_end_to_end_under_turmoil() {
         let req = EnqueueRequest {
             shard: 0,
             id: "".into(),
-            priority: 1,
+            priority: 50,
             start_at_ms: 0,
             retry_policy: None,
             payload: Some(JsonValueBytes {
@@ -303,7 +303,7 @@ fn grpc_fault_injection_with_partition() {
         let req = EnqueueRequest {
             shard: 0,
             id: "".into(),
-            priority: 1,
+            priority: 50,
             start_at_ms: 0,
             retry_policy: None,
             payload: Some(JsonValueBytes {
@@ -518,7 +518,7 @@ fn stress_multiple_workers_with_partitions() {
             let req = EnqueueRequest {
                 shard: 0,
                 id: format!("job-{}", i),
-                priority: 1,
+                priority: 50,
                 start_at_ms: 0,
                 retry_policy: None,
                 payload: Some(JsonValueBytes {
@@ -786,7 +786,7 @@ fn stress_duplicate_completion_idempotency() {
             .enqueue(tonic::Request::new(EnqueueRequest {
                 shard: 0,
                 id: "".into(),
-                priority: 1,
+                priority: 50,
                 start_at_ms: 0,
                 retry_policy: None,
                 payload: Some(JsonValueBytes {
@@ -977,7 +977,7 @@ fn stress_lease_expiry_during_partition() {
             .enqueue(tonic::Request::new(EnqueueRequest {
                 shard: 0,
                 id: "lease-expiry-test".into(),
-                priority: 1,
+                priority: 50,
                 start_at_ms: 0,
                 retry_policy: None,
                 payload: Some(JsonValueBytes {
@@ -1187,7 +1187,7 @@ fn stress_high_message_loss() {
             let req = EnqueueRequest {
                 shard: 0,
                 id: format!("lossy-job-{}", i),
-                priority: 1,
+                priority: 50,
                 start_at_ms: 0,
                 retry_policy: None,
                 payload: Some(JsonValueBytes {
@@ -1365,7 +1365,7 @@ fn concurrency_request_ready_without_release_fails() {
             .enqueue(tonic::Request::new(EnqueueRequest {
                 shard: 0,
                 id: "".into(),
-                priority: 1,
+                priority: 50,
                 start_at_ms: 0,  // Use 0 for "start immediately"
                 retry_policy: None,
                 payload: Some(JsonValueBytes {
@@ -1404,7 +1404,7 @@ fn concurrency_request_ready_without_release_fails() {
             .enqueue(tonic::Request::new(EnqueueRequest {
                 shard: 0,
                 id: "".into(),
-                priority: 1,
+                priority: 50,
                 start_at_ms: 0,  // Changed: enqueue with start_at 0 since time handling is complex with turmoil
                 retry_policy: None,
                 payload: Some(JsonValueBytes {

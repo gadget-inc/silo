@@ -82,7 +82,7 @@ impl JobStoreShard {
                     attempt_number: 1,
                     held_queues: Vec::new(),
                 };
-                put_task(&mut batch, start_at_ms, priority, &job_id, 1, &first_task)?;
+                put_task(&mut batch, start_at_ms, &job_id, 1, &first_task)?;
             }
             Some(Limit::Concurrency(cl)) => {
                 // First limit is a concurrency limit - use existing logic
@@ -132,7 +132,7 @@ impl JobStoreShard {
                     priority,
                     held_queues: Vec::new(),
                 };
-                put_task(&mut batch, start_at_ms, priority, &job_id, 1, &check_task)?;
+                put_task(&mut batch, start_at_ms, &job_id, 1, &check_task)?;
             }
             Some(Limit::FloatingConcurrency(fl)) => {
                 // First limit is a floating concurrency limit
@@ -248,14 +248,7 @@ impl JobStoreShard {
                 attempt_number,
                 held_queues,
             };
-            return put_task(
-                batch,
-                start_at_ms,
-                priority,
-                job_id,
-                attempt_number,
-                &run_task,
-            );
+            return put_task(batch, start_at_ms, job_id, attempt_number, &run_task);
         }
 
         // Enqueue task for the next limit
@@ -292,14 +285,7 @@ impl JobStoreShard {
                 request_id: Uuid::new_v4().to_string(),
             },
         };
-        put_task(
-            batch,
-            start_at_ms,
-            priority,
-            job_id,
-            attempt_number,
-            &next_task,
-        )
+        put_task(batch, start_at_ms, job_id, attempt_number, &next_task)
     }
 
     /// Update job status and maintain secondary indexes in the same write batch.

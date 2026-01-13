@@ -63,7 +63,7 @@ async fn enqueue_job(
     let request = EnqueueRequest {
         shard,
         id: job_id.to_string(),
-        priority: 5,
+        priority: 50, // Default priority (no concurrency limit needed)
         start_at_ms: 0,
         retry_policy: None,
         payload: Some(JsonValueBytes {

@@ -957,8 +957,7 @@ async fn concurrency_request_priority_ordering() {
     // Note: We can't directly check job ID from task without more scanning,
     // but we verify via process of elimination
     let t2_jid = t2_vec[0].job().id();
-    // Higher priority job should come first (requests are ordered by time then priority)
-    // Since both were enqueued at same time, priority determines order
+    // Higher priority job should come first (requests are ordered by priority then time)
     assert_eq!(t2_jid, j3, "high priority job should be granted first");
 
     // Complete and verify job 2 comes last
@@ -974,6 +973,187 @@ async fn concurrency_request_priority_ordering() {
     let t3_vec = shard.dequeue("w", 1).await.expect("deq3").tasks;
     assert_eq!(t3_vec.len(), 1);
     assert_eq!(t3_vec[0].job().id(), j2, "low priority job comes last");
+}
+
+/// Verifies that high-priority jobs get concurrency tickets before low-priority jobs,
+/// even when the low-priority job has an earlier start_at_ms (i.e., priority "skips the line").
+/// This tests that requests are ordered by priority first, then by start_at_ms.
+#[silo::test]
+async fn concurrency_request_priority_beats_start_time() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let queue = "priority-skip-q".to_string();
+
+    // Job 1 takes the slot
+    let _j1 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            serde_json::json!({"j": 1}),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+        )
+        .await
+        .expect("enqueue1");
+    let t1_vec = shard.dequeue("w", 1).await.expect("deq1").tasks;
+    let t1 = t1_vec[0].attempt().task_id().to_string();
+
+    // Enqueue low priority job 2 with earlier start_at_ms
+    // With time-first ordering, this would be granted first
+    let j2 = shard
+        .enqueue(
+            "-",
+            None,
+            50u8,       // low priority
+            now - 1000, // earlier start_at_ms (was ready 1 second ago)
+            None,
+            serde_json::json!({"j": 2}),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+        )
+        .await
+        .expect("enqueue2");
+
+    // Enqueue high priority job 3 with later start_at_ms
+    // With priority-first ordering, this should still be granted first
+    let j3 = shard
+        .enqueue(
+            "-",
+            None,
+            1u8,  // high priority
+            now,  // later start_at_ms
+            None,
+            serde_json::json!({"j": 3}),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+        )
+        .await
+        .expect("enqueue3");
+
+    // Complete job 1 -> should grant job 3 (high priority) despite having later start_at_ms
+    shard
+        .report_attempt_outcome("-", &t1, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report1");
+
+    // Dequeue next task -> should be job 3 (high priority beats earlier start_at_ms)
+    let t2_vec = shard.dequeue("w", 1).await.expect("deq2").tasks;
+    assert_eq!(t2_vec.len(), 1);
+    let t2_jid = t2_vec[0].job().id();
+    assert_eq!(
+        t2_jid, j3,
+        "high priority job should be granted first even though it has later start_at_ms"
+    );
+
+    // Complete and verify job 2 comes last
+    shard
+        .report_attempt_outcome(
+            "-",
+            t2_vec[0].attempt().task_id(),
+            AttemptOutcome::Success { result: vec![] },
+        )
+        .await
+        .expect("report2");
+
+    let t3_vec = shard.dequeue("w", 1).await.expect("deq3").tasks;
+    assert_eq!(t3_vec.len(), 1);
+    assert_eq!(
+        t3_vec[0].job().id(),
+        j2,
+        "low priority job comes last despite having earlier start_at_ms"
+    );
+}
+
+/// Verifies that future (not-yet-ready) high-priority requests don't block
+/// ready lower-priority requests from being granted.
+#[silo::test]
+async fn concurrency_request_skips_future_high_priority() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let queue = "future-skip-q".to_string();
+
+    // Job 1 takes the slot
+    let _j1 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            serde_json::json!({"j": 1}),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+        )
+        .await
+        .expect("enqueue1");
+    let t1_vec = shard.dequeue("w", 1).await.expect("deq1").tasks;
+    let t1 = t1_vec[0].attempt().task_id().to_string();
+
+    // Enqueue high priority job 2 scheduled far in the future (not ready yet)
+    let _j2 = shard
+        .enqueue(
+            "-",
+            None,
+            1u8,              // high priority
+            now + 60 * 1000,  // 1 minute in the future
+            None,
+            serde_json::json!({"j": 2}),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+        )
+        .await
+        .expect("enqueue2");
+
+    // Enqueue low priority job 3 ready now
+    let j3 = shard
+        .enqueue(
+            "-",
+            None,
+            50u8, // low priority
+            now,  // ready now
+            None,
+            serde_json::json!({"j": 3}),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+        )
+        .await
+        .expect("enqueue3");
+
+    // Complete job 1 -> should grant job 3 because j2 is not ready yet
+    shard
+        .report_attempt_outcome("-", &t1, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report1");
+
+    // Dequeue next task -> should be job 3 (j2 is future, not ready)
+    let t2_vec = shard.dequeue("w", 1).await.expect("deq2").tasks;
+    assert_eq!(t2_vec.len(), 1);
+    let t2_jid = t2_vec[0].job().id();
+    assert_eq!(
+        t2_jid, j3,
+        "ready low-priority job should be granted when high-priority job is not ready yet"
+    );
 }
 
 #[silo::test]

@@ -365,6 +365,25 @@ impl Silo for SiloService {
             .filter_map(proto_limit_to_job_limit)
             .collect();
 
+        // Validate priority requires a concurrency limit
+        // Priority only affects ordering within concurrency queues, so specifying a
+        // non-default priority without a concurrency limit is meaningless.
+        const DEFAULT_PRIORITY: u32 = 50;
+        if r.priority != DEFAULT_PRIORITY {
+            let has_concurrency_limit = limits.iter().any(|l| {
+                matches!(
+                    l,
+                    crate::job::Limit::Concurrency(_) | crate::job::Limit::FloatingConcurrency(_)
+                )
+            });
+            if !has_concurrency_limit {
+                return Err(Status::invalid_argument(
+                    "priority requires a concurrency limit; task ordering is by time only, \
+                     use a concurrency queue for priority-based ordering",
+                ));
+            }
+        }
+
         // Validate metadata constraints: <=16 entries, key < 64 chars, value < u16::MAX
         if r.metadata.len() > 16 {
             return Err(Status::invalid_argument(

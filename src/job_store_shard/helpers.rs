@@ -22,14 +22,13 @@ pub fn now_epoch_ms() -> i64 {
 pub(crate) fn put_task(
     batch: &mut WriteBatch,
     time_ms: i64,
-    priority: u8,
     job_id: &str,
     attempt: u32,
     task: &Task,
 ) -> Result<(), JobStoreShardError> {
     let task_value = encode_task(task)?;
     batch.put(
-        task_key(time_ms, priority, job_id, attempt).as_bytes(),
+        task_key(time_ms, job_id, attempt).as_bytes(),
         &task_value,
     );
     Ok(())

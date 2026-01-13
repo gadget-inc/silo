@@ -896,7 +896,7 @@ impl Scan for QueuesScanner {
                 }
             }
 
-            // Scan requests: requests/<tenant>/<queue>/<start_time_ms>/<priority>/<request_id>
+            // Scan requests: requests/<tenant>/<queue>/<priority>/<start_time_ms>/<request_id>
             // When no tenant filter, scan all: requests/
             let requests_prefix = match (&tenant_filter, &queue_filter) {
                 (Some(t), Some(q)) => format!("requests/{}/{}/", t, q),
@@ -914,7 +914,7 @@ impl Scan for QueuesScanner {
                     }
                     if let Ok(key_str) = std::str::from_utf8(&kv.key) {
                         let parts: Vec<&str> = key_str.split('/').collect();
-                        // requests/<tenant>/<queue>/<start_time_ms>/<priority>/<request_id>
+                        // requests/<tenant>/<queue>/<priority>/<start_time_ms>/<request_id>
                         if parts.len() >= 6 && parts[0] == "requests" {
                             let tenant = crate::keys::decode_tenant(parts[1]);
                             // Filter by queue if specified
@@ -924,8 +924,8 @@ impl Scan for QueuesScanner {
                                 }
                             }
                             let queue_name = parts[2].to_string();
-                            let start_time_ms: i64 = parts[3].parse().unwrap_or(0);
-                            let priority: u8 = parts[4].parse().unwrap_or(50);
+                            let priority: u8 = parts[3].parse().unwrap_or(50);
+                            let start_time_ms: i64 = parts[4].parse().unwrap_or(0);
                             let request_id = parts[5].to_string();
                             let job_id = if let Ok(action) =
                                 crate::codec::decode_concurrency_action(&kv.value)

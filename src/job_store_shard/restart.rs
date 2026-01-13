@@ -163,7 +163,6 @@ impl JobStoreShard {
         };
 
         let job_view = crate::job::JobView::new(job_raw)?;
-        let priority = job_view.priority();
         let start_at_ms = job_view.enqueue_time_ms().max(now_ms);
 
         // Create a new task with attempt_number = 1 for fresh retry count
@@ -178,7 +177,7 @@ impl JobStoreShard {
 
         // Use a temporary WriteBatch to encode the task, then extract and put via txn
         let task_value = crate::codec::encode_task(&new_task)?;
-        let task_key = crate::keys::task_key(start_at_ms, priority, id, 1);
+        let task_key = crate::keys::task_key(start_at_ms, id, 1);
         txn.put(task_key.as_bytes(), &task_value)?;
 
         // Commit the transaction

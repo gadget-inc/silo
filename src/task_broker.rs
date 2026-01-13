@@ -73,7 +73,7 @@ impl TaskBroker {
 
     /// Scan tasks from DB and insert into buffer, skipping future tasks and inflight ones.
     async fn scan_tasks(&self, now_ms: i64) -> usize {
-        // [SILO-SCAN-1] Tasks live under tasks/<ts>/<pri>/<job_id>/<attempt>
+        // [SILO-SCAN-1] Tasks live under tasks/<ts>/<job_id>/<attempt>
         let start: Vec<u8> = b"tasks/".to_vec();
         let mut end: Vec<u8> = b"tasks/".to_vec();
         end.push(0xFF);
@@ -93,7 +93,7 @@ impl TaskBroker {
             };
 
             // Filter out future tasks by parsing timestamp from key
-            // Format: tasks/<ts>/<pri>/<job_id>/<attempt>
+            // Format: tasks/<ts>/<job_id>/<attempt>
             let mut parts = key_str.split('/');
             if parts.next() != Some("tasks") {
                 continue;

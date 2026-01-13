@@ -1628,51 +1628,9 @@ async fn large_outcome_payloads_round_trip() {
     });
 }
 
-#[silo::test]
-async fn priority_ordering_when_start_times_equal() {
-    with_timeout!(20000, {
-        let (_tmp, shard) = open_temp_shard().await;
-        let now = now_ms();
-
-        // Enqueue two jobs with identical start_at_ms but different priorities
-        let job_hi = shard
-            .enqueue(
-                "-",
-                None,
-                1u8, // higher priority
-                now,
-                None,
-                serde_json::json!({"j": "hi"}),
-                vec![],
-                None,
-            )
-            .await
-            .expect("enqueue hi");
-        let job_lo = shard
-            .enqueue(
-                "-",
-                None,
-                50u8, // lower priority
-                now,
-                None,
-                serde_json::json!({"j": "lo"}),
-                vec![],
-                None,
-            )
-            .await
-            .expect("enqueue lo");
-
-        // Dequeue two tasks; with equal times, lower priority number should come first
-        let tasks = shard.dequeue("w", 2).await.expect("dequeue").tasks;
-        assert_eq!(tasks.len(), 2);
-        let t1 = &tasks[0];
-        let t2 = &tasks[1];
-        assert_eq!(t1.job().id(), job_hi);
-        assert_eq!(t2.job().id(), job_lo);
-        assert_eq!(t1.attempt().attempt_number(), 1);
-        assert_eq!(t2.attempt().attempt_number(), 1);
-    });
-}
+// Test removed: priority_ordering_when_start_times_equal
+// Priority no longer affects task ordering in the task queue.
+// Priority ordering is handled by concurrency queues instead.
 
 #[silo::test]
 async fn concurrency_immediate_grant_enqueues_task_and_writes_holder() {
@@ -3512,7 +3470,10 @@ async fn restart_cancelled_scheduled_job() {
             .expect("get status")
             .expect("exists");
         assert_eq!(status.kind, JobStatusKind::Cancelled);
-        assert!(shard.is_job_cancelled("-", &job_id).await.expect("is_cancelled"));
+        assert!(shard
+            .is_job_cancelled("-", &job_id)
+            .await
+            .expect("is_cancelled"));
 
         // [SILO-RESTART-*] Restart the job
         shard.restart_job("-", &job_id).await.expect("restart_job");
@@ -3531,7 +3492,10 @@ async fn restart_cancelled_scheduled_job() {
 
         // [SILO-RESTART-4] Verify cancellation flag is cleared
         assert!(
-            !shard.is_job_cancelled("-", &job_id).await.expect("is_cancelled"),
+            !shard
+                .is_job_cancelled("-", &job_id)
+                .await
+                .expect("is_cancelled"),
             "cancellation flag should be cleared after restart"
         );
 
@@ -3540,9 +3504,16 @@ async fn restart_cancelled_scheduled_job() {
         assert!(!tasks.is_empty(), "new task should exist after restart");
         let new_task = &tasks[0];
         match new_task {
-            Task::RunAttempt { job_id: jid, attempt_number, .. } => {
+            Task::RunAttempt {
+                job_id: jid,
+                attempt_number,
+                ..
+            } => {
                 assert_eq!(jid, &job_id);
-                assert_eq!(*attempt_number, 1, "restart should reset attempt number to 1");
+                assert_eq!(
+                    *attempt_number, 1,
+                    "restart should reset attempt number to 1"
+                );
             }
             _ => panic!("expected RunAttempt task, got {:?}", new_task),
         }
@@ -3606,9 +3577,16 @@ async fn restart_failed_job() {
         let tasks = shard.peek_tasks(10).await.expect("peek");
         assert!(!tasks.is_empty(), "new task should exist after restart");
         match &tasks[0] {
-            Task::RunAttempt { job_id: jid, attempt_number, .. } => {
+            Task::RunAttempt {
+                job_id: jid,
+                attempt_number,
+                ..
+            } => {
                 assert_eq!(jid, &job_id);
-                assert_eq!(*attempt_number, 1, "restart should reset attempt number to 1 for fresh retries");
+                assert_eq!(
+                    *attempt_number, 1,
+                    "restart should reset attempt number to 1 for fresh retries"
+                );
             }
             _ => panic!("expected RunAttempt task"),
         }
@@ -3618,7 +3596,13 @@ async fn restart_failed_job() {
         assert_eq!(tasks2.len(), 1);
         let task_id2 = tasks2[0].attempt().task_id().to_string();
         shard
-            .report_attempt_outcome("-", &task_id2, AttemptOutcome::Success { result: b"{}".to_vec() })
+            .report_attempt_outcome(
+                "-",
+                &task_id2,
+                AttemptOutcome::Success {
+                    result: b"{}".to_vec(),
+                },
+            )
             .await
             .expect("report success");
 
@@ -3648,7 +3632,13 @@ async fn restart_succeeded_job_returns_error() {
         let tasks = shard.dequeue("worker-1", 1).await.expect("dequeue").tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
-            .report_attempt_outcome("-", &task_id, AttemptOutcome::Success { result: b"{}".to_vec() })
+            .report_attempt_outcome(
+                "-",
+                &task_id,
+                AttemptOutcome::Success {
+                    result: b"{}".to_vec(),
+                },
+            )
             .await
             .expect("report success");
 
@@ -3719,7 +3709,13 @@ async fn restart_running_job_returns_error() {
         // Clean up - complete the job
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
-            .report_attempt_outcome("-", &task_id, AttemptOutcome::Success { result: b"{}".to_vec() })
+            .report_attempt_outcome(
+                "-",
+                &task_id,
+                AttemptOutcome::Success {
+                    result: b"{}".to_vec(),
+                },
+            )
             .await
             .expect("report success");
     });
@@ -3796,7 +3792,16 @@ async fn restart_failed_job_with_retry_policy_resets_retries() {
         };
 
         let job_id = shard
-            .enqueue("-", None, 10u8, now_ms(), Some(retry_policy), payload, vec![], None)
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                Some(retry_policy),
+                payload,
+                vec![],
+                None,
+            )
             .await
             .expect("enqueue");
 
@@ -3832,7 +3837,10 @@ async fn restart_failed_job_with_retry_policy_resets_retries() {
         assert_eq!(status.kind, JobStatusKind::Failed);
 
         // Verify we had 3 attempts
-        let attempts = shard.get_job_attempts("-", &job_id).await.expect("get attempts");
+        let attempts = shard
+            .get_job_attempts("-", &job_id)
+            .await
+            .expect("get attempts");
         assert_eq!(attempts.len(), 3, "should have 3 failed attempts");
 
         // Restart the job
@@ -3849,9 +3857,16 @@ async fn restart_failed_job_with_retry_policy_resets_retries() {
         // Verify new task has attempt number 1 (fresh start)
         let tasks = shard.peek_tasks(10).await.expect("peek");
         match &tasks[0] {
-            Task::RunAttempt { job_id: jid, attempt_number, .. } => {
+            Task::RunAttempt {
+                job_id: jid,
+                attempt_number,
+                ..
+            } => {
                 assert_eq!(jid, &job_id);
-                assert_eq!(*attempt_number, 1, "restart should reset to attempt 1 for fresh retries");
+                assert_eq!(
+                    *attempt_number, 1,
+                    "restart should reset to attempt 1 for fresh retries"
+                );
             }
             _ => panic!("expected RunAttempt task"),
         }
@@ -3860,7 +3875,13 @@ async fn restart_failed_job_with_retry_policy_resets_retries() {
         let tasks = shard.dequeue("worker-1", 1).await.expect("dequeue").tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
-            .report_attempt_outcome("-", &task_id, AttemptOutcome::Success { result: b"ok".to_vec() })
+            .report_attempt_outcome(
+                "-",
+                &task_id,
+                AttemptOutcome::Success {
+                    result: b"ok".to_vec(),
+                },
+            )
             .await
             .expect("report success");
 
@@ -3895,8 +3916,14 @@ async fn restart_cancelled_running_job_after_acknowledgement() {
         shard.cancel_job("-", &job_id).await.expect("cancel_job");
 
         // Worker discovers cancellation via heartbeat
-        let hb_result = shard.heartbeat_task("-", "worker-1", &task_id).await.expect("heartbeat");
-        assert!(hb_result.cancelled, "heartbeat should indicate cancellation");
+        let hb_result = shard
+            .heartbeat_task("-", "worker-1", &task_id)
+            .await
+            .expect("heartbeat");
+        assert!(
+            hb_result.cancelled,
+            "heartbeat should indicate cancellation"
+        );
 
         // Worker acknowledges cancellation
         shard
@@ -3923,7 +3950,10 @@ async fn restart_cancelled_running_job_after_acknowledgement() {
             .expect("exists");
         assert_eq!(status_after.kind, JobStatusKind::Scheduled);
         assert!(
-            !shard.is_job_cancelled("-", &job_id).await.expect("is_cancelled"),
+            !shard
+                .is_job_cancelled("-", &job_id)
+                .await
+                .expect("is_cancelled"),
             "cancellation should be cleared"
         );
 
@@ -3931,7 +3961,13 @@ async fn restart_cancelled_running_job_after_acknowledgement() {
         let tasks = shard.dequeue("worker-2", 1).await.expect("dequeue").tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
-            .report_attempt_outcome("-", &task_id, AttemptOutcome::Success { result: b"{}".to_vec() })
+            .report_attempt_outcome(
+                "-",
+                &task_id,
+                AttemptOutcome::Success {
+                    result: b"{}".to_vec(),
+                },
+            )
             .await
             .expect("report success");
 
@@ -3973,17 +4009,27 @@ async fn multiple_restarts_of_same_job() {
                 .expect("report error");
 
             // Verify failed
-            let status = shard.get_job_status("-", &job_id).await.expect("status").expect("exists");
+            let status = shard
+                .get_job_status("-", &job_id)
+                .await
+                .expect("status")
+                .expect("exists");
             assert_eq!(status.kind, JobStatusKind::Failed);
 
             // Restart
             shard.restart_job("-", &job_id).await.expect("restart_job");
 
             // Verify scheduled
-            let status_after = shard.get_job_status("-", &job_id).await.expect("status").expect("exists");
+            let status_after = shard
+                .get_job_status("-", &job_id)
+                .await
+                .expect("status")
+                .expect("exists");
             assert_eq!(
-                status_after.kind, JobStatusKind::Scheduled,
-                "iteration {} should be Scheduled after restart", iteration
+                status_after.kind,
+                JobStatusKind::Scheduled,
+                "iteration {} should be Scheduled after restart",
+                iteration
             );
         }
 
@@ -3991,11 +4037,21 @@ async fn multiple_restarts_of_same_job() {
         let tasks = shard.dequeue("worker-1", 1).await.expect("dequeue").tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
-            .report_attempt_outcome("-", &task_id, AttemptOutcome::Success { result: b"done".to_vec() })
+            .report_attempt_outcome(
+                "-",
+                &task_id,
+                AttemptOutcome::Success {
+                    result: b"done".to_vec(),
+                },
+            )
             .await
             .expect("report success");
 
-        let final_status = shard.get_job_status("-", &job_id).await.expect("status").expect("exists");
+        let final_status = shard
+            .get_job_status("-", &job_id)
+            .await
+            .expect("status")
+            .expect("exists");
         assert_eq!(final_status.kind, JobStatusKind::Succeeded);
     });
 }
