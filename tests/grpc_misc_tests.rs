@@ -1,0 +1,439 @@
+mod grpc_integration_helpers;
+
+use std::sync::Arc;
+
+use grpc_integration_helpers::{create_test_factory, setup_test_server, shutdown_server};
+use silo::factory::ShardFactory;
+use silo::gubernator::MockGubernatorClient;
+use silo::pb::*;
+use silo::settings::{AppConfig, Backend, DatabaseTemplate};
+use tonic_health::pb::health_client::HealthClient;
+use tonic_health::pb::HealthCheckRequest;
+
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_health_check_returns_serving() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (_client, shutdown_tx, server, addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        // Get endpoint for health client
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint)?
+            .connect()
+            .await?;
+        let mut health_client = HealthClient::new(channel);
+
+        // Check overall health (empty service name)
+        let resp = health_client
+            .check(HealthCheckRequest {
+                service: "".to_string(),
+            })
+            .await?
+            .into_inner();
+        assert_eq!(
+            resp.status,
+            tonic_health::pb::health_check_response::ServingStatus::Serving as i32,
+            "overall health should be SERVING"
+        );
+
+        // Check the specific Silo service health (silo.v1.Silo is the full gRPC service name)
+        let resp = health_client
+            .check(HealthCheckRequest {
+                service: "silo.v1.Silo".to_string(),
+            })
+            .await?
+            .into_inner();
+        assert_eq!(
+            resp.status,
+            tonic_health::pb::health_check_response::ServingStatus::Serving as i32,
+            "silo.v1.Silo service should be SERVING"
+        );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// Test that lease_tasks correctly polls multiple shards when no shard filter is specified.
+/// This specifically tests that the `remaining` counter is decremented correctly across shards.
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_lease_tasks_multi_shard() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let tmp = tempfile::tempdir()?;
+        let template = DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+        };
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let factory = ShardFactory::new(template, rate_limiter);
+
+        // Open 3 shards
+        let _ = factory.open(0).await?;
+        let _ = factory.open(1).await?;
+        let _ = factory.open(2).await?;
+        let factory = Arc::new(factory);
+
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        // Enqueue 2 jobs into each shard (6 total)
+        for shard in 0..3 {
+            for i in 0..2 {
+                let enq = EnqueueRequest {
+                    shard,
+                    id: format!("job_s{}_i{}", shard, i),
+                    priority: 10,
+                    start_at_ms: 0,
+                    retry_policy: None,
+                    payload: Some(JsonValueBytes {
+                        data: b"{}".to_vec(),
+                    }),
+                    limits: vec![],
+                    tenant: None,
+                    metadata: std::collections::HashMap::new(),
+                };
+                let _ = client.enqueue(enq).await?;
+            }
+        }
+
+        // Lease 4 tasks WITHOUT specifying a shard (shard: None)
+        // This should poll all local shards and return up to 4 tasks
+        let lease_resp = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: None, // Poll all shards
+                worker_id: "multi_shard_worker".to_string(),
+                max_tasks: 4,
+            })
+            .await?
+            .into_inner();
+
+        // Should get exactly 4 tasks (bug would cause fewer due to wrong remaining calc)
+        assert_eq!(
+            lease_resp.tasks.len(),
+            4,
+            "expected 4 tasks when polling multiple shards, got {}",
+            lease_resp.tasks.len()
+        );
+
+        // Lease the remaining 2 tasks
+        let lease_resp2 = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: None,
+                worker_id: "multi_shard_worker".to_string(),
+                max_tasks: 10, // Ask for more than available
+            })
+            .await?
+            .into_inner();
+
+        assert_eq!(
+            lease_resp2.tasks.len(),
+            2,
+            "expected 2 remaining tasks, got {}",
+            lease_resp2.tasks.len()
+        );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_tenant_validation_when_enabled() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+
+        // Enable tenancy in config
+        let mut cfg = AppConfig::load(None).unwrap();
+        cfg.tenancy.enabled = true;
+
+        let (mut client, shutdown_tx, server, _addr) = setup_test_server(factory.clone(), cfg).await?;
+
+        // Test 1: Missing tenant when required - should fail
+        let res = client
+            .enqueue(EnqueueRequest {
+                shard: 0,
+                id: "test-job".to_string(),
+                priority: 5,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(JsonValueBytes {
+                    data: b"{}".to_vec(),
+                }),
+                limits: vec![],
+                tenant: None, // Missing!
+                metadata: std::collections::HashMap::new(),
+            })
+            .await;
+
+        match res {
+            Ok(_) => panic!("expected error for missing tenant"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::InvalidArgument);
+                assert!(
+                    status.message().contains("tenant"),
+                    "error should mention tenant: {}",
+                    status.message()
+                );
+            }
+        }
+
+        // Test 2: Empty tenant string when required - should fail
+        let res = client
+            .enqueue(EnqueueRequest {
+                shard: 0,
+                id: "test-job".to_string(),
+                priority: 5,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(JsonValueBytes {
+                    data: b"{}".to_vec(),
+                }),
+                limits: vec![],
+                tenant: Some("".to_string()), // Empty!
+                metadata: std::collections::HashMap::new(),
+            })
+            .await;
+
+        match res {
+            Ok(_) => panic!("expected error for empty tenant"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::InvalidArgument);
+            }
+        }
+
+        // Test 3: Tenant ID too long (>64 chars) - should fail
+        let res = client
+            .enqueue(EnqueueRequest {
+                shard: 0,
+                id: "test-job".to_string(),
+                priority: 5,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(JsonValueBytes {
+                    data: b"{}".to_vec(),
+                }),
+                limits: vec![],
+                tenant: Some("x".repeat(65)), // Too long!
+                metadata: std::collections::HashMap::new(),
+            })
+            .await;
+
+        match res {
+            Ok(_) => panic!("expected error for long tenant"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::InvalidArgument);
+                assert!(
+                    status.message().contains("tenant"),
+                    "error should mention tenant: {}",
+                    status.message()
+                );
+            }
+        }
+
+        // Test 4: Valid tenant - should succeed
+        let res = client
+            .enqueue(EnqueueRequest {
+                shard: 0,
+                id: "test-job-valid".to_string(),
+                priority: 5,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(JsonValueBytes {
+                    data: b"{}".to_vec(),
+                }),
+                limits: vec![],
+                tenant: Some("my-tenant".to_string()),
+                metadata: std::collections::HashMap::new(),
+            })
+            .await;
+
+        assert!(res.is_ok(), "valid tenant should succeed");
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_reset_shards_requires_dev_mode() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+
+        // dev_mode = false (default)
+        let mut cfg = AppConfig::load(None).unwrap();
+        cfg.server.dev_mode = false;
+
+        let (mut client, shutdown_tx, server, _addr) = setup_test_server(factory.clone(), cfg).await?;
+
+        // reset_shards should fail in non-dev mode
+        let res = client.reset_shards(ResetShardsRequest {}).await;
+
+        match res {
+            Ok(_) => panic!("expected permission denied error"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::PermissionDenied);
+                assert!(
+                    status.message().contains("dev mode"),
+                    "error should mention dev mode: {}",
+                    status.message()
+                );
+            }
+        }
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_reset_shards_works_in_dev_mode() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+
+        // Enable dev mode
+        let mut cfg = AppConfig::load(None).unwrap();
+        cfg.server.dev_mode = true;
+
+        let (mut client, shutdown_tx, server, _addr) = setup_test_server(factory.clone(), cfg).await?;
+
+        // First enqueue a job
+        let _ = client
+            .enqueue(EnqueueRequest {
+                shard: 0,
+                id: "job-to-reset".to_string(),
+                priority: 5,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(JsonValueBytes {
+                    data: b"{}".to_vec(),
+                }),
+                limits: vec![],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+            })
+            .await?;
+
+        // Verify job exists
+        let query_resp = client
+            .query(QueryRequest {
+                shard: 0,
+                sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+        let count_row: serde_json::Value = serde_json::from_slice(&query_resp.rows[0].data)?;
+        assert_eq!(count_row["count"], 1, "should have 1 job before reset");
+
+        // Reset shards should succeed in dev mode
+        let res = client.reset_shards(ResetShardsRequest {}).await?;
+        assert_eq!(res.into_inner().shards_reset, 1, "should reset 1 shard");
+
+        // Verify job is gone after reset
+        let query_resp = client
+            .query(QueryRequest {
+                shard: 0,
+                sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+        let count_row: serde_json::Value = serde_json::from_slice(&query_resp.rows[0].data)?;
+        assert_eq!(count_row["count"], 0, "should have 0 jobs after reset");
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_report_outcome_missing_outcome() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        // report_outcome with missing outcome field should fail
+        let res = client
+            .report_outcome(ReportOutcomeRequest {
+                shard: 0,
+                task_id: "fake-task".to_string(),
+                tenant: None,
+                outcome: None, // Missing!
+            })
+            .await;
+
+        match res {
+            Ok(_) => panic!("expected error for missing outcome"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::InvalidArgument);
+                assert!(
+                    status.message().contains("outcome"),
+                    "error should mention outcome: {}",
+                    status.message()
+                );
+            }
+        }
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_report_refresh_outcome_missing_outcome() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        // report_refresh_outcome with missing outcome field should fail
+        let res = client
+            .report_refresh_outcome(ReportRefreshOutcomeRequest {
+                shard: 0,
+                task_id: "fake-refresh-task".to_string(),
+                tenant: None,
+                outcome: None, // Missing!
+            })
+            .await;
+
+        match res {
+            Ok(_) => panic!("expected error for missing outcome"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::InvalidArgument);
+                assert!(
+                    status.message().contains("outcome"),
+                    "error should mention outcome: {}",
+                    status.message()
+                );
+            }
+        }
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}

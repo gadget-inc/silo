@@ -1025,6 +1025,80 @@ pred restartCancelledJob[j: Job, newTid: TaskId, t: Time, tnext: Time] {
     concurrencyUnchanged[t, tnext]
 }
 
+-- Transition: EXPEDITE_NEXT_ATTEMPT - Move a future-scheduled task to run immediately
+-- This allows dragging forward a job that was scheduled to run in the future.
+-- 
+-- Race safety:
+-- - Task must be in DB queue but NOT in buffer (future-scheduled, not yet ready)
+-- - No lease must exist for the job (not currently running)
+-- - If the task is already in the buffer (ready) or leased (running), expedite is rejected
+--
+-- In the real implementation:
+-- - Tasks are keyed by timestamp, so "future-scheduled" means timestamp > now
+-- - Expedite deletes the old task key and creates a new one with timestamp = now
+-- - The broker then picks it up on the next scan
+--
+-- See: job_store_shard/expedite.rs
+pred expediteNextAttempt[tid: TaskId, j: Job, t: Time, tnext: Time] {
+    -- [SILO-EXP-1] Pre: job exists
+    j in jobExistsAt[t]
+    
+    -- [SILO-EXP-2] Pre: job is NOT terminal (Succeeded or Failed cannot be expedited)
+    not isTerminal[statusAt[j, t]]
+    
+    -- [SILO-EXP-3] Pre: job is NOT cancelled
+    not isCancelledAt[j, t]
+    
+    -- [SILO-EXP-4] Pre: task exists in DB queue for this job
+    dbQueuedAt[tid, t] = j
+    
+    -- [SILO-EXP-5] Pre: task is NOT in buffer (task is future-scheduled, not yet ready)
+    -- If task is in buffer, it's already ready to run and expedite should be rejected.
+    -- This provides race safety against the broker picking up the task.
+    no bufferedAt[tid, t]
+    
+    -- [SILO-EXP-6] Pre: job has no active lease (not currently running)
+    -- This provides race safety against dequeue starting the task.
+    no tid2: TaskId | leaseJobAt[tid2, t] = j
+    
+    -- Post: Task remains in DB queue (now conceptually at current time)
+    -- In the real implementation, the task is deleted and re-inserted with timestamp = now.
+    -- In Alloy, we model this as the task staying in DB queue (it will be scanned soon).
+    dbQueuedAt[tid, tnext] = j
+    
+    -- Frame: other DB queue entries unchanged
+    all tid2: TaskId | tid2 != tid implies dbQueuedAt[tid2, tnext] = dbQueuedAt[tid2, t]
+    
+    -- Frame: buffer unchanged
+    all tid2: TaskId | bufferedAt[tid2, tnext] = bufferedAt[tid2, t]
+    
+    -- Frame: leases unchanged
+    all tid2: TaskId | {
+        leaseAt[tid2, tnext] = leaseAt[tid2, t]
+        leaseJobAt[tid2, tnext] = leaseJobAt[tid2, t]
+        leaseAttemptAt[tid2, tnext] = leaseAttemptAt[tid2, t]
+    }
+    
+    -- Frame: job status unchanged (still Scheduled)
+    all j2: Job | j2 in jobExistsAt[t] implies statusAt[j2, tnext] = statusAt[j2, t]
+    
+    -- Frame: cancellation unchanged
+    all j2: Job | isCancelledAt[j2, tnext] iff isCancelledAt[j2, t]
+    
+    -- Frame: job existence unchanged
+    jobExistsAt[tnext] = jobExistsAt[t]
+    
+    -- Frame: attempts unchanged
+    attemptExistsAt[tnext] = attemptExistsAt[t]
+    all a: attemptExistsAt[t] | attemptStatusAt[a, tnext] = attemptStatusAt[a, t]
+    
+    -- Frame: concurrency state unchanged
+    -- Note: If the job had concurrency requirements and was granted immediately,
+    -- the holder stays with the task. If it was queued (TicketRequest), there's
+    -- no DbQueuedTask to expedite anyway.
+    concurrencyUnchanged[t, tnext]
+}
+
 -- Transition: RESTART_FAILED_JOB - Re-enable a finally-failed job
 -- A job that has permanently failed (status = Failed) can be restarted.
 -- Mid-retry jobs (Scheduled with pending retry task) cannot use this - they have active tasks.
@@ -1216,6 +1290,7 @@ pred step[t: Time, tnext: Time] {
     or (some j: Job | cancelJob[j, t, tnext])
     or (some j: Job, newTid: TaskId | restartCancelledJob[j, newTid, t, tnext])
     or (some j: Job, newTid: TaskId | restartFailedJob[j, newTid, t, tnext])
+    or (some tid: TaskId, j: Job | expediteNextAttempt[tid, j, t, tnext])
     -- Concurrency ticket management
     or (some tid: TaskId, j: Job, q: Queue | enqueueWithConcurrencyGranted[tid, j, q, t, tnext])
     or (some tid: TaskId, j: Job, q: Queue | enqueueWithConcurrencyQueued[tid, j, q, t, tnext])
@@ -1387,6 +1462,41 @@ assert noHoldersForTerminal {
 assert grantedMeansNoRequest {
     all t: Time, h: TicketHolder | h.th_time = t implies
         no r: TicketRequest | r.tr_task = h.th_task and r.tr_queue = h.th_queue and r.tr_time = t
+}
+
+/**
+ * Expedite doesn't change job status.
+ * After expediting, the job remains in the same status (Scheduled).
+ * See: [SILO-EXP-2] pre: not terminal, so status must be Scheduled or Running.
+ * But [SILO-EXP-6] requires no lease, which rules out Running.
+ * So expedited jobs must be Scheduled before and after.
+ */
+assert expeditePreservesStatus {
+    all t: Time - last, tid: TaskId, j: Job |
+        expediteNextAttempt[tid, j, t, t.next] implies
+            statusAt[j, t.next] = statusAt[j, t]
+}
+
+/**
+ * Expedite only works on non-terminal jobs.
+ * Terminal jobs (Succeeded/Failed) cannot be expedited.
+ * See: [SILO-EXP-2]
+ */
+assert expediteRejectsTerminal {
+    all t: Time, tid: TaskId, j: Job |
+        (j in jobExistsAt[t] and isTerminal[statusAt[j, t]]) implies
+            not expediteNextAttempt[tid, j, t, t.next]
+}
+
+/**
+ * Expedite only works on non-cancelled jobs.
+ * Cancelled jobs cannot be expedited - must restart first.
+ * See: [SILO-EXP-3]
+ */
+assert expediteRejectsCancelled {
+    all t: Time, tid: TaskId, j: Job |
+        (j in jobExistsAt[t] and isCancelledAt[j, t]) implies
+            not expediteNextAttempt[tid, j, t, t.next]
 }
 
 
@@ -1799,6 +1909,123 @@ pred exampleRestartFailedJob {
 }
 
 /**
+ * Scenario: Future-scheduled job is expedited to run now
+ * Job is enqueued with future start time (task in DB queue, not in buffer),
+ * then expedited to run immediately. After expedite, the task is picked up
+ * by the broker and completes successfully.
+ * 
+ * This demonstrates:
+ * 1. Task starts in DB queue but not in buffer (future-scheduled)
+ * 2. Expedite is called, task remains in DB queue (now at current time)
+ * 3. Broker scans and moves task to buffer
+ * 4. Worker dequeues and completes successfully
+ */
+pred exampleExpediteJob {
+    some tid: TaskId, j: Job, a: Attempt, t1, t2, t3, t4, t5: Time | {
+        lt[t1, t2] and lt[t2, t3] and lt[t3, t4] and lt[t4, t5]
+        attemptJob[a] = j
+        
+        -- t1: job enqueued with future start time
+        -- Task is in DB queue but NOT in buffer (future-scheduled)
+        j in jobExistsAt[t1]
+        statusAt[j, t1] = Scheduled
+        not isCancelledAt[j, t1]
+        dbQueuedAt[tid, t1] = j
+        no bufferedAt[tid, t1]  -- Not in buffer = future-scheduled
+        no l: Lease | l.ljob = j and l.ltime = t1
+        
+        -- t2: expedite is called
+        -- Task remains in DB queue (conceptually now at current time)
+        j in jobExistsAt[t2]
+        statusAt[j, t2] = Scheduled  -- Status unchanged
+        not isCancelledAt[j, t2]
+        dbQueuedAt[tid, t2] = j  -- Still in DB queue
+        
+        -- t3: broker scans, task now in buffer (expedited, so now "ready")
+        j in jobExistsAt[t3]
+        statusAt[j, t3] = Scheduled
+        bufferedAt[tid, t3] = j  -- Now in buffer
+        
+        -- t4: worker dequeues, job is running
+        j in jobExistsAt[t4]
+        statusAt[j, t4] = Running
+        some l: Lease | l.ljob = j and l.lattempt = a and l.ltime = t4
+        attemptStatusAt[a, t4] = AttemptRunning
+        
+        -- t5: job completes successfully
+        j in jobExistsAt[t5]
+        statusAt[j, t5] = Succeeded
+        attemptStatusAt[a, t5] = AttemptSucceeded
+        no l: Lease | l.ljob = j and l.ltime = t5
+    }
+}
+
+/**
+ * Scenario: Expedite is rejected for running job (race safety)
+ * Job starts running (has lease), expedite cannot be called.
+ * This shows the race-safety mechanism - expedite preconditions reject
+ * jobs that are already running.
+ */
+pred exampleExpediteRejectedForRunningJob {
+    some tid: TaskId, j: Job, t: Time | {
+        -- Job is running with a lease
+        j in jobExistsAt[t]
+        statusAt[j, t] = Running
+        some tid2: TaskId | leaseJobAt[tid2, t] = j
+        -- No task in DB queue for this job (it's been dequeued)
+        no dbQueuedAt[tid, t]
+        -- Therefore expedite preconditions cannot be satisfied
+        -- (need task in DB queue AND no lease - both fail)
+    }
+}
+
+/**
+ * Scenario: Expedite mid-retry job (skip retry backoff)
+ * Job fails with retry, new task is scheduled for future (retry backoff),
+ * operator expedites to skip the backoff and retry immediately.
+ */
+pred exampleExpediteMidRetry {
+    some tid1, tid2: TaskId, j: Job, a1, a2: Attempt, t1, t2, t3, t4, t5, t6: Time | {
+        lt[t1, t2] and lt[t2, t3] and lt[t3, t4] and lt[t4, t5] and lt[t5, t6]
+        tid1 != tid2 and a1 != a2
+        attemptJob[a1] = j and attemptJob[a2] = j
+        
+        -- t1: first attempt is running
+        j in jobExistsAt[t1]
+        statusAt[j, t1] = Running
+        some leaseAt[tid1, t1]
+        leaseJobAt[tid1, t1] = j
+        leaseAttemptAt[tid1, t1] = a1
+        
+        -- t2: attempt fails with retry, new task created (future-scheduled for backoff)
+        statusAt[j, t2] = Scheduled  -- completeFailureRetry sets Scheduled
+        no leaseAt[tid1, t2]
+        attemptStatusAt[a1, t2] = AttemptFailed
+        dbQueuedAt[tid2, t2] = j  -- Retry task in DB queue
+        no bufferedAt[tid2, t2]  -- Not in buffer yet (future = backoff delay)
+        
+        -- t3: expedite is called to skip backoff
+        statusAt[j, t3] = Scheduled
+        dbQueuedAt[tid2, t3] = j  -- Still in DB queue after expedite
+        
+        -- t4: broker scans, retry task now in buffer
+        bufferedAt[tid2, t4] = j
+        
+        -- t5: second attempt running
+        statusAt[j, t5] = Running
+        some leaseAt[tid2, t5]
+        leaseJobAt[tid2, t5] = j
+        leaseAttemptAt[tid2, t5] = a2
+        attemptStatusAt[a2, t5] = AttemptRunning
+        
+        -- t6: second attempt succeeds
+        statusAt[j, t6] = Succeeded
+        no leaseAt[tid2, t6]
+        attemptStatusAt[a2, t6] = AttemptSucceeded
+    }
+}
+
+/**
  * Scenario: Failed+cancelled job is restarted
  * Job runs, is cancelled while running, fails (worker finishes with failure),
  * then is restarted (clearing both Failed status and cancellation).
@@ -1914,6 +2141,12 @@ run exampleLeaseExpiryReleasesTicket for 3 but exactly 1 Job, 1 Worker, 2 TaskId
     8 JobState, 8 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 2 JobAttemptRelation, 8 JobCancelled,
     1 JobQueueRequirement, 8 TicketRequest, 8 TicketHolder
 
+run exampleExpediteJob for 3 but exactly 1 Job, 1 Worker, 2 TaskId, 2 Attempt, 10 Time,
+    10 JobState, 10 AttemptState, 5 DbQueuedTask, 5 BufferedTask, 4 Lease, 10 AttemptExists, 10 JobExists, 2 JobAttemptRelation, 10 JobCancelled
+
+run exampleExpediteMidRetry for 3 but exactly 1 Job, 1 Worker, 3 TaskId, 3 Attempt, 12 Time,
+    12 JobState, 12 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 12 AttemptExists, 12 JobExists, 3 JobAttemptRelation, 12 JobCancelled
+
 -- Bounds analysis for checks:
 -- JobState: Jobs can only exist from creation onwards, so max ~= Jobs × Times (16 for 2×8)
 -- AttemptState: Attempts created during execution, max = Attempts × remaining_times (~18 for 3 attempts)
@@ -1961,4 +2194,12 @@ check holdersRequireActiveTask for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8
 check grantedMeansNoRequest for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time, 2 Queue,
     16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 12 JobCancelled,
     4 JobQueueRequirement, 8 TicketRequest, 8 TicketHolder
+
+-- Expedite assertions
+check expeditePreservesStatus for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
+    16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 12 JobCancelled
+check expediteRejectsTerminal for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
+    16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 12 JobCancelled
+check expediteRejectsCancelled for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
+    16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 12 JobCancelled
 

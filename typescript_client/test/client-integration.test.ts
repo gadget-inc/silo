@@ -419,6 +419,147 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
     });
   });
 
+  describe("expediteJob", () => {
+    it("expedites a future-scheduled job to run immediately", async () => {
+      const uniqueJobId = `expedite-test-${Date.now()}`;
+      const tenant = "expedite-tenant";
+
+      // Schedule job 1 hour in the future
+      const futureStartAtMs = BigInt(Date.now() + 3_600_000);
+
+      const handle = await client.enqueue({
+        tenant,
+        id: uniqueJobId,
+        payload: { action: "expedite-test" },
+        priority: 1,
+        startAtMs: futureStartAtMs,
+      });
+
+      // Verify job was created and is scheduled
+      const jobBefore = await client.getJob(handle.id, tenant);
+      expect(jobBefore?.status).toBe(JobStatus.Scheduled);
+
+      // Get the shard for this tenant to poll from the correct server
+      const shard = client.getShardForTenant(tenant);
+
+      // Try to lease - should get nothing because job is future-scheduled
+      const resultBefore = await client.leaseTasks({
+        shard,
+        workerId: "expedite-test-worker",
+        maxTasks: 1,
+      });
+      expect(
+        resultBefore.tasks.find((t) => t.jobId === handle.id)
+      ).toBeUndefined();
+
+      // Expedite the job
+      await client.expediteJob(handle.id, tenant);
+
+      // Now the job should be leasable
+      let task;
+      for (let i = 0; i < 10; i++) {
+        const result = await client.leaseTasks({
+          shard,
+          workerId: "expedite-test-worker",
+          maxTasks: 10,
+        });
+        task = result.tasks.find((t) => t.jobId === handle.id);
+        if (task) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      expect(task).toBeDefined();
+
+      // Complete the job
+      await client.reportOutcome({
+        shard: task!.shard,
+        taskId: task!.id,
+        tenant,
+        outcome: { type: "success", result: { expedited: true } },
+      });
+
+      // Verify job succeeded
+      const jobAfter = await client.getJob(handle.id, tenant);
+      expect(jobAfter?.status).toBe(JobStatus.Succeeded);
+    });
+
+    it("expedite throws error for non-existent job", async () => {
+      const tenant = "expedite-tenant";
+      await expect(
+        client.expediteJob("non-existent-job-id", tenant)
+      ).rejects.toThrow();
+    });
+
+    it("expedite throws error for running job", async () => {
+      const uniqueJobId = `expedite-running-test-${Date.now()}`;
+      const tenant = "expedite-tenant";
+
+      const handle = await client.enqueue({
+        tenant,
+        id: uniqueJobId,
+        payload: { action: "expedite-running-test" },
+        priority: 1,
+      });
+
+      // Get the shard for this tenant
+      const shard = client.getShardForTenant(tenant);
+
+      // Lease the task to make it running
+      let task;
+      for (let i = 0; i < 10; i++) {
+        const result = await client.leaseTasks({
+          shard,
+          workerId: "expedite-running-test-worker",
+          maxTasks: 10,
+        });
+        task = result.tasks.find((t) => t.jobId === handle.id);
+        if (task) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      expect(task).toBeDefined();
+
+      // Verify job is running
+      const jobRunning = await client.getJob(handle.id, tenant);
+      expect(jobRunning?.status).toBe(JobStatus.Running);
+
+      // Try to expedite - should fail
+      await expect(client.expediteJob(handle.id, tenant)).rejects.toThrow();
+
+      // Complete the job to clean up
+      await client.reportOutcome({
+        shard: task!.shard,
+        taskId: task!.id,
+        tenant,
+        outcome: { type: "success", result: {} },
+      });
+    });
+
+    it("expedite throws error for cancelled job", async () => {
+      const uniqueJobId = `expedite-cancelled-test-${Date.now()}`;
+      const tenant = "expedite-tenant";
+
+      // Schedule job 1 hour in the future
+      const futureStartAtMs = BigInt(Date.now() + 3_600_000);
+
+      const handle = await client.enqueue({
+        tenant,
+        id: uniqueJobId,
+        payload: { action: "expedite-cancelled-test" },
+        priority: 1,
+        startAtMs: futureStartAtMs,
+      });
+
+      // Cancel the job
+      await client.cancelJob(handle.id, tenant);
+
+      // Verify job is cancelled
+      const jobCancelled = await client.getJob(handle.id, tenant);
+      expect(jobCancelled?.status).toBe(JobStatus.Cancelled);
+
+      // Try to expedite - should fail
+      await expect(client.expediteJob(handle.id, tenant)).rejects.toThrow();
+    });
+  });
+
   describe("query", () => {
     it("queries jobs with SQL", async () => {
       const testBatch = `batch-${Date.now()}`;

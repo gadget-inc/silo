@@ -9,7 +9,8 @@
 - [ ] limits on payload, error, result size
 - [x] cancel api
   - [x] restart cancelled api
-- [ ] run next attempt now RPC (expedite)
+- [x] run next attempt now RPC (expedite)
+  - [ ] figure out how to avoid having to scan for all future tasks and delete performance issue
 - [x] get job info api
 - [ ] get job with attempts api
 - [x] list jobs api
