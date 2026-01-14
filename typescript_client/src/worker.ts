@@ -6,9 +6,15 @@ import type {
   TaskOutcome,
   RefreshTask,
   RefreshOutcome,
+  HeartbeatResult,
 } from "./client";
 
 export { Task };
+
+/**
+ * Reason why a task was cancelled.
+ */
+export type CancellationReason = "server" | "client" | "worker_shutdown";
 
 /**
  * Context passed to task handlers with utilities for the current task.
@@ -20,8 +26,185 @@ export interface TaskContext {
   shard: number;
   /** The worker ID processing this task */
   workerId: string;
-  /** Signal that is aborted when the worker is stopping */
+  /**
+   * Signal that is aborted when the task should stop processing.
+   * This signal is triggered when:
+   * - The worker is stopping (graceful shutdown)
+   * - The server reports the job as cancelled (via heartbeat)
+   * - The handler explicitly calls cancel()
+   */
   signal: AbortSignal;
+  /**
+   * Cancel this task. This will:
+   * 1. Abort the task's signal immediately
+   * 2. Notify the server that the job is cancelled
+   *
+   * The handler should stop work when the signal is aborted.
+   * The worker will automatically report a Cancelled outcome.
+   *
+   * @example
+   * ```typescript
+   * const handler: TaskHandler = async (ctx) => {
+   *   // Start processing...
+   *   if (someConditionToCancel) {
+   *     await ctx.cancel();
+   *     // Signal is now aborted, handler should return
+   *     return { type: "success", result: {} }; // This result is ignored
+   *   }
+   *   // ... continue processing
+   * };
+   * ```
+   */
+  cancel(): Promise<void>;
+}
+
+/**
+ * Internal class to manage the state of a single task execution.
+ * Tracks the abort controller, cancellation state, and provides methods
+ * to coordinate cancellation from various sources.
+ * @internal
+ */
+class TaskExecution {
+  /** The task being executed */
+  public readonly task: Task;
+  /** The shard this task came from */
+  public readonly shard: number;
+  /** The worker ID */
+  public readonly workerId: string;
+  /** Tenant for this task */
+  public readonly tenant: string | undefined;
+
+  /** Abort controller for this specific task */
+  private readonly _taskAbortController: AbortController;
+  /** Combined signal that aborts on task cancel OR worker shutdown */
+  private readonly _combinedSignal: AbortSignal;
+  /** Whether the task has been cancelled (by server or client) */
+  private _cancelled: boolean = false;
+  /** The reason for cancellation if cancelled */
+  private _cancellationReason: CancellationReason | undefined;
+  /** Promise resolving when cancel RPC completes (if initiated by client) */
+  private _cancelPromise: Promise<void> | undefined;
+  /** Reference to the client for cancel RPC */
+  private readonly _client: SiloGRPCClient;
+
+  constructor(
+    task: Task,
+    shard: number,
+    workerId: string,
+    tenant: string | undefined,
+    workerAbortSignal: AbortSignal,
+    client: SiloGRPCClient
+  ) {
+    this.task = task;
+    this.shard = shard;
+    this.workerId = workerId;
+    this.tenant = tenant;
+    this._client = client;
+
+    this._taskAbortController = new AbortController();
+
+    // Create a combined signal that aborts when EITHER the task or worker is aborted
+    this._combinedSignal = combineAbortSignals(
+      workerAbortSignal,
+      this._taskAbortController.signal
+    );
+
+    // Track when worker shutdown causes abort
+    workerAbortSignal.addEventListener(
+      "abort",
+      () => {
+        if (!this._cancelled) {
+          this._cancelled = true;
+          this._cancellationReason = "worker_shutdown";
+        }
+      },
+      { once: true }
+    );
+  }
+
+  /** The combined abort signal for this task */
+  get signal(): AbortSignal {
+    return this._combinedSignal;
+  }
+
+  /** Whether this task has been cancelled */
+  get isCancelled(): boolean {
+    return this._cancelled;
+  }
+
+  /** The reason for cancellation, if cancelled */
+  get cancellationReason(): CancellationReason | undefined {
+    return this._cancellationReason;
+  }
+
+  /** Whether the cancellation was due to server-side cancel (should report Cancelled outcome) */
+  get shouldReportCancelled(): boolean {
+    return (
+      this._cancelled &&
+      (this._cancellationReason === "server" ||
+        this._cancellationReason === "client")
+    );
+  }
+
+  /**
+   * Called when heartbeat detects server-side cancellation.
+   * Aborts the task signal immediately.
+   */
+  public markCancelledByServer(): void {
+    if (this._cancelled) return;
+    this._cancelled = true;
+    this._cancellationReason = "server";
+    this._taskAbortController.abort();
+  }
+
+  /**
+   * Cancel this task from the client side.
+   * Calls the server to cancel the job and aborts the task signal.
+   */
+  public async cancelFromClient(): Promise<void> {
+    if (this._cancelled) return;
+
+    this._cancelled = true;
+    this._cancellationReason = "client";
+
+    // Abort the signal immediately so the handler can stop work
+    this._taskAbortController.abort();
+
+    // Call the server to persist the cancellation
+    // We store the promise so we can await it if needed
+    this._cancelPromise = this._client
+      .cancelJob(this.task.jobId, this.tenant)
+      .catch(() => {
+        // Ignore errors - the job may already be cancelled or completed
+      });
+
+    await this._cancelPromise;
+  }
+}
+
+/**
+ * Combine multiple abort signals into one that aborts when ANY input signal aborts.
+ * @internal
+ */
+function combineAbortSignals(...signals: AbortSignal[]): AbortSignal {
+  const controller = new AbortController();
+
+  for (const signal of signals) {
+    if (signal.aborted) {
+      controller.abort();
+      return controller.signal;
+    }
+
+    signal.addEventListener(
+      "abort",
+      () => {
+        controller.abort();
+      },
+      { once: true }
+    );
+  }
+
+  return controller.signal;
 }
 
 /**
@@ -187,6 +370,9 @@ export class SiloWorker {
   private _abortController: AbortController | null = null;
   private _pollerPromises: Promise<void>[] = [];
   private _taskQueue: PQueue;
+  /** Active task executions, keyed by task ID */
+  private _activeExecutions: Map<string, TaskExecution> = new Map();
+  /** Heartbeat intervals for active tasks (regular tasks and refresh tasks) */
   private _heartbeatIntervals: Map<string, ReturnType<typeof setInterval>> =
     new Map();
 
@@ -290,6 +476,9 @@ export class SiloWorker {
     }
     this._heartbeatIntervals.clear();
 
+    // Clear active executions
+    this._activeExecutions.clear();
+
     this._abortController = null;
   }
 
@@ -368,9 +557,20 @@ export class SiloWorker {
     // Shard is now a number from the proto
     const shard = task.shard;
 
+    // Create TaskExecution to manage this task's state
+    const execution = new TaskExecution(
+      task,
+      shard,
+      this._workerId,
+      this._tenant,
+      this._abortController?.signal ?? new AbortController().signal,
+      this._client
+    );
+    this._activeExecutions.set(task.id, execution);
+
     // Start heartbeat for this task immediately
     const heartbeatInterval = setInterval(() => {
-      this._sendHeartbeat(task.id, shard).catch((error) => {
+      this._sendHeartbeatForTask(execution).catch((error) => {
         this._onError(
           error instanceof Error ? error : new Error(String(error)),
           {
@@ -384,7 +584,7 @@ export class SiloWorker {
     // Add task to the queue for execution
     this._taskQueue
       .add(async () => {
-        await this._executeTask(task, shard);
+        await this._executeTaskWithExecution(execution);
       })
       .catch((error) => {
         this._onError(
@@ -401,6 +601,8 @@ export class SiloWorker {
           clearInterval(interval);
           this._heartbeatIntervals.delete(task.id);
         }
+        // Remove from active executions
+        this._activeExecutions.delete(task.id);
       });
   }
 
@@ -410,7 +612,7 @@ export class SiloWorker {
   private _enqueueRefreshTask(task: RefreshTask): void {
     const shard = task.shard;
 
-    // Start heartbeat for this refresh task
+    // Start heartbeat for this refresh task (no TaskExecution needed, refresh tasks can't be cancelled)
     const heartbeatInterval = setInterval(() => {
       this._sendHeartbeat(task.id, shard).catch((error) => {
         this._onError(
@@ -447,14 +649,17 @@ export class SiloWorker {
   }
 
   /**
-   * Execute a single task and report its outcome.
+   * Execute a single task with its TaskExecution and report its outcome.
    */
-  private async _executeTask(task: Task, shard: number): Promise<void> {
+  private async _executeTaskWithExecution(
+    execution: TaskExecution
+  ): Promise<void> {
     const context: TaskContext = {
-      task,
-      shard,
-      workerId: this._workerId,
-      signal: this._abortController?.signal ?? new AbortController().signal,
+      task: execution.task,
+      shard: execution.shard,
+      workerId: execution.workerId,
+      signal: execution.signal,
+      cancel: () => execution.cancelFromClient(),
     };
 
     let outcome: TaskOutcome;
@@ -469,10 +674,21 @@ export class SiloWorker {
       };
     }
 
+    // If the task was cancelled (by server or client), report Cancelled outcome instead
+    if (execution.shouldReportCancelled) {
+      await this._client.reportOutcome({
+        taskId: execution.task.id,
+        shard: execution.shard,
+        outcome: { type: "cancelled" },
+        tenant: this._tenant,
+      });
+      return;
+    }
+
     // Report the outcome to the correct shard
     await this._client.reportOutcome({
-      taskId: task.id,
-      shard,
+      taskId: execution.task.id,
+      shard: execution.shard,
       outcome,
       tenant: this._tenant,
     });
@@ -521,7 +737,29 @@ export class SiloWorker {
   }
 
   /**
-   * Send a heartbeat for a task.
+   * Send a heartbeat for a task execution and handle cancellation if detected.
+   */
+  private async _sendHeartbeatForTask(execution: TaskExecution): Promise<void> {
+    // Don't send heartbeats for already-cancelled tasks
+    if (execution.isCancelled) {
+      return;
+    }
+
+    const result: HeartbeatResult = await this._client.heartbeat(
+      this._workerId,
+      execution.task.id,
+      execution.shard,
+      this._tenant
+    );
+
+    // If the server reports cancellation, mark the execution as cancelled
+    if (result.cancelled) {
+      execution.markCancelledByServer();
+    }
+  }
+
+  /**
+   * Send a heartbeat for a task (for refresh tasks that don't need TaskExecution).
    */
   private async _sendHeartbeat(taskId: string, shard: number): Promise<void> {
     await this._client.heartbeat(this._workerId, taskId, shard, this._tenant);

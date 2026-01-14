@@ -17,6 +17,7 @@ export {
   type ReportOutcomeOptions,
   type SuccessOutcome,
   type FailureOutcome,
+  type CancelledOutcome,
   type TaskOutcome,
   type RefreshTask,
   type RefreshSuccessOutcome,
@@ -43,6 +44,7 @@ export {
   type TaskHandler,
   type RefreshTaskContext,
   type RefreshHandler,
+  type CancellationReason,
 } from "./worker";
 export { JobHandle } from "./JobHandle";
 export type {

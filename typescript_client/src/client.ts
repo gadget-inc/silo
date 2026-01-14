@@ -494,7 +494,12 @@ export interface FailureOutcome {
   data?: unknown;
 }
 
-export type TaskOutcome = SuccessOutcome | FailureOutcome;
+/** Outcome for reporting task cancellation */
+export interface CancelledOutcome {
+  type: "cancelled";
+}
+
+export type TaskOutcome = SuccessOutcome | FailureOutcome | CancelledOutcome;
 
 /** Options for reporting task outcome */
 export interface ReportOutcomeOptions {
@@ -1308,22 +1313,34 @@ export class SiloGRPCClient {
    * @throws TaskNotFoundError if the task (lease) doesn't exist.
    */
   public async reportOutcome(options: ReportOutcomeOptions): Promise<void> {
-    const outcome =
-      options.outcome.type === "success"
-        ? {
-            oneofKind: "success" as const,
-            success: { data: encodePayload(options.outcome.result) },
-          }
-        : {
-            oneofKind: "failure" as const,
-            failure: {
-              code: options.outcome.code,
-              data:
-                options.outcome.data instanceof Uint8Array
-                  ? options.outcome.data
-                  : encodePayload(options.outcome.data),
-            },
-          };
+    let outcome:
+      | { oneofKind: "success"; success: { data: Uint8Array } }
+      | { oneofKind: "failure"; failure: { code: string; data: Uint8Array } }
+      | { oneofKind: "cancelled"; cancelled: Record<string, never> };
+
+    if (options.outcome.type === "success") {
+      outcome = {
+        oneofKind: "success" as const,
+        success: { data: encodePayload(options.outcome.result) },
+      };
+    } else if (options.outcome.type === "failure") {
+      outcome = {
+        oneofKind: "failure" as const,
+        failure: {
+          code: options.outcome.code,
+          data:
+            options.outcome.data instanceof Uint8Array
+              ? options.outcome.data
+              : encodePayload(options.outcome.data),
+        },
+      };
+    } else {
+      // cancelled
+      outcome = {
+        oneofKind: "cancelled" as const,
+        cancelled: {},
+      };
+    }
 
     try {
       // Route to the correct shard (from Task.shard)

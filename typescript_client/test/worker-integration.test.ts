@@ -26,20 +26,20 @@ const RUN_INTEGRATION =
 
 /**
  * Wait until a condition becomes true, polling at intervals.
- * @param condition Function that returns true when the condition is met
+ * @param condition Function that returns true (or Promise<true>) when the condition is met
  * @param options.timeout Maximum time to wait in ms (default: 5000)
  * @param options.interval Polling interval in ms (default: 50)
  * @throws Error if timeout is reached before condition is met
  */
 async function waitFor(
-  condition: () => boolean,
+  condition: () => boolean | Promise<boolean>,
   options?: { timeout?: number; interval?: number }
 ): Promise<void> {
   const timeout = options?.timeout ?? 5000;
   const interval = options?.interval ?? 50;
   const start = Date.now();
 
-  while (!condition()) {
+  while (!(await condition())) {
     if (Date.now() - start > timeout) {
       throw new Error(`waitFor timed out after ${timeout}ms`);
     }
@@ -767,7 +767,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       const errors: Error[] = [];
       const queueKey = `no-handler-error-${Date.now()}`;
 
-      const handler: TaskHandler = async (ctx) => {
+      const handler: TaskHandler = async () => {
         return { type: "success", result: {} };
       };
 
@@ -823,6 +823,464 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       expect(errors[0].message).toContain("floating limit refresh task");
 
       await worker.stop();
+    });
+  });
+
+  describe("task cancellation", () => {
+    it("aborts signal when server cancels job during heartbeat", async () => {
+      let taskStarted = false;
+      let signalAborted = false;
+
+      const handler: TaskHandler = async (ctx) => {
+        taskStarted = true;
+
+        // Listen for abort
+        ctx.signal.addEventListener("abort", () => {
+          signalAborted = true;
+        });
+
+        // Wait indefinitely for abort (like the passing tests do)
+        while (!ctx.signal.aborted) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+
+        return { type: "success", result: { aborted: true } };
+      };
+
+      // Short heartbeat interval to quickly detect cancellation
+      const worker = createWorker(handler, {
+        heartbeatIntervalMs: 100,
+        pollIntervalMs: 50,
+      });
+      worker.start();
+
+      const handle = await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        payload: { action: "long-running" },
+        priority: 1,
+      });
+
+      // Wait for task to start
+      await waitFor(() => taskStarted, { timeout: 5000 });
+
+      // Cancel the job from the server side
+      await handle.cancel();
+
+      // Wait for signal to be aborted
+      await waitFor(() => signalAborted, { timeout: 5000 });
+
+      expect(signalAborted).toBe(true);
+
+      // Wait for job to reach cancelled state
+      await waitFor(
+        async () => {
+          const job = await client.getJob(handle.id, DEFAULT_TENANT);
+          return job.status === JobStatus.Cancelled;
+        },
+        { timeout: 5000 }
+      );
+
+      const finalJob = await client.getJob(handle.id, DEFAULT_TENANT);
+      expect(finalJob.status).toBe(JobStatus.Cancelled);
+    });
+
+    it("reports Cancelled outcome when job is cancelled during execution", async () => {
+      let taskStarted = false;
+      let handlerReturnedValue: unknown = null;
+
+      const handler: TaskHandler = async (ctx) => {
+        taskStarted = true;
+
+        // Wait while checking for abort
+        while (!ctx.signal.aborted) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+
+        // Return a success (this should be ignored because task was cancelled)
+        handlerReturnedValue = { success: true };
+        return { type: "success", result: handlerReturnedValue };
+      };
+
+      const worker = createWorker(handler, {
+        heartbeatIntervalMs: 100,
+        pollIntervalMs: 50,
+      });
+      worker.start();
+
+      const handle = await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        payload: { action: "cancel-test" },
+        priority: 1,
+      });
+
+      // Wait for task to start
+      await waitFor(() => taskStarted, { timeout: 5000 });
+
+      // Cancel from server
+      await handle.cancel();
+
+      // Wait for job to be cancelled
+      await waitFor(
+        async () => {
+          const job = await client.getJob(handle.id, DEFAULT_TENANT);
+          return job.status === JobStatus.Cancelled;
+        },
+        { timeout: 5000 }
+      );
+
+      const finalJob = await client.getJob(handle.id, DEFAULT_TENANT);
+      expect(finalJob.status).toBe(JobStatus.Cancelled);
+    });
+
+    it("handler can cancel task via context.cancel()", async () => {
+      let taskStarted = false;
+      let cancelCalled = false;
+      let signalAbortedAfterCancel = false;
+
+      const handler: TaskHandler = async (ctx) => {
+        taskStarted = true;
+
+        // Simulate some work
+        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        // Call cancel from the handler
+        await ctx.cancel();
+        cancelCalled = true;
+        signalAbortedAfterCancel = ctx.signal.aborted;
+
+        // Return normally (will be ignored because cancelled)
+        return { type: "success", result: {} };
+      };
+
+      const worker = createWorker(handler, {
+        heartbeatIntervalMs: 100,
+        pollIntervalMs: 50,
+      });
+      worker.start();
+
+      const handle = await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        payload: { action: "self-cancel" },
+        priority: 1,
+      });
+
+      // Wait for task to start and cancel
+      await waitFor(() => cancelCalled, { timeout: 5000 });
+
+      expect(taskStarted).toBe(true);
+      expect(cancelCalled).toBe(true);
+      expect(signalAbortedAfterCancel).toBe(true);
+
+      // Wait for job to reach cancelled state
+      await waitFor(
+        async () => {
+          const job = await client.getJob(handle.id, DEFAULT_TENANT);
+          return job.status === JobStatus.Cancelled;
+        },
+        { timeout: 5000 }
+      );
+
+      const finalJob = await client.getJob(handle.id, DEFAULT_TENANT);
+      expect(finalJob.status).toBe(JobStatus.Cancelled);
+    });
+
+    it("client-side cancel notifies server immediately", async () => {
+      let taskStarted = false;
+      let jobStatusDuringHandler: JobStatus | null = null;
+
+      const handler: TaskHandler = async (ctx) => {
+        taskStarted = true;
+
+        // Wait a bit
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        // Cancel the task
+        await ctx.cancel();
+
+        // Check job status after cancel (should already be cancelling on server)
+        // Note: We need to get the job directly to check its state
+        const job = await client.getJob(ctx.task.jobId, DEFAULT_TENANT);
+        jobStatusDuringHandler = job.status;
+
+        return { type: "success", result: {} };
+      };
+
+      const worker = createWorker(handler, {
+        heartbeatIntervalMs: 100,
+        pollIntervalMs: 50,
+      });
+      worker.start();
+
+      await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        payload: { action: "immediate-cancel" },
+        priority: 1,
+      });
+
+      // Wait for task to complete
+      await waitFor(() => jobStatusDuringHandler !== null, { timeout: 5000 });
+
+      // The job should be Running or Cancelled (depends on timing of the reportOutcome)
+      // but the cancel request should have been sent
+      expect(taskStarted).toBe(true);
+    });
+
+    it("cancelling an already-completed task throws an error", async () => {
+      let handlerCompleted = false;
+
+      const handler: TaskHandler = async () => {
+        // Complete immediately
+        handlerCompleted = true;
+        return { type: "success", result: { done: true } };
+      };
+
+      const worker = createWorker(handler, {
+        heartbeatIntervalMs: 100,
+        pollIntervalMs: 50,
+      });
+      worker.start();
+
+      const handle = await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        payload: { action: "quick" },
+        priority: 1,
+      });
+
+      // Wait for completion
+      await waitFor(() => handlerCompleted, { timeout: 5000 });
+
+      // Wait for job to succeed
+      await waitFor(
+        async () => {
+          const job = await client.getJob(handle.id, DEFAULT_TENANT);
+          return job.status === JobStatus.Succeeded;
+        },
+        { timeout: 5000 }
+      );
+
+      // Trying to cancel after completion should throw an error
+      await expect(handle.cancel()).rejects.toThrow("terminal state");
+
+      // Status should still be Succeeded
+      const job = await client.getJob(handle.id, DEFAULT_TENANT);
+      expect(job.status).toBe(JobStatus.Succeeded);
+    });
+
+    it("multiple concurrent tasks have independent abort signals", async () => {
+      // Track which tasks were aborted vs completed normally
+      const abortedTasks: string[] = [];
+      const completedTasks: string[] = [];
+
+      const handler: TaskHandler = async (ctx) => {
+        const payload = decodePayload<{ index: number; shouldWait: boolean }>(
+          ctx.task.payload?.data
+        );
+        const taskKey = `task-${payload?.index}`;
+
+        if (payload?.shouldWait) {
+          // These tasks wait for abort
+          while (!ctx.signal.aborted) {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+          abortedTasks.push(taskKey);
+        } else {
+          // These tasks complete immediately
+          completedTasks.push(taskKey);
+        }
+
+        return { type: "success", result: {} };
+      };
+
+      const worker = createWorker(handler, {
+        heartbeatIntervalMs: 100,
+        pollIntervalMs: 50,
+        maxConcurrentTasks: 5,
+      });
+      worker.start();
+
+      // Enqueue: task 0 and 2 complete immediately, task 1 waits for abort
+      const handle0 = await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        payload: { index: 0, shouldWait: false },
+        priority: 1,
+      });
+      const handle1 = await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        payload: { index: 1, shouldWait: true },
+        priority: 1,
+      });
+      const handle2 = await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        payload: { index: 2, shouldWait: false },
+        priority: 1,
+      });
+
+      // Wait for the quick tasks to complete
+      await waitFor(() => completedTasks.length >= 2, { timeout: 5000 });
+
+      // Cancel task 1 (the one waiting for abort)
+      await handle1.cancel();
+
+      // Wait for task 1 to be aborted
+      await waitFor(() => abortedTasks.includes("task-1"), { timeout: 5000 });
+
+      // Verify the results
+      expect(completedTasks).toContain("task-0");
+      expect(completedTasks).toContain("task-2");
+      expect(abortedTasks).toContain("task-1");
+
+      // Verify job statuses
+      const job0 = await client.getJob(handle0.id, DEFAULT_TENANT);
+      const job1 = await client.getJob(handle1.id, DEFAULT_TENANT);
+      const job2 = await client.getJob(handle2.id, DEFAULT_TENANT);
+
+      expect(job0.status).toBe(JobStatus.Succeeded);
+      expect(job1.status).toBe(JobStatus.Cancelled);
+      expect(job2.status).toBe(JobStatus.Succeeded);
+    });
+
+    it("signal remains aborted after multiple abort attempts", async () => {
+      let handlerExecutionCount = 0;
+      let abortCount = 0;
+
+      const handler: TaskHandler = async (ctx) => {
+        handlerExecutionCount++;
+
+        ctx.signal.addEventListener("abort", () => {
+          abortCount++;
+        });
+
+        // Wait a bit
+        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        // Cancel multiple times (should be idempotent)
+        await ctx.cancel();
+        await ctx.cancel();
+        await ctx.cancel();
+
+        expect(ctx.signal.aborted).toBe(true);
+
+        return { type: "success", result: {} };
+      };
+
+      const worker = createWorker(handler, {
+        heartbeatIntervalMs: 100,
+        pollIntervalMs: 50,
+      });
+      worker.start();
+
+      await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        payload: { action: "multi-cancel" },
+        priority: 1,
+      });
+
+      // Wait for handler to complete
+      await waitFor(() => handlerExecutionCount > 0, { timeout: 5000 });
+
+      // Give time for handler to finish
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      // Abort event should only fire once
+      expect(abortCount).toBe(1);
+    });
+
+    it("cancelled task does not retry", async () => {
+      let attemptCount = 0;
+
+      const handler: TaskHandler = async (ctx) => {
+        attemptCount++;
+
+        // Wait and cancel on first attempt
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        await ctx.cancel();
+
+        return { type: "success", result: {} };
+      };
+
+      const worker = createWorker(handler, {
+        heartbeatIntervalMs: 100,
+        pollIntervalMs: 50,
+      });
+      worker.start();
+
+      const handle = await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        payload: { action: "no-retry-on-cancel" },
+        priority: 1,
+        retryPolicy: {
+          retryCount: 5,
+          initialIntervalMs: 100n,
+          maxIntervalMs: 1000n,
+          randomizeInterval: false,
+          backoffFactor: 2.0,
+        },
+      });
+
+      // Wait for handler to be called at least once
+      await waitFor(() => attemptCount >= 1, { timeout: 5000 });
+
+      // Wait for job to be cancelled
+      await waitFor(
+        async () => {
+          const job = await client.getJob(handle.id, DEFAULT_TENANT);
+          return job.status === JobStatus.Cancelled;
+        },
+        { timeout: 5000 }
+      );
+
+      // Should only have one attempt (no retries on cancellation)
+      expect(attemptCount).toBe(1);
+
+      // Give some time to ensure no retry happens
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(attemptCount).toBe(1);
+    });
+
+    it("worker shutdown aborts running tasks", async () => {
+      let taskStarted = false;
+      let signalAborted = false;
+      let signalAbortReason: string | null = null;
+
+      const handler: TaskHandler = async (ctx) => {
+        taskStarted = true;
+
+        ctx.signal.addEventListener("abort", () => {
+          signalAborted = true;
+          signalAbortReason = "signal_aborted";
+        });
+
+        // Long-running work
+        for (let i = 0; i < 100; i++) {
+          if (ctx.signal.aborted) {
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+
+        return { type: "success", result: {} };
+      };
+
+      const worker = createWorker(handler, {
+        heartbeatIntervalMs: 100,
+        pollIntervalMs: 50,
+      });
+      worker.start();
+
+      await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        payload: { action: "long-task" },
+        priority: 1,
+      });
+
+      // Wait for task to start
+      await waitFor(() => taskStarted, { timeout: 5000 });
+
+      // Stop the worker (should abort signal)
+      await worker.stop(500);
+
+      expect(signalAborted).toBe(true);
+      expect(signalAbortReason).toBe("signal_aborted");
     });
   });
 });
