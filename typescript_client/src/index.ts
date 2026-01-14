@@ -23,6 +23,7 @@ export {
   type RefreshFailureOutcome,
   type RefreshOutcome,
   type ReportRefreshOutcomeOptions,
+  type HeartbeatResult,
   type Job,
   type JobResult,
   type AwaitJobOptions,

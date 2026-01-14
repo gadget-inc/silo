@@ -562,6 +562,14 @@ export interface ReportRefreshOutcomeOptions {
   tenant?: string;
 }
 
+/** Result from a heartbeat request */
+export interface HeartbeatResult {
+  /** True if the job has been cancelled. Worker should stop work and report Cancelled outcome. */
+  cancelled: boolean;
+  /** Timestamp (epoch ms) when cancellation was requested, if cancelled. */
+  cancelledAtMs?: bigint;
+}
+
 /** Result from leasing tasks - includes both job tasks and refresh tasks */
 export interface LeaseTasksResult {
   /** Regular job execution tasks */
@@ -1392,6 +1400,7 @@ export class SiloGRPCClient {
    * @param taskId   The task ID.
    * @param shard    The shard the task came from (from Task.shard).
    * @param tenant   The tenant ID (required when tenancy is enabled).
+   * @returns HeartbeatResult indicating if the job was cancelled.
    * @throws TaskNotFoundError if the task (lease) doesn't exist.
    */
   public async heartbeat(
@@ -1399,10 +1408,10 @@ export class SiloGRPCClient {
     taskId: string,
     shard: number,
     tenant?: string
-  ): Promise<void> {
+  ): Promise<HeartbeatResult> {
     try {
       const client = this._getClientForShard(shard);
-      await client.heartbeat(
+      const call = client.heartbeat(
         {
           shard,
           workerId,
@@ -1411,6 +1420,11 @@ export class SiloGRPCClient {
         },
         this._rpcOptions()
       );
+      const response = await call.response;
+      return {
+        cancelled: response.cancelled,
+        cancelledAtMs: response.cancelledAtMs,
+      };
     } catch (error) {
       if (error instanceof RpcError && error.code === "NOT_FOUND") {
         throw new TaskNotFoundError(taskId);
