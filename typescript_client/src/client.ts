@@ -1238,6 +1238,36 @@ export class SiloGRPCClient {
   }
 
   /**
+   * Expedite a future-scheduled job to run immediately.
+   * This is useful for dragging forward a job that was scheduled for the future,
+   * or for skipping retry backoff delays on a mid-retry job.
+   * @param id     The job ID.
+   * @param tenant Tenant ID for routing to the correct shard. Uses default tenant if not provided.
+   * @throws JobNotFoundError if the job doesn't exist.
+   * @throws Error with FAILED_PRECONDITION if the job is not in an expeditable state
+   *         (already running, terminal, cancelled, or task already ready to run).
+   */
+  public async expediteJob(id: string, tenant?: string): Promise<void> {
+    try {
+      await this._withWrongShardRetry(tenant, async (client, shard) => {
+        await client.expediteJob(
+          {
+            shard,
+            id,
+            tenant,
+          },
+          this._rpcOptions()
+        );
+      });
+    } catch (error) {
+      if (error instanceof RpcError && error.code === "NOT_FOUND") {
+        throw new JobNotFoundError(id, tenant);
+      }
+      throw error;
+    }
+  }
+
+  /**
    * Get the current status of a job.
    * @param id     The job ID.
    * @param tenant Tenant ID for routing to the correct shard. Uses default tenant if not provided.

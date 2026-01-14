@@ -530,6 +530,32 @@ export interface RestartJobRequest {
 export interface RestartJobResponse {
 }
 /**
+ * Expedite a future-scheduled job to run immediately.
+ * This is useful for dragging forward a job that was scheduled for the future,
+ * or for skipping retry backoff delays on a mid-retry job.
+ *
+ * @generated from protobuf message silo.v1.ExpediteJobRequest
+ */
+export interface ExpediteJobRequest {
+    /**
+     * @generated from protobuf field: uint32 shard = 1
+     */
+    shard: number;
+    /**
+     * @generated from protobuf field: string id = 2
+     */
+    id: string;
+    /**
+     * @generated from protobuf field: optional string tenant = 3
+     */
+    tenant?: string;
+}
+/**
+ * @generated from protobuf message silo.v1.ExpediteJobResponse
+ */
+export interface ExpediteJobResponse {
+}
+/**
  * Lease tasks for processing from this server.
  * By default, leases from all shards this server owns (fair distribution).
  * If shard is specified, filters to only that shard.
@@ -2652,6 +2678,106 @@ class RestartJobResponse$Type extends MessageType<RestartJobResponse> {
  */
 export const RestartJobResponse = new RestartJobResponse$Type();
 // @generated message type with reflection information, may provide speed optimized methods
+class ExpediteJobRequest$Type extends MessageType<ExpediteJobRequest> {
+    constructor() {
+        super("silo.v1.ExpediteJobRequest", [
+            { no: 1, name: "shard", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
+            { no: 2, name: "id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 3, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value?: PartialMessage<ExpediteJobRequest>): ExpediteJobRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.shard = 0;
+        message.id = "";
+        if (value !== undefined)
+            reflectionMergePartial<ExpediteJobRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: ExpediteJobRequest): ExpediteJobRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* uint32 shard */ 1:
+                    message.shard = reader.uint32();
+                    break;
+                case /* string id */ 2:
+                    message.id = reader.string();
+                    break;
+                case /* optional string tenant */ 3:
+                    message.tenant = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: ExpediteJobRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* uint32 shard = 1; */
+        if (message.shard !== 0)
+            writer.tag(1, WireType.Varint).uint32(message.shard);
+        /* string id = 2; */
+        if (message.id !== "")
+            writer.tag(2, WireType.LengthDelimited).string(message.id);
+        /* optional string tenant = 3; */
+        if (message.tenant !== undefined)
+            writer.tag(3, WireType.LengthDelimited).string(message.tenant);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.ExpediteJobRequest
+ */
+export const ExpediteJobRequest = new ExpediteJobRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class ExpediteJobResponse$Type extends MessageType<ExpediteJobResponse> {
+    constructor() {
+        super("silo.v1.ExpediteJobResponse", []);
+    }
+    create(value?: PartialMessage<ExpediteJobResponse>): ExpediteJobResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        if (value !== undefined)
+            reflectionMergePartial<ExpediteJobResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: ExpediteJobResponse): ExpediteJobResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: ExpediteJobResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.ExpediteJobResponse
+ */
+export const ExpediteJobResponse = new ExpediteJobResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
 class LeaseTasksRequest$Type extends MessageType<LeaseTasksRequest> {
     constructor() {
         super("silo.v1.LeaseTasksRequest", [
@@ -4101,6 +4227,7 @@ export const Silo = new ServiceType("silo.v1.Silo", [
     { name: "DeleteJob", options: {}, I: DeleteJobRequest, O: DeleteJobResponse },
     { name: "CancelJob", options: {}, I: CancelJobRequest, O: CancelJobResponse },
     { name: "RestartJob", options: {}, I: RestartJobRequest, O: RestartJobResponse },
+    { name: "ExpediteJob", options: {}, I: ExpediteJobRequest, O: ExpediteJobResponse },
     { name: "LeaseTasks", options: {}, I: LeaseTasksRequest, O: LeaseTasksResponse },
     { name: "ReportOutcome", options: {}, I: ReportOutcomeRequest, O: ReportOutcomeResponse },
     { name: "ReportRefreshOutcome", options: {}, I: ReportRefreshOutcomeRequest, O: ReportRefreshOutcomeResponse },

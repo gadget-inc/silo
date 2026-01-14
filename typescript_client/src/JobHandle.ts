@@ -98,6 +98,18 @@ export class JobHandle {
   }
 
   /**
+   * Expedite a future-scheduled job to run immediately.
+   * This is useful for dragging forward a job that was scheduled for the future,
+   * or for skipping retry backoff delays on a mid-retry job.
+   * @throws JobNotFoundError if the job doesn't exist.
+   * @throws Error if the job is not in an expeditable state
+   *         (already running, terminal, cancelled, or task already ready to run).
+   */
+  public async expedite(): Promise<void> {
+    return this._client.expediteJob(this.id, this.tenant);
+  }
+
+  /**
    * Delete the job.
    * @throws JobNotFoundError if the job doesn't exist.
    */
