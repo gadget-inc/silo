@@ -111,6 +111,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
                 shard: 0,
                 id: job_id.clone(),
                 tenant: None,
+                include_attempts: false,
             })
             .await?;
         // Verify metadata via get_job
@@ -119,6 +120,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
                 shard: 0,
                 id: job_id.clone(),
                 tenant: None,
+                include_attempts: false,
             })
             .await?
             .into_inner();
@@ -1167,6 +1169,7 @@ async fn grpc_get_job_includes_status() -> anyhow::Result<()> {
                 shard: 0,
                 id: "status_test_job".to_string(),
                 tenant: None,
+                include_attempts: false,
             })
             .await?
             .into_inner();
@@ -1197,6 +1200,7 @@ async fn grpc_get_job_includes_status() -> anyhow::Result<()> {
                 shard: 0,
                 id: "status_test_job".to_string(),
                 tenant: None,
+                include_attempts: false,
             })
             .await?
             .into_inner();
@@ -1221,6 +1225,7 @@ async fn grpc_get_job_includes_status() -> anyhow::Result<()> {
                 shard: 0,
                 id: "status_test_job".to_string(),
                 tenant: None,
+                include_attempts: false,
             })
             .await?
             .into_inner();
@@ -2426,6 +2431,7 @@ async fn grpc_server_enqueue_with_rate_limit() -> anyhow::Result<()> {
                 shard: 0,
                 id: "rate-limited-job".to_string(),
                 tenant: None,
+                include_attempts: false,
             })
             .await?
             .into_inner();
@@ -2720,6 +2726,7 @@ async fn grpc_restart_cancelled_job() -> anyhow::Result<()> {
                 shard: 0,
                 id: job_id.clone(),
                 tenant: None,
+                include_attempts: false,
             })
             .await?
             .into_inner();
@@ -2740,6 +2747,7 @@ async fn grpc_restart_cancelled_job() -> anyhow::Result<()> {
                 shard: 0,
                 id: job_id.clone(),
                 tenant: None,
+                include_attempts: false,
             })
             .await?
             .into_inner();
@@ -2760,6 +2768,7 @@ async fn grpc_restart_cancelled_job() -> anyhow::Result<()> {
                 shard: 0,
                 id: job_id.clone(),
                 tenant: None,
+                include_attempts: false,
             })
             .await?
             .into_inner();
@@ -2794,6 +2803,7 @@ async fn grpc_restart_cancelled_job() -> anyhow::Result<()> {
                 shard: 0,
                 id: job_id.clone(),
                 tenant: None,
+                include_attempts: false,
             })
             .await?
             .into_inner();
@@ -2899,6 +2909,7 @@ async fn grpc_restart_failed_job() -> anyhow::Result<()> {
                 shard: 0,
                 id: job_id.clone(),
                 tenant: None,
+                include_attempts: false,
             })
             .await?
             .into_inner();
@@ -2919,6 +2930,7 @@ async fn grpc_restart_failed_job() -> anyhow::Result<()> {
                 shard: 0,
                 id: job_id.clone(),
                 tenant: None,
+                include_attempts: false,
             })
             .await?
             .into_inner();
@@ -2953,6 +2965,7 @@ async fn grpc_restart_failed_job() -> anyhow::Result<()> {
                 shard: 0,
                 id: job_id.clone(),
                 tenant: None,
+                include_attempts: false,
             })
             .await?
             .into_inner();
@@ -3113,6 +3126,7 @@ async fn grpc_restart_running_job_fails() -> anyhow::Result<()> {
                 shard: 0,
                 id: job_id.clone(),
                 tenant: None,
+                include_attempts: false,
             })
             .await?
             .into_inner();
@@ -3249,6 +3263,7 @@ async fn grpc_restart_succeeded_job_fails() -> anyhow::Result<()> {
                 shard: 0,
                 id: job_id.clone(),
                 tenant: None,
+                include_attempts: false,
             })
             .await?
             .into_inner();

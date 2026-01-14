@@ -12,7 +12,7 @@ function createMockClient(options?: {
     taskId: string,
     shard: number,
     tenant?: string
-  ) => Promise<void>;
+  ) => Promise<{ cancelled: boolean }>;
 }): SiloGRPCClient {
   return {
     leaseTasks:
@@ -20,7 +20,9 @@ function createMockClient(options?: {
       vi.fn().mockResolvedValue({ tasks: [], refreshTasks: [] }),
     reportOutcome:
       options?.reportOutcome ?? vi.fn().mockResolvedValue(undefined),
-    heartbeat: options?.heartbeat ?? vi.fn().mockResolvedValue(undefined),
+    heartbeat:
+      options?.heartbeat ?? vi.fn().mockResolvedValue({ cancelled: false }),
+    cancelJob: vi.fn().mockResolvedValue(undefined),
   } as unknown as SiloGRPCClient;
 }
 
@@ -401,7 +403,7 @@ describe("SiloWorker", () => {
         .mockResolvedValueOnce(tasksResult([task]))
         .mockResolvedValue(tasksResult([]));
       const reportOutcome = vi.fn().mockResolvedValue(undefined);
-      const heartbeat = vi.fn().mockResolvedValue(undefined);
+      const heartbeat = vi.fn().mockResolvedValue({ cancelled: false });
       const client = createMockClient({ leaseTasks, reportOutcome, heartbeat });
 
       const handler: TaskHandler = async () => {
@@ -440,7 +442,7 @@ describe("SiloWorker", () => {
         .mockResolvedValueOnce(tasksResult([task]))
         .mockResolvedValue(tasksResult([]));
       const reportOutcome = vi.fn().mockResolvedValue(undefined);
-      const heartbeat = vi.fn().mockResolvedValue(undefined);
+      const heartbeat = vi.fn().mockResolvedValue({ cancelled: false });
       const client = createMockClient({ leaseTasks, reportOutcome, heartbeat });
 
       const handler: TaskHandler = async () => {
@@ -584,7 +586,7 @@ describe("SiloWorker", () => {
   });
 
   describe("TaskContext", () => {
-    it("provides abort signal in context", async () => {
+    it("provides abort signal and cancel method in context", async () => {
       const task = createTask("task-sig", "job-sig");
       const leaseTasks = vi
         .fn()
@@ -594,9 +596,11 @@ describe("SiloWorker", () => {
       const client = createMockClient({ leaseTasks, reportOutcome });
 
       let receivedSignal: AbortSignal | undefined;
+      let receivedCancel: (() => Promise<void>) | undefined;
 
       const handler: TaskHandler = async (ctx) => {
         receivedSignal = ctx.signal;
+        receivedCancel = ctx.cancel;
         return { type: "success", result: {} };
       };
 
@@ -613,6 +617,8 @@ describe("SiloWorker", () => {
 
       expect(receivedSignal).toBeDefined();
       expect(receivedSignal).toBeInstanceOf(AbortSignal);
+      expect(receivedCancel).toBeDefined();
+      expect(typeof receivedCancel).toBe("function");
     });
   });
 });

@@ -182,6 +182,7 @@ fn grpc_end_to_end_under_turmoil() {
                 shard: 0,
                 tenant: None,
                 id: job_id.clone(),
+                include_attempts: false,
             }))
             .await?
             .into_inner();
@@ -371,6 +372,7 @@ fn grpc_fault_injection_with_partition() {
                 shard: 0,
                 tenant: None,
                 id: job_id.clone(),
+                include_attempts: false,
             }))
             .await?
             .into_inner();
@@ -858,6 +860,7 @@ fn stress_duplicate_completion_idempotency() {
                 shard: 0,
                 tenant: None,
                 id: job_id,
+                include_attempts: false,
             }))
             .await?
             .into_inner();

@@ -17,7 +17,9 @@ import {
   GubernatorAlgorithm,
   GubernatorBehavior,
   JobStatus as ProtoJobStatus,
+  AttemptStatus as ProtoAttemptStatus,
 } from "./pb/silo";
+import type { JobAttempt as ProtoJobAttempt } from "./pb/silo";
 import { JobHandle } from "./JobHandle";
 
 export type { QueryResponse, RetryPolicy, Task, ShardOwner };
@@ -316,6 +318,8 @@ export interface Job {
   status: JobStatus;
   /** Timestamp when the status last changed (epoch ms) */
   statusChangedAtMs: bigint;
+  /** All attempts for this job. Only populated if includeAttempts was true in the request to fetch the job. */
+  attempts?: JobAttempt[];
 }
 
 /** Possible job statuses */
@@ -325,6 +329,42 @@ export enum JobStatus {
   Succeeded = "Succeeded",
   Failed = "Failed",
   Cancelled = "Cancelled",
+}
+
+/** Possible attempt statuses */
+export enum AttemptStatus {
+  Running = "Running",
+  Succeeded = "Succeeded",
+  Failed = "Failed",
+  Cancelled = "Cancelled",
+}
+
+/** A single execution attempt of a job */
+export interface JobAttempt {
+  /** The job ID */
+  jobId: string;
+  /** Which attempt this is (1 = first attempt) */
+  attemptNumber: number;
+  /** Unique task ID for this attempt */
+  taskId: string;
+  /** Current status of the attempt */
+  status: AttemptStatus;
+  /** Timestamp when attempt started (epoch ms). Present if running. */
+  startedAtMs?: bigint;
+  /** Timestamp when attempt finished (epoch ms). Present if completed. */
+  finishedAtMs?: bigint;
+  /** Result data if attempt succeeded */
+  result?: JsonValueBytes;
+  /** Error code if attempt failed */
+  errorCode?: string;
+  /** Error data if attempt failed */
+  errorData?: Uint8Array;
+}
+
+/** Options for getJob */
+export interface GetJobOptions {
+  /** If true, include all attempts in the response. Defaults to false. */
+  includeAttempts?: boolean;
 }
 
 /** Result of awaiting a job completion */
@@ -494,7 +534,12 @@ export interface FailureOutcome {
   data?: unknown;
 }
 
-export type TaskOutcome = SuccessOutcome | FailureOutcome;
+/** Outcome for reporting task cancellation */
+export interface CancelledOutcome {
+  type: "cancelled";
+}
+
+export type TaskOutcome = SuccessOutcome | FailureOutcome | CancelledOutcome;
 
 /** Options for reporting task outcome */
 export interface ReportOutcomeOptions {
@@ -560,6 +605,14 @@ export interface ReportRefreshOutcomeOptions {
   outcome: RefreshOutcome;
   /** Tenant ID. Required when server has tenancy enabled. */
   tenant?: string;
+}
+
+/** Result from a heartbeat request */
+export interface HeartbeatResult {
+  /** True if the job has been cancelled. Worker should stop work and report Cancelled outcome. */
+  cancelled: boolean;
+  /** Timestamp (epoch ms) when cancellation was requested, if cancelled. */
+  cancelledAtMs?: bigint;
 }
 
 /** Result from leasing tasks - includes both job tasks and refresh tasks */
@@ -629,6 +682,43 @@ function protoJobStatusToPublic(status: ProtoJobStatus): JobStatus {
     default:
       throw new Error(`Unknown job status: ${status}`);
   }
+}
+
+/**
+ * Convert proto AttemptStatus enum to public AttemptStatus enum.
+ * @internal
+ */
+function protoAttemptStatusToPublic(status: ProtoAttemptStatus): AttemptStatus {
+  switch (status) {
+    case ProtoAttemptStatus.RUNNING:
+      return AttemptStatus.Running;
+    case ProtoAttemptStatus.SUCCEEDED:
+      return AttemptStatus.Succeeded;
+    case ProtoAttemptStatus.FAILED:
+      return AttemptStatus.Failed;
+    case ProtoAttemptStatus.CANCELLED:
+      return AttemptStatus.Cancelled;
+    default:
+      throw new Error(`Unknown attempt status: ${status}`);
+  }
+}
+
+/**
+ * Convert proto JobAttempt to public JobAttempt.
+ * @internal
+ */
+function protoAttemptToPublic(attempt: ProtoJobAttempt): JobAttempt {
+  return {
+    jobId: attempt.jobId,
+    attemptNumber: attempt.attemptNumber,
+    taskId: attempt.taskId,
+    status: protoAttemptStatusToPublic(attempt.status),
+    startedAtMs: attempt.startedAtMs,
+    finishedAtMs: attempt.finishedAtMs,
+    result: attempt.result,
+    errorCode: attempt.errorCode,
+    errorData: attempt.errorData,
+  };
 }
 
 /** Connection to a single server */
@@ -1014,12 +1104,17 @@ export class SiloGRPCClient {
 
   /**
    * Get a job by ID.
-   * @param id     The job ID.
-   * @param tenant Tenant ID for routing to the correct shard. Uses default tenant if not provided.
+   * @param id      The job ID.
+   * @param tenant  Tenant ID for routing to the correct shard. Uses default tenant if not provided.
+   * @param options Optional settings for the request.
    * @returns The job details.
    * @throws JobNotFoundError if the job doesn't exist.
    */
-  public async getJob(id: string, tenant?: string): Promise<Job> {
+  public async getJob(
+    id: string,
+    tenant?: string,
+    options?: GetJobOptions
+  ): Promise<Job> {
     try {
       return await this._withWrongShardRetry(tenant, async (client, shard) => {
         const call = client.getJob(
@@ -1027,6 +1122,7 @@ export class SiloGRPCClient {
             shard,
             id,
             tenant,
+            includeAttempts: options?.includeAttempts ?? false,
           },
           this._rpcOptions()
         );
@@ -1045,6 +1141,10 @@ export class SiloGRPCClient {
           metadata: response.metadata,
           status: protoJobStatusToPublic(response.status),
           statusChangedAtMs: response.statusChangedAtMs,
+          attempts:
+            response.attempts.length > 0
+              ? response.attempts.map(protoAttemptToPublic)
+              : undefined,
         };
       });
     } catch (error) {
@@ -1300,22 +1400,34 @@ export class SiloGRPCClient {
    * @throws TaskNotFoundError if the task (lease) doesn't exist.
    */
   public async reportOutcome(options: ReportOutcomeOptions): Promise<void> {
-    const outcome =
-      options.outcome.type === "success"
-        ? {
-            oneofKind: "success" as const,
-            success: { data: encodePayload(options.outcome.result) },
-          }
-        : {
-            oneofKind: "failure" as const,
-            failure: {
-              code: options.outcome.code,
-              data:
-                options.outcome.data instanceof Uint8Array
-                  ? options.outcome.data
-                  : encodePayload(options.outcome.data),
-            },
-          };
+    let outcome:
+      | { oneofKind: "success"; success: { data: Uint8Array } }
+      | { oneofKind: "failure"; failure: { code: string; data: Uint8Array } }
+      | { oneofKind: "cancelled"; cancelled: Record<string, never> };
+
+    if (options.outcome.type === "success") {
+      outcome = {
+        oneofKind: "success" as const,
+        success: { data: encodePayload(options.outcome.result) },
+      };
+    } else if (options.outcome.type === "failure") {
+      outcome = {
+        oneofKind: "failure" as const,
+        failure: {
+          code: options.outcome.code,
+          data:
+            options.outcome.data instanceof Uint8Array
+              ? options.outcome.data
+              : encodePayload(options.outcome.data),
+        },
+      };
+    } else {
+      // cancelled
+      outcome = {
+        oneofKind: "cancelled" as const,
+        cancelled: {},
+      };
+    }
 
     try {
       // Route to the correct shard (from Task.shard)
@@ -1392,6 +1504,7 @@ export class SiloGRPCClient {
    * @param taskId   The task ID.
    * @param shard    The shard the task came from (from Task.shard).
    * @param tenant   The tenant ID (required when tenancy is enabled).
+   * @returns HeartbeatResult indicating if the job was cancelled.
    * @throws TaskNotFoundError if the task (lease) doesn't exist.
    */
   public async heartbeat(
@@ -1399,10 +1512,10 @@ export class SiloGRPCClient {
     taskId: string,
     shard: number,
     tenant?: string
-  ): Promise<void> {
+  ): Promise<HeartbeatResult> {
     try {
       const client = this._getClientForShard(shard);
-      await client.heartbeat(
+      const call = client.heartbeat(
         {
           shard,
           workerId,
@@ -1411,6 +1524,11 @@ export class SiloGRPCClient {
         },
         this._rpcOptions()
       );
+      const response = await call.response;
+      return {
+        cancelled: response.cancelled,
+        cancelledAtMs: response.cancelledAtMs,
+      };
     } catch (error) {
       if (error instanceof RpcError && error.code === "NOT_FOUND") {
         throw new TaskNotFoundError(taskId);

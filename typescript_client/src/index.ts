@@ -1,6 +1,7 @@
 export {
   SiloGRPCClient,
   JobStatus,
+  AttemptStatus,
   JobNotFoundError,
   JobNotTerminalError,
   TaskNotFoundError,
@@ -17,15 +18,19 @@ export {
   type ReportOutcomeOptions,
   type SuccessOutcome,
   type FailureOutcome,
+  type CancelledOutcome,
   type TaskOutcome,
   type RefreshTask,
   type RefreshSuccessOutcome,
   type RefreshFailureOutcome,
   type RefreshOutcome,
   type ReportRefreshOutcomeOptions,
+  type HeartbeatResult,
   type Job,
+  type JobAttempt,
   type JobResult,
   type AwaitJobOptions,
+  type GetJobOptions,
   type JobLimit,
   type ConcurrencyLimitConfig,
   type RateLimitConfig,
@@ -42,6 +47,7 @@ export {
   type TaskHandler,
   type RefreshTaskContext,
   type RefreshHandler,
+  type CancellationReason,
 } from "./worker";
 export { JobHandle } from "./JobHandle";
 export type {

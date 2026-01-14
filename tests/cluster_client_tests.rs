@@ -199,7 +199,7 @@ async fn cluster_client_get_job_local() {
 
     // Get the job
     let response = client
-        .get_job(0, "test-tenant", "job-001")
+        .get_job(0, "test-tenant", "job-001", false)
         .await
         .expect("get job should succeed");
 
@@ -216,7 +216,7 @@ async fn cluster_client_get_job_not_found() {
     let client = ClusterClient::new(factory.clone(), None);
 
     // Get non-existent job
-    let result = client.get_job(0, "test-tenant", "non-existent").await;
+    let result = client.get_job(0, "test-tenant", "non-existent", false).await;
 
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -432,7 +432,7 @@ async fn cluster_client_get_job_on_remote_shard_without_coordinator() {
 
     // Try to get job on shard we don't own (without coordinator)
     let result = client
-        .get_job(999, "test-tenant", "some-job")
+        .get_job(999, "test-tenant", "some-job", false)
         .await;
 
     assert!(result.is_err());

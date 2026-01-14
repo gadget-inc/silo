@@ -20,7 +20,7 @@ pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("silo
 use crate::coordination::Coordinator;
 use crate::factory::{CloseAllError, ShardFactory};
 use crate::job::{GubernatorAlgorithm, GubernatorRateLimit, JobStatusKind, RateLimitRetryPolicy};
-use crate::job_attempt::AttemptOutcome;
+use crate::job_attempt::{AttemptOutcome, AttemptStatus as JobAttemptStatus};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::pb::silo_server::{Silo, SiloServer};
 use crate::pb::*;
@@ -126,6 +126,64 @@ pub fn job_limit_to_proto_limit(job_limit: crate::job::Limit) -> Limit {
                 },
             )),
         },
+    }
+}
+
+/// Convert a JobAttemptView to a proto JobAttempt
+pub fn job_attempt_view_to_proto(attempt: &crate::job_attempt::JobAttemptView) -> crate::pb::JobAttempt {
+    let state = attempt.state();
+    let (status, started_at_ms, finished_at_ms, result, error_code, error_data) = match state {
+        JobAttemptStatus::Running { started_at_ms } => (
+            AttemptStatus::Running,
+            Some(started_at_ms),
+            None,
+            None,
+            None,
+            None,
+        ),
+        JobAttemptStatus::Succeeded {
+            finished_at_ms,
+            result,
+        } => (
+            AttemptStatus::Succeeded,
+            None,
+            Some(finished_at_ms),
+            Some(JsonValueBytes { data: result }),
+            None,
+            None,
+        ),
+        JobAttemptStatus::Failed {
+            finished_at_ms,
+            error_code,
+            error,
+        } => (
+            AttemptStatus::Failed,
+            None,
+            Some(finished_at_ms),
+            None,
+            Some(error_code),
+            Some(error),
+        ),
+        JobAttemptStatus::Cancelled { finished_at_ms } => (
+            AttemptStatus::Cancelled,
+            None,
+            Some(finished_at_ms),
+            None,
+            None,
+            None,
+        ),
+    };
+
+    crate::pb::JobAttempt {
+        job_id: attempt.job_id().to_string(),
+        attempt_number: attempt.attempt_number(),
+        task_id: attempt.task_id().to_string(),
+        status: status.into(),
+        started_at_ms,
+        finished_at_ms,
+        result,
+        error_code,
+        error_data,
     }
 }
 
@@ -434,6 +492,21 @@ impl Silo for SiloService {
             randomize_interval: p.randomize_interval,
             backoff_factor: p.backoff_factor,
         });
+
+        // Optionally fetch attempts if requested
+        let attempts = if r.include_attempts {
+            let attempt_views = shard
+                .get_job_attempts(&tenant, &r.id)
+                .await
+                .map_err(map_err)?;
+            attempt_views
+                .into_iter()
+                .map(|a| job_attempt_view_to_proto(&a))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         let resp = GetJobResponse {
             id: view.id().to_string(),
             priority: view.priority() as u32,
@@ -450,6 +523,7 @@ impl Silo for SiloService {
             metadata: view.metadata().into_iter().collect(),
             status: status.into(),
             status_changed_at_ms,
+            attempts,
         };
         Ok(Response::new(resp))
     }
