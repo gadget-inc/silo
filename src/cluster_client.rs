@@ -387,6 +387,7 @@ impl ClusterClient {
                 status: status.into(),
                 status_changed_at_ms,
                 attempts,
+                next_attempt_starts_after_ms: job_status.next_attempt_starts_after_ms,
             });
         }
 

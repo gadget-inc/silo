@@ -320,6 +320,11 @@ export interface Job {
   statusChangedAtMs: bigint;
   /** All attempts for this job. Only populated if includeAttempts was true in the request to fetch the job. */
   attempts?: JobAttempt[];
+  /**
+   * Timestamp (epoch ms) when the next attempt will start.
+   * Present for scheduled jobs (initial or after retry), absent for running or terminal jobs.
+   */
+  nextAttemptStartsAfterMs?: bigint;
 }
 
 /** Possible job statuses */
@@ -1145,6 +1150,7 @@ export class SiloGRPCClient {
             response.attempts.length > 0
               ? response.attempts.map(protoAttemptToPublic)
               : undefined,
+          nextAttemptStartsAfterMs: response.nextAttemptStartsAfterMs,
         };
       });
     } catch (error) {

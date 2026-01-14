@@ -360,6 +360,10 @@ export interface GetJobResponse {
      * @generated from protobuf field: repeated silo.v1.JobAttempt attempts = 10
      */
     attempts: JobAttempt[]; // All attempts for this job. Only populated if include_attempts was true in the request.
+    /**
+     * @generated from protobuf field: optional int64 next_attempt_starts_after_ms = 11
+     */
+    nextAttemptStartsAfterMs?: bigint; // Unix timestamp (ms) when the next attempt will start. Present for scheduled jobs, absent for running or terminal jobs.
 }
 /**
  * Request to get the result of a completed job.
@@ -1999,7 +2003,8 @@ class GetJobResponse$Type extends MessageType<GetJobResponse> {
             { no: 7, name: "metadata", kind: "map", K: 9 /*ScalarType.STRING*/, V: { kind: "scalar", T: 9 /*ScalarType.STRING*/ } },
             { no: 8, name: "status", kind: "enum", T: () => ["silo.v1.JobStatus", JobStatus, "JOB_STATUS_"] },
             { no: 9, name: "status_changed_at_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
-            { no: 10, name: "attempts", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => JobAttempt }
+            { no: 10, name: "attempts", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => JobAttempt },
+            { no: 11, name: "next_attempt_starts_after_ms", kind: "scalar", opt: true, T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ }
         ]);
     }
     create(value?: PartialMessage<GetJobResponse>): GetJobResponse {
@@ -2050,6 +2055,9 @@ class GetJobResponse$Type extends MessageType<GetJobResponse> {
                     break;
                 case /* repeated silo.v1.JobAttempt attempts */ 10:
                     message.attempts.push(JobAttempt.internalBinaryRead(reader, reader.uint32(), options));
+                    break;
+                case /* optional int64 next_attempt_starts_after_ms */ 11:
+                    message.nextAttemptStartsAfterMs = reader.int64().toBigInt();
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -2109,6 +2117,9 @@ class GetJobResponse$Type extends MessageType<GetJobResponse> {
         /* repeated silo.v1.JobAttempt attempts = 10; */
         for (let i = 0; i < message.attempts.length; i++)
             JobAttempt.internalBinaryWrite(message.attempts[i], writer.tag(10, WireType.LengthDelimited).fork(), options).join();
+        /* optional int64 next_attempt_starts_after_ms = 11; */
+        if (message.nextAttemptStartsAfterMs !== undefined)
+            writer.tag(11, WireType.Varint).int64(message.nextAttemptStartsAfterMs);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);

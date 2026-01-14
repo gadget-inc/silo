@@ -12,7 +12,8 @@
 - [x] run next attempt now RPC (expedite)
   - [ ] figure out how to avoid having to scan for all future tasks and delete performance issue
 - [x] get job info api
-- [ ] get job with attempts api
+- [x] get job with attempts api
+- [ ] performant, clear storage for job payload, result, and error data
 - [x] list jobs api
 - [x] clustering
   - [x] etcd leasing

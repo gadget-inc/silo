@@ -191,34 +191,47 @@ impl JobStatusKind {
 pub struct JobStatus {
     pub kind: JobStatusKind,
     pub changed_at_ms: i64,
+    /// Unix timestamp (ms) when the next attempt will start.
+    /// Present for scheduled jobs (initial or retry), absent for running or terminal jobs.
+    pub next_attempt_starts_after_ms: Option<i64>,
 }
 
 impl JobStatus {
-    pub fn new(kind: JobStatusKind, changed_at_ms: i64) -> Self {
+    pub fn new(
+        kind: JobStatusKind,
+        changed_at_ms: i64,
+        next_attempt_starts_after_ms: Option<i64>,
+    ) -> Self {
         Self {
             kind,
             changed_at_ms,
+            next_attempt_starts_after_ms,
         }
     }
 
-    pub fn scheduled(changed_at_ms: i64) -> Self {
-        Self::new(JobStatusKind::Scheduled, changed_at_ms)
+    /// Create a Scheduled status with the next attempt start time.
+    pub fn scheduled(changed_at_ms: i64, next_attempt_starts_after_ms: i64) -> Self {
+        Self::new(
+            JobStatusKind::Scheduled,
+            changed_at_ms,
+            Some(next_attempt_starts_after_ms),
+        )
     }
 
     pub fn running(changed_at_ms: i64) -> Self {
-        Self::new(JobStatusKind::Running, changed_at_ms)
+        Self::new(JobStatusKind::Running, changed_at_ms, None)
     }
 
     pub fn failed(changed_at_ms: i64) -> Self {
-        Self::new(JobStatusKind::Failed, changed_at_ms)
+        Self::new(JobStatusKind::Failed, changed_at_ms, None)
     }
 
     pub fn cancelled(changed_at_ms: i64) -> Self {
-        Self::new(JobStatusKind::Cancelled, changed_at_ms)
+        Self::new(JobStatusKind::Cancelled, changed_at_ms, None)
     }
 
     pub fn succeeded(changed_at_ms: i64) -> Self {
-        Self::new(JobStatusKind::Succeeded, changed_at_ms)
+        Self::new(JobStatusKind::Succeeded, changed_at_ms, None)
     }
 
     pub fn is_terminal(&self) -> bool {
