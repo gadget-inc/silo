@@ -115,6 +115,28 @@ message GetJobRequest {
   uint32 shard = 1;          // Shard ID where the job is stored.
   string id = 2;             // The job's unique ID.
   optional string tenant = 3; // Tenant ID if multi-tenancy is enabled.
+  bool include_attempts = 4; // If true, include all attempts in the response. Defaults to false.
+}
+
+// Status of a job attempt in its lifecycle.
+enum AttemptStatus {
+  ATTEMPT_STATUS_RUNNING = 0;   // Attempt is currently running.
+  ATTEMPT_STATUS_SUCCEEDED = 1; // Attempt completed successfully.
+  ATTEMPT_STATUS_FAILED = 2;    // Attempt failed.
+  ATTEMPT_STATUS_CANCELLED = 3; // Attempt was cancelled.
+}
+
+// A single execution attempt of a job.
+message JobAttempt {
+  string job_id = 1;                     // The job's unique ID.
+  uint32 attempt_number = 2;             // Which attempt this is (1 = first attempt).
+  string task_id = 3;                    // Unique task ID for this attempt.
+  AttemptStatus status = 4;              // Current status of the attempt.
+  optional int64 started_at_ms = 5;      // Unix timestamp (ms) when attempt started. Present if running.
+  optional int64 finished_at_ms = 6;     // Unix timestamp (ms) when attempt finished. Present if completed.
+  optional JsonValueBytes result = 7;    // Result data if attempt succeeded.
+  optional string error_code = 8;        // Error code if attempt failed.
+  optional bytes error_data = 9;         // Error details if attempt failed.
 }
 
 // Full details of a job including its current state.
@@ -128,6 +150,7 @@ message GetJobResponse {
   map<string, string> metadata = 7;      // Metadata key/value pairs.
   JobStatus status = 8;                  // Current job status.
   int64 status_changed_at_ms = 9;        // Unix timestamp (ms) of last status change.
+  repeated JobAttempt attempts = 10;     // All attempts for this job. Only populated if include_attempts was true in the request.
 }
 
 // Request to get the result of a completed job.

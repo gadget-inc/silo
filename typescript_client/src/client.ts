@@ -17,7 +17,9 @@ import {
   GubernatorAlgorithm,
   GubernatorBehavior,
   JobStatus as ProtoJobStatus,
+  AttemptStatus as ProtoAttemptStatus,
 } from "./pb/silo";
+import type { JobAttempt as ProtoJobAttempt } from "./pb/silo";
 import { JobHandle } from "./JobHandle";
 
 export type { QueryResponse, RetryPolicy, Task, ShardOwner };
@@ -316,6 +318,8 @@ export interface Job {
   status: JobStatus;
   /** Timestamp when the status last changed (epoch ms) */
   statusChangedAtMs: bigint;
+  /** All attempts for this job. Only populated if includeAttempts was true in the request to fetch the job. */
+  attempts?: JobAttempt[];
 }
 
 /** Possible job statuses */
@@ -325,6 +329,42 @@ export enum JobStatus {
   Succeeded = "Succeeded",
   Failed = "Failed",
   Cancelled = "Cancelled",
+}
+
+/** Possible attempt statuses */
+export enum AttemptStatus {
+  Running = "Running",
+  Succeeded = "Succeeded",
+  Failed = "Failed",
+  Cancelled = "Cancelled",
+}
+
+/** A single execution attempt of a job */
+export interface JobAttempt {
+  /** The job ID */
+  jobId: string;
+  /** Which attempt this is (1 = first attempt) */
+  attemptNumber: number;
+  /** Unique task ID for this attempt */
+  taskId: string;
+  /** Current status of the attempt */
+  status: AttemptStatus;
+  /** Timestamp when attempt started (epoch ms). Present if running. */
+  startedAtMs?: bigint;
+  /** Timestamp when attempt finished (epoch ms). Present if completed. */
+  finishedAtMs?: bigint;
+  /** Result data if attempt succeeded */
+  result?: JsonValueBytes;
+  /** Error code if attempt failed */
+  errorCode?: string;
+  /** Error data if attempt failed */
+  errorData?: Uint8Array;
+}
+
+/** Options for getJob */
+export interface GetJobOptions {
+  /** If true, include all attempts in the response. Defaults to false. */
+  includeAttempts?: boolean;
 }
 
 /** Result of awaiting a job completion */
@@ -642,6 +682,43 @@ function protoJobStatusToPublic(status: ProtoJobStatus): JobStatus {
     default:
       throw new Error(`Unknown job status: ${status}`);
   }
+}
+
+/**
+ * Convert proto AttemptStatus enum to public AttemptStatus enum.
+ * @internal
+ */
+function protoAttemptStatusToPublic(status: ProtoAttemptStatus): AttemptStatus {
+  switch (status) {
+    case ProtoAttemptStatus.RUNNING:
+      return AttemptStatus.Running;
+    case ProtoAttemptStatus.SUCCEEDED:
+      return AttemptStatus.Succeeded;
+    case ProtoAttemptStatus.FAILED:
+      return AttemptStatus.Failed;
+    case ProtoAttemptStatus.CANCELLED:
+      return AttemptStatus.Cancelled;
+    default:
+      throw new Error(`Unknown attempt status: ${status}`);
+  }
+}
+
+/**
+ * Convert proto JobAttempt to public JobAttempt.
+ * @internal
+ */
+function protoAttemptToPublic(attempt: ProtoJobAttempt): JobAttempt {
+  return {
+    jobId: attempt.jobId,
+    attemptNumber: attempt.attemptNumber,
+    taskId: attempt.taskId,
+    status: protoAttemptStatusToPublic(attempt.status),
+    startedAtMs: attempt.startedAtMs,
+    finishedAtMs: attempt.finishedAtMs,
+    result: attempt.result,
+    errorCode: attempt.errorCode,
+    errorData: attempt.errorData,
+  };
 }
 
 /** Connection to a single server */
@@ -1027,12 +1104,17 @@ export class SiloGRPCClient {
 
   /**
    * Get a job by ID.
-   * @param id     The job ID.
-   * @param tenant Tenant ID for routing to the correct shard. Uses default tenant if not provided.
+   * @param id      The job ID.
+   * @param tenant  Tenant ID for routing to the correct shard. Uses default tenant if not provided.
+   * @param options Optional settings for the request.
    * @returns The job details.
    * @throws JobNotFoundError if the job doesn't exist.
    */
-  public async getJob(id: string, tenant?: string): Promise<Job> {
+  public async getJob(
+    id: string,
+    tenant?: string,
+    options?: GetJobOptions
+  ): Promise<Job> {
     try {
       return await this._withWrongShardRetry(tenant, async (client, shard) => {
         const call = client.getJob(
@@ -1040,6 +1122,7 @@ export class SiloGRPCClient {
             shard,
             id,
             tenant,
+            includeAttempts: options?.includeAttempts ?? false,
           },
           this._rpcOptions()
         );
@@ -1058,6 +1141,10 @@ export class SiloGRPCClient {
           metadata: response.metadata,
           status: protoJobStatusToPublic(response.status),
           statusChangedAtMs: response.statusChangedAtMs,
+          attempts:
+            response.attempts.length > 0
+              ? response.attempts.map(protoAttemptToPublic)
+              : undefined,
         };
       });
     } catch (error) {

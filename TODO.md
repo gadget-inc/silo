@@ -8,9 +8,10 @@
 - [x] GRPC layer for invoking functions
 - [ ] limits on payload, error, result size
 - [x] cancel api
-  - [ ] restart cancelled api
-- [ ] run next attempt now RPC
+  - [x] restart cancelled api
+- [ ] run next attempt now RPC (expedite)
 - [x] get job info api
+- [ ] get job with attempts api
 - [x] list jobs api
 - [x] clustering
   - [x] etcd leasing

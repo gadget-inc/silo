@@ -1,6 +1,7 @@
 export {
   SiloGRPCClient,
   JobStatus,
+  AttemptStatus,
   JobNotFoundError,
   JobNotTerminalError,
   TaskNotFoundError,
@@ -26,8 +27,10 @@ export {
   type ReportRefreshOutcomeOptions,
   type HeartbeatResult,
   type Job,
+  type JobAttempt,
   type JobResult,
   type AwaitJobOptions,
+  type GetJobOptions,
   type JobLimit,
   type ConcurrencyLimitConfig,
   type RateLimitConfig,

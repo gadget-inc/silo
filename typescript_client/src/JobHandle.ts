@@ -6,6 +6,7 @@ import {
   JobResult,
   JobNotTerminalError,
   sleep,
+  GetJobOptions,
 } from "./client";
 
 /**
@@ -58,11 +59,12 @@ export class JobHandle {
 
   /**
    * Get the full job details.
+   * @param options Optional settings for the request.
    * @returns The job details.
    * @throws JobNotFoundError if the job doesn't exist.
    */
-  public async getJob(): Promise<Job> {
-    return this._client.getJob(this.id, this.tenant);
+  public async getJob(options?: GetJobOptions): Promise<Job> {
+    return this._client.getJob(this.id, this.tenant, options);
   }
 
   /**

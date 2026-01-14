@@ -12,7 +12,8 @@ import type { PartialMessage } from "@protobuf-ts/runtime";
 import { reflectionMergePartial } from "@protobuf-ts/runtime";
 import { MessageType } from "@protobuf-ts/runtime";
 /**
- * Core job messages
+ * Container for arbitrary JSON data stored as raw bytes.
+ * Used for job payloads and results to allow flexible data structures.
  *
  * @generated from protobuf message silo.v1.JsonValueBytes
  */
@@ -20,35 +21,39 @@ export interface JsonValueBytes {
     /**
      * @generated from protobuf field: bytes data = 1
      */
-    data: Uint8Array; // raw JSON bytes
+    data: Uint8Array; // Raw JSON bytes. Callers should serialize/deserialize JSON as needed.
 }
 /**
+ * Configuration for automatic job retry on failure.
+ * When a job attempt fails, Silo will automatically retry according to this policy.
+ *
  * @generated from protobuf message silo.v1.RetryPolicy
  */
 export interface RetryPolicy {
     /**
      * @generated from protobuf field: uint32 retry_count = 1
      */
-    retryCount: number;
+    retryCount: number; // Maximum number of retry attempts after the initial attempt fails.
     /**
      * @generated from protobuf field: int64 initial_interval_ms = 2
      */
-    initialIntervalMs: bigint;
+    initialIntervalMs: bigint; // Initial delay in milliseconds before the first retry.
     /**
      * @generated from protobuf field: int64 max_interval_ms = 3
      */
-    maxIntervalMs: bigint;
+    maxIntervalMs: bigint; // Maximum delay between retries (caps exponential backoff).
     /**
      * @generated from protobuf field: bool randomize_interval = 4
      */
-    randomizeInterval: boolean;
+    randomizeInterval: boolean; // If true, adds jitter to retry intervals to prevent thundering herd.
     /**
      * @generated from protobuf field: double backoff_factor = 5
      */
-    backoffFactor: number;
+    backoffFactor: number; // Multiplier for exponential backoff (e.g., 2.0 doubles delay each retry).
 }
 /**
- * Per-job concurrency limit declaration
+ * Static concurrency limit that restricts how many jobs with the same key can run simultaneously.
+ * Jobs sharing the same key will queue up if max_concurrency is reached.
  *
  * @generated from protobuf message silo.v1.ConcurrencyLimit
  */
@@ -56,14 +61,16 @@ export interface ConcurrencyLimit {
     /**
      * @generated from protobuf field: string key = 1
      */
-    key: string; // grouping key; jobs with same key share a limit
+    key: string; // Grouping key - jobs with the same key share this limit.
     /**
      * @generated from protobuf field: uint32 max_concurrency = 2
      */
-    maxConcurrency: number; // maximum concurrent running jobs for this key
+    maxConcurrency: number; // Maximum number of jobs with this key that can run at once.
 }
 /**
- * Floating concurrency limit - max concurrency is dynamic and refreshed by workers
+ * Dynamic concurrency limit where the max_concurrency value is computed by workers.
+ * Useful when concurrency should be based on external factors like API rate limits.
+ * Workers periodically receive refresh tasks to update the limit.
  *
  * @generated from protobuf message silo.v1.FloatingConcurrencyLimit
  */
@@ -71,24 +78,25 @@ export interface FloatingConcurrencyLimit {
     /**
      * @generated from protobuf field: string key = 1
      */
-    key: string; // grouping key; jobs with same key share a limit
+    key: string; // Grouping key - jobs with the same key share this limit.
     /**
      * @generated from protobuf field: uint32 default_max_concurrency = 2
      */
-    defaultMaxConcurrency: number; // initial max concurrency value used until first refresh
+    defaultMaxConcurrency: number; // Initial max concurrency used until first worker refresh.
     /**
      * @generated from protobuf field: int64 refresh_interval_ms = 3
      */
-    refreshIntervalMs: bigint; // how often to refresh the max concurrency value
+    refreshIntervalMs: bigint; // How often workers receive refresh tasks (milliseconds).
     /**
      * @generated from protobuf field: map<string, string> metadata = 4
      */
     metadata: {
         [key: string]: string;
-    }; // arbitrary key/value metadata passed to workers during refresh
+    }; // Arbitrary data passed to workers during refresh (e.g., API credentials).
 }
 /**
- * Retry policy specifically for rate limit check retries (when rate limit is exceeded)
+ * Retry policy for when a job is blocked by a rate limit.
+ * Configures how long workers should wait before retrying the rate limit check.
  *
  * @generated from protobuf message silo.v1.RateLimitRetryPolicy
  */
@@ -96,22 +104,23 @@ export interface RateLimitRetryPolicy {
     /**
      * @generated from protobuf field: int64 initial_backoff_ms = 1
      */
-    initialBackoffMs: bigint; // Initial backoff time when rate limited
+    initialBackoffMs: bigint; // Initial wait time in milliseconds when rate limited.
     /**
      * @generated from protobuf field: int64 max_backoff_ms = 2
      */
-    maxBackoffMs: bigint; // Maximum backoff time
+    maxBackoffMs: bigint; // Maximum wait time between retries.
     /**
      * @generated from protobuf field: double backoff_multiplier = 3
      */
-    backoffMultiplier: number; // Multiplier for exponential backoff (default 2.0)
+    backoffMultiplier: number; // Multiplier for exponential backoff (default 2.0).
     /**
      * @generated from protobuf field: uint32 max_retries = 4
      */
-    maxRetries: number; // Maximum number of retries (0 = infinite until reset_time)
+    maxRetries: number; // Max retries before failing the job (0 = infinite until reset_time).
 }
 /**
- * Gubernator-based rate limit declaration
+ * Rate limit backed by the Gubernator distributed rate limiting service.
+ * Allows controlling job throughput based on request rates.
  *
  * @generated from protobuf message silo.v1.GubernatorRateLimit
  */
@@ -119,38 +128,39 @@ export interface GubernatorRateLimit {
     /**
      * @generated from protobuf field: string name = 1
      */
-    name: string; // Name identifying this rate limit (for debugging/metrics)
+    name: string; // Human-readable name for debugging and metrics.
     /**
      * @generated from protobuf field: string unique_key = 2
      */
-    uniqueKey: string; // Unique key for this specific rate limit instance
+    uniqueKey: string; // Unique identifier for this rate limit instance (e.g., user ID).
     /**
      * @generated from protobuf field: int64 limit = 3
      */
-    limit: bigint; // Maximum requests allowed in the duration
+    limit: bigint; // Maximum number of requests allowed within the duration.
     /**
      * @generated from protobuf field: int64 duration_ms = 4
      */
-    durationMs: bigint; // Duration window in milliseconds
+    durationMs: bigint; // Time window in milliseconds for the rate limit.
     /**
      * @generated from protobuf field: int32 hits = 5
      */
-    hits: number; // Number of hits to consume (usually 1)
+    hits: number; // Number of hits this job consumes (usually 1).
     /**
      * @generated from protobuf field: silo.v1.GubernatorAlgorithm algorithm = 6
      */
-    algorithm: GubernatorAlgorithm; // Rate limiting algorithm
+    algorithm: GubernatorAlgorithm; // Algorithm for rate limiting (token bucket or leaky bucket).
     /**
      * @generated from protobuf field: int32 behavior = 7
      */
-    behavior: number; // Behavior flags (bitwise OR of GubernatorBehavior)
+    behavior: number; // Behavior flags - combine GubernatorBehavior values with OR.
     /**
      * @generated from protobuf field: silo.v1.RateLimitRetryPolicy retry_policy = 8
      */
-    retryPolicy?: RateLimitRetryPolicy; // How to retry when rate limited
+    retryPolicy?: RateLimitRetryPolicy; // Policy for retrying when rate limited.
 }
 /**
- * A single limit that can be either a concurrency limit, rate limit, or floating concurrency limit
+ * Union type representing any kind of limit that can be applied to a job.
+ * Jobs can have multiple limits; all must be satisfied before execution.
  *
  * @generated from protobuf message silo.v1.Limit
  */
@@ -163,139 +173,197 @@ export interface Limit {
         /**
          * @generated from protobuf field: silo.v1.ConcurrencyLimit concurrency = 1
          */
-        concurrency: ConcurrencyLimit;
+        concurrency: ConcurrencyLimit; // Static concurrency limit.
     } | {
         oneofKind: "rateLimit";
         /**
          * @generated from protobuf field: silo.v1.GubernatorRateLimit rate_limit = 2
          */
-        rateLimit: GubernatorRateLimit;
+        rateLimit: GubernatorRateLimit; // Gubernator-based rate limit.
     } | {
         oneofKind: "floatingConcurrency";
         /**
          * @generated from protobuf field: silo.v1.FloatingConcurrencyLimit floating_concurrency = 3
          */
-        floatingConcurrency: FloatingConcurrencyLimit;
+        floatingConcurrency: FloatingConcurrencyLimit; // Dynamic worker-computed concurrency limit.
     } | {
         oneofKind: undefined;
     };
 }
 /**
+ * Request to enqueue a new job for processing.
+ *
  * @generated from protobuf message silo.v1.EnqueueRequest
  */
 export interface EnqueueRequest {
     /**
      * @generated from protobuf field: uint32 shard = 1
      */
-    shard: number; // shard id
+    shard: number; // Shard ID where the job should be stored.
     /**
      * @generated from protobuf field: string id = 2
      */
-    id: string; // optional
+    id: string; // Optional job ID. If empty, a random UUID is generated.
     /**
      * @generated from protobuf field: uint32 priority = 3
      */
-    priority: number; // 0..99, 0 highest
+    priority: number; // Priority from 0-99. Lower is higher priority (0 = highest).
     /**
      * @generated from protobuf field: int64 start_at_ms = 4
      */
-    startAtMs: bigint; // epoch ms
+    startAtMs: bigint; // Unix timestamp (ms) for future scheduling. 0 = run immediately.
     /**
      * @generated from protobuf field: optional silo.v1.RetryPolicy retry_policy = 5
      */
-    retryPolicy?: RetryPolicy; // optional
+    retryPolicy?: RetryPolicy; // Retry configuration. If absent, job fails on first error.
     /**
      * @generated from protobuf field: silo.v1.JsonValueBytes payload = 6
      */
-    payload?: JsonValueBytes; // JSON
+    payload?: JsonValueBytes; // Opaque JSON payload passed to workers.
     /**
      * @generated from protobuf field: repeated silo.v1.Limit limits = 7
      */
-    limits: Limit[]; // ordered list of limits to check before execution
+    limits: Limit[]; // Ordered list of limits checked before execution.
     /**
      * @generated from protobuf field: optional string tenant = 8
      */
-    tenant?: string; // optional tenant id when tenancy is enabled
+    tenant?: string; // Tenant ID for multi-tenant deployments. Optional.
     /**
      * @generated from protobuf field: map<string, string> metadata = 9
      */
     metadata: {
         [key: string]: string;
-    }; // arbitrary key/value metadata stored with the job
+    }; // Arbitrary key/value metadata stored with the job.
 }
 /**
+ * Response after successfully enqueueing a job.
+ *
  * @generated from protobuf message silo.v1.EnqueueResponse
  */
 export interface EnqueueResponse {
     /**
      * @generated from protobuf field: string id = 1
      */
-    id: string;
+    id: string; // The job's ID (either provided or auto-generated).
 }
 /**
+ * Request to retrieve details about a specific job.
+ *
  * @generated from protobuf message silo.v1.GetJobRequest
  */
 export interface GetJobRequest {
     /**
      * @generated from protobuf field: uint32 shard = 1
      */
-    shard: number;
+    shard: number; // Shard ID where the job is stored.
     /**
      * @generated from protobuf field: string id = 2
      */
-    id: string;
+    id: string; // The job's unique ID.
     /**
      * @generated from protobuf field: optional string tenant = 3
      */
-    tenant?: string;
+    tenant?: string; // Tenant ID if multi-tenancy is enabled.
+    /**
+     * @generated from protobuf field: bool include_attempts = 4
+     */
+    includeAttempts: boolean; // If true, include all attempts in the response. Defaults to false.
 }
 /**
+ * A single execution attempt of a job.
+ *
+ * @generated from protobuf message silo.v1.JobAttempt
+ */
+export interface JobAttempt {
+    /**
+     * @generated from protobuf field: string job_id = 1
+     */
+    jobId: string; // The job's unique ID.
+    /**
+     * @generated from protobuf field: uint32 attempt_number = 2
+     */
+    attemptNumber: number; // Which attempt this is (1 = first attempt).
+    /**
+     * @generated from protobuf field: string task_id = 3
+     */
+    taskId: string; // Unique task ID for this attempt.
+    /**
+     * @generated from protobuf field: silo.v1.AttemptStatus status = 4
+     */
+    status: AttemptStatus; // Current status of the attempt.
+    /**
+     * @generated from protobuf field: optional int64 started_at_ms = 5
+     */
+    startedAtMs?: bigint; // Unix timestamp (ms) when attempt started. Present if running.
+    /**
+     * @generated from protobuf field: optional int64 finished_at_ms = 6
+     */
+    finishedAtMs?: bigint; // Unix timestamp (ms) when attempt finished. Present if completed.
+    /**
+     * @generated from protobuf field: optional silo.v1.JsonValueBytes result = 7
+     */
+    result?: JsonValueBytes; // Result data if attempt succeeded.
+    /**
+     * @generated from protobuf field: optional string error_code = 8
+     */
+    errorCode?: string; // Error code if attempt failed.
+    /**
+     * @generated from protobuf field: optional bytes error_data = 9
+     */
+    errorData?: Uint8Array; // Error details if attempt failed.
+}
+/**
+ * Full details of a job including its current state.
+ *
  * @generated from protobuf message silo.v1.GetJobResponse
  */
 export interface GetJobResponse {
     /**
      * @generated from protobuf field: string id = 1
      */
-    id: string;
+    id: string; // The job's unique ID.
     /**
      * @generated from protobuf field: uint32 priority = 2
      */
-    priority: number;
+    priority: number; // Job priority (0 = highest, 99 = lowest).
     /**
      * @generated from protobuf field: int64 enqueue_time_ms = 3
      */
-    enqueueTimeMs: bigint;
+    enqueueTimeMs: bigint; // Unix timestamp (ms) when job was enqueued.
     /**
      * @generated from protobuf field: silo.v1.JsonValueBytes payload = 4
      */
-    payload?: JsonValueBytes;
+    payload?: JsonValueBytes; // The job's payload data.
     /**
      * @generated from protobuf field: optional silo.v1.RetryPolicy retry_policy = 5
      */
-    retryPolicy?: RetryPolicy; // presence indicates some policy
+    retryPolicy?: RetryPolicy; // Retry policy if configured.
     /**
      * @generated from protobuf field: repeated silo.v1.Limit limits = 6
      */
-    limits: Limit[]; // declared limits
+    limits: Limit[]; // Limits declared on this job.
     /**
      * @generated from protobuf field: map<string, string> metadata = 7
      */
     metadata: {
         [key: string]: string;
-    }; // arbitrary key/value metadata stored with the job
+    }; // Metadata key/value pairs.
     /**
      * @generated from protobuf field: silo.v1.JobStatus status = 8
      */
-    status: JobStatus; // current job status
+    status: JobStatus; // Current job status.
     /**
      * @generated from protobuf field: int64 status_changed_at_ms = 9
      */
-    statusChangedAtMs: bigint; // when the status last changed (epoch ms)
+    statusChangedAtMs: bigint; // Unix timestamp (ms) of last status change.
+    /**
+     * @generated from protobuf field: repeated silo.v1.JobAttempt attempts = 10
+     */
+    attempts: JobAttempt[]; // All attempts for this job. Only populated if include_attempts was true in the request.
 }
 /**
- * Get the result of a completed job.
- * Returns the job's result data if succeeded, error info if failed, or an error if the job
- * is not in a terminal state (still running/scheduled) or doesn't exist.
+ * Request to get the result of a completed job.
+ * Only succeeds if the job has reached a terminal state (succeeded, failed, or cancelled).
  *
  * @generated from protobuf message silo.v1.GetJobResultRequest
  */
@@ -303,19 +371,18 @@ export interface GetJobResultRequest {
     /**
      * @generated from protobuf field: uint32 shard = 1
      */
-    shard: number;
+    shard: number; // Shard ID where the job is stored.
     /**
      * @generated from protobuf field: string id = 2
      */
-    id: string;
+    id: string; // The job's unique ID.
     /**
      * @generated from protobuf field: optional string tenant = 3
      */
-    tenant?: string;
+    tenant?: string; // Tenant ID if multi-tenancy is enabled.
 }
 /**
- * Response for GetJobResult - the result depends on the job's terminal state.
- * Use the oneof to determine which outcome occurred.
+ * Result of a completed job. Check status to determine which result field is populated.
  *
  * @generated from protobuf message silo.v1.GetJobResultResponse
  */
@@ -323,17 +390,17 @@ export interface GetJobResultResponse {
     /**
      * @generated from protobuf field: string id = 1
      */
-    id: string;
+    id: string; // The job's unique ID.
     /**
      * @generated from protobuf field: silo.v1.JobStatus status = 2
      */
-    status: JobStatus; // The terminal status: SUCCEEDED, FAILED, or CANCELLED
+    status: JobStatus; // Terminal status: SUCCEEDED, FAILED, or CANCELLED.
     /**
      * @generated from protobuf field: int64 finished_at_ms = 3
      */
-    finishedAtMs: bigint; // When the job reached its terminal state (epoch ms)
+    finishedAtMs: bigint; // Unix timestamp (ms) when job reached terminal state.
     /**
-     * The result data depends on the terminal status
+     * The result depends on the terminal status.
      *
      * @generated from protobuf oneof: result
      */
@@ -342,25 +409,25 @@ export interface GetJobResultResponse {
         /**
          * @generated from protobuf field: silo.v1.JsonValueBytes success_data = 4
          */
-        successData: JsonValueBytes; // Result data if status == SUCCEEDED
+        successData: JsonValueBytes; // Present if status == SUCCEEDED. Contains job result.
     } | {
         oneofKind: "failure";
         /**
          * @generated from protobuf field: silo.v1.JobFailure failure = 5
          */
-        failure: JobFailure; // Error info if status == FAILED
+        failure: JobFailure; // Present if status == FAILED. Contains error details.
     } | {
         oneofKind: "cancelled";
         /**
          * @generated from protobuf field: silo.v1.JobCancelled cancelled = 6
          */
-        cancelled: JobCancelled; // Cancellation info if status == CANCELLED
+        cancelled: JobCancelled; // Present if status == CANCELLED. Contains cancellation info.
     } | {
         oneofKind: undefined;
     };
 }
 /**
- * Information about a failed job
+ * Error information for a failed job.
  *
  * @generated from protobuf message silo.v1.JobFailure
  */
@@ -368,14 +435,14 @@ export interface JobFailure {
     /**
      * @generated from protobuf field: string error_code = 1
      */
-    errorCode: string; // Application-defined error code
+    errorCode: string; // Application-defined error code.
     /**
      * @generated from protobuf field: bytes error_data = 2
      */
-    errorData: Uint8Array; // Error details (typically JSON)
+    errorData: Uint8Array; // Error details, typically JSON-encoded.
 }
 /**
- * Information about a cancelled job
+ * Information about a cancelled job.
  *
  * @generated from protobuf message silo.v1.JobCancelled
  */
@@ -383,48 +450,56 @@ export interface JobCancelled {
     /**
      * @generated from protobuf field: int64 cancelled_at_ms = 1
      */
-    cancelledAtMs: bigint; // When the job was cancelled (epoch ms)
+    cancelledAtMs: bigint; // Unix timestamp (ms) when cancellation was requested.
 }
 /**
+ * Request to permanently delete a job and all its data.
+ *
  * @generated from protobuf message silo.v1.DeleteJobRequest
  */
 export interface DeleteJobRequest {
     /**
      * @generated from protobuf field: uint32 shard = 1
      */
-    shard: number;
+    shard: number; // Shard ID where the job is stored.
     /**
      * @generated from protobuf field: string id = 2
      */
-    id: string;
+    id: string; // The job's unique ID.
     /**
      * @generated from protobuf field: optional string tenant = 3
      */
-    tenant?: string;
+    tenant?: string; // Tenant ID if multi-tenancy is enabled.
 }
 /**
+ * Response confirming job deletion.
+ *
  * @generated from protobuf message silo.v1.DeleteJobResponse
  */
 export interface DeleteJobResponse {
 }
 /**
+ * Request to cancel a job. Running jobs will be notified via heartbeat response.
+ *
  * @generated from protobuf message silo.v1.CancelJobRequest
  */
 export interface CancelJobRequest {
     /**
      * @generated from protobuf field: uint32 shard = 1
      */
-    shard: number;
+    shard: number; // Shard ID where the job is stored.
     /**
      * @generated from protobuf field: string id = 2
      */
-    id: string;
+    id: string; // The job's unique ID.
     /**
      * @generated from protobuf field: optional string tenant = 3
      */
-    tenant?: string;
+    tenant?: string; // Tenant ID if multi-tenancy is enabled.
 }
 /**
+ * Response confirming cancellation was requested.
+ *
  * @generated from protobuf message silo.v1.CancelJobResponse
  */
 export interface CancelJobResponse {
@@ -476,40 +551,43 @@ export interface LeaseTasksRequest {
     maxTasks: number;
 }
 /**
+ * A task representing a single job attempt leased to a worker.
+ *
  * @generated from protobuf message silo.v1.Task
  */
 export interface Task {
     /**
      * @generated from protobuf field: string id = 1
      */
-    id: string; // task id
+    id: string; // Unique task ID (different from job ID).
     /**
      * @generated from protobuf field: string job_id = 2
      */
-    jobId: string;
+    jobId: string; // ID of the job this task belongs to.
     /**
      * @generated from protobuf field: uint32 attempt_number = 3
      */
-    attemptNumber: number;
+    attemptNumber: number; // Which attempt this is (1 = first attempt).
     /**
      * @generated from protobuf field: int64 lease_ms = 4
      */
-    leaseMs: bigint; // how long to heartbeat in ms
+    leaseMs: bigint; // How long the lease lasts. Heartbeat before this expires.
     /**
      * @generated from protobuf field: silo.v1.JsonValueBytes payload = 5
      */
-    payload?: JsonValueBytes; // job payload for convenience
+    payload?: JsonValueBytes; // The job's payload for the worker to process.
     /**
      * @generated from protobuf field: uint32 priority = 6
      */
-    priority: number;
+    priority: number; // Job priority (for informational purposes).
     /**
      * @generated from protobuf field: uint32 shard = 7
      */
-    shard: number; // which shard this task came from (for reporting outcomes)
+    shard: number; // Shard this task came from (needed for reporting outcome).
 }
 /**
- * Task for refreshing a floating concurrency limit - workers compute new max concurrency
+ * Task for refreshing a floating concurrency limit.
+ * Workers compute the new max_concurrency and report back.
  *
  * @generated from protobuf message silo.v1.RefreshFloatingLimitTask
  */
@@ -517,49 +595,51 @@ export interface RefreshFloatingLimitTask {
     /**
      * @generated from protobuf field: string id = 1
      */
-    id: string; // task id
+    id: string; // Unique task ID for this refresh.
     /**
      * @generated from protobuf field: string queue_key = 2
      */
-    queueKey: string; // the floating limit queue key
+    queueKey: string; // The floating limit key being refreshed.
     /**
      * @generated from protobuf field: uint32 current_max_concurrency = 3
      */
-    currentMaxConcurrency: number; // the current max concurrency value
+    currentMaxConcurrency: number; // Current max concurrency value.
     /**
      * @generated from protobuf field: int64 last_refreshed_at_ms = 4
      */
-    lastRefreshedAtMs: bigint; // when the value was last refreshed
+    lastRefreshedAtMs: bigint; // Unix timestamp (ms) of last refresh.
     /**
      * @generated from protobuf field: map<string, string> metadata = 5
      */
     metadata: {
         [key: string]: string;
-    }; // opaque metadata from the limit definition
+    }; // Metadata from the limit definition.
     /**
      * @generated from protobuf field: int64 lease_ms = 6
      */
-    leaseMs: bigint; // how long to heartbeat in ms
+    leaseMs: bigint; // How long the lease lasts. Heartbeat before this expires.
     /**
      * @generated from protobuf field: uint32 shard = 7
      */
-    shard: number; // which shard this task came from (for reporting outcomes)
+    shard: number; // Shard this task came from (needed for reporting outcome).
 }
 /**
+ * Response containing tasks leased to a worker.
+ *
  * @generated from protobuf message silo.v1.LeaseTasksResponse
  */
 export interface LeaseTasksResponse {
     /**
      * @generated from protobuf field: repeated silo.v1.Task tasks = 1
      */
-    tasks: Task[];
+    tasks: Task[]; // Job execution tasks.
     /**
      * @generated from protobuf field: repeated silo.v1.RefreshFloatingLimitTask refresh_tasks = 2
      */
-    refreshTasks: RefreshFloatingLimitTask[]; // floating limit refresh tasks
+    refreshTasks: RefreshFloatingLimitTask[]; // Floating limit refresh tasks.
 }
 /**
- * Report the outcome of a job attempt task from a worker back to the server
+ * Request to report the outcome of a completed task.
  *
  * @generated from protobuf message silo.v1.ReportOutcomeRequest
  */
@@ -567,15 +647,15 @@ export interface ReportOutcomeRequest {
     /**
      * @generated from protobuf field: uint32 shard = 1
      */
-    shard: number;
+    shard: number; // Shard the task came from.
     /**
      * @generated from protobuf field: string task_id = 2
      */
-    taskId: string;
+    taskId: string; // The task's unique ID.
     /**
      * @generated from protobuf field: optional string tenant = 5
      */
-    tenant?: string;
+    tenant?: string; // Tenant ID if multi-tenancy is enabled.
     /**
      * @generated from protobuf oneof: outcome
      */
@@ -584,48 +664,54 @@ export interface ReportOutcomeRequest {
         /**
          * @generated from protobuf field: silo.v1.JsonValueBytes success = 3
          */
-        success: JsonValueBytes;
+        success: JsonValueBytes; // Job succeeded. Contains result data.
     } | {
         oneofKind: "failure";
         /**
          * @generated from protobuf field: silo.v1.Failure failure = 4
          */
-        failure: Failure;
+        failure: Failure; // Job failed. Contains error details.
     } | {
         oneofKind: "cancelled";
         /**
          * @generated from protobuf field: silo.v1.Cancelled cancelled = 6
          */
-        cancelled: Cancelled; // Worker acknowledges cancellation
+        cancelled: Cancelled; // Worker acknowledges job was cancelled.
     } | {
         oneofKind: undefined;
     };
 }
 /**
+ * Error details for a failed task.
+ *
  * @generated from protobuf message silo.v1.Failure
  */
 export interface Failure {
     /**
      * @generated from protobuf field: string code = 1
      */
-    code: string;
+    code: string; // Application-defined error code.
     /**
      * @generated from protobuf field: bytes data = 2
      */
-    data: Uint8Array;
+    data: Uint8Array; // Error details, typically JSON-encoded.
 }
 /**
+ * Marker indicating the worker acknowledges the job was cancelled.
+ *
  * @generated from protobuf message silo.v1.Cancelled
  */
 export interface Cancelled {
 }
 /**
+ * Response confirming outcome was recorded.
+ *
  * @generated from protobuf message silo.v1.ReportOutcomeResponse
  */
 export interface ReportOutcomeResponse {
 }
 /**
- * Report the outcome of a floating limit refresh task from a worker back to the server
+ * Request to report the outcome of a floating limit refresh task.
  *
  * @generated from protobuf message silo.v1.ReportRefreshOutcomeRequest
  */
@@ -633,15 +719,15 @@ export interface ReportRefreshOutcomeRequest {
     /**
      * @generated from protobuf field: uint32 shard = 1
      */
-    shard: number;
+    shard: number; // Shard the task came from.
     /**
      * @generated from protobuf field: string task_id = 2
      */
-    taskId: string;
+    taskId: string; // The task's unique ID.
     /**
      * @generated from protobuf field: optional string tenant = 3
      */
-    tenant?: string;
+    tenant?: string; // Tenant ID if multi-tenancy is enabled.
     /**
      * @generated from protobuf oneof: outcome
      */
@@ -650,84 +736,92 @@ export interface ReportRefreshOutcomeRequest {
         /**
          * @generated from protobuf field: silo.v1.RefreshSuccess success = 4
          */
-        success: RefreshSuccess;
+        success: RefreshSuccess; // Refresh succeeded with new max concurrency.
     } | {
         oneofKind: "failure";
         /**
          * @generated from protobuf field: silo.v1.RefreshFailure failure = 5
          */
-        failure: RefreshFailure;
+        failure: RefreshFailure; // Refresh failed.
     } | {
         oneofKind: undefined;
     };
 }
 /**
+ * Successful floating limit refresh with the new computed value.
+ *
  * @generated from protobuf message silo.v1.RefreshSuccess
  */
 export interface RefreshSuccess {
     /**
      * @generated from protobuf field: uint32 new_max_concurrency = 1
      */
-    newMaxConcurrency: number; // the new max concurrency value computed by the worker
+    newMaxConcurrency: number; // New max concurrency computed by the worker.
 }
 /**
+ * Error during floating limit refresh.
+ *
  * @generated from protobuf message silo.v1.RefreshFailure
  */
 export interface RefreshFailure {
     /**
      * @generated from protobuf field: string code = 1
      */
-    code: string; // error code
+    code: string; // Error code.
     /**
      * @generated from protobuf field: string message = 2
      */
-    message: string; // error message
+    message: string; // Human-readable error message.
 }
 /**
+ * Response confirming refresh outcome was recorded.
+ *
  * @generated from protobuf message silo.v1.ReportRefreshOutcomeResponse
  */
 export interface ReportRefreshOutcomeResponse {
 }
 /**
+ * Request to extend a task lease and check for cancellation.
+ * Workers must heartbeat before lease_ms expires to keep the task.
+ *
  * @generated from protobuf message silo.v1.HeartbeatRequest
  */
 export interface HeartbeatRequest {
     /**
      * @generated from protobuf field: uint32 shard = 1
      */
-    shard: number;
+    shard: number; // Shard the task came from.
     /**
      * @generated from protobuf field: string worker_id = 2
      */
-    workerId: string;
+    workerId: string; // Worker ID that holds the lease.
     /**
      * @generated from protobuf field: string task_id = 3
      */
-    taskId: string;
+    taskId: string; // The task's unique ID.
     /**
      * @generated from protobuf field: optional string tenant = 4
      */
-    tenant?: string;
+    tenant?: string; // Tenant ID if multi-tenancy is enabled.
 }
 /**
+ * Response indicating if the lease was extended and if the job was cancelled.
+ *
  * @generated from protobuf message silo.v1.HeartbeatResponse
  */
 export interface HeartbeatResponse {
     /**
-     * True if the job has been cancelled. Worker should stop work and report Cancelled outcome.
-     *
      * @generated from protobuf field: bool cancelled = 1
      */
-    cancelled: boolean;
+    cancelled: boolean; // True if job was cancelled. Worker should stop and report Cancelled.
     /**
-     * Timestamp (epoch ms) when cancellation was requested, if cancelled
-     *
      * @generated from protobuf field: optional int64 cancelled_at_ms = 2
      */
-    cancelledAtMs?: bigint;
+    cancelledAtMs?: bigint; // Unix timestamp (ms) when cancellation was requested, if cancelled.
 }
 /**
- * Execute an arbitrary SQL query against shard data
+ * Request to execute an arbitrary SQL query against shard data.
+ * Useful for ad-hoc inspection and debugging.
  *
  * @generated from protobuf message silo.v1.QueryRequest
  */
@@ -735,18 +829,18 @@ export interface QueryRequest {
     /**
      * @generated from protobuf field: uint32 shard = 1
      */
-    shard: number;
+    shard: number; // Shard to query.
     /**
      * @generated from protobuf field: string sql = 2
      */
-    sql: string;
+    sql: string; // SQL query string.
     /**
      * @generated from protobuf field: optional string tenant = 3
      */
-    tenant?: string;
+    tenant?: string; // Tenant ID to scope results, if multi-tenancy is enabled.
 }
 /**
- * Column metadata for the result schema
+ * Metadata about a column in query results.
  *
  * @generated from protobuf message silo.v1.ColumnInfo
  */
@@ -754,14 +848,14 @@ export interface ColumnInfo {
     /**
      * @generated from protobuf field: string name = 1
      */
-    name: string;
+    name: string; // Column name.
     /**
      * @generated from protobuf field: string data_type = 2
      */
-    dataType: string; // Arrow/DataFusion type as string (e.g. "Utf8", "Int64", "UInt8")
+    dataType: string; // Arrow/DataFusion type as string (e.g., "Utf8", "Int64").
 }
 /**
- * Query result row as JSON object
+ * Query results in JSON format.
  *
  * @generated from protobuf message silo.v1.QueryResponse
  */
@@ -769,18 +863,19 @@ export interface QueryResponse {
     /**
      * @generated from protobuf field: repeated silo.v1.ColumnInfo columns = 1
      */
-    columns: ColumnInfo[]; // Schema information
+    columns: ColumnInfo[]; // Schema information for the result columns.
     /**
      * @generated from protobuf field: repeated silo.v1.JsonValueBytes rows = 2
      */
-    rows: JsonValueBytes[]; // Each row is a JSON object
+    rows: JsonValueBytes[]; // Each row as a JSON object.
     /**
      * @generated from protobuf field: int32 row_count = 3
      */
-    rowCount: number; // Number of rows returned
+    rowCount: number; // Total number of rows returned.
 }
 /**
- * Execute SQL query with Arrow IPC streaming response
+ * Request to execute SQL query with Arrow IPC streaming response.
+ * More efficient than QueryResponse for large result sets.
  *
  * @generated from protobuf message silo.v1.QueryArrowRequest
  */
@@ -788,190 +883,224 @@ export interface QueryArrowRequest {
     /**
      * @generated from protobuf field: uint32 shard = 1
      */
-    shard: number;
+    shard: number; // Shard to query.
     /**
      * @generated from protobuf field: string sql = 2
      */
-    sql: string;
+    sql: string; // SQL query string.
     /**
      * @generated from protobuf field: optional string tenant = 3
      */
-    tenant?: string;
+    tenant?: string; // Tenant ID to scope results, if multi-tenancy is enabled.
 }
 /**
- * Arrow IPC encoded schema or record batch
+ * Arrow IPC encoded message. Part of a streaming response.
  *
  * @generated from protobuf message silo.v1.ArrowIpcMessage
  */
 export interface ArrowIpcMessage {
     /**
-     * Arrow IPC stream format: first message is schema, subsequent are record batches
-     *
      * @generated from protobuf field: bytes ipc_data = 1
      */
-    ipcData: Uint8Array;
+    ipcData: Uint8Array; // Arrow IPC stream data. First message is schema, subsequent are record batches.
 }
 /**
- * Cluster topology information for client-side routing
+ * Request to get cluster topology for client-side routing.
  *
  * @generated from protobuf message silo.v1.GetClusterInfoRequest
  */
 export interface GetClusterInfoRequest {
 }
 /**
+ * Information about which node owns a specific shard.
+ *
  * @generated from protobuf message silo.v1.ShardOwner
  */
 export interface ShardOwner {
     /**
      * @generated from protobuf field: uint32 shard_id = 1
      */
-    shardId: number;
+    shardId: number; // The shard ID.
     /**
      * @generated from protobuf field: string grpc_addr = 2
      */
-    grpcAddr: string; // The gRPC address of the server owning this shard
+    grpcAddr: string; // gRPC address of the node owning this shard.
     /**
      * @generated from protobuf field: string node_id = 3
      */
-    nodeId: string; // The node ID of the owner
+    nodeId: string; // Unique identifier of the owning node.
 }
 /**
+ * Cluster topology information.
+ *
  * @generated from protobuf message silo.v1.GetClusterInfoResponse
  */
 export interface GetClusterInfoResponse {
     /**
      * @generated from protobuf field: uint32 num_shards = 1
      */
-    numShards: number; // Total number of shards in the cluster
+    numShards: number; // Total number of shards in the cluster.
     /**
      * @generated from protobuf field: repeated silo.v1.ShardOwner shard_owners = 2
      */
-    shardOwners: ShardOwner[]; // Mapping of shards to their owners
+    shardOwners: ShardOwner[]; // Mapping of each shard to its owner.
     /**
      * @generated from protobuf field: string this_node_id = 3
      */
-    thisNodeId: string; // The node ID of the server responding
+    thisNodeId: string; // Node ID of the server responding.
     /**
      * @generated from protobuf field: string this_grpc_addr = 4
      */
-    thisGrpcAddr: string; // The gRPC address of the server responding
+    thisGrpcAddr: string; // gRPC address of the server responding.
 }
 /**
- * Admin request to reset all shards (dev mode only)
- * This clears all data from all shards owned by this server.
- * WARNING: This is a destructive operation intended only for testing.
+ * Request to reset all shards owned by this server.
+ * WARNING: Destructive operation. Only available in dev mode.
  *
  * @generated from protobuf message silo.v1.ResetShardsRequest
  */
 export interface ResetShardsRequest {
 }
 /**
+ * Response confirming shards were reset.
+ *
  * @generated from protobuf message silo.v1.ResetShardsResponse
  */
 export interface ResetShardsResponse {
     /**
      * @generated from protobuf field: uint32 shards_reset = 1
      */
-    shardsReset: number; // Number of shards that were reset
+    shardsReset: number; // Number of shards that were cleared.
 }
 /**
- * Gubernator rate limiting algorithm
+ * Rate limiting algorithm for Gubernator-based limits.
  *
  * @generated from protobuf enum silo.v1.GubernatorAlgorithm
  */
 export enum GubernatorAlgorithm {
     /**
-     * Token bucket algorithm
+     * Token bucket: tokens refill at steady rate, requests consume tokens.
      *
      * @generated from protobuf enum value: GUBERNATOR_ALGORITHM_TOKEN_BUCKET = 0;
      */
     TOKEN_BUCKET = 0,
     /**
-     * Leaky bucket algorithm
+     * Leaky bucket: requests processed at fixed rate, excess queued.
      *
      * @generated from protobuf enum value: GUBERNATOR_ALGORITHM_LEAKY_BUCKET = 1;
      */
     LEAKY_BUCKET = 1
 }
 /**
- * Gubernator behavior flags (can be combined via bitwise OR)
+ * Behavior flags for Gubernator rate limits. Can be combined via bitwise OR.
  *
  * @generated from protobuf enum silo.v1.GubernatorBehavior
  */
 export enum GubernatorBehavior {
     /**
-     * Default: batch requests to peers
+     * Default: batch rate limit checks to peers for efficiency.
      *
      * @generated from protobuf enum value: GUBERNATOR_BEHAVIOR_BATCHING = 0;
      */
     BATCHING = 0,
     /**
-     * Disable batching
+     * Send each rate limit check immediately (lower latency, higher load).
      *
      * @generated from protobuf enum value: GUBERNATOR_BEHAVIOR_NO_BATCHING = 1;
      */
     NO_BATCHING = 1,
     /**
-     * Global rate limit across all peers
+     * Synchronize rate limit globally across all Gubernator peers.
      *
      * @generated from protobuf enum value: GUBERNATOR_BEHAVIOR_GLOBAL = 2;
      */
     GLOBAL = 2,
     /**
-     * Duration resets on calendar boundaries
+     * Reset duration on calendar boundaries (minute, hour, day).
      *
      * @generated from protobuf enum value: GUBERNATOR_BEHAVIOR_DURATION_IS_GREGORIAN = 4;
      */
     DURATION_IS_GREGORIAN = 4,
     /**
-     * Reset the rate limit on this request
+     * Force reset the remaining counter on this request.
      *
      * @generated from protobuf enum value: GUBERNATOR_BEHAVIOR_RESET_REMAINING = 8;
      */
     RESET_REMAINING = 8,
     /**
-     * Drain remaining counter on over limit
+     * Set remaining to zero on first over-limit event.
      *
      * @generated from protobuf enum value: GUBERNATOR_BEHAVIOR_DRAIN_OVER_LIMIT = 16;
      */
     DRAIN_OVER_LIMIT = 16
 }
 /**
- * Job status enum representing the current state of a job
+ * Current state of a job in its lifecycle.
  *
  * @generated from protobuf enum silo.v1.JobStatus
  */
 export enum JobStatus {
     /**
-     * Job is waiting to be executed
+     * Job is waiting to be executed (queued or scheduled for future).
      *
      * @generated from protobuf enum value: JOB_STATUS_SCHEDULED = 0;
      */
     SCHEDULED = 0,
     /**
-     * Job is currently being processed by a worker
+     * Job is currently being processed by a worker.
      *
      * @generated from protobuf enum value: JOB_STATUS_RUNNING = 1;
      */
     RUNNING = 1,
     /**
-     * Job completed successfully
+     * Job completed successfully.
      *
      * @generated from protobuf enum value: JOB_STATUS_SUCCEEDED = 2;
      */
     SUCCEEDED = 2,
     /**
-     * Job failed after exhausting all retries
+     * Job failed after exhausting all retry attempts.
      *
      * @generated from protobuf enum value: JOB_STATUS_FAILED = 3;
      */
     FAILED = 3,
     /**
-     * Job was cancelled before completion
+     * Job was cancelled before completion.
      *
      * @generated from protobuf enum value: JOB_STATUS_CANCELLED = 4;
      */
     CANCELLED = 4
+}
+/**
+ * Status of a job attempt in its lifecycle.
+ *
+ * @generated from protobuf enum silo.v1.AttemptStatus
+ */
+export enum AttemptStatus {
+    /**
+     * Attempt is currently running.
+     *
+     * @generated from protobuf enum value: ATTEMPT_STATUS_RUNNING = 0;
+     */
+    RUNNING = 0,
+    /**
+     * Attempt completed successfully.
+     *
+     * @generated from protobuf enum value: ATTEMPT_STATUS_SUCCEEDED = 1;
+     */
+    SUCCEEDED = 1,
+    /**
+     * Attempt failed.
+     *
+     * @generated from protobuf enum value: ATTEMPT_STATUS_FAILED = 2;
+     */
+    FAILED = 2,
+    /**
+     * Attempt was cancelled.
+     *
+     * @generated from protobuf enum value: ATTEMPT_STATUS_CANCELLED = 3;
+     */
+    CANCELLED = 3
 }
 // @generated message type with reflection information, may provide speed optimized methods
 class JsonValueBytes$Type extends MessageType<JsonValueBytes> {
@@ -1661,13 +1790,15 @@ class GetJobRequest$Type extends MessageType<GetJobRequest> {
         super("silo.v1.GetJobRequest", [
             { no: 1, name: "shard", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
             { no: 2, name: "id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
-            { no: 3, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ }
+            { no: 3, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
+            { no: 4, name: "include_attempts", kind: "scalar", T: 8 /*ScalarType.BOOL*/ }
         ]);
     }
     create(value?: PartialMessage<GetJobRequest>): GetJobRequest {
         const message = globalThis.Object.create((this.messagePrototype!));
         message.shard = 0;
         message.id = "";
+        message.includeAttempts = false;
         if (value !== undefined)
             reflectionMergePartial<GetJobRequest>(this, message, value);
         return message;
@@ -1685,6 +1816,9 @@ class GetJobRequest$Type extends MessageType<GetJobRequest> {
                     break;
                 case /* optional string tenant */ 3:
                     message.tenant = reader.string();
+                    break;
+                case /* bool include_attempts */ 4:
+                    message.includeAttempts = reader.bool();
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -1707,6 +1841,9 @@ class GetJobRequest$Type extends MessageType<GetJobRequest> {
         /* optional string tenant = 3; */
         if (message.tenant !== undefined)
             writer.tag(3, WireType.LengthDelimited).string(message.tenant);
+        /* bool include_attempts = 4; */
+        if (message.includeAttempts !== false)
+            writer.tag(4, WireType.Varint).bool(message.includeAttempts);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -1717,6 +1854,112 @@ class GetJobRequest$Type extends MessageType<GetJobRequest> {
  * @generated MessageType for protobuf message silo.v1.GetJobRequest
  */
 export const GetJobRequest = new GetJobRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class JobAttempt$Type extends MessageType<JobAttempt> {
+    constructor() {
+        super("silo.v1.JobAttempt", [
+            { no: 1, name: "job_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "attempt_number", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
+            { no: 3, name: "task_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 4, name: "status", kind: "enum", T: () => ["silo.v1.AttemptStatus", AttemptStatus, "ATTEMPT_STATUS_"] },
+            { no: 5, name: "started_at_ms", kind: "scalar", opt: true, T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 6, name: "finished_at_ms", kind: "scalar", opt: true, T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 7, name: "result", kind: "message", T: () => JsonValueBytes },
+            { no: 8, name: "error_code", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
+            { no: 9, name: "error_data", kind: "scalar", opt: true, T: 12 /*ScalarType.BYTES*/ }
+        ]);
+    }
+    create(value?: PartialMessage<JobAttempt>): JobAttempt {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.jobId = "";
+        message.attemptNumber = 0;
+        message.taskId = "";
+        message.status = 0;
+        if (value !== undefined)
+            reflectionMergePartial<JobAttempt>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: JobAttempt): JobAttempt {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string job_id */ 1:
+                    message.jobId = reader.string();
+                    break;
+                case /* uint32 attempt_number */ 2:
+                    message.attemptNumber = reader.uint32();
+                    break;
+                case /* string task_id */ 3:
+                    message.taskId = reader.string();
+                    break;
+                case /* silo.v1.AttemptStatus status */ 4:
+                    message.status = reader.int32();
+                    break;
+                case /* optional int64 started_at_ms */ 5:
+                    message.startedAtMs = reader.int64().toBigInt();
+                    break;
+                case /* optional int64 finished_at_ms */ 6:
+                    message.finishedAtMs = reader.int64().toBigInt();
+                    break;
+                case /* optional silo.v1.JsonValueBytes result */ 7:
+                    message.result = JsonValueBytes.internalBinaryRead(reader, reader.uint32(), options, message.result);
+                    break;
+                case /* optional string error_code */ 8:
+                    message.errorCode = reader.string();
+                    break;
+                case /* optional bytes error_data */ 9:
+                    message.errorData = reader.bytes();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: JobAttempt, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string job_id = 1; */
+        if (message.jobId !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.jobId);
+        /* uint32 attempt_number = 2; */
+        if (message.attemptNumber !== 0)
+            writer.tag(2, WireType.Varint).uint32(message.attemptNumber);
+        /* string task_id = 3; */
+        if (message.taskId !== "")
+            writer.tag(3, WireType.LengthDelimited).string(message.taskId);
+        /* silo.v1.AttemptStatus status = 4; */
+        if (message.status !== 0)
+            writer.tag(4, WireType.Varint).int32(message.status);
+        /* optional int64 started_at_ms = 5; */
+        if (message.startedAtMs !== undefined)
+            writer.tag(5, WireType.Varint).int64(message.startedAtMs);
+        /* optional int64 finished_at_ms = 6; */
+        if (message.finishedAtMs !== undefined)
+            writer.tag(6, WireType.Varint).int64(message.finishedAtMs);
+        /* optional silo.v1.JsonValueBytes result = 7; */
+        if (message.result)
+            JsonValueBytes.internalBinaryWrite(message.result, writer.tag(7, WireType.LengthDelimited).fork(), options).join();
+        /* optional string error_code = 8; */
+        if (message.errorCode !== undefined)
+            writer.tag(8, WireType.LengthDelimited).string(message.errorCode);
+        /* optional bytes error_data = 9; */
+        if (message.errorData !== undefined)
+            writer.tag(9, WireType.LengthDelimited).bytes(message.errorData);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.JobAttempt
+ */
+export const JobAttempt = new JobAttempt$Type();
 // @generated message type with reflection information, may provide speed optimized methods
 class GetJobResponse$Type extends MessageType<GetJobResponse> {
     constructor() {
@@ -1729,7 +1972,8 @@ class GetJobResponse$Type extends MessageType<GetJobResponse> {
             { no: 6, name: "limits", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => Limit },
             { no: 7, name: "metadata", kind: "map", K: 9 /*ScalarType.STRING*/, V: { kind: "scalar", T: 9 /*ScalarType.STRING*/ } },
             { no: 8, name: "status", kind: "enum", T: () => ["silo.v1.JobStatus", JobStatus, "JOB_STATUS_"] },
-            { no: 9, name: "status_changed_at_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ }
+            { no: 9, name: "status_changed_at_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 10, name: "attempts", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => JobAttempt }
         ]);
     }
     create(value?: PartialMessage<GetJobResponse>): GetJobResponse {
@@ -1741,6 +1985,7 @@ class GetJobResponse$Type extends MessageType<GetJobResponse> {
         message.metadata = {};
         message.status = 0;
         message.statusChangedAtMs = 0n;
+        message.attempts = [];
         if (value !== undefined)
             reflectionMergePartial<GetJobResponse>(this, message, value);
         return message;
@@ -1776,6 +2021,9 @@ class GetJobResponse$Type extends MessageType<GetJobResponse> {
                     break;
                 case /* int64 status_changed_at_ms */ 9:
                     message.statusChangedAtMs = reader.int64().toBigInt();
+                    break;
+                case /* repeated silo.v1.JobAttempt attempts */ 10:
+                    message.attempts.push(JobAttempt.internalBinaryRead(reader, reader.uint32(), options));
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -1832,6 +2080,9 @@ class GetJobResponse$Type extends MessageType<GetJobResponse> {
         /* int64 status_changed_at_ms = 9; */
         if (message.statusChangedAtMs !== 0n)
             writer.tag(9, WireType.Varint).int64(message.statusChangedAtMs);
+        /* repeated silo.v1.JobAttempt attempts = 10; */
+        for (let i = 0; i < message.attempts.length; i++)
+            JobAttempt.internalBinaryWrite(message.attempts[i], writer.tag(10, WireType.LengthDelimited).fork(), options).join();
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);

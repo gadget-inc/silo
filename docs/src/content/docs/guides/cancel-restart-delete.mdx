@@ -1,0 +1,395 @@
+---
+title: Cancel, Restart, and Delete
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Jobs in Silo can be cancelled to stop processing, restarted to retry after failure, or deleted to permanently remove them from the system. This guide covers these lifecycle operations using the TypeScript client.
+
+## Cancelling Jobs
+
+Cancellation requests that a job stop processing. The behavior depends on the job's current state:
+
+- **Scheduled jobs**: The job is immediately marked as Cancelled and will never run
+- **Running jobs**: A cancellation flag is set; the worker discovers this on its next heartbeat and should stop processing
+
+### Using the Client
+
+You can cancel a job directly using the client:
+
+```typescript
+import { SiloGRPCClient, JobNotFoundError } from "@silo-ai/client";
+
+const client = new SiloGRPCClient({
+  servers: ["localhost:50051"],
+});
+
+// Cancel a job by ID
+try {
+  await client.cancelJob("job-123");
+  console.log("Job cancelled");
+} catch (error) {
+  if (error instanceof JobNotFoundError) {
+    console.log("Job not found");
+  }
+  throw error;
+}
+```
+
+If you're using tenancy, include the tenant:
+
+```typescript
+await client.cancelJob("job-123", "customer-456");
+```
+
+### Using Job Handles
+
+Job handles provide a convenient `cancel()` method:
+
+```typescript
+// From enqueue
+const handle = await client.enqueue({
+  payload: { task: "process-data" }
+});
+
+// Cancel anytime later
+await handle.cancel();
+```
+
+Or create a handle for an existing job:
+
+```typescript
+// Create a handle from a known job ID
+const handle = client.handle("job-123");
+await handle.cancel();
+
+// Or with a tenant
+const handle = client.handle("job-456", "customer-123");
+await handle.cancel();
+```
+
+### Cancellation Errors
+
+The `cancelJob()` method can throw several errors:
+
+| Error | Condition |
+|-------|-----------|
+| `JobNotFoundError` | The job ID does not exist |
+| `RpcError` (FAILED_PRECONDITION) | The job is already cancelled |
+| `RpcError` (FAILED_PRECONDITION) | The job is already in a terminal state (Succeeded or Failed) |
+
+<Aside type="tip" title="Cancellation is monotonic">
+Once a job is cancelled, it stays cancelled. Attempting to cancel an already-cancelled job returns an error, but you can use [`restart()`](#restarting-jobs) to allow the job to run again.
+</Aside>
+
+### How Workers Discover Cancellation
+
+When a job is running, workers discover cancellation through the heartbeat mechanism:
+
+```typescript
+// Worker code - heartbeat returns cancellation status
+const heartbeat = await client.heartbeat(workerId, taskId, shard, tenant);
+
+if (heartbeat.cancelled) {
+  console.log(`Job was cancelled at ${heartbeat.cancelledAtMs}`);
+  // Stop work and report cancelled outcome
+  await client.reportOutcome({
+    taskId,
+    shard,
+    outcome: { type: "cancelled" }
+  });
+}
+```
+
+<Aside type="caution" title="Workers must cooperate">
+Cancellation is cooperative—Silo notifies workers that a job should stop, but workers must check for cancellation and stop their own work. Long-running workers should heartbeat regularly to detect cancellations promptly.
+</Aside>
+
+## Deleting Jobs
+
+Deletion permanently removes a job and all its data from Silo. Unlike cancellation, deletion completely erases the job from storage.
+
+### Using the Client
+
+```typescript
+// Delete a job by ID
+await client.deleteJob("job-123");
+
+// With tenant
+await client.deleteJob("job-456", "customer-123");
+```
+
+### Using Job Handles
+
+```typescript
+const handle = client.handle("job-123");
+await handle.delete();
+```
+
+### Deletion Requirements
+
+<Aside type="caution" title="Jobs must be in a terminal state">
+You can only delete jobs that have finished processing. Jobs must be in one of these states:
+- **Succeeded** — completed successfully
+- **Failed** — failed after exhausting retries
+- **Cancelled** — was cancelled
+
+Attempting to delete a Scheduled or Running job will throw an error.
+</Aside>
+
+### Deletion Errors
+
+| Error | Condition |
+|-------|-----------|
+| `JobNotFoundError` | The job ID does not exist |
+| `RpcError` (INTERNAL) | The job is still in progress (Scheduled or Running) |
+
+To delete a running job, first cancel it, then delete:
+
+```typescript
+const handle = client.handle("job-123");
+
+// First cancel the job
+await handle.cancel();
+
+// Wait for cancellation to complete if needed
+// (Running jobs need time for the worker to acknowledge)
+const status = await handle.getStatus();
+if (status === JobStatus.Cancelled) {
+  await handle.delete();
+}
+```
+
+## Restarting Jobs
+
+Restarting allows you to re-run a job that has stopped—either because it was cancelled or because it failed after exhausting its retries. The job is re-queued with a fresh retry counter, giving it another chance to complete successfully.
+
+### When to Restart
+
+Restart is useful in several scenarios:
+
+- **Accidental cancellation**: A job was cancelled by mistake and needs to run
+- **Transient failures**: A job failed due to temporary issues (service outage, rate limits) that have been resolved
+- **Configuration fixes**: A job failed due to misconfiguration that has since been corrected
+- **Manual retry**: You want to give a failed job another attempt outside of its automatic retry policy
+
+### Using the Client
+
+You can restart a job directly using the client:
+
+```typescript
+import { SiloGRPCClient, JobNotFoundError } from "@silo-ai/client";
+
+const client = new SiloGRPCClient({
+  servers: ["localhost:50051"],
+});
+
+// Restart a job by ID
+try {
+  await client.restartJob("job-123");
+  console.log("Job restarted and re-queued");
+} catch (error) {
+  if (error instanceof JobNotFoundError) {
+    console.log("Job not found");
+  }
+  throw error;
+}
+```
+
+If you're using tenancy, include the tenant:
+
+```typescript
+await client.restartJob("job-123", "customer-456");
+```
+
+### Using Job Handles
+
+Job handles provide a convenient `restart()` method:
+
+```typescript
+// Create a handle for an existing job
+const handle = client.handle("job-123");
+await handle.restart();
+
+// Or with a tenant
+const handle = client.handle("job-456", "customer-123");
+await handle.restart();
+```
+
+### What Restart Does
+
+When you restart a job, Silo:
+
+1. **Clears the cancellation flag** (if the job was cancelled)
+2. **Creates a new task** with `attempt_number = 1`, resetting the retry counter
+3. **Sets the status to Scheduled**, placing the job back in the queue
+4. **Preserves the original job data** including payload, priority, limits, and metadata
+
+The job will be picked up by the next available worker and processed as if it were newly enqueued.
+
+<Aside type="tip" title="Fresh retry counter">
+Restarting always resets the attempt counter to 1. If the job has a retry policy, it gets a full set of fresh retries. This is intentional—restart is a manual intervention that signals you want to give the job a complete new chance.
+</Aside>
+
+### Restart Requirements
+
+Only jobs in terminal-but-recoverable states can be restarted:
+
+| Status | Can Restart? | Reason |
+|--------|--------------|--------|
+| **Cancelled** | ✅ Yes | Job was stopped before completion |
+| **Failed** | ✅ Yes | Job failed but can be retried |
+| **Succeeded** | ❌ No | Job completed successfully—nothing to retry |
+| **Scheduled** | ❌ No | Job is already queued to run |
+| **Running** | ❌ No | Job is currently being processed |
+
+<Aside type="caution" title="Succeeded jobs cannot be restarted">
+Once a job succeeds, it's truly terminal. If you need to run the same work again, enqueue a new job. This prevents accidental re-processing of completed work.
+</Aside>
+
+### Restart Errors
+
+The `restartJob()` method can throw several errors:
+
+| Error | Condition |
+|-------|-----------|
+| `JobNotFoundError` | The job ID does not exist |
+| `RpcError` (FAILED_PRECONDITION) | Job already succeeded (truly terminal) |
+| `RpcError` (FAILED_PRECONDITION) | Job is still in progress (Scheduled or Running) |
+
+```typescript
+import { RpcError } from "@protobuf-ts/runtime-rpc";
+
+try {
+  await handle.restart();
+  console.log("Job restarted successfully");
+} catch (error) {
+  if (error instanceof RpcError && error.code === "FAILED_PRECONDITION") {
+    // Check the message to understand why
+    console.log("Cannot restart job:", error.message);
+    // e.g., "job already succeeded" or "job is still in progress"
+  }
+  throw error;
+}
+```
+
+### Restarting Failed Jobs
+
+A common pattern is to monitor for failed jobs and restart them after fixing the underlying issue:
+
+```typescript
+import { JobStatus } from "@silo-ai/client";
+
+// Check if a job failed
+const handle = client.handle("job-123", "customer-456");
+const status = await handle.getStatus();
+
+if (status === JobStatus.Failed) {
+  // Get job details to understand the failure
+  const job = await handle.getJob();
+  console.log(`Job failed at ${job.statusChangedAtMs}`);
+  
+  // After fixing the issue, restart the job
+  await handle.restart();
+  console.log("Job restarted");
+}
+```
+
+### Restarting Cancelled Jobs
+
+If a job was cancelled by mistake, you can restart it to allow processing:
+
+```typescript
+import { JobStatus } from "@silo-ai/client";
+
+const handle = client.handle("job-123");
+const status = await handle.getStatus();
+
+if (status === JobStatus.Cancelled) {
+  // Restart the cancelled job
+  await handle.restart();
+  console.log("Cancelled job has been restarted");
+}
+```
+
+## Workflow Patterns
+
+### Cancel and Wait
+
+Wait for a running job to fully cancel before proceeding:
+
+```typescript
+async function cancelAndWait(handle: JobHandle, timeoutMs = 30000) {
+  await handle.cancel();
+  
+  const startTime = Date.now();
+  while (Date.now() - startTime < timeoutMs) {
+    const status = await handle.getStatus();
+    if (status === JobStatus.Cancelled) {
+      return;
+    }
+    // Still running, worker hasn't acknowledged yet
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+  throw new Error("Timeout waiting for job to cancel");
+}
+```
+
+### Safe Delete
+
+Delete a job regardless of its current state:
+
+```typescript
+import { JobNotFoundError, JobStatus } from "@silo-ai/client";
+
+async function safeDelete(handle: JobHandle) {
+  try {
+    const status = await handle.getStatus();
+    
+    // If running or scheduled, cancel first
+    if (status === JobStatus.Running || status === JobStatus.Scheduled) {
+      await handle.cancel();
+      // Wait for worker to acknowledge (if running)
+      while ((await handle.getStatus()) !== JobStatus.Cancelled) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+    
+    await handle.delete();
+  } catch (error) {
+    if (error instanceof JobNotFoundError) {
+      // Already deleted, that's fine
+      return;
+    }
+    throw error;
+  }
+}
+```
+
+### Graceful Shutdown
+
+Cancel all jobs for a tenant before shutdown:
+
+```typescript
+// Query for all non-terminal jobs
+const response = await client.query(
+  "SELECT id FROM jobs WHERE status IN ('Scheduled', 'Running')",
+  "customer-123"
+);
+
+// Cancel each job
+for (const row of response.rows) {
+  const jobId = row.values[0]; // Assuming first column is id
+  try {
+    await client.cancelJob(jobId, "customer-123");
+  } catch {
+    // Ignore errors (job may have completed)
+  }
+}
+```
+
+## Next Steps
+
+- Learn about [running workers](/guides/running-workers) to handle job execution and cancellation
+- Set up [observability](/guides/observability) to monitor cancellations and failures
+- Explore [concurrency limits](/guides/concurrency-limits) to control job execution

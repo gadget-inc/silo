@@ -314,6 +314,7 @@ impl ClusterClient {
         shard_id: u32,
         tenant: &str,
         job_id: &str,
+        include_attempts: bool,
     ) -> Result<GetJobResponse, ClusterClientError> {
         let shard_name = shard_id.to_string();
 
@@ -355,6 +356,20 @@ impl ClusterClient {
             };
             let status_changed_at_ms = job_status.changed_at_ms;
 
+            // Optionally fetch attempts if requested
+            let attempts = if include_attempts {
+                let attempt_views = shard
+                    .get_job_attempts(tenant, job_id)
+                    .await
+                    .map_err(|e| ClusterClientError::QueryFailed(e.to_string()))?;
+                attempt_views
+                    .into_iter()
+                    .map(|a| crate::server::job_attempt_view_to_proto(&a))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
             return Ok(GetJobResponse {
                 id: job_view.id().to_string(),
                 priority: job_view.priority() as u32,
@@ -371,6 +386,7 @@ impl ClusterClient {
                 metadata: job_view.metadata().into_iter().collect(),
                 status: status.into(),
                 status_changed_at_ms,
+                attempts,
             });
         }
 
@@ -383,6 +399,7 @@ impl ClusterClient {
             shard: shard_id,
             id: job_id.to_string(),
             tenant: Some(tenant.to_string()),
+            include_attempts,
         };
 
         let response = client.get_job(request).await.map_err(|e| {
