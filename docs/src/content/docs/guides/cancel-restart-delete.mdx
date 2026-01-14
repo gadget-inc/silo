@@ -1,10 +1,10 @@
 ---
-title: Cancel, Restart, and Delete
+title: Cancel, Restart, Delete
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 
-Jobs in Silo can be cancelled to stop processing, restarted to retry after failure, or deleted to permanently remove them from the system. This guide covers these lifecycle operations using the TypeScript client.
+Jobs in Silo can be cancelled to stop processing, restarted to retry after failure, deleted to permanently remove them from the system, or expedited to run immediately if they were scheduled for the future. This guide covers these lifecycle operations using the TypeScript client.
 
 ## Cancelling Jobs
 
@@ -311,6 +311,190 @@ if (status === JobStatus.Cancelled) {
   console.log("Cancelled job has been restarted");
 }
 ```
+
+## Expediting Jobs
+
+Expediting allows you to make a future-scheduled job or attempt run immediately, skipping any scheduled delay. This is useful for dragging forward jobs that were scheduled for later or for bypassing retry backoff delays.
+
+### When to Expedite
+
+Expedite is useful in several scenarios:
+
+- **User-initiated urgency**: A user requests immediate processing of a scheduled job
+- **Skip retry delays**: A job is waiting for retry backoff, but you've fixed the issue and want it to run now
+- **Testing scheduled jobs**: You want to test a future-scheduled job without waiting
+- **Priority escalation**: Business needs change and a scheduled job needs to run immediately
+
+### Using the Client
+
+You can expedite a job directly using the client:
+
+```typescript
+import { SiloGRPCClient, JobNotFoundError } from "@silo-ai/client";
+
+const client = new SiloGRPCClient({
+  servers: ["localhost:50051"],
+});
+
+// Expedite a job by ID
+try {
+  await client.expediteJob("job-123");
+  console.log("Job expedited and ready to run immediately");
+} catch (error) {
+  if (error instanceof JobNotFoundError) {
+    console.log("Job not found");
+  }
+  throw error;
+}
+```
+
+If you're using tenancy, include the tenant:
+
+```typescript
+await client.expediteJob("job-123", "customer-456");
+```
+
+### Using Job Handles
+
+Job handles provide a convenient `expedite()` method:
+
+```typescript
+// Create a handle for an existing job
+const handle = client.handle("job-123");
+await handle.expedite();
+
+// Or with a tenant
+const handle = client.handle("job-456", "customer-123");
+await handle.expedite();
+```
+
+### What Expedite Does
+
+When you expedite a job, Silo:
+
+1. **Finds the future-scheduled task** in the task queue
+2. **Updates the task timestamp** to the current time, making it immediately ready
+3. **Wakes up the task broker** to pick up the newly available task
+4. **Preserves all other job data** including attempt number, priority, limits, and metadata
+
+The job becomes immediately available for workers to lease and process.
+
+<Aside type="tip" title="Expedite vs Restart">
+Expedite is different from restart:
+- **Expedite** moves a future-scheduled attempt forward in time (keeps the same attempt number)
+- **Restart** creates a brand new attempt with a fresh retry counter (resets to attempt 1)
+
+Use expedite when you want to skip waiting time. Use restart when you want fresh retries.
+</Aside>
+
+### Expedite Requirements
+
+Only jobs with future-scheduled tasks can be expedited:
+
+| Condition | Can Expedite? | Reason |
+|-----------|---------------|--------|
+| **Future-scheduled task** | ✅ Yes | Task timestamp is in the future |
+| **Mid-retry with backoff** | ✅ Yes | Retry is scheduled for future due to exponential backoff |
+| **Ready to run now** | ❌ No | Task is already at current time or earlier |
+| **Running** | ❌ No | Job is currently being processed |
+| **Terminal (Succeeded/Failed)** | ❌ No | Job has finished processing |
+| **Cancelled** | ❌ No | Job was cancelled |
+| **No pending task** | ❌ No | Job has no task in the queue |
+
+<Aside type="caution" title="Task must be in the future">
+Expedite only works if the task's scheduled time is genuinely in the future. If a job is already ready to run (timestamp ≤ now), expediting it has no effect and will return an error. This prevents accidentally expediting jobs that are already being processed by the task broker.
+</Aside>
+
+### Expedite Errors
+
+The `expediteJob()` method can throw several errors:
+
+| Error | Condition |
+|-------|-----------|
+| `JobNotFoundError` | The job ID does not exist |
+| `RpcError` (FAILED_PRECONDITION) | Job is currently running |
+| `RpcError` (FAILED_PRECONDITION) | Job is terminal (Succeeded or Failed) |
+| `RpcError` (FAILED_PRECONDITION) | Job is cancelled |
+| `RpcError` (FAILED_PRECONDITION) | Task is already ready to run (not future-scheduled) |
+| `RpcError` (FAILED_PRECONDITION) | Job has no pending task in queue |
+
+```typescript
+import { RpcError } from "@protobuf-ts/runtime-rpc";
+
+try {
+  await handle.expedite();
+  console.log("Job expedited successfully");
+} catch (error) {
+  if (error instanceof RpcError && error.code === "FAILED_PRECONDITION") {
+    // Check the message to understand why
+    console.log("Cannot expedite job:", error.message);
+    // e.g., "job is already running" or "task is already ready to run"
+  }
+  throw error;
+}
+```
+
+### Expediting Scheduled Jobs
+
+The most common use case is expediting jobs that were enqueued with a future `startAtMs`:
+
+```typescript
+import { JobStatus } from "@silo-ai/client";
+
+// Enqueue a job to run 1 hour from now
+const handle = await client.enqueue({
+  payload: { task: "process-data" },
+  startAtMs: BigInt(Date.now() + 3_600_000), // 1 hour
+});
+
+// Check that it's scheduled
+const status = await handle.getStatus();
+console.log(status); // JobStatus.Scheduled
+
+// Business needs changed - run it now!
+await handle.expedite();
+
+// Job is now immediately available for workers
+```
+
+### Expediting Mid-Retry Jobs
+
+When a job is retrying with exponential backoff, you can skip the waiting period:
+
+```typescript
+import { JobStatus } from "@silo-ai/client";
+
+// A job failed and is scheduled to retry in 5 minutes
+const handle = client.handle("failed-job-123");
+const status = await handle.getStatus();
+
+if (status === JobStatus.Scheduled) {
+  // You fixed the underlying issue and want to retry immediately
+  await handle.expedite();
+  console.log("Retry backoff skipped - job will run now");
+}
+```
+
+<Aside type="tip" title="Checking if a job is future-scheduled">
+There's no direct API to check if a task is future-scheduled vs ready-to-run. Both show as `JobStatus.Scheduled`. If you need to know, you can try expediting and catch the error—if it fails with "task is already ready to run", then it's already in the task broker's queue.
+</Aside>
+
+### Expediting vs Higher Priority
+
+If you want a job to run sooner but it's not necessarily urgent, consider using priority instead of expediting:
+
+```typescript
+// During enqueue, use higher priority
+const handle = await client.enqueue({
+  payload: { task: "process-data" },
+  priority: 100, // Higher priority = processed sooner
+});
+
+// Expedite is for jobs that must run NOW
+// Priority is for jobs that should run SOONER
+```
+
+Expedite is an immediate operation that bypasses time entirely. Priority adjusts ordering among ready jobs. Priority can't be changed once a job has been enqueued.
 
 ## Workflow Patterns
 

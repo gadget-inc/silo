@@ -199,6 +199,9 @@ fn map_err(e: JobStoreShardError) -> Status {
         JobStoreShardError::JobNotRestartable(ref e) => {
             Status::failed_precondition(e.to_string())
         }
+        JobStoreShardError::JobNotExpediteable(ref e) => {
+            Status::failed_precondition(e.to_string())
+        }
         other => Status::internal(other.to_string()),
     }
 }
@@ -655,6 +658,17 @@ impl Silo for SiloService {
         let tenant = self.validate_tenant(r.tenant.as_deref())?;
         shard.restart_job(&tenant, &r.id).await.map_err(map_err)?;
         Ok(Response::new(RestartJobResponse {}))
+    }
+
+    async fn expedite_job(
+        &self,
+        req: Request<ExpediteJobRequest>,
+    ) -> Result<Response<ExpediteJobResponse>, Status> {
+        let r = req.into_inner();
+        let shard = self.shard_with_redirect(r.shard).await?;
+        let tenant = self.validate_tenant(r.tenant.as_deref())?;
+        shard.expedite_job(&tenant, &r.id).await.map_err(map_err)?;
+        Ok(Response::new(ExpediteJobResponse {}))
     }
 
     async fn lease_tasks(

@@ -211,6 +211,12 @@ message CancelJobResponse {}
 message RestartJobRequest { uint32 shard = 1; string id = 2; optional string tenant = 3; }
 message RestartJobResponse {}
 
+// Expedite a future-scheduled job to run immediately.
+// This is useful for dragging forward a job that was scheduled for the future,
+// or for skipping retry backoff delays on a mid-retry job.
+message ExpediteJobRequest { uint32 shard = 1; string id = 2; optional string tenant = 3; }
+message ExpediteJobResponse {}
+
 // Lease tasks for processing from this server.
 // By default, leases from all shards this server owns (fair distribution).
 // If shard is specified, filters to only that shard.
@@ -404,6 +410,13 @@ service Silo {
   // Returns FAILED_PRECONDITION if job is not in a restartable state.
   // Returns NOT_FOUND if the job doesn't exist.
   rpc RestartJob(RestartJobRequest) returns (RestartJobResponse);
+  
+  // Expedite a future-scheduled job to run immediately.
+  // Useful for dragging forward scheduled jobs or skipping retry backoff delays.
+  // Returns FAILED_PRECONDITION if job is not in an expeditable state
+  // (already running, terminal, cancelled, or task already ready to run).
+  // Returns NOT_FOUND if the job doesn't exist.
+  rpc ExpediteJob(ExpediteJobRequest) returns (ExpediteJobResponse);
   
   // Lease tasks for a worker to process.
   // Workers should call this periodically to get work.
