@@ -1,4 +1,3 @@
-use serde_json::json;
 use silo::job_store_shard::JobStoreShard;
 use silo::settings::{Backend, DatabaseConfig};
 use std::sync::Arc;
@@ -44,7 +43,8 @@ async fn measure_enqueue_throughput(
         let shard = Arc::clone(&shard);
         let handle = tokio::spawn(async move {
             for i in 0..jobs_per_producer {
-                let payload = json!({"producer": producer_id, "i": i});
+                let payload = rmp_serde::to_vec(&serde_json::json!({"producer": producer_id, "i": i}))
+                    .expect("serialize payload");
                 shard
                     .enqueue("-", None, 50, now_ms, None, payload, vec![], None)
                     .await
@@ -79,7 +79,8 @@ async fn measure_dequeue_throughput(
 
     // Seed tasks
     for i in 0..total_jobs {
-        let payload = json!({"i": i});
+        let payload = rmp_serde::to_vec(&serde_json::json!({"i": i}))
+            .expect("serialize payload");
         shard
             .enqueue("-", None, 50, now_ms, None, payload, vec![], None)
             .await

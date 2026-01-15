@@ -13,8 +13,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
 
         // Enqueue a few jobs with metadata
         for i in 0..3 {
-            let payload = serde_json::json!({ "index": i });
-            let payload_bytes = serde_json::to_vec(&payload)?;
+            let payload_bytes = rmp_serde::to_vec(&serde_json::json!({ "index": i })).unwrap();
             let mut md = std::collections::HashMap::new();
             md.insert("env".to_string(), "test".to_string());
             md.insert("batch".to_string(), "batch1".to_string());
@@ -24,7 +23,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
                 priority: (10 + i) as u32,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(JsonValueBytes {
+                payload: Some(MsgpackBytes {
                     data: payload_bytes,
                 }),
                 limits: vec![],
@@ -54,8 +53,8 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
             "expected priority column"
         );
 
-        // Verify rows are returned as JSON
-        let first_row: serde_json::Value = serde_json::from_slice(&query_resp.rows[0].data)?;
+        // Verify rows are returned as MessagePack
+        let first_row: serde_json::Value = rmp_serde::from_slice(&query_resp.rows[0].data)?;
         assert!(first_row.get("id").is_some(), "row should have id field");
 
         // Test 2: Query with WHERE clause
@@ -84,7 +83,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
             .into_inner();
 
         assert_eq!(query_resp.row_count, 1, "aggregation should return 1 row");
-        let count_row: serde_json::Value = serde_json::from_slice(&query_resp.rows[0].data)?;
+        let count_row: serde_json::Value = rmp_serde::from_slice(&query_resp.rows[0].data)?;
         assert_eq!(count_row["count"], 3, "count should be 3");
 
         shutdown_server(shutdown_tx, server).await?;
@@ -185,15 +184,14 @@ async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
         assert!(query_resp.rows.is_empty(), "should have no rows");
 
         // Add a job, then query with WHERE that matches nothing
-        let payload = serde_json::json!({ "test": "data" });
-        let payload_bytes = serde_json::to_vec(&payload)?;
+        let payload_bytes = rmp_serde::to_vec(&serde_json::json!({ "test": "data" })).unwrap();
         let enq = EnqueueRequest {
             shard: 0,
             id: "test_job".to_string(),
             priority: 10,
             start_at_ms: 0,
             retry_policy: None,
-            payload: Some(JsonValueBytes {
+            payload: Some(MsgpackBytes {
                 data: payload_bytes,
             }),
             limits: vec![],
@@ -238,7 +236,7 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
             "task": "process",
             "nested": { "field": "value" }
         });
-        let payload_bytes = serde_json::to_vec(&payload)?;
+        let payload_bytes = rmp_serde::to_vec(&payload)?;
         let mut md = std::collections::HashMap::new();
         md.insert("user_id".to_string(), "12345".to_string());
         md.insert("region".to_string(), "us-west".to_string());
@@ -249,7 +247,7 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
             priority: 5,
             start_at_ms: 1234567890,
             retry_policy: None,
-            payload: Some(JsonValueBytes {
+            payload: Some(MsgpackBytes {
                 data: payload_bytes,
             }),
             limits: vec![],
@@ -283,7 +281,7 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
             .any(|c| c.name == "enqueue_time_ms" && c.data_type.contains("Int64")));
 
         // Verify row is valid JSON that TypeScript can deserialize
-        let row: serde_json::Value = serde_json::from_slice(&query_resp.rows[0].data)?;
+        let row: serde_json::Value = rmp_serde::from_slice(&query_resp.rows[0].data)?;
         assert_eq!(row["id"], "complex_job");
         assert_eq!(row["priority"], 5);
         assert_eq!(row["enqueue_time_ms"], 1234567890);
@@ -312,6 +310,7 @@ async fn grpc_server_query_without_tenant() -> anyhow::Result<()> {
             setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
 
         // Enqueue jobs via gRPC (will use default tenant "-")
+        let empty_payload = rmp_serde::to_vec(&serde_json::json!({})).unwrap();
         for i in 0..3 {
             let enq = EnqueueRequest {
                 shard: 0,
@@ -319,8 +318,8 @@ async fn grpc_server_query_without_tenant() -> anyhow::Result<()> {
                 priority: 10,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(JsonValueBytes {
-                    data: b"{}".to_vec(),
+                payload: Some(MsgpackBytes {
+                    data: empty_payload.clone(),
                 }),
                 limits: vec![],
                 tenant: None, // Will use default tenant
@@ -368,6 +367,126 @@ async fn grpc_server_query_without_tenant() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Test that MessagePack serialization handles all Arrow data types correctly.
+/// This exercises the streaming serializer's type-specific encoding paths.
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_query_msgpack_data_types() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        // Enqueue jobs with different priorities and start times to test numeric types
+        for i in 0..3 {
+            let payload_bytes = rmp_serde::to_vec(&serde_json::json!({ "value": i * 100 })).unwrap();
+            let enq = EnqueueRequest {
+                shard: 0,
+                id: format!("type_test_{}", i),
+                priority: (i * 50) as u32, // 0, 50, 100
+                start_at_ms: 1000000000 + (i as i64 * 1000), // Different timestamps
+                retry_policy: None,
+                payload: Some(MsgpackBytes {
+                    data: payload_bytes,
+                }),
+                limits: vec![],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+            };
+            let _ = client.enqueue(enq).await?;
+        }
+
+        // Query with various computed columns to exercise different types
+        // Columns: shard_id (UInt32), tenant (Utf8), id (Utf8), priority (UInt8),
+        //          enqueue_time_ms (Int64), payload (Utf8), status_kind (Utf8),
+        //          status_changed_at_ms (Int64), metadata (Map)
+        let query_resp = client
+            .query(QueryRequest {
+                shard: 0,
+                sql: r#"
+                    SELECT 
+                        id,
+                        shard_id,
+                        priority,
+                        enqueue_time_ms,
+                        status_changed_at_ms,
+                        priority > 25 as is_high_priority,
+                        CAST(priority AS DOUBLE) / 100.0 as priority_ratio,
+                        CASE WHEN priority = 0 THEN NULL ELSE enqueue_time_ms END as nullable_time
+                    FROM jobs 
+                    ORDER BY id
+                "#.to_string(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+
+        assert_eq!(query_resp.row_count, 3, "expected 3 rows");
+
+        // Deserialize all rows and verify types
+        let rows: Vec<serde_json::Value> = query_resp
+            .rows
+            .iter()
+            .map(|r| rmp_serde::from_slice(&r.data).unwrap())
+            .collect();
+
+        // Row 0: priority=0, enqueue_time_ms=1000000000
+        assert_eq!(rows[0]["id"], "type_test_0");
+        assert_eq!(rows[0]["shard_id"], 0); // UInt32
+        assert_eq!(rows[0]["priority"], 0); // UInt8
+        assert_eq!(rows[0]["enqueue_time_ms"], 1000000000_i64); // Int64
+        assert_eq!(rows[0]["is_high_priority"], false); // Boolean false
+        assert!((rows[0]["priority_ratio"].as_f64().unwrap() - 0.0).abs() < 0.001); // Float64
+        assert!(rows[0]["nullable_time"].is_null()); // Null (because priority = 0)
+
+        // Row 1: priority=50, enqueue_time_ms=1000001000
+        assert_eq!(rows[1]["id"], "type_test_1");
+        assert_eq!(rows[1]["priority"], 50);
+        assert_eq!(rows[1]["enqueue_time_ms"], 1000001000_i64);
+        assert_eq!(rows[1]["is_high_priority"], true); // Boolean true
+        assert!((rows[1]["priority_ratio"].as_f64().unwrap() - 0.5).abs() < 0.001);
+        assert!(!rows[1]["nullable_time"].is_null()); // Not null (priority != 0)
+
+        // Row 2: priority=100, enqueue_time_ms=1000002000
+        assert_eq!(rows[2]["id"], "type_test_2");
+        assert_eq!(rows[2]["priority"], 100);
+        assert_eq!(rows[2]["enqueue_time_ms"], 1000002000_i64);
+        assert!((rows[2]["priority_ratio"].as_f64().unwrap() - 1.0).abs() < 0.001);
+
+        // Test aggregation with different result types
+        let agg_resp = client
+            .query(QueryRequest {
+                shard: 0,
+                sql: r#"
+                    SELECT 
+                        COUNT(*) as count_val,
+                        SUM(priority) as sum_val,
+                        AVG(priority) as avg_val,
+                        MIN(priority) as min_val,
+                        MAX(priority) as max_val
+                    FROM jobs
+                "#.to_string(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+
+        assert_eq!(agg_resp.row_count, 1);
+        let agg_row: serde_json::Value = rmp_serde::from_slice(&agg_resp.rows[0].data)?;
+
+        assert_eq!(agg_row["count_val"], 3); // COUNT returns Int64
+        assert_eq!(agg_row["sum_val"], 150); // SUM of 0+50+100
+        assert!((agg_row["avg_val"].as_f64().unwrap() - 50.0).abs() < 0.001); // AVG returns Float64
+        assert_eq!(agg_row["min_val"], 0);
+        assert_eq!(agg_row["max_val"], 100);
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
 /// Test that QueryArrow endpoint works without tenant parameter.
 /// This is the streaming Arrow IPC endpoint used by ClusterQueryEngine for remote shard queries.
 #[silo::test(flavor = "multi_thread")]
@@ -380,6 +499,7 @@ async fn grpc_server_query_arrow_without_tenant() -> anyhow::Result<()> {
             setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
 
         // Enqueue jobs via gRPC
+        let empty_payload = rmp_serde::to_vec(&serde_json::json!({})).unwrap();
         for i in 0..2 {
             let enq = EnqueueRequest {
                 shard: 0,
@@ -387,8 +507,8 @@ async fn grpc_server_query_arrow_without_tenant() -> anyhow::Result<()> {
                 priority: 10,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(JsonValueBytes {
-                    data: b"{}".to_vec(),
+                payload: Some(MsgpackBytes {
+                    data: empty_payload.clone(),
                 }),
                 limits: vec![],
                 tenant: None,

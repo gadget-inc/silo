@@ -11,7 +11,7 @@ use test_helpers::*;
 async fn status_index_scheduled_then_running_then_succeeded() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
-    let payload = serde_json::json!({"k":"v"});
+    let payload = test_helpers::msgpack_payload(&serde_json::json!({"k":"v"}));
 
     let job_id = shard
         .enqueue("-", None, 10u8, now, None, payload, vec![], None)
@@ -62,7 +62,7 @@ async fn status_index_failed_and_scheduled_then_order_newest_first() {
             10u8,
             now,
             None,
-            serde_json::json!({"a":1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"a":1})),
             vec![],
             None,
         )
@@ -102,7 +102,7 @@ async fn status_index_failed_and_scheduled_then_order_newest_first() {
             10u8,
             now,
             Some(policy),
-            serde_json::json!({"b":2}),
+            test_helpers::msgpack_payload(&serde_json::json!({"b":2})),
             vec![],
             None,
         )
@@ -156,7 +156,7 @@ async fn retry_flow_running_to_scheduled_to_running_to_succeeded() {
             10u8,
             now,
             Some(policy),
-            serde_json::json!({"j":1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j":1})),
             vec![],
             None,
         )
@@ -223,7 +223,7 @@ async fn reaper_without_retries_marks_failed_in_index() {
             10u8,
             now,
             None,
-            serde_json::json!({"x":1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"x":1})),
             vec![],
             None,
         )
@@ -297,7 +297,7 @@ async fn reaper_with_retries_moves_to_scheduled_in_index() {
             10u8,
             now,
             Some(policy),
-            serde_json::json!({"y":2}),
+            test_helpers::msgpack_payload(&serde_json::json!({"y":2})),
             vec![],
             None,
         )
@@ -363,7 +363,7 @@ async fn delete_removes_from_index() {
             10u8,
             now,
             None,
-            serde_json::json!({"z":3}),
+            test_helpers::msgpack_payload(&serde_json::json!({"z":3})),
             vec![],
             None,
         )
@@ -404,7 +404,7 @@ async fn cross_tenant_isolation_in_scans() {
             10u8,
             now,
             None,
-            serde_json::json!({"t":"A"}),
+            test_helpers::msgpack_payload(&serde_json::json!({"t":"A"})),
             vec![],
             None,
         )
@@ -417,7 +417,7 @@ async fn cross_tenant_isolation_in_scans() {
             10u8,
             now,
             None,
-            serde_json::json!({"t":"B"}),
+            test_helpers::msgpack_payload(&serde_json::json!({"t":"B"})),
             vec![],
             None,
         )
@@ -445,7 +445,7 @@ async fn pagination_and_ordering_newest_first() {
                 10u8,
                 now + i,
                 None,
-                serde_json::json!({"i": i}),
+                test_helpers::msgpack_payload(&serde_json::json!({"i": i})),
                 vec![],
                 None,
             )
@@ -480,7 +480,7 @@ async fn future_enqueue_is_in_scheduled_scan() {
             10u8,
             future,
             None,
-            serde_json::json!({"f":1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"f":1})),
             vec![],
             None,
         )
@@ -506,7 +506,7 @@ async fn metadata_index_basic_and_delete_cleanup() {
             10u8,
             now,
             None,
-            serde_json::json!({"a":1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"a":1})),
             vec![],
             Some(vec![
                 ("k".to_string(), "v".to_string()),
@@ -522,7 +522,7 @@ async fn metadata_index_basic_and_delete_cleanup() {
             10u8,
             now,
             None,
-            serde_json::json!({"b":2}),
+            test_helpers::msgpack_payload(&serde_json::json!({"b":2})),
             vec![],
             Some(vec![("k".to_string(), "v".to_string())]),
         )
@@ -535,7 +535,7 @@ async fn metadata_index_basic_and_delete_cleanup() {
             10u8,
             now,
             None,
-            serde_json::json!({"c":3}),
+            test_helpers::msgpack_payload(&serde_json::json!({"c":3})),
             vec![],
             Some(vec![("k".to_string(), "w".to_string())]),
         )
@@ -596,7 +596,7 @@ async fn metadata_scan_cross_tenant_isolation() {
             10u8,
             now,
             None,
-            serde_json::json!({"t":"A"}),
+            test_helpers::msgpack_payload(&serde_json::json!({"t":"A"})),
             vec![],
             Some(vec![("k".to_string(), "v".to_string())]),
         )
@@ -609,7 +609,7 @@ async fn metadata_scan_cross_tenant_isolation() {
             10u8,
             now,
             None,
-            serde_json::json!({"t":"B"}),
+            test_helpers::msgpack_payload(&serde_json::json!({"t":"B"})),
             vec![],
             Some(vec![("k".to_string(), "v".to_string())]),
         )
@@ -647,7 +647,7 @@ async fn scan_jobs_unfiltered_basic_and_ordering() {
                 10u8,
                 now,
                 None,
-                serde_json::json!({}),
+                test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
             )
@@ -688,7 +688,7 @@ async fn scan_jobs_is_tenant_isolated_and_limit_zero_empty() {
             10u8,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -701,7 +701,7 @@ async fn scan_jobs_is_tenant_isolated_and_limit_zero_empty() {
             10u8,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )

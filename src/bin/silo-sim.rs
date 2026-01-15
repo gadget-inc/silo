@@ -151,6 +151,7 @@ async fn main() -> anyhow::Result<()> {
                 let shard_id = candidates[(i as usize) % candidates.len()] as usize;
                 let shard = &shards[shard_id];
                 let payload = serde_json::json!({"i": i, "queue": q_name});
+                let payload_bytes = rmp_serde::to_vec(&payload).unwrap();
                 let _ = shard
                     .enqueue(
                         "-",
@@ -158,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
                         (i % 100) as u8,
                         now_ms().await,
                         None,
-                        payload,
+                        payload_bytes,
                         vec![Limit::Concurrency(ConcurrencyLimit {
                             key: q_name.clone(),
                             max_concurrency: *q_limit,

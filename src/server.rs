@@ -148,7 +148,7 @@ pub fn job_attempt_view_to_proto(attempt: &crate::job_attempt::JobAttemptView) -
             AttemptStatus::Succeeded,
             None,
             Some(finished_at_ms),
-            Some(JsonValueBytes { data: result }),
+            Some(MsgpackBytes { data: result }),
             None,
             None,
         ),
@@ -409,8 +409,6 @@ impl Silo for SiloService {
             .as_ref()
             .map(|p| p.data.clone())
             .unwrap_or_default();
-        let payload = serde_json::from_slice::<serde_json::Value>(&payload_bytes)
-            .unwrap_or(serde_json::Value::Null);
         let retry = r.retry_policy.map(|rp| crate::retry::RetryPolicy {
             retry_count: rp.retry_count,
             initial_interval_ms: rp.initial_interval_ms,
@@ -456,7 +454,7 @@ impl Silo for SiloService {
                 r.priority as u8,
                 r.start_at_ms,
                 retry,
-                payload,
+                payload_bytes,
                 limits,
                 metadata,
             )
@@ -514,7 +512,7 @@ impl Silo for SiloService {
             id: view.id().to_string(),
             priority: view.priority() as u32,
             enqueue_time_ms: view.enqueue_time_ms(),
-            payload: Some(JsonValueBytes {
+            payload: Some(MsgpackBytes {
                 data: view.payload_bytes().to_vec(),
             }),
             retry_policy,
@@ -591,7 +589,7 @@ impl Silo for SiloService {
                 status: JobStatus::Succeeded.into(),
                 finished_at_ms,
                 result: Some(get_job_result_response::Result::SuccessData(
-                    JsonValueBytes { data: result },
+                    MsgpackBytes { data: result },
                 )),
             })),
             crate::job_attempt::AttemptStatus::Failed {
@@ -725,7 +723,7 @@ impl Silo for SiloService {
                     job_id: job.id().to_string(),
                     attempt_number: attempt.attempt_number(),
                     lease_ms: DEFAULT_LEASE_MS,
-                    payload: Some(JsonValueBytes {
+                    payload: Some(MsgpackBytes {
                         data: job.payload_bytes().to_vec(),
                     }),
                     priority: job.priority() as u32,
@@ -864,29 +862,13 @@ impl Silo for SiloService {
             })
             .collect();
 
-        // Convert batches to JSON rows
-        let mut rows = Vec::new();
-        for batch in batches {
-            // Convert each batch to JSON using Arrow's built-in JSON writer
-            let mut buf = Vec::new();
-            let mut writer = datafusion::arrow::json::ArrayWriter::new(&mut buf);
-            writer
-                .write(&batch)
-                .map_err(|e| Status::internal(format!("Failed to serialize results: {}", e)))?;
-            writer
-                .finish()
-                .map_err(|e| Status::internal(format!("Failed to finish serialization: {}", e)))?;
-
-            // Parse the JSON array into individual row objects
-            let json_array: Vec<serde_json::Value> = serde_json::from_slice(&buf)
-                .map_err(|e| Status::internal(format!("Failed to parse JSON: {}", e)))?;
-
-            for row_value in json_array {
-                let row_bytes = serde_json::to_vec(&row_value)
-                    .map_err(|e| Status::internal(format!("Failed to serialize row: {}", e)))?;
-                rows.push(JsonValueBytes { data: row_bytes });
-            }
-        }
+        // Convert batches directly to MessagePack rows
+        let row_bytes = crate::query::record_batches_to_msgpack(&batches)
+            .map_err(|e| Status::internal(e))?;
+        let rows: Vec<MsgpackBytes> = row_bytes
+            .into_iter()
+            .map(|data| MsgpackBytes { data })
+            .collect();
 
         let row_count = rows.len() as i32;
 

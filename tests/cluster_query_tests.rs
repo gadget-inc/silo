@@ -108,7 +108,7 @@ async fn cluster_query_single_shard_basic() {
                 10,
                 now,
                 None,
-                serde_json::json!({}),
+                test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
             )
@@ -145,7 +145,7 @@ async fn cluster_query_single_shard_count() {
                 10,
                 now,
                 None,
-                serde_json::json!({}),
+                test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
             )
@@ -186,7 +186,7 @@ async fn cluster_query_multi_shard_combines_results() {
                 10,
                 now,
                 None,
-                serde_json::json!({}),
+                test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
             )
@@ -227,7 +227,7 @@ async fn cluster_query_shard_id_column() {
                 10,
                 now,
                 None,
-                serde_json::json!({}),
+                test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
             )
@@ -282,7 +282,7 @@ async fn cluster_query_group_by_shard_id() {
                 10,
                 now,
                 None,
-                serde_json::json!({}),
+                test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
             )
@@ -299,7 +299,7 @@ async fn cluster_query_group_by_shard_id() {
                 10,
                 now,
                 None,
-                serde_json::json!({}),
+                test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
             )
@@ -315,7 +315,7 @@ async fn cluster_query_group_by_shard_id() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -382,7 +382,7 @@ async fn cluster_query_multi_shard_count_aggregates_correctly() {
                     10,
                     now,
                     None,
-                    serde_json::json!({}),
+                    test_helpers::msgpack_payload(&serde_json::json!({})),
                     vec![],
                     None,
                 )
@@ -421,7 +421,7 @@ async fn cluster_query_multi_shard_group_by() {
                 5, // high priority
                 now,
                 None,
-                serde_json::json!({}),
+                test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
             )
@@ -435,7 +435,7 @@ async fn cluster_query_multi_shard_group_by() {
             50, // low priority
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -451,7 +451,7 @@ async fn cluster_query_multi_shard_group_by() {
             5, // high priority
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -465,7 +465,7 @@ async fn cluster_query_multi_shard_group_by() {
                 50, // low priority
                 now,
                 None,
-                serde_json::json!({}),
+                test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
             )
@@ -503,7 +503,7 @@ async fn cluster_query_multi_shard_filter_pushdown() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -518,7 +518,7 @@ async fn cluster_query_multi_shard_filter_pushdown() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -560,7 +560,7 @@ async fn cluster_query_multi_shard_empty_some_shards() {
                 10,
                 now,
                 None,
-                serde_json::json!({}),
+                test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
             )
@@ -618,7 +618,7 @@ async fn cluster_query_multi_shard_limit() {
                     10,
                     now,
                     None,
-                    serde_json::json!({}),
+                    test_helpers::msgpack_payload(&serde_json::json!({})),
                     vec![],
                     None,
                 )
@@ -656,7 +656,7 @@ async fn cluster_query_queues_table_multi_shard() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
                 key: "queue-a".to_string(),
                 max_concurrency: 1,
@@ -675,7 +675,7 @@ async fn cluster_query_queues_table_multi_shard() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
                 key: "queue-b".to_string(),
                 max_concurrency: 1,
@@ -746,7 +746,7 @@ async fn cluster_query_metadata_filter_multi_shard() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             Some(vec![("env".to_string(), "prod".to_string())]),
         )
@@ -762,7 +762,7 @@ async fn cluster_query_metadata_filter_multi_shard() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             Some(vec![("env".to_string(), "staging".to_string())]),
         )
@@ -897,7 +897,7 @@ async fn cluster_query_division_by_zero() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -948,7 +948,7 @@ async fn cluster_query_handles_missing_shard_gracefully() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -988,7 +988,7 @@ async fn cluster_query_count_with_missing_shards() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -1003,7 +1003,7 @@ async fn cluster_query_count_with_missing_shards() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -1041,7 +1041,7 @@ async fn cluster_query_group_by_shard_id_with_missing_shards() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -1056,7 +1056,7 @@ async fn cluster_query_group_by_shard_id_with_missing_shards() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -1116,7 +1116,7 @@ async fn cluster_query_tenant_isolation_multi_shard() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -1132,7 +1132,7 @@ async fn cluster_query_tenant_isolation_multi_shard() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -1173,7 +1173,7 @@ async fn cluster_query_no_tenant_filter_returns_all_tenants() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -1186,7 +1186,7 @@ async fn cluster_query_no_tenant_filter_returns_all_tenants() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -1202,7 +1202,7 @@ async fn cluster_query_no_tenant_filter_returns_all_tenants() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -1217,7 +1217,7 @@ async fn cluster_query_no_tenant_filter_returns_all_tenants() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -1256,7 +1256,7 @@ async fn cluster_query_count_no_tenant_filter() {
                 10,
                 now,
                 None,
-                serde_json::json!({}),
+                test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
             )
@@ -1274,7 +1274,7 @@ async fn cluster_query_count_no_tenant_filter() {
                 10,
                 now,
                 None,
-                serde_json::json!({}),
+                test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
             )
@@ -1309,7 +1309,7 @@ async fn cluster_query_by_id_no_tenant_filter() {
             10,
             now,
             None,
-            serde_json::json!({"data": "from_x"}),
+            test_helpers::msgpack_payload(&serde_json::json!({"data": "from_x"})),
             vec![],
             None,
         )
@@ -1323,7 +1323,7 @@ async fn cluster_query_by_id_no_tenant_filter() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -1364,7 +1364,7 @@ async fn cluster_query_by_status_no_tenant_filter() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -1379,7 +1379,7 @@ async fn cluster_query_by_status_no_tenant_filter() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -1423,7 +1423,7 @@ async fn cluster_query_webui_style_no_tenant_filter() {
             5,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -1438,7 +1438,7 @@ async fn cluster_query_webui_style_no_tenant_filter() {
             10,
             now + 1000,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )

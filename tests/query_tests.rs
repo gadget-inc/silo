@@ -47,7 +47,7 @@ async fn enqueue_job(shard: &JobStoreShard, id: &str, priority: u8, now: i64) ->
             priority,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -70,7 +70,7 @@ async fn enqueue_job_with_metadata(
             priority,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             Some(metadata),
         )
@@ -621,7 +621,7 @@ async fn sql_filter_failed_status() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -960,7 +960,7 @@ async fn sql_tenant_isolation() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -973,7 +973,7 @@ async fn sql_tenant_isolation() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -1015,7 +1015,7 @@ async fn sql_default_tenant() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -1259,7 +1259,7 @@ async fn queues_table_shows_holders() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: "test-queue".to_string(),
                 max_concurrency: 1,
@@ -1301,7 +1301,7 @@ async fn queues_table_shows_requesters() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: "limited-queue".to_string(),
                 max_concurrency: 1,
@@ -1318,7 +1318,7 @@ async fn queues_table_shows_requesters() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: "limited-queue".to_string(),
                 max_concurrency: 1,
@@ -1371,7 +1371,7 @@ async fn queues_table_filter_by_queue_name() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: "queue-alpha".to_string(),
                 max_concurrency: 1,
@@ -1388,7 +1388,7 @@ async fn queues_table_filter_by_queue_name() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: "queue-beta".to_string(),
                 max_concurrency: 1,
@@ -1425,7 +1425,7 @@ async fn queues_table_all_columns() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: "my-queue".to_string(),
                 max_concurrency: 1,
@@ -1476,7 +1476,7 @@ async fn queues_table_empty_when_no_concurrency() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![], // No limits
             None,
         )
@@ -1511,7 +1511,7 @@ async fn queues_table_count_aggregate() {
                 10,
                 now,
                 None,
-                serde_json::json!({}),
+                test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![Limit::Concurrency(ConcurrencyLimit {
                     key: "shared-queue".to_string(),
                     max_concurrency: 10, // High limit so all get holders
@@ -1555,7 +1555,7 @@ async fn queues_table_tenant_isolation() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: "queue-x".to_string(),
                 max_concurrency: 1,
@@ -1572,7 +1572,7 @@ async fn queues_table_tenant_isolation() {
             10,
             now,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: "queue-y".to_string(),
                 max_concurrency: 1,

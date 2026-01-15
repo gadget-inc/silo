@@ -16,7 +16,7 @@ use crate::coordination::{Coordinator, ShardOwnerMap};
 use crate::factory::ShardFactory;
 use crate::pb::silo_client::SiloClient;
 use crate::pb::{
-    CancelJobRequest, ColumnInfo, GetJobRequest, GetJobResponse, JobStatus, JsonValueBytes,
+    CancelJobRequest, ColumnInfo, GetJobRequest, GetJobResponse, JobStatus, MsgpackBytes,
     QueryRequest,
 };
 
@@ -42,8 +42,8 @@ pub enum ClusterClientError {
 pub struct QueryResult {
     /// Column schema information
     pub columns: Vec<ColumnInfo>,
-    /// Rows as JSON objects
-    pub rows: Vec<JsonValueBytes>,
+    /// Rows as MessagePack-encoded objects
+    pub rows: Vec<MsgpackBytes>,
     /// Number of rows returned
     pub row_count: i32,
     /// Which shard this result came from
@@ -162,28 +162,13 @@ impl ClusterClient {
             })
             .collect();
 
-        // Convert batches to JSON rows using RawValue to avoid double-serialization
-        let mut rows = Vec::new();
-        for batch in batches {
-            let mut buf = Vec::new();
-            let mut writer = datafusion::arrow::json::ArrayWriter::new(&mut buf);
-            writer.write(&batch).map_err(|e| {
-                ClusterClientError::QueryFailed(format!("Serialization error: {}", e))
-            })?;
-            writer.finish().map_err(|e| {
-                ClusterClientError::QueryFailed(format!("Serialization error: {}", e))
-            })?;
-
-            // Parse as raw JSON values to avoid deserialize + serialize round-trip
-            let json_array: Vec<Box<serde_json::value::RawValue>> = serde_json::from_slice(&buf)
-                .map_err(|e| ClusterClientError::QueryFailed(format!("JSON parse error: {}", e)))?;
-
-            for row_raw in json_array {
-                rows.push(JsonValueBytes {
-                    data: row_raw.get().as_bytes().to_vec(),
-                });
-            }
-        }
+        // Convert batches directly to MessagePack rows
+        let row_bytes = crate::query::record_batches_to_msgpack(&batches)
+            .map_err(ClusterClientError::QueryFailed)?;
+        let rows: Vec<MsgpackBytes> = row_bytes
+            .into_iter()
+            .map(|data| MsgpackBytes { data })
+            .collect();
 
         let row_count = rows.len() as i32;
 
@@ -374,7 +359,7 @@ impl ClusterClient {
                 id: job_view.id().to_string(),
                 priority: job_view.priority() as u32,
                 enqueue_time_ms: job_view.enqueue_time_ms(),
-                payload: Some(JsonValueBytes {
+                payload: Some(MsgpackBytes {
                     data: job_view.payload_bytes().to_vec(),
                 }),
                 retry_policy,

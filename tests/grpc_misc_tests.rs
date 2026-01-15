@@ -91,8 +91,8 @@ async fn grpc_server_lease_tasks_multi_shard() -> anyhow::Result<()> {
                     priority: 10,
                     start_at_ms: 0,
                     retry_policy: None,
-                    payload: Some(JsonValueBytes {
-                        data: b"{}".to_vec(),
+                    payload: Some(MsgpackBytes {
+                        data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
                     }),
                     limits: vec![],
                     tenant: None,
@@ -165,8 +165,8 @@ async fn grpc_server_tenant_validation_when_enabled() -> anyhow::Result<()> {
                 priority: 5,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(JsonValueBytes {
-                    data: b"{}".to_vec(),
+                payload: Some(MsgpackBytes {
+                    data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
                 }),
                 limits: vec![],
                 tenant: None, // Missing!
@@ -194,8 +194,8 @@ async fn grpc_server_tenant_validation_when_enabled() -> anyhow::Result<()> {
                 priority: 5,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(JsonValueBytes {
-                    data: b"{}".to_vec(),
+                payload: Some(MsgpackBytes {
+                    data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
                 }),
                 limits: vec![],
                 tenant: Some("".to_string()), // Empty!
@@ -218,8 +218,8 @@ async fn grpc_server_tenant_validation_when_enabled() -> anyhow::Result<()> {
                 priority: 5,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(JsonValueBytes {
-                    data: b"{}".to_vec(),
+                payload: Some(MsgpackBytes {
+                    data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
                 }),
                 limits: vec![],
                 tenant: Some("x".repeat(65)), // Too long!
@@ -247,8 +247,8 @@ async fn grpc_server_tenant_validation_when_enabled() -> anyhow::Result<()> {
                 priority: 5,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(JsonValueBytes {
-                    data: b"{}".to_vec(),
+                payload: Some(MsgpackBytes {
+                    data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
                 }),
                 limits: vec![],
                 tenant: Some("my-tenant".to_string()),
@@ -319,8 +319,8 @@ async fn grpc_server_reset_shards_works_in_dev_mode() -> anyhow::Result<()> {
                 priority: 5,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(JsonValueBytes {
-                    data: b"{}".to_vec(),
+                payload: Some(MsgpackBytes {
+                    data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
                 }),
                 limits: vec![],
                 tenant: None,
@@ -337,7 +337,7 @@ async fn grpc_server_reset_shards_works_in_dev_mode() -> anyhow::Result<()> {
             })
             .await?
             .into_inner();
-        let count_row: serde_json::Value = serde_json::from_slice(&query_resp.rows[0].data)?;
+        let count_row: serde_json::Value = rmp_serde::from_slice(&query_resp.rows[0].data)?;
         assert_eq!(count_row["count"], 1, "should have 1 job before reset");
 
         // Reset shards should succeed in dev mode
@@ -353,7 +353,7 @@ async fn grpc_server_reset_shards_works_in_dev_mode() -> anyhow::Result<()> {
             })
             .await?
             .into_inner();
-        let count_row: serde_json::Value = serde_json::from_slice(&query_resp.rows[0].data)?;
+        let count_row: serde_json::Value = rmp_serde::from_slice(&query_resp.rows[0].data)?;
         assert_eq!(count_row["count"], 0, "should have 0 jobs after reset");
 
         shutdown_server(shutdown_tx, server).await?;

@@ -14,7 +14,7 @@ async fn cancel_scheduled_job_sets_cancelled_and_removes_task() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let priority = 10u8;
         let now = now_ms();
 
@@ -87,7 +87,7 @@ async fn cancel_running_job_sets_flag_status_stays_running() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let priority = 10u8;
         let now = now_ms();
 
@@ -141,7 +141,7 @@ async fn heartbeat_returns_cancelled_flag() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let priority = 10u8;
         let now = now_ms();
 
@@ -187,7 +187,7 @@ async fn worker_reports_cancelled_outcome() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let priority = 10u8;
         let now = now_ms();
 
@@ -241,7 +241,7 @@ async fn reap_expired_lease_cancelled_job_sets_cancelled_status() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let now = now_ms();
         let job_id = shard
             .enqueue("-", None, 10u8, now, None, payload, vec![], None)
@@ -331,7 +331,7 @@ async fn cancel_already_cancelled_job_returns_error() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let priority = 10u8;
         let now = now_ms();
 
@@ -363,7 +363,7 @@ async fn cancel_succeeded_job_returns_error() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let priority = 10u8;
         let now = now_ms();
 
@@ -411,7 +411,7 @@ async fn cancel_failed_job_returns_error() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let priority = 10u8;
         let now = now_ms();
 
@@ -470,7 +470,7 @@ async fn cancellation_preserved_through_stale_dequeue() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let priority = 10u8;
         let now = now_ms();
 
@@ -563,7 +563,7 @@ async fn delete_cancelled_job_succeeds() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
             .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None)
             .await
@@ -608,7 +608,7 @@ async fn cancel_scheduled_job_with_concurrency_removes_request() {
                 10u8,
                 now,
                 None,
-                serde_json::json!({"j": 1}),
+                test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
                 vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
                     key: queue.clone(),
                     max_concurrency: 1,
@@ -628,7 +628,7 @@ async fn cancel_scheduled_job_with_concurrency_removes_request() {
                 10u8,
                 now,
                 None,
-                serde_json::json!({"j": 2}),
+                test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
                 vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
                     key: queue.clone(),
                     max_concurrency: 1,
@@ -683,7 +683,7 @@ async fn dequeue_skips_cancelled_run_attempt_tasks() {
                 10u8,
                 now,
                 None,
-                serde_json::json!({"j": 1}),
+                test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
                 vec![],
                 None,
             )
@@ -697,7 +697,7 @@ async fn dequeue_skips_cancelled_run_attempt_tasks() {
                 10u8,
                 now + 1, // Slightly later so j1 comes first
                 None,
-                serde_json::json!({"j": 2}),
+                test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
                 vec![],
                 None,
             )
@@ -748,7 +748,7 @@ async fn dequeue_skips_cancelled_request_ticket_tasks() {
                 10u8,
                 now,
                 None,
-                serde_json::json!({"j": 1}),
+                test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
                 vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
                     key: queue.clone(),
                     max_concurrency: 1,
@@ -770,7 +770,7 @@ async fn dequeue_skips_cancelled_request_ticket_tasks() {
                 10u8,
                 now + 100,
                 None,
-                serde_json::json!({"j": 2}),
+                test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
                 vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
                     key: queue.clone(),
                     max_concurrency: 1,
@@ -787,7 +787,7 @@ async fn dequeue_skips_cancelled_request_ticket_tasks() {
                 10u8,
                 now + 101,
                 None,
-                serde_json::json!({"j": 3}),
+                test_helpers::msgpack_payload(&serde_json::json!({"j": 3})),
                 vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
                     key: queue.clone(),
                     max_concurrency: 1,
@@ -838,7 +838,7 @@ async fn grant_on_release_skips_multiple_cancelled_requests() {
                 10u8,
                 now,
                 None,
-                serde_json::json!({"j": 1}),
+                test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
                 vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
                     key: queue.clone(),
                     max_concurrency: 1,
@@ -859,7 +859,7 @@ async fn grant_on_release_skips_multiple_cancelled_requests() {
                 10u8,
                 now,
                 None,
-                serde_json::json!({"j": 2}),
+                test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
                 vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
                     key: queue.clone(),
                     max_concurrency: 1,
@@ -876,7 +876,7 @@ async fn grant_on_release_skips_multiple_cancelled_requests() {
                 10u8,
                 now,
                 None,
-                serde_json::json!({"j": 3}),
+                test_helpers::msgpack_payload(&serde_json::json!({"j": 3})),
                 vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
                     key: queue.clone(),
                     max_concurrency: 1,
@@ -893,7 +893,7 @@ async fn grant_on_release_skips_multiple_cancelled_requests() {
                 10u8,
                 now,
                 None,
-                serde_json::json!({"j": 4}),
+                test_helpers::msgpack_payload(&serde_json::json!({"j": 4})),
                 vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
                     key: queue.clone(),
                     max_concurrency: 1,
@@ -958,7 +958,7 @@ async fn dequeue_works_normally_without_cancellation() {
                     10u8,
                     now + i,
                     None,
-                    serde_json::json!({"j": i}),
+                    test_helpers::msgpack_payload(&serde_json::json!({"j": i})),
                     vec![],
                     None,
                 )
@@ -1002,7 +1002,7 @@ async fn cancelled_requests_are_cleaned_up_on_grant() {
                 10u8,
                 now,
                 None,
-                serde_json::json!({"j": 1}),
+                test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
                 vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
                     key: queue.clone(),
                     max_concurrency: 1,
@@ -1023,7 +1023,7 @@ async fn cancelled_requests_are_cleaned_up_on_grant() {
                 10u8,
                 now,
                 None,
-                serde_json::json!({"j": 2}),
+                test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
                 vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
                     key: queue.clone(),
                     max_concurrency: 1,

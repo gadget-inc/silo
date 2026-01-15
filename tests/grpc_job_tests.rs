@@ -19,8 +19,8 @@ async fn grpc_get_job_includes_status() -> anyhow::Result<()> {
             priority: 10,
             start_at_ms: 0,
             retry_policy: None,
-            payload: Some(JsonValueBytes {
-                data: b"{}".to_vec(),
+            payload: Some(MsgpackBytes {
+                data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
             }),
             limits: vec![],
             tenant: None,
@@ -78,8 +78,8 @@ async fn grpc_get_job_includes_status() -> anyhow::Result<()> {
                 shard: 0,
                 task_id: task.id.clone(),
                 tenant: None,
-                outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
-                    data: b"{\"result\":\"done\"}".to_vec(),
+                outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
+                    data: rmp_serde::to_vec(&serde_json::json!({"result": "done"})).unwrap(),
                 })),
             })
             .await?;
@@ -149,8 +149,8 @@ async fn grpc_get_job_result_not_terminal() -> anyhow::Result<()> {
             priority: 10,
             start_at_ms: 0,
             retry_policy: None,
-            payload: Some(JsonValueBytes {
-                data: b"{}".to_vec(),
+            payload: Some(MsgpackBytes {
+                data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
             }),
             limits: vec![],
             tenant: None,
@@ -219,8 +219,8 @@ async fn grpc_get_job_result_success() -> anyhow::Result<()> {
             priority: 10,
             start_at_ms: 0,
             retry_policy: None,
-            payload: Some(JsonValueBytes {
-                data: b"{}".to_vec(),
+            payload: Some(MsgpackBytes {
+                data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
             }),
             limits: vec![],
             tenant: None,
@@ -239,14 +239,14 @@ async fn grpc_get_job_result_success() -> anyhow::Result<()> {
             .into_inner();
 
         let task = &lease_resp.tasks[0];
-        let result_data = b"{\"answer\":42}".to_vec();
+        let result_data = rmp_serde::to_vec(&serde_json::json!({"answer": 42})).unwrap();
 
         let _ = client
             .report_outcome(ReportOutcomeRequest {
                 shard: 0,
                 task_id: task.id.clone(),
                 tenant: None,
-                outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
+                outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
                     data: result_data.clone(),
                 })),
             })
@@ -302,8 +302,8 @@ async fn grpc_get_job_result_failure() -> anyhow::Result<()> {
                 randomize_interval: false,
                 backoff_factor: 1.0,
             }),
-            payload: Some(JsonValueBytes {
-                data: b"{}".to_vec(),
+            payload: Some(MsgpackBytes {
+                data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
             }),
             limits: vec![],
             tenant: None,
@@ -382,8 +382,8 @@ async fn grpc_get_job_result_cancelled() -> anyhow::Result<()> {
             priority: 10,
             start_at_ms: 0,
             retry_policy: None,
-            payload: Some(JsonValueBytes {
-                data: b"{}".to_vec(),
+            payload: Some(MsgpackBytes {
+                data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
             }),
             limits: vec![],
             tenant: None,
@@ -444,8 +444,8 @@ async fn grpc_get_job_result_cancelled_while_running() -> anyhow::Result<()> {
             priority: 10,
             start_at_ms: 0,
             retry_policy: None,
-            payload: Some(JsonValueBytes {
-                data: b"{}".to_vec(),
+            payload: Some(MsgpackBytes {
+                data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
             }),
             limits: vec![],
             tenant: None,
@@ -528,8 +528,8 @@ async fn grpc_server_get_job_result_for_non_terminal_job() -> anyhow::Result<()>
                 priority: 5,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(JsonValueBytes {
-                    data: b"{}".to_vec(),
+                payload: Some(MsgpackBytes {
+                    data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
                 }),
                 limits: vec![],
                 tenant: None,
@@ -586,8 +586,8 @@ async fn grpc_get_job_next_attempt_starts_after() -> anyhow::Result<()> {
             priority: 10,
             start_at_ms: 0,
             retry_policy: None,
-            payload: Some(JsonValueBytes {
-                data: b"{}".to_vec(),
+            payload: Some(MsgpackBytes {
+                data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
             }),
             limits: vec![],
             tenant: None,
@@ -625,8 +625,8 @@ async fn grpc_get_job_next_attempt_starts_after() -> anyhow::Result<()> {
             priority: 10,
             start_at_ms: future_ms,
             retry_policy: None,
-            payload: Some(JsonValueBytes {
-                data: b"{}".to_vec(),
+            payload: Some(MsgpackBytes {
+                data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
             }),
             limits: vec![],
             tenant: None,
@@ -686,8 +686,8 @@ async fn grpc_get_job_next_attempt_starts_after() -> anyhow::Result<()> {
                 shard: 0,
                 task_id: task.id.clone(),
                 tenant: None,
-                outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
-                    data: b"{\"result\":\"done\"}".to_vec(),
+                outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
+                    data: rmp_serde::to_vec(&serde_json::json!({"result": "done"})).unwrap(),
                 })),
             })
             .await?;
@@ -742,8 +742,8 @@ async fn grpc_get_job_next_attempt_after_retry() -> anyhow::Result<()> {
                 randomize_interval: false,
                 backoff_factor: 2.0,
             }),
-            payload: Some(JsonValueBytes {
-                data: b"{}".to_vec(),
+            payload: Some(MsgpackBytes {
+                data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
             }),
             limits: vec![],
             tenant: None,
@@ -824,8 +824,8 @@ async fn grpc_get_job_next_attempt_cancelled() -> anyhow::Result<()> {
             priority: 10,
             start_at_ms: 0,
             retry_policy: None,
-            payload: Some(JsonValueBytes {
-                data: b"{}".to_vec(),
+            payload: Some(MsgpackBytes {
+                data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
             }),
             limits: vec![],
             tenant: None,

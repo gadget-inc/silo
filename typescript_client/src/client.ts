@@ -3,11 +3,11 @@ import { ChannelCredentials, credentials, Metadata } from "@grpc/grpc-js";
 import { GrpcTransport } from "@protobuf-ts/grpc-transport";
 import type { RpcOptions } from "@protobuf-ts/runtime-rpc";
 import { RpcError } from "@protobuf-ts/runtime-rpc";
-import { TextDecoder, TextEncoder } from "util";
+import { pack, unpack } from "msgpackr";
 import { SiloClient } from "./pb/silo.client";
 import type {
-  JsonValueBytes,
   Limit,
+  MsgpackBytes,
   QueryResponse,
   RetryPolicy,
   Task,
@@ -306,8 +306,8 @@ export interface Job {
   priority: number;
   /** Timestamp when the job was enqueued (epoch ms) */
   enqueueTimeMs: bigint;
-  /** The job payload as raw bytes */
-  payload?: JsonValueBytes;
+  /** The job payload as MessagePack bytes */
+  payload?: MsgpackBytes;
   /** Retry policy if configured */
   retryPolicy?: RetryPolicy;
   /** Limits (concurrency limits and/or rate limits) */
@@ -358,8 +358,8 @@ export interface JobAttempt {
   startedAtMs?: bigint;
   /** Timestamp when attempt finished (epoch ms). Present if completed. */
   finishedAtMs?: bigint;
-  /** Result data if attempt succeeded */
-  result?: JsonValueBytes;
+  /** Result data if attempt succeeded (MessagePack) */
+  result?: MsgpackBytes;
   /** Error code if attempt failed */
   errorCode?: string;
   /** Error data if attempt failed */
@@ -1648,27 +1648,23 @@ export class SiloGRPCClient {
   }
 }
 
-const encoder = new TextEncoder();
-
 /**
- * Encode a JSON-serializable value as an array of bytes.
+ * Encode a value as MessagePack bytes.
  * @param value The value to encode.
- * @returns The encoded value as an array of bytes.
+ * @returns The encoded value as MessagePack bytes.
  */
 export function encodePayload(value: unknown): Uint8Array {
-  return encoder.encode(JSON.stringify(value));
+  return pack(value);
 }
 
-const decoder = new TextDecoder();
-
 /**
- * Decode an array of bytes as a JSON value.
- * @param bytes The array of bytes to decode.
- * @returns The bytes decoded and parsed as JSON.
+ * Decode MessagePack bytes as a value.
+ * @param bytes The MessagePack bytes to decode.
+ * @returns The decoded value.
  */
 export function decodePayload<T = unknown>(bytes: Uint8Array | undefined): T {
   if (!bytes || bytes.length === 0) {
     return undefined as T;
   }
-  return JSON.parse(decoder.decode(bytes)) as T;
+  return unpack(bytes) as T;
 }

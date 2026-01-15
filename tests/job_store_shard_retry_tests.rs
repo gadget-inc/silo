@@ -14,7 +14,7 @@ async fn reporting_attempt_outcome_updates_attempt_and_deletes_lease() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let priority = 10u8;
         let now_ms = now_ms();
 
@@ -66,7 +66,7 @@ async fn error_with_no_retries_does_not_enqueue_next_attempt() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let priority = 10u8;
         let now = now_ms();
 
@@ -118,7 +118,7 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let priority = 10u8;
         let now = now_ms();
 
@@ -236,7 +236,7 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_success() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let priority = 10u8;
         let now_ms = now_ms();
 
@@ -308,7 +308,7 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_error() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v2"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v2"}));
         let priority = 10u8;
         let now_ms = now_ms();
 
@@ -371,7 +371,7 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_error() {
 async fn retry_count_one_boundary_enqueues_attempt2_then_stops_on_second_error() {
     let (_tmp, shard) = open_temp_shard().await;
 
-    let payload = serde_json::json!({"k": "v"});
+    let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
     let priority = 10u8;
     let now = now_ms();
     let policy = RetryPolicy {
@@ -461,7 +461,7 @@ async fn retry_count_one_boundary_enqueues_attempt2_then_stops_on_second_error()
 async fn next_retry_time_matches_scheduled_time_smoke() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let priority = 10u8;
         let now = now_ms();
         let policy = RetryPolicy {
@@ -525,7 +525,7 @@ async fn next_retry_time_matches_scheduled_time_smoke() {
 async fn duplicate_reporting_error_then_error_is_rejected_and_no_extra_tasks() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let priority = 10u8;
         let now = now_ms();
         let policy = RetryPolicy {
@@ -590,7 +590,7 @@ async fn duplicate_reporting_error_then_error_is_rejected_and_no_extra_tasks() {
 async fn duplicate_reporting_error_then_success_is_rejected_and_state_persists() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let priority = 10u8;
         let now = now_ms();
         let job_id = shard
@@ -642,7 +642,7 @@ async fn duplicate_reporting_error_then_success_is_rejected_and_state_persists()
 async fn attempt_records_exist_across_retries_and_task_ids_distinct() {
     with_timeout!(30000, {
         let (_tmp, shard) = open_temp_shard().await;
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let priority = 10u8;
         let now = now_ms();
         let policy = RetryPolicy {
@@ -722,7 +722,7 @@ async fn attempt_records_exist_across_retries_and_task_ids_distinct() {
 async fn outcome_payload_edge_cases_empty_vectors_round_trip() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let priority = 10u8;
         let now = now_ms();
         let job_id = shard
@@ -759,7 +759,7 @@ async fn outcome_payload_edge_cases_empty_vectors_round_trip() {
                 priority,
                 now,
                 None,
-                serde_json::json!({"k": "v2"}),
+                test_helpers::msgpack_payload(&serde_json::json!({"k": "v2"})),
                 vec![],
                 None,
             )
@@ -796,7 +796,7 @@ async fn outcome_payload_edge_cases_empty_vectors_round_trip() {
 async fn large_outcome_payloads_round_trip() {
     with_timeout!(30000, {
         let (_tmp, shard) = open_temp_shard().await;
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let priority = 10u8;
         let now = now_ms();
         let job_id = shard
@@ -835,7 +835,7 @@ async fn large_outcome_payloads_round_trip() {
                 priority,
                 now,
                 None,
-                serde_json::json!({"k": "v2"}),
+                test_helpers::msgpack_payload(&serde_json::json!({"k": "v2"})),
                 vec![],
                 None,
             )
@@ -873,7 +873,7 @@ async fn large_outcome_payloads_round_trip() {
 async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
     let (_tmp, shard) = open_temp_shard().await;
 
-    let payload = serde_json::json!({"k": "v"});
+    let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
     let now = now_ms();
     let policy = RetryPolicy {
         retry_count: 1,
