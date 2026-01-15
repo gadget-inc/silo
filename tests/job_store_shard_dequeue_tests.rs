@@ -14,7 +14,7 @@ async fn dequeue_moves_tasks_to_leased_with_uuid() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let priority = 10u8;
         let now_ms = now_ms();
 
@@ -83,7 +83,7 @@ async fn heartbeat_renews_lease_when_worker_matches() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let priority = 10u8;
         let now_ms = now_ms();
 
@@ -131,7 +131,7 @@ async fn heartbeat_rejects_mismatched_worker() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let priority = 10u8;
         let now_ms = now_ms();
 
@@ -168,7 +168,7 @@ async fn heartbeat_rejects_mismatched_worker() {
 async fn heartbeat_after_outcome_returns_lease_not_found() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let priority = 10u8;
         let now = now_ms();
         let _job_id = shard
@@ -202,7 +202,7 @@ async fn heartbeat_after_outcome_returns_lease_not_found() {
 async fn reap_ignores_unexpired_leases() {
     let (_tmp, shard) = open_temp_shard().await;
 
-    let payload = serde_json::json!({"k": "v"});
+    let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
     let now = now_ms();
     let job_id = shard
         .enqueue("-", None, 10u8, now, None, payload, vec![], None)
@@ -244,7 +244,7 @@ async fn reap_ignores_unexpired_leases() {
 async fn delete_job_before_dequeue_skips_task_and_no_lease_created() {
     let (_tmp, shard) = open_temp_shard().await;
 
-    let payload = serde_json::json!({"k": "v"});
+    let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
     let priority = 10u8;
     let now_ms = now_ms();
 
@@ -287,7 +287,7 @@ async fn delete_job_before_dequeue_skips_task_and_no_lease_created() {
 async fn dequeue_gracefully_handles_missing_job_info() {
     let (_tmp, shard) = open_temp_shard().await;
 
-    let payload = serde_json::json!({"k": "v"});
+    let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
     let priority = 10u8;
     let now_ms = now_ms();
 

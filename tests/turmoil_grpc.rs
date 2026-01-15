@@ -142,8 +142,8 @@ fn grpc_end_to_end_under_turmoil() {
             priority: 1,
             start_at_ms: 0,
             retry_policy: None,
-            payload: Some(JsonValueBytes {
-                data: serde_json::to_vec(&serde_json::json!({"hello": "world"})).unwrap(),
+            payload: Some(MsgpackBytes {
+                data: rmp_serde::to_vec(&serde_json::json!({"hello": "world"})).unwrap(),
             }),
             limits: vec![],
             tenant: None,
@@ -170,8 +170,8 @@ fn grpc_end_to_end_under_turmoil() {
                 shard: 0,
                 tenant: None,
                 task_id: task_id.clone(),
-                outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
-                    data: b"ok".to_vec(),
+                outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
+                    data: rmp_serde::to_vec(&serde_json::json!("ok")).unwrap(),
                 })),
             }))
             .await?;
@@ -307,8 +307,8 @@ fn grpc_fault_injection_with_partition() {
             priority: 1,
             start_at_ms: 0,
             retry_policy: None,
-            payload: Some(JsonValueBytes {
-                data: serde_json::to_vec(&serde_json::json!({"hello": "faults"})).unwrap(),
+            payload: Some(MsgpackBytes {
+                data: rmp_serde::to_vec(&serde_json::json!({"hello": "faults"})).unwrap(),
             }),
             limits: vec![],
             tenant: None,
@@ -360,8 +360,8 @@ fn grpc_fault_injection_with_partition() {
                 shard: 0,
                 tenant: None,
                 task_id: task_id.clone(),
-                outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
-                    data: b"ok".to_vec(),
+                outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
+                    data: rmp_serde::to_vec(&serde_json::json!("ok")).unwrap(),
                 })),
             }))
             .await?;
@@ -523,9 +523,9 @@ fn stress_multiple_workers_with_partitions() {
                 priority: 1,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(JsonValueBytes {
-                    data: serde_json::to_vec(&serde_json::json!({"job": i})).unwrap(),
-                }),
+            payload: Some(MsgpackBytes {
+                data: rmp_serde::to_vec(&serde_json::json!({"job": i})).unwrap(),
+            }),
                 limits: vec![],
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
@@ -585,8 +585,8 @@ fn stress_multiple_workers_with_partitions() {
                                     tenant: None,
                                     task_id: task.id.clone(),
                                     outcome: Some(report_outcome_request::Outcome::Success(
-                                        JsonValueBytes {
-                                            data: b"ok".to_vec(),
+                                        MsgpackBytes {
+                                            data: rmp_serde::to_vec(&serde_json::json!("ok")).unwrap(),
                                         },
                                     )),
                                 }))
@@ -648,8 +648,8 @@ fn stress_multiple_workers_with_partitions() {
                                     tenant: None,
                                     task_id: task.id.clone(),
                                     outcome: Some(report_outcome_request::Outcome::Success(
-                                        JsonValueBytes {
-                                            data: b"ok".to_vec(),
+                                        MsgpackBytes {
+                                            data: rmp_serde::to_vec(&serde_json::json!("ok")).unwrap(),
                                         },
                                     )),
                                 }))
@@ -791,8 +791,8 @@ fn stress_duplicate_completion_idempotency() {
                 priority: 1,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(JsonValueBytes {
-                    data: b"test".to_vec(),
+                payload: Some(MsgpackBytes {
+                    data: rmp_serde::to_vec(&serde_json::json!("test")).unwrap(),
                 }),
                 limits: vec![],
                 tenant: None,
@@ -822,8 +822,8 @@ fn stress_duplicate_completion_idempotency() {
                     shard: 0,
                     tenant: None,
                     task_id: task_id.clone(),
-                    outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
-                        data: format!("attempt-{}", i).into_bytes(),
+                    outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
+                        data: rmp_serde::to_vec(&format!("attempt-{}", i)).unwrap(),
                     })),
                 }))
                 .await;
@@ -983,8 +983,8 @@ fn stress_lease_expiry_during_partition() {
                 priority: 1,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(JsonValueBytes {
-                    data: b"test".to_vec(),
+                payload: Some(MsgpackBytes {
+                    data: rmp_serde::to_vec(&serde_json::json!("test")).unwrap(),
                 }),
                 limits: vec![],
                 tenant: None,
@@ -1015,8 +1015,8 @@ fn stress_lease_expiry_during_partition() {
                 shard: 0,
                 tenant: None,
                 task_id: task_id.clone(),
-                outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
-                    data: b"late".to_vec(),
+                outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
+                    data: rmp_serde::to_vec(&serde_json::json!("late")).unwrap(),
                 })),
             }))
             .await;
@@ -1059,8 +1059,8 @@ fn stress_lease_expiry_during_partition() {
                                 tenant: None,
                                 task_id: task_id.clone(),
                                 outcome: Some(report_outcome_request::Outcome::Success(
-                                    JsonValueBytes {
-                                        data: b"recovered".to_vec(),
+                                    MsgpackBytes {
+                                        data: rmp_serde::to_vec(&serde_json::json!("recovered")).unwrap(),
                                     },
                                 )),
                             }))
@@ -1193,9 +1193,9 @@ fn stress_high_message_loss() {
                 priority: 1,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(JsonValueBytes {
-                    data: serde_json::to_vec(&serde_json::json!({"id": i})).unwrap(),
-                }),
+            payload: Some(MsgpackBytes {
+                data: rmp_serde::to_vec(&serde_json::json!({"id": i})).unwrap(),
+            }),
                 limits: vec![],
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
@@ -1254,8 +1254,8 @@ fn stress_high_message_loss() {
                                     tenant: None,
                                     task_id: task.id.clone(),
                                     outcome: Some(report_outcome_request::Outcome::Success(
-                                        JsonValueBytes {
-                                            data: b"done".to_vec(),
+                                        MsgpackBytes {
+                                            data: rmp_serde::to_vec(&serde_json::json!("done")).unwrap(),
                                         },
                                     )),
                                 }))
@@ -1371,8 +1371,8 @@ fn concurrency_request_ready_without_release_fails() {
                 priority: 1,
                 start_at_ms: 0,  // Use 0 for "start immediately"
                 retry_policy: None,
-                payload: Some(JsonValueBytes {
-                    data: b"p".to_vec(),
+                payload: Some(MsgpackBytes {
+                    data: rmp_serde::to_vec(&serde_json::json!("p")).unwrap(),
                 }),
                 limits: conc,
                 tenant: None,
@@ -1410,8 +1410,8 @@ fn concurrency_request_ready_without_release_fails() {
                 priority: 1,
                 start_at_ms: 0,  // Changed: enqueue with start_at 0 since time handling is complex with turmoil
                 retry_policy: None,
-                payload: Some(JsonValueBytes {
-                    data: b"p2".to_vec(),
+                payload: Some(MsgpackBytes {
+                    data: rmp_serde::to_vec(&serde_json::json!("p2")).unwrap(),
                 }),
                 limits: conc2,
                 tenant: None,
@@ -1427,8 +1427,8 @@ fn concurrency_request_ready_without_release_fails() {
                 shard: 0,
                 tenant: None,
                 task_id: t1.clone(),
-                outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
-                    data: b"ok".to_vec(),
+                outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
+                    data: rmp_serde::to_vec(&serde_json::json!("ok")).unwrap(),
                 })),
             }))
             .await?;

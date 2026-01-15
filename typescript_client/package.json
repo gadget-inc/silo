@@ -31,6 +31,7 @@
     "@protobuf-ts/grpc-transport": "^2.9.4",
     "@protobuf-ts/runtime": "^2.9.4",
     "@protobuf-ts/runtime-rpc": "^2.9.4",
+    "msgpackr": "^1.11.2",
     "p-queue": "6.6.2",
     "serialize-error": "7.0.1"
   },

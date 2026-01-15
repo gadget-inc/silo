@@ -12,7 +12,7 @@ async fn expedite_future_scheduled_job() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         // Schedule job for 1 hour in the future
         let future_time_ms = now_ms() + 3_600_000;
         let job_id = shard
@@ -84,7 +84,7 @@ async fn expedite_mid_retry_job() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         // Job with retry policy - will get backoff delay on failure
         let retry_policy = RetryPolicy {
             retry_count: 3,
@@ -204,7 +204,7 @@ async fn expedite_succeeded_job_returns_error() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
             .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None)
             .await
@@ -258,7 +258,7 @@ async fn expedite_failed_job_returns_error() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         // No retry policy - job will fail permanently
         let job_id = shard
             .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None)
@@ -314,7 +314,7 @@ async fn expedite_cancelled_job_returns_error() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         // Schedule job for the future
         let future_time_ms = now_ms() + 3_600_000;
         let job_id = shard
@@ -356,7 +356,7 @@ async fn expedite_already_ready_job_returns_error() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         // Schedule job for NOW (immediately ready)
         let job_id = shard
             .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None)
@@ -391,7 +391,7 @@ async fn expedite_running_job_returns_error() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
             .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None)
             .await
@@ -449,7 +449,7 @@ async fn expedite_job_no_pending_task_returns_error() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
             .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None)
             .await
@@ -494,7 +494,7 @@ async fn double_expedite_fails_second_time() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         // Schedule job for 1 hour in the future
         let future_time_ms = now_ms() + 3_600_000;
         let job_id = shard

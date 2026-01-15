@@ -95,7 +95,7 @@ async fn test_index_page_shows_scheduled_jobs() {
             50,
             test_helpers::now_ms() + 10000, // Future time
             None,
-            serde_json::json!({"foo": "bar"}),
+            test_helpers::msgpack_payload(&serde_json::json!({"foo": "bar"})),
             vec![],
             None,
         )
@@ -121,7 +121,7 @@ async fn test_job_view_renders() {
             25,
             test_helpers::now_ms(),
             None,
-            serde_json::json!({"test": "payload"}),
+            test_helpers::msgpack_payload(&serde_json::json!({"test": "payload"})),
             vec![],
             Some(vec![("key1".to_string(), "value1".to_string())]),
         )
@@ -161,7 +161,7 @@ async fn test_job_view_without_shard_param() {
             30,
             test_helpers::now_ms(),
             None,
-            serde_json::json!({"test": "value"}),
+            test_helpers::msgpack_payload(&serde_json::json!({"test": "value"})),
             vec![],
             None,
         )
@@ -197,7 +197,7 @@ async fn test_job_cancel() {
             50,
             test_helpers::now_ms() + 100000, // Future time so it stays scheduled
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -283,7 +283,7 @@ async fn test_cancel_already_terminal_job_is_noop() {
             50,
             test_helpers::now_ms() + 100000,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -398,7 +398,7 @@ async fn test_index_shows_jobs_from_all_shards() {
             50,
             test_helpers::now_ms() + 10000,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -413,7 +413,7 @@ async fn test_index_shows_jobs_from_all_shards() {
             50,
             test_helpers::now_ms() + 10000,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -428,7 +428,7 @@ async fn test_index_shows_jobs_from_all_shards() {
             50,
             test_helpers::now_ms() + 10000,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -492,7 +492,7 @@ async fn test_job_detail_from_non_zero_shard() {
             25,
             test_helpers::now_ms(),
             None,
-            serde_json::json!({"shard": 1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"shard": 1})),
             vec![],
             None,
         )
@@ -526,7 +526,7 @@ async fn test_queues_page_shows_queues_from_all_shards() {
             50,
             test_helpers::now_ms(),
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: "queue-on-shard-0".to_string(),
                 max_concurrency: 1,
@@ -545,7 +545,7 @@ async fn test_queues_page_shows_queues_from_all_shards() {
             50,
             test_helpers::now_ms(),
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: "queue-on-shard-1".to_string(),
                 max_concurrency: 1,
@@ -584,7 +584,7 @@ async fn test_job_view_with_correct_shard_and_tenant_hint() {
             30,
             test_helpers::now_ms(),
             None,
-            serde_json::json!({"test": "value"}),
+            test_helpers::msgpack_payload(&serde_json::json!({"test": "value"})),
             vec![],
             None,
         )
@@ -622,7 +622,7 @@ async fn test_job_view_with_wrong_shard_returns_not_found() {
             30,
             test_helpers::now_ms(),
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -653,7 +653,7 @@ async fn test_cancel_job_with_correct_shard_and_tenant() {
             30,
             test_helpers::now_ms() + 100000, // Future time so it stays scheduled
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -726,7 +726,7 @@ async fn test_sql_execute_returns_results() {
             50,
             test_helpers::now_ms() + 10000,
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )

@@ -621,7 +621,7 @@ impl Scan for JobsScanner {
                                         enq.push(view.enqueue_time_ms());
                                     }
                                     if need_payload {
-                                        match view.payload_json() {
+                                        match view.payload_as_json() {
                                             Ok(v) => payloads.push(Some(v.to_string())),
                                             Err(_) => payloads.push(None),
                                         }
@@ -1218,4 +1218,149 @@ fn parse_status_kind(s: &str) -> Option<crate::job::JobStatusKind> {
         "Succeeded" | "success" | "succeeded" => Some(JobStatusKind::Succeeded),
         _ => None,
     }
+}
+
+/// Convert Arrow RecordBatches directly to MessagePack-encoded rows.
+/// Uses streaming serialization to avoid buffering intermediate structures.
+pub fn record_batches_to_msgpack(batches: &[RecordBatch]) -> Result<Vec<Vec<u8>>, String> {
+    let mut rows = Vec::new();
+
+    for batch in batches {
+        let schema = batch.schema();
+        let num_rows = batch.num_rows();
+        let num_cols = batch.num_columns() as u32;
+
+        for row_idx in 0..num_rows {
+            let mut buf = Vec::with_capacity(128); // Pre-allocate reasonable size
+
+            // Write map header with number of columns
+            rmp::encode::write_map_len(&mut buf, num_cols)
+                .map_err(|e| format!("Failed to write map header: {}", e))?;
+
+            // Write each column as key-value pair directly to buffer
+            for col_idx in 0..num_cols as usize {
+                let field = schema.field(col_idx);
+                let col_name = field.name();
+                let array = batch.column(col_idx);
+
+                // Write key (column name)
+                rmp::encode::write_str(&mut buf, col_name)
+                    .map_err(|e| format!("Failed to write key: {}", e))?;
+
+                // Write value directly based on Arrow type
+                write_arrow_value_to_msgpack(&mut buf, array.as_ref(), row_idx)?;
+            }
+
+            rows.push(buf);
+        }
+    }
+
+    Ok(rows)
+}
+
+/// Write a single Arrow array value at the given row index directly to MessagePack buffer.
+fn write_arrow_value_to_msgpack(
+    buf: &mut Vec<u8>,
+    array: &dyn Array,
+    row_idx: usize,
+) -> Result<(), String> {
+    use datafusion::arrow::array::{
+        BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int8Array,
+        LargeStringArray, TimestampMillisecondArray, UInt16Array, UInt64Array,
+    };
+
+    if array.is_null(row_idx) {
+        rmp::encode::write_nil(buf).map_err(|e| format!("Failed to write nil: {}", e))?;
+        return Ok(());
+    }
+
+    // Handle each Arrow type with direct MessagePack encoding
+    if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
+        rmp::encode::write_str(buf, arr.value(row_idx))
+            .map_err(|e| format!("Failed to write string: {}", e))?;
+        return Ok(());
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<LargeStringArray>() {
+        rmp::encode::write_str(buf, arr.value(row_idx))
+            .map_err(|e| format!("Failed to write string: {}", e))?;
+        return Ok(());
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
+        rmp::encode::write_sint(buf, arr.value(row_idx))
+            .map_err(|e| format!("Failed to write int64: {}", e))?;
+        return Ok(());
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<Int32Array>() {
+        rmp::encode::write_sint(buf, arr.value(row_idx) as i64)
+            .map_err(|e| format!("Failed to write int32: {}", e))?;
+        return Ok(());
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<Int16Array>() {
+        rmp::encode::write_sint(buf, arr.value(row_idx) as i64)
+            .map_err(|e| format!("Failed to write int16: {}", e))?;
+        return Ok(());
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<Int8Array>() {
+        rmp::encode::write_sint(buf, arr.value(row_idx) as i64)
+            .map_err(|e| format!("Failed to write int8: {}", e))?;
+        return Ok(());
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<UInt64Array>() {
+        rmp::encode::write_uint(buf, arr.value(row_idx))
+            .map_err(|e| format!("Failed to write uint64: {}", e))?;
+        return Ok(());
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<UInt32Array>() {
+        rmp::encode::write_uint(buf, arr.value(row_idx) as u64)
+            .map_err(|e| format!("Failed to write uint32: {}", e))?;
+        return Ok(());
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<UInt16Array>() {
+        rmp::encode::write_uint(buf, arr.value(row_idx) as u64)
+            .map_err(|e| format!("Failed to write uint16: {}", e))?;
+        return Ok(());
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<UInt8Array>() {
+        rmp::encode::write_uint(buf, arr.value(row_idx) as u64)
+            .map_err(|e| format!("Failed to write uint8: {}", e))?;
+        return Ok(());
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
+        rmp::encode::write_f64(buf, arr.value(row_idx))
+            .map_err(|e| format!("Failed to write f64: {}", e))?;
+        return Ok(());
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<Float32Array>() {
+        rmp::encode::write_f32(buf, arr.value(row_idx))
+            .map_err(|e| format!("Failed to write f32: {}", e))?;
+        return Ok(());
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<BooleanArray>() {
+        rmp::encode::write_bool(buf, arr.value(row_idx))
+            .map_err(|e| format!("Failed to write bool: {}", e))?;
+        return Ok(());
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<TimestampMillisecondArray>() {
+        rmp::encode::write_sint(buf, arr.value(row_idx))
+            .map_err(|e| format!("Failed to write timestamp: {}", e))?;
+        return Ok(());
+    }
+
+    // For complex types or unknown types, fall back to string representation
+    let formatter = datafusion::arrow::util::display::ArrayFormatter::try_new(
+        array,
+        &datafusion::arrow::util::display::FormatOptions::default(),
+    );
+    match formatter {
+        Ok(fmt) => {
+            rmp::encode::write_str(buf, &fmt.value(row_idx).to_string())
+                .map_err(|e| format!("Failed to write formatted value: {}", e))?;
+        }
+        Err(_) => {
+            rmp::encode::write_str(buf, "<unable to format>")
+                .map_err(|e| format!("Failed to write fallback: {}", e))?;
+        }
+    }
+
+    Ok(())
 }

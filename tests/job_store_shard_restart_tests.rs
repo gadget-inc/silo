@@ -13,7 +13,7 @@ async fn restart_cancelled_scheduled_job() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
             .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None)
             .await
@@ -87,7 +87,7 @@ async fn restart_failed_job() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         // No retry policy - job will fail permanently on first error
         let job_id = shard
             .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None)
@@ -183,7 +183,7 @@ async fn restart_succeeded_job_returns_error() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
             .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None)
             .await
@@ -235,7 +235,7 @@ async fn restart_running_job_returns_error() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
             .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None)
             .await
@@ -290,7 +290,7 @@ async fn restart_scheduled_job_returns_error() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
             .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None)
             .await
@@ -347,7 +347,7 @@ async fn restart_failed_job_with_retry_policy_resets_retries() {
     with_timeout!(30000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let retry_policy = RetryPolicy {
             retry_count: 2,
             initial_interval_ms: 1,
@@ -467,7 +467,7 @@ async fn restart_cancelled_running_job_after_acknowledgement() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"k": "v"});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
             .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None)
             .await
@@ -553,7 +553,7 @@ async fn multiple_restarts_of_same_job() {
     with_timeout!(30000, {
         let (_tmp, shard) = open_temp_shard().await;
 
-        let payload = serde_json::json!({"iteration": 0});
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"iteration": 0}));
         let job_id = shard
             .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None)
             .await

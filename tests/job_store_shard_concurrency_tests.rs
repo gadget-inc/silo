@@ -80,7 +80,7 @@ async fn concurrent_dequeue_many_workers_no_duplicates() {
         let shard_prod = Arc::clone(&shard);
         let producer = tokio::spawn(async move {
             for i in 0..total_jobs {
-                let payload = serde_json::json!({"i": i});
+                let payload = test_helpers::msgpack_payload(&serde_json::json!({"i": i}));
                 shard_prod
                     .enqueue("-", None, (i % 50) as u8, now, None, payload, vec![], None)
                     .await
@@ -124,7 +124,7 @@ async fn future_tasks_are_not_dequeued_under_concurrency() {
                     (i % 10) as u8,
                     now,
                     None,
-                    serde_json::json!({"r": i}),
+                    test_helpers::msgpack_payload(&serde_json::json!({"r": i})),
                     vec![],
                     None,
                 )
@@ -140,7 +140,7 @@ async fn future_tasks_are_not_dequeued_under_concurrency() {
                     (i % 10) as u8,
                     future,
                     None,
-                    serde_json::json!({"f": i}),
+                    test_helpers::msgpack_payload(&serde_json::json!({"f": i})),
                     vec![],
                     None,
                 )
@@ -200,7 +200,7 @@ async fn future_tasks_are_not_dequeued_under_concurrency() {
 async fn concurrency_immediate_grant_enqueues_task_and_writes_holder() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
-    let payload = serde_json::json!({"k": "v"});
+    let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
     let queue = "q1".to_string();
     // enqueue with limit 1
     let job_id = shard
@@ -252,7 +252,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
             10u8,
             now,
             None,
-            serde_json::json!({"j": 1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
             vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -273,7 +273,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
             10u8,
             now,
             None,
-            serde_json::json!({"j": 2}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
             vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -326,7 +326,7 @@ async fn concurrency_held_queues_propagate_across_retries_and_release_on_finish(
                 randomize_interval: false,
                 backoff_factor: 1.0,
             }),
-            serde_json::json!({"j": 3}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 3})),
             vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -390,7 +390,7 @@ async fn concurrency_retry_releases_original_holder() {
                 randomize_interval: false,
                 backoff_factor: 1.0,
             }),
-            serde_json::json!({"j": 33}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 33})),
             vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -449,7 +449,7 @@ async fn concurrency_no_overgrant_after_release() {
             10u8,
             now,
             None,
-            serde_json::json!({"a": true}),
+            test_helpers::msgpack_payload(&serde_json::json!({"a": true})),
             vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -470,7 +470,7 @@ async fn concurrency_no_overgrant_after_release() {
             10u8,
             now,
             None,
-            serde_json::json!({"b": true}),
+            test_helpers::msgpack_payload(&serde_json::json!({"b": true})),
             vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -495,7 +495,7 @@ async fn concurrency_no_overgrant_after_release() {
             10u8,
             now,
             None,
-            serde_json::json!({"c": true}),
+            test_helpers::msgpack_payload(&serde_json::json!({"c": true})),
             vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -530,7 +530,7 @@ async fn stress_single_queue_no_double_grant() {
                 (i % 10) as u8,
                 now,
                 None,
-                serde_json::json!({"i": i}),
+                test_helpers::msgpack_payload(&serde_json::json!({"i": i})),
                 vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
                     key: queue.clone(),
                     max_concurrency: 1,
@@ -581,7 +581,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
             10u8,
             now,
             None,
-            serde_json::json!({"first": true}),
+            test_helpers::msgpack_payload(&serde_json::json!({"first": true})),
             vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -604,7 +604,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
                 (i % 5) as u8,
                 now,
                 None,
-                serde_json::json!({"i": i}),
+                test_helpers::msgpack_payload(&serde_json::json!({"i": i})),
                 vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
                     key: queue.clone(),
                     max_concurrency: 1,

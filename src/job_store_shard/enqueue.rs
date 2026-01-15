@@ -1,6 +1,5 @@
 //! Job enqueue operations.
 
-use serde_json::Value as JsonValue;
 use slatedb::WriteBatch;
 use uuid::Uuid;
 
@@ -17,6 +16,7 @@ use tracing::info_span;
 
 impl JobStoreShard {
     /// Enqueue a new job with optional limits (concurrency and/or rate limits).
+    /// The payload is stored as raw bytes (MessagePack-encoded by the client).
     #[allow(clippy::too_many_arguments)]
     pub async fn enqueue(
         &self,
@@ -25,7 +25,7 @@ impl JobStoreShard {
         priority: u8,
         start_at_ms: i64,
         retry_policy: Option<RetryPolicy>,
-        payload: JsonValue,
+        payload: Vec<u8>,
         limits: Vec<Limit>,
         metadata: Option<Vec<(String, String)>>,
     ) -> Result<String, JobStoreShardError> {
@@ -39,13 +39,12 @@ impl JobStoreShard {
         {
             return Err(JobStoreShardError::JobAlreadyExists(job_id));
         }
-        let payload_bytes = serde_json::to_vec(&payload)?;
 
         let job = JobInfo {
             id: job_id.clone(),
             priority,
             enqueue_time_ms: start_at_ms,
-            payload: payload_bytes,
+            payload,
             retry_policy,
             metadata: metadata.unwrap_or_default(),
             limits: limits.clone(),

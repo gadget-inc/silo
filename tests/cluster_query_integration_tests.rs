@@ -12,7 +12,7 @@ use silo::coordination::Coordinator;
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::pb::silo_client::SiloClient;
-use silo::pb::{EnqueueRequest, JsonValueBytes};
+use silo::pb::{EnqueueRequest, MsgpackBytes};
 use silo::server::run_server;
 use silo::settings::{Backend, DatabaseTemplate};
 use std::collections::HashMap;
@@ -66,8 +66,8 @@ async fn enqueue_job(
         priority: 5,
         start_at_ms: 0,
         retry_policy: None,
-        payload: Some(JsonValueBytes {
-            data: b"{}".to_vec(),
+        payload: Some(MsgpackBytes {
+            data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
         }),
         limits: vec![],
         tenant: tenant.map(|s| s.to_string()),
