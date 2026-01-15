@@ -224,6 +224,9 @@ impl JobStoreShard {
             self.broker.wakeup();
         }
 
+        // Record stats
+        self.stats.record_enqueue();
+
         Ok(job_id)
     }
 

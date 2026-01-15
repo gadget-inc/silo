@@ -129,6 +129,13 @@ impl JobStoreShard {
         // Commit the transaction - this will detect conflicts with concurrent modifications
         txn.commit().await?;
 
+        // Record stats: if job was scheduled (pending), it's now removed from pending
+        if status.kind == JobStatusKind::Scheduled {
+            self.stats.record_pending_job_removed();
+        }
+        // Note: For running jobs, the stats will be updated when the worker reports
+        // the cancellation via report_attempt_outcome
+
         Ok(())
     }
 

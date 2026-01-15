@@ -32,6 +32,8 @@ pub struct EtcdCoordinator {
     cluster_prefix: String,
     membership_lease_id: i64,
     liveness_lease_id: i64,
+    /// Lease ID used for leader election (separate from liveness to allow independent TTL)
+    leader_lease_id: i64,
     shard_guards: Arc<Mutex<HashMap<u32, Arc<EtcdShardGuard>>>>,
 }
 
@@ -64,13 +66,18 @@ impl EtcdCoordinator {
         let node_id = node_id.into();
         let grpc_addr = grpc_addr.into();
 
-        // Create membership and liveness leases
+        // Create membership, liveness, and leader election leases
         let membership_lease = client
             .lease_grant(ttl_secs, None)
             .await
             .map_err(|e| CoordinationError::BackendError(e.to_string()))?
             .id();
         let liveness_lease = client
+            .lease_grant(ttl_secs, None)
+            .await
+            .map_err(|e| CoordinationError::BackendError(e.to_string()))?
+            .id();
+        let leader_lease = client
             .lease_grant(ttl_secs, None)
             .await
             .map_err(|e| CoordinationError::BackendError(e.to_string()))?
@@ -108,9 +115,29 @@ impl EtcdCoordinator {
             cluster_prefix: cluster_prefix.clone(),
             membership_lease_id: membership_lease,
             liveness_lease_id: liveness_lease,
+            leader_lease_id: leader_lease,
             shard_guards: Arc::new(Mutex::new(HashMap::new())),
         };
         let shutdown_rx = base.shutdown_rx.clone();
+
+        // Spawn leader election background task
+        let leader_client = client.clone();
+        let leader_prefix = cluster_prefix.clone();
+        let leader_node_id = node_id.clone();
+        let leader_base = base.clone();
+        let leader_shutdown_rx = base.shutdown_rx.clone();
+        tokio::spawn(async move {
+            run_leader_election(
+                leader_client,
+                leader_prefix,
+                leader_node_id,
+                leader_lease,
+                ttl_secs,
+                leader_base,
+                leader_shutdown_rx,
+            )
+            .await;
+        });
 
         let me_bg = me.clone();
         let cprefix = cluster_prefix.clone();
@@ -463,6 +490,139 @@ impl Coordinator for EtcdCoordinator {
 
     fn grpc_addr(&self) -> &str {
         &self.base.grpc_addr
+    }
+
+    fn is_leader(&self) -> bool {
+        self.base.is_leader()
+    }
+
+    fn leadership_watch(&self) -> watch::Receiver<bool> {
+        self.base.leadership_watch()
+    }
+}
+
+/// Background task that competes for placement engine leadership using etcd locks.
+///
+/// Only one node can be the leader at a time. The leader is responsible for
+/// making shard placement decisions.
+async fn run_leader_election(
+    client: Client,
+    cluster_prefix: String,
+    node_id: String,
+    leader_lease: i64,
+    ttl_secs: i64,
+    base: Arc<CoordinatorBase>,
+    shutdown_rx: watch::Receiver<bool>,
+) {
+    let leader_key = keys::leader_election_key(&cluster_prefix);
+    let mut lock_cli = client.lock_client();
+    let mut lease_cli = client.lease_client();
+
+    // Start leader lease keepalive
+    let (mut leader_keeper, mut leader_stream) = loop {
+        if *shutdown_rx.borrow() {
+            return;
+        }
+        match lease_cli.keep_alive(leader_lease).await {
+            Ok(x) => {
+                debug!(node_id = %node_id, lease_id = leader_lease, "leader lease keepalive channel established");
+                break x;
+            }
+            Err(e) => {
+                warn!(node_id = %node_id, error = %e, "failed to start leader keepalive, retrying...");
+                sleep(Duration::from_millis(200)).await;
+            }
+        }
+    };
+
+    // Send initial keepalive
+    if let Err(e) = leader_keeper.keep_alive().await {
+        error!(node_id = %node_id, error = %e, "failed to send initial leader keepalive");
+    }
+
+    let keepalive_interval_secs = (ttl_secs / 3).max(1) as u64;
+    let mut keepalive_timer = tokio::time::interval(Duration::from_secs(keepalive_interval_secs));
+
+    // Track our current lock key if we hold leadership
+    let mut held_lock_key: Option<Vec<u8>> = None;
+
+    loop {
+        if *shutdown_rx.borrow() {
+            // Release leadership if held
+            if let Some(key) = held_lock_key.take() {
+                let _ = lock_cli.unlock(key).await;
+                base.set_leader(false);
+                info!(node_id = %node_id, "released leadership on shutdown");
+            }
+            return;
+        }
+
+        // If we don't hold leadership, try to acquire it
+        if held_lock_key.is_none() {
+            match tokio::time::timeout(
+                Duration::from_millis(500),
+                lock_cli.lock(
+                    leader_key.as_bytes().to_vec(),
+                    Some(LockOptions::new().with_lease(leader_lease)),
+                ),
+            )
+            .await
+            {
+                Ok(Ok(resp)) => {
+                    let key = resp.key().to_vec();
+                    held_lock_key = Some(key);
+                    base.set_leader(true);
+                    info!(node_id = %node_id, "acquired placement engine leadership");
+                }
+                Ok(Err(e)) => {
+                    // Lock acquisition failed (likely held by another node)
+                    debug!(node_id = %node_id, error = %e, "failed to acquire leadership, will retry");
+                }
+                Err(_) => {
+                    // Timeout - lock is likely held by another node
+                    debug!(node_id = %node_id, "leadership acquisition timed out, will retry");
+                }
+            }
+        }
+
+        // Process keepalives and watch for leadership loss
+        tokio::select! {
+            _ = keepalive_timer.tick() => {
+                if let Err(e) = leader_keeper.keep_alive().await {
+                    error!(node_id = %node_id, error = %e, "failed to send leader keepalive");
+                    // If keepalive fails repeatedly, we may lose the lease
+                    // The lock will automatically be released when the lease expires
+                }
+            }
+            resp = leader_stream.message() => {
+                match resp {
+                    Ok(Some(ka_resp)) => {
+                        if ka_resp.ttl() == 0 {
+                            // Lease expired, we've lost leadership
+                            if held_lock_key.take().is_some() {
+                                base.set_leader(false);
+                                warn!(node_id = %node_id, "leader lease expired, lost leadership");
+                            }
+                        } else {
+                            debug!(node_id = %node_id, ttl = ka_resp.ttl(), "leader keepalive response received");
+                        }
+                    }
+                    Ok(None) => {
+                        error!(node_id = %node_id, "leader lease keepalive stream closed");
+                        if held_lock_key.take().is_some() {
+                            base.set_leader(false);
+                        }
+                        // Try to re-establish keepalive
+                        sleep(Duration::from_millis(500)).await;
+                    }
+                    Err(e) => {
+                        error!(node_id = %node_id, error = %e, "leader lease keepalive error");
+                    }
+                }
+            }
+            // Small delay between acquisition attempts
+            _ = sleep(Duration::from_secs(1)), if held_lock_key.is_none() => {}
+        }
     }
 }
 

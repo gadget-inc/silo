@@ -22,11 +22,13 @@ mod lease;
 mod rate_limit;
 mod restart;
 mod scan;
+pub mod stats;
 
 pub use expedite::JobNotExpediteableError;
 pub use restart::JobNotRestartableError;
 
 pub use helpers::now_epoch_ms;
+pub use stats::{ShardLoadReport, ShardStats, ShardStatsSnapshot};
 
 use slatedb::Db;
 use std::sync::{Arc, OnceLock};
@@ -70,6 +72,8 @@ pub struct JobStoreShard {
     pub(crate) rate_limiter: Arc<dyn RateLimitClient>,
     /// Optional WAL close configuration - present when using local WAL storage
     wal_close_config: Option<WalCloseConfig>,
+    /// Statistics tracking for load-aware placement
+    pub(crate) stats: ShardStats,
 }
 
 #[derive(Debug, Error)]
@@ -172,6 +176,7 @@ impl JobStoreShard {
             query_engine: OnceLock::new(),
             rate_limiter,
             wal_close_config,
+            stats: ShardStats::new(),
         });
 
         Ok(shard)
@@ -272,6 +277,20 @@ impl JobStoreShard {
 
     pub fn db(&self) -> &Db {
         &self.db
+    }
+
+    /// Get a load report for this shard.
+    ///
+    /// The shard_id should be provided by the caller since it's not stored
+    /// in the shard itself (it's just the name).
+    pub fn load_report(&self, shard_id: u32) -> ShardLoadReport {
+        let snapshot = self.stats.snapshot();
+        ShardLoadReport::from_snapshot(shard_id, snapshot)
+    }
+
+    /// Get the stats tracker for this shard.
+    pub fn stats(&self) -> &ShardStats {
+        &self.stats
     }
 
     /// Fetch a job by id as a zero-copy archived view.

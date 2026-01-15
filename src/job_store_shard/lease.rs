@@ -251,6 +251,24 @@ impl JobStoreShard {
         if let Some(err) = job_missing_error {
             return Err(err);
         }
+
+        // Record stats based on outcome
+        match &outcome {
+            AttemptOutcome::Success { .. } | AttemptOutcome::Cancelled => {
+                // Job completed (running -> terminal)
+                self.stats.record_job_completed();
+            }
+            AttemptOutcome::Error { .. } => {
+                if followup_next_time.is_some() {
+                    // Job is being retried (running -> pending)
+                    self.stats.record_job_requeued();
+                } else {
+                    // Job failed permanently (running -> terminal)
+                    self.stats.record_job_completed();
+                }
+            }
+        }
+
         tracing::debug!(task_id = %task_id, "report_attempt_outcome: completed");
         Ok(())
     }

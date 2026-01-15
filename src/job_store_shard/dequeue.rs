@@ -443,6 +443,8 @@ impl JobStoreShard {
                     JobStoreShardError::Rkyv("attempt not found after dequeue".to_string())
                 })?;
             out.push(LeasedTask::new(job_view, attempt_view));
+            // Record dequeue stat (job moved from pending to running)
+            self.stats.record_dequeue();
         }
         tracing::debug!(
             worker_id = %worker_id,

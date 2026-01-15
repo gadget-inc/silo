@@ -203,6 +203,11 @@ pub struct CoordinationConfig {
     /// Kubernetes namespace for Lease objects (default: "default")
     #[serde(default = "default_k8s_namespace")]
     pub k8s_namespace: String,
+
+    // ---- Placement engine settings ----
+    /// Configuration for the load-aware placement engine
+    #[serde(default)]
+    pub placement: PlacementConfig,
 }
 
 impl Default for CoordinationConfig {
@@ -215,8 +220,91 @@ impl Default for CoordinationConfig {
             advertised_grpc_addr: None,
             etcd_endpoints: default_etcd_endpoints(),
             k8s_namespace: default_k8s_namespace(),
+            placement: PlacementConfig::default(),
         }
     }
+}
+
+/// Configuration for the load-aware shard placement engine.
+///
+/// The placement engine monitors load across all nodes and moves shards
+/// between nodes to balance the load. It is conservative by default to
+/// avoid constant shard movement (flapping).
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct PlacementConfig {
+    /// Enable the load-aware placement engine (default: false)
+    /// When disabled, only rendezvous hashing is used for shard placement.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Minimum ratio of max node load to average load to trigger rebalancing.
+    /// A value of 2.0 means the busiest node must have 2x the average load
+    /// before we consider moving shards. (default: 2.0)
+    #[serde(default = "default_load_imbalance_threshold")]
+    pub load_imbalance_threshold: f64,
+
+    /// Number of consecutive intervals the load must be imbalanced before acting.
+    /// This provides hysteresis to avoid reacting to transient spikes. (default: 3)
+    #[serde(default = "default_stability_intervals")]
+    pub stability_intervals: u32,
+
+    /// Minimum time between migrations in seconds.
+    /// This cooldown prevents rapid successive migrations. (default: 60)
+    #[serde(default = "default_migration_cooldown_secs")]
+    pub migration_cooldown_secs: u32,
+
+    /// Maximum number of migrations allowed per hour.
+    /// Acts as a circuit breaker to prevent runaway rebalancing. (default: 10)
+    #[serde(default = "default_max_migrations_per_hour")]
+    pub max_migrations_per_hour: u32,
+
+    /// How often to collect load metrics from nodes in seconds. (default: 5)
+    #[serde(default = "default_load_collection_interval_secs")]
+    pub load_collection_interval_secs: u32,
+
+    /// TTL for placement overrides in seconds.
+    /// Overrides expire if not refreshed, allowing the system to self-heal
+    /// if the placement engine leader fails. (default: 300 = 5 minutes)
+    #[serde(default = "default_override_ttl_secs")]
+    pub override_ttl_secs: u32,
+}
+
+impl Default for PlacementConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            load_imbalance_threshold: default_load_imbalance_threshold(),
+            stability_intervals: default_stability_intervals(),
+            migration_cooldown_secs: default_migration_cooldown_secs(),
+            max_migrations_per_hour: default_max_migrations_per_hour(),
+            load_collection_interval_secs: default_load_collection_interval_secs(),
+            override_ttl_secs: default_override_ttl_secs(),
+        }
+    }
+}
+
+fn default_load_imbalance_threshold() -> f64 {
+    2.0
+}
+
+fn default_stability_intervals() -> u32 {
+    3
+}
+
+fn default_migration_cooldown_secs() -> u32 {
+    60
+}
+
+fn default_max_migrations_per_hour() -> u32 {
+    10
+}
+
+fn default_load_collection_interval_secs() -> u32 {
+    5
+}
+
+fn default_override_ttl_secs() -> u32 {
+    300 // 5 minutes
 }
 
 fn default_num_shards() -> u32 {

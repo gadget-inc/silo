@@ -973,6 +973,86 @@ impl Silo for SiloService {
             shards_reset: reset_count,
         }))
     }
+
+    // ==========================================================================
+    // Placement Engine RPCs
+    // ==========================================================================
+
+    async fn report_load(
+        &self,
+        req: Request<ReportLoadRequest>,
+    ) -> Result<Response<ReportLoadResponse>, Status> {
+        let req = req.into_inner();
+        tracing::debug!(
+            node_id = %req.node_id,
+            shards = req.shards.len(),
+            "received load report"
+        );
+        // For now, just acknowledge the report
+        // The placement engine will collect this via GetClusterLoad
+        // TODO: Store load reports for the placement engine to query
+        Ok(Response::new(ReportLoadResponse {}))
+    }
+
+    async fn get_cluster_load(
+        &self,
+        _req: Request<GetClusterLoadRequest>,
+    ) -> Result<Response<GetClusterLoadResponse>, Status> {
+        // Collect load from all shards owned by this node
+        let local_shards: Vec<(String, std::sync::Arc<crate::job_store_shard::JobStoreShard>)> =
+            self.factory.instances().into_iter().collect();
+
+        let mut shard_loads: Vec<ShardLoad> = Vec::new();
+        let mut total_score = 0.0;
+
+        for (name, shard) in &local_shards {
+            let shard_id: u32 = name.parse().unwrap_or(0);
+            let report = shard.load_report(shard_id);
+            total_score += report.load_score;
+            shard_loads.push(ShardLoad {
+                shard_id,
+                enqueue_rate_per_sec: report.enqueue_rate_per_sec,
+                dequeue_rate_per_sec: report.dequeue_rate_per_sec,
+                pending_jobs: report.pending_jobs,
+                running_jobs: report.running_jobs,
+                load_score: report.load_score,
+            });
+        }
+
+        // Get node info from coordinator or use defaults
+        let (node_id, grpc_addr) = if let Some(coord) = &self.coordinator {
+            (coord.node_id().to_string(), coord.grpc_addr().to_string())
+        } else {
+            ("local".to_string(), self.cfg.server.grpc_addr.clone())
+        };
+
+        let node_load = NodeLoad {
+            node_id,
+            grpc_addr,
+            shards: shard_loads,
+            total_load_score: total_score,
+        };
+
+        // For now, only return this node's load
+        // In a full implementation, the leader would aggregate from all nodes
+        Ok(Response::new(GetClusterLoadResponse {
+            nodes: vec![node_load],
+        }))
+    }
+
+    async fn get_leader_status(
+        &self,
+        _req: Request<GetLeaderStatusRequest>,
+    ) -> Result<Response<GetLeaderStatusResponse>, Status> {
+        let (is_leader, node_id) = if let Some(coord) = &self.coordinator {
+            (coord.is_leader(), coord.node_id().to_string())
+        } else {
+            // Single-node mode - always the leader
+            (true, "local".to_string())
+        };
+
+        Ok(Response::new(GetLeaderStatusResponse { is_leader, node_id }))
+    }
 }
 
 /// Run the gRPC server and a periodic reaper task together until shutdown.

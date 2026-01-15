@@ -381,6 +381,57 @@ message ResetShardsResponse {
   uint32 shards_reset = 1; // Number of shards that were cleared.
 }
 
+// =============================================================================
+// Placement Engine Load Reporting
+// =============================================================================
+
+// Load statistics for a single shard.
+// Used by the placement engine to make shard placement decisions.
+message ShardLoad {
+  uint32 shard_id = 1;              // The shard ID.
+  double enqueue_rate_per_sec = 2;  // Recent enqueue rate (jobs/second).
+  double dequeue_rate_per_sec = 3;  // Recent dequeue rate (tasks/second).
+  uint64 pending_jobs = 4;          // Current number of pending (scheduled) jobs.
+  uint64 running_jobs = 5;          // Current number of running jobs.
+  double load_score = 6;            // Composite load score for placement decisions.
+}
+
+// Load statistics for a single node, aggregating all shards it owns.
+message NodeLoad {
+  string node_id = 1;               // Node identifier.
+  string grpc_addr = 2;             // gRPC address of the node.
+  repeated ShardLoad shards = 3;    // Load for each shard owned by this node.
+  double total_load_score = 4;      // Sum of load scores across all shards.
+}
+
+// Request to report load statistics from a node.
+// Sent periodically by each node to the placement engine leader.
+message ReportLoadRequest {
+  string node_id = 1;               // Reporting node's ID.
+  repeated ShardLoad shards = 2;    // Load stats for each shard owned by this node.
+}
+
+// Response to load report.
+message ReportLoadResponse {}
+
+// Request to get cluster-wide load statistics.
+// Used by the placement engine leader to collect load from all nodes.
+message GetClusterLoadRequest {}
+
+// Response containing cluster-wide load statistics.
+message GetClusterLoadResponse {
+  repeated NodeLoad nodes = 1;      // Load for each node in the cluster.
+}
+
+// Request to check if this node is the placement engine leader.
+message GetLeaderStatusRequest {}
+
+// Response indicating whether this node is the leader.
+message GetLeaderStatusResponse {
+  bool is_leader = 1;               // True if this node is the placement engine leader.
+  string node_id = 2;               // This node's ID.
+}
+
 // The Silo job queue service.
 service Silo {
   // Get cluster topology for client-side routing.
@@ -450,5 +501,20 @@ service Silo {
   // WARNING: Destructive operation. Only available in dev mode.
   // Clears all jobs, tasks, queues, and other data.
   rpc ResetShards(ResetShardsRequest) returns (ResetShardsResponse);
+  
+  // =============================================================================
+  // Placement Engine RPCs
+  // =============================================================================
+  
+  // Report load statistics for shards owned by this node.
+  // Called periodically by each node, typically to the placement engine leader.
+  rpc ReportLoad(ReportLoadRequest) returns (ReportLoadResponse);
+  
+  // Get cluster-wide load statistics.
+  // Returns load for all nodes in the cluster.
+  rpc GetClusterLoad(GetClusterLoadRequest) returns (GetClusterLoadResponse);
+  
+  // Check if this node is the placement engine leader.
+  rpc GetLeaderStatus(GetLeaderStatusRequest) returns (GetLeaderStatusResponse);
 }
 

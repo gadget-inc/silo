@@ -20,12 +20,18 @@ pub mod etcd;
 #[cfg(feature = "k8s")]
 pub mod k8s;
 pub mod none;
+pub mod placement;
 
 // Re-export the backends
 pub use etcd::EtcdCoordinator;
 #[cfg(feature = "k8s")]
 pub use k8s::K8sCoordinator;
 pub use none::NoneCoordinator;
+
+// Re-export placement types
+pub use placement::{
+    compute_desired_shards_with_overrides, PlacementOverride, PlacementOverrides,
+};
 
 /// Information about a cluster member
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -194,6 +200,9 @@ pub struct CoordinatorBase {
     pub shutdown_tx: watch::Sender<bool>,
     pub shutdown_rx: watch::Receiver<bool>,
     pub factory: Arc<ShardFactory>,
+    /// Whether this node is currently the placement engine leader
+    pub leader_tx: watch::Sender<bool>,
+    pub leader_rx: watch::Receiver<bool>,
 }
 
 impl CoordinatorBase {
@@ -205,6 +214,7 @@ impl CoordinatorBase {
         factory: Arc<ShardFactory>,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (leader_tx, leader_rx) = watch::channel(false);
         Self {
             node_id: node_id.into(),
             grpc_addr: grpc_addr.into(),
@@ -213,7 +223,24 @@ impl CoordinatorBase {
             shutdown_tx,
             shutdown_rx,
             factory,
+            leader_tx,
+            leader_rx,
         }
+    }
+
+    /// Check if this node is currently the leader.
+    pub fn is_leader(&self) -> bool {
+        *self.leader_rx.borrow()
+    }
+
+    /// Get a watch receiver for leadership changes.
+    pub fn leadership_watch(&self) -> watch::Receiver<bool> {
+        self.leader_rx.clone()
+    }
+
+    /// Set this node's leadership status.
+    pub fn set_leader(&self, is_leader: bool) {
+        let _ = self.leader_tx.send(is_leader);
     }
 
     /// Get owned shards sorted (shared by both backends).
@@ -336,6 +363,20 @@ pub trait Coordinator: Send + Sync {
 
     /// Get this node's gRPC address.
     fn grpc_addr(&self) -> &str;
+
+    // === Leader Election for Placement Engine ===
+
+    /// Check if this node is currently the placement engine leader.
+    ///
+    /// The leader is responsible for making shard placement decisions and
+    /// writing placement overrides. Only one node should be the leader at a time.
+    fn is_leader(&self) -> bool;
+
+    /// Subscribe to leadership changes.
+    ///
+    /// Returns a watch receiver that will be notified when leadership status changes.
+    /// The boolean value is true when this node becomes the leader, false when it loses leadership.
+    fn leadership_watch(&self) -> watch::Receiver<bool>;
 }
 
 /// Dynamically create a coordinator based on configuration.
@@ -461,11 +502,29 @@ pub mod keys {
         format!("{}{}/owner", shards_prefix(cluster_prefix), shard_id)
     }
 
+    /// Key for leader election (used by placement engine)
+    pub fn leader_election_key(cluster_prefix: &str) -> String {
+        format!("{}/coord/leader", cluster_prefix)
+    }
+
+    /// Key prefix for placement overrides
+    pub fn placements_prefix(cluster_prefix: &str) -> String {
+        format!("{}/coord/placements/", cluster_prefix)
+    }
+
+    /// Key for a specific placement override
+    pub fn placement_key(cluster_prefix: &str, shard_id: u32) -> String {
+        format!("{}{}", placements_prefix(cluster_prefix), shard_id)
+    }
+
     // K8S-specific naming (Lease object names must be DNS-compatible)
     pub fn k8s_member_lease_name(cluster_prefix: &str, node_id: &str) -> String {
         format!("{}-member-{}", cluster_prefix, node_id)
     }
     pub fn k8s_shard_lease_name(cluster_prefix: &str, shard_id: u32) -> String {
         format!("{}-shard-{}", cluster_prefix, shard_id)
+    }
+    pub fn k8s_leader_lease_name(cluster_prefix: &str) -> String {
+        format!("{}-placement-leader", cluster_prefix)
     }
 }

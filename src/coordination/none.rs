@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
 
 use crate::factory::ShardFactory;
 
@@ -16,10 +17,13 @@ use super::{CoordinationError, Coordinator, MemberInfo, ShardOwnerMap};
 ///
 /// In this mode, the single node is assumed to own all shards.
 /// No distributed coordination is performed.
+/// The single node is always the leader.
 pub struct NoneCoordinator {
     node_id: String,
     grpc_addr: String,
     num_shards: u32,
+    /// In single-node mode, we're always the leader
+    leader_rx: watch::Receiver<bool>,
 }
 
 impl NoneCoordinator {
@@ -39,10 +43,14 @@ impl NoneCoordinator {
             }
         }
 
+        // Single-node mode: always the leader
+        let (_leader_tx, leader_rx) = watch::channel(true);
+
         Self {
             node_id: node_id.into(),
             grpc_addr: grpc_addr.into(),
             num_shards,
+            leader_rx,
         }
     }
 }
@@ -99,5 +107,14 @@ impl Coordinator for NoneCoordinator {
 
     fn grpc_addr(&self) -> &str {
         &self.grpc_addr
+    }
+
+    fn is_leader(&self) -> bool {
+        // Single-node mode: always the leader
+        true
+    }
+
+    fn leadership_watch(&self) -> watch::Receiver<bool> {
+        self.leader_rx.clone()
     }
 }

@@ -1,11 +1,13 @@
 use std::collections::HashSet;
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
+use rand::Rng;
+use rand::SeedableRng;
 use silo::coordination::{Coordinator, EtcdCoordinator};
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
@@ -31,6 +33,136 @@ struct Args {
     /// Concurrency limit for q-gamma
     #[arg(long, default_value = "8")]
     gamma: u32,
+    /// Enable Zipf-distributed load (hot shard simulation)
+    #[arg(long)]
+    zipf: bool,
+    /// Zipf exponent (higher = more skewed, default 1.0)
+    #[arg(long, default_value = "1.0")]
+    zipf_exponent: f64,
+    /// Enable load tracking and output stats
+    #[arg(long)]
+    track_load: bool,
+    /// Interval for load stats output in seconds
+    #[arg(long, default_value = "10")]
+    stats_interval_secs: u64,
+}
+
+/// Zipf distribution for shard selection (simulates hot shards)
+struct ZipfDistribution {
+    #[allow(dead_code)]
+    weights: Vec<f64>,
+    cumulative: Vec<f64>,
+}
+
+impl ZipfDistribution {
+    fn new(n: usize, exponent: f64) -> Self {
+        let mut weights = Vec::with_capacity(n);
+        for i in 1..=n {
+            weights.push(1.0 / (i as f64).powf(exponent));
+        }
+        let sum: f64 = weights.iter().sum();
+        for w in &mut weights {
+            *w /= sum;
+        }
+        
+        let mut cumulative = Vec::with_capacity(n);
+        let mut acc = 0.0;
+        for w in &weights {
+            acc += w;
+            cumulative.push(acc);
+        }
+        
+        Self { weights, cumulative }
+    }
+    
+    fn sample(&self, rng: &mut impl Rng) -> usize {
+        let p: f64 = rng.gen();
+        match self.cumulative.binary_search_by(|w| w.partial_cmp(&p).unwrap()) {
+            Ok(i) => i,
+            Err(i) => i.min(self.cumulative.len() - 1),
+        }
+    }
+}
+
+/// Load tracker for monitoring shard activity
+struct LoadTracker {
+    shard_enqueues: Vec<AtomicU64>,
+    shard_dequeues: Vec<AtomicU64>,
+    last_report: Mutex<Instant>,
+}
+
+impl LoadTracker {
+    fn new(num_shards: usize) -> Self {
+        let mut shard_enqueues = Vec::with_capacity(num_shards);
+        let mut shard_dequeues = Vec::with_capacity(num_shards);
+        for _ in 0..num_shards {
+            shard_enqueues.push(AtomicU64::new(0));
+            shard_dequeues.push(AtomicU64::new(0));
+        }
+        Self {
+            shard_enqueues,
+            shard_dequeues,
+            last_report: Mutex::new(Instant::now()),
+        }
+    }
+    
+    fn record_enqueue(&self, shard_id: usize) {
+        if shard_id < self.shard_enqueues.len() {
+            self.shard_enqueues[shard_id].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    
+    fn record_dequeue(&self, shard_id: usize) {
+        if shard_id < self.shard_dequeues.len() {
+            self.shard_dequeues[shard_id].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    
+    fn report_stats(&self) {
+        let mut last = self.last_report.lock().unwrap();
+        let elapsed = last.elapsed();
+        let secs = elapsed.as_secs_f64();
+        
+        println!("\n=== Load Statistics (last {:.1}s) ===", secs);
+        
+        let mut total_enq = 0u64;
+        let mut total_deq = 0u64;
+        let mut enq_rates: Vec<f64> = Vec::new();
+        
+        for i in 0..self.shard_enqueues.len() {
+            let enq = self.shard_enqueues[i].swap(0, Ordering::Relaxed);
+            let deq = self.shard_dequeues[i].swap(0, Ordering::Relaxed);
+            total_enq += enq;
+            total_deq += deq;
+            let enq_rate = enq as f64 / secs;
+            enq_rates.push(enq_rate);
+            println!(
+                "  Shard {}: enqueue {:.1}/s, dequeue {:.1}/s",
+                i,
+                enq_rate,
+                deq as f64 / secs
+            );
+        }
+        
+        println!("  Total: enqueue {:.1}/s, dequeue {:.1}/s", 
+                 total_enq as f64 / secs, 
+                 total_deq as f64 / secs);
+        
+        // Calculate load imbalance metrics
+        if !enq_rates.is_empty() {
+            let avg = enq_rates.iter().sum::<f64>() / enq_rates.len() as f64;
+            let max = enq_rates.iter().cloned().fold(0.0_f64, f64::max);
+            let min = enq_rates.iter().cloned().fold(f64::MAX, f64::min);
+            
+            if avg > 0.0 {
+                println!("  Imbalance: max/avg = {:.2}x, max/min = {:.2}x", 
+                         max / avg,
+                         if min > 0.0 { max / min } else { f64::INFINITY });
+            }
+        }
+        
+        *last = Instant::now();
+    }
 }
 
 fn unique_prefix() -> String {
@@ -126,15 +258,34 @@ async fn main() -> anyhow::Result<()> {
         ("q-gamma".to_string(), args.gamma),
     ];
 
+    // Initialize Zipf distribution if enabled
+    let zipf_dist = if args.zipf {
+        println!("Zipf distribution enabled with exponent {}", args.zipf_exponent);
+        Some(Arc::new(ZipfDistribution::new(num_shards as usize, args.zipf_exponent)))
+    } else {
+        None
+    };
+    
+    // Initialize load tracker if enabled
+    let load_tracker = if args.track_load {
+        println!("Load tracking enabled, stats every {}s", args.stats_interval_secs);
+        Some(Arc::new(LoadTracker::new(num_shards as usize)))
+    } else {
+        None
+    };
+
     let shards_for_enq = Arc::new(shards);
     let c1_owned = c1.clone();
     let c2_owned = c2.clone();
     let enq_running = Arc::new(AtomicBool::new(true));
     let queues_enq = queues.clone();
+    let zipf_for_enq = zipf_dist.clone();
+    let tracker_for_enq = load_tracker.clone();
     let enq_handle = {
         let shards = Arc::clone(&shards_for_enq);
         let enq_running = enq_running.clone();
         tokio::spawn(async move {
+            let mut rng = rand::rngs::SmallRng::from_entropy();
             let mut i: u64 = 0;
             loop {
                 if !enq_running.load(Ordering::SeqCst) {
@@ -147,12 +298,21 @@ async fn main() -> anyhow::Result<()> {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     continue;
                 }
+                
+                // Select shard - use Zipf if enabled, otherwise round-robin
+                let shard_id = if let Some(ref zipf) = zipf_for_enq {
+                    // Zipf selects from all shards (creates hot shards)
+                    zipf.sample(&mut rng)
+                } else {
+                    // Round-robin across candidates
+                    candidates[(i as usize) % candidates.len()] as usize
+                };
+                
                 let (q_name, q_limit) = &queues_enq[(i as usize) % queues_enq.len()];
-                let shard_id = candidates[(i as usize) % candidates.len()] as usize;
                 let shard = &shards[shard_id];
                 let payload = serde_json::json!({"i": i, "queue": q_name});
                 let payload_bytes = rmp_serde::to_vec(&payload).unwrap();
-                let _ = shard
+                let result = shard
                     .enqueue(
                         "-",
                         None,
@@ -167,6 +327,14 @@ async fn main() -> anyhow::Result<()> {
                         None,
                     )
                     .await;
+                
+                // Track load if enabled
+                if result.is_ok() {
+                    if let Some(ref tracker) = tracker_for_enq {
+                        tracker.record_enqueue(shard_id);
+                    }
+                }
+                
                 i = i.wrapping_add(1);
                 if i % 50 == 0 {
                     tokio::task::yield_now().await;
@@ -182,6 +350,7 @@ async fn main() -> anyhow::Result<()> {
         let workers_running = workers_running.clone();
         let seen = Arc::clone(&seen_attempt_ids);
         let processed = Arc::clone(&processed_total);
+        let tracker_for_worker = load_tracker.clone();
         let handle = tokio::spawn(async move {
             let wid = format!("w-{}", s);
             loop {
@@ -211,11 +380,31 @@ async fn main() -> anyhow::Result<()> {
                         )
                         .await;
                     processed.fetch_add(1, Ordering::Relaxed);
+                    
+                    // Track dequeue if enabled
+                    if let Some(ref tracker) = tracker_for_worker {
+                        tracker.record_dequeue(s);
+                    }
                 }
             }
         });
         worker_handles.push(handle);
     }
+    
+    // Stats reporting task if load tracking is enabled
+    let stats_running = Arc::new(AtomicBool::new(true));
+    let stats_handle = if let Some(tracker) = load_tracker.clone() {
+        let stats_running = stats_running.clone();
+        let interval = Duration::from_secs(args.stats_interval_secs);
+        Some(tokio::spawn(async move {
+            while stats_running.load(Ordering::SeqCst) {
+                tokio::time::sleep(interval).await;
+                tracker.report_stats();
+            }
+        }))
+    } else {
+        None
+    };
 
     let checker_running = Arc::new(AtomicBool::new(true));
     let shards_for_check = Arc::clone(&shards_for_enq);
@@ -275,6 +464,17 @@ async fn main() -> anyhow::Result<()> {
     }
     checker_running.store(false, Ordering::SeqCst);
     let _ = check_handle.await;
+    
+    // Stop stats reporter if running
+    stats_running.store(false, Ordering::SeqCst);
+    if let Some(h) = stats_handle {
+        let _ = h.await;
+    }
+    
+    // Final load stats report
+    if let Some(ref tracker) = load_tracker {
+        tracker.report_stats();
+    }
 
     for shard in shards_for_enq.iter() {
         assert_eq!(

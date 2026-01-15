@@ -162,6 +162,27 @@ impl K8sCoordinator {
         // Do initial member list fetch before starting background tasks
         me.refresh_members_cache().await?;
 
+        // Spawn leader election background task
+        let leader_client = client.clone();
+        let leader_namespace = namespace.clone();
+        let leader_prefix = cluster_prefix.clone();
+        let leader_node_id = node_id.clone();
+        let leader_base = base.clone();
+        let leader_shutdown_rx = base.shutdown_rx.clone();
+        let leader_duration_secs = lease_duration_secs as i32;
+        tokio::spawn(async move {
+            run_k8s_leader_election(
+                leader_client,
+                leader_namespace,
+                leader_prefix,
+                leader_node_id,
+                leader_duration_secs,
+                leader_base,
+                leader_shutdown_rx,
+            )
+            .await;
+        });
+
         let me_bg = me.clone();
         let nid = node_id.clone();
 
@@ -627,6 +648,14 @@ impl Coordinator for K8sCoordinator {
 
     fn grpc_addr(&self) -> &str {
         &self.base.grpc_addr
+    }
+
+    fn is_leader(&self) -> bool {
+        self.base.is_leader()
+    }
+
+    fn leadership_watch(&self) -> watch::Receiver<bool> {
+        self.base.leadership_watch()
     }
 }
 
@@ -1303,4 +1332,301 @@ impl K8sShardGuard {
             Err(e) => Err(CoordinationError::BackendError(e.to_string())),
         }
     }
+}
+
+/// Background task that competes for placement engine leadership using K8s Lease objects.
+///
+/// Only one node can be the leader at a time. The leader is responsible for
+/// making shard placement decisions.
+async fn run_k8s_leader_election(
+    client: Client,
+    namespace: String,
+    cluster_prefix: String,
+    node_id: String,
+    lease_duration_secs: i32,
+    base: Arc<CoordinatorBase>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let leases: Api<Lease> = Api::namespaced(client, &namespace);
+    let leader_lease_name = keys::k8s_leader_lease_name(&cluster_prefix);
+    let renew_interval = Duration::from_secs((lease_duration_secs / 3).max(1) as u64);
+
+    // Track our current resourceVersion if we hold leadership
+    let mut held_rv: Option<String> = None;
+
+    loop {
+        if *shutdown_rx.borrow() {
+            // Release leadership if held
+            if held_rv.is_some() {
+                let _ = release_leader_lease(&leases, &leader_lease_name, &node_id).await;
+                base.set_leader(false);
+                info!(node_id = %node_id, "released leadership on shutdown");
+            }
+            return;
+        }
+
+        // If we don't hold leadership, try to acquire it
+        if held_rv.is_none() {
+            match try_acquire_leader_lease(&leases, &leader_lease_name, &node_id, lease_duration_secs)
+                .await
+            {
+                Ok(rv) => {
+                    held_rv = Some(rv);
+                    base.set_leader(true);
+                    info!(node_id = %node_id, "acquired placement engine leadership");
+                }
+                Err(e) => {
+                    debug!(node_id = %node_id, error = %e, "failed to acquire leadership, will retry");
+                }
+            }
+        } else {
+            // We hold leadership, try to renew
+            match renew_leader_lease(&leases, &leader_lease_name, &node_id, lease_duration_secs).await
+            {
+                Ok(new_rv) => {
+                    held_rv = Some(new_rv);
+                }
+                Err(e) => {
+                    warn!(node_id = %node_id, error = %e, "failed to renew leadership, lost leader status");
+                    held_rv = None;
+                    base.set_leader(false);
+                }
+            }
+        }
+
+        // Wait before next iteration
+        tokio::select! {
+            _ = tokio::time::sleep(if held_rv.is_some() { renew_interval } else { Duration::from_secs(1) }) => {}
+            _ = shutdown_rx.changed() => {}
+        }
+    }
+}
+
+/// Try to acquire the leader lease using CAS semantics.
+async fn try_acquire_leader_lease(
+    leases: &Api<Lease>,
+    lease_name: &str,
+    node_id: &str,
+    lease_duration_secs: i32,
+) -> Result<String, CoordinationError> {
+    let now = Utc::now();
+
+    // Try to get existing lease
+    match leases.get(lease_name).await {
+        Ok(existing) => {
+            let spec = existing.spec.as_ref();
+            let holder = spec.and_then(|s| s.holder_identity.as_ref());
+            let renew_time = spec
+                .and_then(|s| s.renew_time.as_ref())
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t.0.to_rfc3339()).ok());
+            let duration_secs = spec
+                .and_then(|s| s.lease_duration_seconds)
+                .unwrap_or(lease_duration_secs);
+
+            let is_expired = renew_time
+                .map(|rt| now > rt + chrono::Duration::seconds(duration_secs as i64))
+                .unwrap_or(true);
+
+            let holder_is_empty = holder.map(|h| h.is_empty()).unwrap_or(true);
+            let is_ours = holder.map(|h| h == node_id).unwrap_or(false);
+            let can_acquire = holder_is_empty || is_expired || is_ours;
+
+            if can_acquire {
+                let rv = existing
+                    .metadata
+                    .resource_version
+                    .as_ref()
+                    .ok_or_else(|| CoordinationError::BackendError("no resourceVersion".into()))?;
+
+                let updated_lease = Lease {
+                    metadata: kube::api::ObjectMeta {
+                        name: Some(lease_name.to_string()),
+                        resource_version: Some(rv.clone()),
+                        uid: existing.metadata.uid.clone(),
+                        labels: Some(
+                            [
+                                ("silo.dev/type".to_string(), "leader".to_string()),
+                            ]
+                            .into(),
+                        ),
+                        ..Default::default()
+                    },
+                    spec: Some(k8s_openapi::api::coordination::v1::LeaseSpec {
+                        holder_identity: Some(node_id.to_string()),
+                        lease_duration_seconds: Some(lease_duration_secs),
+                        acquire_time: Some(MicroTime(now)),
+                        renew_time: Some(MicroTime(now)),
+                        ..Default::default()
+                    }),
+                };
+
+                match leases
+                    .replace(lease_name, &PostParams::default(), &updated_lease)
+                    .await
+                {
+                    Ok(result) => {
+                        let new_rv = result
+                            .metadata
+                            .resource_version
+                            .ok_or_else(|| CoordinationError::BackendError("no rv".into()))?;
+                        Ok(new_rv)
+                    }
+                    Err(kube::Error::Api(e)) if e.code == 409 => {
+                        Err(CoordinationError::BackendError("CAS conflict".into()))
+                    }
+                    Err(e) => Err(CoordinationError::BackendError(e.to_string())),
+                }
+            } else {
+                Err(CoordinationError::BackendError("held by another node".into()))
+            }
+        }
+        Err(kube::Error::Api(e)) if e.code == 404 => {
+            // Create new lease
+            let lease_spec = Lease {
+                metadata: kube::api::ObjectMeta {
+                    name: Some(lease_name.to_string()),
+                    labels: Some(
+                        [("silo.dev/type".to_string(), "leader".to_string())].into(),
+                    ),
+                    ..Default::default()
+                },
+                spec: Some(k8s_openapi::api::coordination::v1::LeaseSpec {
+                    holder_identity: Some(node_id.to_string()),
+                    lease_duration_seconds: Some(lease_duration_secs),
+                    acquire_time: Some(MicroTime(now)),
+                    renew_time: Some(MicroTime(now)),
+                    ..Default::default()
+                }),
+            };
+
+            match leases.create(&PostParams::default(), &lease_spec).await {
+                Ok(result) => {
+                    let rv = result
+                        .metadata
+                        .resource_version
+                        .ok_or_else(|| CoordinationError::BackendError("no rv".into()))?;
+                    Ok(rv)
+                }
+                Err(kube::Error::Api(e)) if e.code == 409 => {
+                    Err(CoordinationError::BackendError("create conflict".into()))
+                }
+                Err(e) => Err(CoordinationError::BackendError(e.to_string())),
+            }
+        }
+        Err(e) => Err(CoordinationError::BackendError(e.to_string())),
+    }
+}
+
+/// Renew the leader lease.
+async fn renew_leader_lease(
+    leases: &Api<Lease>,
+    lease_name: &str,
+    node_id: &str,
+    lease_duration_secs: i32,
+) -> Result<String, CoordinationError> {
+    let now = Utc::now();
+
+    let existing = leases
+        .get(lease_name)
+        .await
+        .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+
+    let holder = existing
+        .spec
+        .as_ref()
+        .and_then(|s| s.holder_identity.as_ref());
+    if holder != Some(&node_id.to_string()) {
+        return Err(CoordinationError::BackendError("not the holder".into()));
+    }
+
+    let current_rv = existing
+        .metadata
+        .resource_version
+        .as_ref()
+        .ok_or_else(|| CoordinationError::BackendError("no resourceVersion".into()))?;
+
+    let updated_lease = Lease {
+        metadata: kube::api::ObjectMeta {
+            name: Some(lease_name.to_string()),
+            resource_version: Some(current_rv.clone()),
+            uid: existing.metadata.uid.clone(),
+            labels: existing.metadata.labels.clone(),
+            ..Default::default()
+        },
+        spec: Some(k8s_openapi::api::coordination::v1::LeaseSpec {
+            holder_identity: Some(node_id.to_string()),
+            lease_duration_seconds: Some(lease_duration_secs),
+            acquire_time: existing.spec.as_ref().and_then(|s| s.acquire_time.clone()),
+            renew_time: Some(MicroTime(now)),
+            ..Default::default()
+        }),
+    };
+
+    match leases
+        .replace(lease_name, &PostParams::default(), &updated_lease)
+        .await
+    {
+        Ok(result) => {
+            let new_rv = result
+                .metadata
+                .resource_version
+                .ok_or_else(|| CoordinationError::BackendError("no rv".into()))?;
+            Ok(new_rv)
+        }
+        Err(kube::Error::Api(e)) if e.code == 409 => {
+            Err(CoordinationError::BackendError("CAS conflict".into()))
+        }
+        Err(e) => Err(CoordinationError::BackendError(e.to_string())),
+    }
+}
+
+/// Release the leader lease by clearing the holder identity.
+async fn release_leader_lease(
+    leases: &Api<Lease>,
+    lease_name: &str,
+    node_id: &str,
+) -> Result<(), CoordinationError> {
+    let now = Utc::now();
+
+    let existing = match leases.get(lease_name).await {
+        Ok(l) => l,
+        Err(_) => return Ok(()), // Lease doesn't exist, nothing to release
+    };
+
+    let holder = existing
+        .spec
+        .as_ref()
+        .and_then(|s| s.holder_identity.as_ref());
+    if holder != Some(&node_id.to_string()) {
+        return Ok(()); // We're not the holder, nothing to release
+    }
+
+    let current_rv = existing
+        .metadata
+        .resource_version
+        .as_ref()
+        .ok_or_else(|| CoordinationError::BackendError("no resourceVersion".into()))?;
+
+    let updated_lease = Lease {
+        metadata: kube::api::ObjectMeta {
+            name: Some(lease_name.to_string()),
+            resource_version: Some(current_rv.clone()),
+            uid: existing.metadata.uid.clone(),
+            labels: existing.metadata.labels.clone(),
+            ..Default::default()
+        },
+        spec: Some(k8s_openapi::api::coordination::v1::LeaseSpec {
+            holder_identity: Some(String::new()), // Clear holder
+            lease_duration_seconds: existing.spec.as_ref().and_then(|s| s.lease_duration_seconds),
+            acquire_time: existing.spec.as_ref().and_then(|s| s.acquire_time.clone()),
+            renew_time: Some(MicroTime(now)),
+            ..Default::default()
+        }),
+    };
+
+    let _ = leases
+        .replace(lease_name, &PostParams::default(), &updated_lease)
+        .await;
+
+    Ok(())
 }
