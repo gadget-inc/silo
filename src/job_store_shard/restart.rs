@@ -114,20 +114,24 @@ impl JobStoreShard {
             }
             JobStatusKind::Succeeded => {
                 // [SILO-RESTART-2] Cannot restart succeeded jobs - they are truly terminal
-                return Err(JobStoreShardError::JobNotRestartable(JobNotRestartableError {
-                    job_id: id.to_string(),
-                    status: status.kind,
-                    reason: "job already succeeded".to_string(),
-                }));
+                return Err(JobStoreShardError::JobNotRestartable(
+                    JobNotRestartableError {
+                        job_id: id.to_string(),
+                        status: status.kind,
+                        reason: "job already succeeded".to_string(),
+                    },
+                ));
             }
             JobStatusKind::Running | JobStatusKind::Scheduled => {
                 // [SILO-RESTART-3] Cannot restart jobs that are still in progress
                 // These jobs may have active tasks/leases
-                return Err(JobStoreShardError::JobNotRestartable(JobNotRestartableError {
-                    job_id: id.to_string(),
-                    status: status.kind,
-                    reason: "job is still in progress".to_string(),
-                }));
+                return Err(JobStoreShardError::JobNotRestartable(
+                    JobNotRestartableError {
+                        job_id: id.to_string(),
+                        status: status.kind,
+                        reason: "job is still in progress".to_string(),
+                    },
+                ));
             }
         }
 
@@ -136,12 +140,23 @@ impl JobStoreShard {
             txn.delete(cancelled_key.as_bytes())?;
         }
 
+        // Get the job info first to know the priority and compute start_at_ms
+        let job_info_key = crate::keys::job_info_key(tenant, id);
+        let maybe_job_raw = txn.get(job_info_key.as_bytes()).await?;
+        let Some(job_raw) = maybe_job_raw else {
+            return Err(JobStoreShardError::JobNotFound(id.to_string()));
+        };
+
+        let job_view = crate::job::JobView::new(job_raw)?;
+        let priority = job_view.priority();
+        let start_at_ms = job_view.enqueue_time_ms().max(now_ms);
+
         // Delete old status index entry
         let old_time = idx_status_time_key(tenant, status.kind.as_str(), status.changed_at_ms, id);
         txn.delete(old_time.as_bytes())?;
 
-        // [SILO-RESTART-6] Post: Set status to Scheduled
-        let new_status = JobStatus::scheduled(now_ms);
+        // [SILO-RESTART-6] Post: Set status to Scheduled with next attempt time
+        let new_status = JobStatus::scheduled(now_ms, start_at_ms);
         let status_value = encode_job_status(&new_status)?;
         txn.put(status_key.as_bytes(), &status_value)?;
 
@@ -155,18 +170,6 @@ impl JobStoreShard {
         txn.put(new_time.as_bytes(), [])?;
 
         // [SILO-RESTART-5] Post: Create new task in DB queue with attempt 1 (fresh retries)
-        // We need to get the job info to know the priority
-        let job_info_key = crate::keys::job_info_key(tenant, id);
-        let maybe_job_raw = txn.get(job_info_key.as_bytes()).await?;
-        let Some(job_raw) = maybe_job_raw else {
-            return Err(JobStoreShardError::JobNotFound(id.to_string()));
-        };
-
-        let job_view = crate::job::JobView::new(job_raw)?;
-        let priority = job_view.priority();
-        let start_at_ms = job_view.enqueue_time_ms().max(now_ms);
-
-        // Create a new task with attempt_number = 1 for fresh retry count
         let new_task_id = Uuid::new_v4().to_string();
         let new_task = Task::RunAttempt {
             id: new_task_id,

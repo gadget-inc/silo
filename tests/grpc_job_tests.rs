@@ -565,3 +565,317 @@ async fn grpc_server_get_job_result_for_non_terminal_job() -> anyhow::Result<()>
     .expect("test timed out")?;
     Ok(())
 }
+
+/// Test that GetJob returns next_attempt_starts_after_ms correctly across job lifecycle
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_get_job_next_attempt_starts_after() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(15000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        // Test 1: Enqueue with start_at_ms=0 should have next_attempt_starts_after_ms close to now
+        let enq = EnqueueRequest {
+            shard: 0,
+            id: "next_attempt_test_1".to_string(),
+            priority: 10,
+            start_at_ms: 0,
+            retry_policy: None,
+            payload: Some(JsonValueBytes {
+                data: b"{}".to_vec(),
+            }),
+            limits: vec![],
+            tenant: None,
+            metadata: std::collections::HashMap::new(),
+        };
+        let _ = client.enqueue(enq).await?;
+
+        let job = client
+            .get_job(GetJobRequest {
+                shard: 0,
+                id: "next_attempt_test_1".to_string(),
+                tenant: None,
+                include_attempts: false,
+            })
+            .await?
+            .into_inner();
+
+        assert_eq!(job.status, JobStatus::Scheduled as i32);
+        assert!(
+            job.next_attempt_starts_after_ms.is_some(),
+            "scheduled job should have next_attempt_starts_after_ms"
+        );
+        // The next_attempt_starts_after_ms should be close to when the job was enqueued (start_at_ms=0 means now)
+        let next_starts = job.next_attempt_starts_after_ms.unwrap();
+        assert!(
+            (next_starts - now_ms).abs() < 5000,
+            "next_attempt_starts_after_ms should be close to now for immediate jobs"
+        );
+
+        // Test 2: Enqueue with future start_at_ms
+        let future_ms = now_ms + 60000; // 1 minute in future
+        let enq_future = EnqueueRequest {
+            shard: 0,
+            id: "next_attempt_test_future".to_string(),
+            priority: 10,
+            start_at_ms: future_ms,
+            retry_policy: None,
+            payload: Some(JsonValueBytes {
+                data: b"{}".to_vec(),
+            }),
+            limits: vec![],
+            tenant: None,
+            metadata: std::collections::HashMap::new(),
+        };
+        let _ = client.enqueue(enq_future).await?;
+
+        let job_future = client
+            .get_job(GetJobRequest {
+                shard: 0,
+                id: "next_attempt_test_future".to_string(),
+                tenant: None,
+                include_attempts: false,
+            })
+            .await?
+            .into_inner();
+
+        assert_eq!(job_future.status, JobStatus::Scheduled as i32);
+        assert_eq!(
+            job_future.next_attempt_starts_after_ms,
+            Some(future_ms),
+            "future-scheduled job should have next_attempt_starts_after_ms set to start_at_ms"
+        );
+
+        // Test 3: Running job should NOT have next_attempt_starts_after_ms
+        let lease_resp = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: Some(0),
+                worker_id: "w1".to_string(),
+                max_tasks: 1,
+            })
+            .await?
+            .into_inner();
+
+        assert!(!lease_resp.tasks.is_empty());
+        let task = &lease_resp.tasks[0];
+
+        let running_job = client
+            .get_job(GetJobRequest {
+                shard: 0,
+                id: "next_attempt_test_1".to_string(),
+                tenant: None,
+                include_attempts: false,
+            })
+            .await?
+            .into_inner();
+
+        assert_eq!(running_job.status, JobStatus::Running as i32);
+        assert!(
+            running_job.next_attempt_starts_after_ms.is_none(),
+            "running job should NOT have next_attempt_starts_after_ms"
+        );
+
+        // Test 4: Complete the job - terminal jobs should NOT have next_attempt_starts_after_ms
+        let _ = client
+            .report_outcome(ReportOutcomeRequest {
+                shard: 0,
+                task_id: task.id.clone(),
+                tenant: None,
+                outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
+                    data: b"{\"result\":\"done\"}".to_vec(),
+                })),
+            })
+            .await?;
+
+        let succeeded_job = client
+            .get_job(GetJobRequest {
+                shard: 0,
+                id: "next_attempt_test_1".to_string(),
+                tenant: None,
+                include_attempts: false,
+            })
+            .await?
+            .into_inner();
+
+        assert_eq!(succeeded_job.status, JobStatus::Succeeded as i32);
+        assert!(
+            succeeded_job.next_attempt_starts_after_ms.is_none(),
+            "succeeded job should NOT have next_attempt_starts_after_ms"
+        );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// Test that GetJob returns next_attempt_starts_after_ms correctly for retrying jobs
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_get_job_next_attempt_after_retry() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(15000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        // Enqueue a job with retry policy
+        let enq = EnqueueRequest {
+            shard: 0,
+            id: "retry_next_attempt_test".to_string(),
+            priority: 10,
+            start_at_ms: 0,
+            retry_policy: Some(RetryPolicy {
+                retry_count: 3,
+                initial_interval_ms: 1000, // 1 second retry interval
+                max_interval_ms: 10000,
+                randomize_interval: false,
+                backoff_factor: 2.0,
+            }),
+            payload: Some(JsonValueBytes {
+                data: b"{}".to_vec(),
+            }),
+            limits: vec![],
+            tenant: None,
+            metadata: std::collections::HashMap::new(),
+        };
+        let _ = client.enqueue(enq).await?;
+
+        // Lease and fail the task to trigger retry
+        let lease_resp = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: Some(0),
+                worker_id: "w1".to_string(),
+                max_tasks: 1,
+            })
+            .await?
+            .into_inner();
+
+        let task = &lease_resp.tasks[0];
+
+        let _ = client
+            .report_outcome(ReportOutcomeRequest {
+                shard: 0,
+                task_id: task.id.clone(),
+                tenant: None,
+                outcome: Some(report_outcome_request::Outcome::Failure(Failure {
+                    code: "TEST_FAILURE".to_string(),
+                    data: b"{}".to_vec(),
+                })),
+            })
+            .await?;
+
+        // After failure with retry, job should be Scheduled with next_attempt_starts_after_ms in the future
+        let retrying_job = client
+            .get_job(GetJobRequest {
+                shard: 0,
+                id: "retry_next_attempt_test".to_string(),
+                tenant: None,
+                include_attempts: false,
+            })
+            .await?
+            .into_inner();
+
+        assert_eq!(retrying_job.status, JobStatus::Scheduled as i32);
+        assert!(
+            retrying_job.next_attempt_starts_after_ms.is_some(),
+            "retrying job should have next_attempt_starts_after_ms"
+        );
+
+        // The next attempt should be in the future (after the retry interval)
+        let next_attempt = retrying_job.next_attempt_starts_after_ms.unwrap();
+        assert!(
+            next_attempt > now_ms,
+            "next_attempt_starts_after_ms ({}) should be after now ({})",
+            next_attempt,
+            now_ms
+        );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// Test that cancelled jobs do not have next_attempt_starts_after_ms
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_get_job_next_attempt_cancelled() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        // Enqueue a job
+        let enq = EnqueueRequest {
+            shard: 0,
+            id: "cancel_next_attempt_test".to_string(),
+            priority: 10,
+            start_at_ms: 0,
+            retry_policy: None,
+            payload: Some(JsonValueBytes {
+                data: b"{}".to_vec(),
+            }),
+            limits: vec![],
+            tenant: None,
+            metadata: std::collections::HashMap::new(),
+        };
+        let _ = client.enqueue(enq).await?;
+
+        // Verify scheduled job has next_attempt_starts_after_ms
+        let job = client
+            .get_job(GetJobRequest {
+                shard: 0,
+                id: "cancel_next_attempt_test".to_string(),
+                tenant: None,
+                include_attempts: false,
+            })
+            .await?
+            .into_inner();
+
+        assert!(job.next_attempt_starts_after_ms.is_some());
+
+        // Cancel the job
+        let _ = client
+            .cancel_job(CancelJobRequest {
+                shard: 0,
+                id: "cancel_next_attempt_test".to_string(),
+                tenant: None,
+            })
+            .await?;
+
+        // Cancelled job should NOT have next_attempt_starts_after_ms
+        let cancelled_job = client
+            .get_job(GetJobRequest {
+                shard: 0,
+                id: "cancel_next_attempt_test".to_string(),
+                tenant: None,
+                include_attempts: false,
+            })
+            .await?
+            .into_inner();
+
+        assert_eq!(cancelled_job.status, JobStatus::Cancelled as i32);
+        assert!(
+            cancelled_job.next_attempt_starts_after_ms.is_none(),
+            "cancelled job should NOT have next_attempt_starts_after_ms"
+        );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}

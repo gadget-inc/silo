@@ -151,6 +151,7 @@ message GetJobResponse {
   JobStatus status = 8;                  // Current job status.
   int64 status_changed_at_ms = 9;        // Unix timestamp (ms) of last status change.
   repeated JobAttempt attempts = 10;     // All attempts for this job. Only populated if include_attempts was true in the request.
+  optional int64 next_attempt_starts_after_ms = 11; // Unix timestamp (ms) when the next attempt will start. Present for scheduled jobs, absent for running or terminal jobs.
 }
 
 // Request to get the result of a completed job.

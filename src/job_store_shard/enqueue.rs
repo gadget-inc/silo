@@ -8,8 +8,8 @@ use crate::codec::{encode_job_info, encode_job_status};
 use crate::concurrency::{MemoryEvent, RequestTicketOutcome};
 use crate::job::{JobInfo, JobStatus, Limit};
 use crate::job_store_shard::helpers::{now_epoch_ms, put_task};
-use crate::job_store_shard::JobStoreShardError;
 use crate::job_store_shard::JobStoreShard;
+use crate::job_store_shard::JobStoreShardError;
 use crate::keys::{idx_metadata_key, idx_status_time_key, job_info_key, job_status_key};
 use crate::retry::RetryPolicy;
 use crate::task::{GubernatorRateLimitData, Task};
@@ -54,8 +54,15 @@ impl JobStoreShard {
 
         let first_task_id = Uuid::new_v4().to_string();
         let now_ms = now_epoch_ms();
-        // [SILO-ENQ-2] Create job with status Scheduled
-        let job_status = JobStatus::scheduled(now_ms);
+        // If start_at_ms is 0 (the default, which means start now) or in the past, use now_ms as the effective start time
+        let effective_start_at_ms = if start_at_ms <= 0 {
+            now_ms
+        } else {
+            start_at_ms
+        };
+
+        // [SILO-ENQ-2] Create job with status Scheduled, with next attempt time
+        let job_status = JobStatus::scheduled(now_ms, effective_start_at_ms);
 
         // Atomically write job info, job status, and handle first limit
         let mut batch = WriteBatch::new();
