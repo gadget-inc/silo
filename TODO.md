@@ -15,6 +15,10 @@
 - [x] get job with attempts api
 - [ ] performant, clear storage for job payload, result, and error data
 - [x] list jobs api
+- [x] job query api
+  - [ ] unhappy path tests
+  - [ ] limits on resource usage
+  - [ ] verify all query patterns needed by gadget are supported and performant
 - [x] clustering
   - [x] etcd leasing
   - [x] integration tests of some sort
@@ -22,14 +26,15 @@
   - [ ] think through if failing open when control plane is down is ok with write fencing
   - [ ] add new coordination mode for persistent disk wal storage and k8s restarts
     - if using persistent disk for the wal, the wal only exists there, and we dont have full compute/storage separation. instead, let's expect any crashed nodes to come back, and rely on cloud provider persistent disk implementations to make that disk available elsewhere. the lease must thusly _not_ expire when a pod goes away, and instead must be explicitly released when it is ready to release it.
+  - [ ] figure out how to balance shards, placement engine?
 - [ ] floating concurrency limits
   - [x] basics
-  - [ ] typescript client implementation
+  - [x] typescript client implementation
   - [ ] failure to refresh handling
   - [ ] performance optimization to not refresh if no jobs currently enqueued with limit
 - [ ] review what happened with the check-if-cancelled-on-dequeue thing happened, if alloy model matches rust impl
 - [x] webui / operator tooling
-  - [] use / refine
+  - [ ] use / refine
 - [x] /healthz endpoint
 - [ ] /metrics prometheus endpoint
 - [ ] opentelemetry support
@@ -47,3 +52,6 @@
 - [ ] waiting state? that matches the gadget ui, but we dont have it modeled because it changes in time without anything else changing
   - [ ] do we need to be able to query for it in the SQL layer? probably
 - [ ] worker <=> server GRPC auth
+- [ ] much more simulation testing
+- [ ] rust best practices review
+- [ ] benchmarks in CI, codspeed or similar regression tracker
