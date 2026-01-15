@@ -2,10 +2,10 @@ syntax = "proto3";
 
 package silo.v1;
 
-// Container for arbitrary JSON data stored as raw bytes.
-// Used for job payloads and results to allow flexible data structures.
-message JsonValueBytes {
-  bytes data = 1; // Raw JSON bytes. Callers should serialize/deserialize JSON as needed.
+// Container for arbitrary data stored as raw MessagePack bytes.
+// Used for job payloads, results, and query response rows.
+message MsgpackBytes {
+  bytes data = 1; // Raw MessagePack bytes. Callers should serialize/deserialize using MessagePack.
 }
 
 // Configuration for automatic job retry on failure.
@@ -90,7 +90,7 @@ message EnqueueRequest {
   uint32 priority = 3;                   // Priority from 0-99. Lower is higher priority (0 = highest).
   int64 start_at_ms = 4;                 // Unix timestamp (ms) for future scheduling. 0 = run immediately.
   optional RetryPolicy retry_policy = 5; // Retry configuration. If absent, job fails on first error.
-  JsonValueBytes payload = 6;            // Opaque JSON payload passed to workers.
+  MsgpackBytes payload = 6;              // Opaque MessagePack payload passed to workers.
   repeated Limit limits = 7;             // Ordered list of limits checked before execution.
   optional string tenant = 8;            // Tenant ID for multi-tenant deployments. Optional.
   map<string, string> metadata = 9;      // Arbitrary key/value metadata stored with the job.
@@ -134,9 +134,9 @@ message JobAttempt {
   AttemptStatus status = 4;              // Current status of the attempt.
   optional int64 started_at_ms = 5;      // Unix timestamp (ms) when attempt started. Present if running.
   optional int64 finished_at_ms = 6;     // Unix timestamp (ms) when attempt finished. Present if completed.
-  optional JsonValueBytes result = 7;    // Result data if attempt succeeded.
+  optional MsgpackBytes result = 7;      // Result data if attempt succeeded (MessagePack).
   optional string error_code = 8;        // Error code if attempt failed.
-  optional bytes error_data = 9;         // Error details if attempt failed.
+  optional bytes error_data = 9;         // Error details if attempt failed (MessagePack).
 }
 
 // Full details of a job including its current state.
@@ -144,7 +144,7 @@ message GetJobResponse {
   string id = 1;                         // The job's unique ID.
   uint32 priority = 2;                   // Job priority (0 = highest, 99 = lowest).
   int64 enqueue_time_ms = 3;             // Unix timestamp (ms) when job was enqueued.
-  JsonValueBytes payload = 4;            // The job's payload data.
+  MsgpackBytes payload = 4;              // The job's payload data (MessagePack).
   optional RetryPolicy retry_policy = 5; // Retry policy if configured.
   repeated Limit limits = 6;             // Limits declared on this job.
   map<string, string> metadata = 7;      // Metadata key/value pairs.
@@ -170,7 +170,7 @@ message GetJobResultResponse {
   
   // The result depends on the terminal status.
   oneof result {
-    JsonValueBytes success_data = 4; // Present if status == SUCCEEDED. Contains job result.
+    MsgpackBytes success_data = 4;   // Present if status == SUCCEEDED. Contains job result (MessagePack).
     JobFailure failure = 5;          // Present if status == FAILED. Contains error details.
     JobCancelled cancelled = 6;      // Present if status == CANCELLED. Contains cancellation info.
   }
@@ -179,7 +179,7 @@ message GetJobResultResponse {
 // Error information for a failed job.
 message JobFailure {
   string error_code = 1; // Application-defined error code.
-  bytes error_data = 2;  // Error details, typically JSON-encoded.
+  bytes error_data = 2;  // Error details (MessagePack-encoded).
 }
 
 // Information about a cancelled job.
@@ -233,7 +233,7 @@ message Task {
   string job_id = 2;          // ID of the job this task belongs to.
   uint32 attempt_number = 3;  // Which attempt this is (1 = first attempt).
   int64 lease_ms = 4;         // How long the lease lasts. Heartbeat before this expires.
-  JsonValueBytes payload = 5; // The job's payload for the worker to process.
+  MsgpackBytes payload = 5;   // The job's payload for the worker to process (MessagePack).
   uint32 priority = 6;        // Job priority (for informational purposes).
   uint32 shard = 7;           // Shard this task came from (needed for reporting outcome).
 }
@@ -262,7 +262,7 @@ message ReportOutcomeRequest {
   string task_id = 2;        // The task's unique ID.
   optional string tenant = 5; // Tenant ID if multi-tenancy is enabled.
   oneof outcome {
-    JsonValueBytes success = 3; // Job succeeded. Contains result data.
+    MsgpackBytes success = 3;   // Job succeeded. Contains result data (MessagePack).
     Failure failure = 4;        // Job failed. Contains error details.
     Cancelled cancelled = 6;    // Worker acknowledges job was cancelled.
   }
@@ -271,7 +271,7 @@ message ReportOutcomeRequest {
 // Error details for a failed task.
 message Failure {
   string code = 1;  // Application-defined error code.
-  bytes data = 2;   // Error details, typically JSON-encoded.
+  bytes data = 2;   // Error details (MessagePack-encoded).
 }
 
 // Marker indicating the worker acknowledges the job was cancelled.
@@ -334,10 +334,10 @@ message ColumnInfo {
   string data_type = 2; // Arrow/DataFusion type as string (e.g., "Utf8", "Int64").
 }
 
-// Query results in JSON format.
+// Query results with rows as MessagePack.
 message QueryResponse {
   repeated ColumnInfo columns = 1;  // Schema information for the result columns.
-  repeated JsonValueBytes rows = 2; // Each row as a JSON object.
+  repeated MsgpackBytes rows = 2;   // Each row as a MessagePack-encoded object.
   int32 row_count = 3;              // Total number of rows returned.
 }
 

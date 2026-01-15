@@ -122,7 +122,7 @@ async fn rate_limit_single_dequeue_returns_task() {
             10u8,
             now,
             None,
-            serde_json::json!({"task": "rate_limited"}),
+            test_helpers::msgpack_payload(&serde_json::json!({"task": "rate_limited"})),
             vec![Limit::RateLimit(rate_limit)],
             None,
         )
@@ -158,7 +158,7 @@ async fn rate_limit_passes_and_job_becomes_runnable() {
             10u8,
             now,
             None,
-            serde_json::json!({"task": "rate_limited"}),
+            test_helpers::msgpack_payload(&serde_json::json!({"task": "rate_limited"})),
             vec![Limit::RateLimit(rate_limit)],
             None,
         )
@@ -220,7 +220,7 @@ async fn rate_limit_exceeded_then_passes_after_window() {
             10u8,
             now,
             None,
-            serde_json::json!({"task": "rate_limited_retry"}),
+            test_helpers::msgpack_payload(&serde_json::json!({"task": "rate_limited_retry"})),
             vec![Limit::RateLimit(rate_limit)],
             None,
         )
@@ -256,7 +256,7 @@ async fn multiple_rate_limits_acquired_in_order() {
             10u8,
             now,
             None,
-            serde_json::json!({"task": "multi_rate_limit"}),
+            test_helpers::msgpack_payload(&serde_json::json!({"task": "multi_rate_limit"})),
             vec![Limit::RateLimit(rate_limit1), Limit::RateLimit(rate_limit2)],
             None,
         )
@@ -289,7 +289,7 @@ async fn concurrency_then_rate_limit_acquired_in_order() {
             10u8,
             now,
             None,
-            serde_json::json!({"task": "concurrency_then_rate"}),
+            test_helpers::msgpack_payload(&serde_json::json!({"task": "concurrency_then_rate"})),
             vec![
                 Limit::Concurrency(concurrency),
                 Limit::RateLimit(rate_limit),
@@ -332,7 +332,7 @@ async fn rate_limit_then_concurrency_acquired_in_order() {
             10u8,
             now,
             None,
-            serde_json::json!({"task": "rate_then_concurrency"}),
+            test_helpers::msgpack_payload(&serde_json::json!({"task": "rate_then_concurrency"})),
             vec![
                 Limit::RateLimit(rate_limit),
                 Limit::Concurrency(concurrency),
@@ -376,7 +376,7 @@ async fn concurrency_blocked_with_rate_limit_pending() {
             10u8,
             now,
             None,
-            serde_json::json!({"job": 1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"job": 1})),
             vec![
                 Limit::Concurrency(concurrency.clone()),
                 Limit::RateLimit(rate_limit.clone()),
@@ -394,7 +394,7 @@ async fn concurrency_blocked_with_rate_limit_pending() {
             10u8,
             now,
             None,
-            serde_json::json!({"job": 2}),
+            test_helpers::msgpack_payload(&serde_json::json!({"job": 2})),
             vec![
                 Limit::Concurrency(concurrency.clone()),
                 Limit::RateLimit(rate_limit.clone()),
@@ -444,7 +444,7 @@ async fn three_limits_concurrency_rate_concurrency() {
             10u8,
             now,
             None,
-            serde_json::json!({"task": "complex_limits"}),
+            test_helpers::msgpack_payload(&serde_json::json!({"task": "complex_limits"})),
             vec![
                 Limit::Concurrency(conc1),
                 Limit::RateLimit(rate),
@@ -495,7 +495,7 @@ async fn rate_limit_counts_hits_correctly() {
                 10u8,
                 now,
                 None,
-                serde_json::json!({"job": i}),
+                test_helpers::msgpack_payload(&serde_json::json!({"job": i})),
                 vec![Limit::RateLimit(rate_limit.clone())],
                 None,
             )

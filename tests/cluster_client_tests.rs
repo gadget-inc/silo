@@ -59,7 +59,7 @@ async fn cluster_client_query_local_shard() {
             5,
             test_helpers::now_ms(),
             None,
-            serde_json::json!({"test": "data"}),
+            test_helpers::msgpack_payload(&serde_json::json!({"test": "data"})),
             vec![],
             None,
         )
@@ -115,7 +115,7 @@ async fn cluster_client_query_all_local_shards() {
             5,
             test_helpers::now_ms(),
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -130,7 +130,7 @@ async fn cluster_client_query_all_local_shards() {
             5,
             test_helpers::now_ms(),
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -188,7 +188,7 @@ async fn cluster_client_get_job_local() {
             5,
             test_helpers::now_ms(),
             None,
-            serde_json::json!({"foo": "bar"}),
+            test_helpers::msgpack_payload(&serde_json::json!({"foo": "bar"})),
             vec![],
             None,
         )
@@ -240,7 +240,7 @@ async fn cluster_client_cancel_job_local() {
             5,
             test_helpers::now_ms() + 10000, // Future so it's still pending
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -280,7 +280,7 @@ async fn cluster_client_json_serialization_preserves_data() {
             5,
             test_helpers::now_ms(),
             None,
-            serde_json::json!({
+            test_helpers::msgpack_payload(&serde_json::json!({
                 "string": "hello",
                 "number": 42,
                 "float": 3.14,
@@ -288,7 +288,7 @@ async fn cluster_client_json_serialization_preserves_data() {
                 "null": null,
                 "array": [1, 2, 3],
                 "nested": {"key": "value"}
-            }),
+            })),
             vec![],
             None,
         )
@@ -307,7 +307,7 @@ async fn cluster_client_json_serialization_preserves_data() {
 
     // Parse the JSON row to verify it's valid
     let row_json: serde_json::Value =
-        serde_json::from_slice(&result.rows[0].data).expect("row should be valid JSON");
+        rmp_serde::from_slice(&result.rows[0].data).expect("row should be valid MessagePack");
 
     assert_eq!(row_json["id"], "job-complex");
 
@@ -460,7 +460,7 @@ async fn cluster_client_query_all_local_shards_with_mixed_results() {
             5,
             test_helpers::now_ms(),
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )
@@ -475,7 +475,7 @@ async fn cluster_client_query_all_local_shards_with_mixed_results() {
             5,
             test_helpers::now_ms(),
             None,
-            serde_json::json!({}),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
         )

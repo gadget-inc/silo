@@ -153,3 +153,9 @@ pub async fn count_with_prefix(db: &Db, prefix: &str) -> usize {
     }
     count
 }
+
+/// Encode a JSON value as MessagePack bytes for use as a job payload.
+/// This is a helper for tests to create MessagePack-encoded payloads.
+pub fn msgpack_payload(value: &serde_json::Value) -> Vec<u8> {
+    rmp_serde::to_vec(value).expect("failed to encode payload as messagepack")
+}

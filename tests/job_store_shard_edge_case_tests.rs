@@ -21,7 +21,7 @@ async fn tenant_allows_same_job_id_independent() {
                 10u8,
                 now,
                 None,
-                serde_json::json!({"tenant": "A"}),
+                test_helpers::msgpack_payload(&serde_json::json!({"tenant": "A"})),
                 vec![],
                 None,
             )
@@ -36,7 +36,7 @@ async fn tenant_allows_same_job_id_independent() {
                 10u8,
                 now + 1, // avoid any potential key collisions in task queue
                 None,
-                serde_json::json!({"tenant": "B"}),
+                test_helpers::msgpack_payload(&serde_json::json!({"tenant": "B"})),
                 vec![],
                 None,
             )

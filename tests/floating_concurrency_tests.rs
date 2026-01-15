@@ -29,7 +29,7 @@ async fn floating_concurrency_limit_creates_state_on_enqueue() {
             10u8,
             now,
             None,
-            serde_json::json!({"test": 1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"test": 1})),
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
@@ -86,7 +86,7 @@ async fn floating_concurrency_limit_schedules_refresh_when_stale() {
             10u8,
             now,
             None,
-            serde_json::json!({"j": 1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
@@ -112,7 +112,7 @@ async fn floating_concurrency_limit_schedules_refresh_when_stale() {
             10u8,
             now_advanced,
             None,
-            serde_json::json!({"j": 2}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
@@ -153,7 +153,7 @@ async fn floating_concurrency_limit_dequeue_returns_refresh_tasks() {
             10u8,
             now,
             None,
-            serde_json::json!({"j": 1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
@@ -178,7 +178,7 @@ async fn floating_concurrency_limit_dequeue_returns_refresh_tasks() {
             10u8,
             now_ms(),
             None,
-            serde_json::json!({"j": 2}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
@@ -227,7 +227,7 @@ async fn floating_limit_refresh_success_updates_state() {
             10u8,
             now,
             None,
-            serde_json::json!({"j": 1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
@@ -252,7 +252,7 @@ async fn floating_limit_refresh_success_updates_state() {
             10u8,
             now_ms(),
             None,
-            serde_json::json!({"j": 2}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
@@ -319,7 +319,7 @@ async fn floating_limit_refresh_failure_triggers_backoff() {
             10u8,
             now,
             None,
-            serde_json::json!({"j": 1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
@@ -344,7 +344,7 @@ async fn floating_limit_refresh_failure_triggers_backoff() {
             10u8,
             now_ms(),
             None,
-            serde_json::json!({"j": 2}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
@@ -420,7 +420,7 @@ async fn floating_limit_concurrent_enqueues_no_duplicate_refresh() {
             10u8,
             now,
             None,
-            serde_json::json!({"j": 1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
@@ -448,7 +448,7 @@ async fn floating_limit_concurrent_enqueues_no_duplicate_refresh() {
                 10u8,
                 now_stale,
                 None,
-                serde_json::json!({"j": i}),
+                test_helpers::msgpack_payload(&serde_json::json!({"j": i})),
                 vec![silo::job::Limit::FloatingConcurrency(
                     silo::job::FloatingConcurrencyLimit {
                         key: queue.clone(),
@@ -497,7 +497,7 @@ async fn floating_limit_uses_dynamic_max_concurrency() {
             10u8,
             now,
             None,
-            serde_json::json!({"j": 1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
@@ -519,7 +519,7 @@ async fn floating_limit_uses_dynamic_max_concurrency() {
             10u8,
             now,
             None,
-            serde_json::json!({"j": 2}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
@@ -588,7 +588,7 @@ async fn floating_limit_job_persists_limit_type() {
             10u8,
             now,
             None,
-            serde_json::json!({"test": true}),
+            test_helpers::msgpack_payload(&serde_json::json!({"test": true})),
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
@@ -648,7 +648,7 @@ async fn floating_limit_multiple_retries_increase_backoff() {
             10u8,
             now,
             None,
-            serde_json::json!({"j": 1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
@@ -673,7 +673,7 @@ async fn floating_limit_multiple_retries_increase_backoff() {
             10u8,
             now_ms(),
             None,
-            serde_json::json!({"j": 2}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
@@ -755,7 +755,7 @@ async fn floating_limit_successful_refresh_resets_backoff() {
             10u8,
             now,
             None,
-            serde_json::json!({"j": 1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
@@ -780,7 +780,7 @@ async fn floating_limit_successful_refresh_resets_backoff() {
             10u8,
             now_ms(),
             None,
-            serde_json::json!({"j": 2}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
@@ -853,7 +853,7 @@ async fn floating_limit_refresh_task_lease_expiry_allows_rescheduling() {
             10u8,
             now,
             None,
-            serde_json::json!({"j": 1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
@@ -878,7 +878,7 @@ async fn floating_limit_refresh_task_lease_expiry_allows_rescheduling() {
             10u8,
             now_ms(),
             None,
-            serde_json::json!({"j": 2}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
@@ -974,7 +974,7 @@ async fn floating_limit_refresh_task_lease_expiry_allows_rescheduling() {
             10u8,
             now_ms(),
             None,
-            serde_json::json!({"j": 3}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 3})),
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
@@ -1021,7 +1021,7 @@ async fn floating_limit_refresh_task_lease_expiry_preserves_state() {
             10u8,
             now,
             None,
-            serde_json::json!({"j": 1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
@@ -1049,7 +1049,7 @@ async fn floating_limit_refresh_task_lease_expiry_preserves_state() {
             10u8,
             now_ms(),
             None,
-            serde_json::json!({"j": 2}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),

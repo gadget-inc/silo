@@ -12,6 +12,7 @@ async fn enqueue_round_trip_with_explicit_id() {
     let (_tmp, shard) = open_temp_shard().await;
 
     let payload = serde_json::json!({"hello": "world"});
+    let payload_bytes = test_helpers::msgpack_payload(&payload);
     let id = "job-123".to_string();
     let priority = 50u8;
     let start_time_ms = 1_700_000_000_000i64;
@@ -23,7 +24,7 @@ async fn enqueue_round_trip_with_explicit_id() {
             priority,
             start_time_ms,
             None,
-            payload.clone(),
+            payload_bytes,
             vec![],
             None,
         )
@@ -47,7 +48,7 @@ async fn enqueue_round_trip_with_explicit_id() {
     assert_eq!(view.id(), id);
     assert_eq!(view.priority(), priority);
     assert_eq!(view.enqueue_time_ms(), start_time_ms);
-    let got_payload = view.payload_json().unwrap();
+    let got_payload = view.payload_as_json().unwrap();
     assert_eq!(got_payload, payload);
 
     // A task should be present and point at attempt 1 for this job
@@ -63,6 +64,7 @@ async fn enqueue_with_metadata_round_trips_in_job_view() {
     let (_tmp, shard) = open_temp_shard().await;
 
     let payload = serde_json::json!({"m": true});
+    let payload_bytes = test_helpers::msgpack_payload(&payload);
     let priority = 5u8;
     let start_at_ms = 123i64;
     let md: Vec<(String, String)> = vec![
@@ -77,7 +79,7 @@ async fn enqueue_with_metadata_round_trips_in_job_view() {
             priority,
             start_at_ms,
             None,
-            payload.clone(),
+            payload_bytes,
             vec![],
             Some(md.clone()),
         )
@@ -107,6 +109,7 @@ async fn enqueue_generates_uuid_when_none_provided() {
     let (_tmp, shard) = open_temp_shard().await;
 
     let payload = serde_json::json!({"k": "v"});
+    let payload_bytes = test_helpers::msgpack_payload(&payload);
     let priority = 10u8;
     let start_time_ms = 12345i64;
 
@@ -117,7 +120,7 @@ async fn enqueue_generates_uuid_when_none_provided() {
             priority,
             start_time_ms,
             None,
-            payload.clone(),
+            payload_bytes,
             vec![],
             None,
         )
@@ -134,7 +137,7 @@ async fn enqueue_generates_uuid_when_none_provided() {
     assert_eq!(view.id(), got_id);
     assert_eq!(view.priority(), priority);
     assert_eq!(view.enqueue_time_ms(), start_time_ms);
-    let got_payload = view.payload_json().unwrap();
+    let got_payload = view.payload_as_json().unwrap();
     assert_eq!(got_payload, payload);
 
     // A task should be present and point at attempt 1 for this job
@@ -151,6 +154,7 @@ async fn delete_job_removes_key_and_is_idempotent() {
 
     // Enqueue a job
     let payload = serde_json::json!({"hello": "world"});
+    let payload_bytes = test_helpers::msgpack_payload(&payload);
     let id = "job-to-delete".to_string();
     let priority = 42u8;
     let start_time_ms = 1_700_000_000_001i64;
@@ -162,7 +166,7 @@ async fn delete_job_removes_key_and_is_idempotent() {
             priority,
             start_time_ms,
             None,
-            payload.clone(),
+            payload_bytes,
             vec![],
             None,
         )
@@ -203,12 +207,13 @@ async fn peek_omits_future_scheduled_tasks() {
     let (_tmp, shard) = open_temp_shard().await;
 
     let payload = serde_json::json!({"k": "v"});
+    let payload_bytes = test_helpers::msgpack_payload(&payload);
     let priority = 10u8;
     let now_ms = now_ms();
     let future_ms = now_ms + 60_000;
 
     let _ = shard
-        .enqueue("-", None, priority, future_ms, None, payload, vec![], None)
+        .enqueue("-", None, priority, future_ms, None, payload_bytes, vec![], None)
         .await
         .expect("enqueue");
 
@@ -223,6 +228,7 @@ async fn enqueue_fails_when_id_already_exists_and_db_unchanged() {
 
     let id = "dup-job".to_string();
     let payload1 = serde_json::json!({"v": 1});
+    let payload1_bytes = test_helpers::msgpack_payload(&payload1);
     let priority1 = 10u8;
     let start1 = 1_700_000_123_000i64;
 
@@ -233,7 +239,7 @@ async fn enqueue_fails_when_id_already_exists_and_db_unchanged() {
             priority1,
             start1,
             None,
-            payload1.clone(),
+            payload1_bytes,
             vec![],
             None,
         )
@@ -247,6 +253,7 @@ async fn enqueue_fails_when_id_already_exists_and_db_unchanged() {
 
     // Attempt duplicate enqueue with different values to ensure no overwrite occurs
     let payload2 = serde_json::json!({"v": 2});
+    let payload2_bytes = test_helpers::msgpack_payload(&payload2);
     let priority2 = 20u8;
     let start2 = start1 + 999_000;
 
@@ -257,7 +264,7 @@ async fn enqueue_fails_when_id_already_exists_and_db_unchanged() {
             priority2,
             start2,
             None,
-            payload2.clone(),
+            payload2_bytes,
             vec![],
             None,
         )
@@ -283,7 +290,7 @@ async fn enqueue_fails_when_id_already_exists_and_db_unchanged() {
         .expect("exists");
     assert_eq!(view.priority(), priority1);
     assert_eq!(view.enqueue_time_ms(), start1);
-    let got_payload = view.payload_json().unwrap();
+    let got_payload = view.payload_as_json().unwrap();
     assert_eq!(got_payload, payload1);
 }
 
@@ -291,11 +298,11 @@ async fn enqueue_fails_when_id_already_exists_and_db_unchanged() {
 async fn cannot_delete_running_job() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
-        let payload = serde_json::json!({"k": "v"});
+        let payload_bytes = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let priority = 10u8;
         let now = now_ms();
         let job_id = shard
-            .enqueue("-", None, priority, now, None, payload, vec![], None)
+            .enqueue("-", None, priority, now, None, payload_bytes, vec![], None)
             .await
             .expect("enqueue");
         let tasks = shard.dequeue("w", 1).await.expect("dequeue").tasks;
@@ -339,11 +346,11 @@ async fn cannot_delete_running_job() {
 async fn cannot_delete_scheduled_job() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
-        let payload = serde_json::json!({"k": "v"});
+        let payload_bytes = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let priority = 10u8;
         let now = now_ms();
         let job_id = shard
-            .enqueue("-", None, priority, now, None, payload, vec![], None)
+            .enqueue("-", None, priority, now, None, payload_bytes, vec![], None)
             .await
             .expect("enqueue");
 
@@ -401,7 +408,7 @@ async fn priority_ordering_when_start_times_equal() {
                 1u8, // higher priority
                 now,
                 None,
-                serde_json::json!({"j": "hi"}),
+                test_helpers::msgpack_payload(&serde_json::json!({"j": "hi"})),
                 vec![],
                 None,
             )
@@ -414,7 +421,7 @@ async fn priority_ordering_when_start_times_equal() {
                 50u8, // lower priority
                 now,
                 None,
-                serde_json::json!({"j": "lo"}),
+                test_helpers::msgpack_payload(&serde_json::json!({"j": "lo"})),
                 vec![],
                 None,
             )

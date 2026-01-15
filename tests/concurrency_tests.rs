@@ -14,7 +14,7 @@ use test_helpers::*;
 async fn concurrency_immediate_grant_enqueues_task_and_writes_holder() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
-    let payload = serde_json::json!({"k": "v"});
+    let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
     let queue = "q1".to_string();
     // enqueue with limit 1
     let job_id = shard
@@ -66,7 +66,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
             10u8,
             now,
             None,
-            serde_json::json!({"j": 1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -87,7 +87,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
             10u8,
             now,
             None,
-            serde_json::json!({"j": 2}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -140,7 +140,7 @@ async fn concurrency_held_queues_propagate_across_retries_and_release_on_finish(
                 randomize_interval: false,
                 backoff_factor: 1.0,
             }),
-            serde_json::json!({"j": 3}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 3})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -198,7 +198,7 @@ async fn concurrency_tickets_are_tenant_scoped() {
             10u8,
             now,
             None,
-            serde_json::json!({"t": "A"}),
+            test_helpers::msgpack_payload(&serde_json::json!({"t": "A"})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -218,7 +218,7 @@ async fn concurrency_tickets_are_tenant_scoped() {
             10u8,
             now,
             None,
-            serde_json::json!({"t": "B"}),
+            test_helpers::msgpack_payload(&serde_json::json!({"t": "B"})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -255,7 +255,7 @@ async fn concurrency_retry_releases_original_holder() {
                 randomize_interval: false,
                 backoff_factor: 1.0,
             }),
-            serde_json::json!({"j": 33}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 33})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -314,7 +314,7 @@ async fn concurrency_no_overgrant_after_release() {
             10u8,
             now,
             None,
-            serde_json::json!({"a": true}),
+            test_helpers::msgpack_payload(&serde_json::json!({"a": true})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -335,7 +335,7 @@ async fn concurrency_no_overgrant_after_release() {
             10u8,
             now,
             None,
-            serde_json::json!({"b": true}),
+            test_helpers::msgpack_payload(&serde_json::json!({"b": true})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -360,7 +360,7 @@ async fn concurrency_no_overgrant_after_release() {
             10u8,
             now,
             None,
-            serde_json::json!({"c": true}),
+            test_helpers::msgpack_payload(&serde_json::json!({"c": true})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -395,7 +395,7 @@ async fn stress_single_queue_no_double_grant() {
                 (i % 10) as u8,
                 now,
                 None,
-                serde_json::json!({"i": i}),
+                test_helpers::msgpack_payload(&serde_json::json!({"i": i})),
                 vec![Limit::Concurrency(ConcurrencyLimit {
                     key: queue.clone(),
                     max_concurrency: 1,
@@ -446,7 +446,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
             10u8,
             now,
             None,
-            serde_json::json!({"first": true}),
+            test_helpers::msgpack_payload(&serde_json::json!({"first": true})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -469,7 +469,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
                 (i % 5) as u8,
                 now,
                 None,
-                serde_json::json!({"i": i}),
+                test_helpers::msgpack_payload(&serde_json::json!({"i": i})),
                 vec![Limit::Concurrency(ConcurrencyLimit {
                     key: queue.clone(),
                     max_concurrency: 1,
@@ -503,7 +503,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
 async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
     let (_tmp, shard) = open_temp_shard().await;
 
-    let payload = serde_json::json!({"k": "v"});
+    let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
     let now = now_ms();
     let policy = RetryPolicy {
         retry_count: 1,
@@ -609,7 +609,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
 async fn reap_ignores_unexpired_leases() {
     let (_tmp, shard) = open_temp_shard().await;
 
-    let payload = serde_json::json!({"k": "v"});
+    let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
     let now = now_ms();
     let job_id = shard
         .enqueue("-", None, 10u8, now, None, payload, vec![], None)
@@ -663,7 +663,7 @@ async fn concurrency_multiple_holders_max_greater_than_one() {
                 10u8,
                 now,
                 None,
-                serde_json::json!({"i": i}),
+                test_helpers::msgpack_payload(&serde_json::json!({"i": i})),
                 vec![Limit::Concurrency(ConcurrencyLimit {
                     key: queue.clone(),
                     max_concurrency: 3,
@@ -751,7 +751,7 @@ async fn concurrency_multiple_queues_per_job() {
             10u8,
             now,
             None,
-            serde_json::json!({"task": "needs both"}),
+            test_helpers::msgpack_payload(&serde_json::json!({"task": "needs both"})),
             vec![
                 Limit::Concurrency(ConcurrencyLimit {
                     key: q1.clone(),
@@ -820,7 +820,7 @@ async fn concurrency_future_request_waits_until_ready() {
             10u8,
             now,
             None,
-            serde_json::json!({"j": 1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -840,7 +840,7 @@ async fn concurrency_future_request_waits_until_ready() {
             10u8,
             future,
             None,
-            serde_json::json!({"j": 2}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -897,7 +897,7 @@ async fn concurrency_request_priority_ordering() {
             10u8,
             now,
             None,
-            serde_json::json!({"j": 1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -917,7 +917,7 @@ async fn concurrency_request_priority_ordering() {
             50u8, // low priority
             now,
             None,
-            serde_json::json!({"j": 2}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -935,7 +935,7 @@ async fn concurrency_request_priority_ordering() {
             1u8, // high priority
             now,
             None,
-            serde_json::json!({"j": 3}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 3})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -990,7 +990,7 @@ async fn concurrency_permanent_failure_releases_holder() {
             10u8,
             now,
             None,
-            serde_json::json!({"j": 1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -1010,7 +1010,7 @@ async fn concurrency_permanent_failure_releases_holder() {
             10u8,
             now,
             None,
-            serde_json::json!({"j": 2}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -1071,7 +1071,7 @@ async fn concurrency_reap_expired_lease_releases_holder() {
                 randomize_interval: false,
                 backoff_factor: 1.0,
             }),
-            serde_json::json!({"j": 1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -1091,7 +1091,7 @@ async fn concurrency_reap_expired_lease_releases_holder() {
             10u8,
             now,
             None,
-            serde_json::json!({"j": 2}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -1183,7 +1183,7 @@ async fn concurrency_future_request_granted_after_time_passes() {
             10u8,
             now,
             None,
-            serde_json::json!({"j": 1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -1204,7 +1204,7 @@ async fn concurrency_future_request_granted_after_time_passes() {
             10u8,
             future,
             None,
-            serde_json::json!({"j": 2}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -1272,7 +1272,7 @@ async fn cannot_delete_job_with_future_request_ticket() {
             10u8,
             now,
             None,
-            serde_json::json!({"j": 1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -1292,7 +1292,7 @@ async fn cannot_delete_job_with_future_request_ticket() {
             10u8,
             future,
             None,
-            serde_json::json!({"j": 2}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -1353,7 +1353,7 @@ async fn cannot_delete_job_with_pending_request() {
             10u8,
             now,
             None,
-            serde_json::json!({"j": 1}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,
@@ -1373,7 +1373,7 @@ async fn cannot_delete_job_with_pending_request() {
             10u8,
             now,
             None,
-            serde_json::json!({"j": 2}),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
             vec![Limit::Concurrency(ConcurrencyLimit {
                 key: queue.clone(),
                 max_concurrency: 1,

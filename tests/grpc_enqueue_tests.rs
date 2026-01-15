@@ -13,8 +13,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
             setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
 
         // Enqueue a job
-        let payload = serde_json::json!({ "hello": "world" });
-        let payload_bytes = serde_json::to_vec(&payload)?;
+        let payload_bytes = rmp_serde::to_vec(&serde_json::json!({ "hello": "world" })).unwrap();
         let mut md = std::collections::HashMap::new();
         md.insert("env".to_string(), "test".to_string());
         let enq = EnqueueRequest {
@@ -23,7 +22,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
             priority: 10,
             start_at_ms: 0,
             retry_policy: None,
-            payload: Some(JsonValueBytes {
+            payload: Some(MsgpackBytes {
                 data: payload_bytes.clone(),
             }),
             limits: vec![],
@@ -56,8 +55,8 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
                 shard: 0,
                 task_id: task.id.clone(),
                 tenant: None,
-                outcome: Some(report_outcome_request::Outcome::Success(JsonValueBytes {
-                    data: b"{}".to_vec(),
+                outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
+                    data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
                 })),
             })
             .await?;
@@ -135,8 +134,8 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
                 priority: 1,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(JsonValueBytes {
-                    data: b"{}".to_vec(),
+                payload: Some(MsgpackBytes {
+                    data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
                 }),
                 limits: vec![],
                 tenant: None,
@@ -156,8 +155,8 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
                 priority: 1,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(JsonValueBytes {
-                    data: b"{}".to_vec(),
+                payload: Some(MsgpackBytes {
+                    data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
                 }),
                 limits: vec![],
                 tenant: None,
@@ -180,8 +179,8 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
                 priority: 1,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(JsonValueBytes {
-                    data: b"{}".to_vec(),
+                payload: Some(MsgpackBytes {
+                    data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
                 }),
                 limits: vec![],
                 tenant: None,
@@ -213,8 +212,8 @@ async fn grpc_server_enqueue_with_rate_limit() -> anyhow::Result<()> {
                 priority: 5,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(JsonValueBytes {
-                    data: b"{}".to_vec(),
+                payload: Some(MsgpackBytes {
+                    data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
                 }),
                 limits: vec![Limit {
                     limit: Some(limit::Limit::RateLimit(silo::pb::GubernatorRateLimit {
@@ -289,8 +288,8 @@ async fn grpc_enqueue_requires_tenant_when_tenancy_enabled() -> anyhow::Result<(
             priority: 1,
             start_at_ms: 0,
             retry_policy: None,
-            payload: Some(JsonValueBytes {
-                data: b"{}".to_vec(),
+            payload: Some(MsgpackBytes {
+                data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
             }),
             limits: vec![],
             tenant: None,
@@ -316,8 +315,8 @@ async fn grpc_enqueue_requires_tenant_when_tenancy_enabled() -> anyhow::Result<(
             priority: 1,
             start_at_ms: 0,
             retry_policy: None,
-            payload: Some(JsonValueBytes {
-                data: b"{}".to_vec(),
+            payload: Some(MsgpackBytes {
+                data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
             }),
             limits: vec![],
             tenant: Some("".to_string()),
@@ -343,8 +342,8 @@ async fn grpc_enqueue_requires_tenant_when_tenancy_enabled() -> anyhow::Result<(
             priority: 1,
             start_at_ms: 0,
             retry_policy: None,
-            payload: Some(JsonValueBytes {
-                data: b"{}".to_vec(),
+            payload: Some(MsgpackBytes {
+                data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
             }),
             limits: vec![],
             tenant: Some("my-tenant".to_string()),

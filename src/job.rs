@@ -264,7 +264,7 @@ pub struct JobInfo {
     pub id: String,
     pub priority: u8,         // 0..=99, 0 is highest priority and will run first
     pub enqueue_time_ms: i64, // epoch millis
-    pub payload: Vec<u8>,     // JSON bytes for now (opaque to rkyv)
+    pub payload: Vec<u8>,     // MessagePack bytes (opaque to rkyv)
     pub retry_policy: Option<RetryPolicy>,
     pub metadata: Vec<(String, String)>,
     pub limits: Vec<Limit>, // Ordered list of limits to check before execution
@@ -290,8 +290,18 @@ impl JobView {
     pub fn payload_bytes(&self) -> &[u8] {
         self.archived().payload.as_ref()
     }
-    pub fn payload_json(&self) -> serde_json::Result<serde_json::Value> {
-        serde_json::from_slice(self.payload_bytes())
+
+    /// Decode the payload from MessagePack bytes into a serde_json::Value for display.
+    /// This is used by the web UI and SQL query engine for human-readable display.
+    pub fn payload_as_json(&self) -> Result<serde_json::Value, rmp_serde::decode::Error> {
+        rmp_serde::from_slice(self.payload_bytes())
+    }
+
+    /// Decode the payload from MessagePack bytes into a typed value.
+    pub fn payload_msgpack<T: serde::de::DeserializeOwned>(
+        &self,
+    ) -> Result<T, rmp_serde::decode::Error> {
+        rmp_serde::from_slice(self.payload_bytes())
     }
 
     /// Accessor to the archived root (validated at construction).

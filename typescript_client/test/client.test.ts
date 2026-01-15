@@ -108,55 +108,54 @@ describe("defaultTenantToShard", () => {
 });
 
 describe("encodePayload", () => {
-  it("encodes a string as JSON bytes", () => {
+  it("encodes a string as msgpack bytes", () => {
     const result = encodePayload("hello");
-    expect(new TextDecoder().decode(result)).toBe('"hello"');
+    // Verify roundtrip works
+    expect(decodePayload<string>(result)).toBe("hello");
   });
 
-  it("encodes an object as JSON bytes", () => {
+  it("encodes an object as msgpack bytes", () => {
     const result = encodePayload({ foo: "bar", count: 42 });
-    expect(new TextDecoder().decode(result)).toBe('{"foo":"bar","count":42}');
+    expect(decodePayload(result)).toEqual({ foo: "bar", count: 42 });
   });
 
-  it("encodes null as JSON bytes", () => {
+  it("encodes null as msgpack bytes", () => {
     const result = encodePayload(null);
-    expect(new TextDecoder().decode(result)).toBe("null");
+    expect(decodePayload(result)).toBe(null);
   });
 
-  it("encodes an array as JSON bytes", () => {
+  it("encodes an array as msgpack bytes", () => {
     const result = encodePayload([1, 2, 3]);
-    expect(new TextDecoder().decode(result)).toBe("[1,2,3]");
+    expect(decodePayload(result)).toEqual([1, 2, 3]);
   });
 
-  it("encodes nested objects as JSON bytes", () => {
+  it("encodes nested objects as msgpack bytes", () => {
     const result = encodePayload({ outer: { inner: "value" } });
-    expect(new TextDecoder().decode(result)).toBe(
-      '{"outer":{"inner":"value"}}'
-    );
+    expect(decodePayload(result)).toEqual({ outer: { inner: "value" } });
   });
 });
 
 describe("decodePayload", () => {
-  it("decodes JSON bytes as a string", () => {
-    const bytes = new TextEncoder().encode('"hello"');
+  it("decodes msgpack bytes as a string", () => {
+    const bytes = encodePayload("hello");
     const result = decodePayload<string>(bytes);
     expect(result).toBe("hello");
   });
 
-  it("decodes JSON bytes as an object", () => {
-    const bytes = new TextEncoder().encode('{"foo":"bar","count":42}');
+  it("decodes msgpack bytes as an object", () => {
+    const bytes = encodePayload({ foo: "bar", count: 42 });
     const result = decodePayload<{ foo: string; count: number }>(bytes);
     expect(result).toEqual({ foo: "bar", count: 42 });
   });
 
-  it("decodes JSON bytes as null", () => {
-    const bytes = new TextEncoder().encode("null");
+  it("decodes msgpack bytes as null", () => {
+    const bytes = encodePayload(null);
     const result = decodePayload<null>(bytes);
     expect(result).toBe(null);
   });
 
-  it("decodes JSON bytes as an array", () => {
-    const bytes = new TextEncoder().encode("[1,2,3]");
+  it("decodes msgpack bytes as an array", () => {
+    const bytes = encodePayload([1, 2, 3]);
     const result = decodePayload<number[]>(bytes);
     expect(result).toEqual([1, 2, 3]);
   });
