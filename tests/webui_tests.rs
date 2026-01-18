@@ -98,6 +98,7 @@ async fn test_index_page_shows_scheduled_jobs() {
             test_helpers::msgpack_payload(&serde_json::json!({"foo": "bar"})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
@@ -124,6 +125,7 @@ async fn test_job_view_renders() {
             test_helpers::msgpack_payload(&serde_json::json!({"test": "payload"})),
             vec![],
             Some(vec![("key1".to_string(), "value1".to_string())]),
+            "default",
         )
         .await
         .expect("enqueue");
@@ -164,6 +166,7 @@ async fn test_job_view_without_shard_param() {
             test_helpers::msgpack_payload(&serde_json::json!({"test": "value"})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
@@ -200,6 +203,7 @@ async fn test_job_cancel() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
@@ -286,6 +290,7 @@ async fn test_cancel_already_terminal_job_is_noop() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
@@ -401,6 +406,7 @@ async fn test_index_shows_jobs_from_all_shards() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue shard 0");
@@ -416,6 +422,7 @@ async fn test_index_shows_jobs_from_all_shards() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue shard 1");
@@ -431,6 +438,7 @@ async fn test_index_shows_jobs_from_all_shards() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue shard 2");
@@ -495,6 +503,7 @@ async fn test_job_detail_from_non_zero_shard() {
             test_helpers::msgpack_payload(&serde_json::json!({"shard": 1})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue shard 1");
@@ -532,6 +541,7 @@ async fn test_queues_page_shows_queues_from_all_shards() {
                 max_concurrency: 1,
             })],
             None,
+            "default",
         )
         .await
         .expect("enqueue shard 0");
@@ -551,14 +561,15 @@ async fn test_queues_page_shows_queues_from_all_shards() {
                 max_concurrency: 1,
             })],
             None,
+            "default",
         )
         .await
         .expect("enqueue shard 1");
 
     // Dequeue to create holders (jobs will wait in concurrency queues)
     // Since max_concurrency is 1 and we enqueued, there should be holders or requesters
-    let _ = shard0.dequeue("worker-0", 1).await;
-    let _ = shard1.dequeue("worker-1", 1).await;
+    let _ = shard0.dequeue("worker-0", "default", 1).await;
+    let _ = shard1.dequeue("worker-1", "default", 1).await;
 
     // Request the queues page
     let (status, body) = make_request(state, "GET", "/queues").await;
@@ -587,6 +598,7 @@ async fn test_job_view_with_correct_shard_and_tenant_hint() {
             test_helpers::msgpack_payload(&serde_json::json!({"test": "value"})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
@@ -625,6 +637,7 @@ async fn test_job_view_with_wrong_shard_returns_not_found() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
@@ -656,6 +669,7 @@ async fn test_cancel_job_with_correct_shard_and_tenant() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
@@ -729,6 +743,7 @@ async fn test_sql_execute_returns_results() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue");

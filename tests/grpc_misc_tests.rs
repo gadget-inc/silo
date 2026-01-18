@@ -97,6 +97,7 @@ async fn grpc_server_lease_tasks_multi_shard() -> anyhow::Result<()> {
                     limits: vec![],
                     tenant: None,
                     metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
                 };
                 let _ = client.enqueue(enq).await?;
             }
@@ -109,6 +110,7 @@ async fn grpc_server_lease_tasks_multi_shard() -> anyhow::Result<()> {
                 shard: None, // Poll all shards
                 worker_id: "multi_shard_worker".to_string(),
                 max_tasks: 4,
+                task_group: "default".to_string(),
             })
             .await?
             .into_inner();
@@ -127,6 +129,7 @@ async fn grpc_server_lease_tasks_multi_shard() -> anyhow::Result<()> {
                 shard: None,
                 worker_id: "multi_shard_worker".to_string(),
                 max_tasks: 10, // Ask for more than available
+                task_group: "default".to_string(),
             })
             .await?
             .into_inner();
@@ -171,6 +174,7 @@ async fn grpc_server_tenant_validation_when_enabled() -> anyhow::Result<()> {
                 limits: vec![],
                 tenant: None, // Missing!
                 metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
             })
             .await;
 
@@ -200,6 +204,7 @@ async fn grpc_server_tenant_validation_when_enabled() -> anyhow::Result<()> {
                 limits: vec![],
                 tenant: Some("".to_string()), // Empty!
                 metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
             })
             .await;
 
@@ -224,6 +229,7 @@ async fn grpc_server_tenant_validation_when_enabled() -> anyhow::Result<()> {
                 limits: vec![],
                 tenant: Some("x".repeat(65)), // Too long!
                 metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
             })
             .await;
 
@@ -253,6 +259,7 @@ async fn grpc_server_tenant_validation_when_enabled() -> anyhow::Result<()> {
                 limits: vec![],
                 tenant: Some("my-tenant".to_string()),
                 metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
             })
             .await;
 
@@ -325,6 +332,7 @@ async fn grpc_server_reset_shards_works_in_dev_mode() -> anyhow::Result<()> {
                 limits: vec![],
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
             })
             .await?;
 

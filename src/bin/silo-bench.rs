@@ -326,6 +326,7 @@ async fn worker_loop(
             shard: Some(shard),
             worker_id: worker_id.clone(),
             max_tasks,
+            task_group: "default".to_string(),
         };
 
         poll_count.fetch_add(1, Ordering::Relaxed);
@@ -473,6 +474,7 @@ async fn enqueuer_loop(
             }],
             tenant: Some(tenant),
             metadata: Default::default(),
+            task_group: "default".to_string(),
         };
 
         match client.enqueue(request).await {

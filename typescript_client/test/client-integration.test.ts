@@ -15,6 +15,9 @@ const SILO_SERVERS = (
 const RUN_INTEGRATION =
   process.env.RUN_INTEGRATION === "true" || process.env.CI === "true";
 
+// Default task group for all integration tests
+const DEFAULT_TASK_GROUP = "integration-test-group";
+
 describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
   let client: SiloGRPCClient;
 
@@ -61,6 +64,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload,
         priority: 10,
       });
@@ -104,6 +108,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload,
         priority: 10,
         metadata: { source: "integration-test" },
@@ -130,6 +135,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         id: customId,
         payload: { data: "test" },
       });
@@ -145,6 +151,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { data: "retry-test" },
         retryPolicy: {
           retryCount: 3,
@@ -166,6 +173,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { data: "concurrency-test" },
         limits: [{ type: "concurrency", key: "user:123", maxConcurrency: 5 }],
       });
@@ -187,6 +195,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { data: "rate-limit-test" },
         limits: [
           {
@@ -232,6 +241,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { data: "mixed-limits-test" },
         limits: [
           { type: "concurrency", key: "tenant:abc", maxConcurrency: 10 },
@@ -262,6 +272,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         id: uniqueJobId,
         payload,
         priority: 1,
@@ -276,6 +287,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
           workerId: `test-worker-lease-${Date.now()}`,
           maxTasks: 50,
           shard,
+          taskGroup: DEFAULT_TASK_GROUP,
         });
         task = result.tasks.find((t) => t.jobId === handle.id);
         if (!task) {
@@ -307,6 +319,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         id: uniqueJobId,
         payload: { action: "fail-test" },
         priority: 1,
@@ -321,6 +334,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
           workerId: `test-worker-fail-${Date.now()}`,
           maxTasks: 50,
           shard,
+          taskGroup: DEFAULT_TASK_GROUP,
         });
         task = result.tasks.find((t) => t.jobId === handle.id);
         if (!task) {
@@ -349,6 +363,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { action: "heartbeat-test" },
         priority: 1,
       });
@@ -360,6 +375,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         workerId: "test-worker-3",
         maxTasks: 10,
         shard,
+        taskGroup: DEFAULT_TASK_GROUP,
       });
 
       const task = result.tasks.find((t) => t.jobId === handle.id);
@@ -383,6 +399,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         id: uniqueJobId,
         payload: { action: "delete-test" },
         priority: 1,
@@ -400,6 +417,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
           workerId: `delete-test-worker-${Date.now()}`,
           maxTasks: 50,
           shard,
+          taskGroup: DEFAULT_TASK_GROUP,
         });
         task = result.tasks.find((t) => t.jobId === handle.id);
         if (!task) {
@@ -429,6 +447,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         id: uniqueJobId,
         payload: { action: "expedite-test" },
         priority: 1,
@@ -447,6 +466,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         shard,
         workerId: "expedite-test-worker",
         maxTasks: 1,
+        taskGroup: DEFAULT_TASK_GROUP,
       });
       expect(
         resultBefore.tasks.find((t) => t.jobId === handle.id)
@@ -462,6 +482,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
           shard,
           workerId: "expedite-test-worker",
           maxTasks: 10,
+          taskGroup: DEFAULT_TASK_GROUP,
         });
         task = result.tasks.find((t) => t.jobId === handle.id);
         if (task) break;
@@ -495,6 +516,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         id: uniqueJobId,
         payload: { action: "expedite-running-test" },
         priority: 1,
@@ -510,6 +532,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
           shard,
           workerId: "expedite-running-test-worker",
           maxTasks: 10,
+          taskGroup: DEFAULT_TASK_GROUP,
         });
         task = result.tasks.find((t) => t.jobId === handle.id);
         if (task) break;
@@ -542,6 +565,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         id: uniqueJobId,
         payload: { action: "expedite-cancelled-test" },
         priority: 1,
@@ -568,6 +592,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       for (let i = 0; i < 3; i++) {
         await client.enqueue({
           tenant,
+          taskGroup: DEFAULT_TASK_GROUP,
           payload: { index: i },
           priority: 10 + i,
           metadata: { batch: testBatch },
@@ -591,6 +616,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       // First ensure there's data
       await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { test: true },
         priority: 5,
       });
@@ -608,6 +634,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       // Ensure there's at least one job
       await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { test: true },
       });
 
@@ -629,6 +656,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { test: "handle-test" },
       });
 
@@ -643,6 +671,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload,
         priority: 15,
       });
@@ -659,6 +688,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { test: "status-test" },
       });
 
@@ -671,6 +701,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { test: "cancel-test" },
       });
 
@@ -692,6 +723,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       // First enqueue a job
       const originalHandle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { test: "factory-test" },
       });
 
@@ -712,6 +744,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         id: uniqueJobId,
         payload: { test: "delete-test" },
       });
@@ -726,6 +759,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
           workerId: `handle-delete-worker-${Date.now()}`,
           maxTasks: 50,
           shard,
+          taskGroup: DEFAULT_TASK_GROUP,
         });
         task = result.tasks.find((t) => t.jobId === handle.id);
         if (!task) {
@@ -754,6 +788,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { test: "await-test" },
       });
 
@@ -767,6 +802,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
           workerId: `handle-await-worker-${Date.now()}`,
           maxTasks: 50,
           shard,
+          taskGroup: DEFAULT_TASK_GROUP,
         });
         task = result.tasks.find((t) => t.jobId === handle.id);
         if (!task) {
@@ -797,6 +833,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { test: "await-fail-test" },
       });
 
@@ -810,6 +847,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
           workerId: `handle-await-fail-worker-${Date.now()}`,
           maxTasks: 50,
           shard,
+          taskGroup: DEFAULT_TASK_GROUP,
         });
         task = result.tasks.find((t) => t.jobId === handle.id);
         if (!task) {
@@ -844,6 +882,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { test: "timeout-test" },
         // Schedule far in the future so it won't be leased
         startAtMs: BigInt(Date.now() + 60000),
@@ -863,6 +902,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       const payload = { task: "floating-limit-test" };
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload,
         limits: [
           {
@@ -899,6 +939,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       // Enqueue first job with a very short refresh interval
       const handle1 = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { job: 1 },
         limits: [
           {
@@ -918,6 +959,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       // Enqueue second job to trigger refresh scheduling
       const handle2 = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { job: 2 },
         limits: [
           {
@@ -936,6 +978,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         workerId: `floating-refresh-worker-${Date.now()}`,
         maxTasks: 10,
         shard,
+        taskGroup: DEFAULT_TASK_GROUP,
       });
 
       // Should have refresh tasks (and job tasks)
@@ -981,6 +1024,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       // Enqueue job with short refresh interval
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { task: "failure-test" },
         limits: [
           {
@@ -1000,6 +1044,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       // Trigger refresh by enqueueing another job
       await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { task: "trigger-refresh" },
         limits: [
           {
@@ -1017,6 +1062,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         workerId: `failure-worker-${Date.now()}`,
         maxTasks: 10,
         shard,
+        taskGroup: DEFAULT_TASK_GROUP,
       });
 
       // Find our refresh task - it MUST exist
@@ -1059,6 +1105,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       for (let i = 0; i < 3; i++) {
         const handle = await client.enqueue({
           tenant,
+          taskGroup: DEFAULT_TASK_GROUP,
           payload: { jobNum: i },
           limits: [
             {
@@ -1078,6 +1125,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         workerId: `concurrency-worker-${Date.now()}`,
         maxTasks: 10,
         shard,
+        taskGroup: DEFAULT_TASK_GROUP,
       });
 
       // Filter to just our jobs
@@ -1105,6 +1153,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { task: "combined-limits" },
         limits: [
           {
@@ -1171,6 +1220,7 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
         // Now requests should work because we've discovered the actual topology
         const handle = await client.enqueue({
           tenant: "wrong-shard-test",
+          taskGroup: DEFAULT_TASK_GROUP,
           payload: { test: true },
         });
         expect(handle.id).toBeTruthy();
@@ -1198,6 +1248,7 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
         // Now operations should work
         const handle = await client.enqueue({
           tenant: "retry-test-tenant",
+          taskGroup: DEFAULT_TASK_GROUP,
           payload: { data: "retry test" },
         });
         expect(handle.id).toBeTruthy();
@@ -1231,6 +1282,7 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
         for (const tenant of tenants) {
           handles[tenant] = await client.enqueue({
             tenant,
+            taskGroup: DEFAULT_TASK_GROUP,
             payload: { tenant },
           });
         }
@@ -1269,6 +1321,7 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
           const tenant = `bulk-tenant-${i}`;
           const handle = await client.enqueue({
             tenant,
+            taskGroup: DEFAULT_TASK_GROUP,
             payload: { index: i },
           });
           results.push({ tenant, jobId: handle.id });
@@ -1333,6 +1386,7 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
         await client.refreshTopology();
         const handle1 = await client.enqueue({
           tenant,
+          taskGroup: DEFAULT_TASK_GROUP,
           payload: { phase: "before" },
         });
 
@@ -1342,6 +1396,7 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
         // Enqueue after refresh
         const handle2 = await client.enqueue({
           tenant,
+          taskGroup: DEFAULT_TASK_GROUP,
           payload: { phase: "after" },
         });
 
@@ -1379,6 +1434,7 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
         // Operations should work
         const handle = await client.enqueue({
           tenant: "multi-server-test",
+          taskGroup: DEFAULT_TASK_GROUP,
           payload: { test: true },
         });
         expect(handle.id).toBeTruthy();
@@ -1404,6 +1460,7 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
 
         const handle = await client.enqueue({
           tenant: "host-port-test",
+          taskGroup: DEFAULT_TASK_GROUP,
           payload: { test: true },
         });
         expect(handle.id).toBeTruthy();

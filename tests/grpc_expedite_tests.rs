@@ -36,6 +36,7 @@ async fn grpc_expedite_future_scheduled_job() -> anyhow::Result<()> {
                 limits: vec![],
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
             })
             .await?
             .into_inner();
@@ -59,6 +60,7 @@ async fn grpc_expedite_future_scheduled_job() -> anyhow::Result<()> {
                 shard: Some(0),
                 worker_id: "worker-1".to_string(),
                 max_tasks: 1,
+                task_group: "default".to_string(),
             })
             .await?
             .into_inner();
@@ -79,6 +81,7 @@ async fn grpc_expedite_future_scheduled_job() -> anyhow::Result<()> {
                 shard: Some(0),
                 worker_id: "worker-1".to_string(),
                 max_tasks: 1,
+                task_group: "default".to_string(),
             })
             .await?
             .into_inner();
@@ -172,6 +175,7 @@ async fn grpc_expedite_running_job_fails() -> anyhow::Result<()> {
                 limits: vec![],
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
             })
             .await?
             .into_inner();
@@ -183,6 +187,7 @@ async fn grpc_expedite_running_job_fails() -> anyhow::Result<()> {
                 shard: Some(0),
                 worker_id: "worker-1".to_string(),
                 max_tasks: 1,
+                task_group: "default".to_string(),
             })
             .await?
             .into_inner();
@@ -270,6 +275,7 @@ async fn grpc_expedite_cancelled_job_fails() -> anyhow::Result<()> {
                 limits: vec![],
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
             })
             .await?
             .into_inner();

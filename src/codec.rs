@@ -109,6 +109,7 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
             job_id,
             attempt_number,
             held_queues,
+            task_group,
         } => Task::RunAttempt {
             id: id.as_str().to_string(),
             tenant: tenant.as_str().to_string(),
@@ -118,6 +119,7 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
                 .iter()
                 .map(|s| s.as_str().to_string())
                 .collect::<Vec<String>>(),
+            task_group: task_group.as_str().to_string(),
         },
         ArchivedTask::RequestTicket {
             queue,
@@ -127,6 +129,7 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
             job_id,
             attempt_number,
             request_id,
+            task_group,
         } => Task::RequestTicket {
             queue: queue.as_str().to_string(),
             start_time_ms: *start_time_ms,
@@ -135,6 +138,7 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
             job_id: job_id.as_str().to_string(),
             attempt_number: *attempt_number,
             request_id: request_id.as_str().to_string(),
+            task_group: task_group.as_str().to_string(),
         },
         ArchivedTask::CheckRateLimit {
             task_id,
@@ -147,6 +151,7 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
             started_at_ms,
             priority,
             held_queues,
+            task_group,
         } => Task::CheckRateLimit {
             task_id: task_id.as_str().to_string(),
             tenant: tenant.as_str().to_string(),
@@ -173,6 +178,7 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
                 .iter()
                 .map(|s| s.as_str().to_string())
                 .collect::<Vec<String>>(),
+            task_group: task_group.as_str().to_string(),
         },
         ArchivedTask::RefreshFloatingLimit {
             task_id,
@@ -181,6 +187,7 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
             current_max_concurrency,
             last_refreshed_at_ms,
             metadata,
+            task_group,
         } => Task::RefreshFloatingLimit {
             task_id: task_id.as_str().to_string(),
             tenant: tenant.as_str().to_string(),
@@ -191,6 +198,7 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
                 .iter()
                 .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
                 .collect(),
+            task_group: task_group.as_str().to_string(),
         },
     })
 }
@@ -303,12 +311,14 @@ impl DecodedLease {
                 job_id,
                 attempt_number,
                 held_queues,
+                task_group,
             } => Task::RunAttempt {
                 id: id.as_str().to_string(),
                 tenant: tenant.as_str().to_string(),
                 job_id: job_id.as_str().to_string(),
                 attempt_number: *attempt_number,
                 held_queues: held_queues.iter().map(|s| s.as_str().to_string()).collect(),
+                task_group: task_group.as_str().to_string(),
             },
             ArchivedTask::RequestTicket {
                 queue,
@@ -318,6 +328,7 @@ impl DecodedLease {
                 job_id,
                 attempt_number,
                 request_id,
+                task_group,
             } => Task::RequestTicket {
                 queue: queue.as_str().to_string(),
                 start_time_ms: *start_time_ms,
@@ -326,6 +337,7 @@ impl DecodedLease {
                 job_id: job_id.as_str().to_string(),
                 attempt_number: *attempt_number,
                 request_id: request_id.as_str().to_string(),
+                task_group: task_group.as_str().to_string(),
             },
             ArchivedTask::CheckRateLimit {
                 task_id,
@@ -338,6 +350,7 @@ impl DecodedLease {
                 started_at_ms,
                 priority,
                 held_queues,
+                task_group,
             } => Task::CheckRateLimit {
                 task_id: task_id.as_str().to_string(),
                 tenant: tenant.as_str().to_string(),
@@ -361,6 +374,7 @@ impl DecodedLease {
                 started_at_ms: *started_at_ms,
                 priority: *priority,
                 held_queues: held_queues.iter().map(|s| s.as_str().to_string()).collect(),
+                task_group: task_group.as_str().to_string(),
             },
             ArchivedTask::RefreshFloatingLimit {
                 task_id,
@@ -369,6 +383,7 @@ impl DecodedLease {
                 current_max_concurrency,
                 last_refreshed_at_ms,
                 metadata,
+                task_group,
             } => Task::RefreshFloatingLimit {
                 task_id: task_id.as_str().to_string(),
                 tenant: tenant.as_str().to_string(),
@@ -379,6 +394,7 @@ impl DecodedLease {
                     .iter()
                     .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
                     .collect(),
+                task_group: task_group.as_str().to_string(),
             },
         }
     }

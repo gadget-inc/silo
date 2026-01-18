@@ -17,9 +17,12 @@ impl JobStoreShard {
     ///
     /// This method processes internal tasks (CheckRateLimit, RequestTicket) transparently and returns
     /// RunAttempt tasks for job execution and RefreshFloatingLimit tasks for workers to refresh floating limits.
+    ///
+    /// The `task_group` parameter specifies which task group to poll for tasks.
     pub async fn dequeue(
         &self,
         worker_id: &str,
+        task_group: &str,
         max_tasks: usize,
     ) -> Result<DequeueResult, JobStoreShardError> {
         let _ts_enter = now_epoch_ms();
@@ -42,8 +45,8 @@ impl JobStoreShard {
                 break;
             }
 
-            // [SILO-DEQ-1] Claim from the broker buffer (tenant-agnostic)
-            let claimed: Vec<BrokerTask> = self.broker.claim_ready_or_nudge(remaining).await;
+            // [SILO-DEQ-1] Claim from the broker buffer for the specified task_group
+            let claimed: Vec<BrokerTask> = self.broker.claim_ready_or_nudge(task_group, remaining).await;
 
             if claimed.is_empty() {
                 break;
@@ -67,6 +70,7 @@ impl JobStoreShard {
                         job_id,
                         attempt_number,
                         request_id,
+                        task_group: req_task_group,
                     } => {
                         // Process ticket request internally
                         processed_internal = true;
@@ -112,6 +116,7 @@ impl JobStoreShard {
                                     job_id: job_id.clone(),
                                     attempt_number: *attempt_number,
                                     held_queues: vec![queue.clone()],
+                                    task_group: req_task_group.clone(),
                                 };
                                 let lease_key = leased_task_key(&request_id);
                                 let record = LeaseRecord {
@@ -176,6 +181,7 @@ impl JobStoreShard {
                         started_at_ms,
                         priority,
                         held_queues,
+                        task_group: check_task_group,
                     } => {
                         // Process rate limit check internally
                         processed_internal = true;
@@ -212,6 +218,7 @@ impl JobStoreShard {
                                     now_ms,
                                     now_ms,
                                     held_queues.clone(),
+                                    check_task_group,
                                 )?;
                             }
                             Ok(result) => {
@@ -245,6 +252,7 @@ impl JobStoreShard {
                                     *priority,
                                     held_queues,
                                     retry_backoff,
+                                    check_task_group,
                                 )?;
                             }
                             Err(e) => {
@@ -262,6 +270,7 @@ impl JobStoreShard {
                                     *priority,
                                     held_queues,
                                     retry_backoff,
+                                    check_task_group,
                                 )?;
                             }
                         }
@@ -274,6 +283,7 @@ impl JobStoreShard {
                         current_max_concurrency,
                         last_refreshed_at_ms,
                         metadata,
+                        task_group: refresh_task_group,
                     } => {
                         // RefreshFloatingLimit tasks are sent to workers - create lease
                         let lease_key = leased_task_key(task_id);
@@ -292,6 +302,7 @@ impl JobStoreShard {
                             current_max_concurrency: *current_max_concurrency,
                             last_refreshed_at_ms: *last_refreshed_at_ms,
                             metadata: metadata.clone(),
+                            task_group: refresh_task_group.clone(),
                         });
                         ack_keys.push(entry.key.clone());
                         continue;
@@ -457,23 +468,29 @@ impl JobStoreShard {
     }
 
     /// Peek up to `max_tasks` available tasks (time <= now), without deleting them.
-    pub async fn peek_tasks(&self, max_tasks: usize) -> Result<Vec<Task>, JobStoreShardError> {
-        let (tasks, _keys) = self.scan_ready_tasks(max_tasks).await?;
+    pub async fn peek_tasks(
+        &self,
+        task_group: &str,
+        max_tasks: usize,
+    ) -> Result<Vec<Task>, JobStoreShardError> {
+        let (tasks, _keys) = self.scan_ready_tasks(task_group, max_tasks).await?;
         Ok(tasks)
     }
 
     /// Internal: scan up to `max_tasks` ready tasks and return them with their keys.
     pub(crate) async fn scan_ready_tasks(
         &self,
+        task_group: &str,
         max_tasks: usize,
     ) -> Result<(Vec<Task>, Vec<Vec<u8>>), JobStoreShardError> {
         if max_tasks == 0 {
             return Ok((Vec::new(), Vec::new()));
         }
 
-        // Scan tasks under tasks/
-        let start: Vec<u8> = b"tasks/".to_vec();
-        let mut end: Vec<u8> = b"tasks/".to_vec();
+        // Scan tasks under tasks/{task_group}/
+        let prefix = crate::keys::task_group_prefix(task_group);
+        let start: Vec<u8> = prefix.as_bytes().to_vec();
+        let mut end: Vec<u8> = start.clone();
         end.push(0xFF);
         let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..=end).await?;
 
@@ -486,15 +503,20 @@ impl JobStoreShard {
                 break;
             };
 
-            // Only process task keys: tasks/...
+            // Only process task keys: tasks/{task_group}/...
             let key_str = String::from_utf8_lossy(&kv.key);
 
             // Enforce time cutoff: only keys with ts <= now_ms
-            // Format: tasks/<ts>/...
+            // Format: tasks/<task_group>/<ts>/...
             let mut parts = key_str.split('/');
             if parts.next() != Some("tasks") {
                 continue;
             }
+            // Skip task_group part
+            if parts.next().is_none() {
+                continue;
+            }
+            // Get timestamp part
             let ts_part = match parts.next() {
                 Some(v) => v,
                 None => continue,

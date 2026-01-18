@@ -94,6 +94,7 @@ message EnqueueRequest {
   repeated Limit limits = 7;             // Ordered list of limits checked before execution.
   optional string tenant = 8;            // Tenant ID for multi-tenant deployments. Optional.
   map<string, string> metadata = 9;      // Arbitrary key/value metadata stored with the job.
+  string task_group = 10;                // Task group for organizing tasks. Required. Tasks are enqueued into this group.
 }
 
 // Response after successfully enqueueing a job.
@@ -152,6 +153,7 @@ message GetJobResponse {
   int64 status_changed_at_ms = 9;        // Unix timestamp (ms) of last status change.
   repeated JobAttempt attempts = 10;     // All attempts for this job. Only populated if include_attempts was true in the request.
   optional int64 next_attempt_starts_after_ms = 11; // Unix timestamp (ms) when the next attempt will start. Present for scheduled jobs, absent for running or terminal jobs.
+  string task_group = 12;                // Task group this job's tasks are enqueued into.
 }
 
 // Request to get the result of a completed job.
@@ -224,7 +226,8 @@ message ExpediteJobResponse {}
 message LeaseTasksRequest { 
   optional uint32 shard = 1;  // optional filter - if set, only lease from this shard
   string worker_id = 2; 
-  uint32 max_tasks = 3; 
+  uint32 max_tasks = 3;
+  string task_group = 4;      // Required. Task group to poll tasks from.
 }
 
 // A task representing a single job attempt leased to a worker.
@@ -236,6 +239,7 @@ message Task {
   MsgpackBytes payload = 5;   // The job's payload for the worker to process (MessagePack).
   uint32 priority = 6;        // Job priority (for informational purposes).
   uint32 shard = 7;           // Shard this task came from (needed for reporting outcome).
+  string task_group = 8;      // Task group this task belongs to.
 }
 
 // Task for refreshing a floating concurrency limit.
@@ -248,6 +252,7 @@ message RefreshFloatingLimitTask {
   map<string, string> metadata = 5;    // Metadata from the limit definition.
   int64 lease_ms = 6;                  // How long the lease lasts. Heartbeat before this expires.
   uint32 shard = 7;                    // Shard this task came from (needed for reporting outcome).
+  string task_group = 8;               // Task group this refresh task belongs to.
 }
 
 // Response containing tasks leased to a worker.

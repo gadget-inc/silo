@@ -151,8 +151,12 @@ impl JobStoreShard {
         }
 
         // Extract task details to create new key
-        let (priority, attempt_number) = match &task {
-            Task::RunAttempt { attempt_number, .. } => {
+        let (priority, attempt_number, task_group) = match &task {
+            Task::RunAttempt {
+                attempt_number,
+                task_group,
+                ..
+            } => {
                 // Get priority from job info
                 let job_info_key = crate::keys::job_info_key(tenant, id);
                 let maybe_job_raw = txn.get(job_info_key.as_bytes()).await?;
@@ -160,7 +164,7 @@ impl JobStoreShard {
                     return Err(JobStoreShardError::JobNotFound(id.to_string()));
                 };
                 let job_view = crate::job::JobView::new(job_raw)?;
-                (job_view.priority(), *attempt_number)
+                (job_view.priority(), *attempt_number, task_group.clone())
             }
             _ => {
                 // Not a RunAttempt task - this shouldn't happen for normal jobs
@@ -178,7 +182,7 @@ impl JobStoreShard {
         txn.delete(task_key_str.as_bytes())?;
 
         // Create new task key with current timestamp
-        let new_task_key = task_key(now_ms, priority, id, attempt_number);
+        let new_task_key = task_key(&task_group, now_ms, priority, id, attempt_number);
         let task_value = encode_task(&task)?;
         txn.put(new_task_key.as_bytes(), &task_value)?;
 
@@ -198,7 +202,7 @@ impl JobStoreShard {
         job_id: &str,
     ) -> Result<Option<(String, Task, i64)>, JobStoreShardError> {
         // Scan all tasks looking for one that belongs to this job
-        // Task keys are: tasks/<timestamp>/<priority>/<job_id>/<attempt>
+        // Task keys are: tasks/<task_group>/<timestamp>/<priority>/<job_id>/<attempt>
         let start: Vec<u8> = b"tasks/".to_vec();
         let mut end: Vec<u8> = b"tasks/".to_vec();
         end.push(0xFF);
@@ -211,14 +215,20 @@ impl JobStoreShard {
                 Err(_) => continue,
             };
 
-            // Parse task key: tasks/<timestamp>/<priority>/<job_id>/<attempt>
+            // Parse task key: tasks/<task_group>/<timestamp>/<priority>/<job_id>/<attempt>
             let parts: Vec<&str> = key_str.split('/').collect();
-            if parts.len() < 5 || parts[0] != "tasks" {
+            if parts.len() < 6 || parts[0] != "tasks" {
                 continue;
             }
 
-            let ts_str = parts[1];
-            let task_job_id = parts[3];
+            // parts[0] = "tasks"
+            // parts[1] = task_group
+            // parts[2] = timestamp
+            // parts[3] = priority
+            // parts[4] = job_id
+            // parts[5] = attempt
+            let ts_str = parts[2];
+            let task_job_id = parts[4];
 
             if task_job_id != job_id {
                 continue;

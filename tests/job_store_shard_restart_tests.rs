@@ -15,7 +15,7 @@ async fn restart_cancelled_scheduled_job() {
 
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
-            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None)
+            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None, "default")
             .await
             .expect("enqueue");
 
@@ -59,7 +59,7 @@ async fn restart_cancelled_scheduled_job() {
         );
 
         // [SILO-RESTART-5] Verify a new task exists in queue
-        let tasks = shard.peek_tasks(10).await.expect("peek");
+        let tasks = shard.peek_tasks("default", 10).await.expect("peek");
         assert!(!tasks.is_empty(), "new task should exist after restart");
         let new_task = &tasks[0];
         match new_task {
@@ -90,12 +90,12 @@ async fn restart_failed_job() {
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         // No retry policy - job will fail permanently on first error
         let job_id = shard
-            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None)
+            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None, "default")
             .await
             .expect("enqueue");
 
         // Dequeue and fail the job
-        let tasks = shard.dequeue("worker-1", 1).await.expect("dequeue").tasks;
+        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
         assert_eq!(tasks.len(), 1);
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
@@ -134,7 +134,7 @@ async fn restart_failed_job() {
         );
 
         // [SILO-RESTART-5] Verify a new task exists with attempt number 1
-        let tasks = shard.peek_tasks(10).await.expect("peek");
+        let tasks = shard.peek_tasks("default", 10).await.expect("peek");
         assert!(!tasks.is_empty(), "new task should exist after restart");
         match &tasks[0] {
             Task::RunAttempt {
@@ -152,7 +152,7 @@ async fn restart_failed_job() {
         }
 
         // Dequeue and complete successfully this time
-        let tasks2 = shard.dequeue("worker-2", 1).await.expect("dequeue").tasks;
+        let tasks2 = shard.dequeue("worker-2", "default", 1).await.expect("dequeue").tasks;
         assert_eq!(tasks2.len(), 1);
         let task_id2 = tasks2[0].attempt().task_id().to_string();
         shard
@@ -185,12 +185,12 @@ async fn restart_succeeded_job_returns_error() {
 
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
-            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None)
+            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None, "default")
             .await
             .expect("enqueue");
 
         // Complete the job successfully
-        let tasks = shard.dequeue("worker-1", 1).await.expect("dequeue").tasks;
+        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
@@ -237,12 +237,12 @@ async fn restart_running_job_returns_error() {
 
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
-            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None)
+            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None, "default")
             .await
             .expect("enqueue");
 
         // Dequeue to make it Running
-        let tasks = shard.dequeue("worker-1", 1).await.expect("dequeue").tasks;
+        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
         assert_eq!(tasks.len(), 1);
 
         // Verify job is Running
@@ -292,7 +292,7 @@ async fn restart_scheduled_job_returns_error() {
 
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
-            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None)
+            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None, "default")
             .await
             .expect("enqueue");
 
@@ -366,13 +366,14 @@ async fn restart_failed_job_with_retry_policy_resets_retries() {
                 payload,
                 vec![],
                 None,
+            "default",
             )
             .await
             .expect("enqueue");
 
         // Fail the job 3 times (1 initial + 2 retries = 3 attempts)
         for attempt in 1..=3 {
-            let tasks = shard.dequeue("worker-1", 1).await.expect("dequeue").tasks;
+            let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
             assert_eq!(tasks.len(), 1, "should have task for attempt {}", attempt);
             let task_id = tasks[0].attempt().task_id().to_string();
             shard
@@ -420,7 +421,7 @@ async fn restart_failed_job_with_retry_policy_resets_retries() {
         assert_eq!(status_after.kind, JobStatusKind::Scheduled);
 
         // Verify new task has attempt number 1 (fresh start)
-        let tasks = shard.peek_tasks(10).await.expect("peek");
+        let tasks = shard.peek_tasks("default", 10).await.expect("peek");
         match &tasks[0] {
             Task::RunAttempt {
                 job_id: jid,
@@ -437,7 +438,7 @@ async fn restart_failed_job_with_retry_policy_resets_retries() {
         }
 
         // Successfully complete the restarted job
-        let tasks = shard.dequeue("worker-1", 1).await.expect("dequeue").tasks;
+        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
@@ -469,12 +470,12 @@ async fn restart_cancelled_running_job_after_acknowledgement() {
 
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
-            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None)
+            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None, "default")
             .await
             .expect("enqueue");
 
         // Dequeue to make job Running
-        let tasks = shard.dequeue("worker-1", 1).await.expect("dequeue").tasks;
+        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
         assert_eq!(tasks.len(), 1);
         let task_id = tasks[0].attempt().task_id().to_string();
 
@@ -524,7 +525,7 @@ async fn restart_cancelled_running_job_after_acknowledgement() {
         );
 
         // Complete the restarted job
-        let tasks = shard.dequeue("worker-2", 1).await.expect("dequeue").tasks;
+        let tasks = shard.dequeue("worker-2", "default", 1).await.expect("dequeue").tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
@@ -555,13 +556,13 @@ async fn multiple_restarts_of_same_job() {
 
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"iteration": 0}));
         let job_id = shard
-            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None)
+            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None, "default")
             .await
             .expect("enqueue");
 
         for iteration in 1..=3 {
             // Dequeue and fail
-            let tasks = shard.dequeue("worker-1", 1).await.expect("dequeue").tasks;
+            let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
             let task_id = tasks[0].attempt().task_id().to_string();
             shard
                 .report_attempt_outcome(
@@ -601,7 +602,7 @@ async fn multiple_restarts_of_same_job() {
         }
 
         // Finally succeed
-        let tasks = shard.dequeue("worker-1", 1).await.expect("dequeue").tasks;
+        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(

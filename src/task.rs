@@ -22,6 +22,7 @@ pub enum Task {
         job_id: String,
         attempt_number: u32,
         held_queues: Vec<String>,
+        task_group: String,
     },
     /// Internal: request a concurrency ticket for a queue at or after a specific time
     RequestTicket {
@@ -32,6 +33,7 @@ pub enum Task {
         job_id: String,
         attempt_number: u32,
         request_id: String,
+        task_group: String,
     },
     /// Internal: check a Gubernator rate limit before proceeding
     CheckRateLimit {
@@ -51,6 +53,7 @@ pub enum Task {
         priority: u8,
         /// Queues already held from previous concurrency limits
         held_queues: Vec<String>,
+        task_group: String,
     },
     /// Worker task: refresh a floating concurrency limit's max concurrency value
     RefreshFloatingLimit {
@@ -61,6 +64,7 @@ pub enum Task {
         last_refreshed_at_ms: i64,
         /// Opaque metadata from the floating limit definition
         metadata: Vec<(String, String)>,
+        task_group: String,
     },
 }
 
@@ -125,6 +129,7 @@ pub enum ConcurrencyAction {
         priority: u8,
         job_id: String,
         attempt_number: u32,
+        task_group: String,
     },
 }
 
@@ -167,4 +172,5 @@ pub struct LeasedRefreshTask {
     pub current_max_concurrency: u32,
     pub last_refreshed_at_ms: i64,
     pub metadata: Vec<(String, String)>,
+    pub task_group: String,
 }

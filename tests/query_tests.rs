@@ -50,6 +50,7 @@ async fn enqueue_job(shard: &JobStoreShard, id: &str, priority: u8, now: i64) ->
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue")
@@ -73,6 +74,7 @@ async fn enqueue_job_with_metadata(
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             Some(metadata),
+            "default",
         )
         .await
         .expect("enqueue")
@@ -102,7 +104,7 @@ async fn sql_pushdown_status_kind_running() {
     enqueue_job(&shard, "j2", 10, now).await;
 
     // Move j1 to Running by leasing a task
-    shard.dequeue("w", 1).await.expect("dequeue").tasks;
+    shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
 
     let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
     let got = query_ids(
@@ -157,7 +159,7 @@ async fn sql_status_and_exact_id() {
     enqueue_job(&shard, "j2", 10, now).await;
 
     // Move j1 to Running
-    shard.dequeue("w", 1).await.expect("dequeue").tasks;
+    shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
 
     let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
     let got = query_ids(
@@ -178,7 +180,7 @@ async fn sql_status_and_prefix_id() {
         enqueue_job(&shard, id, 10, now).await;
     }
     // Make two jobs Running
-    shard.dequeue("w", 2).await.expect("dequeue").tasks;
+    shard.dequeue("w", "default", 2).await.expect("dequeue").tasks;
 
     let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
     let got = query_ids(&sql, "SELECT id FROM jobs WHERE tenant='-' AND status_kind='Running' AND id LIKE 'job_%' ORDER BY id").await;
@@ -240,7 +242,7 @@ async fn sql_metadata_and_status_pushdown() {
     .await;
 
     // Make j1 Running
-    shard.dequeue("w", 1).await.expect("dequeue").tasks;
+    shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
 
     let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
     let got = query_ids(&sql, "SELECT id FROM jobs WHERE tenant='-' AND array_contains(element_at(metadata, 'role'), 'api') AND status_kind='Running'").await;
@@ -378,7 +380,7 @@ async fn sql_metadata_with_status_and_id_prefix() {
     }
 
     // Make two jobs Running (app_1 and app_2 by priority order)
-    shard.dequeue("w", 2).await.expect("dequeue").tasks;
+    shard.dequeue("w", "default", 2).await.expect("dequeue").tasks;
 
     let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
     let got = query_ids(&sql, "SELECT id FROM jobs WHERE tenant='-' AND array_contains(element_at(metadata, 'version'), 'v1') AND status_kind='Running' AND id LIKE 'app_%' ORDER BY id").await;
@@ -454,7 +456,7 @@ async fn verify_status_filter_pushdown() {
     let now = now_ms();
 
     enqueue_job(&shard, "j1", 10, now).await;
-    shard.dequeue("w", 1).await.expect("dequeue").tasks;
+    shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
 
     let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
     let plan = sql
@@ -511,7 +513,7 @@ async fn verify_multiple_filters_pushed() {
         vec![("role".to_string(), "api".to_string())],
     )
     .await;
-    shard.dequeue("w", 1).await.expect("dequeue").tasks;
+    shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
 
     let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
     // Query has metadata AND status filters
@@ -563,7 +565,7 @@ async fn sql_filter_scheduled_status() {
     enqueue_job(&shard, "s2", 10, now).await;
 
     // Make one Running
-    shard.dequeue("w", 1).await.expect("dequeue").tasks;
+    shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
 
     let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
     let got = query_ids(
@@ -585,7 +587,7 @@ async fn sql_filter_succeeded_status() {
     enqueue_job(&shard, "other", 10, now).await;
 
     // Dequeue and complete success1
-    let tasks = shard.dequeue("w", 1).await.expect("dequeue").tasks;
+    let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
     assert_eq!(tasks.len(), 1);
     let task_id = tasks[0].attempt().task_id().to_string();
 
@@ -624,13 +626,14 @@ async fn sql_filter_failed_status() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
     enqueue_job(&shard, "other", 10, now).await;
 
     // Dequeue and fail fail1
-    let tasks = shard.dequeue("w", 1).await.expect("dequeue").tasks;
+    let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
     assert_eq!(tasks.len(), 1);
     let task_id = tasks[0].attempt().task_id().to_string();
 
@@ -675,8 +678,8 @@ async fn sql_select_all_columns() {
         .expect("collect");
 
     assert!(!batches.is_empty());
-    // Should have all 9 columns: shard_id, tenant, id, priority, enqueue_time_ms, payload, status_kind, status_changed_at_ms, metadata
-    assert_eq!(batches[0].num_columns(), 9);
+    // Should have all 10 columns: shard_id, tenant, id, priority, enqueue_time_ms, payload, status_kind, status_changed_at_ms, task_group, metadata
+    assert_eq!(batches[0].num_columns(), 10);
     assert_eq!(batches[0].num_rows(), 1);
 }
 
@@ -963,6 +966,7 @@ async fn sql_tenant_isolation() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
@@ -976,6 +980,7 @@ async fn sql_tenant_isolation() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
@@ -1018,6 +1023,7 @@ async fn sql_default_tenant() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
@@ -1168,7 +1174,7 @@ async fn verify_combined_filters_all_pushed() {
         vec![("env".to_string(), "prod".to_string())],
     )
     .await;
-    shard.dequeue("w", 1).await.expect("dequeue").tasks;
+    shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
 
     let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
     let plan = sql
@@ -1265,12 +1271,13 @@ async fn queues_table_shows_holders() {
                 max_concurrency: 1,
             })],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
 
     // Dequeue to create a holder
-    let tasks = shard.dequeue("worker", 1).await.expect("dequeue").tasks;
+    let tasks = shard.dequeue("worker", "default", 1).await.expect("dequeue").tasks;
     assert_eq!(tasks.len(), 1);
 
     let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
@@ -1307,6 +1314,7 @@ async fn queues_table_shows_requesters() {
                 max_concurrency: 1,
             })],
             None,
+            "default",
         )
         .await
         .expect("enqueue first");
@@ -1324,12 +1332,13 @@ async fn queues_table_shows_requesters() {
                 max_concurrency: 1,
             })],
             None,
+            "default",
         )
         .await
         .expect("enqueue second");
 
     // Dequeue both - first gets holder, second becomes requester
-    shard.dequeue("worker", 2).await.expect("dequeue");
+    shard.dequeue("worker", "default", 2).await.expect("dequeue");
 
     let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
 
@@ -1377,6 +1386,7 @@ async fn queues_table_filter_by_queue_name() {
                 max_concurrency: 1,
             })],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
@@ -1394,11 +1404,12 @@ async fn queues_table_filter_by_queue_name() {
                 max_concurrency: 1,
             })],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
 
-    shard.dequeue("worker", 2).await.expect("dequeue");
+    shard.dequeue("worker", "default", 2).await.expect("dequeue");
 
     let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
 
@@ -1431,11 +1442,12 @@ async fn queues_table_all_columns() {
                 max_concurrency: 1,
             })],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
 
-    shard.dequeue("worker", 1).await.expect("dequeue");
+    shard.dequeue("worker", "default", 1).await.expect("dequeue");
 
     let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
     let batches = sql
@@ -1479,11 +1491,12 @@ async fn queues_table_empty_when_no_concurrency() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![], // No limits
             None,
+            "default",
         )
         .await
         .expect("enqueue");
 
-    shard.dequeue("worker", 1).await.expect("dequeue");
+    shard.dequeue("worker", "default", 1).await.expect("dequeue");
 
     let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
     let queue_names =
@@ -1517,12 +1530,13 @@ async fn queues_table_count_aggregate() {
                     max_concurrency: 10, // High limit so all get holders
                 })],
                 None,
+            "default",
             )
             .await
             .expect("enqueue");
     }
 
-    shard.dequeue("worker", 3).await.expect("dequeue");
+    shard.dequeue("worker", "default", 3).await.expect("dequeue");
 
     let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
     let batches = sql
@@ -1561,6 +1575,7 @@ async fn queues_table_tenant_isolation() {
                 max_concurrency: 1,
             })],
             None,
+            "default",
         )
         .await
         .expect("enqueue tenant_x");
@@ -1578,12 +1593,13 @@ async fn queues_table_tenant_isolation() {
                 max_concurrency: 1,
             })],
             None,
+            "default",
         )
         .await
         .expect("enqueue tenant_y");
 
-    shard.dequeue("worker", 1).await.expect("dequeue x");
-    shard.dequeue("worker", 1).await.expect("dequeue y");
+    shard.dequeue("worker", "default", 1).await.expect("dequeue x");
+    shard.dequeue("worker", "default", 1).await.expect("dequeue y");
 
     let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
 

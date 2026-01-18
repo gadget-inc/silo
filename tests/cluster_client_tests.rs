@@ -62,6 +62,7 @@ async fn cluster_client_query_local_shard() {
             test_helpers::msgpack_payload(&serde_json::json!({"test": "data"})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue job");
@@ -118,6 +119,7 @@ async fn cluster_client_query_all_local_shards() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue job on shard 0");
@@ -133,6 +135,7 @@ async fn cluster_client_query_all_local_shards() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue job on shard 1");
@@ -191,6 +194,7 @@ async fn cluster_client_get_job_local() {
             test_helpers::msgpack_payload(&serde_json::json!({"foo": "bar"})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue job");
@@ -243,6 +247,7 @@ async fn cluster_client_cancel_job_local() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue job");
@@ -291,6 +296,7 @@ async fn cluster_client_json_serialization_preserves_data() {
             })),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue complex job");
@@ -463,6 +469,7 @@ async fn cluster_client_query_all_local_shards_with_mixed_results() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue on shard 0");
@@ -478,6 +485,7 @@ async fn cluster_client_query_all_local_shards_with_mixed_results() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue on shard 2");

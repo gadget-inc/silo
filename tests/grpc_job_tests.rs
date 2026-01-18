@@ -25,6 +25,7 @@ async fn grpc_get_job_includes_status() -> anyhow::Result<()> {
             limits: vec![],
             tenant: None,
             metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
         };
         let _ = client.enqueue(enq).await?;
 
@@ -52,6 +53,7 @@ async fn grpc_get_job_includes_status() -> anyhow::Result<()> {
                 shard: Some(0),
                 worker_id: "w1".to_string(),
                 max_tasks: 1,
+                task_group: "default".to_string(),
             })
             .await?
             .into_inner();
@@ -155,6 +157,7 @@ async fn grpc_get_job_result_not_terminal() -> anyhow::Result<()> {
             limits: vec![],
             tenant: None,
             metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
         };
         let _ = client.enqueue(enq).await?;
 
@@ -178,6 +181,7 @@ async fn grpc_get_job_result_not_terminal() -> anyhow::Result<()> {
                 shard: Some(0),
                 worker_id: "w1".to_string(),
                 max_tasks: 1,
+                task_group: "default".to_string(),
             })
             .await?
             .into_inner();
@@ -225,6 +229,7 @@ async fn grpc_get_job_result_success() -> anyhow::Result<()> {
             limits: vec![],
             tenant: None,
             metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
         };
         let _ = client.enqueue(enq).await?;
 
@@ -234,6 +239,7 @@ async fn grpc_get_job_result_success() -> anyhow::Result<()> {
                 shard: Some(0),
                 worker_id: "w1".to_string(),
                 max_tasks: 1,
+                task_group: "default".to_string(),
             })
             .await?
             .into_inner();
@@ -308,6 +314,7 @@ async fn grpc_get_job_result_failure() -> anyhow::Result<()> {
             limits: vec![],
             tenant: None,
             metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
         };
         let _ = client.enqueue(enq).await?;
 
@@ -317,6 +324,7 @@ async fn grpc_get_job_result_failure() -> anyhow::Result<()> {
                 shard: Some(0),
                 worker_id: "w1".to_string(),
                 max_tasks: 1,
+                task_group: "default".to_string(),
             })
             .await?
             .into_inner();
@@ -388,6 +396,7 @@ async fn grpc_get_job_result_cancelled() -> anyhow::Result<()> {
             limits: vec![],
             tenant: None,
             metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
         };
         let _ = client.enqueue(enq).await?;
 
@@ -450,6 +459,7 @@ async fn grpc_get_job_result_cancelled_while_running() -> anyhow::Result<()> {
             limits: vec![],
             tenant: None,
             metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
         };
         let _ = client.enqueue(enq).await?;
 
@@ -459,6 +469,7 @@ async fn grpc_get_job_result_cancelled_while_running() -> anyhow::Result<()> {
                 shard: Some(0),
                 worker_id: "w1".to_string(),
                 max_tasks: 1,
+                task_group: "default".to_string(),
             })
             .await?
             .into_inner();
@@ -534,6 +545,7 @@ async fn grpc_server_get_job_result_for_non_terminal_job() -> anyhow::Result<()>
                 limits: vec![],
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
             })
             .await?;
 
@@ -592,6 +604,7 @@ async fn grpc_get_job_next_attempt_starts_after() -> anyhow::Result<()> {
             limits: vec![],
             tenant: None,
             metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
         };
         let _ = client.enqueue(enq).await?;
 
@@ -631,6 +644,7 @@ async fn grpc_get_job_next_attempt_starts_after() -> anyhow::Result<()> {
             limits: vec![],
             tenant: None,
             metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
         };
         let _ = client.enqueue(enq_future).await?;
 
@@ -657,6 +671,7 @@ async fn grpc_get_job_next_attempt_starts_after() -> anyhow::Result<()> {
                 shard: Some(0),
                 worker_id: "w1".to_string(),
                 max_tasks: 1,
+                task_group: "default".to_string(),
             })
             .await?
             .into_inner();
@@ -748,6 +763,7 @@ async fn grpc_get_job_next_attempt_after_retry() -> anyhow::Result<()> {
             limits: vec![],
             tenant: None,
             metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
         };
         let _ = client.enqueue(enq).await?;
 
@@ -757,6 +773,7 @@ async fn grpc_get_job_next_attempt_after_retry() -> anyhow::Result<()> {
                 shard: Some(0),
                 worker_id: "w1".to_string(),
                 max_tasks: 1,
+                task_group: "default".to_string(),
             })
             .await?
             .into_inner();
@@ -830,6 +847,7 @@ async fn grpc_get_job_next_attempt_cancelled() -> anyhow::Result<()> {
             limits: vec![],
             tenant: None,
             metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
         };
         let _ = client.enqueue(enq).await?;
 

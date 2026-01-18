@@ -148,6 +148,7 @@ fn grpc_end_to_end_under_turmoil() {
             limits: vec![],
             tenant: None,
             metadata: std::collections::HashMap::new(),
+            task_group: "default".to_string(),
         };
         let resp = client.enqueue(tonic::Request::new(req)).await?.into_inner();
         let job_id = resp.id;
@@ -158,6 +159,7 @@ fn grpc_end_to_end_under_turmoil() {
                 shard: Some(0),
                 worker_id: "w".into(),
                 max_tasks: 1,
+                task_group: "default".to_string(),
             }))
             .await?
             .into_inner();
@@ -313,6 +315,7 @@ fn grpc_fault_injection_with_partition() {
             limits: vec![],
             tenant: None,
             metadata: std::collections::HashMap::new(),
+            task_group: "default".to_string(),
         };
 
         let job_id = client
@@ -334,6 +337,7 @@ fn grpc_fault_injection_with_partition() {
                     shard: Some(0),
                     worker_id: "w".into(),
                     max_tasks: 1,
+                task_group: "default".to_string(),
                 }))
                 .await
             {
@@ -384,6 +388,7 @@ fn grpc_fault_injection_with_partition() {
                 shard: Some(0),
                 worker_id: "w".into(),
                 max_tasks: 1,
+                task_group: "default".to_string(),
             }))
             .await?
             .into_inner();
@@ -529,6 +534,7 @@ fn stress_multiple_workers_with_partitions() {
                 limits: vec![],
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
+            task_group: "default".to_string(),
             };
 
             // Retry on failure
@@ -561,6 +567,7 @@ fn stress_multiple_workers_with_partitions() {
                     shard: Some(0),
                     worker_id: "w1".into(),
                     max_tasks: 2,
+                task_group: "default".to_string(),
                 }))
                 .await
             {
@@ -626,6 +633,7 @@ fn stress_multiple_workers_with_partitions() {
                     shard: Some(0),
                     worker_id: "w2".into(),
                     max_tasks: 2,
+                task_group: "default".to_string(),
                 }))
                 .await
             {
@@ -797,6 +805,7 @@ fn stress_duplicate_completion_idempotency() {
                 limits: vec![],
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
+            task_group: "default".to_string(),
             }))
             .await?
             .into_inner()
@@ -808,6 +817,7 @@ fn stress_duplicate_completion_idempotency() {
                 shard: Some(0),
                 worker_id: "w".into(),
                 max_tasks: 1,
+                task_group: "default".to_string(),
             }))
             .await?
             .into_inner();
@@ -844,6 +854,7 @@ fn stress_duplicate_completion_idempotency() {
                 shard: Some(0),
                 worker_id: "w".into(),
                 max_tasks: 10,
+                task_group: "default".to_string(),
             }))
             .await?
             .into_inner();
@@ -989,6 +1000,7 @@ fn stress_lease_expiry_during_partition() {
                 limits: vec![],
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
+            task_group: "default".to_string(),
             }))
             .await?;
 
@@ -997,6 +1009,7 @@ fn stress_lease_expiry_during_partition() {
                 shard: Some(0),
                 worker_id: "w1".into(),
                 max_tasks: 1,
+                task_group: "default".to_string(),
             }))
             .await?
             .into_inner();
@@ -1044,6 +1057,7 @@ fn stress_lease_expiry_during_partition() {
                     shard: Some(0),
                     worker_id: "w2".into(),
                     max_tasks: 1,
+                task_group: "default".to_string(),
                 }))
                 .await
             {
@@ -1199,6 +1213,7 @@ fn stress_high_message_loss() {
                 limits: vec![],
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
+            task_group: "default".to_string(),
             };
 
             for attempt in 0..20 {
@@ -1226,6 +1241,7 @@ fn stress_high_message_loss() {
                     shard: Some(0),
                     worker_id: "resilient".into(),
                     max_tasks: 5,
+                task_group: "default".to_string(),
                 }))
                 .await
             {
@@ -1377,6 +1393,7 @@ fn concurrency_request_ready_without_release_fails() {
                 limits: conc,
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
+            task_group: "default".to_string(),
             }))
             .await?
             .into_inner()
@@ -1387,6 +1404,7 @@ fn concurrency_request_ready_without_release_fails() {
                 shard: Some(0),
                 worker_id: "w".into(),
                 max_tasks: 1,
+                task_group: "default".to_string(),
             }))
             .await?
             .into_inner();
@@ -1416,6 +1434,7 @@ fn concurrency_request_ready_without_release_fails() {
                 limits: conc2,
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
+            task_group: "default".to_string(),
             }))
             .await?
             .into_inner()
@@ -1442,6 +1461,7 @@ fn concurrency_request_ready_without_release_fails() {
                     shard: Some(0),
                     worker_id: "w".into(),
                     max_tasks: 1,
+                task_group: "default".to_string(),
                 }))
                 .await?
                 .into_inner();

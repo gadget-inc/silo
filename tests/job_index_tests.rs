@@ -14,7 +14,7 @@ async fn status_index_scheduled_then_running_then_succeeded() {
     let payload = test_helpers::msgpack_payload(&serde_json::json!({"k":"v"}));
 
     let job_id = shard
-        .enqueue("-", None, 10u8, now, None, payload, vec![], None)
+        .enqueue("-", None, 10u8, now, None, payload, vec![], None, "default")
         .await
         .expect("enqueue");
 
@@ -26,7 +26,7 @@ async fn status_index_scheduled_then_running_then_succeeded() {
     assert!(s.contains(&job_id));
 
     // Dequeue -> Running
-    let tasks = shard.dequeue("w", 1).await.expect("dequeue").tasks;
+    let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
     assert_eq!(tasks.len(), 1);
 
     let running = shard
@@ -65,10 +65,11 @@ async fn status_index_failed_and_scheduled_then_order_newest_first() {
             test_helpers::msgpack_payload(&serde_json::json!({"a":1})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enq a");
-    let ta = shard.dequeue("w", 1).await.expect("deq a").tasks[0]
+    let ta = shard.dequeue("w", "default", 1).await.expect("deq a").tasks[0]
         .attempt()
         .task_id()
         .to_string();
@@ -105,10 +106,11 @@ async fn status_index_failed_and_scheduled_then_order_newest_first() {
             test_helpers::msgpack_payload(&serde_json::json!({"b":2})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enq b");
-    let tb = shard.dequeue("w", 1).await.expect("deq b").tasks[0]
+    let tb = shard.dequeue("w", "default", 1).await.expect("deq b").tasks[0]
         .attempt()
         .task_id()
         .to_string();
@@ -159,11 +161,12 @@ async fn retry_flow_running_to_scheduled_to_running_to_succeeded() {
             test_helpers::msgpack_payload(&serde_json::json!({"j":1})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
     // Running
-    let t1 = shard.dequeue("w", 1).await.expect("deq").tasks[0]
+    let t1 = shard.dequeue("w", "default", 1).await.expect("deq").tasks[0]
         .attempt()
         .task_id()
         .to_string();
@@ -190,7 +193,7 @@ async fn retry_flow_running_to_scheduled_to_running_to_succeeded() {
         .expect("scan scheduled");
     assert!(scheduled.contains(&job_id));
     // Dequeue attempt 2 -> Running
-    let t2 = shard.dequeue("w", 1).await.expect("deq2").tasks[0]
+    let t2 = shard.dequeue("w", "default", 1).await.expect("deq2").tasks[0]
         .attempt()
         .task_id()
         .to_string();
@@ -226,11 +229,12 @@ async fn reaper_without_retries_marks_failed_in_index() {
             test_helpers::msgpack_payload(&serde_json::json!({"x":1})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
     // Lease one task
-    let _tid = shard.dequeue("w", 1).await.expect("deq").tasks[0]
+    let _tid = shard.dequeue("w", "default", 1).await.expect("deq").tasks[0]
         .attempt()
         .task_id()
         .to_string();
@@ -254,6 +258,7 @@ async fn reaper_without_retries_marks_failed_in_index() {
             job_id: job_id.as_str().to_string(),
             attempt_number: *attempt_number,
             held_queues: Vec::new(),
+            task_group: "default".to_string(),
         },
         _ => unreachable!(),
     };
@@ -300,11 +305,12 @@ async fn reaper_with_retries_moves_to_scheduled_in_index() {
             test_helpers::msgpack_payload(&serde_json::json!({"y":2})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
     // Lease and expire
-    let _tid = shard.dequeue("w", 1).await.expect("deq").tasks[0]
+    let _tid = shard.dequeue("w", "default", 1).await.expect("deq").tasks[0]
         .attempt()
         .task_id()
         .to_string();
@@ -327,6 +333,7 @@ async fn reaper_with_retries_moves_to_scheduled_in_index() {
             job_id: job_id.as_str().to_string(),
             attempt_number: *attempt_number,
             held_queues: Vec::new(),
+            task_group: "default".to_string(),
         },
         _ => unreachable!(),
     };
@@ -366,11 +373,12 @@ async fn delete_removes_from_index() {
             test_helpers::msgpack_payload(&serde_json::json!({"z":3})),
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
     // Run and succeed
-    let tid = shard.dequeue("w", 1).await.expect("deq").tasks[0]
+    let tid = shard.dequeue("w", "default", 1).await.expect("deq").tasks[0]
         .attempt()
         .task_id()
         .to_string();
@@ -407,6 +415,7 @@ async fn cross_tenant_isolation_in_scans() {
             test_helpers::msgpack_payload(&serde_json::json!({"t":"A"})),
             vec![],
             None,
+            "default",
         )
         .await
         .unwrap();
@@ -420,6 +429,7 @@ async fn cross_tenant_isolation_in_scans() {
             test_helpers::msgpack_payload(&serde_json::json!({"t":"B"})),
             vec![],
             None,
+            "default",
         )
         .await
         .unwrap();
@@ -448,6 +458,7 @@ async fn pagination_and_ordering_newest_first() {
                 test_helpers::msgpack_payload(&serde_json::json!({"i": i})),
                 vec![],
                 None,
+            "default",
             )
             .await
             .unwrap();
@@ -483,6 +494,7 @@ async fn future_enqueue_is_in_scheduled_scan() {
             test_helpers::msgpack_payload(&serde_json::json!({"f":1})),
             vec![],
             None,
+            "default",
         )
         .await
         .unwrap();
@@ -512,6 +524,7 @@ async fn metadata_index_basic_and_delete_cleanup() {
                 ("k".to_string(), "v".to_string()),
                 ("x".to_string(), "y".to_string()),
             ]),
+            "default",
         )
         .await
         .expect("enqueue a");
@@ -525,6 +538,7 @@ async fn metadata_index_basic_and_delete_cleanup() {
             test_helpers::msgpack_payload(&serde_json::json!({"b":2})),
             vec![],
             Some(vec![("k".to_string(), "v".to_string())]),
+            "default",
         )
         .await
         .expect("enqueue b");
@@ -538,6 +552,7 @@ async fn metadata_index_basic_and_delete_cleanup() {
             test_helpers::msgpack_payload(&serde_json::json!({"c":3})),
             vec![],
             Some(vec![("k".to_string(), "w".to_string())]),
+            "default",
         )
         .await
         .expect("enqueue c");
@@ -566,7 +581,7 @@ async fn metadata_index_basic_and_delete_cleanup() {
     assert_eq!(kw, vec![c.clone()]);
 
     // Complete A so it reaches a terminal state, then delete and verify cleanup
-    let tasks = shard.dequeue("w", 3).await.expect("dequeue").tasks;
+    let tasks = shard.dequeue("w", "default", 3).await.expect("dequeue").tasks;
     let a_tid = tasks
         .iter()
         .find(|t| t.job().id() == a)
@@ -599,6 +614,7 @@ async fn metadata_scan_cross_tenant_isolation() {
             test_helpers::msgpack_payload(&serde_json::json!({"t":"A"})),
             vec![],
             Some(vec![("k".to_string(), "v".to_string())]),
+            "default",
         )
         .await
         .unwrap();
@@ -612,6 +628,7 @@ async fn metadata_scan_cross_tenant_isolation() {
             test_helpers::msgpack_payload(&serde_json::json!({"t":"B"})),
             vec![],
             Some(vec![("k".to_string(), "v".to_string())]),
+            "default",
         )
         .await
         .unwrap();
@@ -650,6 +667,7 @@ async fn scan_jobs_unfiltered_basic_and_ordering() {
                 test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
+            "default",
             )
             .await
             .expect("enqueue");
@@ -691,6 +709,7 @@ async fn scan_jobs_is_tenant_isolated_and_limit_zero_empty() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            "default",
         )
         .await
         .unwrap();
@@ -704,6 +723,7 @@ async fn scan_jobs_is_tenant_isolated_and_limit_zero_empty() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            "default",
         )
         .await
         .unwrap();

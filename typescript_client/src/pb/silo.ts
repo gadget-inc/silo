@@ -234,6 +234,10 @@ export interface EnqueueRequest {
     metadata: {
         [key: string]: string;
     }; // Arbitrary key/value metadata stored with the job.
+    /**
+     * @generated from protobuf field: string task_group = 10
+     */
+    taskGroup: string; // Task group for organizing tasks. Required. Tasks are enqueued into this group.
 }
 /**
  * Response after successfully enqueueing a job.
@@ -364,6 +368,10 @@ export interface GetJobResponse {
      * @generated from protobuf field: optional int64 next_attempt_starts_after_ms = 11
      */
     nextAttemptStartsAfterMs?: bigint; // Unix timestamp (ms) when the next attempt will start. Present for scheduled jobs, absent for running or terminal jobs.
+    /**
+     * @generated from protobuf field: string task_group = 12
+     */
+    taskGroup: string; // Task group this job's tasks are enqueued into.
 }
 /**
  * Request to get the result of a completed job.
@@ -579,6 +587,10 @@ export interface LeaseTasksRequest {
      * @generated from protobuf field: uint32 max_tasks = 3
      */
     maxTasks: number;
+    /**
+     * @generated from protobuf field: string task_group = 4
+     */
+    taskGroup: string; // Required. Task group to poll tasks from.
 }
 /**
  * A task representing a single job attempt leased to a worker.
@@ -614,6 +626,10 @@ export interface Task {
      * @generated from protobuf field: uint32 shard = 7
      */
     shard: number; // Shard this task came from (needed for reporting outcome).
+    /**
+     * @generated from protobuf field: string task_group = 8
+     */
+    taskGroup: string; // Task group this task belongs to.
 }
 /**
  * Task for refreshing a floating concurrency limit.
@@ -652,6 +668,10 @@ export interface RefreshFloatingLimitTask {
      * @generated from protobuf field: uint32 shard = 7
      */
     shard: number; // Shard this task came from (needed for reporting outcome).
+    /**
+     * @generated from protobuf field: string task_group = 8
+     */
+    taskGroup: string; // Task group this refresh task belongs to.
 }
 /**
  * Response containing tasks leased to a worker.
@@ -1655,7 +1675,8 @@ class EnqueueRequest$Type extends MessageType<EnqueueRequest> {
             { no: 6, name: "payload", kind: "message", T: () => MsgpackBytes },
             { no: 7, name: "limits", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => Limit },
             { no: 8, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
-            { no: 9, name: "metadata", kind: "map", K: 9 /*ScalarType.STRING*/, V: { kind: "scalar", T: 9 /*ScalarType.STRING*/ } }
+            { no: 9, name: "metadata", kind: "map", K: 9 /*ScalarType.STRING*/, V: { kind: "scalar", T: 9 /*ScalarType.STRING*/ } },
+            { no: 10, name: "task_group", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
         ]);
     }
     create(value?: PartialMessage<EnqueueRequest>): EnqueueRequest {
@@ -1666,6 +1687,7 @@ class EnqueueRequest$Type extends MessageType<EnqueueRequest> {
         message.startAtMs = 0n;
         message.limits = [];
         message.metadata = {};
+        message.taskGroup = "";
         if (value !== undefined)
             reflectionMergePartial<EnqueueRequest>(this, message, value);
         return message;
@@ -1701,6 +1723,9 @@ class EnqueueRequest$Type extends MessageType<EnqueueRequest> {
                     break;
                 case /* map<string, string> metadata */ 9:
                     this.binaryReadMap9(message.metadata, reader, options);
+                    break;
+                case /* string task_group */ 10:
+                    message.taskGroup = reader.string();
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -1757,6 +1782,9 @@ class EnqueueRequest$Type extends MessageType<EnqueueRequest> {
         /* map<string, string> metadata = 9; */
         for (let k of globalThis.Object.keys(message.metadata))
             writer.tag(9, WireType.LengthDelimited).fork().tag(1, WireType.LengthDelimited).string(k).tag(2, WireType.LengthDelimited).string(message.metadata[k]).join();
+        /* string task_group = 10; */
+        if (message.taskGroup !== "")
+            writer.tag(10, WireType.LengthDelimited).string(message.taskGroup);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -2004,7 +2032,8 @@ class GetJobResponse$Type extends MessageType<GetJobResponse> {
             { no: 8, name: "status", kind: "enum", T: () => ["silo.v1.JobStatus", JobStatus, "JOB_STATUS_"] },
             { no: 9, name: "status_changed_at_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
             { no: 10, name: "attempts", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => JobAttempt },
-            { no: 11, name: "next_attempt_starts_after_ms", kind: "scalar", opt: true, T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ }
+            { no: 11, name: "next_attempt_starts_after_ms", kind: "scalar", opt: true, T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 12, name: "task_group", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
         ]);
     }
     create(value?: PartialMessage<GetJobResponse>): GetJobResponse {
@@ -2017,6 +2046,7 @@ class GetJobResponse$Type extends MessageType<GetJobResponse> {
         message.status = 0;
         message.statusChangedAtMs = 0n;
         message.attempts = [];
+        message.taskGroup = "";
         if (value !== undefined)
             reflectionMergePartial<GetJobResponse>(this, message, value);
         return message;
@@ -2058,6 +2088,9 @@ class GetJobResponse$Type extends MessageType<GetJobResponse> {
                     break;
                 case /* optional int64 next_attempt_starts_after_ms */ 11:
                     message.nextAttemptStartsAfterMs = reader.int64().toBigInt();
+                    break;
+                case /* string task_group */ 12:
+                    message.taskGroup = reader.string();
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -2120,6 +2153,9 @@ class GetJobResponse$Type extends MessageType<GetJobResponse> {
         /* optional int64 next_attempt_starts_after_ms = 11; */
         if (message.nextAttemptStartsAfterMs !== undefined)
             writer.tag(11, WireType.Varint).int64(message.nextAttemptStartsAfterMs);
+        /* string task_group = 12; */
+        if (message.taskGroup !== "")
+            writer.tag(12, WireType.LengthDelimited).string(message.taskGroup);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -2794,13 +2830,15 @@ class LeaseTasksRequest$Type extends MessageType<LeaseTasksRequest> {
         super("silo.v1.LeaseTasksRequest", [
             { no: 1, name: "shard", kind: "scalar", opt: true, T: 13 /*ScalarType.UINT32*/ },
             { no: 2, name: "worker_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
-            { no: 3, name: "max_tasks", kind: "scalar", T: 13 /*ScalarType.UINT32*/ }
+            { no: 3, name: "max_tasks", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
+            { no: 4, name: "task_group", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
         ]);
     }
     create(value?: PartialMessage<LeaseTasksRequest>): LeaseTasksRequest {
         const message = globalThis.Object.create((this.messagePrototype!));
         message.workerId = "";
         message.maxTasks = 0;
+        message.taskGroup = "";
         if (value !== undefined)
             reflectionMergePartial<LeaseTasksRequest>(this, message, value);
         return message;
@@ -2818,6 +2856,9 @@ class LeaseTasksRequest$Type extends MessageType<LeaseTasksRequest> {
                     break;
                 case /* uint32 max_tasks */ 3:
                     message.maxTasks = reader.uint32();
+                    break;
+                case /* string task_group */ 4:
+                    message.taskGroup = reader.string();
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -2840,6 +2881,9 @@ class LeaseTasksRequest$Type extends MessageType<LeaseTasksRequest> {
         /* uint32 max_tasks = 3; */
         if (message.maxTasks !== 0)
             writer.tag(3, WireType.Varint).uint32(message.maxTasks);
+        /* string task_group = 4; */
+        if (message.taskGroup !== "")
+            writer.tag(4, WireType.LengthDelimited).string(message.taskGroup);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -2860,7 +2904,8 @@ class Task$Type extends MessageType<Task> {
             { no: 4, name: "lease_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
             { no: 5, name: "payload", kind: "message", T: () => MsgpackBytes },
             { no: 6, name: "priority", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
-            { no: 7, name: "shard", kind: "scalar", T: 13 /*ScalarType.UINT32*/ }
+            { no: 7, name: "shard", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
+            { no: 8, name: "task_group", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
         ]);
     }
     create(value?: PartialMessage<Task>): Task {
@@ -2871,6 +2916,7 @@ class Task$Type extends MessageType<Task> {
         message.leaseMs = 0n;
         message.priority = 0;
         message.shard = 0;
+        message.taskGroup = "";
         if (value !== undefined)
             reflectionMergePartial<Task>(this, message, value);
         return message;
@@ -2900,6 +2946,9 @@ class Task$Type extends MessageType<Task> {
                     break;
                 case /* uint32 shard */ 7:
                     message.shard = reader.uint32();
+                    break;
+                case /* string task_group */ 8:
+                    message.taskGroup = reader.string();
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -2934,6 +2983,9 @@ class Task$Type extends MessageType<Task> {
         /* uint32 shard = 7; */
         if (message.shard !== 0)
             writer.tag(7, WireType.Varint).uint32(message.shard);
+        /* string task_group = 8; */
+        if (message.taskGroup !== "")
+            writer.tag(8, WireType.LengthDelimited).string(message.taskGroup);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -2954,7 +3006,8 @@ class RefreshFloatingLimitTask$Type extends MessageType<RefreshFloatingLimitTask
             { no: 4, name: "last_refreshed_at_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
             { no: 5, name: "metadata", kind: "map", K: 9 /*ScalarType.STRING*/, V: { kind: "scalar", T: 9 /*ScalarType.STRING*/ } },
             { no: 6, name: "lease_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
-            { no: 7, name: "shard", kind: "scalar", T: 13 /*ScalarType.UINT32*/ }
+            { no: 7, name: "shard", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
+            { no: 8, name: "task_group", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
         ]);
     }
     create(value?: PartialMessage<RefreshFloatingLimitTask>): RefreshFloatingLimitTask {
@@ -2966,6 +3019,7 @@ class RefreshFloatingLimitTask$Type extends MessageType<RefreshFloatingLimitTask
         message.metadata = {};
         message.leaseMs = 0n;
         message.shard = 0;
+        message.taskGroup = "";
         if (value !== undefined)
             reflectionMergePartial<RefreshFloatingLimitTask>(this, message, value);
         return message;
@@ -2995,6 +3049,9 @@ class RefreshFloatingLimitTask$Type extends MessageType<RefreshFloatingLimitTask
                     break;
                 case /* uint32 shard */ 7:
                     message.shard = reader.uint32();
+                    break;
+                case /* string task_group */ 8:
+                    message.taskGroup = reader.string();
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -3045,6 +3102,9 @@ class RefreshFloatingLimitTask$Type extends MessageType<RefreshFloatingLimitTask
         /* uint32 shard = 7; */
         if (message.shard !== 0)
             writer.tag(7, WireType.Varint).uint32(message.shard);
+        /* string task_group = 8; */
+        if (message.taskGroup !== "")
+            writer.tag(8, WireType.LengthDelimited).string(message.taskGroup);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);

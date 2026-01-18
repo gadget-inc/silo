@@ -257,6 +257,12 @@ export interface SiloWorkerOptions {
   client: SiloGRPCClient;
   /** Unique identifier for this worker */
   workerId: string;
+  /**
+   * Task group to poll for tasks.
+   * Workers can only receive tasks from the specified task group.
+   * Required.
+   */
+  taskGroup: string;
   /** The function that will handle each task */
   handler: TaskHandler;
   /**
@@ -353,6 +359,7 @@ export interface SiloWorkerOptions {
 export class SiloWorker {
   private readonly _client: SiloGRPCClient;
   private readonly _workerId: string;
+  private readonly _taskGroup: string;
   private readonly _handler: TaskHandler;
   private readonly _refreshHandler: RefreshHandler | undefined;
   private readonly _tenant: string | undefined;
@@ -379,6 +386,7 @@ export class SiloWorker {
   public constructor(options: SiloWorkerOptions) {
     this._client = options.client;
     this._workerId = options.workerId;
+    this._taskGroup = options.taskGroup;
     this._handler = options.handler;
     this._refreshHandler = options.refreshHandler;
     this._tenant = options.tenant;
@@ -529,6 +537,7 @@ export class SiloWorker {
     const result = await this._client.leaseTasks({
       workerId: this._workerId,
       maxTasks: tasksToRequest,
+      taskGroup: this._taskGroup,
     });
 
     // Add regular job tasks to the queue

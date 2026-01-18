@@ -325,6 +325,8 @@ export interface Job {
    * Present for scheduled jobs (initial or after retry), absent for running or terminal jobs.
    */
   nextAttemptStartsAfterMs?: bigint;
+  /** Task group the job belongs to */
+  taskGroup: string;
 }
 
 /** Possible job statuses */
@@ -494,6 +496,12 @@ function fromProtoLimit(limit: Limit): JobLimit | undefined {
 export interface EnqueueJobOptions {
   /** The JSON-serializable payload for the job */
   payload: unknown;
+  /**
+   * Task group for organizing tasks.
+   * Workers must specify which task group to poll for tasks.
+   * Required.
+   */
+  taskGroup: string;
   /** Optional job ID. If not provided, the server will generate one. */
   id?: string;
   /** Priority 0-99, where 0 is highest priority. Defaults to 50. */
@@ -516,6 +524,12 @@ export interface LeaseTasksOptions {
   workerId: string;
   /** Maximum number of tasks to lease */
   maxTasks: number;
+  /**
+   * Task group to poll for tasks.
+   * Workers can only receive tasks from the specified task group.
+   * Required.
+   */
+  taskGroup: string;
   /**
    * Optional shard filter. If specified, only leases from this shard.
    * If not specified (the default), the server leases from all its shards.
@@ -580,6 +594,8 @@ export interface RefreshTask {
   leaseMs: bigint;
   /** Which shard this task came from (for reporting outcomes) */
   shard: number;
+  /** Task group this task belongs to */
+  taskGroup: string;
 }
 
 /** Outcome for reporting refresh task success */
@@ -1096,6 +1112,7 @@ export class SiloGRPCClient {
             limits: options.limits?.map(toProtoLimit) ?? [],
             tenant: options.tenant,
             metadata: options.metadata ?? {},
+            taskGroup: options.taskGroup,
           },
           this._rpcOptions()
         );
@@ -1151,6 +1168,7 @@ export class SiloGRPCClient {
               ? response.attempts.map(protoAttemptToPublic)
               : undefined,
           nextAttemptStartsAfterMs: response.nextAttemptStartsAfterMs,
+          taskGroup: response.taskGroup,
         };
       });
     } catch (error) {
@@ -1407,6 +1425,7 @@ export class SiloGRPCClient {
         shard: options.shard,
         workerId: options.workerId,
         maxTasks: options.maxTasks,
+        taskGroup: options.taskGroup,
       },
       this._rpcOptions()
     );
@@ -1422,6 +1441,7 @@ export class SiloGRPCClient {
       metadata: { ...rt.metadata },
       leaseMs: rt.leaseMs,
       shard: rt.shard,
+      taskGroup: rt.taskGroup,
     }));
 
     return {

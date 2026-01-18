@@ -19,6 +19,9 @@ const RUN_INTEGRATION =
  * Integration tests for JobHandle.
  * These tests exercise the full stack from JobHandle -> SiloGRPCClient -> gRPC -> Server.
  */
+// Default task group for integration tests
+const DEFAULT_TASK_GROUP = "job-handle-test-group";
+
 describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
   let client: SiloGRPCClient;
 
@@ -42,6 +45,7 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
       const tenant = "handle-props-tenant";
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { test: "props" },
       });
 
@@ -71,6 +75,7 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload,
         priority: 25,
         metadata: { source: "job-handle-test" },
@@ -99,6 +104,7 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { test: "status" },
       });
 
@@ -111,6 +117,7 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { test: "running" },
       });
 
@@ -123,6 +130,7 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
           workerId: `handle-running-worker-${Date.now()}`,
           maxTasks: 50,
           shard,
+          taskGroup: DEFAULT_TASK_GROUP,
         });
         task = result.tasks.find((t) => t.jobId === handle.id);
         if (!task) await new Promise((r) => setTimeout(r, 100));
@@ -154,6 +162,7 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { test: "cancel" },
       });
 
@@ -180,6 +189,7 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { test: "delete" },
       });
 
@@ -192,6 +202,7 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
           workerId: `handle-delete-worker-${Date.now()}`,
           maxTasks: 50,
           shard,
+          taskGroup: DEFAULT_TASK_GROUP,
         });
         task = result.tasks.find((t) => t.jobId === handle.id);
         if (!task) await new Promise((r) => setTimeout(r, 100));
@@ -227,6 +238,7 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { test: "await-success" },
       });
 
@@ -239,6 +251,7 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
           workerId: `handle-await-success-worker-${Date.now()}`,
           maxTasks: 50,
           shard,
+          taskGroup: DEFAULT_TASK_GROUP,
         });
         task = result.tasks.find((t) => t.jobId === handle.id);
         if (!task) await new Promise((r) => setTimeout(r, 100));
@@ -267,6 +280,7 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { test: "await-fail" },
       });
 
@@ -279,6 +293,7 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
           workerId: `handle-await-fail-worker-${Date.now()}`,
           maxTasks: 50,
           shard,
+          taskGroup: DEFAULT_TASK_GROUP,
         });
         task = result.tasks.find((t) => t.jobId === handle.id);
         if (!task) await new Promise((r) => setTimeout(r, 100));
@@ -314,6 +329,7 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { test: "await-cancel" },
       });
 
@@ -334,6 +350,7 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
 
       const handle = await client.enqueue({
         tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { test: "await-timeout" },
         // Schedule far in the future so it won't be leased
         startAtMs: BigInt(Date.now() + 60000),

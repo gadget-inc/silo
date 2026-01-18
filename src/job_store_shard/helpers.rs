@@ -21,6 +21,7 @@ pub fn now_epoch_ms() -> i64 {
 /// Encode and write a task to the batch at the standard task key location.
 pub(crate) fn put_task(
     batch: &mut WriteBatch,
+    task_group: &str,
     time_ms: i64,
     priority: u8,
     job_id: &str,
@@ -29,7 +30,7 @@ pub(crate) fn put_task(
 ) -> Result<(), JobStoreShardError> {
     let task_value = encode_task(task)?;
     batch.put(
-        task_key(time_ms, priority, job_id, attempt).as_bytes(),
+        task_key(task_group, time_ms, priority, job_id, attempt).as_bytes(),
         &task_value,
     );
     Ok(())

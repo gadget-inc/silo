@@ -8,7 +8,7 @@ New jobs must be enqueued into Silo with an API call using the Silo client. This
 
 ## Basic Usage
 
-You can enqueue a job by enqueuing a payload:
+You can enqueue a job by enqueuing a payload with a task group:
 
 ```typescript
 import { SiloGRPCClient } from "@silo-ai/client";
@@ -19,7 +19,10 @@ const client = new SiloGRPCClient({
 
 // Enqueue a simple job - returns a JobHandle
 const handle = await client.enqueue({
-  payload: { task: "send-email", to: "user@example.com" }
+  // params that will be passed to the job
+  payload: { task: "send-email", to: "user@example.com" },
+  // specifies which worker task group will process the job
+  taskGroup: "default"
 });
 
 console.log(`Enqueued job: ${handle.id}`);
@@ -73,9 +76,41 @@ await client.enqueue({
     userId: 123,
     action: "generate-report",
     reportType: "monthly"
-  }
+  },
+  taskGroup: "reports"
 });
 ```
+
+### `taskGroup` (required)
+
+The task group this job belongs to. Workers poll for tasks from specific task groups, so this determines which workers will process the job.
+
+```typescript
+// Email jobs are processed by email workers
+await client.enqueue({
+  payload: { to: "user@example.com", subject: "Hello" },
+  taskGroup: "emails"
+});
+
+// Report jobs are processed by report workers
+await client.enqueue({
+  payload: { reportId: 456 },
+  taskGroup: "reports"
+});
+```
+
+Task groups allow you to:
+- **Route jobs to specialized workers**: Different task groups can be processed by workers with different capabilities (e.g., GPU workers for ML tasks, high-memory workers for data processing)
+- **Scale worker pools independently**: You can scale email workers and report workers separately based on their respective queue depths
+- **Isolate workloads**: Slow jobs in one task group won't block jobs in another
+
+<Aside type="tip" title="Choosing task groups">
+You must run separate workers for each task group. You can make as many task groups as you want, but the resources you need to run all the workers might be high if you create a lot of task groups. For high-cardinality concurrency management, use [concurrent limits](/guides/concurrency-limits) instead.
+</Aside>
+
+Task group names must be:
+- Non-empty
+- Maximum 64 characters
 
 ### `id` (optional)
 
@@ -84,6 +119,7 @@ A custom job ID. If not provided, Silo will autogenerate a job id. If a job with
 ```typescript
 const handle = await client.enqueue({
   payload: { task: "cleanup" },
+  taskGroup: "maintenance",
   id: "cleanup-2024-01-08"
 });
 
@@ -101,11 +137,13 @@ Priority from 0-99, where **0 is highest priority**. Defaults to 50.
 ```typescript
 const urgentHandle = await client.enqueue({
   payload: { task: "urgent-notification" },
+  taskGroup: "notifications",
   priority: 0  // Highest priority
 });
 
 const backgroundHandle = await client.enqueue({
   payload: { task: "background-sync" },
+  taskGroup: "sync",
   priority: 90  // Lower priority
 });
 ```
@@ -120,6 +158,7 @@ const oneHourLater = BigInt(Date.now() + 60 * 60 * 1000);
 
 const handle = await client.enqueue({
   payload: { task: "scheduled-reminder" },
+  taskGroup: "reminders",
   startAtMs: oneHourLater
 });
 ```
@@ -131,6 +170,7 @@ Tenant ID for multi-tenancy. Jobs with the same tenant are routed to the same sh
 ```typescript
 const handle = await client.enqueue({
   payload: { task: "process-order" },
+  taskGroup: "orders",
   tenant: "customer-123"
 });
 
@@ -142,6 +182,8 @@ console.log(handle.tenant); // "customer-123"
 When tenancy is enabled server-side, you __must__ provide the `tenant` for every job you enqueue. If you don't provide a tenant ID, the enqueue call will fail.
 </Aside>
 
+Tenants are different than task groups as well. Tenants influence data sharding and generally only exist on one shard, whereas task groups exist on all shards. Tenants can be very high cardinality, but task groups generally are not. You can run workers against specific task groups, but not against specific tenants.
+
 ### `metadata` (optional)
 
 Arbitrary key-value pairs stored with the job. Metadata pairs are useful for tracking, filtering, or debugging, as jobs can later be queried by these metadata keys. 
@@ -149,6 +191,7 @@ Arbitrary key-value pairs stored with the job. Metadata pairs are useful for tra
 ```typescript
 const handle = await client.enqueue({
   payload: { task: "process-image" },
+  taskGroup: "image-processing",
   metadata: {
     source: "api",
     userId: "user-456",
@@ -169,6 +212,7 @@ Configure automatic retries if the job fails:
 ```typescript
 const handle = await client.enqueue({
   payload: { task: "api-call" },
+  taskGroup: "api-calls",
   retryPolicy: {
     retryCount: 3,                    // Maximum number of retries
     initialIntervalMs: 1000n,         // Initial backoff (1 second)
@@ -197,6 +241,7 @@ Limit how many jobs with the same key can run concurrently:
 ```typescript
 const handle = await client.enqueue({
   payload: { task: "process-user-upload", userId: 123 },
+  taskGroup: "uploads",
   limits: [
     {
       type: "concurrency",
@@ -221,6 +266,7 @@ import { GubernatorAlgorithm } from "@silo-ai/client";
 
 const handle = await client.enqueue({
   payload: { task: "api-request" },
+  taskGroup: "api-calls",
   limits: [
     {
       type: "rateLimit",
@@ -255,6 +301,7 @@ You can combine multiple limits. They are checked in order, and all must pass be
 ```typescript
 const handle = await client.enqueue({
   payload: { task: "expensive-operation", tenantId: "abc" },
+  taskGroup: "expensive-ops",
   limits: [
     // First check: tenant concurrency limit
     {
@@ -280,7 +327,8 @@ The `enqueue()` method returns a `JobHandle` object that provides convenient met
 
 ```typescript
 const handle = await client.enqueue({
-  payload: { task: "process-data" }
+  payload: { task: "process-data" },
+  taskGroup: "data-processing"
 });
 
 // Access the job ID

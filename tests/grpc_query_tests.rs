@@ -29,6 +29,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
                 limits: vec![],
                 tenant: None,
                 metadata: md,
+            task_group: "default".to_string(),
             };
             let _ = client.enqueue(enq).await?;
         }
@@ -197,6 +198,7 @@ async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
             limits: vec![],
             tenant: None,
             metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
         };
         let _ = client.enqueue(enq).await?;
 
@@ -253,6 +255,7 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
             limits: vec![],
             tenant: None,
             metadata: md,
+            task_group: "default".to_string(),
         };
         let _ = client.enqueue(enq).await?;
 
@@ -324,6 +327,7 @@ async fn grpc_server_query_without_tenant() -> anyhow::Result<()> {
                 limits: vec![],
                 tenant: None, // Will use default tenant
                 metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
             };
             let _ = client.enqueue(enq).await?;
         }
@@ -391,6 +395,7 @@ async fn grpc_server_query_msgpack_data_types() -> anyhow::Result<()> {
                 limits: vec![],
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
             };
             let _ = client.enqueue(enq).await?;
         }
@@ -513,6 +518,7 @@ async fn grpc_server_query_arrow_without_tenant() -> anyhow::Result<()> {
                 limits: vec![],
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
             };
             let _ = client.enqueue(enq).await?;
         }

@@ -24,6 +24,7 @@ impl JobStoreShard {
         priority: u8,
         held_queues: &[String],
         retry_at_ms: i64,
+        task_group: &str,
     ) -> Result<(), JobStoreShardError> {
         let retry_task = Task::CheckRateLimit {
             task_id: Uuid::new_v4().to_string(),
@@ -36,9 +37,11 @@ impl JobStoreShard {
             started_at_ms,
             priority,
             held_queues: held_queues.to_vec(),
+            task_group: task_group.to_string(),
         };
         put_task(
             batch,
+            task_group,
             retry_at_ms,
             priority,
             job_id,

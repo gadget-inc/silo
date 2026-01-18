@@ -1,17 +1,293 @@
 mod test_helpers;
 
-use silo::codec::{decode_task};
-use silo::job_attempt::{AttemptOutcome};
+use silo::codec::decode_task;
+use silo::job_attempt::AttemptOutcome;
 use silo::keys::concurrency_holder_key;
-use silo::task::{Task};
+use silo::task::Task;
 use std::collections::HashSet;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
-    Mutex,
+    Arc, Mutex,
 };
 
 use test_helpers::*;
+
+/// Tests that jobs from different task groups can participate in the same concurrency queue.
+/// This is important because task groups are for routing work to different workers,
+/// but concurrency limits should work across task groups.
+#[silo::test]
+async fn concurrency_shared_across_task_groups() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let queue = "shared-q".to_string();
+
+    // Job A in task_group "alpha" takes the only slot
+    let j1 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"from": "alpha"})),
+            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "alpha", // task_group alpha
+        )
+        .await
+        .expect("enqueue alpha");
+
+    // Dequeue from alpha task_group - should get the job
+    let tasks1 = shard.dequeue("w1", "alpha", 1).await.expect("deq alpha").tasks;
+    assert_eq!(tasks1.len(), 1);
+    assert_eq!(tasks1[0].job().id(), j1);
+    let t1 = tasks1[0].attempt().task_id().to_string();
+
+    // Job B in task_group "beta" should queue as a request (same concurrency key, slot is taken)
+    let j2 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"from": "beta"})),
+            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "beta", // task_group beta
+        )
+        .await
+        .expect("enqueue beta");
+
+    // Dequeue from beta task_group - should get nothing (waiting for concurrency)
+    let tasks2 = shard.dequeue("w2", "beta", 1).await.expect("deq beta").tasks;
+    // Should only have RequestTicket, not RunAttempt
+    let run_attempts: Vec<_> = tasks2.iter().filter(|t| t.attempt().task_id().len() > 0).collect();
+    assert_eq!(run_attempts.len(), 0, "beta job should be waiting for concurrency");
+
+    // Complete alpha job - this should grant the slot to the beta job
+    shard
+        .report_attempt_outcome("-", &t1, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report alpha success");
+
+    // Now dequeue from beta - should get the job
+    let tasks3 = shard.dequeue("w2", "beta", 1).await.expect("deq beta after").tasks;
+    assert_eq!(tasks3.len(), 1, "beta job should now be runnable");
+    assert_eq!(tasks3[0].job().id(), j2);
+}
+
+/// Tests that multiple jobs from different task groups properly queue for a shared concurrency limit.
+#[silo::test]
+async fn concurrency_queues_jobs_from_multiple_task_groups() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let queue = "multi-tg-q".to_string();
+
+    // Enqueue jobs from 3 different task groups with max_concurrency=1
+    let jobs: Vec<(String, &str)> = vec![
+        (
+            shard
+                .enqueue(
+                    "-",
+                    None,
+                    10u8,
+                    now,
+                    None,
+                    test_helpers::msgpack_payload(&serde_json::json!({"order": 1})),
+                    vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                        key: queue.clone(),
+                        max_concurrency: 1,
+                    })],
+                    None,
+                    "group-a",
+                )
+                .await
+                .expect("enqueue a"),
+            "group-a",
+        ),
+        (
+            shard
+                .enqueue(
+                    "-",
+                    None,
+                    10u8,
+                    now,
+                    None,
+                    test_helpers::msgpack_payload(&serde_json::json!({"order": 2})),
+                    vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                        key: queue.clone(),
+                        max_concurrency: 1,
+                    })],
+                    None,
+                    "group-b",
+                )
+                .await
+                .expect("enqueue b"),
+            "group-b",
+        ),
+        (
+            shard
+                .enqueue(
+                    "-",
+                    None,
+                    10u8,
+                    now,
+                    None,
+                    test_helpers::msgpack_payload(&serde_json::json!({"order": 3})),
+                    vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                        key: queue.clone(),
+                        max_concurrency: 1,
+                    })],
+                    None,
+                    "group-c",
+                )
+                .await
+                .expect("enqueue c"),
+            "group-c",
+        ),
+    ];
+
+    // Only one holder should exist at a time
+    let mut processed = 0;
+    for (_job_id, task_group) in &jobs {
+        // Try to get a task from each task group
+        let result = shard.dequeue("worker", task_group, 1).await.expect("dequeue");
+        for task in &result.tasks {
+            // Complete it
+            let tid = task.attempt().task_id().to_string();
+            shard
+                .report_attempt_outcome("-", &tid, AttemptOutcome::Success { result: vec![] })
+                .await
+                .expect("report success");
+            processed += 1;
+        }
+    }
+
+    // Keep processing until all jobs are done
+    while processed < 3 {
+        for (_job_id, task_group) in &jobs {
+            let result = shard.dequeue("worker", task_group, 1).await.expect("dequeue");
+            for task in &result.tasks {
+                let tid = task.attempt().task_id().to_string();
+                shard
+                    .report_attempt_outcome("-", &tid, AttemptOutcome::Success { result: vec![] })
+                    .await
+                    .expect("report success");
+                processed += 1;
+            }
+        }
+    }
+
+    assert_eq!(processed, 3, "all 3 jobs should be processed");
+
+    // No holders should remain
+    assert_eq!(count_with_prefix(shard.db(), "holders/").await, 0);
+    assert_eq!(count_with_prefix(shard.db(), "requests/").await, 0);
+}
+
+/// Tests that concurrency limits with higher max_concurrency work across task groups.
+#[silo::test]
+async fn concurrency_allows_multiple_slots_across_task_groups() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let queue = "multi-slot-q".to_string();
+
+    // Enqueue 4 jobs across 2 task groups with max_concurrency=2
+    let _j1 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 2,
+            })],
+            None,
+            "workers-a",
+        )
+        .await
+        .expect("enqueue 1");
+
+    let _j2 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 2,
+            })],
+            None,
+            "workers-b",
+        )
+        .await
+        .expect("enqueue 2");
+
+    let _j3 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 3})),
+            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 2,
+            })],
+            None,
+            "workers-a",
+        )
+        .await
+        .expect("enqueue 3");
+
+    let _j4 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 4})),
+            vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 2,
+            })],
+            None,
+            "workers-b",
+        )
+        .await
+        .expect("enqueue 4");
+
+    // Both task groups should be able to get 1 task each (2 total for the queue)
+    let tasks_a = shard.dequeue("wa", "workers-a", 2).await.expect("deq a").tasks;
+    let tasks_b = shard.dequeue("wb", "workers-b", 2).await.expect("deq b").tasks;
+
+    // Total runnable tasks should be at most 2 (the max_concurrency)
+    let total_running = tasks_a.len() + tasks_b.len();
+    assert!(
+        total_running <= 2,
+        "should not exceed max_concurrency across task groups: got {}",
+        total_running
+    );
+
+    // Should have exactly 2 holders
+    let holders = count_with_prefix(shard.db(), "holders/").await;
+    assert_eq!(holders, 2, "should have exactly 2 holders");
+}
 
 #[silo::test]
 async fn concurrent_dequeue_many_workers_no_duplicates() {
@@ -38,7 +314,7 @@ async fn concurrent_dequeue_many_workers_no_duplicates() {
                 loop {
                     // debug: before_dequeue suppressed
                     let tasks = shard_cl
-                        .dequeue(&worker_id, 1)
+                        .dequeue(&worker_id, "default", 1)
                         .await
                         .expect("dequeue")
                         .tasks;
@@ -82,7 +358,7 @@ async fn concurrent_dequeue_many_workers_no_duplicates() {
             for i in 0..total_jobs {
                 let payload = test_helpers::msgpack_payload(&serde_json::json!({"i": i}));
                 shard_prod
-                    .enqueue("-", None, (i % 50) as u8, now, None, payload, vec![], None)
+                    .enqueue("-", None, (i % 50) as u8, now, None, payload, vec![], None, "default")
                     .await
                     .expect("enqueue");
                 // Yield occasionally to allow scanner/workers to run
@@ -127,6 +403,7 @@ async fn future_tasks_are_not_dequeued_under_concurrency() {
                     test_helpers::msgpack_payload(&serde_json::json!({"r": i})),
                     vec![],
                     None,
+            "default",
                 )
                 .await
                 .expect("enqueue ready");
@@ -143,6 +420,7 @@ async fn future_tasks_are_not_dequeued_under_concurrency() {
                     test_helpers::msgpack_payload(&serde_json::json!({"f": i})),
                     vec![],
                     None,
+            "default",
                 )
                 .await
                 .expect("enqueue future");
@@ -159,7 +437,7 @@ async fn future_tasks_are_not_dequeued_under_concurrency() {
             handles.push(tokio::spawn(async move {
                 loop {
                     let tasks = shard_cl
-                        .dequeue(&worker_id, 4)
+                        .dequeue(&worker_id, "default", 4)
                         .await
                         .expect("dequeue")
                         .tasks;
@@ -216,12 +494,13 @@ async fn concurrency_immediate_grant_enqueues_task_and_writes_holder() {
                 max_concurrency: 1,
             })],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
 
     // Task should be ready immediately
-    let tasks = shard.dequeue("w", 1).await.expect("dequeue").tasks;
+    let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
     assert_eq!(tasks.len(), 1);
     let t = &tasks[0];
     assert_eq!(t.job().id(), job_id);
@@ -258,10 +537,11 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
                 max_concurrency: 1,
             })],
             None,
+            "default",
         )
         .await
         .expect("enqueue1");
-    let tasks1 = shard.dequeue("w1", 1).await.expect("deq1").tasks;
+    let tasks1 = shard.dequeue("w1", "default", 1).await.expect("deq1").tasks;
     assert_eq!(tasks1.len(), 1);
     let t1 = tasks1[0].attempt().task_id().to_string();
 
@@ -279,6 +559,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
                 max_concurrency: 1,
             })],
             None,
+            "default",
         )
         .await
         .expect("enqueue2");
@@ -332,11 +613,12 @@ async fn concurrency_held_queues_propagate_across_retries_and_release_on_finish(
                 max_concurrency: 1,
             })],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
 
-    let t1 = shard.dequeue("w", 1).await.expect("deq").tasks[0]
+    let t1 = shard.dequeue("w", "default", 1).await.expect("deq").tasks[0]
         .attempt()
         .task_id()
         .to_string();
@@ -355,7 +637,7 @@ async fn concurrency_held_queues_propagate_across_retries_and_release_on_finish(
         .expect("report err");
 
     // Attempt 2 should be present
-    let t2 = shard.dequeue("w", 1).await.expect("deq2").tasks[0]
+    let t2 = shard.dequeue("w", "default", 1).await.expect("deq2").tasks[0]
         .attempt()
         .task_id()
         .to_string();
@@ -396,12 +678,13 @@ async fn concurrency_retry_releases_original_holder() {
                 max_concurrency: 1,
             })],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
 
     // Attempt 1 fails -> attempt 2 scheduled
-    let t1 = shard.dequeue("w", 1).await.expect("deq1").tasks[0]
+    let t1 = shard.dequeue("w", "default", 1).await.expect("deq1").tasks[0]
         .attempt()
         .task_id()
         .to_string();
@@ -416,7 +699,7 @@ async fn concurrency_retry_releases_original_holder() {
         )
         .await
         .expect("report err");
-    let t2 = shard.dequeue("w", 1).await.expect("deq2").tasks[0]
+    let t2 = shard.dequeue("w", "default", 1).await.expect("deq2").tasks[0]
         .attempt()
         .task_id()
         .to_string();
@@ -455,10 +738,11 @@ async fn concurrency_no_overgrant_after_release() {
                 max_concurrency: 1,
             })],
             None,
+            "default",
         )
         .await
         .expect("enqueue a");
-    let a_task = shard.dequeue("wa", 1).await.expect("deq a").tasks;
+    let a_task = shard.dequeue("wa", "default", 1).await.expect("deq a").tasks;
     assert_eq!(a_task.len(), 1);
     let a_tid = a_task[0].attempt().task_id().to_string();
 
@@ -476,6 +760,7 @@ async fn concurrency_no_overgrant_after_release() {
                 max_concurrency: 1,
             })],
             None,
+            "default",
         )
         .await
         .expect("enqueue b");
@@ -501,6 +786,7 @@ async fn concurrency_no_overgrant_after_release() {
                 max_concurrency: 1,
             })],
             None,
+            "default",
         )
         .await
         .expect("enqueue c");
@@ -536,6 +822,7 @@ async fn stress_single_queue_no_double_grant() {
                     max_concurrency: 1,
                 })],
                 None,
+            "default",
             )
             .await
             .expect("enqueue");
@@ -543,7 +830,7 @@ async fn stress_single_queue_no_double_grant() {
 
     let mut processed = 0usize;
     loop {
-        let tasks = shard.dequeue("w-stress", 1).await.expect("deq").tasks;
+        let tasks = shard.dequeue("w-stress", "default", 1).await.expect("deq").tasks;
         if tasks.is_empty() {
             if processed >= total {
                 break;
@@ -587,10 +874,11 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
                 max_concurrency: 1,
             })],
             None,
+            "default",
         )
         .await
         .expect("enqueue1");
-    let tasks1 = shard.dequeue("w-hold", 1).await.expect("deq1").tasks;
+    let tasks1 = shard.dequeue("w-hold", "default", 1).await.expect("deq1").tasks;
     assert_eq!(tasks1.len(), 1);
     let t1 = tasks1[0].attempt().task_id().to_string();
 
@@ -610,6 +898,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
                     max_concurrency: 1,
                 })],
                 None,
+            "default",
             )
             .await
             .expect("enqueue add");

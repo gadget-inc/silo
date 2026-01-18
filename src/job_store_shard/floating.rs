@@ -58,6 +58,7 @@ impl JobStoreShard {
         fl: &FloatingConcurrencyLimit,
         state: &DecodedFloatingLimitState,
         now_ms: i64,
+        task_group: &str,
     ) -> Result<(), JobStoreShardError> {
         let archived = state.archived();
 
@@ -94,12 +95,14 @@ impl JobStoreShard {
                 .iter()
                 .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
                 .collect(),
+            task_group: task_group.to_string(),
         };
 
         // Use a synthetic task key based on the queue key to avoid collisions
         let task_value = encode_task(&refresh_task)?;
         let task_key_str = format!(
-            "tasks/{:020}/{:02}/floating_refresh/{}/{}",
+            "tasks/{}/{:020}/{:02}/floating_refresh/{}/{}",
+            crate::keys::escape_segment(task_group),
             now_ms,
             0, // highest priority for refresh tasks
             fl.key,
@@ -226,19 +229,21 @@ impl JobStoreShard {
         };
 
         let decoded = decode_lease(&value_bytes)?;
-        let (queue_key, current_max_concurrency, last_refreshed_at_ms, metadata) =
+        let (queue_key, current_max_concurrency, last_refreshed_at_ms, metadata, task_group) =
             match decoded.to_task() {
                 Task::RefreshFloatingLimit {
                     queue_key,
                     current_max_concurrency,
                     last_refreshed_at_ms,
                     metadata,
+                    task_group,
                     ..
                 } => (
                     queue_key,
                     current_max_concurrency,
                     last_refreshed_at_ms,
                     metadata,
+                    task_group,
                 ),
                 _ => {
                     return Err(JobStoreShardError::Rkyv(
@@ -282,11 +287,13 @@ impl JobStoreShard {
             current_max_concurrency,
             last_refreshed_at_ms,
             metadata,
+            task_group: task_group.clone(),
         };
 
         let task_value = encode_task(&refresh_task)?;
         let task_key_str = format!(
-            "tasks/{:020}/{:02}/floating_refresh/{}/{}",
+            "tasks/{}/{:020}/{:02}/floating_refresh/{}/{}",
+            crate::keys::escape_segment(&task_group),
             next_retry_at,
             0, // highest priority
             queue_key,

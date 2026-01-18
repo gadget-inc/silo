@@ -27,6 +27,7 @@ async fn enqueue_round_trip_with_explicit_id() {
             payload_bytes,
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
@@ -52,7 +53,7 @@ async fn enqueue_round_trip_with_explicit_id() {
     assert_eq!(got_payload, payload);
 
     // A task should be present and point at attempt 1 for this job
-    let tasks = shard.peek_tasks(10).await.expect("peek");
+    let tasks = shard.peek_tasks("default", 10).await.expect("peek");
     assert!(!tasks.is_empty());
     assert!(
         matches!(tasks[0], Task::RunAttempt { ref job_id, attempt_number, .. } if job_id == &id && attempt_number == 1)
@@ -82,6 +83,7 @@ async fn enqueue_with_metadata_round_trips_in_job_view() {
             payload_bytes,
             vec![],
             Some(md.clone()),
+            "default",
         )
         .await
         .expect("enqueue_with_metadata");
@@ -123,6 +125,7 @@ async fn enqueue_generates_uuid_when_none_provided() {
             payload_bytes,
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
@@ -141,7 +144,7 @@ async fn enqueue_generates_uuid_when_none_provided() {
     assert_eq!(got_payload, payload);
 
     // A task should be present and point at attempt 1 for this job
-    let tasks = shard.peek_tasks(10).await.expect("peek");
+    let tasks = shard.peek_tasks("default", 10).await.expect("peek");
     assert!(!tasks.is_empty());
     assert!(
         matches!(tasks[0], Task::RunAttempt { ref job_id, attempt_number, .. } if job_id == &got_id && attempt_number == 1)
@@ -169,6 +172,7 @@ async fn delete_job_removes_key_and_is_idempotent() {
             payload_bytes,
             vec![],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
@@ -178,7 +182,7 @@ async fn delete_job_removes_key_and_is_idempotent() {
     assert!(shard.get_job("-", &id).await.expect("get_job").is_some());
 
     // Complete the job first (can't delete while scheduled/running)
-    let tasks = shard.dequeue("w", 1).await.expect("dequeue").tasks;
+    let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
     assert_eq!(tasks.len(), 1);
     shard
         .report_attempt_outcome(
@@ -213,12 +217,12 @@ async fn peek_omits_future_scheduled_tasks() {
     let future_ms = now_ms + 60_000;
 
     let _ = shard
-        .enqueue("-", None, priority, future_ms, None, payload_bytes, vec![], None)
+        .enqueue("-", None, priority, future_ms, None, payload_bytes, vec![], None, "default")
         .await
         .expect("enqueue");
 
     // Should not see the task yet
-    let tasks = shard.peek_tasks(10).await.expect("peek");
+    let tasks = shard.peek_tasks("default", 10).await.expect("peek");
     assert!(tasks.is_empty(), "future task should not be visible");
 }
 
@@ -242,6 +246,7 @@ async fn enqueue_fails_when_id_already_exists_and_db_unchanged() {
             payload1_bytes,
             vec![],
             None,
+            "default",
         )
         .await
         .expect("first enqueue ok");
@@ -267,6 +272,7 @@ async fn enqueue_fails_when_id_already_exists_and_db_unchanged() {
             payload2_bytes,
             vec![],
             None,
+            "default",
         )
         .await
         .expect_err("duplicate enqueue should fail");
@@ -302,10 +308,10 @@ async fn cannot_delete_running_job() {
         let priority = 10u8;
         let now = now_ms();
         let job_id = shard
-            .enqueue("-", None, priority, now, None, payload_bytes, vec![], None)
+            .enqueue("-", None, priority, now, None, payload_bytes, vec![], None, "default")
             .await
             .expect("enqueue");
-        let tasks = shard.dequeue("w", 1).await.expect("dequeue").tasks;
+        let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
 
         // Attempt to delete while running - should fail
@@ -350,7 +356,7 @@ async fn cannot_delete_scheduled_job() {
         let priority = 10u8;
         let now = now_ms();
         let job_id = shard
-            .enqueue("-", None, priority, now, None, payload_bytes, vec![], None)
+            .enqueue("-", None, priority, now, None, payload_bytes, vec![], None, "default")
             .await
             .expect("enqueue");
 
@@ -373,7 +379,7 @@ async fn cannot_delete_scheduled_job() {
         }
 
         // Complete the job first
-        let tasks = shard.dequeue("w", 1).await.expect("dequeue").tasks;
+        let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
@@ -411,6 +417,7 @@ async fn priority_ordering_when_start_times_equal() {
                 test_helpers::msgpack_payload(&serde_json::json!({"j": "hi"})),
                 vec![],
                 None,
+            "default",
             )
             .await
             .expect("enqueue hi");
@@ -424,12 +431,13 @@ async fn priority_ordering_when_start_times_equal() {
                 test_helpers::msgpack_payload(&serde_json::json!({"j": "lo"})),
                 vec![],
                 None,
+            "default",
             )
             .await
             .expect("enqueue lo");
 
         // Dequeue two tasks; with equal times, lower priority number should come first
-        let tasks = shard.dequeue("w", 2).await.expect("dequeue").tasks;
+        let tasks = shard.dequeue("w", "default", 2).await.expect("dequeue").tasks;
         assert_eq!(tasks.len(), 2);
         let t1 = &tasks[0];
         let t2 = &tasks[1];
