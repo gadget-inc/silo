@@ -72,6 +72,7 @@ async fn enqueue_job(
         limits: vec![],
         tenant: tenant.map(|s| s.to_string()),
         metadata: HashMap::new(),
+            task_group: "default".to_string(),
     };
     client
         .enqueue(request)

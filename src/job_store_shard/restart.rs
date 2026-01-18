@@ -171,17 +171,19 @@ impl JobStoreShard {
 
         // [SILO-RESTART-5] Post: Create new task in DB queue with attempt 1 (fresh retries)
         let new_task_id = Uuid::new_v4().to_string();
+        let task_group = job_view.task_group().to_string();
         let new_task = Task::RunAttempt {
             id: new_task_id,
             tenant: tenant.to_string(),
             job_id: id.to_string(),
             attempt_number: 1, // Fresh start - retry counter reset
             held_queues: Vec::new(),
+            task_group: task_group.clone(),
         };
 
         // Use a temporary WriteBatch to encode the task, then extract and put via txn
         let task_value = crate::codec::encode_task(&new_task)?;
-        let task_key = crate::keys::task_key(start_at_ms, priority, id, 1);
+        let task_key = crate::keys::task_key(&task_group, start_at_ms, priority, id, 1);
         txn.put(task_key.as_bytes(), &task_value)?;
 
         // Commit the transaction

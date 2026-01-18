@@ -24,6 +24,7 @@ async fn tenant_allows_same_job_id_independent() {
                 test_helpers::msgpack_payload(&serde_json::json!({"tenant": "A"})),
                 vec![],
                 None,
+                "default",
             )
             .await
             .expect("enqueue A");
@@ -39,6 +40,7 @@ async fn tenant_allows_same_job_id_independent() {
                 test_helpers::msgpack_payload(&serde_json::json!({"tenant": "B"})),
                 vec![],
                 None,
+                "default",
             )
             .await
             .expect("enqueue B");
@@ -57,7 +59,7 @@ async fn tenant_allows_same_job_id_independent() {
             .is_some());
 
         // Complete tenantA's job first so it can be deleted
-        let tasks_a = shard.dequeue("wA", 1).await.expect("deq A").tasks;
+        let tasks_a = shard.dequeue("wA", "default", 1).await.expect("deq A").tasks;
         assert_eq!(tasks_a.len(), 1);
         shard
             .report_attempt_outcome(

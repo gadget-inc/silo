@@ -180,6 +180,7 @@ impl ConcurrencyManager {
         start_at_ms: i64,
         now_ms: i64,
         limits: &[ConcurrencyLimit],
+        task_group: &str,
     ) -> Result<Option<RequestTicketOutcome>, String> {
         // Only gate on the first limit (if any)
         let Some(limit) = limits.first() else {
@@ -202,6 +203,7 @@ impl ConcurrencyManager {
                 priority,
                 job_id,
                 1,
+                task_group,
             )?;
             Ok(Some(RequestTicketOutcome::GrantedImmediately {
                 task_id: task_id.to_string(),
@@ -221,6 +223,7 @@ impl ConcurrencyManager {
                 priority,
                 job_id,
                 1,
+                task_group,
             )?;
             Ok(Some(RequestTicketOutcome::TicketRequested {
                 queue: queue.clone(),
@@ -236,10 +239,11 @@ impl ConcurrencyManager {
                 job_id: job_id.to_string(),
                 attempt_number: 1,
                 request_id: request_id.clone(),
+                task_group: task_group.to_string(),
             };
             let ticket_value = encode_task(&ticket)?;
             batch.put(
-                task_key(start_at_ms, priority, job_id, 1).as_bytes(),
+                task_key(task_group, start_at_ms, priority, job_id, 1).as_bytes(),
                 &ticket_value,
             );
             Ok(Some(RequestTicketOutcome::FutureRequestTaskWritten {
@@ -327,6 +331,7 @@ fn append_grant_edits(
     priority: u8,
     job_id: &str,
     attempt_number: u32,
+    task_group: &str,
 ) -> Result<Vec<MemoryEvent>, String> {
     let holder = HolderRecord {
         granted_at_ms: now_ms,
@@ -343,10 +348,11 @@ fn append_grant_edits(
         job_id: job_id.to_string(),
         attempt_number,
         held_queues: vec![queue.to_string()],
+        task_group: task_group.to_string(),
     };
     let task_value = encode_task(&task)?;
     batch.put(
-        task_key(start_time_ms, priority, job_id, attempt_number).as_bytes(),
+        task_key(task_group, start_time_ms, priority, job_id, attempt_number).as_bytes(),
         &task_value,
     );
 
@@ -366,12 +372,14 @@ fn append_request_edits(
     priority: u8,
     job_id: &str,
     attempt_number: u32,
+    task_group: &str,
 ) -> Result<(), String> {
     let action = ConcurrencyAction::EnqueueTask {
         start_time_ms,
         priority,
         job_id: job_id.to_string(),
         attempt_number,
+        task_group: task_group.to_string(),
     };
     let action_val = encode_concurrency_action(&action)?;
     let req_key = concurrency_request_key(
@@ -422,8 +430,10 @@ async fn append_release_and_grant_next(
                     priority,
                     job_id,
                     attempt_number,
+                    task_group,
                 } => {
                     let job_id_str = job_id.as_str();
+                    let task_group_str = task_group.as_str();
 
                     // [SILO-GRANT-CXL] Check if job is cancelled - if so, delete request and continue
                     let cancelled_key = job_cancelled_key(tenant, job_id_str);
@@ -470,10 +480,11 @@ async fn append_release_and_grant_next(
                         job_id: job_id_str.to_string(),
                         attempt_number: *attempt_number,
                         held_queues: vec![queue.clone()],
+                        task_group: task_group_str.to_string(),
                     };
                     let tval = encode_task(&task)?;
                     batch.put(
-                        task_key(*start_time_ms, *priority, job_id_str, *attempt_number).as_bytes(),
+                        task_key(task_group_str, *start_time_ms, *priority, job_id_str, *attempt_number).as_bytes(),
                         &tval,
                     );
                     batch.delete(&kv.key);

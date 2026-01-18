@@ -346,6 +346,7 @@ impl JobsScanner {
             Field::new("payload", DataType::Utf8, true),
             Field::new("status_kind", DataType::Utf8, true),
             Field::new("status_changed_at_ms", DataType::Int64, true),
+            Field::new("task_group", DataType::Utf8, false),
             // Arbitrary key/value metadata as Arrow Map<Utf8, Utf8>
             Field::new(
                 "metadata",
@@ -666,6 +667,17 @@ impl Scan for JobsScanner {
                             if need_changed {
                                 cols.push(Arc::new(Int64Array::from(changed)));
                             }
+                        }
+                        "task_group" => {
+                            let mut task_groups: Vec<String> = Vec::new();
+                            for (_, id) in &existing_pairs {
+                                if let Some(view) = jobs_map.get(id) {
+                                    task_groups.push(view.task_group().to_string());
+                                } else {
+                                    task_groups.push(String::new());
+                                }
+                            }
+                            cols.push(Arc::new(StringArray::from(task_groups)));
                         }
                         "metadata" => {
                             use datafusion::arrow::array::{MapArray, StructArray};

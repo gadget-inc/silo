@@ -13,6 +13,382 @@ use silo::task::{LeaseRecord, Task};
 
 use test_helpers::*;
 
+/// Tests that jobs from different task groups can share the same floating concurrency queue.
+/// Task groups are for routing work to different workers, but floating limits should work
+/// across all task groups using the same queue key.
+#[silo::test]
+async fn floating_limit_shared_across_task_groups() {
+    tokio::time::pause();
+    let now = now_ms();
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "fl-shared-tg-q".to_string();
+    let refresh_interval_ms = 60_000i64; // long interval to avoid refresh during test
+
+    // Job A in task_group "alpha" takes the only slot (max_concurrency=1)
+    let j1 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"from": "alpha"})),
+            vec![silo::job::Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: queue.clone(),
+                    default_max_concurrency: 1,
+                    refresh_interval_ms,
+                    metadata: vec![],
+                },
+            )],
+            None,
+            "alpha",
+        )
+        .await
+        .expect("enqueue alpha");
+
+    // Dequeue from alpha - should get the job
+    let result1 = shard.dequeue("w1", "alpha", 1).await.expect("deq alpha");
+    assert_eq!(result1.tasks.len(), 1);
+    assert_eq!(result1.tasks[0].job().id(), j1);
+    let t1 = result1.tasks[0].attempt().task_id().to_string();
+
+    // Job B in task_group "beta" should queue (same floating limit key, slot is taken)
+    let j2 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"from": "beta"})),
+            vec![silo::job::Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: queue.clone(),
+                    default_max_concurrency: 1,
+                    refresh_interval_ms,
+                    metadata: vec![],
+                },
+            )],
+            None,
+            "beta",
+        )
+        .await
+        .expect("enqueue beta");
+
+    // Verify j2 is scheduled but waiting
+    let j2_status = shard
+        .get_job_status("-", &j2)
+        .await
+        .expect("get j2 status")
+        .expect("j2 exists");
+    assert_eq!(j2_status.kind, JobStatusKind::Scheduled);
+
+    // Dequeue from beta - should get nothing (waiting for concurrency)
+    let result2 = shard.dequeue("w2", "beta", 1).await.expect("deq beta");
+    assert_eq!(
+        result2.tasks.len(),
+        0,
+        "beta job should be waiting for concurrency"
+    );
+
+    // Complete alpha job
+    shard
+        .report_attempt_outcome("-", &t1, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report alpha success");
+
+    // Now dequeue from beta - should get the job
+    let result3 = shard.dequeue("w2", "beta", 1).await.expect("deq beta after");
+    assert_eq!(result3.tasks.len(), 1, "beta job should now be runnable");
+    assert_eq!(result3.tasks[0].job().id(), j2);
+}
+
+/// Tests that floating concurrency state is shared correctly when jobs from different
+/// task groups use the same queue key.
+#[silo::test]
+async fn floating_limit_state_shared_across_task_groups() {
+    tokio::time::pause();
+    let now = now_ms();
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "fl-state-shared-q".to_string();
+    let refresh_interval_ms = 60_000i64;
+
+    // Enqueue from task_group "alpha"
+    let _j1 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"from": "alpha"})),
+            vec![silo::job::Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: queue.clone(),
+                    default_max_concurrency: 5,
+                    refresh_interval_ms,
+                    metadata: vec![("source".to_string(), "alpha".to_string())],
+                },
+            )],
+            None,
+            "alpha",
+        )
+        .await
+        .expect("enqueue alpha");
+
+    // Check floating limit state was created
+    let state_key = format!("floating_limits/-/{}", queue);
+    let state_raw = shard
+        .db()
+        .get(state_key.as_bytes())
+        .await
+        .expect("db get")
+        .expect("state should exist");
+    let decoded = silo::codec::decode_floating_limit_state(&state_raw).expect("decode state");
+    assert_eq!(decoded.archived().current_max_concurrency, 5);
+
+    // Enqueue from task_group "beta" with the same queue key
+    // The floating limit state should already exist and be reused
+    let _j2 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"from": "beta"})),
+            vec![silo::job::Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: queue.clone(),
+                    default_max_concurrency: 5,
+                    refresh_interval_ms,
+                    metadata: vec![("source".to_string(), "beta".to_string())],
+                },
+            )],
+            None,
+            "beta",
+        )
+        .await
+        .expect("enqueue beta");
+
+    // State should still have the same max_concurrency
+    let state_raw = shard
+        .db()
+        .get(state_key.as_bytes())
+        .await
+        .expect("db get")
+        .expect("state should exist");
+    let decoded = silo::codec::decode_floating_limit_state(&state_raw).expect("decode state");
+    assert_eq!(
+        decoded.archived().current_max_concurrency, 5,
+        "state should be reused, not recreated"
+    );
+}
+
+/// Tests that floating limit refresh tasks can be triggered by jobs from any task group
+/// and the updated limit applies to all task groups.
+#[silo::test]
+async fn floating_limit_refresh_applies_to_all_task_groups() {
+    tokio::time::pause();
+    let now = now_ms();
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "fl-refresh-all-tg-q".to_string();
+    let refresh_interval_ms = 100i64;
+
+    // Create the floating limit with max_concurrency=1 via alpha task_group
+    let _j1 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            vec![silo::job::Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: queue.clone(),
+                    default_max_concurrency: 1,
+                    refresh_interval_ms,
+                    metadata: vec![],
+                },
+            )],
+            None,
+            "alpha",
+        )
+        .await
+        .expect("enqueue alpha");
+
+    // Advance time to make the limit stale
+    tokio::time::advance(std::time::Duration::from_millis(200)).await;
+
+    // Enqueue from beta task_group - should trigger refresh scheduling
+    let _j2 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+            vec![silo::job::Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: queue.clone(),
+                    default_max_concurrency: 1,
+                    refresh_interval_ms,
+                    metadata: vec![],
+                },
+            )],
+            None,
+            "beta",
+        )
+        .await
+        .expect("enqueue beta");
+
+    // Dequeue from alpha - should get job and refresh task
+    let result1 = shard.dequeue("w1", "alpha", 10).await.expect("dequeue alpha");
+    // Note: refresh tasks are returned regardless of task_group since they're system tasks
+
+    // Dequeue from beta
+    let result2 = shard.dequeue("w2", "beta", 10).await.expect("dequeue beta");
+
+    // One of them should have the refresh task
+    let has_refresh = !result1.refresh_tasks.is_empty() || !result2.refresh_tasks.is_empty();
+    assert!(has_refresh, "refresh task should be available");
+
+    // Get the refresh task and complete it with a higher limit
+    let refresh_task_id = if !result1.refresh_tasks.is_empty() {
+        result1.refresh_tasks[0].task_id.clone()
+    } else {
+        result2.refresh_tasks[0].task_id.clone()
+    };
+
+    // Report successful refresh with increased concurrency
+    shard
+        .report_refresh_success("-", &refresh_task_id, 3) // Increase from 1 to 3
+        .await
+        .expect("report refresh success");
+
+    // Verify the state was updated
+    let state_key = format!("floating_limits/-/{}", queue);
+    let state_raw = shard
+        .db()
+        .get(state_key.as_bytes())
+        .await
+        .expect("db get")
+        .expect("state should exist");
+    let decoded = silo::codec::decode_floating_limit_state(&state_raw).expect("decode state");
+    assert_eq!(
+        decoded.archived().current_max_concurrency, 3,
+        "max_concurrency should be updated to 3"
+    );
+}
+
+/// Tests that multiple jobs from different task groups properly queue for a shared
+/// floating concurrency limit.
+#[silo::test]
+async fn floating_limit_queues_jobs_from_multiple_task_groups() {
+    tokio::time::pause();
+    let now = now_ms();
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "fl-multi-tg-q".to_string();
+    let refresh_interval_ms = 60_000i64;
+
+    // Enqueue 3 jobs from different task groups with max_concurrency=1
+    let j1 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"order": 1})),
+            vec![silo::job::Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: queue.clone(),
+                    default_max_concurrency: 1,
+                    refresh_interval_ms,
+                    metadata: vec![],
+                },
+            )],
+            None,
+            "group-x",
+        )
+        .await
+        .expect("enqueue x");
+
+    let j2 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"order": 2})),
+            vec![silo::job::Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: queue.clone(),
+                    default_max_concurrency: 1,
+                    refresh_interval_ms,
+                    metadata: vec![],
+                },
+            )],
+            None,
+            "group-y",
+        )
+        .await
+        .expect("enqueue y");
+
+    let j3 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"order": 3})),
+            vec![silo::job::Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: queue.clone(),
+                    default_max_concurrency: 1,
+                    refresh_interval_ms,
+                    metadata: vec![],
+                },
+            )],
+            None,
+            "group-z",
+        )
+        .await
+        .expect("enqueue z");
+
+    // Process all jobs by cycling through task groups
+    let mut processed_jobs: Vec<String> = Vec::new();
+    let task_groups = ["group-x", "group-y", "group-z"];
+
+    while processed_jobs.len() < 3 {
+        for tg in &task_groups {
+            let result = shard.dequeue("worker", tg, 1).await.expect("dequeue");
+            for task in &result.tasks {
+                let tid = task.attempt().task_id().to_string();
+                let job_id = task.job().id().to_string();
+                shard
+                    .report_attempt_outcome("-", &tid, AttemptOutcome::Success { result: vec![] })
+                    .await
+                    .expect("report success");
+                processed_jobs.push(job_id);
+            }
+        }
+    }
+
+    assert_eq!(processed_jobs.len(), 3, "all 3 jobs should be processed");
+    assert!(processed_jobs.contains(&j1));
+    assert!(processed_jobs.contains(&j2));
+    assert!(processed_jobs.contains(&j3));
+
+    // No holders should remain
+    assert_eq!(count_with_prefix(shard.db(), "holders/").await, 0);
+}
+
 #[silo::test]
 async fn floating_concurrency_limit_creates_state_on_enqueue() {
     tokio::time::pause();
@@ -39,6 +415,7 @@ async fn floating_concurrency_limit_creates_state_on_enqueue() {
                 },
             )],
             None,
+            "default",
         )
         .await
         .expect("enqueue with floating limit");
@@ -96,6 +473,7 @@ async fn floating_concurrency_limit_schedules_refresh_when_stale() {
                 },
             )],
             None,
+            "default",
         )
         .await
         .expect("enqueue j1");
@@ -122,12 +500,13 @@ async fn floating_concurrency_limit_schedules_refresh_when_stale() {
                 },
             )],
             None,
+            "default",
         )
         .await
         .expect("enqueue j2");
 
     // Check that a refresh task was scheduled
-    let tasks = shard.peek_tasks(50).await.expect("peek tasks");
+    let tasks = shard.peek_tasks("default", 50).await.expect("peek tasks");
     let has_refresh_task = tasks.iter().any(|t| {
         matches!(
             t,
@@ -163,6 +542,7 @@ async fn floating_concurrency_limit_dequeue_returns_refresh_tasks() {
                 },
             )],
             None,
+            "default",
         )
         .await
         .expect("enqueue j1");
@@ -188,12 +568,13 @@ async fn floating_concurrency_limit_dequeue_returns_refresh_tasks() {
                 },
             )],
             None,
+            "default",
         )
         .await
         .expect("enqueue j2");
 
     // Dequeue should return the refresh task
-    let result = shard.dequeue("worker-1", 10).await.expect("dequeue");
+    let result = shard.dequeue("worker-1", "default", 10).await.expect("dequeue");
 
     // Should have job tasks and refresh tasks
     assert!(
@@ -237,6 +618,7 @@ async fn floating_limit_refresh_success_updates_state() {
                 },
             )],
             None,
+            "default",
         )
         .await
         .expect("enqueue j1");
@@ -262,12 +644,13 @@ async fn floating_limit_refresh_success_updates_state() {
                 },
             )],
             None,
+            "default",
         )
         .await
         .expect("enqueue j2");
 
     // Dequeue to get the refresh task
-    let result = shard.dequeue("worker-1", 10).await.expect("dequeue");
+    let result = shard.dequeue("worker-1", "default", 10).await.expect("dequeue");
     assert!(!result.refresh_tasks.is_empty());
     let task_id = result.refresh_tasks[0].task_id.clone();
     let new_max = 10u32;
@@ -329,6 +712,7 @@ async fn floating_limit_refresh_failure_triggers_backoff() {
                 },
             )],
             None,
+            "default",
         )
         .await
         .expect("enqueue j1");
@@ -354,12 +738,13 @@ async fn floating_limit_refresh_failure_triggers_backoff() {
                 },
             )],
             None,
+            "default",
         )
         .await
         .expect("enqueue j2");
 
     // Dequeue to get the refresh task
-    let result = shard.dequeue("worker-1", 10).await.expect("dequeue");
+    let result = shard.dequeue("worker-1", "default", 10).await.expect("dequeue");
     assert!(!result.refresh_tasks.is_empty());
     let task_id = result.refresh_tasks[0].task_id.clone();
 
@@ -430,6 +815,7 @@ async fn floating_limit_concurrent_enqueues_no_duplicate_refresh() {
                 },
             )],
             None,
+            "default",
         )
         .await
         .expect("enqueue j1");
@@ -458,13 +844,14 @@ async fn floating_limit_concurrent_enqueues_no_duplicate_refresh() {
                     },
                 )],
                 None,
+            "default",
             )
             .await
             .expect("enqueue");
     }
 
     // Count refresh tasks
-    let tasks = shard.peek_tasks(100).await.expect("peek tasks");
+    let tasks = shard.peek_tasks("default", 100).await.expect("peek tasks");
     let refresh_count = tasks
         .iter()
         .filter(|t| {
@@ -507,6 +894,7 @@ async fn floating_limit_uses_dynamic_max_concurrency() {
                 },
             )],
             None,
+            "default",
         )
         .await
         .expect("enqueue j1");
@@ -529,6 +917,7 @@ async fn floating_limit_uses_dynamic_max_concurrency() {
                 },
             )],
             None,
+            "default",
         )
         .await
         .expect("enqueue j2");
@@ -549,7 +938,7 @@ async fn floating_limit_uses_dynamic_max_concurrency() {
     assert_eq!(j2_status.kind, JobStatusKind::Scheduled);
 
     // Dequeue j1
-    let result = shard.dequeue("worker-1", 1).await.expect("dequeue");
+    let result = shard.dequeue("worker-1", "default", 1).await.expect("dequeue");
     assert_eq!(result.tasks.len(), 1);
     let t1_id = result.tasks[0].attempt().task_id().to_string();
 
@@ -560,7 +949,7 @@ async fn floating_limit_uses_dynamic_max_concurrency() {
         .expect("report j1 success");
 
     // j2 should now have a RunAttempt task
-    let tasks = shard.peek_tasks(10).await.expect("peek tasks");
+    let tasks = shard.peek_tasks("default", 10).await.expect("peek tasks");
     let has_j2_run = tasks.iter().any(|t| {
         matches!(
             t,
@@ -601,6 +990,7 @@ async fn floating_limit_job_persists_limit_type() {
                 },
             )],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
@@ -658,6 +1048,7 @@ async fn floating_limit_multiple_retries_increase_backoff() {
                 },
             )],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
@@ -683,12 +1074,13 @@ async fn floating_limit_multiple_retries_increase_backoff() {
                 },
             )],
             None,
+            "default",
         )
         .await
         .expect("enqueue j2");
 
     // First failure
-    let result = shard.dequeue("worker-1", 10).await.expect("dequeue");
+    let result = shard.dequeue("worker-1", "default", 10).await.expect("dequeue");
     assert!(!result.refresh_tasks.is_empty());
     let task_id = result.refresh_tasks[0].task_id.clone();
 
@@ -713,7 +1105,7 @@ async fn floating_limit_multiple_retries_increase_backoff() {
     tokio::time::advance(std::time::Duration::from_millis(10_000)).await;
 
     // Second failure
-    let result = shard.dequeue("worker-1", 10).await.expect("dequeue 2");
+    let result = shard.dequeue("worker-1", "default", 10).await.expect("dequeue 2");
     if !result.refresh_tasks.is_empty() {
         let task_id = result.refresh_tasks[0].task_id.clone();
         shard
@@ -765,6 +1157,7 @@ async fn floating_limit_successful_refresh_resets_backoff() {
                 },
             )],
             None,
+            "default",
         )
         .await
         .expect("enqueue");
@@ -790,12 +1183,13 @@ async fn floating_limit_successful_refresh_resets_backoff() {
                 },
             )],
             None,
+            "default",
         )
         .await
         .expect("enqueue j2");
 
     // First failure to set retry_count
-    let result = shard.dequeue("worker-1", 10).await.expect("dequeue");
+    let result = shard.dequeue("worker-1", "default", 10).await.expect("dequeue");
     let task_id = result.refresh_tasks[0].task_id.clone();
     shard
         .report_refresh_failure("-", &task_id, "test_error", "simulated failure")
@@ -815,7 +1209,7 @@ async fn floating_limit_successful_refresh_resets_backoff() {
     // Advance time and succeed
     tokio::time::advance(std::time::Duration::from_millis(10_000)).await;
 
-    let result = shard.dequeue("worker-1", 10).await.expect("dequeue 2");
+    let result = shard.dequeue("worker-1", "default", 10).await.expect("dequeue 2");
     if !result.refresh_tasks.is_empty() {
         let task_id = result.refresh_tasks[0].task_id.clone();
         shard
@@ -863,6 +1257,7 @@ async fn floating_limit_refresh_task_lease_expiry_allows_rescheduling() {
                 },
             )],
             None,
+            "default",
         )
         .await
         .expect("enqueue j1");
@@ -888,12 +1283,13 @@ async fn floating_limit_refresh_task_lease_expiry_allows_rescheduling() {
                 },
             )],
             None,
+            "default",
         )
         .await
         .expect("enqueue j2");
 
     // Dequeue to get the refresh task - this creates a lease
-    let result = shard.dequeue("worker-1", 10).await.expect("dequeue");
+    let result = shard.dequeue("worker-1", "default", 10).await.expect("dequeue");
     assert!(
         !result.refresh_tasks.is_empty(),
         "should have refresh task after dequeue"
@@ -984,12 +1380,13 @@ async fn floating_limit_refresh_task_lease_expiry_allows_rescheduling() {
                 },
             )],
             None,
+            "default",
         )
         .await
         .expect("enqueue j3");
 
     // Check that a new refresh task was scheduled
-    let tasks = shard.peek_tasks(50).await.expect("peek tasks");
+    let tasks = shard.peek_tasks("default", 50).await.expect("peek tasks");
     let refresh_count = tasks
         .iter()
         .filter(|t| {
@@ -1034,6 +1431,7 @@ async fn floating_limit_refresh_task_lease_expiry_preserves_state() {
                 },
             )],
             None,
+            "default",
         )
         .await
         .expect("enqueue j1");
@@ -1062,12 +1460,13 @@ async fn floating_limit_refresh_task_lease_expiry_preserves_state() {
                 },
             )],
             None,
+            "default",
         )
         .await
         .expect("enqueue j2");
 
     // Dequeue to get the refresh task and create a lease
-    let result = shard.dequeue("worker-1", 10).await.expect("dequeue");
+    let result = shard.dequeue("worker-1", "default", 10).await.expect("dequeue");
     assert!(!result.refresh_tasks.is_empty(), "should have refresh task");
     let task_id = result.refresh_tasks[0].task_id.clone();
 

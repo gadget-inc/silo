@@ -10,7 +10,7 @@ pub fn decode_tenant(encoded: &str) -> String {
     encoded.replace("%2F", "/").replace("%25", "%")
 }
 
-fn escape_segment(segment: &str) -> String {
+pub fn escape_segment(segment: &str) -> String {
     // Apply the same escaping used for tenants to arbitrary path segments
     segment.replace('%', "%25").replace('/', "%2F")
 }
@@ -80,17 +80,37 @@ pub fn idx_metadata_prefix(tenant: &str, key: &str, value: &str) -> String {
     )
 }
 
-/// Construct the key for a task, ordered by start time.
-pub fn task_key(start_time_ms: i64, priority: u8, job_id: &str, attempt: u32) -> String {
+/// Construct the key for a task, ordered by task group then start time.
+/// Format: tasks/{task_group}/{time}/{priority}/{job_id}/{attempt}
+pub fn task_key(
+    task_group: &str,
+    start_time_ms: i64,
+    priority: u8,
+    job_id: &str,
+    attempt: u32,
+) -> String {
     // Zero-pad time to 20 digits and priority to 2 digits; 00 is highest, 99 lowest
-    // Lexicographic order: time asc, then priority asc (so higher priority first)
+    // Lexicographic order: task_group, then time asc, then priority asc (so higher priority first)
     format!(
-        "tasks/{:020}/{:02}/{}/{}",
+        "tasks/{}/{:020}/{:02}/{}/{}",
+        escape_segment(task_group),
         start_time_ms.max(0) as u64,
         priority,
         job_id,
         attempt
     )
+}
+
+/// Get the prefix for scanning all tasks in a specific task group.
+/// Format: tasks/{task_group}/
+pub fn task_group_prefix(task_group: &str) -> String {
+    format!("tasks/{}/", escape_segment(task_group))
+}
+
+/// Get the prefix for scanning all task groups.
+/// Format: tasks/
+pub fn tasks_prefix() -> &'static str {
+    "tasks/"
 }
 
 /// Construct the key for a leased task by task id

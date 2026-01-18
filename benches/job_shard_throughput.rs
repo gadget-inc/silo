@@ -46,7 +46,7 @@ async fn measure_enqueue_throughput(
                 let payload = rmp_serde::to_vec(&serde_json::json!({"producer": producer_id, "i": i}))
                     .expect("serialize payload");
                 shard
-                    .enqueue("-", None, 50, now_ms, None, payload, vec![], None)
+                    .enqueue("-", None, 50, now_ms, None, payload, vec![], None, "")
                     .await
                     .expect("enqueue");
             }
@@ -82,7 +82,7 @@ async fn measure_dequeue_throughput(
         let payload = rmp_serde::to_vec(&serde_json::json!({"i": i}))
             .expect("serialize payload");
         shard
-            .enqueue("-", None, 50, now_ms, None, payload, vec![], None)
+            .enqueue("-", None, 50, now_ms, None, payload, vec![], None, "")
             .await
             .expect("enqueue");
     }
@@ -103,7 +103,7 @@ async fn measure_dequeue_throughput(
                     break;
                 }
 
-                let result = shard.dequeue(&worker_id, batch).await.expect("dequeue");
+                let result = shard.dequeue(&worker_id, "", batch).await.expect("dequeue");
                 if result.tasks.is_empty() {
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                     continue;

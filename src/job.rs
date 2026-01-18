@@ -254,6 +254,7 @@ impl std::fmt::Debug for JobView {
             .field("id", &self.id())
             .field("priority", &self.priority())
             .field("enqueue_time_ms", &self.enqueue_time_ms())
+            .field("task_group", &self.task_group())
             .finish()
     }
 }
@@ -268,6 +269,7 @@ pub struct JobInfo {
     pub retry_policy: Option<RetryPolicy>,
     pub metadata: Vec<(String, String)>,
     pub limits: Vec<Limit>, // Ordered list of limits to check before execution
+    pub task_group: String, // Task group for organizing tasks. Immutable after enqueue.
 }
 
 impl JobView {
@@ -289,6 +291,9 @@ impl JobView {
     }
     pub fn payload_bytes(&self) -> &[u8] {
         self.archived().payload.as_ref()
+    }
+    pub fn task_group(&self) -> &str {
+        self.archived().task_group.as_str()
     }
 
     /// Decode the payload from MessagePack bytes into a serde_json::Value for display.

@@ -73,7 +73,7 @@ impl TaskBroker {
 
     /// Scan tasks from DB and insert into buffer, skipping future tasks and inflight ones.
     async fn scan_tasks(&self, now_ms: i64) -> usize {
-        // [SILO-SCAN-1] Tasks live under tasks/<ts>/<pri>/<job_id>/<attempt>
+        // [SILO-SCAN-1] Tasks live under tasks/<task_group>/<ts>/<pri>/<job_id>/<attempt>
         let start: Vec<u8> = b"tasks/".to_vec();
         let mut end: Vec<u8> = b"tasks/".to_vec();
         end.push(0xFF);
@@ -93,11 +93,16 @@ impl TaskBroker {
             };
 
             // Filter out future tasks by parsing timestamp from key
-            // Format: tasks/<ts>/<pri>/<job_id>/<attempt>
+            // Format: tasks/<task_group>/<ts>/<pri>/<job_id>/<attempt>
             let mut parts = key_str.split('/');
             if parts.next() != Some("tasks") {
                 continue;
             }
+            // Skip task_group part
+            if parts.next().is_none() {
+                continue;
+            }
+            // Get timestamp part
             let ts_part = match parts.next() {
                 Some(x) => x,
                 None => continue,
@@ -201,14 +206,20 @@ impl TaskBroker {
         self.running.store(false, Ordering::SeqCst);
     }
 
-    /// Claim up to `max` ready tasks from the head of the buffer.
-    pub fn claim_ready(&self, max: usize) -> Vec<BrokerTask> {
+    /// Claim up to `max` ready tasks from the head of the buffer for a specific task_group.
+    pub fn claim_ready(&self, task_group: &str, max: usize) -> Vec<BrokerTask> {
         let mut claimed = Vec::with_capacity(max);
+        let task_group_prefix = format!("tasks/{}/", task_group);
 
         while claimed.len() < max {
-            // Find the first claimable entry
+            // Find the first claimable entry for this task_group
             let candidate_key = self.buffer.iter().find_map(|entry| {
                 let key = entry.key();
+
+                // Skip if not in the requested task_group
+                if !key.starts_with(&task_group_prefix) {
+                    return None;
+                }
 
                 // Skip if inflight
                 if self.inflight.lock().unwrap().contains(key) {
@@ -240,10 +251,10 @@ impl TaskBroker {
         claimed
     }
 
-    /// Try to claim tasks. If none available, wait briefly for scanner to populate.
-    pub async fn claim_ready_or_nudge(&self, max: usize) -> Vec<BrokerTask> {
+    /// Try to claim tasks for a task_group. If none available, wait briefly for scanner to populate.
+    pub async fn claim_ready_or_nudge(&self, task_group: &str, max: usize) -> Vec<BrokerTask> {
         // Try fast path first
-        let claimed = self.claim_ready(max);
+        let claimed = self.claim_ready(task_group, max);
         if !claimed.is_empty() {
             return claimed;
         }
@@ -252,7 +263,7 @@ impl TaskBroker {
         self.wakeup();
         for _ in 0..5 {
             tokio::time::sleep(Duration::from_millis(5)).await;
-            let claimed = self.claim_ready(max);
+            let claimed = self.claim_ready(task_group, max);
             if !claimed.is_empty() {
                 return claimed;
             }
@@ -261,14 +272,13 @@ impl TaskBroker {
         Vec::new()
     }
 
-    /// Try to claim up to `max` ready tasks for a specific tenant. If none, nudge scanner.
-    pub async fn claim_ready_for_tenant_or_nudge(
+    /// Try to claim up to `max` ready tasks for a specific task_group. If none, nudge scanner.
+    pub async fn claim_ready_for_task_group_or_nudge(
         &self,
-        tenant: &str,
+        task_group: &str,
         max: usize,
     ) -> Vec<BrokerTask> {
-        let _ = tenant; // tasks are tenant-agnostic; claim globally
-        self.claim_ready_or_nudge(max).await
+        self.claim_ready_or_nudge(task_group, max).await
     }
 
     /// Requeue tasks back into the buffer after a failed durable write.

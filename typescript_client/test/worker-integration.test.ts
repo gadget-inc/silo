@@ -80,6 +80,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
 
   // Default tenant for all tests - reset ensures isolation between tests
   const DEFAULT_TENANT = "test-tenant";
+  // Default task group for all tests
+  const DEFAULT_TASK_GROUP = "test-task-group";
 
   function createWorker(
     handler: TaskHandler,
@@ -94,6 +96,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         .slice(2)}`,
       handler,
       tenant: DEFAULT_TENANT,
+      taskGroup: options?.taskGroup ?? DEFAULT_TASK_GROUP,
       pollIntervalMs: 50,
       heartbeatIntervalMs: 1000,
       ...options,
@@ -121,6 +124,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       // Enqueue a job to test tenant
       await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { message: "hello-worker" },
         priority: 1,
       });
@@ -155,6 +159,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       for (let i = 0; i < 5; i++) {
         await client.enqueue({
           tenant: DEFAULT_TENANT,
+          taskGroup: DEFAULT_TASK_GROUP,
           payload: { index: i },
           priority: 1,
         });
@@ -194,6 +199,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         Array.from({ length: 10 }, (_, i) =>
           client.enqueue({
             tenant: DEFAULT_TENANT,
+            taskGroup: DEFAULT_TASK_GROUP,
             payload: { index: i },
             priority: 1,
           })
@@ -233,6 +239,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         labels.map((label) =>
           client.enqueue({
             tenant: DEFAULT_TENANT,
+            taskGroup: DEFAULT_TASK_GROUP,
             payload: { label },
             priority: 1,
           })
@@ -268,6 +275,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
 
       const handle = await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { action: "fail" },
         priority: 1,
       });
@@ -293,6 +301,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
 
       await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { action: "throw" },
         priority: 1,
       });
@@ -322,6 +331,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
 
       await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { action: "slow" },
         priority: 1,
       });
@@ -358,6 +368,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       worker.start();
       await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { run: 1 },
         priority: 1,
       });
@@ -371,6 +382,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       worker.start();
       await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { run: 2 },
         priority: 1,
       });
@@ -402,6 +414,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         Array.from({ length: 20 }, (_, i) =>
           client.enqueue({
             tenant: DEFAULT_TENANT,
+            taskGroup: DEFAULT_TASK_GROUP,
             payload: { index: i },
             priority: 1,
           })
@@ -437,6 +450,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
 
       await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { action: "long" },
         priority: 1,
       });
@@ -470,6 +484,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
 
       await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { test: true },
         priority: 1,
       });
@@ -480,6 +495,147 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       // Should have received a valid shard ID
       expect(receivedShard).toBeDefined();
       expect(receivedShard).toBeGreaterThanOrEqual(0);
+    });
+  });
+
+  describe("task group isolation", () => {
+    it("worker polling default task group does not receive tasks from other task groups", async () => {
+      const processedByDefaultWorker: string[] = [];
+      const otherTaskGroup = `other-group-${Date.now()}`;
+
+      // Worker polling the default task group
+      const defaultHandler: TaskHandler = async (ctx) => {
+        const payload = decodePayload<{ message: string }>(
+          ctx.task.payload?.data
+        );
+        processedByDefaultWorker.push(payload?.message ?? ctx.task.id);
+        return { type: "success", result: {} };
+      };
+
+      const defaultWorker = createWorker(defaultHandler, {
+        taskGroup: DEFAULT_TASK_GROUP,
+      });
+      defaultWorker.start();
+
+      // Enqueue a task to a DIFFERENT task group
+      const handle = await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        taskGroup: otherTaskGroup,
+        payload: { message: "task-for-other-group" },
+        priority: 1,
+      });
+
+      // Wait for some time to give the worker a chance to poll
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      // The default worker should NOT have picked up the task
+      expect(processedByDefaultWorker).not.toContain("task-for-other-group");
+      expect(processedByDefaultWorker.length).toBe(0);
+
+      // Verify the job is still scheduled (not picked up)
+      const job = await client.getJob(handle.id, DEFAULT_TENANT);
+      expect(job.status).toBe(JobStatus.Scheduled);
+    });
+
+    it("worker polling a specific task group receives tasks from that task group", async () => {
+      const processedBySpecificWorker: string[] = [];
+      const specificTaskGroup = `specific-group-${Date.now()}`;
+
+      // Worker polling the specific task group
+      const specificHandler: TaskHandler = async (ctx) => {
+        const payload = decodePayload<{ message: string }>(
+          ctx.task.payload?.data
+        );
+        processedBySpecificWorker.push(payload?.message ?? ctx.task.id);
+        return { type: "success", result: {} };
+      };
+
+      const specificWorker = createWorker(specificHandler, {
+        taskGroup: specificTaskGroup,
+      });
+      specificWorker.start();
+
+      // Enqueue a task to that specific task group
+      const handle = await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        taskGroup: specificTaskGroup,
+        payload: { message: "task-for-specific-group" },
+        priority: 1,
+      });
+
+      // Wait until the task is processed
+      await waitFor(() =>
+        processedBySpecificWorker.includes("task-for-specific-group")
+      );
+
+      expect(processedBySpecificWorker).toContain("task-for-specific-group");
+
+      // Verify the job completed successfully
+      const job = await client.getJob(handle.id, DEFAULT_TENANT);
+      expect(job.status).toBe(JobStatus.Succeeded);
+    });
+
+    it("multiple workers on different task groups only receive their own tasks", async () => {
+      const processedByWorkerA: string[] = [];
+      const processedByWorkerB: string[] = [];
+      const taskGroupA = `group-a-${Date.now()}`;
+      const taskGroupB = `group-b-${Date.now()}`;
+
+      // Enqueue tasks FIRST so they're ready when workers start polling
+      await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        taskGroup: taskGroupA,
+        payload: { message: "task-for-A" },
+        priority: 1,
+      });
+
+      await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        taskGroup: taskGroupB,
+        payload: { message: "task-for-B" },
+        priority: 1,
+      });
+
+      // Worker A polls task group A
+      const workerA = createWorker(
+        async (ctx) => {
+          const payload = decodePayload<{ message: string }>(
+            ctx.task.payload?.data
+          );
+          processedByWorkerA.push(payload?.message ?? ctx.task.id);
+          return { type: "success", result: {} };
+        },
+        { taskGroup: taskGroupA }
+      );
+
+      // Worker B polls task group B
+      const workerB = createWorker(
+        async (ctx) => {
+          const payload = decodePayload<{ message: string }>(
+            ctx.task.payload?.data
+          );
+          processedByWorkerB.push(payload?.message ?? ctx.task.id);
+          return { type: "success", result: {} };
+        },
+        { taskGroup: taskGroupB }
+      );
+
+      workerA.start();
+      workerB.start();
+
+      // Wait until both tasks are processed
+      await waitFor(
+        () =>
+          processedByWorkerA.includes("task-for-A") &&
+          processedByWorkerB.includes("task-for-B")
+      );
+
+      // Each worker should only have processed its own task group's tasks
+      expect(processedByWorkerA).toContain("task-for-A");
+      expect(processedByWorkerA).not.toContain("task-for-B");
+
+      expect(processedByWorkerB).toContain("task-for-B");
+      expect(processedByWorkerB).not.toContain("task-for-A");
     });
   });
 
@@ -502,6 +658,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         handler,
         refreshHandler,
         tenant: DEFAULT_TENANT,
+        taskGroup: options?.taskGroup ?? DEFAULT_TASK_GROUP,
         pollIntervalMs: 50,
         heartbeatIntervalMs: 1000,
         ...options,
@@ -535,6 +692,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       // Enqueue job with floating limit and very short refresh interval
       await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { message: "job-1" },
         limits: [
           {
@@ -556,6 +714,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       // Trigger refresh by enqueueing another job
       await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { message: "job-2" },
         limits: [
           {
@@ -609,6 +768,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       // Enqueue first job to create the limit
       await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { init: true },
         limits: [
           {
@@ -626,6 +786,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
 
       await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { trigger: true },
         limits: [
           {
@@ -671,6 +832,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       // Enqueue jobs to trigger refresh
       await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { test: 1 },
         limits: [
           {
@@ -687,6 +849,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
 
       await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { test: 2 },
         limits: [
           {
@@ -737,6 +900,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       for (let i = 0; i < 5; i++) {
         await client.enqueue({
           tenant: DEFAULT_TENANT,
+          taskGroup: DEFAULT_TASK_GROUP,
           payload: { index: i },
           limits: [
             {
@@ -775,16 +939,19 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       const worker = new SiloWorker({
         client,
         workerId: `no-refresh-handler-worker-${Date.now()}`,
+        taskGroup: DEFAULT_TASK_GROUP,
         handler,
         onError: (error) => {
           errors.push(error);
         },
       });
+      activeWorkers.push(worker);
       worker.start();
 
       // Enqueue jobs with floating limit
       await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { job: 1 },
         limits: [
           {
@@ -802,6 +969,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       // Enqueue another to trigger refresh task (limit is stale)
       await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { job: 2 },
         limits: [
           {
@@ -856,6 +1024,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
 
       const handle = await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { action: "long-running" },
         priority: 1,
       });
@@ -909,6 +1078,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
 
       const handle = await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { action: "cancel-test" },
         priority: 1,
       });
@@ -960,6 +1130,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
 
       const handle = await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { action: "self-cancel" },
         priority: 1,
       });
@@ -1013,6 +1184,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
 
       await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { action: "immediate-cancel" },
         priority: 1,
       });
@@ -1042,6 +1214,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
 
       const handle = await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { action: "quick" },
         priority: 1,
       });
@@ -1101,16 +1274,19 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       // Enqueue: task 0 and 2 complete immediately, task 1 waits for abort
       const handle0 = await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { index: 0, shouldWait: false },
         priority: 1,
       });
       const handle1 = await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { index: 1, shouldWait: true },
         priority: 1,
       });
       const handle2 = await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { index: 2, shouldWait: false },
         priority: 1,
       });
@@ -1171,6 +1347,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
 
       await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { action: "multi-cancel" },
         priority: 1,
       });
@@ -1206,6 +1383,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
 
       const handle = await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { action: "no-retry-on-cancel" },
         priority: 1,
         retryPolicy: {
@@ -1269,6 +1447,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
 
       await client.enqueue({
         tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
         payload: { action: "long-task" },
         priority: 1,
       });

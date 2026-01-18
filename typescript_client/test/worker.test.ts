@@ -40,6 +40,7 @@ function createTask(id: string, jobId: string, shard: number = 0): Task {
     payload: { data: new TextEncoder().encode('{"test":"data"}') },
     priority: 10,
     shard,
+    taskGroup: "default",
   };
 }
 
@@ -55,6 +56,7 @@ describe("SiloWorker", () => {
       const worker = new SiloWorker({
         client,
         workerId: "test-worker",
+        taskGroup: "default",
         handler,
       });
 
@@ -72,6 +74,7 @@ describe("SiloWorker", () => {
       const worker = new SiloWorker({
         client,
         workerId: "test-worker",
+        taskGroup: "default",
         handler,
         concurrentPollers: 3,
         maxConcurrentTasks: 20,
@@ -95,6 +98,7 @@ describe("SiloWorker", () => {
       const worker = new SiloWorker({
         client,
         workerId: "test-worker",
+        taskGroup: "default",
         handler,
         pollIntervalMs: 50,
       });
@@ -127,6 +131,7 @@ describe("SiloWorker", () => {
       const worker = new SiloWorker({
         client,
         workerId: "test-worker",
+        taskGroup: "default",
         handler,
         pollIntervalMs: 10,
       });
@@ -142,6 +147,7 @@ describe("SiloWorker", () => {
       expect(leaseTasks).toHaveBeenCalledWith({
         workerId: "test-worker",
         maxTasks: expect.any(Number),
+        taskGroup: "default",
       });
     });
 
@@ -161,6 +167,7 @@ describe("SiloWorker", () => {
       const worker = new SiloWorker({
         client,
         workerId: "test-worker",
+        taskGroup: "default",
         handler,
         concurrentPollers: 3,
         pollIntervalMs: 10,
@@ -199,6 +206,7 @@ describe("SiloWorker", () => {
       const worker = new SiloWorker({
         client,
         workerId: "test-worker",
+        taskGroup: "default",
         handler,
         pollIntervalMs: 10,
       });
@@ -243,6 +251,7 @@ describe("SiloWorker", () => {
       const worker = new SiloWorker({
         client,
         workerId: "test-worker",
+        taskGroup: "default",
         handler,
         pollIntervalMs: 10,
       });
@@ -279,6 +288,7 @@ describe("SiloWorker", () => {
       const worker = new SiloWorker({
         client,
         workerId: "test-worker",
+        taskGroup: "default",
         handler,
         pollIntervalMs: 10,
         onError: () => {}, // Suppress error logging
@@ -337,6 +347,7 @@ describe("SiloWorker", () => {
       const worker = new SiloWorker({
         client,
         workerId: "test-worker",
+        taskGroup: "default",
         handler,
         maxConcurrentTasks: 2,
         pollIntervalMs: 10,
@@ -370,6 +381,7 @@ describe("SiloWorker", () => {
       const worker = new SiloWorker({
         client,
         workerId: "test-worker",
+        taskGroup: "default",
         handler: async () => {
           activeCountDuringExecution = workerRef.activeTasks;
           await new Promise((resolve) => setTimeout(resolve, 50));
@@ -415,6 +427,7 @@ describe("SiloWorker", () => {
       const worker = new SiloWorker({
         client,
         workerId: "test-worker",
+        taskGroup: "default",
         handler,
         pollIntervalMs: 10,
         heartbeatIntervalMs: 30,
@@ -453,6 +466,7 @@ describe("SiloWorker", () => {
       const worker = new SiloWorker({
         client,
         workerId: "test-worker",
+        taskGroup: "default",
         handler,
         pollIntervalMs: 10,
         heartbeatIntervalMs: 50,
@@ -491,6 +505,7 @@ describe("SiloWorker", () => {
       const worker = new SiloWorker({
         client,
         workerId: "test-worker",
+        taskGroup: "default",
         handler,
         pollIntervalMs: 10,
         onError,
@@ -526,6 +541,7 @@ describe("SiloWorker", () => {
       const worker = new SiloWorker({
         client,
         workerId: "test-worker",
+        taskGroup: "default",
         handler,
         pollIntervalMs: 10,
         heartbeatIntervalMs: 20,
@@ -571,6 +587,7 @@ describe("SiloWorker", () => {
       const worker = new SiloWorker({
         client,
         workerId: "test-worker",
+        taskGroup: "default",
         handler,
         pollIntervalMs: 10,
         onError: () => {}, // Suppress error logging
@@ -607,6 +624,7 @@ describe("SiloWorker", () => {
       const worker = new SiloWorker({
         client,
         workerId: "test-worker",
+        taskGroup: "default",
         handler,
         pollIntervalMs: 10,
       });

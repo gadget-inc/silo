@@ -420,6 +420,7 @@ describe("Shard Routing", () => {
         const handle = await client.enqueue({
           tenant: "test-tenant",
           payload: { test: true },
+          taskGroup: "default",
         });
 
         expect(handle.id).toBe("job-123");
@@ -440,6 +441,7 @@ describe("Shard Routing", () => {
           client.enqueue({
             tenant: "test-tenant",
             payload: { test: true },
+            taskGroup: "default",
           })
         ).rejects.toThrow("shard not found");
 
@@ -460,6 +462,7 @@ describe("Shard Routing", () => {
           client.enqueue({
             tenant: "test-tenant",
             payload: { test: true },
+            taskGroup: "default",
           })
         ).rejects.toThrow("internal server error");
 
@@ -498,6 +501,7 @@ describe("Shard Routing", () => {
         const handle = await client.enqueue({
           tenant: "test-tenant",
           payload: { test: true },
+          taskGroup: "default",
         });
 
         expect(handle.id).toBe("job-456");
@@ -529,6 +533,7 @@ describe("Shard Routing", () => {
         const handle = await client.enqueue({
           tenant: "test-tenant",
           payload: { test: true },
+          taskGroup: "default",
         });
 
         expect(handle.id).toBe("job-789");
@@ -560,6 +565,7 @@ describe("Shard Routing", () => {
         const handle = await client.enqueue({
           tenant: "test-tenant",
           payload: { test: true },
+          taskGroup: "default",
         });
 
         expect(handle.id).toBe("job-abc");

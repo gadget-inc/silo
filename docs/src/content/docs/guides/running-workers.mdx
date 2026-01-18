@@ -1,3 +1,233 @@
 ---
 title: Running Workers
 ---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Workers are processes that poll Silo for tasks and execute them. Each worker polls for tasks from a specific **task group**, processes them, and reports the results back to Silo.
+
+## Basic Worker Setup
+
+Here's a minimal worker that processes jobs from a task group:
+
+```typescript
+import { SiloGRPCClient, SiloWorker } from "@silo-ai/client";
+
+const client = new SiloGRPCClient({
+  servers: ["localhost:50051"],
+});
+
+const worker = new SiloWorker({
+  client,
+  workerId: "worker-1",
+  taskGroup: "emails",  // This worker processes jobs from the "emails" task group
+  handler: async (task) => {
+    const { to, subject, body } = task.payload;
+    
+    // Process the job
+    await sendEmail(to, subject, body);
+    
+    // Return a result (optional)
+    return { sent: true, timestamp: Date.now() };
+  }
+});
+
+// Start polling for tasks
+await worker.start();
+
+// Later, gracefully stop the worker
+await worker.stop();
+```
+
+## Task Groups
+
+Workers poll for tasks from a specific task group. When you enqueue a job, you specify which task group it belongs to:
+
+```typescript
+// Enqueue a job to the "emails" task group
+await client.enqueue({
+  payload: { to: "user@example.com" },
+  taskGroup: "emails"
+});
+
+// This job will only be picked up by workers polling the "emails" task group
+```
+
+### Why Task Groups?
+
+Task groups provide several benefits:
+
+1. **Workload isolation**: Jobs in different task groups are processed independently. A backlog in one task group doesn't affect others.
+
+2. **Specialized workers**: You can run different worker configurations for different task groups:
+   ```typescript
+   // High-concurrency worker for quick tasks
+   const emailWorker = new SiloWorker({
+     client,
+     workerId: "email-worker-1",
+     taskGroup: "emails",
+     maxConcurrentTasks: 20,
+     handler: handleEmail
+   });
+
+   // Low-concurrency worker for resource-intensive tasks
+   const reportWorker = new SiloWorker({
+     client,
+     workerId: "report-worker-1",
+     taskGroup: "reports",
+     maxConcurrentTasks: 2,
+     handler: handleReport
+   });
+   ```
+
+3. **Independent scaling**: Scale each task group's worker pool based on its specific needs.
+
+4. **Resource allocation**: Route jobs to workers with appropriate resources (GPU, high memory, etc.).
+
+## Worker Options
+
+The `SiloWorker` constructor accepts the following options:
+
+### `client` (required)
+
+The `SiloGRPCClient` instance to use for communication with Silo.
+
+### `workerId` (required)
+
+A unique identifier for this worker. Used for tracking and debugging.
+
+```typescript
+const worker = new SiloWorker({
+  client,
+  workerId: `worker-${process.env.HOSTNAME}-${process.pid}`,
+  taskGroup: "default",
+  handler: async (task) => { /* ... */ }
+});
+```
+
+### `taskGroup` (required)
+
+The task group to poll for tasks. The worker will only receive jobs that were enqueued with this task group.
+
+### `handler` (required)
+
+An async function that processes each task. Receives a task object with:
+- `id`: The task ID
+- `jobId`: The job ID
+- `payload`: The job payload (as enqueued)
+- `attemptNumber`: Which attempt this is (1 for first attempt)
+
+```typescript
+const handler = async (task) => {
+  console.log(`Processing job ${task.jobId}, attempt ${task.attemptNumber}`);
+  
+  // Your processing logic here
+  const result = await processData(task.payload);
+  
+  // Return a result (will be stored with the job)
+  return result;
+};
+```
+
+If the handler throws an error, the job will be marked as failed and may be retried according to its retry policy.
+
+### `maxConcurrentTasks` (optional)
+
+Maximum number of tasks to process concurrently. Defaults to 10.
+
+```typescript
+const worker = new SiloWorker({
+  client,
+  workerId: "worker-1",
+  taskGroup: "heavy-processing",
+  maxConcurrentTasks: 2,  // Only process 2 tasks at a time
+  handler: async (task) => { /* ... */ }
+});
+```
+
+### `pollIntervalMs` (optional)
+
+How often to poll for new tasks when idle, in milliseconds. Defaults to 1000 (1 second).
+
+### `leaseExpirationMarginMs` (optional)
+
+How much time before lease expiration to stop processing and renew. Defaults to 5000 (5 seconds).
+
+## Handling Results and Errors
+
+### Successful completion
+
+Return a value from your handler to store it as the job result:
+
+```typescript
+handler: async (task) => {
+  const processed = await processData(task.payload);
+  return { 
+    processedAt: Date.now(),
+    itemCount: processed.length 
+  };
+}
+```
+
+### Failures
+
+Throw an error to mark the job as failed:
+
+```typescript
+handler: async (task) => {
+  const result = await callExternalApi(task.payload);
+  
+  if (!result.success) {
+    throw new Error(`API call failed: ${result.error}`);
+  }
+  
+  return result.data;
+}
+```
+
+If the job has a retry policy, it will be automatically retried.
+
+## Running Multiple Workers
+
+For production deployments, run multiple worker processes for redundancy and throughput:
+
+```typescript
+// worker.ts - run multiple instances of this
+import { SiloGRPCClient, SiloWorker } from "@silo-ai/client";
+
+const client = new SiloGRPCClient({
+  servers: process.env.SILO_SERVERS?.split(",") || ["localhost:50051"],
+});
+
+const workerId = `${process.env.HOSTNAME || "local"}-${process.pid}`;
+
+const worker = new SiloWorker({
+  client,
+  workerId,
+  taskGroup: process.env.TASK_GROUP || "default",
+  maxConcurrentTasks: parseInt(process.env.MAX_CONCURRENT || "10"),
+  handler: async (task) => {
+    // Your handler logic
+  }
+});
+
+// Handle graceful shutdown
+process.on("SIGTERM", async () => {
+  console.log("Received SIGTERM, shutting down gracefully...");
+  await worker.stop();
+  process.exit(0);
+});
+
+await worker.start();
+console.log(`Worker ${workerId} started, polling task group: ${process.env.TASK_GROUP}`);
+```
+
+<Aside type="tip" title="Scaling workers">
+You can scale workers horizontally by running more instances. Each worker independently polls for tasks, and Silo ensures each task is only processed once.
+</Aside>
+
+## Next Steps
+
+- Learn about [enqueueing jobs](/guides/enqueueing) with different options
+- Configure [concurrency limits](/guides/concurrency-limits) to control throughput
+- Set up [observability](/guides/observability) to monitor your workers

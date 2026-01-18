@@ -153,6 +153,7 @@ impl JobStoreShard {
                 if let Some(jbytes) = maybe_job {
                     let view = JobView::new(jbytes)?;
                     let priority = view.priority();
+                    let task_group = view.task_group();
                     let failures_so_far = attempt_number;
                     if let Some(policy_rt) = view.retry_policy() {
                         if let Some(next_time) =
@@ -166,9 +167,11 @@ impl JobStoreShard {
                                 job_id: job_id.clone(),
                                 attempt_number: next_attempt_number,
                                 held_queues: held_queues_local.clone(),
+                                task_group: task_group.to_string(),
                             };
                             put_task(
                                 &mut batch,
+                                task_group,
                                 next_time,
                                 priority,
                                 &job_id,

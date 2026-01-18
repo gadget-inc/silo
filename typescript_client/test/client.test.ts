@@ -275,6 +275,7 @@ describe("SiloGRPCClient", () => {
     it("allows minimal options", () => {
       const options: EnqueueJobOptions = {
         payload: { task: "test" },
+        taskGroup: "default",
       };
       expect(options.payload).toEqual({ task: "test" });
     });
@@ -282,6 +283,7 @@ describe("SiloGRPCClient", () => {
     it("allows full options with concurrency limit", () => {
       const options: EnqueueJobOptions = {
         payload: { task: "test" },
+        taskGroup: "default",
         id: "job-123",
         priority: 10,
         startAtMs: BigInt(Date.now()),
@@ -310,6 +312,7 @@ describe("SiloGRPCClient", () => {
     it("allows full options with rate limit", () => {
       const options: EnqueueJobOptions = {
         payload: { task: "test" },
+        taskGroup: "default",
         limits: [
           {
             type: "rateLimit",
@@ -338,6 +341,7 @@ describe("SiloGRPCClient", () => {
     it("allows mixed limits", () => {
       const options: EnqueueJobOptions = {
         payload: { task: "test" },
+        taskGroup: "default",
         limits: [
           { type: "concurrency", key: "tenant:abc", maxConcurrency: 10 },
           {

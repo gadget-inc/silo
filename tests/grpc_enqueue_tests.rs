@@ -28,6 +28,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
             limits: vec![],
             tenant: None,
             metadata: md,
+            task_group: "default".to_string(),
         };
         let enq_resp = client.enqueue(enq).await?.into_inner();
         let job_id = enq_resp.id;
@@ -38,6 +39,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
                 shard: Some(0),
                 worker_id: "w1".to_string(),
                 max_tasks: 1,
+            task_group: "default".to_string(),
             })
             .await?
             .into_inner();
@@ -140,6 +142,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
                 limits: vec![],
                 tenant: None,
                 metadata: md,
+            task_group: "default".to_string(),
             };
             expect_invalid_arg(&mut client, req, "too many entries").await;
         }
@@ -161,6 +164,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
                 limits: vec![],
                 tenant: None,
                 metadata: md,
+            task_group: "default".to_string(),
             };
             expect_invalid_arg(&mut client, req, "key too long").await;
         }
@@ -185,6 +189,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
                 limits: vec![],
                 tenant: None,
                 metadata: md,
+            task_group: "default".to_string(),
             };
             expect_invalid_arg(&mut client, req, "value too long").await;
         }
@@ -234,6 +239,7 @@ async fn grpc_server_enqueue_with_rate_limit() -> anyhow::Result<()> {
                 }],
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
             })
             .await?
             .into_inner();
@@ -294,6 +300,7 @@ async fn grpc_enqueue_requires_tenant_when_tenancy_enabled() -> anyhow::Result<(
             limits: vec![],
             tenant: None,
             metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
         };
         let res = client.enqueue(req).await;
         match res {
@@ -321,6 +328,7 @@ async fn grpc_enqueue_requires_tenant_when_tenancy_enabled() -> anyhow::Result<(
             limits: vec![],
             tenant: Some("".to_string()),
             metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
         };
         let res = client.enqueue(req).await;
         match res {
@@ -348,6 +356,7 @@ async fn grpc_enqueue_requires_tenant_when_tenancy_enabled() -> anyhow::Result<(
             limits: vec![],
             tenant: Some("my-tenant".to_string()),
             metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
         };
         let res = client.enqueue(req).await;
         assert!(res.is_ok(), "enqueue with valid tenant should succeed");

@@ -28,6 +28,7 @@ impl JobStoreShard {
         payload: Vec<u8>,
         limits: Vec<Limit>,
         metadata: Option<Vec<(String, String)>>,
+        task_group: &str,
     ) -> Result<String, JobStoreShardError> {
         let job_id = id.unwrap_or_else(|| Uuid::new_v4().to_string());
         // [SILO-ENQ-1] If caller provided an id, ensure it doesn't already exist
@@ -48,6 +49,7 @@ impl JobStoreShard {
             retry_policy,
             metadata: metadata.unwrap_or_default(),
             limits: limits.clone(),
+            task_group: task_group.to_string(),
         };
         let job_value = encode_job_info(&job)?;
 
@@ -87,8 +89,9 @@ impl JobStoreShard {
                     job_id: job_id.clone(),
                     attempt_number: 1,
                     held_queues: Vec::new(),
+                    task_group: task_group.to_string(),
                 };
-                put_task(&mut batch, start_at_ms, priority, &job_id, 1, &first_task)?;
+                put_task(&mut batch, task_group, start_at_ms, priority, &job_id, 1, &first_task)?;
             }
             Some(Limit::Concurrency(cl)) => {
                 // First limit is a concurrency limit - use existing logic
@@ -103,6 +106,7 @@ impl JobStoreShard {
                         start_at_ms,
                         now_ms,
                         std::slice::from_ref(cl),
+                        task_group,
                     )
                     .map_err(JobStoreShardError::Rkyv)?;
 
@@ -121,6 +125,7 @@ impl JobStoreShard {
                         start_at_ms,
                         now_ms,
                         vec![cl.key.clone()], // held queues
+                        task_group,
                     )?;
                 }
             }
@@ -137,8 +142,9 @@ impl JobStoreShard {
                     started_at_ms: now_ms,
                     priority,
                     held_queues: Vec::new(),
+                    task_group: task_group.to_string(),
                 };
-                put_task(&mut batch, start_at_ms, priority, &job_id, 1, &check_task)?;
+                put_task(&mut batch, task_group, start_at_ms, priority, &job_id, 1, &check_task)?;
             }
             Some(Limit::FloatingConcurrency(fl)) => {
                 // First limit is a floating concurrency limit
@@ -148,7 +154,7 @@ impl JobStoreShard {
                     .await?;
 
                 // Maybe schedule a refresh task if needed
-                self.maybe_schedule_floating_limit_refresh(&mut batch, tenant, fl, &state, now_ms)?;
+                self.maybe_schedule_floating_limit_refresh(&mut batch, tenant, fl, &state, now_ms, task_group)?;
 
                 // Create a temporary ConcurrencyLimit with the current max concurrency
                 let temp_cl = crate::job::ConcurrencyLimit {
@@ -168,6 +174,7 @@ impl JobStoreShard {
                         start_at_ms,
                         now_ms,
                         std::slice::from_ref(&temp_cl),
+                        task_group,
                     )
                     .map_err(JobStoreShardError::Rkyv)?;
 
@@ -186,6 +193,7 @@ impl JobStoreShard {
                         start_at_ms,
                         now_ms,
                         vec![fl.key.clone()], // held queues
+                        task_group,
                     )?;
                 }
             }
@@ -242,6 +250,7 @@ impl JobStoreShard {
         start_at_ms: i64,
         now_ms: i64,
         held_queues: Vec<String>,
+        task_group: &str,
     ) -> Result<(), JobStoreShardError> {
         let next_index = current_limit_index + 1;
 
@@ -253,9 +262,11 @@ impl JobStoreShard {
                 job_id: job_id.to_string(),
                 attempt_number,
                 held_queues,
+                task_group: task_group.to_string(),
             };
             return put_task(
                 batch,
+                task_group,
                 start_at_ms,
                 priority,
                 job_id,
@@ -274,6 +285,7 @@ impl JobStoreShard {
                 job_id: job_id.to_string(),
                 attempt_number,
                 request_id: Uuid::new_v4().to_string(),
+                task_group: task_group.to_string(),
             },
             Limit::RateLimit(rl) => Task::CheckRateLimit {
                 task_id: Uuid::new_v4().to_string(),
@@ -286,6 +298,7 @@ impl JobStoreShard {
                 started_at_ms: now_ms,
                 priority,
                 held_queues,
+                task_group: task_group.to_string(),
             },
             // Floating concurrency limits use the same RequestTicket mechanism as regular concurrency limits
             Limit::FloatingConcurrency(fl) => Task::RequestTicket {
@@ -296,10 +309,12 @@ impl JobStoreShard {
                 job_id: job_id.to_string(),
                 attempt_number,
                 request_id: Uuid::new_v4().to_string(),
+                task_group: task_group.to_string(),
             },
         };
         put_task(
             batch,
+            task_group,
             start_at_ms,
             priority,
             job_id,

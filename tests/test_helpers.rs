@@ -18,12 +18,16 @@ macro_rules! with_timeout {
 
 pub fn parse_time_from_task_key(key: &str) -> Option<u64> {
     // Accept both legacy and tenant-aware formats:
-    // - tasks/{:020}/{:02}/{job_id}/{attempt}
-    // - t/<tenant>/tasks/{:020}/{:02}/{job_id}/{attempt}
+    // - tasks/{task_group}/{:020}/{:02}/{job_id}/{attempt}
+    // - t/<tenant>/tasks/{task_group}/{:020}/{:02}/{job_id}/{attempt}
     if let Some(pos) = key.find("tasks/") {
         let after = &key[pos + "tasks/".len()..];
-        let ts_str = after.split('/').next().unwrap_or("");
-        return ts_str.parse::<u64>().ok();
+        // Skip the task_group part, then get the timestamp
+        let parts: Vec<&str> = after.split('/').collect();
+        if parts.len() >= 2 {
+            // parts[0] = task_group, parts[1] = timestamp
+            return parts[1].parse::<u64>().ok();
+        }
     }
     None
 }

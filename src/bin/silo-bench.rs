@@ -57,9 +57,22 @@ struct Args {
     #[arg(long, default_value = "1")]
     report_interval_secs: u64,
 
-    /// Tenant ID for multi-tenant mode (required if server has tenancy enabled)
-    #[arg(long, default_value = "-")]
-    tenant: String,
+    /// Tenant ID prefix for multi-tenant mode. When tenant_count > 1, tenants are
+    /// named "{tenant_prefix}-0", "{tenant_prefix}-1", etc.
+    #[arg(long, default_value = "bench")]
+    tenant_prefix: String,
+
+    /// Number of tenants to distribute jobs across
+    #[arg(long, short = 't', default_value = "4")]
+    tenant_count: u32,
+
+    /// Imbalance factor for tenant job distribution. When set to 1.0 (default),
+    /// jobs are distributed evenly. When > 1.0, creates an imbalanced distribution
+    /// where the first tenant receives `imbalance_factor` times more jobs than
+    /// the last tenant (with intermediate tenants receiving proportionally
+    /// distributed amounts).
+    #[arg(long, default_value = "1.0")]
+    imbalance_factor: f64,
 
     /// Enable structured JSON logging
     #[arg(long)]
@@ -158,7 +171,98 @@ impl ClusterInfo {
     }
 }
 
-/// Worker task that polls for tasks from random shards and reports success outcomes
+/// Handles weighted tenant selection for distributing jobs across tenants.
+///
+/// With imbalance_factor = 1.0, all tenants receive equal weight (uniform distribution).
+/// With imbalance_factor > 1.0, the first tenant gets `imbalance_factor` times more
+/// jobs than the last tenant, with intermediate tenants distributed linearly.
+#[derive(Debug, Clone)]
+struct TenantSelector {
+    /// List of tenant IDs
+    tenants: Vec<String>,
+    /// Cumulative weights for weighted random selection (normalized to 0.0-1.0)
+    cumulative_weights: Vec<f64>,
+}
+
+impl TenantSelector {
+    /// Create a new TenantSelector with the given prefix, count, and imbalance factor.
+    ///
+    /// - `prefix`: The tenant ID prefix (e.g., "bench" produces "bench-0", "bench-1", etc.)
+    /// - `count`: Number of tenants
+    /// - `imbalance_factor`: How much more the first tenant receives vs the last (1.0 = uniform)
+    fn new(prefix: &str, count: u32, imbalance_factor: f64) -> Self {
+        let count = count.max(1);
+        let tenants: Vec<String> = (0..count).map(|i| format!("{}-{}", prefix, i)).collect();
+
+        // Calculate weights for each tenant
+        // With imbalance_factor = F:
+        //   - Tenant 0 (first) gets weight F
+        //   - Tenant n-1 (last) gets weight 1.0
+        //   - Linear interpolation between
+        let weights: Vec<f64> = if count == 1 {
+            vec![1.0]
+        } else {
+            (0..count)
+                .map(|i| {
+                    // Linear interpolation from imbalance_factor (at i=0) to 1.0 (at i=count-1)
+                    let t = i as f64 / (count - 1) as f64;
+                    imbalance_factor * (1.0 - t) + 1.0 * t
+                })
+                .collect()
+        };
+
+        // Calculate cumulative weights (normalized)
+        let total: f64 = weights.iter().sum();
+        let mut cumulative = 0.0;
+        let cumulative_weights: Vec<f64> = weights
+            .iter()
+            .map(|w| {
+                cumulative += w / total;
+                cumulative
+            })
+            .collect();
+
+        TenantSelector {
+            tenants,
+            cumulative_weights,
+        }
+    }
+
+    /// Select a random tenant according to the weighted distribution
+    fn select(&self) -> &str {
+        let r: f64 = rand::thread_rng().gen();
+        for (i, &threshold) in self.cumulative_weights.iter().enumerate() {
+            if r < threshold {
+                return &self.tenants[i];
+            }
+        }
+        // Fallback to last tenant (shouldn't happen due to cumulative weights reaching 1.0)
+        self.tenants.last().map(|s| s.as_str()).unwrap_or("-")
+    }
+
+    /// Get all tenant IDs
+    fn all_tenants(&self) -> &[String] {
+        &self.tenants
+    }
+
+    /// Get the weight percentages for each tenant (for logging/display)
+    fn weight_percentages(&self) -> Vec<(String, f64)> {
+        let mut prev = 0.0;
+        self.tenants
+            .iter()
+            .zip(self.cumulative_weights.iter())
+            .map(|(tenant, &cum)| {
+                let pct = (cum - prev) * 100.0;
+                prev = cum;
+                (tenant.clone(), pct)
+            })
+            .collect()
+    }
+}
+
+/// Worker task that polls for tasks from random shards and reports success outcomes.
+/// Workers lease tasks from all tenants and report outcomes without specifying a tenant
+/// (the server determines the tenant from the task_id).
 async fn worker_loop(
     cluster_info: Arc<ClusterInfo>,
     worker_id: String,
@@ -167,7 +271,6 @@ async fn worker_loop(
     completed_count: Arc<AtomicU64>,
     poll_count: Arc<AtomicU64>,
     empty_poll_count: Arc<AtomicU64>,
-    tenant: Option<String>,
 ) {
     // Create connections to all servers in the cluster
     let mut connections: std::collections::HashMap<String, SiloClient<Channel>> =
@@ -223,6 +326,7 @@ async fn worker_loop(
             shard: Some(shard),
             worker_id: worker_id.clone(),
             max_tasks,
+            task_group: "default".to_string(),
         };
 
         poll_count.fetch_add(1, Ordering::Relaxed);
@@ -255,7 +359,7 @@ async fn worker_loop(
                     let outcome_request = ReportOutcomeRequest {
                         shard: task_shard,
                         task_id: task.id.clone(),
-                        tenant: tenant.clone(),
+                        tenant: None, // Server determines tenant from task_id
                         outcome: Some(Outcome::Success(MsgpackBytes {
                             data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
                         })),
@@ -289,7 +393,7 @@ async fn enqueuer_loop(
     max_concurrency: u32,
     running: Arc<AtomicBool>,
     enqueued_count: Arc<AtomicU64>,
-    tenant: Option<String>,
+    tenant_selector: Arc<TenantSelector>,
 ) {
     // Create connections to all servers in the cluster
     let mut connections: std::collections::HashMap<String, SiloClient<Channel>> =
@@ -343,9 +447,13 @@ async fn enqueuer_loop(
             }
         };
 
+        // Select a tenant according to the weighted distribution
+        let tenant = tenant_selector.select().to_string();
+
         let payload = serde_json::json!({
             "enqueuer": enqueuer_id,
             "job": job_counter,
+            "tenant": tenant,
             "timestamp": now_ms(),
         });
 
@@ -364,8 +472,9 @@ async fn enqueuer_loop(
                     max_concurrency,
                 })),
             }],
-            tenant: tenant.clone(),
+            tenant: Some(tenant),
             metadata: Default::default(),
+            task_group: "default".to_string(),
         };
 
         match client.enqueue(request).await {
@@ -404,11 +513,31 @@ async fn main() -> anyhow::Result<()> {
         workers = args.workers,
         enqueuers = args.enqueuers,
         duration_secs = args.duration_secs,
-        tenant = %args.tenant,
+        tenant_prefix = %args.tenant_prefix,
+        tenant_count = args.tenant_count,
+        imbalance_factor = args.imbalance_factor,
         concurrency_key = %args.concurrency_key,
         max_concurrency = args.max_concurrency,
         "Benchmark configuration"
     );
+
+    // Create tenant selector for weighted distribution
+    let tenant_selector = Arc::new(TenantSelector::new(
+        &args.tenant_prefix,
+        args.tenant_count,
+        args.imbalance_factor,
+    ));
+
+    // Log tenant distribution
+    info!(
+        tenants = ?tenant_selector.all_tenants(),
+        "Configured tenants"
+    );
+    if args.imbalance_factor != 1.0 {
+        for (tenant, pct) in tenant_selector.weight_percentages() {
+            info!(tenant = %tenant, weight_pct = pct, "Tenant weight");
+        }
+    }
 
     // Discover cluster topology
     info!("Discovering cluster topology...");
@@ -447,7 +576,6 @@ async fn main() -> anyhow::Result<()> {
         let completed = completed_count.clone();
         let polls = poll_count.clone();
         let empty_polls = empty_poll_count.clone();
-        let tenant = Some(args.tenant.clone());
 
         handles.push(tokio::spawn(worker_loop(
             cluster,
@@ -457,7 +585,6 @@ async fn main() -> anyhow::Result<()> {
             completed,
             polls,
             empty_polls,
-            tenant,
         )));
     }
 
@@ -469,7 +596,7 @@ async fn main() -> anyhow::Result<()> {
         let enqueued = enqueued_count.clone();
         let concurrency_key = args.concurrency_key.clone();
         let max_concurrency = args.max_concurrency;
-        let tenant = Some(args.tenant.clone());
+        let selector = tenant_selector.clone();
 
         handles.push(tokio::spawn(enqueuer_loop(
             cluster,
@@ -478,7 +605,7 @@ async fn main() -> anyhow::Result<()> {
             max_concurrency,
             running,
             enqueued,
-            tenant,
+            selector,
         )));
     }
 

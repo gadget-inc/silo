@@ -447,6 +447,17 @@ impl Silo for SiloService {
         } else {
             Some(r.metadata.into_iter().collect())
         };
+
+        // Validate task_group - required and must be <= 64 chars
+        if r.task_group.is_empty() {
+            return Err(Status::invalid_argument("task_group is required"));
+        }
+        if r.task_group.chars().count() > 64 {
+            return Err(Status::invalid_argument(
+                "task_group too long (must be <= 64 chars)",
+            ));
+        }
+
         let id = shard
             .enqueue(
                 &tenant,
@@ -457,6 +468,7 @@ impl Silo for SiloService {
                 payload_bytes,
                 limits,
                 metadata,
+                &r.task_group,
             )
             .await
             .map_err(map_err)?;
@@ -526,6 +538,7 @@ impl Silo for SiloService {
             status_changed_at_ms,
             attempts,
             next_attempt_starts_after_ms: job_status.next_attempt_starts_after_ms,
+            task_group: view.task_group().to_string(),
         };
         Ok(Response::new(resp))
     }
@@ -678,6 +691,11 @@ impl Silo for SiloService {
         // LeaseTasks is tenant-agnostic - it returns tasks from all tenants on local shards
         let max_tasks = r.max_tasks as usize;
 
+        // Validate task_group - required
+        if r.task_group.is_empty() {
+            return Err(Status::invalid_argument("task_group is required"));
+        }
+
         // Determine which shards to poll:
         // - If shard filter is specified, only poll that shard
         // - Otherwise, poll all local shards (default behavior for workers)
@@ -710,7 +728,7 @@ impl Silo for SiloService {
             }
 
             let result = shard
-                .dequeue(&r.worker_id, remaining)
+                .dequeue(&r.worker_id, &r.task_group, remaining)
                 .await
                 .map_err(map_err)?;
 
@@ -728,6 +746,7 @@ impl Silo for SiloService {
                     }),
                     priority: job.priority() as u32,
                     shard: shard_id,
+                    task_group: job.task_group().to_string(),
                 });
             }
 
@@ -740,6 +759,7 @@ impl Silo for SiloService {
                     metadata: rt.metadata.into_iter().collect(),
                     lease_ms: DEFAULT_LEASE_MS,
                     shard: shard_id,
+                    task_group: rt.task_group,
                 });
             }
 

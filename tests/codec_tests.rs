@@ -17,6 +17,7 @@ fn test_task_roundtrip() {
         job_id: "job-1".to_string(),
         attempt_number: 1,
         held_queues: vec!["queue-1".to_string()],
+        task_group: "default".to_string(),
     };
     let encoded = encode_task(&task).unwrap();
     assert_eq!(encoded[0], TASK_VERSION);
@@ -28,12 +29,14 @@ fn test_task_roundtrip() {
             job_id,
             attempt_number,
             held_queues,
+            task_group,
         } => {
             assert_eq!(id, "task-1");
             assert_eq!(tenant, "tenant-1");
             assert_eq!(job_id, "job-1");
             assert_eq!(attempt_number, 1);
             assert_eq!(held_queues, vec!["queue-1"]);
+            assert_eq!(task_group, "default");
         }
         _ => panic!("unexpected task variant"),
     }
@@ -47,6 +50,7 @@ fn test_version_mismatch() {
         job_id: "job-1".to_string(),
         attempt_number: 1,
         held_queues: vec![],
+        task_group: "default".to_string(),
     };
     let mut encoded = encode_task(&task).unwrap();
     encoded[0] = 99; // Wrong version
@@ -76,6 +80,7 @@ fn test_lease_roundtrip() {
             job_id: "job-1".to_string(),
             attempt_number: 1,
             held_queues: vec![],
+            task_group: "default".to_string(),
         },
         expiry_ms: 12345,
     };
@@ -138,6 +143,7 @@ fn test_concurrency_action_roundtrip() {
         priority: 5,
         job_id: "job-1".to_string(),
         attempt_number: 1,
+        task_group: "default".to_string(),
     };
     let encoded = encode_concurrency_action(&action).unwrap();
     assert_eq!(encoded[0], CONCURRENCY_ACTION_VERSION);
@@ -148,11 +154,13 @@ fn test_concurrency_action_roundtrip() {
             priority,
             job_id,
             attempt_number,
+            task_group,
         } => {
             assert_eq!(*start_time_ms, 1000);
             assert_eq!(*priority, 5);
             assert_eq!(job_id.as_str(), "job-1");
             assert_eq!(*attempt_number, 1);
+            assert_eq!(task_group.as_str(), "default");
         }
     }
 }
