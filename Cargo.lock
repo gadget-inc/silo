@@ -3516,6 +3516,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mad-turmoil"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4bc8359bc806196a8b082c225e5de2492518ec5149bcd1a7c573ab6b6e687b5"
+dependencies = [
+ "libc",
+ "rand 0.9.2",
+ "tokio",
+ "turmoil",
+]
+
+[[package]]
 name = "madsim"
 version = "0.2.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5407,12 +5419,14 @@ dependencies = [
  "datafusion",
  "datafusion-sql",
  "etcd-client",
+ "fastrand",
  "futures",
  "http-body-util",
  "hyper 1.7.0",
  "hyper-util",
  "k8s-openapi",
  "kube",
+ "mad-turmoil",
  "object_store",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -5421,8 +5435,8 @@ dependencies = [
  "prost 0.13.5",
  "prost-types 0.13.5",
  "protoc-bin-vendored",
- "rand 0.8.5",
- "rand_chacha 0.3.1",
+ "rand 0.9.2",
+ "rand_chacha 0.9.0",
  "rkyv",
  "rmp",
  "rmp-serde",
@@ -6371,8 +6385,9 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "turmoil"
-version = "0.6.6"
-source = "git+https://github.com/tokio-rs/turmoil?rev=dd7c0b1515537e639e045fe1034b6287dc026440#dd7c0b1515537e639e045fe1034b6287dc026440"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85cd2d56e2ec74ade0b5c61c3a435df11aa8584cb1f672b36feb4d2980f956b3"
 dependencies = [
  "bytes",
  "indexmap 2.11.4",
@@ -6554,7 +6569,6 @@ checksum = "2f87b8aa10b915a06587d0dec516c282ff295b475d94abf425d62b57710070a2"
 dependencies = [
  "getrandom 0.3.3",
  "js-sys",
- "rand 0.9.2",
  "serde",
  "wasm-bindgen",
 ]

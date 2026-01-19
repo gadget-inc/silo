@@ -147,7 +147,7 @@ struct ClusterInfo {
 impl ClusterInfo {
     /// Get a random shard ID
     fn random_shard(&self) -> u32 {
-        rand::thread_rng().gen_range(0..self.num_shards)
+        rand::rng().random_range(0..self.num_shards)
     }
 
     /// Get the address of the server owning a specific shard
@@ -230,7 +230,7 @@ impl TenantSelector {
 
     /// Select a random tenant according to the weighted distribution
     fn select(&self) -> &str {
-        let r: f64 = rand::thread_rng().r#gen();
+        let r: f64 = rand::rng().random();
         for (i, &threshold) in self.cumulative_weights.iter().enumerate() {
             if r < threshold {
                 return &self.tenants[i];

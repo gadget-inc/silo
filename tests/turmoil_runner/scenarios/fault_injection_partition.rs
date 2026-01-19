@@ -1,0 +1,96 @@
+//! Fault injection scenario: Network partition and recovery.
+
+use crate::helpers::{
+    EnqueueRequest, HashMap, LeaseTasksRequest, MsgpackBytes, ReportOutcomeRequest, get_seed,
+    report_outcome_request, run_scenario_impl, setup_server, turmoil, turmoil_connector,
+};
+use silo::pb::silo_client::SiloClient;
+use std::time::Duration;
+use tonic::transport::Endpoint;
+
+pub fn run() {
+    let seed = get_seed();
+    run_scenario_impl("fault_injection_partition", seed, 30, |sim| {
+        sim.set_max_message_latency(Duration::from_millis(10));
+
+        sim.host("server", || async move { setup_server(9901).await });
+
+        sim.client("client", async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tracing::trace!("client_start");
+
+            let ch = Endpoint::new("http://server:9901")?
+                .connect_with_connector(turmoil_connector())
+                .await?;
+            let mut client = SiloClient::new(ch);
+
+            // Enqueue before partition
+            tracing::trace!(job_id = "partition-test", "enqueue");
+            client
+                .enqueue(tonic::Request::new(EnqueueRequest {
+                    shard: 0,
+                    id: "partition-test".into(),
+                    priority: 1,
+                    start_at_ms: 0,
+                    retry_policy: None,
+                    payload: Some(MsgpackBytes {
+                        data: rmp_serde::to_vec(&serde_json::json!({"test": "partition"})).unwrap(),
+                    }),
+                    limits: vec![],
+                    tenant: None,
+                    metadata: HashMap::new(),
+                    task_group: "default".to_string(),
+                }))
+                .await?;
+
+            // Partition
+            let sim_time = turmoil::sim_elapsed().map(|d| d.as_millis()).unwrap_or(0);
+            tracing::trace!(sim_time_ms = sim_time, "partition_start");
+            turmoil::partition("client", "server");
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            turmoil::repair("client", "server");
+            let sim_time = turmoil::sim_elapsed().map(|d| d.as_millis()).unwrap_or(0);
+            tracing::trace!(sim_time_ms = sim_time, "partition_end");
+
+            // Reconnect and lease after partition
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let ch = Endpoint::new("http://server:9901")?
+                .connect_with_connector(turmoil_connector())
+                .await?;
+            let mut client = SiloClient::new(ch);
+
+            let lease = client
+                .lease_tasks(tonic::Request::new(LeaseTasksRequest {
+                    shard: Some(0),
+                    worker_id: "worker-1".into(),
+                    max_tasks: 1,
+                    task_group: "default".to_string(),
+                }))
+                .await?
+                .into_inner();
+
+            tracing::trace!(count = lease.tasks.len(), "lease_after_partition");
+
+            if !lease.tasks.is_empty() {
+                let task = &lease.tasks[0];
+                client
+                    .report_outcome(tonic::Request::new(ReportOutcomeRequest {
+                        shard: 0,
+                        tenant: None,
+                        task_id: task.id.clone(),
+                        outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
+                            data: rmp_serde::to_vec(&serde_json::json!({"result": "recovered"}))
+                                .unwrap(),
+                        })),
+                    }))
+                    .await?;
+                tracing::trace!(job_id = %task.job_id, "complete");
+            }
+
+            tracing::trace!("client_done");
+            Ok(())
+        });
+    });
+}
