@@ -1,4 +1,0 @@
-TODO:
-
-- add metric exports
-- document in detail all metrics here, common failure modes, of slatedb too
