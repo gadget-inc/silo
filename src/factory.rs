@@ -78,12 +78,8 @@ impl ShardFactory {
             wal,
             apply_wal_on_close: self.template.apply_wal_on_close,
         };
-        let shard_arc = JobStoreShard::open(
-            &cfg,
-            Arc::clone(&self.rate_limiter),
-            self.metrics.clone(),
-        )
-        .await?;
+        let shard_arc =
+            JobStoreShard::open(&cfg, Arc::clone(&self.rate_limiter), self.metrics.clone()).await?;
 
         let mut instances = self.instances.write().await;
         instances.insert(cfg.name.clone(), Arc::clone(&shard_arc));

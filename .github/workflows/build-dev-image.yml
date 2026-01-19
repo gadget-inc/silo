@@ -1,0 +1,60 @@
+name: Build Dev Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Push image to registry"
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  build-docker-dev:
+    name: Build and push Docker dev image
+    runs-on: ubuntu-latest-l
+    permissions:
+      contents: "read"
+      id-token: "write"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up environment
+        uses: ./.github/actions/setup-test-env
+        with:
+          cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Build Docker dev image with Nix
+        run: |
+          nix build .#packages.x86_64-linux.silo-docker-dev -L
+          docker load < result
+
+      - name: Authenticate gcloud
+        if: ${{ inputs.push }}
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          token_format: access_token
+          workload_identity_provider: ${{ vars.GCLOUD_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCLOUD_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Login to Google Artifact Registry
+        if: ${{ inputs.push }}
+        uses: docker/login-action@v3
+        with:
+          registry: us-central1-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - name: Tag and push image
+        if: ${{ inputs.push }}
+        run: |
+          sha=$(git rev-parse --short HEAD)
+          registry="us-central1-docker.pkg.dev/gadget-core-production/core-production/silo"
+
+          docker tag silo-dev:latest "${registry}/silo-dev:sha-${sha}"
+          docker push "${registry}/silo-dev:sha-${sha}"
+
+          docker tag silo-dev:latest "${registry}/silo-dev:latest"
+          docker push "${registry}/silo-dev:latest"
