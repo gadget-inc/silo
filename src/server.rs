@@ -344,6 +344,15 @@ impl Silo for SiloService {
     ) -> Result<Response<GetClusterInfoResponse>, Status> {
         let Some(coord) = &self.coordinator else {
             // Single-node mode - report just ourselves
+            // Use advertised_grpc_addr if set, otherwise fall back to the bind address
+            let grpc_addr = self
+                .cfg
+                .coordination
+                .advertised_grpc_addr
+                .as_ref()
+                .unwrap_or(&self.cfg.server.grpc_addr)
+                .clone();
+
             let local_shards: Vec<u32> = self
                 .factory
                 .instances()
@@ -355,7 +364,7 @@ impl Silo for SiloService {
                 .into_iter()
                 .map(|shard_id| ShardOwner {
                     shard_id,
-                    grpc_addr: "localhost".to_string(),
+                    grpc_addr: grpc_addr.clone(),
                     node_id: "local".to_string(),
                 })
                 .collect();
@@ -364,7 +373,7 @@ impl Silo for SiloService {
                 num_shards: shard_owners.len() as u32,
                 shard_owners,
                 this_node_id: "local".to_string(),
-                this_grpc_addr: "localhost".to_string(),
+                this_grpc_addr: grpc_addr,
             }));
         };
 

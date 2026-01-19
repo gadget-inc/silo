@@ -974,9 +974,18 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
 
     // If no coordinator, add a single "self" member for standalone mode
     if members.is_empty() {
+        // Use advertised_grpc_addr if set, otherwise fall back to the bind address
+        let grpc_addr = state
+            .config
+            .coordination
+            .advertised_grpc_addr
+            .as_ref()
+            .unwrap_or(&state.config.server.grpc_addr)
+            .clone();
+
         members.push(MemberRow {
             node_id: this_node_id.unwrap_or_else(|| "standalone".to_string()),
-            grpc_addr: "localhost".to_string(),
+            grpc_addr,
             is_self: true,
             shard_count: shards.len(),
         });
