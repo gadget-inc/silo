@@ -53,6 +53,7 @@ fn grpc_end_to_end_under_turmoil() {
             gubernator: GubernatorSettings::default(),
             webui: WebUiConfig::default(),
             logging: LoggingConfig::default(),
+            metrics: silo::settings::MetricsConfig::default(),
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
@@ -121,6 +122,7 @@ fn grpc_end_to_end_under_turmoil() {
             factory,
             None,
             silo::settings::AppConfig::load(None).unwrap(),
+            None, // metrics
             rx,
         )
         .await
@@ -217,6 +219,7 @@ fn grpc_fault_injection_with_partition() {
             gubernator: GubernatorSettings::default(),
             webui: WebUiConfig::default(),
             logging: LoggingConfig::default(),
+            metrics: silo::settings::MetricsConfig::default(),
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
@@ -285,6 +288,7 @@ fn grpc_fault_injection_with_partition() {
             factory,
             None,
             silo::settings::AppConfig::load(None).unwrap(),
+            None, // metrics
             rx,
         )
         .await
@@ -423,6 +427,7 @@ fn stress_multiple_workers_with_partitions() {
             gubernator: GubernatorSettings::default(),
             webui: WebUiConfig::default(),
             logging: LoggingConfig::default(),
+            metrics: silo::settings::MetricsConfig::default(),
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
@@ -491,6 +496,7 @@ fn stress_multiple_workers_with_partitions() {
             factory,
             None,
             silo::settings::AppConfig::load(None).unwrap(),
+            None, // metrics
             rx,
         )
         .await
@@ -707,6 +713,7 @@ fn stress_duplicate_completion_idempotency() {
             gubernator: GubernatorSettings::default(),
             webui: WebUiConfig::default(),
             logging: LoggingConfig::default(),
+            metrics: silo::settings::MetricsConfig::default(),
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
@@ -775,6 +782,7 @@ fn stress_duplicate_completion_idempotency() {
             factory,
             None,
             silo::settings::AppConfig::load(None).unwrap(),
+            None, // metrics
             rx,
         )
         .await
@@ -902,6 +910,7 @@ fn stress_lease_expiry_during_partition() {
             gubernator: GubernatorSettings::default(),
             webui: WebUiConfig::default(),
             logging: LoggingConfig::default(),
+            metrics: silo::settings::MetricsConfig::default(),
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
@@ -970,6 +979,7 @@ fn stress_lease_expiry_during_partition() {
             factory,
             None,
             silo::settings::AppConfig::load(None).unwrap(),
+            None, // metrics
             rx,
         )
         .await
@@ -1114,6 +1124,7 @@ fn stress_high_message_loss() {
             gubernator: GubernatorSettings::default(),
             webui: WebUiConfig::default(),
             logging: LoggingConfig::default(),
+            metrics: silo::settings::MetricsConfig::default(),
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
@@ -1182,6 +1193,7 @@ fn stress_high_message_loss() {
             factory,
             None,
             silo::settings::AppConfig::load(None).unwrap(),
+            None, // metrics
             rx,
         )
         .await
@@ -1334,6 +1346,7 @@ fn concurrency_request_ready_without_release_fails() {
             gubernator: GubernatorSettings::default(),
             webui: WebUiConfig::default(),
             logging: LoggingConfig::default(),
+            metrics: silo::settings::MetricsConfig::default(),
             database: silo::settings::DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "mem://shard-{shard}".to_string(),
@@ -1362,7 +1375,7 @@ fn concurrency_request_ready_without_release_fails() {
         }
         let incoming = async_stream::stream! { loop { let (s, _a) = listener.accept().await.unwrap(); yield Ok::<_, std::io::Error>(Accepted(s)); } };
         let (_tx, rx) = tokio::sync::broadcast::channel::<()>(1);
-        run_server_with_incoming(incoming, factory, None, silo::settings::AppConfig::load(None).unwrap(), rx).await.unwrap();
+        run_server_with_incoming(incoming, factory, None, silo::settings::AppConfig::load(None).unwrap(), None, rx).await.unwrap();
         Ok(())
     });
 

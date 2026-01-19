@@ -22,6 +22,7 @@ use crate::factory::{CloseAllError, ShardFactory};
 use crate::job::{GubernatorAlgorithm, GubernatorRateLimit, JobStatusKind, RateLimitRetryPolicy};
 use crate::job_attempt::{AttemptOutcome, AttemptStatus as JobAttemptStatus};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
+use crate::metrics::Metrics;
 use crate::pb::silo_server::{Silo, SiloServer};
 use crate::pb::*;
 use crate::settings::AppConfig;
@@ -130,7 +131,9 @@ pub fn job_limit_to_proto_limit(job_limit: crate::job::Limit) -> Limit {
 }
 
 /// Convert a JobAttemptView to a proto JobAttempt
-pub fn job_attempt_view_to_proto(attempt: &crate::job_attempt::JobAttemptView) -> crate::pb::JobAttempt {
+pub fn job_attempt_view_to_proto(
+    attempt: &crate::job_attempt::JobAttemptView,
+) -> crate::pb::JobAttempt {
     let state = attempt.state();
     let (status, started_at_ms, finished_at_ms, result, error_code, error_data) = match state {
         JobAttemptStatus::Running { started_at_ms } => (
@@ -196,12 +199,8 @@ fn map_err(e: JobStoreShardError) -> Status {
         JobStoreShardError::JobAlreadyTerminal(_, _) => {
             Status::failed_precondition("job is already in terminal state")
         }
-        JobStoreShardError::JobNotRestartable(ref e) => {
-            Status::failed_precondition(e.to_string())
-        }
-        JobStoreShardError::JobNotExpediteable(ref e) => {
-            Status::failed_precondition(e.to_string())
-        }
+        JobStoreShardError::JobNotRestartable(ref e) => Status::failed_precondition(e.to_string()),
+        JobStoreShardError::JobNotExpediteable(ref e) => Status::failed_precondition(e.to_string()),
         other => Status::internal(other.to_string()),
     }
 }
@@ -212,6 +211,7 @@ pub struct SiloService {
     factory: Arc<ShardFactory>,
     coordinator: Option<Arc<dyn Coordinator>>,
     cfg: AppConfig,
+    metrics: Option<Metrics>,
 }
 
 impl SiloService {
@@ -219,11 +219,13 @@ impl SiloService {
         factory: Arc<ShardFactory>,
         coordinator: Option<Arc<dyn Coordinator>>,
         cfg: AppConfig,
+        metrics: Option<Metrics>,
     ) -> Self {
         Self {
             factory,
             coordinator,
             cfg,
+            metrics,
         }
     }
 
@@ -467,6 +469,7 @@ impl Silo for SiloService {
             ));
         }
 
+        let shard_str = r.shard.to_string();
         let id = shard
             .enqueue(
                 &tenant,
@@ -481,6 +484,12 @@ impl Silo for SiloService {
             )
             .await
             .map_err(map_err)?;
+
+        // Record metrics
+        if let Some(ref m) = self.metrics {
+            m.record_enqueue(&shard_str, &tenant);
+        }
+
         Ok(Response::new(EnqueueResponse { id }))
     }
 
@@ -610,9 +619,9 @@ impl Silo for SiloService {
                 id: r.id,
                 status: JobStatus::Succeeded.into(),
                 finished_at_ms,
-                result: Some(get_job_result_response::Result::SuccessData(
-                    MsgpackBytes { data: result },
-                )),
+                result: Some(get_job_result_response::Result::SuccessData(MsgpackBytes {
+                    data: result,
+                })),
             })),
             crate::job_attempt::AttemptStatus::Failed {
                 finished_at_ms,
@@ -772,6 +781,13 @@ impl Silo for SiloService {
                 });
             }
 
+            // Record dequeue metrics per shard
+            if let Some(ref m) = self.metrics {
+                if tasks_added > 0 {
+                    m.record_dequeue(&shard_id.to_string(), &r.task_group, tasks_added as u64);
+                }
+            }
+
             remaining = remaining.saturating_sub(tasks_added);
         }
 
@@ -786,25 +802,37 @@ impl Silo for SiloService {
         req: Request<ReportOutcomeRequest>,
     ) -> Result<Response<ReportOutcomeResponse>, Status> {
         let r = req.into_inner();
+        let shard_str = r.shard.to_string();
         let shard = self.shard_with_redirect(r.shard).await?;
         let tenant = self.validate_tenant(r.tenant.as_deref())?;
-        let outcome = match r
+        let (outcome, status_str) = match r
             .outcome
             .ok_or_else(|| Status::invalid_argument("missing outcome"))?
         {
             report_outcome_request::Outcome::Success(s) => {
-                AttemptOutcome::Success { result: s.data }
+                (AttemptOutcome::Success { result: s.data }, "succeeded")
             }
-            report_outcome_request::Outcome::Failure(f) => AttemptOutcome::Error {
-                error_code: f.code,
-                error: f.data,
-            },
-            report_outcome_request::Outcome::Cancelled(_) => AttemptOutcome::Cancelled,
+            report_outcome_request::Outcome::Failure(f) => (
+                AttemptOutcome::Error {
+                    error_code: f.code,
+                    error: f.data,
+                },
+                "failed",
+            ),
+            report_outcome_request::Outcome::Cancelled(_) => {
+                (AttemptOutcome::Cancelled, "cancelled")
+            }
         };
         shard
             .report_attempt_outcome(&tenant, &r.task_id, outcome)
             .await
             .map_err(map_err)?;
+
+        // Record completion metrics
+        if let Some(ref m) = self.metrics {
+            m.record_completion(&shard_str, status_str);
+        }
+
         Ok(Response::new(ReportOutcomeResponse {}))
     }
 
@@ -892,8 +920,8 @@ impl Silo for SiloService {
             .collect();
 
         // Convert batches directly to MessagePack rows
-        let row_bytes = crate::query::record_batches_to_msgpack(&batches)
-            .map_err(|e| Status::internal(e))?;
+        let row_bytes =
+            crate::query::record_batches_to_msgpack(&batches).map_err(|e| Status::internal(e))?;
         let rows: Vec<MsgpackBytes> = row_bytes
             .into_iter()
             .map(|data| MsgpackBytes { data })
@@ -1010,10 +1038,11 @@ pub async fn run_server(
     factory: Arc<ShardFactory>,
     coordinator: Option<Arc<dyn Coordinator>>,
     cfg: crate::settings::AppConfig,
+    metrics: Option<Metrics>,
     shutdown: broadcast::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let incoming = TcpListenerStream::new(listener);
-    run_server_with_incoming(incoming, factory, coordinator, cfg, shutdown).await
+    run_server_with_incoming(incoming, factory, coordinator, cfg, metrics, shutdown).await
 }
 
 /// Generic variant that accepts any incoming stream of IOs (e.g., Turmoil TcpListener) and runs the server
@@ -1023,6 +1052,7 @@ pub async fn run_server_with_incoming<S, IO>(
     factory: Arc<ShardFactory>,
     coordinator: Option<Arc<dyn Coordinator>>,
     cfg: crate::settings::AppConfig,
+    metrics: Option<Metrics>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
@@ -1034,7 +1064,7 @@ where
         + 'static
         + tonic::transport::server::Connected,
 {
-    let svc = SiloService::new(factory.clone(), coordinator, cfg);
+    let svc = SiloService::new(factory.clone(), coordinator, cfg, metrics);
     let server = SiloServer::new(svc);
 
     // Create health service for gRPC health probes

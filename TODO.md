@@ -36,7 +36,7 @@
 - [x] webui / operator tooling
   - [ ] use / refine
 - [x] /healthz endpoint
-- [ ] /metrics prometheus endpoint
+- [x] /metrics prometheus endpoint
 - [ ] opentelemetry support
 - [x] investigate how we might do schema evolution
 - [x] secondary indexes for filtering

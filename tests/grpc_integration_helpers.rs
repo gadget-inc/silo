@@ -28,6 +28,7 @@ pub async fn setup_test_server(
         factory.clone(),
         None,
         config,
+        None, // metrics
         shutdown_rx,
     ));
 
