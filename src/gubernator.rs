@@ -89,6 +89,7 @@ impl From<RateLimitResp> for RateLimitResult {
 
 /// Trait for rate limit clients (real, mock, or null)
 #[async_trait]
+#[allow(clippy::too_many_arguments)]
 pub trait RateLimitClient: Send + Sync {
     /// Check a rate limit
     async fn check_rate_limit(
@@ -201,7 +202,7 @@ impl GubernatorClient {
         // Replace the placeholder handle
         // Note: This is a bit awkward but necessary for the self-referential setup
         // In practice, the handle is just for cleanup and the loop runs independently
-        let _ = handle;
+        drop(handle);
 
         client
     }
@@ -288,7 +289,7 @@ impl GubernatorClient {
 
             // Send the batch
             if !pending.is_empty() {
-                let batch: Vec<PendingRequest> = pending.drain(..).collect();
+                let batch: Vec<PendingRequest> = std::mem::take(&mut pending);
                 let client_clone = Arc::clone(&client);
 
                 // Spawn a task to handle this batch so we don't block the loop

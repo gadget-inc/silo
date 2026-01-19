@@ -24,7 +24,7 @@ fn build_env_filter() -> EnvFilter {
 pub fn init(log_format: LogFormat) -> anyhow::Result<()> {
     let mut init_result: Option<anyhow::Result<()>> = None;
     INIT.call_once(|| {
-        let result = (|| -> anyhow::Result<()> {
+        let result = {
             let env_filter = build_env_filter();
 
             match log_format {
@@ -45,7 +45,7 @@ pub fn init(log_format: LogFormat) -> anyhow::Result<()> {
                     init_with_fmt_layer(fmt_layer)
                 }
             }
-        })();
+        };
         init_result = Some(result);
     });
     if let Some(res) = init_result {
