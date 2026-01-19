@@ -24,6 +24,7 @@ fn make_test_factory(prefix: &str) -> Arc<ShardFactory> {
             apply_wal_on_close: true,
         },
         MockGubernatorClient::new_arc(),
+        None,
     ))
 }
 

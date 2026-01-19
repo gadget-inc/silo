@@ -40,6 +40,7 @@ fn make_test_factory(node_id: &str) -> Arc<ShardFactory> {
             apply_wal_on_close: true,
         },
         MockGubernatorClient::new_arc(),
+        None,
     ))
 }
 
@@ -205,6 +206,7 @@ async fn cluster_two_nodes_basic_query() {
         factory1.clone(),
         Some(coordinator1.clone()),
         cfg.clone(),
+        None, // metrics
         shutdown_rx1,
     ));
 
@@ -213,6 +215,7 @@ async fn cluster_two_nodes_basic_query() {
         factory2.clone(),
         Some(coordinator2.clone()),
         cfg.clone(),
+        None, // metrics
         shutdown_rx2,
     ));
 
@@ -323,6 +326,7 @@ async fn cluster_two_nodes_status_filter_query() {
         factory1.clone(),
         Some(coordinator1.clone()),
         cfg.clone(),
+        None, // metrics
         shutdown_rx1,
     ));
 
@@ -331,6 +335,7 @@ async fn cluster_two_nodes_status_filter_query() {
         factory2.clone(),
         Some(coordinator2.clone()),
         cfg.clone(),
+        None, // metrics
         shutdown_rx2,
     ));
 
@@ -439,6 +444,7 @@ async fn cluster_two_nodes_count_across_shards() {
         factory1.clone(),
         Some(coordinator1.clone()),
         cfg.clone(),
+        None, // metrics
         shutdown_rx1,
     ));
 
@@ -447,6 +453,7 @@ async fn cluster_two_nodes_count_across_shards() {
         factory2.clone(),
         Some(coordinator2.clone()),
         cfg.clone(),
+        None, // metrics
         shutdown_rx2,
     ));
 
@@ -553,6 +560,7 @@ async fn cluster_two_nodes_queues_table() {
         factory1.clone(),
         Some(coordinator1.clone()),
         cfg.clone(),
+        None, // metrics
         shutdown_rx1,
     ));
 
@@ -561,6 +569,7 @@ async fn cluster_two_nodes_queues_table() {
         factory2.clone(),
         Some(coordinator2.clone()),
         cfg.clone(),
+        None, // metrics
         shutdown_rx2,
     ));
 
@@ -651,6 +660,7 @@ async fn cluster_two_nodes_projection_remote_shards() {
         factory1.clone(),
         Some(coordinator1.clone()),
         cfg.clone(),
+        None, // metrics
         shutdown_rx1,
     ));
 
@@ -659,6 +669,7 @@ async fn cluster_two_nodes_projection_remote_shards() {
         factory2.clone(),
         Some(coordinator2.clone()),
         cfg.clone(),
+        None, // metrics
         shutdown_rx2,
     ));
 

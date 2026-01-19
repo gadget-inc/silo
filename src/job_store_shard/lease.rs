@@ -95,6 +95,12 @@ impl JobStoreShard {
         let job_id = decoded.job_id().to_string();
         let attempt_number = decoded.attempt_number();
         let held_queues_local = decoded.held_queues(); // Only allocation needed
+        let task_group = decoded.task_group().to_string();
+
+        // Decrement active lease counter
+        if let Some(ref m) = self.metrics {
+            m.dec_task_leases_active(&self.name, &task_group);
+        }
 
         let now_ms = now_epoch_ms();
         let attempt_status = match &outcome {

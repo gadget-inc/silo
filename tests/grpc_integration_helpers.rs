@@ -28,6 +28,7 @@ pub async fn setup_test_server(
         factory.clone(),
         None,
         config,
+        None, // metrics
         shutdown_rx,
     ));
 
@@ -48,7 +49,7 @@ pub async fn create_test_factory() -> anyhow::Result<(Arc<ShardFactory>, tempfil
         apply_wal_on_close: true,
     };
     let rate_limiter = MockGubernatorClient::new_arc();
-    let factory = ShardFactory::new(template, rate_limiter);
+    let factory = ShardFactory::new(template, rate_limiter, None);
     let _ = factory.open(0).await?;
     Ok((Arc::new(factory), tmp))
 }

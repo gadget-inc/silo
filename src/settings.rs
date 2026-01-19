@@ -17,6 +17,8 @@ pub struct AppConfig {
     pub webui: WebUiConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub metrics: MetricsConfig,
     pub database: DatabaseTemplate,
 }
 
@@ -37,6 +39,34 @@ pub enum LogFormat {
     Text,
     /// Structured JSON format
     Json,
+}
+
+/// Prometheus metrics configuration
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct MetricsConfig {
+    /// Enable Prometheus metrics endpoint
+    #[serde(default = "default_metrics_enabled")]
+    pub enabled: bool,
+    /// Metrics listen address (e.g., "127.0.0.1:9090")
+    #[serde(default = "default_metrics_addr")]
+    pub addr: String,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_metrics_enabled(),
+            addr: default_metrics_addr(),
+        }
+    }
+}
+
+fn default_metrics_enabled() -> bool {
+    true
+}
+
+fn default_metrics_addr() -> String {
+    "127.0.0.1:9090".to_string()
 }
 
 /// Settings for Gubernator rate limiting service
@@ -359,6 +389,7 @@ impl AppConfig {
             gubernator: GubernatorSettings::default(),
             webui: WebUiConfig::default(),
             logging: LoggingConfig::default(),
+            metrics: MetricsConfig::default(),
             database: DatabaseTemplate {
                 backend: Backend::Fs,
                 path: "/tmp/silo-%shard%".to_string(),

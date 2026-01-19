@@ -1,6 +1,201 @@
 ---
 title: Observability
+description: Monitoring and observability for Silo deployments
 ---
 
-- add metric exports
-- document in detail all metrics here, common failure modes, of slatedb too
+Silo exposes Prometheus metrics for monitoring system health, performance, and capacity. This guide covers the available metrics, how to configure the metrics endpoint, and recommended alerting strategies.
+
+## Metrics Endpoint
+
+Silo exposes metrics in Prometheus format on a separate HTTP port. Configure the address in your configuration file:
+
+```toml
+[server]
+metrics_addr = "0.0.0.0:9090"
+```
+
+Metrics are available at the `/metrics` endpoint:
+
+```bash
+curl http://localhost:9090/metrics
+```
+
+## Available Metrics
+
+### Job Lifecycle Metrics
+
+These metrics track jobs as they flow through the system.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `silo_jobs_enqueued_total` | Counter | `shard`, `tenant` | Total number of jobs enqueued |
+| `silo_jobs_dequeued_total` | Counter | `shard`, `task_group` | Total number of tasks dequeued for execution |
+| `silo_jobs_completed_total` | Counter | `shard`, `status` | Total jobs completed. Status is `succeeded`, `failed`, or `cancelled` |
+| `silo_job_attempts_total` | Counter | `shard`, `task_group`, `is_retry` | Total job attempts started. `is_retry=true` for attempts after the first |
+| `silo_job_wait_time_seconds` | Histogram | `shard`, `task_group` | Time jobs spent in queue before being dequeued (enqueue to dequeue latency) |
+
+**Key insights:**
+- Compare `silo_jobs_enqueued_total` vs `silo_jobs_dequeued_total` to detect queue buildup
+- High `silo_job_wait_time_seconds` indicates workers can't keep up with incoming jobs
+- Track `is_retry=true` in `silo_job_attempts_total` to monitor retry rates
+
+### Lease Metrics
+
+Leases represent tasks actively being processed by workers.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `silo_task_leases_active` | Gauge | `shard`, `task_group` | Number of tasks currently leased to workers |
+
+**Key insights:**
+- This metric shows in-flight work at any given moment
+- Sudden drops may indicate worker crashes or network issues
+- Compare against worker count to understand utilization
+
+### Broker Metrics
+
+The task broker maintains an in-memory buffer of ready tasks for efficient dequeue operations.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `silo_broker_buffer_size` | Gauge | `shard` | Number of tasks in the broker's in-memory buffer |
+| `silo_broker_inflight_size` | Gauge | `shard` | Tasks claimed but not yet durably leased |
+| `silo_broker_scan_duration_seconds` | Histogram | `shard` | Duration of broker task scanning operations |
+
+**Key insights:**
+- `silo_broker_buffer_size` near 0 with pending work may indicate scan issues
+- High `silo_broker_scan_duration_seconds` suggests database pressure
+- `silo_broker_inflight_size` should be transiently low; persistent high values indicate dequeue bottlenecks
+
+### Shard & Coordination Metrics
+
+These metrics track distributed shard ownership across the cluster.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `silo_shards_owned` | Gauge | - | Number of shards owned by this node (from coordinator) |
+| `silo_coordination_shards_open` | Gauge | - | Number of shards currently open in this process |
+
+**Key insights:**
+- `silo_shards_owned` should match `silo_coordination_shards_open` after convergence
+- Discrepancies indicate shard acquisition/release in progress
+- Use for capacity planning: total shards / nodes = shards per node
+
+### Concurrency Metrics
+
+Concurrency limits control how many jobs with the same concurrency key can run simultaneously.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `silo_concurrency_holders` | Gauge | `tenant`, `queue` | Active concurrency ticket holders per queue |
+| `silo_concurrency_tickets_granted_total` | Counter | - | Total concurrency tickets granted |
+
+**Key insights:**
+- `silo_concurrency_holders` at limit indicates jobs are waiting for capacity
+- Track `silo_concurrency_tickets_granted_total` rate to understand throughput through limited queues
+
+### gRPC Metrics
+
+These metrics track the gRPC API performance.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `silo_grpc_requests_total` | Counter | `method`, `status` | Total gRPC requests by method and status |
+| `silo_grpc_request_duration_seconds` | Histogram | `method` | gRPC request latency by method |
+
+**Key insights:**
+- Monitor error rates via `status` label (look for non-OK statuses)
+- `silo_grpc_request_duration_seconds` helps identify slow operations
+- High latency on `LeaseTasks` may indicate database or broker issues
+
+### SlateDB Storage Metrics
+
+Silo uses [SlateDB](https://slatedb.io/) as its underlying embedded key-value storage engine. These metrics expose SlateDB's internal statistics for monitoring storage-layer health and performance.
+
+#### Database Operations
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `silo_slatedb_get_requests_total` | Gauge | `shard` | Total number of GET (read) requests to SlateDB |
+| `silo_slatedb_scan_requests_total` | Gauge | `shard` | Total number of scan (range query) requests |
+| `silo_slatedb_write_ops_total` | Gauge | `shard` | Total number of individual write operations |
+| `silo_slatedb_write_batch_count_total` | Gauge | `shard` | Total number of write batches |
+| `silo_slatedb_backpressure_count_total` | Gauge | `shard` | Number of times writes were blocked by back-pressure |
+
+**Key insights:**
+- High `silo_slatedb_backpressure_count_total` indicates the storage layer is under write pressure
+- Compare `silo_slatedb_write_ops_total` to `silo_slatedb_write_batch_count_total` to understand batching efficiency
+
+#### WAL (Write-Ahead Log) Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `silo_slatedb_wal_buffer_estimated_bytes` | Gauge | `shard` | Estimated bytes buffered in the WAL buffer |
+| `silo_slatedb_wal_buffer_flushes_total` | Gauge | `shard` | Total number of WAL buffer flushes |
+| `silo_slatedb_immutable_memtable_flushes_total` | Gauge | `shard` | Total number of immutable memtable flushes to SSTs |
+
+**Key insights:**
+- `silo_slatedb_wal_buffer_estimated_bytes` shows pending writes not yet durably flushed
+- Monitor `silo_slatedb_immutable_memtable_flushes_total` rate to understand flush frequency
+- High WAL buffer sizes may indicate slow object storage writes
+
+#### SST Filter (Bloom Filter) Metrics
+
+SlateDB uses bloom filters to avoid unnecessary SST reads. These metrics track filter effectiveness.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `silo_slatedb_sst_filter_positives_total` | Gauge | `shard` | True positives: key exists and filter said yes |
+| `silo_slatedb_sst_filter_negatives_total` | Gauge | `shard` | True negatives: key absent and filter said no (avoided read) |
+| `silo_slatedb_sst_filter_false_positives_total` | Gauge | `shard` | False positives: key absent but filter said yes (wasted read) |
+
+**Key insights:**
+- High `silo_slatedb_sst_filter_negatives_total` rate indicates filters are effective at avoiding reads
+- `silo_slatedb_sst_filter_false_positives_total` / total lookups gives the false positive rate
+- A false positive rate above 1-2% may indicate bloom filter tuning is needed
+
+#### Compaction Metrics
+
+SlateDB periodically compacts SST files to reclaim space and improve read performance.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `silo_slatedb_bytes_compacted_total` | Gauge | `shard` | Total number of bytes compacted |
+| `silo_slatedb_running_compactions` | Gauge | `shard` | Number of compactions currently running |
+| `silo_slatedb_last_compaction_ts_seconds` | Gauge | `shard` | Unix timestamp of the last compaction |
+
+**Key insights:**
+- `silo_slatedb_running_compactions` > 0 indicates compaction is actively working
+- Monitor `silo_slatedb_bytes_compacted_total` rate to understand compaction throughput
+- If `silo_slatedb_last_compaction_ts_seconds` is very old, compaction may be stuck or disabled
+
+## Tracing
+
+Silo supports OpenTelemetry tracing. Configure the OTLP endpoint in your configuration:
+
+```toml
+[tracing]
+otlp_endpoint = "http://localhost:4317"
+service_name = "silo"
+```
+
+Key spans include:
+- `enqueue` - Job enqueue operations
+- `dequeue` - Task dequeue and lease creation
+- `report_outcome` - Attempt completion reporting
+- `concurrency.grant` / `concurrency.release` - Concurrency ticket operations
+
+## Logging
+
+Silo uses structured logging via `tracing`. Configure the log level:
+
+```toml
+[server]
+log_level = "info"  # trace, debug, info, warn, error
+```
+
+Key log events to monitor:
+- `shard opened/closed` - Shard lifecycle
+- `lease expired` - Worker crashes or timeouts
+- `rate limit check failed` - Gubernator connectivity issues
+- `failed to close shard` - Graceful shutdown problems

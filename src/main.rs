@@ -7,6 +7,7 @@ use tracing::{error, info};
 use silo::coordination::{create_coordinator, Coordinator};
 use silo::factory::ShardFactory;
 use silo::gubernator::{GubernatorClient, NullGubernatorClient, RateLimitClient};
+use silo::metrics::{self, Metrics};
 use silo::server::run_server;
 use silo::settings::{self, CoordinationBackend};
 use silo::webui::run_webui;
@@ -56,6 +57,19 @@ async fn main() -> anyhow::Result<()> {
     // Initialize tracing with configured log format
     silo::trace::init(cfg.logging.format)?;
 
+    // Initialize metrics if enabled
+    let metrics: Option<Metrics> = if cfg.metrics.enabled {
+        match metrics::init() {
+            Ok(m) => Some(m),
+            Err(e) => {
+                error!(error = %e, "failed to initialize metrics, continuing without metrics");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Create rate limiter based on configuration
     let rate_limiter: Arc<dyn RateLimitClient> = if let Some(guber_cfg) = cfg.gubernator.to_config()
     {
@@ -67,7 +81,11 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Create factory first - coordinator will own a reference and manage shard lifecycle
-    let factory = Arc::new(ShardFactory::new(cfg.database.clone(), rate_limiter));
+    let factory = Arc::new(ShardFactory::new(
+        cfg.database.clone(),
+        rate_limiter,
+        metrics.clone(),
+    ));
 
     // Initialize coordination - coordinator will open/close shards as ownership changes
     let node_id = uuid::Uuid::new_v4().to_string();
@@ -135,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
         factory.clone(),
         coordinator.clone(),
         cfg.clone(),
+        metrics.clone(),
         shutdown_rx,
     ));
 
@@ -145,7 +164,6 @@ async fn main() -> anyhow::Result<()> {
         let webui_factory = factory.clone();
         let webui_cfg = cfg.clone();
         let webui_coordinator = coordinator.clone();
-        info!(grpc = %addr, webui = %webui_addr, "server started");
         Some(tokio::spawn(async move {
             if let Err(e) = run_webui(
                 webui_addr,
@@ -160,9 +178,40 @@ async fn main() -> anyhow::Result<()> {
             }
         }))
     } else {
-        info!(grpc = %addr, "server started");
         None
     };
+
+    // Start metrics server if enabled
+    let metrics_handle = if let Some(ref m) = metrics {
+        let metrics_addr: SocketAddr = cfg.metrics.addr.parse()?;
+        let metrics_shutdown = shutdown_tx.subscribe();
+        let metrics_for_server = m.clone();
+        Some(tokio::spawn(async move {
+            if let Err(e) = metrics::run_metrics_server(metrics_addr, metrics_for_server, metrics_shutdown).await {
+                error!(error = %e, "metrics server error");
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Log server startup with all enabled endpoints
+    let webui_addr_str = if cfg.webui.enabled {
+        Some(cfg.webui.addr.as_str())
+    } else {
+        None
+    };
+    let metrics_addr_str = if cfg.metrics.enabled {
+        Some(cfg.metrics.addr.as_str())
+    } else {
+        None
+    };
+    info!(
+        grpc = %addr,
+        webui = webui_addr_str,
+        metrics = metrics_addr_str,
+        "server started"
+    );
 
     // Wait for shutdown signal (SIGINT or SIGTERM)
     let shutdown_signal = async {
@@ -190,6 +239,9 @@ async fn main() -> anyhow::Result<()> {
     let _ = shutdown_tx.send(());
     let _ = server.await?;
     if let Some(handle) = webui_handle {
+        let _ = handle.await;
+    }
+    if let Some(handle) = metrics_handle {
         let _ = handle.await;
     }
 

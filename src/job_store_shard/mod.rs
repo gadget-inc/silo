@@ -34,10 +34,11 @@ use thiserror::Error;
 
 use crate::codec::CodecError;
 use crate::concurrency::ConcurrencyManager;
-use crate::gubernator::{NullGubernatorClient, RateLimitClient};
+use crate::gubernator::RateLimitClient;
 use crate::job::{JobStatus, JobStatusKind, JobView};
 use crate::job_attempt::JobAttemptView;
 use crate::keys::{attempt_key, job_info_key, job_status_key};
+use crate::metrics::Metrics;
 use crate::query::ShardQueryEngine;
 use crate::settings::DatabaseConfig;
 use crate::storage::resolve_object_store;
@@ -70,6 +71,8 @@ pub struct JobStoreShard {
     pub(crate) rate_limiter: Arc<dyn RateLimitClient>,
     /// Optional WAL close configuration - present when using local WAL storage
     wal_close_config: Option<WalCloseConfig>,
+    /// Optional metrics for recording shard-level stats
+    pub(crate) metrics: Option<Metrics>,
 }
 
 #[derive(Debug, Error)]
@@ -115,15 +118,11 @@ impl From<CodecError> for JobStoreShardError {
 }
 
 impl JobStoreShard {
-    /// Open a shard with a NullGubernatorClient (rate limits will error)
-    pub async fn open(cfg: &DatabaseConfig) -> Result<Arc<Self>, JobStoreShardError> {
-        Self::open_with_rate_limiter(cfg, NullGubernatorClient::new()).await
-    }
-
-    /// Open a shard with a rate limit client
-    pub async fn open_with_rate_limiter(
+    /// Open a shard with a rate limit client and optional metrics
+    pub async fn open(
         cfg: &DatabaseConfig,
         rate_limiter: Arc<dyn RateLimitClient>,
+        metrics: Option<Metrics>,
     ) -> Result<Arc<Self>, JobStoreShardError> {
         let resolved = resolve_object_store(&cfg.backend, &cfg.path)?;
 
@@ -161,7 +160,12 @@ impl JobStoreShard {
         let db = db_builder.build().await?;
         let db = Arc::new(db);
         let concurrency = Arc::new(ConcurrencyManager::new());
-        let broker = TaskBroker::new(Arc::clone(&db), Arc::clone(&concurrency));
+        let broker = TaskBroker::new(
+            Arc::clone(&db),
+            Arc::clone(&concurrency),
+            cfg.name.clone(),
+            metrics.clone(),
+        );
         broker.start();
 
         let shard = Arc::new(Self {
@@ -172,6 +176,7 @@ impl JobStoreShard {
             query_engine: OnceLock::new(),
             rate_limiter,
             wal_close_config,
+            metrics,
         });
 
         Ok(shard)
@@ -272,6 +277,12 @@ impl JobStoreShard {
 
     pub fn db(&self) -> &Db {
         &self.db
+    }
+
+    /// Get the SlateDB metrics registry for this shard.
+    /// Use this to collect storage-level statistics for observability.
+    pub fn slatedb_stats(&self) -> std::sync::Arc<slatedb::stats::StatRegistry> {
+        self.db.metrics()
     }
 
     /// Fetch a job by id as a zero-copy archived view.

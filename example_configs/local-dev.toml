@@ -15,6 +15,12 @@ backend = "none"
 enabled = true
 addr = "127.0.0.1:50052"
 
+[metrics]
+# Enable Prometheus metrics endpoint (default: true)
+enabled = true
+# Metrics listen address (default: 127.0.0.1:9090)
+addr = "127.0.0.1:9090"
+
 [database]
 backend = "fs"
 # %shard% placeholder will be replaced with the shard number

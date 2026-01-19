@@ -49,7 +49,7 @@ async fn open_shard_with_gubernator(
         wal: None,
         apply_wal_on_close: true,
     };
-    let shard = JobStoreShard::open_with_rate_limiter(&cfg, gubernator.clone())
+    let shard = JobStoreShard::open(&cfg, gubernator.clone(), None)
         .await
         .expect("open shard");
     (tmp, shard, gubernator)
