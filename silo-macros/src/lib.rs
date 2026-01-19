@@ -21,11 +21,11 @@ pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { ( #args_ts ) }
     };
 
-    let gen = quote! {
+    let output = quote! {
         #[tokio::test #paren_args]
         #vis #sig {
             silo::trace::with_test_tracing(stringify!(#name), || async move { #block }).await
         }
     };
-    gen.into()
+    output.into()
 }

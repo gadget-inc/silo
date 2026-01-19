@@ -1,6 +1,6 @@
 [package]
 authors = ["Harry Brundage <harry@gadget.dev>"]
-edition = "2021"
+edition = "2024"
 name = "silo"
 description = "A background job server on top of object storage"
 version = "0.1.0"

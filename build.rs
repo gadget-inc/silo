@@ -1,6 +1,8 @@
 fn main() {
     let protoc = protoc_bin_vendored::protoc_bin_path().expect("protoc not found");
-    std::env::set_var("PROTOC", protoc);
+    // SAFETY: This is safe because the build script runs single-threaded before any
+    // parallel compilation, so there's no concurrent access to environment variables.
+    unsafe { std::env::set_var("PROTOC", protoc) };
     let includes = &["proto"];
 
     // Generate file descriptor set for gRPC reflection
