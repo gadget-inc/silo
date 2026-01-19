@@ -85,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         },
         rate_limiter.clone(),
+        None,
     ));
     let factory2 = Arc::new(ShardFactory::new(
         DatabaseTemplate {
@@ -94,6 +95,7 @@ async fn main() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         },
         rate_limiter.clone(),
+        None,
     ));
 
     let (c1, h1) = EtcdCoordinator::start(&cfg.coordination.etcd_endpoints, &prefix, "node-a", "http://127.0.0.1:50051", num_shards, 10, factory1).await?;
@@ -113,7 +115,7 @@ async fn main() -> anyhow::Result<()> {
             wal: None,
             apply_wal_on_close: true,
         };
-        let shard = JobStoreShard::open_with_rate_limiter(&cfg, rate_limiter.clone()).await?;
+        let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None).await?;
         shards.push(shard);
     }
 
@@ -260,6 +262,7 @@ async fn main() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         },
         rate_limiter.clone(),
+        None,
     ));
     let (c3, h3) = EtcdCoordinator::start(&cfg.coordination.etcd_endpoints, &prefix, "node-c", "http://127.0.0.1:50053", num_shards, 10, factory3).await?;
 

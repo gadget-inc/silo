@@ -27,6 +27,7 @@ async fn setup_test_state() -> (tempfile::TempDir, AppState) {
             apply_wal_on_close: true,
         },
         rate_limiter,
+        None,
     );
 
     // Open shard 0 in the factory
@@ -361,6 +362,7 @@ async fn setup_multi_shard_state(num_shards: usize) -> (tempfile::TempDir, AppSt
             apply_wal_on_close: true,
         },
         rate_limiter,
+        None,
     );
 
     // Open multiple shards

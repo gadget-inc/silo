@@ -51,7 +51,7 @@ pub async fn open_temp_shard_with_rate_limiter(
         wal: None,
         apply_wal_on_close: true,
     };
-    let shard = JobStoreShard::open_with_rate_limiter(&cfg, rate_limiter)
+    let shard = JobStoreShard::open(&cfg, rate_limiter, None)
         .await
         .expect("open shard");
     (tmp, shard)
@@ -94,7 +94,7 @@ pub async fn open_temp_shard_with_local_wal_and_rate_limiter(
         apply_wal_on_close: flush_on_close,
     };
 
-    let shard = JobStoreShard::open_with_rate_limiter(&cfg, rate_limiter)
+    let shard = JobStoreShard::open(&cfg, rate_limiter, None)
         .await
         .expect("open shard with local WAL");
 

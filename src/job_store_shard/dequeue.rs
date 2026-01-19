@@ -161,6 +161,10 @@ impl JobStoreShard {
                                     &queue,
                                     &request_id,
                                 );
+                                // Record concurrency ticket metric
+                                if let Some(ref m) = self.metrics {
+                                    m.record_concurrency_ticket_granted();
+                                }
                             }
                             RequestTicketTaskOutcome::Requested
                             | RequestTicketTaskOutcome::JobMissing => {
@@ -553,6 +557,10 @@ impl JobStoreShard {
                     self.concurrency
                         .counts()
                         .record_grant(tenant, &queue, &task_id);
+                    // Record concurrency ticket metric
+                    if let Some(ref m) = self.metrics {
+                        m.record_concurrency_ticket_granted();
+                    }
                     self.broker.wakeup();
                 }
             }

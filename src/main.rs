@@ -81,7 +81,11 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Create factory first - coordinator will own a reference and manage shard lifecycle
-    let factory = Arc::new(ShardFactory::new(cfg.database.clone(), rate_limiter));
+    let factory = Arc::new(ShardFactory::new(
+        cfg.database.clone(),
+        rate_limiter,
+        metrics.clone(),
+    ));
 
     // Initialize coordination - coordinator will open/close shards as ownership changes
     let node_id = uuid::Uuid::new_v4().to_string();

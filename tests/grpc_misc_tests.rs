@@ -71,7 +71,7 @@ async fn grpc_server_lease_tasks_multi_shard() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
-        let factory = ShardFactory::new(template, rate_limiter);
+        let factory = ShardFactory::new(template, rate_limiter, None);
 
         // Open 3 shards
         let _ = factory.open(0).await?;

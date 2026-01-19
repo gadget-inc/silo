@@ -32,7 +32,7 @@ async fn create_multi_shard_factory(
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
-    let factory = Arc::new(ShardFactory::new(template, rate_limiter));
+    let factory = Arc::new(ShardFactory::new(template, rate_limiter, None));
 
     // Open all shards
     for i in 0..num_shards {

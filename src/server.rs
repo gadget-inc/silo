@@ -751,20 +751,40 @@ impl Silo for SiloService {
                 .map_err(map_err)?;
 
             let tasks_added = result.tasks.len();
+            let shard_str = shard_id.to_string();
+            let now_ms = crate::job_store_shard::now_epoch_ms();
+
             for lt in result.tasks {
                 let job = lt.job();
                 let attempt = lt.attempt();
+                let task_group = job.task_group().to_string();
+                let attempt_number = attempt.attempt_number();
+
+                // Record attempt and wait time metrics
+                if let Some(ref m) = self.metrics {
+                    let is_retry = attempt_number > 1;
+                    m.record_attempt(&shard_str, &task_group, is_retry);
+
+                    // Calculate wait time in seconds (enqueue to now)
+                    let enqueue_time_ms = job.enqueue_time_ms();
+                    let wait_time_secs = (now_ms - enqueue_time_ms).max(0) as f64 / 1000.0;
+                    m.record_job_wait_time(&shard_str, &task_group, wait_time_secs);
+
+                    // Increment active leases
+                    m.inc_task_leases_active(&shard_str, &task_group);
+                }
+
                 all_tasks.push(Task {
                     id: attempt.task_id().to_string(),
                     job_id: job.id().to_string(),
-                    attempt_number: attempt.attempt_number(),
+                    attempt_number,
                     lease_ms: DEFAULT_LEASE_MS,
                     payload: Some(MsgpackBytes {
                         data: job.payload_bytes().to_vec(),
                     }),
                     priority: job.priority() as u32,
                     shard: shard_id,
-                    task_group: job.task_group().to_string(),
+                    task_group,
                 });
             }
 
@@ -784,7 +804,7 @@ impl Silo for SiloService {
             // Record dequeue metrics per shard
             if let Some(ref m) = self.metrics {
                 if tasks_added > 0 {
-                    m.record_dequeue(&shard_id.to_string(), &r.task_group, tasks_added as u64);
+                    m.record_dequeue(&shard_str, &r.task_group, tasks_added as u64);
                 }
             }
 
@@ -1064,7 +1084,7 @@ where
         + 'static
         + tonic::transport::server::Connected,
 {
-    let svc = SiloService::new(factory.clone(), coordinator, cfg, metrics);
+    let svc = SiloService::new(factory.clone(), coordinator, cfg, metrics.clone());
     let server = SiloServer::new(svc);
 
     // Create health service for gRPC health probes
@@ -1073,17 +1093,32 @@ where
         .set_serving::<SiloServer<SiloService>>()
         .await;
 
-    // Periodic reaper that iterates all shards every second
+    // Periodic reaper that iterates all shards every 100ms for lease reaping,
+    // and collects SlateDB metrics from each shard.
     let (tick_tx, mut tick_rx) = broadcast::channel::<()>(1);
     let reaper_factory = factory.clone();
+    let reaper_metrics = metrics.clone();
     let reaper: JoinHandle<()> = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    let instances = reaper_factory.instances();
+
+                    // Update shards open metric
+                    if let Some(ref m) = reaper_metrics {
+                        m.set_coordination_shards_open(instances.len() as u64);
+                    }
+
                     // Use default tenant "-" for system-level reaping
-                    for shard in reaper_factory.instances().values() {
+                    for (name, shard) in instances.iter() {
                         let _ = shard.reap_expired_leases("-").await;
+
+                        // Collect SlateDB storage metrics for this shard
+                        if let Some(ref m) = reaper_metrics {
+                            let stats = shard.slatedb_stats();
+                            m.update_slatedb_stats(name, &stats);
+                        }
                     }
                 }
                 _ = tick_rx.recv() => { break; }

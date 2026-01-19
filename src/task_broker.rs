@@ -12,6 +12,7 @@ use tokio::sync::Notify;
 
 use crate::codec::decode_task;
 use crate::concurrency::ConcurrencyManager;
+use crate::metrics::Metrics;
 use crate::task::Task;
 use tracing::debug;
 
@@ -46,10 +47,19 @@ pub struct TaskBroker {
     target_buffer: usize,
     // The batch size for the background scanner to read out of the DB
     scan_batch: usize,
+    // The shard name for metrics labeling
+    shard_name: String,
+    // Optional metrics for recording broker stats
+    metrics: Option<Metrics>,
 }
 
 impl TaskBroker {
-    pub fn new(db: Arc<Db>, concurrency: Arc<ConcurrencyManager>) -> Arc<Self> {
+    pub fn new(
+        db: Arc<Db>,
+        concurrency: Arc<ConcurrencyManager>,
+        shard_name: String,
+        metrics: Option<Metrics>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             db,
             buffer: Arc::new(SkipMap::new()),
@@ -60,6 +70,8 @@ impl TaskBroker {
             concurrency,
             target_buffer: 4096,
             scan_batch: 1024,
+            shard_name,
+            metrics,
         })
     }
 
@@ -171,7 +183,14 @@ impl TaskBroker {
 
                 // Scan for ready tasks
                 let now_ms = crate::job_store_shard::now_epoch_ms();
+                let scan_start = std::time::Instant::now();
                 let inserted = broker.scan_tasks(now_ms).await;
+                if let Some(ref m) = broker.metrics {
+                    m.record_broker_scan_duration(
+                        &broker.shard_name,
+                        scan_start.elapsed().as_secs_f64(),
+                    );
+                }
 
                 // Adjust backoff: stay aggressive when buffer needs filling
                 if broker.buffer.len() < broker.target_buffer / 2 {

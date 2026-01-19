@@ -302,6 +302,16 @@ impl DecodedLease {
         }
     }
 
+    /// Extract task_group from the leased task (zero-copy).
+    pub fn task_group(&self) -> &str {
+        match self.archived_task() {
+            ArchivedTask::RunAttempt { task_group, .. } => task_group.as_str(),
+            ArchivedTask::RequestTicket { task_group, .. } => task_group.as_str(),
+            ArchivedTask::CheckRateLimit { task_group, .. } => task_group.as_str(),
+            ArchivedTask::RefreshFloatingLimit { task_group, .. } => task_group.as_str(),
+        }
+    }
+
     /// Convert to an owned Task - only call when you need to create a new record
     pub fn to_task(&self) -> Task {
         match self.archived_task() {
