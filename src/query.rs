@@ -1165,13 +1165,12 @@ fn parse_metadata_contains_filter(expr: &Expr) -> Option<(String, String)> {
             // First arg should be element_at(metadata, 'key')
             if let Some(key) = extract_metadata_key_from_expr(&func.args[0]) {
                 // Second arg should be the literal value
-                if let Expr::Literal(s, _) = &func.args[1] {
-                    match s {
-                        ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => {
-                            return Some((key, v.clone()));
-                        }
-                        _ => {}
-                    }
+                if let Expr::Literal(
+                    ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)),
+                    _,
+                ) = &func.args[1]
+                {
+                    return Some((key, v.clone()));
                 }
             }
         }
@@ -1184,29 +1183,25 @@ fn extract_metadata_key_from_expr(expr: &Expr) -> Option<String> {
     use datafusion::scalar::ScalarValue;
 
     // Match: element_at(metadata, 'key') or GetIndexedField for metadata['key']
-    match expr {
-        Expr::ScalarFunction(func) => {
-            // element_at(metadata, 'key')
-            if func.func.name() == "element_at" && func.args.len() == 2 {
-                // First arg should be Column("metadata")
-                if let Expr::Column(col) = &func.args[0] {
-                    if col.name == "metadata" {
-                        // Second arg should be the literal key
-                        if let Expr::Literal(s, _) = &func.args[1] {
-                            match s {
-                                ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => {
-                                    return Some(v.clone());
-                                }
-                                _ => {}
-                            }
-                        }
+    // Note: DataFusion may not use GetIndexedField in this version,
+    // relying on ScalarFunction for element_at instead
+    if let Expr::ScalarFunction(func) = expr {
+        // element_at(metadata, 'key')
+        if func.func.name() == "element_at" && func.args.len() == 2 {
+            // First arg should be Column("metadata")
+            if let Expr::Column(col) = &func.args[0] {
+                if col.name == "metadata" {
+                    // Second arg should be the literal key
+                    if let Expr::Literal(
+                        ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)),
+                        _,
+                    ) = &func.args[1]
+                    {
+                        return Some(v.clone());
                     }
                 }
             }
         }
-        // Note: DataFusion may not use GetIndexedField in this version,
-        // relying on ScalarFunction for element_at instead
-        _ => {}
     }
     None
 }

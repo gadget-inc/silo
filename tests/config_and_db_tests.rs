@@ -364,45 +364,54 @@ fn expand_env_vars_no_vars() {
 
 #[test]
 fn expand_env_vars_simple_var() {
-    std::env::set_var("TEST_SILO_VAR", "test_value");
+    // SAFETY: Test runs single-threaded and uses a unique env var name
+    unsafe { std::env::set_var("TEST_SILO_VAR", "test_value") };
     let input = "prefix-${TEST_SILO_VAR}-suffix";
     assert_eq!(expand_env_vars_for_test(input), "prefix-test_value-suffix");
-    std::env::remove_var("TEST_SILO_VAR");
+    unsafe { std::env::remove_var("TEST_SILO_VAR") };
 }
 
 #[test]
 fn expand_env_vars_missing_var() {
-    std::env::remove_var("TEST_SILO_MISSING");
+    // SAFETY: Test runs single-threaded and uses a unique env var name
+    unsafe { std::env::remove_var("TEST_SILO_MISSING") };
     let input = "prefix-${TEST_SILO_MISSING}-suffix";
     assert_eq!(expand_env_vars_for_test(input), "prefix--suffix");
 }
 
 #[test]
 fn expand_env_vars_default_value_used() {
-    std::env::remove_var("TEST_SILO_DEFAULT");
+    // SAFETY: Test runs single-threaded and uses a unique env var name
+    unsafe { std::env::remove_var("TEST_SILO_DEFAULT") };
     let input = "prefix-${TEST_SILO_DEFAULT:-fallback}-suffix";
     assert_eq!(expand_env_vars_for_test(input), "prefix-fallback-suffix");
 }
 
 #[test]
 fn expand_env_vars_default_value_not_used() {
-    std::env::set_var("TEST_SILO_DEFAULT2", "actual_value");
+    // SAFETY: Test runs single-threaded and uses a unique env var name
+    unsafe { std::env::set_var("TEST_SILO_DEFAULT2", "actual_value") };
     let input = "prefix-${TEST_SILO_DEFAULT2:-fallback}-suffix";
     assert_eq!(
         expand_env_vars_for_test(input),
         "prefix-actual_value-suffix"
     );
-    std::env::remove_var("TEST_SILO_DEFAULT2");
+    unsafe { std::env::remove_var("TEST_SILO_DEFAULT2") };
 }
 
 #[test]
 fn expand_env_vars_multiple_vars() {
-    std::env::set_var("TEST_SILO_A", "aaa");
-    std::env::set_var("TEST_SILO_B", "bbb");
+    // SAFETY: Test runs single-threaded and uses unique env var names
+    unsafe {
+        std::env::set_var("TEST_SILO_A", "aaa");
+        std::env::set_var("TEST_SILO_B", "bbb");
+    }
     let input = "${TEST_SILO_A}:${TEST_SILO_B}";
     assert_eq!(expand_env_vars_for_test(input), "aaa:bbb");
-    std::env::remove_var("TEST_SILO_A");
-    std::env::remove_var("TEST_SILO_B");
+    unsafe {
+        std::env::remove_var("TEST_SILO_A");
+        std::env::remove_var("TEST_SILO_B");
+    }
 }
 
 #[test]
@@ -420,10 +429,11 @@ fn expand_env_vars_dollar_without_brace() {
 
 #[test]
 fn expand_env_vars_real_k8s_example() {
-    std::env::set_var("POD_IP", "10.0.0.5");
+    // SAFETY: Test runs single-threaded and uses a unique env var name
+    unsafe { std::env::set_var("POD_IP", "10.0.0.5") };
     let input = "${POD_IP}:50051";
     assert_eq!(expand_env_vars_for_test(input), "10.0.0.5:50051");
-    std::env::remove_var("POD_IP");
+    unsafe { std::env::remove_var("POD_IP") };
 }
 
 // =============================================================================

@@ -123,6 +123,7 @@ pub struct DatabaseTemplate {
     /// 1. Flush all memtable data to SSTs in object storage
     /// 2. Close the database
     /// 3. Delete the local WAL directory
+    ///
     /// This ensures durability and allows shards to be reopened elsewhere.
     /// Defaults to true.
     #[serde(default = "default_apply_wal_on_close")]
@@ -296,6 +297,7 @@ pub struct DatabaseConfig {
     /// 1. Flush all memtable data to SSTs in object storage
     /// 2. Close the database
     /// 3. Delete the local WAL directory
+    ///
     /// This ensures durability and allows the shard to be reopened elsewhere.
     /// Defaults to true when WAL is configured.
     #[serde(default = "default_apply_wal_on_close")]

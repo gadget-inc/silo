@@ -610,8 +610,7 @@ impl Silo for SiloService {
         };
 
         // Extract result based on attempt status
-        let attempt_state = attempt.state();
-        let result = match attempt_state {
+        match attempt.state() {
             crate::job_attempt::AttemptStatus::Succeeded {
                 finished_at_ms,
                 result,
@@ -652,9 +651,7 @@ impl Silo for SiloService {
                     "job status is terminal but attempt is still running",
                 ))
             }
-        };
-
-        result
+        }
     }
 
     async fn delete_job(
@@ -941,7 +938,7 @@ impl Silo for SiloService {
 
         // Convert batches directly to MessagePack rows
         let row_bytes =
-            crate::query::record_batches_to_msgpack(&batches).map_err(|e| Status::internal(e))?;
+            crate::query::record_batches_to_msgpack(&batches).map_err(Status::internal)?;
         let rows: Vec<MsgpackBytes> = row_bytes
             .into_iter()
             .map(|data| MsgpackBytes { data })
