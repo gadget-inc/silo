@@ -81,3 +81,12 @@ fn concurrency_limits() {
         verify_determinism("concurrency_limits", get_seed());
     }
 }
+
+#[test]
+fn chaos() {
+    if is_subprocess() || is_fuzz_mode() {
+        scenarios::chaos::run();
+    } else {
+        verify_determinism("chaos", get_seed());
+    }
+}

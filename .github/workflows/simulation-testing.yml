@@ -35,3 +35,12 @@ jobs:
             args="$args --random-seed ${{ github.event.inputs.random_seed }}"
           fi
           node scripts/run-simulation-tests.mjs $args
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dst-failure-logs
+          path: |
+            target/debug/deps/turmoil_runner-*
+          retention-days: 7

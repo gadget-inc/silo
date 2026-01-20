@@ -10,19 +10,20 @@
 //! Invariants verified:
 //! 1. Per-response limit check: A single lease response never contains more tasks
 //!    for a limit key than that limit's max_concurrency
-//! 2. No duplicate completions: Same job_id never reported as success twice
-//! 3. All jobs terminal: Every enqueued job reaches a terminal state (via GetJob)
-//! 4. System progress: Jobs complete without deadlock
+//! 2. Global concurrency limit: At no point do we have more than max_concurrency
+//!    tasks actively leased system-wide for any limit key (queueLimitEnforced)
+//! 3. No duplicate completions: Same job_id never reported as success twice
+//! 4. All jobs terminal: Every enqueued job reaches a terminal state (via GetJob)
+//! 5. System progress: Jobs complete without deadlock
 
 use crate::helpers::{
-    ConcurrencyLimit, EnqueueRequest, HashMap, LeaseTasksRequest, Limit, MsgpackBytes,
-    ReportOutcomeRequest, get_seed, limit, report_outcome_request, run_scenario_impl, setup_server,
-    turmoil_connector,
+    ConcurrencyLimit, EnqueueRequest, GetJobRequest, GlobalConcurrencyTracker, HashMap, JobStatus,
+    LeaseTasksRequest, Limit, MsgpackBytes, ReportOutcomeRequest, Task, get_seed, limit,
+    report_outcome_request, run_scenario_impl, setup_server, turmoil_connector,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use silo::pb::silo_client::SiloClient;
-use silo::pb::{GetJobRequest, JobStatus, Task};
 use std::collections::{HashMap as StdHashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -81,8 +82,17 @@ pub fn run() {
         // Track all enqueued job_ids for terminal state verification
         let enqueued_jobs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
-        // Track completed job_ids to detect duplicates (invariant #2)
+        // Track completed job_ids to detect duplicates (invariant #3)
         let completed_jobs: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
+        // INVARIANT #2: Global concurrency tracking (queueLimitEnforced)
+        // Tracks all active leases across all workers to verify system-wide concurrency limits
+        let global_concurrency = Arc::new(GlobalConcurrencyTracker::new());
+
+        // Register all limit keys with their max concurrency values
+        for config in LIMIT_CONFIGS {
+            global_concurrency.register_limit(config.key, config.max_concurrency);
+        }
 
         sim.host("server", || async move { setup_server(9905).await });
 
@@ -263,6 +273,7 @@ pub fn run() {
             let worker_id = format!("worker{}", worker_num);
             let completion_counter = Arc::clone(&total_completed);
             let completed_jobs_tracker = Arc::clone(&completed_jobs);
+            let worker_concurrency = Arc::clone(&global_concurrency);
 
             let client_name: &'static str =
                 Box::leak(format!("worker{}", worker_num).into_boxed_str());
@@ -322,9 +333,15 @@ pub fn run() {
                             }
 
                             for task in tasks {
+                                // INVARIANT #2: Track global concurrency acquisition
+                                let limit_key = extract_limit_key(&task.job_id);
+                                worker_concurrency.acquire(&limit_key, &task.id, &task.job_id);
+
                                 tracing::trace!(
                                     worker = %worker_id,
                                     job_id = %task.job_id,
+                                    task_id = %task.id,
+                                    limit_key = %limit_key,
                                     round = round,
                                     "lease"
                                 );
@@ -382,6 +399,10 @@ pub fn run() {
                                 .await
                             {
                                 Ok(_) => {
+                                    // INVARIANT #2: Release global concurrency slot
+                                    let limit_key = extract_limit_key(&task.job_id);
+                                    worker_concurrency.release(&limit_key, &task.id, &task.job_id);
+
                                     if should_fail {
                                         tracing::trace!(
                                             worker = %worker_id,
@@ -390,7 +411,7 @@ pub fn run() {
                                         );
                                         failed += 1;
                                     } else {
-                                        // INVARIANT #2: No duplicate completions
+                                        // INVARIANT #3: No duplicate completions
                                         let was_new = completed_jobs_tracker
                                             .lock()
                                             .unwrap()
@@ -453,7 +474,11 @@ pub fn run() {
                         .await
                     {
                         Ok(_) => {
-                            // INVARIANT #2: No duplicate completions
+                            // INVARIANT #2: Release global concurrency slot
+                            let limit_key = extract_limit_key(&task.job_id);
+                            worker_concurrency.release(&limit_key, &task.id, &task.job_id);
+
+                            // INVARIANT #3: No duplicate completions
                             let was_new = completed_jobs_tracker
                                 .lock()
                                 .unwrap()
@@ -499,6 +524,7 @@ pub fn run() {
         let verify_enqueued = Arc::clone(&total_enqueued);
         let verify_jobs = Arc::clone(&enqueued_jobs);
         let verify_completed_set = Arc::clone(&completed_jobs);
+        let verify_concurrency = Arc::clone(&global_concurrency);
         sim.client("verifier", async move {
             // Wait for producers and workers to do their work
             tokio::time::sleep(Duration::from_secs(90)).await;
@@ -589,6 +615,20 @@ pub fn run() {
                 enqueued,
                 expected_min
             );
+
+            // INVARIANT #2: Final global concurrency verification
+            // After all work is done, verify no duplicate job leases occurred
+            verify_concurrency.verify_no_duplicate_job_leases();
+
+            // Log final concurrency state for all limit keys
+            for config in LIMIT_CONFIGS {
+                let holder_count = verify_concurrency.holder_count(config.key);
+                tracing::trace!(
+                    limit_key = config.key,
+                    remaining_holders = holder_count,
+                    "final_concurrency_state"
+                );
+            }
 
             tracing::trace!(
                 enqueued = enqueued,
