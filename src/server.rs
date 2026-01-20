@@ -727,7 +727,7 @@ impl Silo for SiloService {
                 .iter()
                 .filter_map(|(name, shard)| name.parse::<u32>().ok().map(|id| (id, shard.clone())))
                 .collect();
-            shards.shuffle(&mut rand::thread_rng());
+            shards.shuffle(&mut rand::rng());
             shards
         };
 

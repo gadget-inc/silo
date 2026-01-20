@@ -1,0 +1,37 @@
+name: Simulation Testing
+
+on:
+  # Run nightly at 3am UTC
+  schedule:
+    - cron: "0 3 * * *"
+  # Allow manual triggering with custom parameters
+  workflow_dispatch:
+    inputs:
+      num_seeds:
+        description: "Number of random seeds to test"
+        required: false
+        default: "100"
+      random_seed:
+        description: "Base random seed (leave empty for random)"
+        required: false
+        default: ""
+
+jobs:
+  run-dst:
+    name: Deterministic simulation testing
+    runs-on: ubuntu-latest-l
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-test-env
+        with:
+          cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run simulation tests
+        shell: bash
+        run: |
+          args="--seeds ${{ github.event.inputs.num_seeds || '100' }} --verbose"
+          if [ -n "${{ github.event.inputs.random_seed }}" ]; then
+            args="$args --random-seed ${{ github.event.inputs.random_seed }}"
+          fi
+          node scripts/run-simulation-tests.mjs $args
