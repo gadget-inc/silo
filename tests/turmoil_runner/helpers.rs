@@ -57,7 +57,21 @@ impl Write for DstWriter {
 /// - No ANSI colors (consistent output)
 /// - Thread names/IDs disabled (ordering could vary)
 /// - No file/line numbers (could change with code edits)
+///
+/// Panics if called more than once in the same process - each DST scenario
+/// must run in its own process for true determinism.
 fn init_deterministic_tracing() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+    if INITIALIZED.swap(true, Ordering::SeqCst) {
+        panic!(
+            "DST tracing already initialized in this process. \
+             Each DST scenario must run in a separate process for determinism. \
+             If running in fuzz mode, ensure each test is spawned as a subprocess."
+        );
+    }
+
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .with_target(true)
@@ -77,14 +91,17 @@ fn init_deterministic_tracing() {
 /// Initialize mad-turmoil for deterministic simulation testing.
 /// This should only be called once per process - each DST scenario
 /// runs in its own subprocess for true determinism.
+///
+/// Panics if called more than once in the same process.
 fn init_deterministic_sim(seed: u64) -> mad_turmoil::time::SimClocksGuard {
     use rand::SeedableRng;
     use rand::rngs::StdRng;
 
-    // Initialize deterministic tracing first
+    // Initialize deterministic tracing first (will panic if already initialized)
     init_deterministic_tracing();
 
     // Set the seeded RNG for mad-turmoil (intercepts getrandom/getentropy at libc level)
+    // This will panic if called twice - that's intentional, see init_deterministic_tracing
     let rng = StdRng::seed_from_u64(seed);
     mad_turmoil::rand::set_rng(rng);
 
@@ -202,7 +219,10 @@ pub async fn setup_server(port: u16) -> turmoil::Result<()> {
     Ok(())
 }
 
-/// Run a scenario and output deterministic markers
+/// Run a scenario and output deterministic markers.
+///
+/// In fuzz mode (DST_FUZZ=1), panics on scenario failure to fail the test.
+/// In normal mode, just outputs the result for determinism comparison.
 pub fn run_scenario_impl<F>(name: &str, seed: u64, duration_secs: u64, setup: F)
 where
     F: FnOnce(&mut turmoil::Sim<'_>),
@@ -234,6 +254,11 @@ where
             tracing::error!(scenario = name, error = %e, "scenario failed");
             println!("---DST_END---");
             println!("DST_RESULT:error:{}", e);
+
+            // In fuzz mode, panic to fail the test
+            if is_fuzz_mode() {
+                panic!("Scenario '{}' failed with seed {}: {}", name, seed, e);
+            }
         }
     }
 }
