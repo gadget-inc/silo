@@ -1,10 +1,18 @@
 //! Multiple workers scenario: Multiple workers competing for tasks.
+//!
+//! Invariants verified:
+//! - All enqueued jobs are processed exactly once (no missed, no duplicates)
+//! - No job is processed by two workers simultaneously
+//! - All jobs reach terminal state
 
 use crate::helpers::{
-    EnqueueRequest, HashMap, LeaseTasksRequest, MsgpackBytes, ReportOutcomeRequest, get_seed,
-    report_outcome_request, run_scenario_impl, setup_server, turmoil_connector,
+    EnqueueRequest, GetJobRequest, HashMap, JobStateTracker, JobStatus, LeaseTasksRequest,
+    MsgpackBytes, ReportOutcomeRequest, get_seed, report_outcome_request, run_scenario_impl,
+    setup_server, turmoil_connector,
 };
 use silo::pb::silo_client::SiloClient;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tonic::transport::Endpoint;
 
@@ -12,6 +20,14 @@ pub fn run() {
     let seed = get_seed();
     run_scenario_impl("multiple_workers", seed, 60, |sim| {
         sim.host("server", || async move { setup_server(9902).await });
+
+        // Shared state for invariant checking
+        let job_tracker = Arc::new(JobStateTracker::new());
+        let total_completed = Arc::new(AtomicU32::new(0));
+        let enqueued_jobs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let producer_tracker = Arc::clone(&job_tracker);
+        let producer_jobs = Arc::clone(&enqueued_jobs);
 
         // Enqueue jobs from producer
         sim.client("producer", async move {
@@ -28,7 +44,7 @@ pub fn run() {
                 client
                     .enqueue(tonic::Request::new(EnqueueRequest {
                         shard: 0,
-                        id: job_id,
+                        id: job_id.clone(),
                         priority: i as u32,
                         start_at_ms: 0,
                         retry_policy: None,
@@ -41,12 +57,17 @@ pub fn run() {
                         task_group: "default".to_string(),
                     }))
                     .await?;
+
+                producer_tracker.job_enqueued(&job_id);
+                producer_jobs.lock().unwrap().push(job_id);
             }
             tracing::trace!("producer_done");
             Ok(())
         });
 
         // Worker 1
+        let w1_tracker = Arc::clone(&job_tracker);
+        let w1_completed = Arc::clone(&total_completed);
         sim.client("worker1", async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -68,6 +89,9 @@ pub fn run() {
                     .into_inner();
 
                 for task in &lease.tasks {
+                    // Track lease acquisition
+                    w1_tracker.task_leased(&task.job_id, &task.id);
+
                     tracing::trace!(worker = "worker1", job_id = %task.job_id, "lease");
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     client
@@ -80,8 +104,19 @@ pub fn run() {
                             })),
                         }))
                         .await?;
+
+                    // Track completion
+                    w1_tracker.task_released(&task.job_id, &task.id);
+                    let was_new = w1_tracker.job_completed(&task.job_id);
+                    assert!(
+                        was_new,
+                        "INVARIANT VIOLATION: Job '{}' completed twice!",
+                        task.job_id
+                    );
+
                     tracing::trace!(worker = "worker1", job_id = %task.job_id, "complete");
                     completed += 1;
+                    w1_completed.fetch_add(1, Ordering::SeqCst);
                 }
 
                 if lease.tasks.is_empty() {
@@ -93,6 +128,8 @@ pub fn run() {
         });
 
         // Worker 2
+        let w2_tracker = Arc::clone(&job_tracker);
+        let w2_completed = Arc::clone(&total_completed);
         sim.client("worker2", async move {
             tokio::time::sleep(Duration::from_millis(120)).await;
 
@@ -114,6 +151,9 @@ pub fn run() {
                     .into_inner();
 
                 for task in &lease.tasks {
+                    // Track lease acquisition
+                    w2_tracker.task_leased(&task.job_id, &task.id);
+
                     tracing::trace!(worker = "worker2", job_id = %task.job_id, "lease");
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     client
@@ -126,8 +166,19 @@ pub fn run() {
                             })),
                         }))
                         .await?;
+
+                    // Track completion
+                    w2_tracker.task_released(&task.job_id, &task.id);
+                    let was_new = w2_tracker.job_completed(&task.job_id);
+                    assert!(
+                        was_new,
+                        "INVARIANT VIOLATION: Job '{}' completed twice!",
+                        task.job_id
+                    );
+
                     tracing::trace!(worker = "worker2", job_id = %task.job_id, "complete");
                     completed += 1;
+                    w2_completed.fetch_add(1, Ordering::SeqCst);
                 }
 
                 if lease.tasks.is_empty() {
@@ -135,6 +186,77 @@ pub fn run() {
                 }
             }
             tracing::trace!(worker = "worker2", completed = completed, "worker_done");
+            Ok(())
+        });
+
+        // Verifier: Check all jobs completed exactly once
+        let verify_tracker = Arc::clone(&job_tracker);
+        let verify_completed = Arc::clone(&total_completed);
+        let verify_jobs = Arc::clone(&enqueued_jobs);
+        sim.client("verifier", async move {
+            // Wait for workers to finish
+            tokio::time::sleep(Duration::from_secs(30)).await;
+
+            let ch = Endpoint::new("http://server:9902")?
+                .connect_with_connector(turmoil_connector())
+                .await?;
+            let mut client = SiloClient::new(ch);
+
+            let enqueued = verify_jobs.lock().unwrap().clone();
+            let completed = verify_completed.load(Ordering::SeqCst);
+
+            tracing::trace!(
+                enqueued = enqueued.len(),
+                completed = completed,
+                "verification_start"
+            );
+
+            // INVARIANT: All enqueued jobs should be completed
+            assert_eq!(
+                completed as usize,
+                enqueued.len(),
+                "Not all jobs completed: {} enqueued, {} completed",
+                enqueued.len(),
+                completed
+            );
+
+            // INVARIANT: All jobs should be in Succeeded state
+            let mut succeeded = 0u32;
+            for job_id in &enqueued {
+                let job_resp = client
+                    .get_job(tonic::Request::new(GetJobRequest {
+                        shard: 0,
+                        id: job_id.clone(),
+                        tenant: None,
+                        include_attempts: false,
+                    }))
+                    .await?
+                    .into_inner();
+
+                let status = job_resp.status();
+                if status == JobStatus::Succeeded {
+                    succeeded += 1;
+                } else {
+                    tracing::error!(job_id = %job_id, status = ?status, "job_not_succeeded");
+                }
+            }
+
+            assert_eq!(
+                succeeded as usize,
+                enqueued.len(),
+                "Not all jobs succeeded: {} succeeded out of {}",
+                succeeded,
+                enqueued.len()
+            );
+
+            // INVARIANT: No terminal job leases (noLeasesForTerminal)
+            verify_tracker.verify_no_terminal_leases();
+
+            tracing::trace!(
+                succeeded = succeeded,
+                "verifier_done"
+            );
+
             Ok(())
         });
     });

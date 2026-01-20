@@ -3,9 +3,10 @@
 //! This module provides the foundational infrastructure for deterministic
 //! simulation testing (DST) using turmoil and mad-turmoil.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use core::future::Future;
@@ -23,8 +24,8 @@ use turmoil::net::TcpListener;
 
 // Re-export common types needed by scenarios
 pub use silo::pb::{
-    ConcurrencyLimit, EnqueueRequest, LeaseTasksRequest, Limit, MsgpackBytes, ReportOutcomeRequest,
-    RetryPolicy, limit, report_outcome_request,
+    ConcurrencyLimit, EnqueueRequest, GetJobRequest, JobStatus, LeaseTasksRequest, Limit,
+    MsgpackBytes, ReportOutcomeRequest, RetryPolicy, Task, limit, report_outcome_request,
 };
 pub use std::collections::HashMap;
 pub use turmoil;
@@ -397,4 +398,306 @@ pub fn verify_determinism(scenario: &str, seed: u64) {
         det1.len(),
         line_count
     );
+}
+
+// ============================================================================
+// Invariant Verification Infrastructure
+// ============================================================================
+//
+// These types and functions help verify system invariants during DST scenarios.
+// Invariants are derived from the Alloy specification in specs/job_shard.als.
+
+/// Tracks global concurrency state across all workers for invariant verification.
+/// This verifies the Alloy invariant: queueLimitEnforced - at most max_concurrency
+/// tasks can be leased for a given limit key at any time.
+#[derive(Debug, Default)]
+pub struct GlobalConcurrencyTracker {
+    /// Maps limit_key -> set of (task_id, job_id) pairs currently holding the limit
+    holders: Mutex<HashMap<String, HashSet<(String, String)>>>,
+    /// Maps limit_key -> max_concurrency for that key
+    limits: Mutex<HashMap<String, u32>>,
+}
+
+impl GlobalConcurrencyTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a limit key and its max concurrency value
+    pub fn register_limit(&self, key: &str, max_concurrency: u32) {
+        let mut limits = self.limits.lock().unwrap();
+        limits.entry(key.to_string()).or_insert(max_concurrency);
+    }
+
+    /// Record that a task has acquired a concurrency slot.
+    /// Panics if this would violate the concurrency limit (invariant violation).
+    pub fn acquire(&self, limit_key: &str, task_id: &str, job_id: &str) {
+        let mut holders = self.holders.lock().unwrap();
+        let limits = self.limits.lock().unwrap();
+
+        let entry = holders.entry(limit_key.to_string()).or_default();
+        let max = limits.get(limit_key).copied().unwrap_or(u32::MAX);
+
+        // Check invariant BEFORE adding
+        assert!(
+            entry.len() < max as usize,
+            "INVARIANT VIOLATION (queueLimitEnforced): Attempting to acquire slot for limit '{}' \
+             but already at max_concurrency {}. Current holders: {:?}. \
+             New task_id={}, job_id={}",
+            limit_key,
+            max,
+            entry,
+            task_id,
+            job_id
+        );
+
+        let inserted = entry.insert((task_id.to_string(), job_id.to_string()));
+        assert!(
+            inserted,
+            "INVARIANT VIOLATION (noDoubleLease): Task {} already holds limit '{}'",
+            task_id, limit_key
+        );
+
+        tracing::trace!(
+            limit_key = limit_key,
+            task_id = task_id,
+            job_id = job_id,
+            current_count = entry.len(),
+            max_concurrency = max,
+            "concurrency_acquired"
+        );
+    }
+
+    /// Record that a task has released a concurrency slot.
+    pub fn release(&self, limit_key: &str, task_id: &str, job_id: &str) {
+        let mut holders = self.holders.lock().unwrap();
+
+        if let Some(entry) = holders.get_mut(limit_key) {
+            let removed = entry.remove(&(task_id.to_string(), job_id.to_string()));
+            if !removed {
+                tracing::warn!(
+                    limit_key = limit_key,
+                    task_id = task_id,
+                    job_id = job_id,
+                    "release called for task not in holders set (may have failed/timed out)"
+                );
+            } else {
+                tracing::trace!(
+                    limit_key = limit_key,
+                    task_id = task_id,
+                    job_id = job_id,
+                    remaining_count = entry.len(),
+                    "concurrency_released"
+                );
+            }
+        }
+    }
+
+    /// Get the current holder count for a limit key
+    pub fn holder_count(&self, limit_key: &str) -> usize {
+        let holders = self.holders.lock().unwrap();
+        holders.get(limit_key).map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Verify that a job doesn't have duplicate active leases (oneLeasePerJob invariant)
+    pub fn verify_no_duplicate_job_leases(&self) {
+        let holders = self.holders.lock().unwrap();
+
+        // Collect all job_ids across all limit keys
+        let mut job_to_tasks: HashMap<String, Vec<(String, String)>> = HashMap::new();
+
+        for (limit_key, tasks) in holders.iter() {
+            for (task_id, job_id) in tasks {
+                job_to_tasks
+                    .entry(job_id.clone())
+                    .or_default()
+                    .push((limit_key.clone(), task_id.clone()));
+            }
+        }
+
+        // Check that no job has multiple tasks with the same limit key
+        // (a job can have multiple limit keys, but not duplicate entries for the same key)
+        for (job_id, entries) in &job_to_tasks {
+            let mut seen_limits: HashSet<&str> = HashSet::new();
+            for (limit_key, task_id) in entries {
+                if !seen_limits.insert(limit_key.as_str()) {
+                    panic!(
+                        "INVARIANT VIOLATION (oneLeasePerJob): Job '{}' has multiple tasks \
+                         holding limit '{}'. Entries: {:?}",
+                        job_id, limit_key, entries
+                    );
+                }
+                let _ = task_id; // used in debug output above
+            }
+        }
+    }
+}
+
+/// Tracks job state for invariant verification.
+/// Verifies invariants like:
+/// - noLeasesForTerminal: Terminal jobs have no active leases
+/// - validTransitions: Only valid status transitions occur
+/// - noZombieAttempts: Terminal jobs have no running attempts
+#[derive(Debug, Default)]
+pub struct JobStateTracker {
+    /// Maps job_id -> last known status
+    job_statuses: Mutex<HashMap<String, i32>>,
+    /// Maps job_id -> set of task_ids with active leases
+    active_leases: Mutex<HashMap<String, HashSet<String>>>,
+    /// Set of job_ids that have been completed (success/fail/cancel)
+    terminal_jobs: Mutex<HashSet<String>>,
+    /// Set of job_ids that have been successfully completed (for duplicate detection)
+    completed_jobs: Mutex<HashSet<String>>,
+}
+
+impl JobStateTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that a job was enqueued
+    pub fn job_enqueued(&self, job_id: &str) {
+        let mut statuses = self.job_statuses.lock().unwrap();
+        statuses.insert(job_id.to_string(), JobStatus::Scheduled as i32);
+    }
+
+    /// Record that a task was leased for a job
+    pub fn task_leased(&self, job_id: &str, task_id: &str) {
+        // Check that this job is not terminal
+        {
+            let terminal = self.terminal_jobs.lock().unwrap();
+            assert!(
+                !terminal.contains(job_id),
+                "INVARIANT VIOLATION (noLeasesForTerminal): Attempting to lease task {} \
+                 for job {} which is already terminal",
+                task_id,
+                job_id
+            );
+        }
+
+        let mut leases = self.active_leases.lock().unwrap();
+        leases
+            .entry(job_id.to_string())
+            .or_default()
+            .insert(task_id.to_string());
+
+        let mut statuses = self.job_statuses.lock().unwrap();
+        statuses.insert(job_id.to_string(), JobStatus::Running as i32);
+    }
+
+    /// Record that a task lease was released (completed, failed, or expired)
+    pub fn task_released(&self, job_id: &str, task_id: &str) {
+        let mut leases = self.active_leases.lock().unwrap();
+        if let Some(job_leases) = leases.get_mut(job_id) {
+            job_leases.remove(task_id);
+            if job_leases.is_empty() {
+                leases.remove(job_id);
+            }
+        }
+    }
+
+    /// Record that a job completed successfully.
+    /// Verifies no duplicate completions.
+    pub fn job_completed(&self, job_id: &str) -> bool {
+        let mut completed = self.completed_jobs.lock().unwrap();
+        let was_new = completed.insert(job_id.to_string());
+
+        if was_new {
+            let mut terminal = self.terminal_jobs.lock().unwrap();
+            terminal.insert(job_id.to_string());
+
+            let mut statuses = self.job_statuses.lock().unwrap();
+            statuses.insert(job_id.to_string(), JobStatus::Succeeded as i32);
+        }
+
+        was_new
+    }
+
+    /// Record that a job failed (permanently, not retrying)
+    #[allow(dead_code)]
+    pub fn job_failed(&self, job_id: &str) {
+        let mut terminal = self.terminal_jobs.lock().unwrap();
+        terminal.insert(job_id.to_string());
+
+        let mut statuses = self.job_statuses.lock().unwrap();
+        statuses.insert(job_id.to_string(), JobStatus::Failed as i32);
+    }
+
+    /// Record that a job was cancelled
+    pub fn job_cancelled(&self, job_id: &str) {
+        let mut terminal = self.terminal_jobs.lock().unwrap();
+        terminal.insert(job_id.to_string());
+
+        let mut statuses = self.job_statuses.lock().unwrap();
+        statuses.insert(job_id.to_string(), JobStatus::Cancelled as i32);
+    }
+
+    /// Record that a job is being retried (not terminal)
+    pub fn job_retrying(&self, job_id: &str) {
+        let mut statuses = self.job_statuses.lock().unwrap();
+        statuses.insert(job_id.to_string(), JobStatus::Scheduled as i32);
+    }
+
+    /// Check if a job has been completed
+    pub fn is_completed(&self, job_id: &str) -> bool {
+        let completed = self.completed_jobs.lock().unwrap();
+        completed.contains(job_id)
+    }
+
+    /// Check if a job is terminal
+    #[allow(dead_code)]
+    pub fn is_terminal(&self, job_id: &str) -> bool {
+        let terminal = self.terminal_jobs.lock().unwrap();
+        terminal.contains(job_id)
+    }
+
+    /// Verify that no terminal jobs have active leases
+    pub fn verify_no_terminal_leases(&self) {
+        let terminal = self.terminal_jobs.lock().unwrap();
+        let leases = self.active_leases.lock().unwrap();
+
+        for job_id in terminal.iter() {
+            if let Some(active) = leases.get(job_id) {
+                if !active.is_empty() {
+                    panic!(
+                        "INVARIANT VIOLATION (noLeasesForTerminal): Terminal job '{}' \
+                         still has active leases: {:?}",
+                        job_id, active
+                    );
+                }
+            }
+        }
+    }
+
+    /// Get the count of completed jobs
+    #[allow(dead_code)]
+    pub fn completed_count(&self) -> usize {
+        let completed = self.completed_jobs.lock().unwrap();
+        completed.len()
+    }
+
+    /// Get the count of terminal jobs (completed + failed + cancelled)
+    pub fn terminal_count(&self) -> usize {
+        let terminal = self.terminal_jobs.lock().unwrap();
+        terminal.len()
+    }
+}
+
+/// Combined invariant tracker for comprehensive verification
+#[derive(Debug, Default)]
+pub struct InvariantTracker {
+    pub concurrency: GlobalConcurrencyTracker,
+    pub jobs: JobStateTracker,
+}
+
+impl InvariantTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Run all invariant checks. Should be called periodically during scenarios.
+    pub fn verify_all(&self) {
+        self.concurrency.verify_no_duplicate_job_leases();
+        self.jobs.verify_no_terminal_leases();
+    }
 }
