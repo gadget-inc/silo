@@ -6,11 +6,18 @@
 //! # Key Invariants (see specs/job_shard.als for formal specification)
 //!
 //! - Queue limit is enforced: at most N holders per queue at any time.
-//!   Currently modeled with N=1 (mutex semantics). Enforced by checking `can_grant` before granting.
+//!   Enforced by `try_reserve` which atomically checks capacity and reserves a slot.
 //!
 //! - Holders only exist for tasks that are active (in DB queue, buffer, or leased).
 //!   Holders are created at enqueue (granted) or grant_next, and released when task completes,
 //!   lease expires, or cancelled task is cleaned up at dequeue.
+//!
+//! # TOCTOU Prevention
+//!
+//! To prevent time-of-check-time-of-use races, in-memory concurrency counts are updated
+//! BEFORE the DB write. If the DB write fails, callers must use rollback methods to revert
+//! the in-memory state. This ensures no window exists where capacity appears available
+//! between check and grant.
 //!
 //! # Cancellation Semantics
 //!
@@ -33,21 +40,22 @@ use crate::job::{ConcurrencyLimit, JobView};
 use crate::keys::{concurrency_holder_key, concurrency_request_key, job_cancelled_key, task_key};
 use crate::task::{ConcurrencyAction, HolderRecord, Task};
 
+/// Information needed to rollback a release_and_grant operation if DB write fails.
 #[derive(Debug, Clone)]
-pub enum MemoryEvent {
-    Granted { queue: String, task_id: String },
-    Released { queue: String, task_id: String },
+pub struct ReleaseGrantRollback {
+    pub tenant: String,
+    pub queue: String,
+    pub released_task_id: String,
+    /// If Some, a grant was made to this task_id
+    pub granted_task_id: Option<String>,
 }
 
 /// Result of attempting to enqueue a job with concurrency limits
 #[derive(Debug)]
 pub enum RequestTicketOutcome {
-    /// Concurrency tocket granted immediately - RunAttempt task created
-    GrantedImmediately {
-        task_id: String,
-        queue: String,
-        events: Vec<MemoryEvent>,
-    },
+    /// Concurrency ticket granted immediately - RunAttempt task created.
+    /// Note: In-memory slot is already reserved by try_reserve before this is returned.
+    GrantedImmediately { task_id: String, queue: String },
     /// Ticket queued as a request record (for immediate start time but no capacity)
     TicketRequested { queue: String },
     /// Job queued as a RequestTicket task (for future start time)
@@ -120,29 +128,92 @@ impl ConcurrencyCounts {
         Ok(())
     }
 
-    pub fn can_grant(&self, tenant: &str, queue: &str, limit: usize) -> bool {
-        let key = format!("{}|{}", tenant, queue);
-        self.holders
-            .lock()
-            .unwrap()
-            .get(&key)
-            .map(|s| s.len())
-            .unwrap_or(0)
-            < limit
-    }
-
-    pub fn record_grant(&self, tenant: &str, queue: &str, task_id: &str) {
+    /// Atomically try to reserve a concurrency slot.
+    /// Returns true if the slot was reserved, false if at capacity.
+    /// This MUST be called before writing to the DB to prevent TOCTOU races.
+    /// If the DB write fails, call `release_reservation` to roll back.
+    pub fn try_reserve(&self, tenant: &str, queue: &str, task_id: &str, limit: usize) -> bool {
         let mut h = self.holders.lock().unwrap();
-        let set = h.entry(format!("{}|{}", tenant, queue)).or_default();
+        let key = format!("{}|{}", tenant, queue);
+        let set = h.entry(key).or_default();
+
+        // Check if we're at capacity
+        if set.len() >= limit {
+            return false;
+        }
+
+        // Reserve the slot atomically
         set.insert(task_id.to_string());
+        true
     }
 
-    pub fn record_release(&self, tenant: &str, queue: &str, task_id: &str) {
+    /// Release a reservation made by `try_reserve` if the DB write fails.
+    pub fn release_reservation(&self, tenant: &str, queue: &str, task_id: &str) {
         let mut h = self.holders.lock().unwrap();
         let key = format!("{}|{}", tenant, queue);
         if let Some(set) = h.get_mut(&key) {
             set.remove(task_id);
         }
+    }
+
+    /// Atomically release one task and reserve another in a single mutex acquisition.
+    /// This prevents a race window where capacity appears available between release and grant.
+    /// Used by release_and_grant_next to keep in-memory counts consistent.
+    pub fn atomic_release_and_reserve(
+        &self,
+        tenant: &str,
+        queue: &str,
+        release_task_id: &str,
+        reserve_task_id: &str,
+    ) {
+        let mut h = self.holders.lock().unwrap();
+        let key = format!("{}|{}", tenant, queue);
+        let set = h.entry(key).or_default();
+        set.remove(release_task_id);
+        set.insert(reserve_task_id.to_string());
+    }
+
+    /// Atomically release a task without granting to another.
+    /// Used when there are no pending requests to grant to.
+    pub fn atomic_release(&self, tenant: &str, queue: &str, task_id: &str) {
+        let mut h = self.holders.lock().unwrap();
+        let key = format!("{}|{}", tenant, queue);
+        if let Some(set) = h.get_mut(&key) {
+            set.remove(task_id);
+        }
+    }
+
+    /// Rollback a release_and_reserve operation if DB write fails.
+    /// Re-adds the released task and removes the reserved task.
+    pub fn rollback_release_and_reserve(
+        &self,
+        tenant: &str,
+        queue: &str,
+        released_task_id: &str,
+        reserved_task_id: &str,
+    ) {
+        let mut h = self.holders.lock().unwrap();
+        let key = format!("{}|{}", tenant, queue);
+        let set = h.entry(key).or_default();
+        set.remove(reserved_task_id);
+        set.insert(released_task_id.to_string());
+    }
+
+    /// Rollback a release operation if DB write fails.
+    /// Re-adds the released task.
+    pub fn rollback_release(&self, tenant: &str, queue: &str, task_id: &str) {
+        let mut h = self.holders.lock().unwrap();
+        let key = format!("{}|{}", tenant, queue);
+        let set = h.entry(key).or_default();
+        set.insert(task_id.to_string());
+    }
+
+    /// Get the current holder count for a queue.
+    /// Useful for testing and debugging.
+    pub fn holder_count(&self, tenant: &str, queue: &str) -> usize {
+        let h = self.holders.lock().unwrap();
+        let key = format!("{}|{}", tenant, queue);
+        h.get(&key).map(|s| s.len()).unwrap_or(0)
     }
 }
 
@@ -168,7 +239,11 @@ impl ConcurrencyManager {
         &self.counts
     }
 
-    /// Handle concurrency for a new job enqueue
+    /// Handle concurrency for a new job enqueue.
+    ///
+    /// IMPORTANT: This method atomically reserves in-memory concurrency slots BEFORE returning.
+    /// If the DB write fails after calling this, you MUST call `rollback_grant` to release
+    /// the reservation.
     #[allow(clippy::too_many_arguments)]
     pub fn handle_enqueue(
         &self,
@@ -190,10 +265,12 @@ impl ConcurrencyManager {
         let queue = &limit.key;
         let max_allowed = limit.max_concurrency as usize;
 
-        // [SILO-ENQ-CONC-1] Check if queue has capacity
-        if self.counts.can_grant(tenant, queue, max_allowed) {
+        // [SILO-ENQ-CONC-1] Atomically check and reserve if queue has capacity
+        // This prevents TOCTOU races by reserving the slot before writing to DB
+        if self.counts.try_reserve(tenant, queue, task_id, max_allowed) {
             // Grant immediately: [SILO-ENQ-CONC-2] create holder, [SILO-ENQ-CONC-3] create task
-            let events = append_grant_edits(
+            // Note: in-memory slot is already reserved by try_reserve
+            append_grant_edits(
                 batch,
                 now_ms,
                 tenant,
@@ -208,7 +285,6 @@ impl ConcurrencyManager {
             Ok(Some(RequestTicketOutcome::GrantedImmediately {
                 task_id: task_id.to_string(),
                 queue: queue.clone(),
-                events,
             }))
         } else if start_at_ms <= now_ms {
             // [SILO-ENQ-CONC-4] Queue is at capacity
@@ -253,7 +329,17 @@ impl ConcurrencyManager {
         }
     }
 
-    /// Process a RequestTicket task during dequeue
+    /// Rollback a grant that was made by `handle_enqueue` if the DB write fails.
+    /// Call this with the queue and task_id from the GrantedImmediately outcome.
+    pub fn rollback_grant(&self, tenant: &str, queue: &str, task_id: &str) {
+        self.counts.release_reservation(tenant, queue, task_id);
+    }
+
+    /// Process a RequestTicket task during dequeue.
+    ///
+    /// IMPORTANT: This method atomically reserves in-memory concurrency slots when granting.
+    /// If the DB write fails after calling this with a Granted outcome, you MUST call
+    /// `rollback_grant` to release the reservation.
     #[allow(clippy::too_many_arguments)]
     pub fn process_ticket_request_task(
         &self,
@@ -282,12 +368,12 @@ impl ConcurrencyManager {
             }
         }
 
-        // Check if can grant
-        if !self.counts.can_grant(tenant, queue, max_allowed) {
+        // Atomically check and reserve the slot to prevent TOCTOU races
+        if !self.counts.try_reserve(tenant, queue, request_id, max_allowed) {
             return Ok(RequestTicketTaskOutcome::Requested);
         }
 
-        // Grant: create holder, delete ticket
+        // Grant: create holder in DB, delete ticket
         let holder = HolderRecord {
             granted_at_ms: now_ms,
         };
@@ -304,7 +390,14 @@ impl ConcurrencyManager {
         })
     }
 
-    /// Release holders and grant next requests
+    /// Release holders and grant next requests.
+    ///
+    /// IMPORTANT: This method updates in-memory counts BEFORE returning (atomically).
+    /// If the DB write fails, you MUST call `rollback_release_grants` with the returned
+    /// rollback info to revert the in-memory changes.
+    ///
+    /// Returns a tuple of (rollback_info, queues_to_wakeup).
+    /// Call broker.wakeup() for each queue after successful DB write.
     pub async fn release_and_grant_next(
         &self,
         db: &Db,
@@ -313,13 +406,139 @@ impl ConcurrencyManager {
         queues: &[String],
         finished_task_id: &str,
         now_ms: i64,
-    ) -> Result<Vec<MemoryEvent>, String> {
-        append_release_and_grant_next(db, batch, tenant, queues, finished_task_id, now_ms).await
+    ) -> Result<Vec<ReleaseGrantRollback>, String> {
+        let mut rollbacks: Vec<ReleaseGrantRollback> = Vec::new();
+
+        for queue in queues {
+            // [SILO-REL-1] Remove holder for this task/queue from DB
+            batch.delete(concurrency_holder_key(tenant, queue, finished_task_id).as_bytes());
+
+            // [SILO-GRANT-1] Queue now has capacity (we just released)
+            // [SILO-GRANT-2] Find pending requests for this queue
+            let start = format!("requests/{}/{}/", tenant, queue).into_bytes();
+            let mut end: Vec<u8> = format!("requests/{}/{}/", tenant, queue).into_bytes();
+            end.push(0xFF);
+            let mut iter: DbIterator = db
+                .scan::<Vec<u8>, _>(start..=end)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            let mut granted_task_id: Option<String> = None;
+
+            while let Some(kv) = iter.next().await.map_err(|e| e.to_string())? {
+                type ArchivedAction = <ConcurrencyAction as rkyv::Archive>::Archived;
+                let decoded = decode_concurrency_action(&kv.value)?;
+                let a: &ArchivedAction = decoded.archived();
+                match a {
+                    ArchivedAction::EnqueueTask {
+                        start_time_ms,
+                        priority,
+                        job_id,
+                        attempt_number,
+                        task_group,
+                    } => {
+                        let job_id_str = job_id.as_str();
+                        let task_group_str = task_group.as_str();
+
+                        // [SILO-GRANT-CXL] Check if job is cancelled - if so, delete request and continue
+                        let cancelled_key = job_cancelled_key(tenant, job_id_str);
+                        let is_cancelled = db
+                            .get(cancelled_key.as_bytes())
+                            .await
+                            .map_err(|e| e.to_string())?
+                            .is_some();
+
+                        if is_cancelled {
+                            // [SILO-GRANT-CXL-2] Delete the cancelled request without granting
+                            batch.delete(&kv.key);
+                            tracing::debug!(
+                                job_id = %job_id_str,
+                                queue = %queue,
+                                "grant_next: skipping cancelled job request"
+                            );
+                            continue;
+                        }
+
+                        let req_key_str = String::from_utf8_lossy(&kv.key).to_string();
+                        let request_id = req_key_str.split('/').next_back().unwrap_or("").to_string();
+
+                        if *start_time_ms > now_ms {
+                            // Not ready yet; leave request for later and stop searching
+                            // (requests are ordered by time, so subsequent ones are also not ready)
+                            break;
+                        }
+
+                        // [SILO-GRANT-3] Create holder for this task/queue in DB
+                        let holder = HolderRecord {
+                            granted_at_ms: now_ms,
+                        };
+                        let holder_val = encode_holder(&holder)?;
+                        batch.put(
+                            concurrency_holder_key(tenant, queue, &request_id).as_bytes(),
+                            &holder_val,
+                        );
+
+                        // [SILO-GRANT-4] Create RunAttempt task in DB queue
+                        let task = Task::RunAttempt {
+                            id: request_id.clone(),
+                            tenant: tenant.to_string(),
+                            job_id: job_id_str.to_string(),
+                            attempt_number: *attempt_number,
+                            held_queues: vec![queue.clone()],
+                            task_group: task_group_str.to_string(),
+                        };
+                        let tval = encode_task(&task)?;
+                        batch.put(
+                            task_key(task_group_str, *start_time_ms, *priority, job_id_str, *attempt_number).as_bytes(),
+                            &tval,
+                        );
+                        batch.delete(&kv.key);
+
+                        granted_task_id = Some(request_id);
+
+                        // Only grant one request per release
+                        break;
+                    }
+                }
+            }
+
+            // Update in-memory counts ATOMICALLY before returning
+            // This prevents a race window where capacity appears available
+            if let Some(ref new_task_id) = granted_task_id {
+                // Release old + grant new in one atomic operation
+                self.counts.atomic_release_and_reserve(tenant, queue, finished_task_id, new_task_id);
+            } else {
+                // Just release, no grant
+                self.counts.atomic_release(tenant, queue, finished_task_id);
+            }
+
+            rollbacks.push(ReleaseGrantRollback {
+                tenant: tenant.to_string(),
+                queue: queue.clone(),
+                released_task_id: finished_task_id.to_string(),
+                granted_task_id,
+            });
+        }
+
+        Ok(rollbacks)
+    }
+
+    /// Rollback release_and_grant operations if DB write fails.
+    pub fn rollback_release_grants(&self, rollbacks: &[ReleaseGrantRollback]) {
+        for rb in rollbacks {
+            if let Some(ref granted) = rb.granted_task_id {
+                self.counts.rollback_release_and_reserve(&rb.tenant, &rb.queue, &rb.released_task_id, granted);
+            } else {
+                self.counts.rollback_release(&rb.tenant, &rb.queue, &rb.released_task_id);
+            }
+        }
     }
 }
 
 // Internal helper functions
 
+/// Append DB edits to grant a concurrency slot: creates holder record and RunAttempt task.
+/// Note: In-memory reservation should already be done via try_reserve before calling this.
 #[allow(clippy::too_many_arguments)]
 fn append_grant_edits(
     batch: &mut WriteBatch,
@@ -332,7 +551,7 @@ fn append_grant_edits(
     job_id: &str,
     attempt_number: u32,
     task_group: &str,
-) -> Result<Vec<MemoryEvent>, String> {
+) -> Result<(), String> {
     let holder = HolderRecord {
         granted_at_ms: now_ms,
     };
@@ -356,10 +575,7 @@ fn append_grant_edits(
         &task_value,
     );
 
-    Ok(vec![MemoryEvent::Granted {
-        queue: queue.to_string(),
-        task_id: task_id.to_string(),
-    }])
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -393,111 +609,3 @@ fn append_request_edits(
     Ok(())
 }
 
-async fn append_release_and_grant_next(
-    db: &Db,
-    batch: &mut WriteBatch,
-    tenant: &str,
-    queues: &[String],
-    finished_task_id: &str,
-    now_ms: i64,
-) -> Result<Vec<MemoryEvent>, String> {
-    let mut events: Vec<MemoryEvent> = Vec::new();
-    for queue in queues {
-        // [SILO-REL-1] Remove holder for this task/queue
-        batch.delete(concurrency_holder_key(tenant, queue, finished_task_id).as_bytes());
-        events.push(MemoryEvent::Released {
-            queue: queue.clone(),
-            task_id: finished_task_id.to_string(),
-        });
-
-        // [SILO-GRANT-1] Queue now has capacity (we just released)
-        // [SILO-GRANT-2] Find pending requests for this queue
-        let start = format!("requests/{}/{}/", tenant, queue).into_bytes();
-        let mut end: Vec<u8> = format!("requests/{}/{}/", tenant, queue).into_bytes();
-        end.push(0xFF);
-        let mut iter: DbIterator = db
-            .scan::<Vec<u8>, _>(start..=end)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        while let Some(kv) = iter.next().await.map_err(|e| e.to_string())? {
-            type ArchivedAction = <ConcurrencyAction as rkyv::Archive>::Archived;
-            let decoded = decode_concurrency_action(&kv.value)?;
-            let a: &ArchivedAction = decoded.archived();
-            match a {
-                ArchivedAction::EnqueueTask {
-                    start_time_ms,
-                    priority,
-                    job_id,
-                    attempt_number,
-                    task_group,
-                } => {
-                    let job_id_str = job_id.as_str();
-                    let task_group_str = task_group.as_str();
-
-                    // [SILO-GRANT-CXL] Check if job is cancelled - if so, delete request and continue
-                    let cancelled_key = job_cancelled_key(tenant, job_id_str);
-                    let is_cancelled = db
-                        .get(cancelled_key.as_bytes())
-                        .await
-                        .map_err(|e| e.to_string())?
-                        .is_some();
-
-                    if is_cancelled {
-                        // [SILO-GRANT-CXL-2] Delete the cancelled request without granting
-                        batch.delete(&kv.key);
-                        tracing::debug!(
-                            job_id = %job_id_str,
-                            queue = %queue,
-                            "grant_next: skipping cancelled job request"
-                        );
-                        continue;
-                    }
-
-                    let req_key_str = String::from_utf8_lossy(&kv.key).to_string();
-                    let request_id = req_key_str.split('/').next_back().unwrap_or("").to_string();
-
-                    if *start_time_ms > now_ms {
-                        // Not ready yet; leave request for later and stop searching
-                        // (requests are ordered by time, so subsequent ones are also not ready)
-                        break;
-                    }
-
-                    // [SILO-GRANT-3] Create holder for this task/queue
-                    let holder = HolderRecord {
-                        granted_at_ms: now_ms,
-                    };
-                    let holder_val = encode_holder(&holder)?;
-                    batch.put(
-                        concurrency_holder_key(tenant, queue, &request_id).as_bytes(),
-                        &holder_val,
-                    );
-
-                    // [SILO-GRANT-4] Create RunAttempt task in DB queue
-                    let task = Task::RunAttempt {
-                        id: request_id.clone(),
-                        tenant: tenant.to_string(),
-                        job_id: job_id_str.to_string(),
-                        attempt_number: *attempt_number,
-                        held_queues: vec![queue.clone()],
-                        task_group: task_group_str.to_string(),
-                    };
-                    let tval = encode_task(&task)?;
-                    batch.put(
-                        task_key(task_group_str, *start_time_ms, *priority, job_id_str, *attempt_number).as_bytes(),
-                        &tval,
-                    );
-                    batch.delete(&kv.key);
-                    events.push(MemoryEvent::Granted {
-                        queue: queue.clone(),
-                        task_id: request_id,
-                    });
-
-                    // Only grant one request per release
-                    break;
-                }
-            }
-        }
-    }
-    Ok(events)
-}

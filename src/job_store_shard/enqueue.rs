@@ -4,7 +4,7 @@ use slatedb::WriteBatch;
 use uuid::Uuid;
 
 use crate::codec::{encode_job_info, encode_job_status};
-use crate::concurrency::{MemoryEvent, RequestTicketOutcome};
+use crate::concurrency::RequestTicketOutcome;
 use crate::job::{JobInfo, JobStatus, Limit};
 use crate::job_store_shard::helpers::{now_epoch_ms, put_task};
 use crate::job_store_shard::JobStoreShard;
@@ -199,30 +199,44 @@ impl JobStoreShard {
             }
         }
 
-        self.db.write(batch).await?;
-        self.db.flush().await?;
+        // Track grant info for potential rollback
+        let grant_info: Option<(String, String)> = match &concurrency_outcome {
+            Some(RequestTicketOutcome::GrantedImmediately { queue, task_id }) => {
+                Some((queue.clone(), task_id.clone()))
+            }
+            _ => None,
+        };
 
-        // Apply memory events and log after durable commit
+        // Write to DB - if this fails, we need to rollback the in-memory reservation
+        if let Err(e) = self.db.write(batch).await {
+            if let Some((queue, task_id)) = grant_info {
+                self.concurrency.rollback_grant(tenant, &queue, &task_id);
+            }
+            return Err(e.into());
+        }
+        if let Err(e) = self.db.flush().await {
+            // Note: write succeeded but flush failed - the grant is committed,
+            // so we don't rollback here
+            return Err(e.into());
+        }
+
+        // Log outcome after durable commit
         if let Some(outcome) = concurrency_outcome {
             match outcome {
-                RequestTicketOutcome::GrantedImmediately { events, .. } => {
-                    for ev in events {
-                        if let MemoryEvent::Granted { queue, task_id } = ev {
-                            let span = info_span!("concurrency.grant", queue = %queue, task_id = %task_id, job_id = %job_id, attempt = 1u32, source = "immediate");
-                            let _g = span.enter();
-                            self.concurrency
-                                .counts()
-                                .record_grant(tenant, &queue, &task_id);
-                        }
-                    }
+                RequestTicketOutcome::GrantedImmediately { queue, task_id } => {
+                    let span = info_span!("concurrency.grant", queue = %queue, task_id = %task_id, job_id = %job_id, attempt = 1u32, source = "immediate");
+                    let _g = span.enter();
+                    tracing::debug!("granted concurrency slot immediately");
                 }
                 RequestTicketOutcome::TicketRequested { queue } => {
                     let span = info_span!("concurrency.request", queue = %queue, job_id = %job_id, attempt = 1u32, start_at_ms = start_at_ms, priority = priority);
                     let _g = span.enter();
+                    tracing::debug!("queued concurrency request");
                 }
-                RequestTicketOutcome::FutureRequestTaskWritten { queue, .. } => {
-                    let span = info_span!("concurrency.ticket", queue = %queue, job_id = %job_id, attempt = 1u32, start_at_ms = start_at_ms, priority = priority);
+                RequestTicketOutcome::FutureRequestTaskWritten { queue, task_id } => {
+                    let span = info_span!("concurrency.ticket", queue = %queue, task_id = %task_id, job_id = %job_id, attempt = 1u32, start_at_ms = start_at_ms, priority = priority);
                     let _g = span.enter();
+                    tracing::debug!("wrote future request ticket task");
                 }
             }
         }
