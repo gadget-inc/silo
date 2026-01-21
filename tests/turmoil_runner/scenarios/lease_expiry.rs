@@ -87,7 +87,7 @@ pub fn run() {
 
             tracing::trace!(worker = "worker1", count = lease.tasks.len(), "lease");
 
-            if !lease.tasks.is_empty() {
+            let leased_task_info: Option<(String, String)> = if !lease.tasks.is_empty() {
                 let task = &lease.tasks[0];
                 // Track lease and attempt number
                 job_tracker_w1.task_leased(&task.job_id, &task.id);
@@ -98,6 +98,15 @@ pub fn run() {
                     attempt = task.attempt_number,
                     "lease_acquired"
                 );
+                Some((task.job_id.clone(), task.id.clone()))
+            } else {
+                None
+            };
+
+            // Release from tracker BEFORE crashing. The server's lease reaper will
+            // release the expired lease server-side, so we simulate that here.
+            if let Some((job_id, task_id)) = &leased_task_info {
+                job_tracker_w1.task_released(job_id, task_id);
             }
 
             // Simulate crash
@@ -157,6 +166,9 @@ pub fn run() {
                             );
                             worker2_got_task_clone.store(true, Ordering::SeqCst);
 
+                            // Release from tracker BEFORE report_outcome (server releases immediately)
+                            job_tracker_w2.task_released(&task.job_id, &task.id);
+
                             client
                                 .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                                     shard: 0,
@@ -173,8 +185,7 @@ pub fn run() {
                                 }))
                                 .await?;
 
-                            // Track completion
-                            job_tracker_w2.task_released(&task.job_id, &task.id);
+                            // Track completion (release already done above)
                             job_tracker_w2.job_completed(&task.job_id);
 
                             tracing::trace!(worker = "worker2", job_id = %task.job_id, "complete");

@@ -34,6 +34,35 @@ use std::sync::Arc;
 use std::time::Duration;
 use tonic::transport::Endpoint;
 
+/// Connect to the server with retries.
+/// In chaos mode, the initial connection can fail due to message loss.
+async fn connect_with_retry(
+    endpoint: &str,
+    max_retries: u32,
+) -> turmoil::Result<SiloClient<tonic::transport::Channel>> {
+    let mut last_error: Option<String> = None;
+    for attempt in 0..max_retries {
+        match Endpoint::new(endpoint.to_string())
+            .map_err(|e| e.to_string())?
+            .connect_with_connector(turmoil_connector())
+            .await
+        {
+            Ok(ch) => return Ok(SiloClient::new(ch)),
+            Err(e) => {
+                tracing::trace!(
+                    attempt = attempt,
+                    error = %e,
+                    "connection attempt failed, retrying"
+                );
+                last_error = Some(e.to_string());
+                // Exponential backoff
+                tokio::time::sleep(Duration::from_millis(50 * (1 << attempt.min(4)))).await;
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "no connection attempts made".to_string()).into())
+}
+
 /// Concurrency limit configurations for chaos testing
 const CHAOS_LIMITS: &[(&str, u32)] = &[
     ("chaos-mutex", 1),     // Strict serialization
@@ -48,10 +77,10 @@ pub fn run() {
         let mut config_rng = StdRng::seed_from_u64(seed);
 
         // Randomize network conditions based on seed
-        let fail_rate = 0.05 + 0.15 * (config_rng.gen_range(0..100) as f64 / 100.0);
-        let max_latency_ms = config_rng.gen_range(5..100);
-        let num_workers = config_rng.gen_range(2..=6);
-        let num_jobs = config_rng.gen_range(15..=40);
+        let fail_rate = 0.05 + 0.15 * (config_rng.random_range(0..100) as f64 / 100.0);
+        let max_latency_ms = config_rng.random_range(5..100);
+        let num_workers = config_rng.random_range(2..=6);
+        let num_jobs = config_rng.random_range(15..=40);
 
         tracing::info!(
             fail_rate = fail_rate,
@@ -90,19 +119,16 @@ pub fn run() {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let mut rng = StdRng::seed_from_u64(producer_seed.wrapping_add(1));
 
-            let ch = Endpoint::new("http://server:9910")?
-                .connect_with_connector(turmoil_connector())
-                .await?;
-            let mut client = SiloClient::new(ch);
+            let mut client = connect_with_retry("http://server:9910", 10).await?;
 
             for i in 0..producer_num_jobs {
                 // Randomly select a limit configuration (including "unlimited")
-                let (limit_key, max_conc) = CHAOS_LIMITS[rng.gen_range(0..CHAOS_LIMITS.len())];
+                let (limit_key, max_conc) = CHAOS_LIMITS[rng.random_range(0..CHAOS_LIMITS.len())];
                 let job_id = format!("{}-{}", limit_key, i);
-                let priority = rng.gen_range(1..100);
+                let priority = rng.random_range(1..100);
 
                 // Random delay between enqueues
-                let delay_ms = rng.gen_range(0..50);
+                let delay_ms = rng.random_range(0..50);
                 if delay_ms > 0 {
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
@@ -120,9 +146,9 @@ pub fn run() {
                 };
 
                 // Some jobs get retry policies
-                let retry_policy = if rng.gen_ratio(30, 100) {
+                let retry_policy = if rng.random_ratio(30, 100) {
                     Some(RetryPolicy {
-                        retry_count: rng.gen_range(1..=3),
+                        retry_count: rng.random_range(1..=3),
                         initial_interval_ms: 100,
                         max_interval_ms: 1000,
                         randomize_interval: true,
@@ -187,19 +213,16 @@ pub fn run() {
             tokio::time::sleep(Duration::from_millis(500)).await;
             let mut rng = StdRng::seed_from_u64(canceller_seed.wrapping_add(99));
 
-            let ch = Endpoint::new("http://server:9910")?
-                .connect_with_connector(turmoil_connector())
-                .await?;
-            let mut client = SiloClient::new(ch);
+            let mut client = connect_with_retry("http://server:9910", 10).await?;
 
             // Cancel a few random jobs
-            let num_cancels = rng.gen_range(2..=5);
+            let num_cancels = rng.random_range(2..=5);
             for _ in 0..num_cancels {
-                let limit_idx = rng.gen_range(0..CHAOS_LIMITS.len());
-                let job_idx = rng.gen_range(0..20);
+                let limit_idx = rng.random_range(0..CHAOS_LIMITS.len());
+                let job_idx = rng.random_range(0..20);
                 let job_id = format!("{}-{}", CHAOS_LIMITS[limit_idx].0, job_idx);
 
-                tokio::time::sleep(Duration::from_millis(rng.gen_range(100..500))).await;
+                tokio::time::sleep(Duration::from_millis(rng.random_range(100..500))).await;
 
                 match client
                     .cancel_job(tonic::Request::new(CancelJobRequest {
@@ -241,10 +264,7 @@ pub fn run() {
 
                 let mut rng = StdRng::seed_from_u64(worker_seed);
 
-                let ch = Endpoint::new("http://server:9910")?
-                    .connect_with_connector(turmoil_connector())
-                    .await?;
-                let mut client = SiloClient::new(ch);
+                let mut client = connect_with_retry("http://server:9910", 10).await?;
 
                 let mut completed = 0u32;
                 let mut failed = 0u32;
@@ -256,7 +276,7 @@ pub fn run() {
                     }
 
                     // Random batch size
-                    let max_tasks = rng.gen_range(1..=5);
+                    let max_tasks = rng.random_range(1..=5);
 
                     let lease_result = client
                         .lease_tasks(tonic::Request::new(LeaseTasksRequest {
@@ -318,7 +338,7 @@ pub fn run() {
 
                     // Process tasks
                     if !processing.is_empty() {
-                        let num_to_complete = rng.gen_range(1..=processing.len());
+                        let num_to_complete = rng.random_range(1..=processing.len());
                         let mut indices_to_remove: HashSet<usize> = HashSet::new();
 
                         for i in 0..num_to_complete {
@@ -329,11 +349,11 @@ pub fn run() {
                             let task = &processing[i];
 
                             // Random processing time
-                            let process_time = rng.gen_range(5..100);
+                            let process_time = rng.random_range(5..100);
                             tokio::time::sleep(Duration::from_millis(process_time)).await;
 
                             // 10% chance of failure
-                            let should_fail = rng.gen_ratio(10, 100);
+                            let should_fail = rng.random_ratio(10, 100);
 
                             let outcome = if should_fail {
                                 report_outcome_request::Outcome::Failure(silo::pb::Failure {
@@ -347,6 +367,26 @@ pub fn run() {
                                 })
                             };
 
+                            // Release from tracker BEFORE report_outcome because the server
+                            // will release and potentially grant to another worker immediately
+                            let limit_key = task
+                                .job_id
+                                .split('-')
+                                .take(2)
+                                .collect::<Vec<_>>()
+                                .join("-");
+                            worker_tracker.jobs.task_released(&task.job_id, &task.id);
+                            let is_limited = CHAOS_LIMITS
+                                .iter()
+                                .any(|(k, c)| *k == limit_key && *c > 0);
+                            if is_limited {
+                                worker_tracker.concurrency.release(
+                                    &limit_key,
+                                    &task.id,
+                                    &task.job_id,
+                                );
+                            }
+
                             match client
                                 .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                                     shard: 0,
@@ -357,27 +397,7 @@ pub fn run() {
                                 .await
                             {
                                 Ok(_) => {
-                                    let limit_key = task
-                                        .job_id
-                                        .split('-')
-                                        .take(2)
-                                        .collect::<Vec<_>>()
-                                        .join("-");
-
-                                    // Release lease tracking
-                                    worker_tracker.jobs.task_released(&task.job_id, &task.id);
-
-                                    // Release concurrency if limited
-                                    let is_limited = CHAOS_LIMITS
-                                        .iter()
-                                        .any(|(k, c)| *k == limit_key && *c > 0);
-                                    if is_limited {
-                                        worker_tracker.concurrency.release(
-                                            &limit_key,
-                                            &task.id,
-                                            &task.job_id,
-                                        );
-                                    }
+                                    // Releases already done above
 
                                     if should_fail {
                                         tracing::trace!(
@@ -408,6 +428,15 @@ pub fn run() {
                                     indices_to_remove.insert(i);
                                 }
                                 Err(e) => {
+                                    // Re-acquire since we pre-released but the report failed
+                                    worker_tracker.jobs.task_leased(&task.job_id, &task.id);
+                                    if is_limited {
+                                        worker_tracker.concurrency.acquire(
+                                            &limit_key,
+                                            &task.id,
+                                            &task.job_id,
+                                        );
+                                    }
                                     tracing::trace!(
                                         worker = %worker_id,
                                         job_id = %task.job_id,
@@ -427,14 +456,30 @@ pub fn run() {
                     }
 
                     // Random delay between rounds
-                    let delay = rng.gen_range(10..150);
+                    let delay = rng.random_range(10..150);
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                 }
 
                 // Finish remaining tasks
                 for task in &processing {
-                    let process_time = rng.gen_range(5..30);
+                    let process_time = rng.random_range(5..30);
                     tokio::time::sleep(Duration::from_millis(process_time)).await;
+
+                    // Release from tracker BEFORE report_outcome
+                    let limit_key = task
+                        .job_id
+                        .split('-')
+                        .take(2)
+                        .collect::<Vec<_>>()
+                        .join("-");
+                    worker_tracker.jobs.task_released(&task.job_id, &task.id);
+                    let is_limited =
+                        CHAOS_LIMITS.iter().any(|(k, c)| *k == limit_key && *c > 0);
+                    if is_limited {
+                        worker_tracker
+                            .concurrency
+                            .release(&limit_key, &task.id, &task.job_id);
+                    }
 
                     match client
                         .report_outcome(tonic::Request::new(ReportOutcomeRequest {
@@ -448,22 +493,7 @@ pub fn run() {
                         .await
                     {
                         Ok(_) => {
-                            let limit_key = task
-                                .job_id
-                                .split('-')
-                                .take(2)
-                                .collect::<Vec<_>>()
-                                .join("-");
-
-                            worker_tracker.jobs.task_released(&task.job_id, &task.id);
-
-                            let is_limited =
-                                CHAOS_LIMITS.iter().any(|(k, c)| *k == limit_key && *c > 0);
-                            if is_limited {
-                                worker_tracker
-                                    .concurrency
-                                    .release(&limit_key, &task.id, &task.job_id);
-                            }
+                            // Releases already done above
 
                             let was_new = worker_tracker.jobs.job_completed(&task.job_id);
                             if was_new {
@@ -478,6 +508,15 @@ pub fn run() {
                             );
                         }
                         Err(e) => {
+                            // Re-acquire since we pre-released but the report failed
+                            worker_tracker.jobs.task_leased(&task.job_id, &task.id);
+                            if is_limited {
+                                worker_tracker.concurrency.acquire(
+                                    &limit_key,
+                                    &task.id,
+                                    &task.job_id,
+                                );
+                            }
                             tracing::trace!(
                                 worker = %worker_id,
                                 job_id = %task.job_id,
@@ -507,13 +546,13 @@ pub fn run() {
             let mut rng = StdRng::seed_from_u64(partition_seed.wrapping_add(200));
 
             // Inject a few partitions during the scenario
-            let num_partitions = rng.gen_range(1..=3);
+            let num_partitions = rng.random_range(1..=3);
             for p in 0..num_partitions {
                 // Random delay between partitions
-                tokio::time::sleep(Duration::from_millis(rng.gen_range(2000..5000))).await;
+                tokio::time::sleep(Duration::from_millis(rng.random_range(2000..5000))).await;
 
                 // Pick a random worker to partition
-                let worker_to_partition = rng.gen_range(0..partition_num_workers);
+                let worker_to_partition = rng.random_range(0..partition_num_workers);
                 let worker_name = format!("worker{}", worker_to_partition);
 
                 let sim_time = turmoil::sim_elapsed().map(|d| d.as_millis()).unwrap_or(0);
@@ -527,7 +566,7 @@ pub fn run() {
                 turmoil::partition(worker_name.as_str(), "server");
 
                 // Partition duration
-                let partition_duration = rng.gen_range(500..2000);
+                let partition_duration = rng.random_range(500..2000);
                 tokio::time::sleep(Duration::from_millis(partition_duration)).await;
 
                 turmoil::repair(worker_name.as_str(), "server");
@@ -555,10 +594,7 @@ pub fn run() {
             // Wait for work to start
             tokio::time::sleep(Duration::from_millis(500)).await;
 
-            let ch = Endpoint::new("http://server:9910")?
-                .connect_with_connector(turmoil_connector())
-                .await?;
-            let mut client = SiloClient::new(ch);
+            let mut client = connect_with_retry("http://server:9910", 10).await?;
 
             // Periodically verify invariants
             for check in 0..20 {
