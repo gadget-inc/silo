@@ -256,6 +256,7 @@ impl ConcurrencyManager {
         now_ms: i64,
         limits: &[ConcurrencyLimit],
         task_group: &str,
+        attempt_number: u32,
     ) -> Result<Option<RequestTicketOutcome>, String> {
         // Only gate on the first limit (if any)
         let Some(limit) = limits.first() else {
@@ -279,7 +280,7 @@ impl ConcurrencyManager {
                 start_at_ms,
                 priority,
                 job_id,
-                1,
+                attempt_number,
                 task_group,
             )?;
             Ok(Some(RequestTicketOutcome::GrantedImmediately {
@@ -298,7 +299,7 @@ impl ConcurrencyManager {
                 start_at_ms,
                 priority,
                 job_id,
-                1,
+                attempt_number,
                 task_group,
             )?;
             Ok(Some(RequestTicketOutcome::TicketRequested {
@@ -313,13 +314,13 @@ impl ConcurrencyManager {
                 priority,
                 tenant: tenant.to_string(),
                 job_id: job_id.to_string(),
-                attempt_number: 1,
+                attempt_number,
                 request_id: request_id.clone(),
                 task_group: task_group.to_string(),
             };
             let ticket_value = encode_task(&ticket)?;
             batch.put(
-                task_key(task_group, start_at_ms, priority, job_id, 1).as_bytes(),
+                task_key(task_group, start_at_ms, priority, job_id, attempt_number).as_bytes(),
                 &ticket_value,
             );
             Ok(Some(RequestTicketOutcome::FutureRequestTaskWritten {

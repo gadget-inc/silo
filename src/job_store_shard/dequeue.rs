@@ -221,20 +221,26 @@ impl JobStoreShard {
                         match rate_limit_result {
                             Ok(result) if result.under_limit => {
                                 // Rate limit passed! Proceed to next limit or RunAttempt
-                                self.enqueue_next_limit_task(
-                                    &mut batch,
-                                    &tenant,
-                                    check_task_id,
-                                    job_id,
-                                    *attempt_number,
-                                    *limit_index,
-                                    &job_view.limits(),
-                                    *priority,
-                                    now_ms,
-                                    now_ms,
-                                    held_queues.clone(),
-                                    check_task_group,
-                                )?;
+                                let grants = self
+                                    .enqueue_limit_task_at_index(
+                                        &mut batch,
+                                        &tenant,
+                                        check_task_id,
+                                        job_id,
+                                        *attempt_number,
+                                        (*limit_index + 1) as usize, // next limit after current
+                                        &job_view.limits(),
+                                        *priority,
+                                        now_ms,
+                                        now_ms,
+                                        held_queues.clone(),
+                                        check_task_group,
+                                    )
+                                    .await?;
+                                // Track any immediate grants for rollback if DB write fails
+                                for (queue, task_id) in grants {
+                                    grants_to_rollback.push((tenant.clone(), queue, task_id));
+                                }
                             }
                             Ok(result) => {
                                 // Over limit - schedule retry

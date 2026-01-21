@@ -1,8 +1,10 @@
 mod test_helpers;
 
 use silo::codec::decode_task;
+use silo::job::Limit;
 use silo::job_attempt::AttemptOutcome;
 use silo::keys::concurrency_holder_key;
+use silo::retry::RetryPolicy;
 use silo::task::Task;
 use std::collections::HashSet;
 use std::sync::{
@@ -921,5 +923,268 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
         .expect("report1");
     let after = first_kv_with_prefix(shard.db(), "tasks/").await;
     assert!(after.is_some(), "one task should be enqueued after release");
+}
+
+/// BUG TEST: When a job with concurrency limits fails and schedules a retry, the retry
+/// task must NOT claim to hold the concurrency slot because the slot is released and
+/// may be granted to another waiting job.
+///
+/// This test reproduces the bug found in DST chaos scenario with seed 2137192077:
+/// - Job A (with mutex concurrency limit and retry policy) runs
+/// - Job B (with same mutex) enqueues and waits for the slot
+/// - Job A fails and schedules a retry
+/// - The bug: A's retry task has held_queues populated, AND the slot is granted to B
+/// - Result: Both A's retry and B are returned in the same dequeue, violating the mutex
+#[silo::test]
+async fn retry_with_concurrency_must_reacquire_slot_not_claim_released_slot() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let queue = "mutex-retry-bug".to_string();
+
+    // Job A: has mutex concurrency limit AND a retry policy
+    let job_a = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            Some(RetryPolicy {
+                retry_count: 1,
+                initial_interval_ms: 1, // Very short retry interval so retry is immediately ready
+                max_interval_ms: i64::MAX,
+                randomize_interval: false,
+                backoff_factor: 1.0,
+            }),
+            test_helpers::msgpack_payload(&serde_json::json!({"job": "A"})),
+            vec![Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1, // Mutex - only 1 job at a time
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue A");
+
+    // Dequeue Job A - it gets the slot
+    let tasks_a = shard.dequeue("worker", "default", 1).await.expect("dequeue A").tasks;
+    assert_eq!(tasks_a.len(), 1, "Job A should be dequeued");
+    assert_eq!(tasks_a[0].job().id(), job_a);
+    let task_a_id = tasks_a[0].attempt().task_id().to_string();
+
+    // Verify Job A has the holder
+    let holder_a = shard
+        .db()
+        .get(concurrency_holder_key("-", &queue, &task_a_id).as_bytes())
+        .await
+        .expect("get holder A");
+    assert!(holder_a.is_some(), "Job A should have the holder");
+
+    // Job B: same mutex, no retry policy
+    let job_b = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"job": "B"})),
+            vec![Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue B");
+
+    // Job B should NOT be runnable yet (mutex is held by A)
+    let tasks_while_a_running = shard.dequeue("worker", "default", 1).await.expect("dequeue while A running").tasks;
+    assert_eq!(
+        tasks_while_a_running.len(),
+        0,
+        "Job B should NOT be runnable while A holds the mutex"
+    );
+
+    // Job A fails - this should:
+    // 1. Release A's concurrency slot
+    // 2. Grant the slot to waiting Job B
+    // 3. Schedule a retry for A (but the retry must NOT claim to hold the slot!)
+    shard
+        .report_attempt_outcome(
+            "-",
+            &task_a_id,
+            AttemptOutcome::Error {
+                error_code: "TEST_FAILURE".to_string(),
+                error: b"simulated failure".to_vec(),
+            },
+        )
+        .await
+        .expect("report A failure");
+
+    // Now dequeue - we should get EXACTLY ONE task (Job B which was granted the slot)
+    // The bug would cause us to get BOTH Job B AND Job A's retry
+    let tasks_after_failure = shard.dequeue("worker", "default", 10).await.expect("dequeue after failure").tasks;
+
+    // Critical assertion: only ONE task should be runnable with max_concurrency=1
+    assert_eq!(
+        tasks_after_failure.len(),
+        1,
+        "BUG: Got {} tasks but max_concurrency=1, only 1 should be runnable. \
+         Jobs returned: {:?}",
+        tasks_after_failure.len(),
+        tasks_after_failure.iter().map(|t| t.job().id()).collect::<Vec<_>>()
+    );
+
+    // That one task should be Job B (which was granted the slot)
+    assert_eq!(
+        tasks_after_failure[0].job().id(),
+        job_b,
+        "Job B should have been granted the slot after A released it"
+    );
+
+    // Verify only one holder exists
+    let holder_count = count_with_prefix(shard.db(), "holders/").await;
+    assert_eq!(
+        holder_count, 1,
+        "Should have exactly 1 holder (for Job B)"
+    );
+
+    // Complete Job B
+    let task_b_id = tasks_after_failure[0].attempt().task_id().to_string();
+    shard
+        .report_attempt_outcome("-", &task_b_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report B success");
+
+    // Now Job A's retry should be able to run (after B released the slot)
+    let tasks_after_b = shard.dequeue("worker", "default", 10).await.expect("dequeue after B").tasks;
+    assert_eq!(
+        tasks_after_b.len(),
+        1,
+        "Job A's retry should be runnable after B completed"
+    );
+    assert_eq!(
+        tasks_after_b[0].job().id(),
+        job_a,
+        "Should be Job A's retry"
+    );
+    assert_eq!(
+        tasks_after_b[0].attempt().attempt_number(),
+        2,
+        "Should be attempt 2 (retry)"
+    );
+}
+
+/// Test that retry tasks properly go through the concurrency request flow
+/// when there are waiting jobs that should get the slot first.
+#[silo::test]
+async fn retry_must_wait_for_slot_when_another_job_was_granted() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let queue = "retry-wait-q".to_string();
+
+    // Job A with retry
+    let job_a = shard
+        .enqueue(
+            "-",
+            None,
+            5u8, // Lower priority
+            now,
+            Some(RetryPolicy {
+                retry_count: 1,
+                initial_interval_ms: 1,
+                max_interval_ms: i64::MAX,
+                randomize_interval: false,
+                backoff_factor: 1.0,
+            }),
+            test_helpers::msgpack_payload(&serde_json::json!({"job": "A"})),
+            vec![Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue A");
+
+    // Dequeue A
+    let tasks_a = shard.dequeue("w", "default", 1).await.expect("deq A").tasks;
+    let task_a_id = tasks_a[0].attempt().task_id().to_string();
+
+    // Enqueue B and C while A is running - they wait
+    let job_b = shard
+        .enqueue(
+            "-",
+            None,
+            10u8, // Higher priority than A's retry
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"job": "B"})),
+            vec![Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue B");
+
+    let job_c = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"job": "C"})),
+            vec![Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue C");
+
+    // Fail A - one of B or C should get the slot, A's retry should wait
+    shard
+        .report_attempt_outcome(
+            "-",
+            &task_a_id,
+            AttemptOutcome::Error {
+                error_code: "E".to_string(),
+                error: vec![],
+            },
+        )
+        .await
+        .expect("report A fail");
+
+    // Should get exactly 1 task (either B or C, but NOT A's retry)
+    let tasks = shard.dequeue("w", "default", 10).await.expect("deq after A fail").tasks;
+    assert_eq!(tasks.len(), 1, "Only one of B/C should be runnable, not A's retry");
+    
+    let returned_job_id = tasks[0].job().id();
+    assert!(
+        returned_job_id == job_b || returned_job_id == job_c,
+        "Should be B or C, not A's retry. Got job_id={}, job_a={}, job_b={}, job_c={}",
+        returned_job_id, job_a, job_b, job_c
+    );
+    
+    // Critical: the returned job should NOT be A (its retry shouldn't claim the slot)
+    assert_ne!(
+        returned_job_id, job_a,
+        "A's retry should NOT be granted the slot immediately"
+    );
+
+    // Verify at most 1 holder
+    assert!(
+        count_with_prefix(shard.db(), "holders/").await <= 1,
+        "At most 1 holder should exist"
+    );
 }
 

@@ -267,3 +267,92 @@ fn multiple_rollbacks_in_sequence() {
     assert_eq!(counts.holder_count("t", "q1"), 1);
     assert_eq!(counts.holder_count("t", "q2"), 1);
 }
+
+/// Test the retry-scheduling scenario where both an immediate grant and a release
+/// happen in the same operation, requiring rollback of both on failure.
+///
+/// Scenario (with max_concurrency=2):
+/// 1. Job A is running (holds task1, 1/2 slots)
+/// 2. Job A fails and schedules retry task2
+/// 3. Retry task2 gets immediate grant (2/2 slots now)
+/// 4. A's original slot (task1) is released via release_and_reserve to grant to waiting task3
+/// 5. If DB write fails, we need to rollback:
+///    - task2's immediate grant (from retry scheduling)
+///    - task1's release and task3's grant (from release_and_reserve)
+///
+/// Without proper rollback, we'd leak slot(s) in memory:
+/// - If we only rollback release_and_reserve: task2's slot leaks (count shows 2, should be 1)
+/// - If we only rollback task2's grant: task1 is released but shouldn't be
+#[test]
+fn retry_scheduling_with_immediate_grant_rollback() {
+    let counts = ConcurrencyCounts::new();
+
+    // Initial state: Job A running with task1 (1/2 slots used)
+    assert!(counts.try_reserve("t", "q", "task1", 2));
+    assert_eq!(counts.holder_count("t", "q"), 1);
+
+    // There's also a waiting job B that will get granted when A releases
+    // (simulated by task3 which will be granted via release_and_reserve)
+
+    // Step 1: Retry scheduling - task2 gets immediate grant (now 2/2)
+    // This simulates what happens in lease.rs when enqueue_limit_task_at_index
+    // is called for retry scheduling with available capacity
+    assert!(counts.try_reserve("t", "q", "task2", 2));
+    assert_eq!(counts.holder_count("t", "q"), 2);
+
+    // Step 2: Release A's slot and grant to waiting B (task3)
+    // This simulates release_and_grant_next in lease.rs
+    counts.atomic_release_and_reserve("t", "q", "task1", "task3");
+    assert_eq!(counts.holder_count("t", "q"), 2); // task2 + task3
+
+    // Now simulate DB write failure - we need to rollback BOTH operations
+
+    // Rollback the retry's immediate grant (task2)
+    counts.release_reservation("t", "q", "task2");
+
+    // Rollback the release-and-reserve (restore task1, remove task3)
+    counts.rollback_release_and_reserve("t", "q", "task1", "task3");
+
+    // Should be back to original state: only task1 holding
+    assert_eq!(counts.holder_count("t", "q"), 1);
+
+    // Verify task1 is the holder (can't add another at limit=1)
+    assert!(!counts.try_reserve("t", "q", "task_check", 1));
+}
+
+/// Test that WITHOUT proper rollback of retry immediate grants, we leak slots.
+/// This demonstrates why the rollback is necessary.
+#[test]
+fn retry_immediate_grant_leak_without_rollback() {
+    let counts = ConcurrencyCounts::new();
+
+    // Initial state: Job A running with task1 (1/2 slots used)
+    assert!(counts.try_reserve("t", "q", "task1", 2));
+    assert_eq!(counts.holder_count("t", "q"), 1);
+
+    // Retry scheduling - task2 gets immediate grant (now 2/2)
+    assert!(counts.try_reserve("t", "q", "task2", 2));
+    assert_eq!(counts.holder_count("t", "q"), 2);
+
+    // Release A's slot and grant to waiting B (task3)
+    counts.atomic_release_and_reserve("t", "q", "task1", "task3");
+    assert_eq!(counts.holder_count("t", "q"), 2); // task2 + task3
+
+    // Simulate INCORRECT rollback - only rollback release_and_reserve, forget task2
+    // This is what would happen if we ignored the grants from enqueue_limit_task_at_index
+    counts.rollback_release_and_reserve("t", "q", "task1", "task3");
+
+    // BUG: count is 2 but should be 1! task2's slot leaked
+    assert_eq!(
+        counts.holder_count("t", "q"),
+        2,
+        "This demonstrates the leak: count is 2 when it should be 1 after rollback"
+    );
+
+    // We can't acquire more slots even though task1 should be the only holder
+    // and max=2 should allow one more
+    assert!(
+        !counts.try_reserve("t", "q", "new_task", 2),
+        "Leaked slot prevents new reservations"
+    );
+}

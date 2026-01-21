@@ -9,10 +9,10 @@ use crate::codec::{
 };
 use crate::job::{FloatingLimitState, JobStatus, JobView};
 use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt};
-use crate::job_store_shard::helpers::{now_epoch_ms, put_task};
+use crate::job_store_shard::helpers::now_epoch_ms;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{attempt_key, floating_limit_state_key, job_info_key, leased_task_key};
-use crate::task::{HeartbeatResult, LeaseRecord, Task, DEFAULT_LEASE_MS};
+use crate::task::{HeartbeatResult, LeaseRecord, DEFAULT_LEASE_MS};
 use tracing::{debug, info_span};
 
 impl JobStoreShard {
@@ -134,6 +134,8 @@ impl JobStoreShard {
 
         let mut job_missing_error: Option<JobStoreShardError> = None;
         let mut followup_next_time: Option<i64> = None;
+        // Track grants from retry scheduling for rollback if DB write fails
+        let mut retry_grants: Vec<(String, String)> = Vec::new();
 
         match &outcome {
             // [SILO-SUCC-3] If success: mark job succeeded now (pure write)
@@ -159,30 +161,37 @@ impl JobStoreShard {
                     let view = JobView::new(jbytes)?;
                     let priority = view.priority();
                     let task_group = view.task_group();
+                    let limits = view.limits();
                     let failures_so_far = attempt_number;
                     if let Some(policy_rt) = view.retry_policy() {
                         if let Some(next_time) =
                             crate::retry::next_retry_time_ms(now_ms, failures_so_far, &policy_rt)
                         {
                             // [SILO-RETRY-5] Enqueue new task to DB queue for retry
+                            // [SILO-RETRY-5-CONC] Retry task starts with no held queues, so it must
+                            // re-acquire any concurrency tickets. Combined with [SILO-RETRY-REL] releasing
+                            // the current task's tickets below, this allows other jobs to run during
+                            // the retry backoff period.
                             let next_attempt_number = attempt_number + 1;
-                            let next_task = Task::RunAttempt {
-                                id: Uuid::new_v4().to_string(),
-                                tenant: tenant.to_string(),
-                                job_id: job_id.clone(),
-                                attempt_number: next_attempt_number,
-                                held_queues: held_queues_local.clone(),
-                                task_group: task_group.to_string(),
-                            };
-                            put_task(
-                                &mut batch,
-                                task_group,
-                                next_time,
-                                priority,
-                                &job_id,
-                                next_attempt_number,
-                                &next_task,
-                            )?;
+                            let next_task_id = Uuid::new_v4().to_string();
+
+                            // Track any immediate grants for rollback if DB write fails
+                            retry_grants = self
+                                .enqueue_limit_task_at_index(
+                                    &mut batch,
+                                    tenant,
+                                    &next_task_id,
+                                    &job_id,
+                                    next_attempt_number,
+                                    0, // start from first limit
+                                    &limits,
+                                    priority,
+                                    next_time,
+                                    now_ms,
+                                    Vec::new(), // no held queues - must re-acquire
+                                    task_group,
+                                )
+                                .await?;
 
                             // [SILO-RETRY-3] Set job status to Scheduled with next attempt time
                             let job_status = JobStatus::scheduled(now_ms, next_time);
@@ -204,7 +213,7 @@ impl JobStoreShard {
             }
         }
 
-        // [SILO-REL-1] Release any held concurrency tickets
+        // [SILO-REL-1][SILO-RETRY-REL] Release any held concurrency tickets
         // This also handles [SILO-GRANT-*] granting to next waiting request
         // IMPORTANT: release_and_grant_next updates in-memory counts BEFORE returning
         // to prevent TOCTOU races. If DB write fails, we must rollback.
@@ -223,6 +232,11 @@ impl JobStoreShard {
 
         // Write to DB - if this fails, rollback the in-memory changes
         if let Err(e) = self.db.write(batch).await {
+            // Rollback any grants made during retry scheduling
+            for (queue, grant_task_id) in &retry_grants {
+                self.concurrency.rollback_grant(tenant, queue, grant_task_id);
+            }
+            // Rollback release-and-grant operations
             self.concurrency.rollback_release_grants(&release_rollbacks);
             return Err(e.into());
         }

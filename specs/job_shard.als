@@ -922,6 +922,66 @@ pred completeFailureRetry[tid: TaskId, w: Worker, newTid: TaskId, t: Time, tnext
     concurrencyUnchanged[t, tnext]
 }
 
+-- Transition: COMPLETE_FAILURE_RETRY_RELEASE_TICKET - Worker reports retriable failure while holding concurrency ticket
+-- The ticket is released so other jobs can use it during the retry backoff period.
+-- When the retry task runs later, it will need to re-acquire the ticket (via grantNextRequest or enqueue path).
+pred completeFailureRetryReleaseTicket[tid: TaskId, w: Worker, q: Queue, newTid: TaskId, t: Time, tnext: Time] {
+    -- [SILO-RETRY-1] Pre: worker holds lease
+    leaseAt[tid, t] = w
+    some leaseJobAt[tid, t]
+    some leaseAttemptAt[tid, t]
+    
+    newTid != tid
+    no dbQueuedAt[newTid, t]
+    no bufferedAt[newTid, t]
+    no leaseAt[newTid, t]
+    
+    -- Pre: Task holds a ticket for this queue
+    some h: TicketHolder | h.th_task = tid and h.th_queue = q and h.th_time = t
+    
+    let j = leaseJobAt[tid, t], a = leaseAttemptAt[tid, t] | {
+        one j
+        one a
+        attemptStatusAt[a, t] = AttemptRunning
+        
+        -- [SILO-RETRY-2] Post: release lease
+        no leaseAt[tid, tnext]
+        
+        -- [SILO-RETRY-4] Post: set attempt status to AttemptFailed
+        attemptStatusAt[a, tnext] = AttemptFailed
+        
+        -- [SILO-RETRY-5-CONC] Post: Create a TicketRequest for the new retry task
+        -- The retry task doesn't get immediate holder - it must wait in the request queue
+        -- This allows other jobs to acquire the ticket during the retry backoff
+        one r: TicketRequest | r.tr_job = j and r.tr_queue = q and r.tr_task = newTid and r.tr_time = tnext
+        
+        -- Note: NO DbQueuedTask is created yet - the task will be created when grantNextRequest grants the ticket
+        -- This matches the enqueueWithConcurrencyQueued pattern
+        all tid2: TaskId | dbQueuedAt[tid2, tnext] = dbQueuedAt[tid2, t]
+        
+        -- [SILO-RETRY-3] Post: set job status to Scheduled (pure write, overwrites ANY previous status)
+        statusAt[j, tnext] = Scheduled
+        
+        all j2: Job | j2 in jobExistsAt[t] and j2 != j implies statusAt[j2, tnext] = statusAt[j2, t]
+        attemptExistsAt[tnext] = attemptExistsAt[t]
+        all a2: attemptExistsAt[t] - a | attemptStatusAt[a2, tnext] = attemptStatusAt[a2, t]
+    }
+    
+    -- Frame: job existence, cancellation unchanged
+    jobExistsAt[tnext] = jobExistsAt[t]
+    all j: Job | isCancelledAt[j, tnext] iff isCancelledAt[j, t]
+    
+    all tid2: TaskId | tid2 != tid implies {
+        leaseAt[tid2, tnext] = leaseAt[tid2, t]
+        leaseJobAt[tid2, tnext] = leaseJobAt[tid2, t]
+        leaseAttemptAt[tid2, tnext] = leaseAttemptAt[tid2, t]
+    }
+    all tid2: TaskId | bufferedAt[tid2, tnext] = bufferedAt[tid2, t]
+    
+    -- [SILO-RETRY-REL] Release the holder so other jobs can acquire the ticket
+    releaseHolder[tid, q, t, tnext]
+}
+
 -- Transition: CANCEL - mark job as cancelled
 -- Note: Tasks are NOT removed from DB queue here (lazy cleanup).
 -- Tasks will be cleaned up when dequeue encounters them.
@@ -1298,6 +1358,7 @@ pred step[t: Time, tnext: Time] {
     or (some q: Queue, tid: TaskId | cleanupCancelledRequest[q, tid, t, tnext])
     or (some tid: TaskId, w: Worker, q: Queue | completeSuccessReleaseTicket[tid, w, q, t, tnext])
     or (some tid: TaskId, w: Worker, q: Queue | completeFailurePermanentReleaseTicket[tid, w, q, t, tnext])
+    or (some tid: TaskId, w: Worker, q: Queue, newTid: TaskId | completeFailureRetryReleaseTicket[tid, w, q, newTid, t, tnext])
     or (some tid: TaskId, q: Queue | reapExpiredLeaseReleaseTicket[tid, q, t, tnext])
     -- Stutter
     or stutter[t, tnext]
@@ -2080,6 +2141,118 @@ pred exampleRestartFailedAndCancelledJob {
     }
 }
 
+/**
+ * Scenario: Job with concurrency retries, releasing ticket so another job can run in between
+ * 
+ * This is the key scenario for verifying that:
+ * 1. When a job with concurrency requirements fails and schedules a retry, its ticket is released
+ * 2. Another job can acquire the ticket and run during the retry backoff period
+ * 3. When the first job's retry runs, it re-acquires the ticket
+ * 
+ * Timeline:
+ * - t1: Job A is running with concurrency ticket for queue Q
+ * - t2: Job A fails with retry, releases ticket, creates request for retry task
+ * - t3: Job B (waiting for queue Q) is granted the ticket and starts running
+ * - t4: Job B completes successfully, releases ticket
+ * - t5: Job A's retry is granted the ticket
+ * - t6: Job A's retry runs
+ * - t7: Job A's retry succeeds
+ */
+pred exampleRetryReleasesTicketForOtherJob {
+    some tidA1, tidA2, tidB: TaskId, jA, jB: Job, aA1, aA2, aB: Attempt, q: Queue,
+         t1, t2, t3, t4, t5, t6, t7: Time | {
+        lt[t1, t2] and lt[t2, t3] and lt[t3, t4] and lt[t4, t5] and lt[t5, t6] and lt[t6, t7]
+        tidA1 != tidA2 and tidA1 != tidB and tidA2 != tidB
+        jA != jB
+        aA1 != aA2 and aA1 != aB and aA2 != aB
+        attemptJob[aA1] = jA
+        attemptJob[aA2] = jA
+        attemptJob[aB] = jB
+        
+        -- Both jobs require the same queue
+        q in jobQueues[jA]
+        q in jobQueues[jB]
+        
+        -- t1: Job A is running with the concurrency ticket
+        jA in jobExistsAt[t1]
+        jB in jobExistsAt[t1]
+        statusAt[jA, t1] = Running
+        some leaseAt[tidA1, t1]
+        leaseJobAt[tidA1, t1] = jA
+        leaseAttemptAt[tidA1, t1] = aA1
+        attemptStatusAt[aA1, t1] = AttemptRunning
+        -- Job A holds the ticket
+        some h: TicketHolder | h.th_task = tidA1 and h.th_queue = q and h.th_time = t1
+        -- Job B is waiting for the ticket (has a request)
+        some r: TicketRequest | r.tr_job = jB and r.tr_queue = q and r.tr_task = tidB and r.tr_time = t1
+        
+        -- t2: Job A fails with retry, releases ticket, creates request for retry
+        statusAt[jA, t2] = Scheduled  -- completeFailureRetryReleaseTicket sets Scheduled
+        no leaseAt[tidA1, t2]  -- lease released
+        attemptStatusAt[aA1, t2] = AttemptFailed
+        -- Job A's ticket is released (no holder for tidA1)
+        no h: TicketHolder | h.th_task = tidA1 and h.th_queue = q and h.th_time = t2
+        -- Job A has a request for the retry task
+        some r: TicketRequest | r.tr_job = jA and r.tr_queue = q and r.tr_task = tidA2 and r.tr_time = t2
+        
+        -- t3: Job B is granted the ticket (since queue now has capacity) and runs
+        statusAt[jB, t3] = Running
+        some leaseAt[tidB, t3]
+        leaseJobAt[tidB, t3] = jB
+        leaseAttemptAt[tidB, t3] = aB
+        attemptStatusAt[aB, t3] = AttemptRunning
+        -- Job B now holds the ticket
+        some h: TicketHolder | h.th_task = tidB and h.th_queue = q and h.th_time = t3
+        -- Job A is still waiting (request exists)
+        some r: TicketRequest | r.tr_job = jA and r.tr_queue = q and r.tr_task = tidA2 and r.tr_time = t3
+        
+        -- t4: Job B completes successfully, releases ticket
+        statusAt[jB, t4] = Succeeded
+        no leaseAt[tidB, t4]
+        attemptStatusAt[aB, t4] = AttemptSucceeded
+        -- Job B's ticket is released
+        no h: TicketHolder | h.th_task = tidB and h.th_queue = q and h.th_time = t4
+        
+        -- t5: Job A's retry is granted the ticket (grantNextRequest)
+        some h: TicketHolder | h.th_task = tidA2 and h.th_queue = q and h.th_time = t5
+        some dbQueuedAt[tidA2, t5]  -- grantNextRequest creates DB task
+        dbQueuedAt[tidA2, t5] = jA
+        -- No more request for Job A
+        no r: TicketRequest | r.tr_job = jA and r.tr_queue = q and r.tr_time = t5
+        
+        -- t6: Job A's retry runs (dequeued)
+        statusAt[jA, t6] = Running
+        some leaseAt[tidA2, t6]
+        leaseJobAt[tidA2, t6] = jA
+        leaseAttemptAt[tidA2, t6] = aA2
+        attemptStatusAt[aA2, t6] = AttemptRunning
+        
+        -- t7: Job A's retry succeeds
+        statusAt[jA, t7] = Succeeded
+        no leaseAt[tidA2, t7]
+        attemptStatusAt[aA2, t7] = AttemptSucceeded
+        -- All attempts exist
+        aA1 in attemptExistsAt[t7]
+        aA2 in attemptExistsAt[t7]
+        aB in attemptExistsAt[t7]
+    }
+}
+
+/**
+ * Asserts that when a job with concurrency releases its ticket on retry,
+ * other jobs can acquire the ticket before the retry runs.
+ * 
+ * This is verified by the queueLimitEnforced and holdersRequireActiveTask assertions,
+ * combined with the fact that completeFailureRetryReleaseTicket releases the holder.
+ * If the holder wasn't released, another job couldn't get it (due to queueLimitEnforced).
+ */
+assert retryReleasesTicket {
+    -- After completeFailureRetryReleaseTicket, the original task no longer holds the ticket
+    all tid: TaskId, w: Worker, q: Queue, newTid: TaskId, t: Time - last |
+        completeFailureRetryReleaseTicket[tid, w, q, newTid, t, t.next] implies
+            no h: TicketHolder | h.th_task = tid and h.th_queue = q and h.th_time = t.next
+}
+
 -- Note: JobState count = Jobs × Times where job exists (not all times)
 -- AttemptExists and JobExists need 1 per Time
 -- JobCancelled: needs entries for times when job is cancelled
@@ -2147,6 +2320,13 @@ run exampleExpediteJob for 3 but exactly 1 Job, 1 Worker, 2 TaskId, 2 Attempt, 1
 run exampleExpediteMidRetry for 3 but exactly 1 Job, 1 Worker, 3 TaskId, 3 Attempt, 12 Time,
     12 JobState, 12 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 12 AttemptExists, 12 JobExists, 3 JobAttemptRelation, 12 JobCancelled
 
+-- Retry with concurrency release example
+-- 2 Jobs, 3 TaskIds (A1, A2, B), 3 Attempts (A1, A2, B), 1 Queue, 14 Time steps
+-- Need more bounds for interleaved scenario
+run exampleRetryReleasesTicketForOtherJob for 5 but exactly 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 14 Time, 1 Queue,
+    28 JobState, 28 AttemptState, 8 DbQueuedTask, 8 BufferedTask, 6 Lease, 14 AttemptExists, 14 JobExists, 3 JobAttemptRelation, 28 JobCancelled,
+    2 JobQueueRequirement, 14 TicketRequest, 14 TicketHolder
+
 -- Bounds analysis for checks:
 -- JobState: Jobs can only exist from creation onwards, so max ~= Jobs × Times (16 for 2×8)
 -- AttemptState: Attempts created during execution, max = Attempts × remaining_times (~18 for 3 attempts)
@@ -2202,4 +2382,9 @@ check expediteRejectsTerminal for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 
     16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 12 JobCancelled
 check expediteRejectsCancelled for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
     16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 12 JobCancelled
+
+-- Retry with concurrency release assertion
+check retryReleasesTicket for 4 but 2 Job, 2 Worker, 4 TaskId, 4 Attempt, 8 Time, 2 Queue,
+    16 JobState, 18 AttemptState, 8 DbQueuedTask, 8 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled,
+    4 JobQueueRequirement, 12 TicketRequest, 12 TicketHolder
 
