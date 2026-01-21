@@ -17,9 +17,10 @@
 //! 5. System progress: Jobs complete without deadlock
 
 use crate::helpers::{
-    ConcurrencyLimit, EnqueueRequest, GetJobRequest, GlobalConcurrencyTracker, HashMap, JobStatus,
-    LeaseTasksRequest, Limit, MsgpackBytes, ReportOutcomeRequest, Task, get_seed, limit,
-    report_outcome_request, run_scenario_impl, setup_server, turmoil_connector,
+    AttemptStatus, ConcurrencyLimit, EnqueueRequest, GetJobRequest, GlobalConcurrencyTracker,
+    HashMap, JobStateTracker, JobStatus, LeaseTasksRequest, Limit, MsgpackBytes,
+    ReportOutcomeRequest, Task,
+    get_seed, limit, report_outcome_request, run_scenario_impl, setup_server, turmoil_connector,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -85,6 +86,9 @@ pub fn run() {
         // Track completed job_ids to detect duplicates (invariant #3)
         let completed_jobs: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
+        // Track job state for lease and terminal invariants
+        let job_tracker = Arc::new(JobStateTracker::new());
+
         // INVARIANT #2: Global concurrency tracking (queueLimitEnforced)
         // Tracks all active leases across all workers to verify system-wide concurrency limits
         let global_concurrency = Arc::new(GlobalConcurrencyTracker::new());
@@ -100,6 +104,7 @@ pub fn run() {
         let producer_seed = seed;
         let enqueue_counter1 = Arc::clone(&total_enqueued);
         let enqueued_jobs1 = Arc::clone(&enqueued_jobs);
+        let producer_tracker1 = Arc::clone(&job_tracker);
         sim.client("producer1", async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let mut rng = StdRng::seed_from_u64(producer_seed.wrapping_add(1));
@@ -171,6 +176,7 @@ pub fn run() {
                     Ok(_) => {
                         enqueued += 1;
                         enqueue_counter1.fetch_add(1, Ordering::SeqCst);
+                        producer_tracker1.job_enqueued(&job_id);
                         enqueued_jobs1.lock().unwrap().push(job_id);
                     }
                     Err(e) => {
@@ -187,6 +193,7 @@ pub fn run() {
         let producer2_seed = seed;
         let enqueue_counter2 = Arc::clone(&total_enqueued);
         let enqueued_jobs2 = Arc::clone(&enqueued_jobs);
+        let producer_tracker2 = Arc::clone(&job_tracker);
         sim.client("producer2", async move {
             // Start slightly later to create interleaving with producer1
             tokio::time::sleep(Duration::from_millis(80)).await;
@@ -255,6 +262,7 @@ pub fn run() {
                     Ok(_) => {
                         enqueued += 1;
                         enqueue_counter2.fetch_add(1, Ordering::SeqCst);
+                        producer_tracker2.job_enqueued(&job_id);
                         enqueued_jobs2.lock().unwrap().push(job_id);
                     }
                     Err(e) => {
@@ -274,6 +282,7 @@ pub fn run() {
             let completion_counter = Arc::clone(&total_completed);
             let completed_jobs_tracker = Arc::clone(&completed_jobs);
             let worker_concurrency = Arc::clone(&global_concurrency);
+            let worker_job_tracker = Arc::clone(&job_tracker);
 
             let client_name: &'static str =
                 Box::leak(format!("worker{}", worker_num).into_boxed_str());
@@ -333,6 +342,8 @@ pub fn run() {
                             }
 
                             for task in tasks {
+                                worker_job_tracker.task_leased(&task.job_id, &task.id);
+
                                 // INVARIANT #2: Track global concurrency acquisition
                                 let limit_key = extract_limit_key(&task.job_id);
                                 worker_concurrency.acquire(&limit_key, &task.id, &task.job_id);
@@ -409,6 +420,9 @@ pub fn run() {
                                     // Slot already released above
 
                                     if should_fail {
+                                        worker_job_tracker
+                                            .task_released(&task.job_id, &task.id);
+                                        worker_job_tracker.job_failed(&task.job_id);
                                         tracing::trace!(
                                             worker = %worker_id,
                                             job_id = %task.job_id,
@@ -416,6 +430,16 @@ pub fn run() {
                                         );
                                         failed += 1;
                                     } else {
+                                        worker_job_tracker
+                                            .task_released(&task.job_id, &task.id);
+                                        let was_new = worker_job_tracker.job_completed(&task.job_id);
+                                        assert!(
+                                            was_new,
+                                            "INVARIANT VIOLATION: Job '{}' completed twice! \
+                                             (job_tracker, worker={}, round={})",
+                                            task.job_id, worker_id, round
+                                        );
+
                                         // INVARIANT #3: No duplicate completions
                                         let was_new = completed_jobs_tracker
                                             .lock()
@@ -487,6 +511,14 @@ pub fn run() {
                     {
                         Ok(_) => {
                             // Slot already released above
+                            worker_job_tracker.task_released(&task.job_id, &task.id);
+                            let was_new = worker_job_tracker.job_completed(&task.job_id);
+                            assert!(
+                                was_new,
+                                "INVARIANT VIOLATION: Job '{}' completed twice! \
+                                 (job_tracker, worker={}, final)",
+                                task.job_id, worker_id
+                            );
 
                             // INVARIANT #3: No duplicate completions
                             let was_new = completed_jobs_tracker
@@ -537,6 +569,7 @@ pub fn run() {
         let verify_jobs = Arc::clone(&enqueued_jobs);
         let verify_completed_set = Arc::clone(&completed_jobs);
         let verify_concurrency = Arc::clone(&global_concurrency);
+        let verify_job_tracker = Arc::clone(&job_tracker);
         sim.client("verifier", async move {
             // Wait for producers and workers to do their work
             tokio::time::sleep(Duration::from_secs(90)).await;
@@ -568,7 +601,7 @@ pub fn run() {
                         shard: 0,
                         id: job_id.clone(),
                         tenant: None,
-                        include_attempts: false,
+                        include_attempts: true,
                     }))
                     .await
                 {
@@ -585,6 +618,32 @@ pub fn run() {
                             JobStatus::Scheduled => {
                                 scheduled_count += 1;
                                 tracing::trace!(job_id = %job_id, "job_still_scheduled");
+                            }
+                        }
+
+                        let running_attempts = job
+                            .attempts
+                            .iter()
+                            .filter(|attempt| attempt.status() == AttemptStatus::Running)
+                            .count();
+                        match job.status() {
+                            JobStatus::Running => {
+                                assert_eq!(
+                                    running_attempts, 1,
+                                    "Running job should have exactly one running attempt"
+                                );
+                            }
+                            JobStatus::Scheduled => {
+                                assert_eq!(
+                                    running_attempts, 0,
+                                    "Scheduled job should not have running attempts"
+                                );
+                            }
+                            JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled => {
+                                assert_eq!(
+                                    running_attempts, 0,
+                                    "Terminal job should not have running attempts"
+                                );
                             }
                         }
                     }
@@ -631,6 +690,7 @@ pub fn run() {
             // INVARIANT #2: Final global concurrency verification
             // After all work is done, verify no duplicate job leases occurred
             verify_concurrency.verify_no_duplicate_job_leases();
+            verify_job_tracker.verify_no_terminal_leases();
 
             // Log final concurrency state for all limit keys
             for config in LIMIT_CONFIGS {

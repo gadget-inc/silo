@@ -7,9 +7,9 @@
 //! - Attempt count increases after lease expiry (first attempt failed/timed out)
 
 use crate::helpers::{
-    EnqueueRequest, GetJobRequest, HashMap, JobStateTracker, JobStatus, LeaseTasksRequest,
-    MsgpackBytes, ReportOutcomeRequest, RetryPolicy, get_seed, report_outcome_request,
-    run_scenario_impl, setup_server, turmoil, turmoil_connector,
+    AttemptStatus, EnqueueRequest, GetJobRequest, HashMap, JobStateTracker, JobStatus,
+    LeaseTasksRequest, MsgpackBytes, ReportOutcomeRequest, RetryPolicy, get_seed,
+    report_outcome_request, run_scenario_impl, setup_server, turmoil, turmoil_connector,
 };
 use silo::pb::silo_client::SiloClient;
 use std::sync::Arc as StdArc;
@@ -87,10 +87,15 @@ pub fn run() {
 
             tracing::trace!(worker = "worker1", count = lease.tasks.len(), "lease");
 
+            assert!(
+                !lease.tasks.is_empty(),
+                "Worker1 should lease the initial task"
+            );
             let leased_task_info: Option<(String, String)> = if !lease.tasks.is_empty() {
                 let task = &lease.tasks[0];
                 // Track lease and attempt number
                 job_tracker_w1.task_leased(&task.job_id, &task.id);
+                assert_eq!(task.attempt_number, 1, "First lease should be attempt #1");
                 w1_attempt_clone.store(task.attempt_number, Ordering::SeqCst);
                 tracing::trace!(
                     worker = "worker1",
@@ -155,6 +160,10 @@ pub fn run() {
 
                             // Track lease and attempt number
                             job_tracker_w2.task_leased(&task.job_id, &task.id);
+                            assert!(
+                                task.attempt_number >= 2,
+                                "Retry lease should have attempt number >= 2"
+                            );
                             w2_attempt_clone.store(task.attempt_number, Ordering::SeqCst);
 
                             tracing::trace!(
@@ -238,6 +247,24 @@ pub fn run() {
                 attempt_count = job_resp.attempts.len(),
                 "final_job_state"
             );
+            let running_attempts = job_resp
+                .attempts
+                .iter()
+                .filter(|attempt| attempt.status() == AttemptStatus::Running)
+                .count();
+            let succeeded_attempts = job_resp
+                .attempts
+                .iter()
+                .filter(|attempt| attempt.status() == AttemptStatus::Succeeded)
+                .count();
+            let crashed_attempts = job_resp
+                .attempts
+                .iter()
+                .filter(|attempt| {
+                    attempt.status() == AttemptStatus::Failed
+                        && attempt.error_code.as_deref() == Some("WORKER_CRASHED")
+                })
+                .count();
 
             // INVARIANT: Job should be in terminal state (Succeeded)
             assert!(
@@ -245,6 +272,31 @@ pub fn run() {
                 "Job should be Succeeded after recovery, got {:?}",
                 status
             );
+            assert_eq!(
+                running_attempts, 0,
+                "Terminal job should not have running attempts"
+            );
+            assert_eq!(
+                succeeded_attempts, 1,
+                "Expected exactly one successful attempt"
+            );
+            assert!(
+                crashed_attempts >= 1,
+                "Expected a failed attempt due to lease expiry (WORKER_CRASHED)"
+            );
+            assert!(
+                job_resp.attempts.len() >= 2,
+                "Expected at least two attempts after lease expiry"
+            );
+
+            let mut seen_attempt_numbers = std::collections::HashSet::new();
+            for attempt in &job_resp.attempts {
+                assert!(
+                    seen_attempt_numbers.insert(attempt.attempt_number),
+                    "Duplicate attempt number {} in job attempts",
+                    attempt.attempt_number
+                );
+            }
 
             // INVARIANT: There should be multiple attempts (first expired, second succeeded)
             // Note: The reaper creates a new attempt when the lease expires
@@ -260,6 +312,14 @@ pub fn run() {
             // Worker 2's attempt should be after worker 1's (could be same if retry policy
             // creates a new task, or different if lease expiry creates retry)
             // The key invariant is that worker2 got a task and completed it successfully
+            assert!(
+                w1_attempt_num > 0,
+                "Worker1 should have recorded an attempt number"
+            );
+            assert!(
+                w2_attempt_num > w1_attempt_num,
+                "Worker2 attempt number should be greater than worker1's"
+            );
 
             // INVARIANT: Job tracker should show the job as completed
             assert!(

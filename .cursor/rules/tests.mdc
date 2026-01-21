@@ -27,7 +27,7 @@ The TypeScript integration tests require a running Silo server. Assume one is ru
 
 Use the #[silo::test] macro for wrapping rust test cases (not tokio::test).
 
-Don't run the tests in the sandbox -- it often causes false positives with failed network accesses or SSL issues.
+Run tests as often as you like. When running tests, don't run them within the sandbox with limited permissions -- it often causes false positives with failed network accesses or SSL issues.
 
 # Deterministic simulation tests
 

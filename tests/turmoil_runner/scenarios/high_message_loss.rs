@@ -6,7 +6,7 @@
 //! - No duplicate completions despite retries
 
 use crate::helpers::{
-    ClientConfig, EnqueueRequest, GetJobRequest, HashMap, JobStateTracker, JobStatus,
+    AttemptStatus, ClientConfig, EnqueueRequest, GetJobRequest, HashMap, JobStateTracker, JobStatus,
     LeaseTasksRequest, MsgpackBytes, ReportOutcomeRequest, RetryPolicy, create_turmoil_client,
     get_seed, report_outcome_request, run_scenario_impl, setup_server,
 };
@@ -187,8 +187,11 @@ pub fn run() {
         let verify_jobs = Arc::clone(&enqueued_jobs);
         let verify_config = client_config.clone();
         sim.client("verifier", async move {
-            // Wait for work to complete
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            // Wait for work to complete. 40s is enough for:
+            // - Producer: 20 jobs with delays (~2-5s simulated)
+            // - Worker: 30 rounds × 100ms delay (~3s minimum, more with retries)
+            // - Buffer for message loss and reconnection overhead
+            tokio::time::sleep(Duration::from_secs(40)).await;
 
             let mut client = create_turmoil_client("http://server:9904", &verify_config).await?;
             let mut consecutive_failures = 0u32;
@@ -211,16 +214,33 @@ pub fn run() {
                         shard: 0,
                         id: job_id.clone(),
                         tenant: None,
-                        include_attempts: false,
+                        include_attempts: true,
                     }))
                     .await
                 {
                     Ok(resp) => {
                         consecutive_failures = 0;
                         server_exists += 1;
-                        let status = resp.into_inner().status();
+                        let job = resp.into_inner();
+                        let status = job.status();
                         if status == JobStatus::Succeeded {
                             server_succeeded += 1;
+                        }
+                        let running_attempts = job
+                            .attempts
+                            .iter()
+                            .filter(|attempt| attempt.status() == AttemptStatus::Running)
+                            .count();
+                        if status == JobStatus::Running {
+                            assert_eq!(
+                                running_attempts, 1,
+                                "Running job should have exactly one running attempt"
+                            );
+                        } else {
+                            assert_eq!(
+                                running_attempts, 0,
+                                "Non-running job should not have running attempts"
+                            );
                         }
                     }
                     Err(_) => {

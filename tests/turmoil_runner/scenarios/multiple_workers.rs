@@ -6,9 +6,9 @@
 //! - All jobs reach terminal state
 
 use crate::helpers::{
-    EnqueueRequest, GetJobRequest, HashMap, JobStateTracker, JobStatus, LeaseTasksRequest,
-    MsgpackBytes, ReportOutcomeRequest, get_seed, report_outcome_request, run_scenario_impl,
-    setup_server, turmoil_connector,
+    AttemptStatus, EnqueueRequest, GetJobRequest, HashMap, JobStateTracker, JobStatus,
+    LeaseTasksRequest, MsgpackBytes, ReportOutcomeRequest, get_seed, report_outcome_request,
+    run_scenario_impl, setup_server, turmoil_connector,
 };
 use silo::pb::silo_client::SiloClient;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -91,6 +91,10 @@ pub fn run() {
                 for task in &lease.tasks {
                     // Track lease acquisition
                     w1_tracker.task_leased(&task.job_id, &task.id);
+                    assert_eq!(
+                        task.attempt_number, 1,
+                        "Unexpected retry attempt in multiple_workers scenario"
+                    );
 
                     tracing::trace!(worker = "worker1", job_id = %task.job_id, "lease");
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -153,6 +157,10 @@ pub fn run() {
                 for task in &lease.tasks {
                     // Track lease acquisition
                     w2_tracker.task_leased(&task.job_id, &task.id);
+                    assert_eq!(
+                        task.attempt_number, 1,
+                        "Unexpected retry attempt in multiple_workers scenario"
+                    );
 
                     tracing::trace!(worker = "worker2", job_id = %task.job_id, "lease");
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -228,14 +236,34 @@ pub fn run() {
                         shard: 0,
                         id: job_id.clone(),
                         tenant: None,
-                        include_attempts: false,
+                        include_attempts: true,
                     }))
                     .await?
                     .into_inner();
 
                 let status = job_resp.status();
                 if status == JobStatus::Succeeded {
+                    let running_attempts = job_resp
+                        .attempts
+                        .iter()
+                        .filter(|attempt| attempt.status() == AttemptStatus::Running)
+                        .count();
                     succeeded += 1;
+
+                    assert_eq!(
+                        running_attempts, 0,
+                        "Terminal job should not have running attempts"
+                    );
+                    assert_eq!(
+                        job_resp.attempts.len(),
+                        1,
+                        "Expected exactly one attempt for completed job"
+                    );
+                    assert_eq!(
+                        job_resp.attempts[0].status(),
+                        AttemptStatus::Succeeded,
+                        "Attempt should be marked Succeeded"
+                    );
                 } else {
                     tracing::error!(job_id = %job_id, status = ?status, "job_not_succeeded");
                 }
