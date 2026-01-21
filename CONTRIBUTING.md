@@ -126,14 +126,14 @@ The DST tests live in `tests/turmoil_runner.rs`. Each test scenario runs in an i
 ### Running DST tests
 
 ```shell
-# Run all DST tests with determinism verification (runs each scenario twice)
-cargo test --test turmoil_runner
+# Run the fuzzer to test all scenarios for one seed
+scripts/run-simulation-tests.mjs --seed 123
 
-# Run with a specific seed
-DST_SEED=12345 cargo test --test turmoil_runner
+# Run the fuzzer to test just the chaos scenario for one seed
+scripts/run-simulation-tests.mjs --seed 123 --scenario chaos
 
 # Run the fuzzer to test many random seeds
-node scripts/run-simulation-tests.mjs --seeds 100
+scripts/run-simulation-tests.mjs --seeds 100
 ```
 
 ### Two modes
@@ -141,6 +141,16 @@ node scripts/run-simulation-tests.mjs --seeds 100
 1. **Verification mode** (default for `cargo test`): Runs each scenario twice with the same seed and compares trace output byte-for-byte. This proves the simulation is truly deterministic.
 
 2. **Fuzz mode** (via the script or `DST_FUZZ=1`): Runs each scenario once per seed to maximize coverage. Use this to find bugs by testing many seeds quickly.
+
+#### Running verification tests
+
+```bash
+# Run all DST tests with determinism verification (runs each scenario twice)
+cargo test --test turmoil_runner
+
+# Run determinism verifier with a specific seed
+DST_SEED=12345 cargo test --test turmoil_runner
+```
 
 ### Adding a new scenario
 
