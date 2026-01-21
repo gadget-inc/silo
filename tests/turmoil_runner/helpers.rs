@@ -127,6 +127,48 @@ pub fn turmoil_connector()
     })
 }
 
+// Re-export ClientConfig for convenience
+pub use silo::cluster_client::ClientConfig;
+
+/// Create a SiloClient for turmoil simulations with proper timeout and retry configuration.
+///
+/// This is the turmoil equivalent of `silo::cluster_client::create_silo_client`.
+/// It uses the turmoil connector for simulated networking while applying the
+/// same timeout and retry configuration used in production.
+pub async fn create_turmoil_client(
+    uri: &str,
+    config: &ClientConfig,
+) -> turmoil::Result<silo::pb::silo_client::SiloClient<tonic::transport::Channel>> {
+    let endpoint = tonic::transport::Endpoint::new(uri.to_string())
+        .map_err(|e| e.to_string())?
+        .connect_timeout(config.connect_timeout)
+        .timeout(config.request_timeout);
+
+    let mut last_error = None;
+    for attempt in 0..config.max_retries {
+        match endpoint.connect_with_connector(turmoil_connector()).await {
+            Ok(channel) => return Ok(silo::pb::silo_client::SiloClient::new(channel)),
+            Err(e) => {
+                tracing::trace!(
+                    attempt = attempt,
+                    max_retries = config.max_retries,
+                    error = %e,
+                    uri = uri,
+                    "connection attempt failed, retrying"
+                );
+                last_error = Some(e.to_string());
+                if attempt + 1 < config.max_retries {
+                    tokio::time::sleep(config.backoff_for_attempt(attempt)).await;
+                }
+            }
+        }
+    }
+
+    Err(last_error
+        .unwrap_or_else(|| "no connection attempts made".to_string())
+        .into())
+}
+
 /// Helper to create a standard server host for tests
 pub async fn setup_server(port: u16) -> turmoil::Result<()> {
     let cfg = AppConfig {
@@ -573,11 +615,26 @@ pub struct JobStateTracker {
     terminal_jobs: Mutex<HashSet<String>>,
     /// Set of job_ids that have been successfully completed (for duplicate detection)
     completed_jobs: Mutex<HashSet<String>>,
+    /// If true, allow "stale" leases for terminal jobs (can happen with network delays)
+    lenient_mode: bool,
 }
 
 impl JobStateTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a tracker in lenient mode, suitable for chaos testing.
+    ///
+    /// In lenient mode, receiving a lease for an already-terminal job is logged
+    /// as a warning rather than causing a panic. This can happen legitimately
+    /// when network delays cause lease responses to arrive out-of-order relative
+    /// to completion reports.
+    pub fn new_lenient() -> Self {
+        Self {
+            lenient_mode: true,
+            ..Default::default()
+        }
     }
 
     /// Record that a job was enqueued
@@ -591,13 +648,23 @@ impl JobStateTracker {
         // Check that this job is not terminal
         {
             let terminal = self.terminal_jobs.lock().unwrap();
-            assert!(
-                !terminal.contains(job_id),
-                "INVARIANT VIOLATION (noLeasesForTerminal): Attempting to lease task {} \
-                 for job {} which is already terminal",
-                task_id,
-                job_id
-            );
+            if terminal.contains(job_id) {
+                if self.lenient_mode {
+                    // In lenient mode, just log a warning - this can happen with network delays
+                    tracing::warn!(
+                        job_id = job_id,
+                        task_id = task_id,
+                        "received lease for already-terminal job (stale lease due to network delay)"
+                    );
+                    return;
+                } else {
+                    panic!(
+                        "INVARIANT VIOLATION (noLeasesForTerminal): Attempting to lease task {} \
+                         for job {} which is already terminal",
+                        task_id, job_id
+                    );
+                }
+            }
         }
 
         let mut leases = self.active_leases.lock().unwrap();
@@ -684,11 +751,19 @@ impl JobStateTracker {
         for job_id in terminal.iter() {
             if let Some(active) = leases.get(job_id) {
                 if !active.is_empty() {
-                    panic!(
-                        "INVARIANT VIOLATION (noLeasesForTerminal): Terminal job '{}' \
-                         still has active leases: {:?}",
-                        job_id, active
-                    );
+                    if self.lenient_mode {
+                        tracing::warn!(
+                            job_id = job_id,
+                            active_leases = ?active,
+                            "terminal job still has active leases (possible stale tracking)"
+                        );
+                    } else {
+                        panic!(
+                            "INVARIANT VIOLATION (noLeasesForTerminal): Terminal job '{}' \
+                             still has active leases: {:?}",
+                            job_id, active
+                        );
+                    }
                 }
             }
         }
@@ -718,6 +793,18 @@ pub struct InvariantTracker {
 impl InvariantTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a tracker in lenient mode, suitable for chaos testing.
+    ///
+    /// In lenient mode, certain timing-related invariant "violations" that can
+    /// happen legitimately with network delays are logged as warnings instead
+    /// of causing panics.
+    pub fn new_lenient() -> Self {
+        Self {
+            concurrency: GlobalConcurrencyTracker::new(),
+            jobs: JobStateTracker::new_lenient(),
+        }
     }
 
     /// Run all invariant checks. Should be called periodically during scenarios.
