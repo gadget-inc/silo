@@ -119,7 +119,7 @@ pub fn run() {
 
             // Fisher-Yates shuffle with seeded rng
             for i in (1..jobs.len()).rev() {
-                let j = rng.gen_range(0..=i);
+                let j = rng.random_range(0..=i);
                 jobs.swap(i, j);
             }
 
@@ -127,10 +127,10 @@ pub fn run() {
             for (limit_idx, job_num) in jobs {
                 let config = &LIMIT_CONFIGS[limit_idx];
                 let job_id = format!("{}-p1-{}", config.key, job_num);
-                let priority = rng.gen_range(1..100);
+                let priority = rng.random_range(1..100);
 
                 // Random delay between enqueues to create interesting interleavings
-                let delay_ms = rng.gen_range(0..30);
+                let delay_ms = rng.random_range(0..30);
                 if delay_ms > 0 {
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
@@ -206,7 +206,7 @@ pub fn run() {
 
             // Shuffle differently from producer1
             for i in 0..(jobs.len().saturating_sub(1)) {
-                let j = rng.gen_range(i..jobs.len());
+                let j = rng.random_range(i..jobs.len());
                 jobs.swap(i, j);
             }
 
@@ -214,9 +214,9 @@ pub fn run() {
             for (limit_idx, job_num) in jobs {
                 let config = &LIMIT_CONFIGS[limit_idx];
                 let job_id = format!("{}-p2-{}", config.key, job_num);
-                let priority = rng.gen_range(1..100);
+                let priority = rng.random_range(1..100);
 
-                let delay_ms = rng.gen_range(5..40);
+                let delay_ms = rng.random_range(5..40);
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 
                 tracing::trace!(
@@ -297,7 +297,7 @@ pub fn run() {
 
                 for round in 0..60 {
                     // Random batch size per lease attempt - vary aggressively
-                    let max_tasks = rng.gen_range(1..=8);
+                    let max_tasks = rng.random_range(1..=8);
 
                     let lease_result = client
                         .lease_tasks(tonic::Request::new(LeaseTasksRequest {
@@ -361,7 +361,7 @@ pub fn run() {
                     // Process tasks with randomized timing and outcomes
                     if !processing.is_empty() {
                         // Randomly decide how many to complete this round
-                        let num_to_complete = rng.gen_range(1..=processing.len());
+                        let num_to_complete = rng.random_range(1..=processing.len());
                         let mut indices_to_remove: HashSet<usize> = HashSet::new();
 
                         for i in 0..num_to_complete {
@@ -372,11 +372,11 @@ pub fn run() {
                             let task = &processing[i];
 
                             // Random processing time - simulate variable work
-                            let process_time = rng.gen_range(5..80);
+                            let process_time = rng.random_range(5..80);
                             tokio::time::sleep(Duration::from_millis(process_time)).await;
 
                             // 15% chance of failure (will retry) to stress retry logic
-                            let should_fail = rng.gen_ratio(15, 100);
+                            let should_fail = rng.random_ratio(15, 100);
 
                             let outcome = if should_fail {
                                 report_outcome_request::Outcome::Failure(silo::pb::Failure {
@@ -389,6 +389,13 @@ pub fn run() {
                                 })
                             };
 
+                            // IMPORTANT: Release from tracker BEFORE report_outcome because
+                            // the server will release and potentially grant to another worker
+                            // immediately upon receiving report_outcome. If we release after,
+                            // there's a race where another worker acquires before we release.
+                            let limit_key = extract_limit_key(&task.job_id);
+                            worker_concurrency.release(&limit_key, &task.id, &task.job_id);
+
                             match client
                                 .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                                     shard: 0,
@@ -399,9 +406,7 @@ pub fn run() {
                                 .await
                             {
                                 Ok(_) => {
-                                    // INVARIANT #2: Release global concurrency slot
-                                    let limit_key = extract_limit_key(&task.job_id);
-                                    worker_concurrency.release(&limit_key, &task.id, &task.job_id);
+                                    // Slot already released above
 
                                     if should_fail {
                                         tracing::trace!(
@@ -434,6 +439,9 @@ pub fn run() {
                                     indices_to_remove.insert(i);
                                 }
                                 Err(e) => {
+                                    // Re-acquire since we pre-released but the report failed
+                                    // The task is still leased on the server
+                                    worker_concurrency.acquire(&limit_key, &task.id, &task.job_id);
                                     tracing::trace!(
                                         worker = %worker_id,
                                         job_id = %task.job_id,
@@ -453,14 +461,18 @@ pub fn run() {
                     }
 
                     // Random delay between rounds - vary from quick polling to slow
-                    let delay = rng.gen_range(10..120);
+                    let delay = rng.random_range(10..120);
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                 }
 
                 // Finish processing any remaining tasks
                 for task in &processing {
-                    let process_time = rng.gen_range(5..30);
+                    let process_time = rng.random_range(5..30);
                     tokio::time::sleep(Duration::from_millis(process_time)).await;
+
+                    // Release from tracker BEFORE report_outcome (see comment above)
+                    let limit_key = extract_limit_key(&task.job_id);
+                    worker_concurrency.release(&limit_key, &task.id, &task.job_id);
 
                     match client
                         .report_outcome(tonic::Request::new(ReportOutcomeRequest {
@@ -474,9 +486,7 @@ pub fn run() {
                         .await
                     {
                         Ok(_) => {
-                            // INVARIANT #2: Release global concurrency slot
-                            let limit_key = extract_limit_key(&task.job_id);
-                            worker_concurrency.release(&limit_key, &task.id, &task.job_id);
+                            // Slot already released above
 
                             // INVARIANT #3: No duplicate completions
                             let was_new = completed_jobs_tracker
@@ -498,6 +508,8 @@ pub fn run() {
                             completion_counter.fetch_add(1, Ordering::SeqCst);
                         }
                         Err(e) => {
+                            // Re-acquire since we pre-released but the report failed
+                            worker_concurrency.acquire(&limit_key, &task.id, &task.job_id);
                             tracing::trace!(
                                 worker = %worker_id,
                                 job_id = %task.job_id,

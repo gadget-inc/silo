@@ -3,14 +3,22 @@
 //! This module provides a client that can query any shard in the cluster by:
 //! - Querying local shards directly via the ShardFactory
 //! - Making gRPC Query calls to remote nodes for shards they own
+//!
+//! ## Connection Resilience
+//!
+//! The client includes built-in timeout and reconnection logic to handle network
+//! failures gracefully. When a connection fails or times out, the client will
+//! automatically invalidate the cached connection and attempt to reconnect on
+//! the next request.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::future::join_all;
 use tokio::sync::RwLock;
-use tonic::transport::Channel;
-use tracing::{debug, warn};
+use tonic::transport::{Channel, Endpoint};
+use tracing::{debug, trace, warn};
 
 use crate::coordination::{Coordinator, ShardOwnerMap};
 use crate::factory::ShardFactory;
@@ -19,6 +27,148 @@ use crate::pb::{
     CancelJobRequest, ColumnInfo, GetJobRequest, GetJobResponse, JobStatus, MsgpackBytes,
     QueryRequest,
 };
+
+/// Configuration for gRPC client connections.
+///
+/// These settings control timeouts, retries, and connection behavior for both
+/// internal cluster communication and external client connections.
+#[derive(Debug, Clone)]
+pub struct ClientConfig {
+    /// Timeout for establishing a connection to a remote node.
+    /// Default: 5 seconds.
+    pub connect_timeout: Duration,
+    /// Timeout for individual RPC requests.
+    /// Default: 30 seconds.
+    pub request_timeout: Duration,
+    /// Interval for HTTP/2 keepalive pings.
+    /// Default: 10 seconds.
+    pub keepalive_interval: Duration,
+    /// Timeout for keepalive ping acknowledgment.
+    /// Default: 5 seconds.
+    pub keepalive_timeout: Duration,
+    /// Maximum number of connection retry attempts.
+    /// Default: 3.
+    pub max_retries: u32,
+    /// Base delay for exponential backoff between retries.
+    /// Default: 50ms. Actual delays are base * 2^attempt, capped at 16x base.
+    pub retry_backoff_base: Duration,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(30),
+            keepalive_interval: Duration::from_secs(10),
+            keepalive_timeout: Duration::from_secs(5),
+            max_retries: 3,
+            retry_backoff_base: Duration::from_millis(50),
+        }
+    }
+}
+
+impl ClientConfig {
+    /// Create a config optimized for high-latency or unreliable networks.
+    /// Uses shorter timeouts to fail fast and more retries.
+    pub fn for_unreliable_network() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(10),
+            keepalive_interval: Duration::from_secs(5),
+            keepalive_timeout: Duration::from_secs(3),
+            max_retries: 10,
+            retry_backoff_base: Duration::from_millis(50),
+        }
+    }
+
+    /// Create a config optimized for deterministic simulation testing (DST).
+    /// Uses very short timeouts to ensure simulations complete within their time budgets,
+    /// while still being long enough to handle normal request processing.
+    pub fn for_dst() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(2),
+            keepalive_interval: Duration::from_secs(1),
+            keepalive_timeout: Duration::from_secs(1),
+            max_retries: 3,
+            retry_backoff_base: Duration::from_millis(50),
+        }
+    }
+
+    /// Create an Endpoint configured with these timeout settings.
+    pub fn configure_endpoint(&self, uri: &str) -> Result<Endpoint, tonic::transport::Error> {
+        Endpoint::from_shared(uri.to_string()).map(|e| {
+            e.connect_timeout(self.connect_timeout)
+                .timeout(self.request_timeout)
+                .http2_keep_alive_interval(self.keepalive_interval)
+                .keep_alive_timeout(self.keepalive_timeout)
+        })
+    }
+
+    /// Calculate backoff duration for a given retry attempt.
+    /// Uses exponential backoff: base * 2^attempt, capped at 16x base.
+    pub fn backoff_for_attempt(&self, attempt: u32) -> Duration {
+        self.retry_backoff_base * (1 << attempt.min(4))
+    }
+}
+
+/// Helper to create a SiloClient with proper timeout and retry configuration.
+///
+/// This function creates a gRPC client with configurable timeouts and automatic
+/// retry logic with exponential backoff. Retries are attempted when the initial
+/// connection fails.
+///
+/// # Arguments
+/// * `uri` - The server URI (e.g., "http://localhost:9910")
+/// * `config` - Client configuration with timeout and retry settings
+///
+/// # Example
+/// ```ignore
+/// let config = ClientConfig::default();
+/// let client = create_silo_client("http://localhost:9910", &config).await?;
+/// ```
+pub async fn create_silo_client(
+    uri: &str,
+    config: &ClientConfig,
+) -> Result<SiloClient<Channel>, ClusterClientError> {
+    // Ensure address has http:// scheme
+    let full_uri = if uri.starts_with("http://") || uri.starts_with("https://") {
+        uri.to_string()
+    } else {
+        format!("http://{}", uri)
+    };
+
+    let endpoint = config
+        .configure_endpoint(&full_uri)
+        .map_err(|e| ClusterClientError::ConnectionFailed(full_uri.clone(), e.to_string()))?;
+
+    let mut last_error = None;
+    for attempt in 0..config.max_retries {
+        match endpoint.connect().await {
+            Ok(channel) => return Ok(SiloClient::new(channel)),
+            Err(e) => {
+                trace!(
+                    attempt = attempt,
+                    max_retries = config.max_retries,
+                    error = %e,
+                    uri = %full_uri,
+                    "connection attempt failed, retrying"
+                );
+                last_error = Some(e);
+                if attempt + 1 < config.max_retries {
+                    tokio::time::sleep(config.backoff_for_attempt(attempt)).await;
+                }
+            }
+        }
+    }
+
+    Err(ClusterClientError::ConnectionFailed(
+        full_uri,
+        last_error
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "no connection attempts made".into()),
+    ))
+}
 
 /// Error types for cluster client operations
 #[derive(Debug, thiserror::Error)]
@@ -58,15 +208,27 @@ pub struct ClusterClient {
     coordinator: Option<Arc<dyn Coordinator>>,
     /// Cache of gRPC client connections to peer nodes
     connections: RwLock<HashMap<String, SiloClient<Channel>>>,
+    /// Client configuration for timeouts and connection behavior
+    config: ClientConfig,
 }
 
 impl ClusterClient {
-    /// Create a new cluster client
+    /// Create a new cluster client with default configuration
     pub fn new(factory: Arc<ShardFactory>, coordinator: Option<Arc<dyn Coordinator>>) -> Self {
+        Self::with_config(factory, coordinator, ClientConfig::default())
+    }
+
+    /// Create a new cluster client with custom configuration
+    pub fn with_config(
+        factory: Arc<ShardFactory>,
+        coordinator: Option<Arc<dyn Coordinator>>,
+        config: ClientConfig,
+    ) -> Self {
         Self {
             factory,
             coordinator,
             connections: RwLock::new(HashMap::new()),
+            config,
         }
     }
 
@@ -87,15 +249,9 @@ impl ClusterClient {
             }
         }
 
-        // Create new connection
+        // Create new connection with configured timeouts
         debug!(addr = %full_addr, "connecting to remote node");
-        let channel = Channel::from_shared(full_addr.clone())
-            .map_err(|e| ClusterClientError::ConnectionFailed(full_addr.clone(), e.to_string()))?
-            .connect()
-            .await
-            .map_err(|e| ClusterClientError::ConnectionFailed(full_addr.clone(), e.to_string()))?;
-
-        let client = SiloClient::new(channel);
+        let client = create_silo_client(&full_addr, &self.config).await?;
 
         // Cache the connection (double-check after acquiring write lock to avoid race)
         let mut cache = self.connections.write().await;
@@ -106,6 +262,20 @@ impl ClusterClient {
         cache.insert(full_addr, client.clone());
 
         Ok(client)
+    }
+
+    /// Invalidate a cached connection (call after RPC failures to force reconnect)
+    pub async fn invalidate_connection(&self, addr: &str) {
+        let full_addr = if addr.starts_with("http://") || addr.starts_with("https://") {
+            addr.to_string()
+        } else {
+            format!("http://{}", addr)
+        };
+
+        let mut cache = self.connections.write().await;
+        if cache.remove(&full_addr).is_some() {
+            debug!(addr = %full_addr, "invalidated cached connection");
+        }
     }
 
     /// Query a specific shard, routing to the appropriate node
@@ -195,10 +365,17 @@ impl ClusterClient {
             tenant: None,
         };
 
-        let response = client
-            .query(request)
-            .await
-            .map_err(|e| ClusterClientError::QueryFailed(format!("gRPC error: {}", e)))?;
+        let response = match client.query(request).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                // Invalidate connection on failure to force reconnect on next attempt
+                self.invalidate_connection(addr).await;
+                return Err(ClusterClientError::QueryFailed(format!(
+                    "gRPC error: {}",
+                    e
+                )));
+            }
+        };
 
         let resp = response.into_inner();
 
@@ -389,13 +566,18 @@ impl ClusterClient {
             include_attempts,
         };
 
-        let response = client.get_job(request).await.map_err(|e| {
-            if e.code() == tonic::Code::NotFound {
-                ClusterClientError::JobNotFound
-            } else {
-                ClusterClientError::RpcFailed(e.to_string())
+        let response = match client.get_job(request).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                // Invalidate connection on failure to force reconnect on next attempt
+                self.invalidate_connection(&addr).await;
+                if e.code() == tonic::Code::NotFound {
+                    return Err(ClusterClientError::JobNotFound);
+                } else {
+                    return Err(ClusterClientError::RpcFailed(e.to_string()));
+                }
             }
-        })?;
+        };
 
         Ok(response.into_inner())
     }
@@ -434,10 +616,11 @@ impl ClusterClient {
             tenant: Some(tenant.to_string()),
         };
 
-        client
-            .cancel_job(request)
-            .await
-            .map_err(|e| ClusterClientError::RpcFailed(e.to_string()))?;
+        if let Err(e) = client.cancel_job(request).await {
+            // Invalidate connection on failure to force reconnect on next attempt
+            self.invalidate_connection(&addr).await;
+            return Err(ClusterClientError::RpcFailed(e.to_string()));
+        }
 
         Ok(())
     }

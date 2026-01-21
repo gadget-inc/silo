@@ -4,7 +4,6 @@ use slatedb::WriteBatch;
 use uuid::Uuid;
 
 use crate::codec::{encode_job_info, encode_job_status};
-use crate::concurrency::{MemoryEvent, RequestTicketOutcome};
 use crate::job::{JobInfo, JobStatus, Limit};
 use crate::job_store_shard::helpers::{now_epoch_ms, put_task};
 use crate::job_store_shard::JobStoreShard;
@@ -76,155 +75,43 @@ impl JobStoreShard {
         self.set_job_status_with_index(&mut batch, tenant, &job_id, job_status)
             .await?;
 
-        // Process the first limit in the list
-        let first_limit = limits.first();
-        let mut concurrency_outcome: Option<RequestTicketOutcome> = None;
+        // Process limits starting from index 0. For concurrency limits, we try immediate
+        // grant as an optimization. Returns all grants made for potential rollback.
+        let grants = self
+            .enqueue_limit_task_at_index(
+                &mut batch,
+                tenant,
+                &first_task_id,
+                &job_id,
+                1, // attempt number
+                0, // start from first limit
+                &limits,
+                priority,
+                start_at_ms,
+                now_ms,
+                Vec::new(), // no held queues yet
+                task_group,
+            )
+            .await?;
 
-        match first_limit {
-            None => {
-                // No limits - write RunAttempt task directly
-                let first_task = Task::RunAttempt {
-                    id: first_task_id.clone(),
-                    tenant: tenant.to_string(),
-                    job_id: job_id.clone(),
-                    attempt_number: 1,
-                    held_queues: Vec::new(),
-                    task_group: task_group.to_string(),
-                };
-                put_task(&mut batch, task_group, start_at_ms, priority, &job_id, 1, &first_task)?;
+        // Write to DB - if this fails, we need to rollback all in-memory grants
+        if let Err(e) = self.db.write(batch).await {
+            for (queue, task_id) in &grants {
+                self.concurrency.rollback_grant(tenant, queue, task_id);
             }
-            Some(Limit::Concurrency(cl)) => {
-                // First limit is a concurrency limit - use existing logic
-                concurrency_outcome = self
-                    .concurrency
-                    .handle_enqueue(
-                        &mut batch,
-                        tenant,
-                        &first_task_id,
-                        &job_id,
-                        priority,
-                        start_at_ms,
-                        now_ms,
-                        std::slice::from_ref(cl),
-                        task_group,
-                    )
-                    .map_err(JobStoreShardError::Rkyv)?;
-
-                // If no concurrency limits blocked, check if there are more limits
-                if concurrency_outcome.is_none() {
-                    // Granted immediately, but we need to proceed to next limit
-                    self.enqueue_next_limit_task(
-                        &mut batch,
-                        tenant,
-                        &first_task_id,
-                        &job_id,
-                        1, // attempt number
-                        0, // current limit index
-                        &limits,
-                        priority,
-                        start_at_ms,
-                        now_ms,
-                        vec![cl.key.clone()], // held queues
-                        task_group,
-                    )?;
-                }
-            }
-            Some(Limit::RateLimit(rl)) => {
-                // First limit is a rate limit - create CheckRateLimit task
-                let check_task = Task::CheckRateLimit {
-                    task_id: first_task_id.clone(),
-                    tenant: tenant.to_string(),
-                    job_id: job_id.clone(),
-                    attempt_number: 1,
-                    limit_index: 0,
-                    rate_limit: GubernatorRateLimitData::from(rl),
-                    retry_count: 0,
-                    started_at_ms: now_ms,
-                    priority,
-                    held_queues: Vec::new(),
-                    task_group: task_group.to_string(),
-                };
-                put_task(&mut batch, task_group, start_at_ms, priority, &job_id, 1, &check_task)?;
-            }
-            Some(Limit::FloatingConcurrency(fl)) => {
-                // First limit is a floating concurrency limit
-                // Get or create the floating limit state (zero-copy for existing)
-                let state = self
-                    .get_or_create_floating_limit_state(&mut batch, tenant, fl)
-                    .await?;
-
-                // Maybe schedule a refresh task if needed
-                self.maybe_schedule_floating_limit_refresh(&mut batch, tenant, fl, &state, now_ms, task_group)?;
-
-                // Create a temporary ConcurrencyLimit with the current max concurrency
-                let temp_cl = crate::job::ConcurrencyLimit {
-                    key: fl.key.clone(),
-                    max_concurrency: state.archived().current_max_concurrency,
-                };
-
-                // Use the concurrency system with the current floating limit value
-                concurrency_outcome = self
-                    .concurrency
-                    .handle_enqueue(
-                        &mut batch,
-                        tenant,
-                        &first_task_id,
-                        &job_id,
-                        priority,
-                        start_at_ms,
-                        now_ms,
-                        std::slice::from_ref(&temp_cl),
-                        task_group,
-                    )
-                    .map_err(JobStoreShardError::Rkyv)?;
-
-                // If no concurrency limits blocked, check if there are more limits
-                if concurrency_outcome.is_none() {
-                    // Granted immediately, but we need to proceed to next limit
-                    self.enqueue_next_limit_task(
-                        &mut batch,
-                        tenant,
-                        &first_task_id,
-                        &job_id,
-                        1, // attempt number
-                        0, // current limit index
-                        &limits,
-                        priority,
-                        start_at_ms,
-                        now_ms,
-                        vec![fl.key.clone()], // held queues
-                        task_group,
-                    )?;
-                }
-            }
+            return Err(e.into());
+        }
+        if let Err(e) = self.db.flush().await {
+            // Note: write succeeded but flush failed - the grants are committed,
+            // so we don't rollback here
+            return Err(e.into());
         }
 
-        self.db.write(batch).await?;
-        self.db.flush().await?;
-
-        // Apply memory events and log after durable commit
-        if let Some(outcome) = concurrency_outcome {
-            match outcome {
-                RequestTicketOutcome::GrantedImmediately { events, .. } => {
-                    for ev in events {
-                        if let MemoryEvent::Granted { queue, task_id } = ev {
-                            let span = info_span!("concurrency.grant", queue = %queue, task_id = %task_id, job_id = %job_id, attempt = 1u32, source = "immediate");
-                            let _g = span.enter();
-                            self.concurrency
-                                .counts()
-                                .record_grant(tenant, &queue, &task_id);
-                        }
-                    }
-                }
-                RequestTicketOutcome::TicketRequested { queue } => {
-                    let span = info_span!("concurrency.request", queue = %queue, job_id = %job_id, attempt = 1u32, start_at_ms = start_at_ms, priority = priority);
-                    let _g = span.enter();
-                }
-                RequestTicketOutcome::FutureRequestTaskWritten { queue, .. } => {
-                    let span = info_span!("concurrency.ticket", queue = %queue, job_id = %job_id, attempt = 1u32, start_at_ms = start_at_ms, priority = priority);
-                    let _g = span.enter();
-                }
-            }
+        // Log grants after durable commit
+        for (queue, task_id) in &grants {
+            let span = info_span!("concurrency.grant", queue = %queue, task_id = %task_id, job_id = %job_id, attempt = 1u32, source = "immediate");
+            let _g = span.enter();
+            tracing::debug!("granted concurrency slot immediately");
         }
 
         // If ready now, wake the scanner to refill promptly
@@ -235,92 +122,171 @@ impl JobStoreShard {
         Ok(job_id)
     }
 
-    /// Helper to enqueue the next limit check task after passing a limit
+    /// Enqueue a task to begin processing limits starting at `limit_index`.
+    ///
+    /// This is the unified function for creating limit-processing tasks, used by:
+    /// - Initial enqueue (starts at index 0)
+    /// - Retry scheduling (starts at index 0 with empty held_queues)
+    /// - Subsequent limit processing after passing a rate limit (in dequeue)
+    ///
+    /// For concurrency limits (regular and floating), this tries immediate grant as an
+    /// optimization. If granted, it proceeds to the next limit (iteratively).
+    ///
+    /// Returns a Vec of all grants made (queue, task_id) for potential rollback if DB write fails.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn enqueue_next_limit_task(
+    pub(crate) async fn enqueue_limit_task_at_index(
         &self,
         batch: &mut WriteBatch,
         tenant: &str,
         task_id: &str,
         job_id: &str,
         attempt_number: u32,
-        current_limit_index: u32,
+        limit_index: usize,
         limits: &[Limit],
         priority: u8,
         start_at_ms: i64,
         now_ms: i64,
         held_queues: Vec<String>,
         task_group: &str,
-    ) -> Result<(), JobStoreShardError> {
-        let next_index = current_limit_index + 1;
+    ) -> Result<Vec<(String, String)>, JobStoreShardError> {
+        let mut grants = Vec::new();
+        let mut current_index = limit_index;
+        let mut current_held_queues = held_queues;
+        let mut current_task_id = task_id.to_string();
 
-        if next_index as usize >= limits.len() {
-            // No more limits - enqueue RunAttempt
-            let run_task = Task::RunAttempt {
-                id: task_id.to_string(),
-                tenant: tenant.to_string(),
-                job_id: job_id.to_string(),
-                attempt_number,
-                held_queues,
-                task_group: task_group.to_string(),
-            };
-            return put_task(
-                batch,
-                task_group,
-                start_at_ms,
-                priority,
-                job_id,
-                attempt_number,
-                &run_task,
-            );
+        loop {
+            if current_index >= limits.len() {
+                // No more limits - enqueue RunAttempt
+                let run_task = Task::RunAttempt {
+                    id: current_task_id,
+                    tenant: tenant.to_string(),
+                    job_id: job_id.to_string(),
+                    attempt_number,
+                    held_queues: current_held_queues,
+                    task_group: task_group.to_string(),
+                };
+                put_task(
+                    batch,
+                    task_group,
+                    start_at_ms,
+                    priority,
+                    job_id,
+                    attempt_number,
+                    &run_task,
+                )?;
+                return Ok(grants);
+            }
+
+            match &limits[current_index] {
+                Limit::Concurrency(cl) => {
+                    // Try immediate grant for concurrency limits
+                    let outcome = self
+                        .concurrency
+                        .handle_enqueue(
+                            batch,
+                            tenant,
+                            &current_task_id,
+                            job_id,
+                            priority,
+                            start_at_ms,
+                            now_ms,
+                            std::slice::from_ref(cl),
+                            task_group,
+                            attempt_number,
+                        )
+                        .map_err(JobStoreShardError::Rkyv)?;
+
+                    match outcome {
+                        None => {
+                            // Granted immediately - record grant and continue to next limit
+                            grants.push((cl.key.clone(), current_task_id.clone()));
+                            current_held_queues.push(cl.key.clone());
+                            current_index += 1;
+                            current_task_id = Uuid::new_v4().to_string();
+                            // Continue loop to process next limit
+                        }
+                        Some(_) => {
+                            // Not granted - RequestTicket was created by handle_enqueue
+                            return Ok(grants);
+                        }
+                    }
+                }
+
+                Limit::FloatingConcurrency(fl) => {
+                    // Get/create floating limit state and maybe schedule refresh
+                    let state = self
+                        .get_or_create_floating_limit_state(batch, tenant, fl)
+                        .await?;
+                    self.maybe_schedule_floating_limit_refresh(
+                        batch, tenant, fl, &state, now_ms, task_group,
+                    )?;
+
+                    // Try immediate grant using current max concurrency
+                    let temp_cl = crate::job::ConcurrencyLimit {
+                        key: fl.key.clone(),
+                        max_concurrency: state.archived().current_max_concurrency,
+                    };
+
+                    let outcome = self
+                        .concurrency
+                        .handle_enqueue(
+                            batch,
+                            tenant,
+                            &current_task_id,
+                            job_id,
+                            priority,
+                            start_at_ms,
+                            now_ms,
+                            std::slice::from_ref(&temp_cl),
+                            task_group,
+                            attempt_number,
+                        )
+                        .map_err(JobStoreShardError::Rkyv)?;
+
+                    match outcome {
+                        None => {
+                            // Granted immediately - record grant and continue to next limit
+                            grants.push((fl.key.clone(), current_task_id.clone()));
+                            current_held_queues.push(fl.key.clone());
+                            current_index += 1;
+                            current_task_id = Uuid::new_v4().to_string();
+                            // Continue loop to process next limit
+                        }
+                        Some(_) => {
+                            // Not granted - RequestTicket was created by handle_enqueue
+                            return Ok(grants);
+                        }
+                    }
+                }
+
+                Limit::RateLimit(rl) => {
+                    // Rate limits don't have immediate grant - create CheckRateLimit task
+                    let task = Task::CheckRateLimit {
+                        task_id: current_task_id,
+                        tenant: tenant.to_string(),
+                        job_id: job_id.to_string(),
+                        attempt_number,
+                        limit_index: current_index as u32,
+                        rate_limit: GubernatorRateLimitData::from(rl),
+                        retry_count: 0,
+                        started_at_ms: now_ms,
+                        priority,
+                        held_queues: current_held_queues,
+                        task_group: task_group.to_string(),
+                    };
+                    put_task(
+                        batch,
+                        task_group,
+                        start_at_ms,
+                        priority,
+                        job_id,
+                        attempt_number,
+                        &task,
+                    )?;
+                    return Ok(grants);
+                }
+            }
         }
-
-        // Enqueue task for the next limit
-        let next_task = match &limits[next_index as usize] {
-            Limit::Concurrency(cl) => Task::RequestTicket {
-                queue: cl.key.clone(),
-                start_time_ms: start_at_ms,
-                priority,
-                tenant: tenant.to_string(),
-                job_id: job_id.to_string(),
-                attempt_number,
-                request_id: Uuid::new_v4().to_string(),
-                task_group: task_group.to_string(),
-            },
-            Limit::RateLimit(rl) => Task::CheckRateLimit {
-                task_id: Uuid::new_v4().to_string(),
-                tenant: tenant.to_string(),
-                job_id: job_id.to_string(),
-                attempt_number,
-                limit_index: next_index,
-                rate_limit: GubernatorRateLimitData::from(rl),
-                retry_count: 0,
-                started_at_ms: now_ms,
-                priority,
-                held_queues,
-                task_group: task_group.to_string(),
-            },
-            // Floating concurrency limits use the same RequestTicket mechanism as regular concurrency limits
-            Limit::FloatingConcurrency(fl) => Task::RequestTicket {
-                queue: fl.key.clone(),
-                start_time_ms: start_at_ms,
-                priority,
-                tenant: tenant.to_string(),
-                job_id: job_id.to_string(),
-                attempt_number,
-                request_id: Uuid::new_v4().to_string(),
-                task_group: task_group.to_string(),
-            },
-        };
-        put_task(
-            batch,
-            task_group,
-            start_at_ms,
-            priority,
-            job_id,
-            attempt_number,
-            &next_task,
-        )
     }
 
     /// Update job status and maintain secondary indexes in the same write batch.

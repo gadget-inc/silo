@@ -7,13 +7,12 @@ use crate::codec::{
     decode_floating_limit_state, decode_lease, encode_attempt, encode_floating_limit_state,
     encode_lease,
 };
-use crate::concurrency::MemoryEvent;
 use crate::job::{FloatingLimitState, JobStatus, JobView};
 use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt};
-use crate::job_store_shard::helpers::{now_epoch_ms, put_task};
+use crate::job_store_shard::helpers::now_epoch_ms;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{attempt_key, floating_limit_state_key, job_info_key, leased_task_key};
-use crate::task::{HeartbeatResult, LeaseRecord, Task, DEFAULT_LEASE_MS};
+use crate::task::{HeartbeatResult, LeaseRecord, DEFAULT_LEASE_MS};
 use tracing::{debug, info_span};
 
 impl JobStoreShard {
@@ -135,6 +134,8 @@ impl JobStoreShard {
 
         let mut job_missing_error: Option<JobStoreShardError> = None;
         let mut followup_next_time: Option<i64> = None;
+        // Track grants from retry scheduling for rollback if DB write fails
+        let mut retry_grants: Vec<(String, String)> = Vec::new();
 
         match &outcome {
             // [SILO-SUCC-3] If success: mark job succeeded now (pure write)
@@ -160,30 +161,37 @@ impl JobStoreShard {
                     let view = JobView::new(jbytes)?;
                     let priority = view.priority();
                     let task_group = view.task_group();
+                    let limits = view.limits();
                     let failures_so_far = attempt_number;
                     if let Some(policy_rt) = view.retry_policy() {
                         if let Some(next_time) =
                             crate::retry::next_retry_time_ms(now_ms, failures_so_far, &policy_rt)
                         {
                             // [SILO-RETRY-5] Enqueue new task to DB queue for retry
+                            // [SILO-RETRY-5-CONC] Retry task starts with no held queues, so it must
+                            // re-acquire any concurrency tickets. Combined with [SILO-RETRY-REL] releasing
+                            // the current task's tickets below, this allows other jobs to run during
+                            // the retry backoff period.
                             let next_attempt_number = attempt_number + 1;
-                            let next_task = Task::RunAttempt {
-                                id: Uuid::new_v4().to_string(),
-                                tenant: tenant.to_string(),
-                                job_id: job_id.clone(),
-                                attempt_number: next_attempt_number,
-                                held_queues: held_queues_local.clone(),
-                                task_group: task_group.to_string(),
-                            };
-                            put_task(
-                                &mut batch,
-                                task_group,
-                                next_time,
-                                priority,
-                                &job_id,
-                                next_attempt_number,
-                                &next_task,
-                            )?;
+                            let next_task_id = Uuid::new_v4().to_string();
+
+                            // Track any immediate grants for rollback if DB write fails
+                            retry_grants = self
+                                .enqueue_limit_task_at_index(
+                                    &mut batch,
+                                    tenant,
+                                    &next_task_id,
+                                    &job_id,
+                                    next_attempt_number,
+                                    0, // start from first limit
+                                    &limits,
+                                    priority,
+                                    next_time,
+                                    now_ms,
+                                    Vec::new(), // no held queues - must re-acquire
+                                    task_group,
+                                )
+                                .await?;
 
                             // [SILO-RETRY-3] Set job status to Scheduled with next attempt time
                             let job_status = JobStatus::scheduled(now_ms, next_time);
@@ -205,9 +213,11 @@ impl JobStoreShard {
             }
         }
 
-        // [SILO-REL-1] Release any held concurrency tickets
+        // [SILO-REL-1][SILO-RETRY-REL] Release any held concurrency tickets
         // This also handles [SILO-GRANT-*] granting to next waiting request
-        let release_events: Vec<MemoryEvent> = self
+        // IMPORTANT: release_and_grant_next updates in-memory counts BEFORE returning
+        // to prevent TOCTOU races. If DB write fails, we must rollback.
+        let release_rollbacks = self
             .concurrency
             .release_and_grant_next(
                 &self.db,
@@ -220,36 +230,36 @@ impl JobStoreShard {
             .await
             .map_err(JobStoreShardError::Rkyv)?;
 
-        self.db.write(batch).await?;
-        self.db.flush().await?;
-        // Update in-memory broker counts after durable release and emit spans for release/grant
-        for ev in release_events.into_iter() {
-            match ev {
-                MemoryEvent::Released {
-                    queue,
-                    task_id: tid,
-                } => {
-                    let span =
-                        info_span!("concurrency.release", queue = %queue, finished_task_id = %tid);
-                    let _g = span.enter();
-                    debug!("released ticket for finished task");
-                    self.concurrency
-                        .counts()
-                        .record_release(tenant, &queue, &tid);
-                    // Wake broker; durable grant-from-release already enqueues run task if ready
-                    self.broker.wakeup();
-                }
-                MemoryEvent::Granted { queue, task_id } => {
-                    // We granted on release: bump in-memory counts now and wake the broker to scan promptly.
-                    self.concurrency
-                        .counts()
-                        .record_grant(tenant, &queue, &task_id);
-                    let span = info_span!("task.enqueue_from_grant", queue = %queue, task_id = %task_id, cause = "release");
-                    let _g = span.enter();
-                    debug!("enqueued task for next requester after release");
-                    self.broker.wakeup();
-                }
+        // Write to DB - if this fails, rollback the in-memory changes
+        if let Err(e) = self.db.write(batch).await {
+            // Rollback any grants made during retry scheduling
+            for (queue, grant_task_id) in &retry_grants {
+                self.concurrency.rollback_grant(tenant, queue, grant_task_id);
             }
+            // Rollback release-and-grant operations
+            self.concurrency.rollback_release_grants(&release_rollbacks);
+            return Err(e.into());
+        }
+        if let Err(e) = self.db.flush().await {
+            // Write succeeded but flush failed - in-memory is correct, don't rollback
+            return Err(e.into());
+        }
+
+        // Log and wake broker for any releases/grants
+        // In-memory counts are already updated by release_and_grant_next
+        for rb in &release_rollbacks {
+            let span = info_span!("concurrency.release", queue = %rb.queue, finished_task_id = %rb.released_task_id);
+            let _g = span.enter();
+            debug!("released ticket for finished task");
+
+            if let Some(ref granted_id) = rb.granted_task_id {
+                let span = info_span!("task.enqueue_from_grant", queue = %rb.queue, task_id = %granted_id, cause = "release");
+                let _g = span.enter();
+                debug!("enqueued task for next requester after release");
+            }
+
+            // Wake broker to scan for new tasks
+            self.broker.wakeup();
         }
         // If we scheduled a follow-up that is ready now, wake the scanner
         if let Some(nt) = followup_next_time {

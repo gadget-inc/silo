@@ -3,7 +3,7 @@
 use slatedb::{DbIterator, WriteBatch};
 
 use crate::codec::{decode_task, encode_attempt, encode_lease};
-use crate::concurrency::{MemoryEvent, RequestTicketTaskOutcome};
+use crate::concurrency::{ReleaseGrantRollback, RequestTicketTaskOutcome};
 use crate::job::{JobStatus, JobView};
 use crate::job_attempt::{AttemptStatus, JobAttempt};
 use crate::job_store_shard::helpers::now_epoch_ms;
@@ -36,6 +36,12 @@ impl JobStoreShard {
         let mut out: Vec<LeasedTask> = Vec::new();
         let mut refresh_out: Vec<LeasedRefreshTask> = Vec::new();
         let mut pending_attempts: Vec<(String, JobView, String, u32)> = Vec::new();
+
+        // Track grants made during this dequeue for rollback on failure
+        // Format: (tenant, queue, task_id)
+        let mut grants_to_rollback: Vec<(String, String, String)> = Vec::new();
+        // Track release-and-grant operations for rollback on failure
+        let mut release_grants_to_rollback: Vec<ReleaseGrantRollback> = Vec::new();
 
         // Loop to process internal tasks until we have tasks that are destined for the worker, or no more ready tasks at all.
         const MAX_INTERNAL_ITERATIONS: usize = 10;
@@ -109,6 +115,14 @@ impl JobStoreShard {
 
                         match outcome {
                             RequestTicketTaskOutcome::Granted { request_id, queue } => {
+                                // Track grant for rollback if DB write fails
+                                // Grant already recorded by try_reserve in process_ticket_request_task
+                                grants_to_rollback.push((
+                                    tenant.clone(),
+                                    queue.clone(),
+                                    request_id.clone(),
+                                ));
+
                                 // Create lease and attempt records
                                 let run = Task::RunAttempt {
                                     id: request_id.clone(),
@@ -147,7 +161,7 @@ impl JobStoreShard {
                                 let akey = attempt_key(&tenant, job_id, *attempt_number);
                                 batch.put(akey.as_bytes(), &attempt_val);
 
-                                // Track for response and in-memory counts
+                                // Track for response
                                 let view = job_view.unwrap();
                                 pending_attempts.push((
                                     tenant.clone(),
@@ -156,11 +170,8 @@ impl JobStoreShard {
                                     *attempt_number,
                                 ));
                                 ack_keys.push(entry.key.clone());
-                                self.concurrency.counts().record_grant(
-                                    &tenant,
-                                    &queue,
-                                    &request_id,
-                                );
+                                // Grant already recorded by try_reserve - no need to call record_grant
+
                                 // Record concurrency ticket metric
                                 if let Some(ref m) = self.metrics {
                                     m.record_concurrency_ticket_granted();
@@ -210,20 +221,26 @@ impl JobStoreShard {
                         match rate_limit_result {
                             Ok(result) if result.under_limit => {
                                 // Rate limit passed! Proceed to next limit or RunAttempt
-                                self.enqueue_next_limit_task(
-                                    &mut batch,
-                                    &tenant,
-                                    check_task_id,
-                                    job_id,
-                                    *attempt_number,
-                                    *limit_index,
-                                    &job_view.limits(),
-                                    *priority,
-                                    now_ms,
-                                    now_ms,
-                                    held_queues.clone(),
-                                    check_task_group,
-                                )?;
+                                let grants = self
+                                    .enqueue_limit_task_at_index(
+                                        &mut batch,
+                                        &tenant,
+                                        check_task_id,
+                                        job_id,
+                                        *attempt_number,
+                                        (*limit_index + 1) as usize, // next limit after current
+                                        &job_view.limits(),
+                                        *priority,
+                                        now_ms,
+                                        now_ms,
+                                        held_queues.clone(),
+                                        check_task_group,
+                                    )
+                                    .await?;
+                                // Track any immediate grants for rollback if DB write fails
+                                for (queue, task_id) in grants {
+                                    grants_to_rollback.push((tenant.clone(), queue, task_id));
+                                }
                             }
                             Ok(result) => {
                                 // Over limit - schedule retry
@@ -350,7 +367,9 @@ impl JobStoreShard {
                             }
                         };
                         if !held_queues.is_empty() {
-                            let release_events = self
+                            // release_and_grant_next updates in-memory atomically before returning
+                            // Track rollback info in case DB write fails
+                            let release_rollbacks = self
                                 .concurrency
                                 .release_and_grant_next(
                                     &self.db,
@@ -362,7 +381,7 @@ impl JobStoreShard {
                                 )
                                 .await
                                 .map_err(JobStoreShardError::Rkyv)?;
-                            self.apply_concurrency_events(&tenant, release_events);
+                            release_grants_to_rollback.extend(release_rollbacks);
                             tracing::debug!(job_id = %job_id, queues = ?held_queues, "dequeue: released tickets for cancelled job task");
                         }
 
@@ -417,16 +436,32 @@ impl JobStoreShard {
                 }
             }
 
-            // Try to commit durable state. On failure, requeue the tasks and return error.
+            // Try to commit durable state. On failure, rollback grants and requeue tasks.
             if let Err(e) = self.db.write(batch).await {
+                // Rollback all grants made during this iteration
+                for (tenant, queue, task_id) in &grants_to_rollback {
+                    self.concurrency.rollback_grant(tenant, queue, task_id);
+                }
+                // Rollback all release-and-grant operations
+                self.concurrency.rollback_release_grants(&release_grants_to_rollback);
                 // Put back all claimed entries since we didn't lease them durably
                 self.broker.requeue(claimed);
                 return Err(JobStoreShardError::Slate(e));
             }
             if let Err(e) = self.db.flush().await {
+                // Write succeeded but flush failed - in-memory is correct, don't rollback
                 self.broker.requeue(claimed);
                 return Err(JobStoreShardError::Slate(e));
             }
+
+            // Wake broker for any release-grants that happened (before clearing)
+            if !release_grants_to_rollback.is_empty() {
+                self.broker.wakeup();
+            }
+
+            // DB write succeeded - clear rollback lists for next iteration
+            grants_to_rollback.clear();
+            release_grants_to_rollback.clear();
 
             // [SILO-DEQ-3] Ack durable and evict from buffer; we no longer use TTL tombstones.
             self.broker.ack_durable(&ack_keys);
@@ -540,30 +575,5 @@ impl JobStoreShard {
         }
 
         Ok((tasks, keys))
-    }
-
-    /// Apply concurrency release/grant events to in-memory counts and wake broker.
-    /// Called after durably committing releases to update optimistic counts.
-    pub(crate) fn apply_concurrency_events(&self, tenant: &str, events: Vec<MemoryEvent>) {
-        for ev in events {
-            match ev {
-                MemoryEvent::Released { queue, task_id } => {
-                    self.concurrency
-                        .counts()
-                        .record_release(tenant, &queue, &task_id);
-                    self.broker.wakeup();
-                }
-                MemoryEvent::Granted { queue, task_id } => {
-                    self.concurrency
-                        .counts()
-                        .record_grant(tenant, &queue, &task_id);
-                    // Record concurrency ticket metric
-                    if let Some(ref m) = self.metrics {
-                        m.record_concurrency_ticket_granted();
-                    }
-                    self.broker.wakeup();
-                }
-            }
-        }
     }
 }
