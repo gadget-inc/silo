@@ -2,8 +2,9 @@ name: Simulation Testing
 
 on:
   # Run nightly at 3am UTC
-  schedule:
-    - cron: "0 3 * * *"
+  # disabled while we fix the first many issues, which dont need this schedule to find
+  # schedule:
+  #   - cron: "0 3 * * *"
   # Allow manual triggering with custom parameters
   workflow_dispatch:
     inputs:
