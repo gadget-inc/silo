@@ -28,3 +28,7 @@ The TypeScript integration tests require a running Silo server. Assume one is ru
 Use the #[silo::test] macro for wrapping rust test cases (not tokio::test).
 
 Don't run the tests in the sandbox -- it often causes false positives with failed network accesses or SSL issues.
+
+# Deterministic simulation tests
+
+We use turmoil and mad-turmoil for DST tests. See CONTRIBUTING.md for more details.

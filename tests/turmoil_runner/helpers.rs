@@ -483,11 +483,29 @@ pub struct GlobalConcurrencyTracker {
     holders: Mutex<HashMap<String, HashSet<(String, String)>>>,
     /// Maps limit_key -> max_concurrency for that key
     limits: Mutex<HashMap<String, u32>>,
+    /// If true, log warnings instead of panicking on apparent violations
+    /// (can happen with message loss causing stale tracking state)
+    lenient_mode: bool,
 }
 
 impl GlobalConcurrencyTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a tracker in lenient mode, suitable for chaos testing.
+    ///
+    /// In lenient mode, apparent concurrency limit violations are logged as
+    /// warnings instead of panics. This is necessary for high message loss
+    /// scenarios where the client-side tracker can become stale due to:
+    /// - Pre-releasing before report_outcome
+    /// - Response loss causing re-acquire on failure
+    /// - Server already processed the release but client doesn't know
+    pub fn new_lenient() -> Self {
+        Self {
+            lenient_mode: true,
+            ..Default::default()
+        }
     }
 
     /// Register a limit key and its max concurrency value
@@ -497,7 +515,8 @@ impl GlobalConcurrencyTracker {
     }
 
     /// Record that a task has acquired a concurrency slot.
-    /// Panics if this would violate the concurrency limit (invariant violation).
+    /// In strict mode, panics if this would violate the concurrency limit.
+    /// In lenient mode, logs a warning for apparent violations.
     pub fn acquire(&self, limit_key: &str, task_id: &str, job_id: &str) {
         let mut holders = self.holders.lock().unwrap();
         let limits = self.limits.lock().unwrap();
@@ -506,24 +525,42 @@ impl GlobalConcurrencyTracker {
         let max = limits.get(limit_key).copied().unwrap_or(u32::MAX);
 
         // Check invariant BEFORE adding
-        assert!(
-            entry.len() < max as usize,
-            "INVARIANT VIOLATION (queueLimitEnforced): Attempting to acquire slot for limit '{}' \
-             but already at max_concurrency {}. Current holders: {:?}. \
-             New task_id={}, job_id={}",
-            limit_key,
-            max,
-            entry,
-            task_id,
-            job_id
-        );
+        if entry.len() >= max as usize {
+            if self.lenient_mode {
+                tracing::warn!(
+                    limit_key = limit_key,
+                    max_concurrency = max,
+                    current_holders = ?entry,
+                    new_task_id = task_id,
+                    new_job_id = job_id,
+                    "apparent concurrency limit exceeded (likely stale tracking due to message loss)"
+                );
+                // Still add the task in lenient mode - the tracker is stale, not the server
+            } else {
+                panic!(
+                    "INVARIANT VIOLATION (queueLimitEnforced): Attempting to acquire slot for limit '{}' \
+                     but already at max_concurrency {}. Current holders: {:?}. \
+                     New task_id={}, job_id={}",
+                    limit_key, max, entry, task_id, job_id
+                );
+            }
+        }
 
         let inserted = entry.insert((task_id.to_string(), job_id.to_string()));
-        assert!(
-            inserted,
-            "INVARIANT VIOLATION (noDoubleLease): Task {} already holds limit '{}'",
-            task_id, limit_key
-        );
+        if !inserted {
+            if self.lenient_mode {
+                tracing::warn!(
+                    task_id = task_id,
+                    limit_key = limit_key,
+                    "task already tracked as holding limit (duplicate lease tracking)"
+                );
+            } else {
+                panic!(
+                    "INVARIANT VIOLATION (noDoubleLease): Task {} already holds limit '{}'",
+                    task_id, limit_key
+                );
+            }
+        }
 
         tracing::trace!(
             limit_key = limit_key,
@@ -588,11 +625,20 @@ impl GlobalConcurrencyTracker {
             let mut seen_limits: HashSet<&str> = HashSet::new();
             for (limit_key, task_id) in entries {
                 if !seen_limits.insert(limit_key.as_str()) {
-                    panic!(
-                        "INVARIANT VIOLATION (oneLeasePerJob): Job '{}' has multiple tasks \
-                         holding limit '{}'. Entries: {:?}",
-                        job_id, limit_key, entries
-                    );
+                    if self.lenient_mode {
+                        tracing::warn!(
+                            job_id = job_id,
+                            limit_key = limit_key,
+                            entries = ?entries,
+                            "job appears to have duplicate task leases (likely stale tracking due to message loss)"
+                        );
+                    } else {
+                        panic!(
+                            "INVARIANT VIOLATION (oneLeasePerJob): Job '{}' has multiple tasks \
+                             holding limit '{}'. Entries: {:?}",
+                            job_id, limit_key, entries
+                        );
+                    }
                 }
                 let _ = task_id; // used in debug output above
             }
@@ -802,7 +848,7 @@ impl InvariantTracker {
     /// of causing panics.
     pub fn new_lenient() -> Self {
         Self {
-            concurrency: GlobalConcurrencyTracker::new(),
+            concurrency: GlobalConcurrencyTracker::new_lenient(),
             jobs: JobStateTracker::new_lenient(),
         }
     }

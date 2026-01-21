@@ -81,6 +81,20 @@ impl ClientConfig {
         }
     }
 
+    /// Create a config optimized for deterministic simulation testing (DST).
+    /// Uses very short timeouts to ensure simulations complete within their time budgets,
+    /// while still being long enough to handle normal request processing.
+    pub fn for_dst() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(2),
+            keepalive_interval: Duration::from_secs(1),
+            keepalive_timeout: Duration::from_secs(1),
+            max_retries: 3,
+            retry_backoff_base: Duration::from_millis(50),
+        }
+    }
+
     /// Create an Endpoint configured with these timeout settings.
     pub fn configure_endpoint(&self, uri: &str) -> Result<Endpoint, tonic::transport::Error> {
         Endpoint::from_shared(uri.to_string()).map(|e| {

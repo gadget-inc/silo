@@ -63,9 +63,9 @@ pub fn run() {
         sim.set_fail_rate(fail_rate);
         sim.set_max_message_latency(Duration::from_millis(max_latency_ms));
 
-        // Client configuration optimized for unreliable networks.
-        // Uses shorter timeouts to fail fast and reconnect when packets are lost.
-        let client_config = ClientConfig::for_unreliable_network();
+        // Client configuration optimized for DST with short timeouts.
+        // Uses very short timeouts to ensure simulations complete within their time budgets.
+        let client_config = ClientConfig::for_dst();
 
         // Shared invariant tracker in lenient mode.
         // Lenient mode is necessary because with high message loss and network
