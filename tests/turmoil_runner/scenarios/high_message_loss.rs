@@ -7,8 +7,8 @@
 
 use crate::helpers::{
     ClientConfig, EnqueueRequest, GetJobRequest, HashMap, JobStateTracker, JobStatus,
-    LeaseTasksRequest, MsgpackBytes, ReportOutcomeRequest, create_turmoil_client, get_seed,
-    report_outcome_request, run_scenario_impl, setup_server,
+    LeaseTasksRequest, MsgpackBytes, ReportOutcomeRequest, RetryPolicy, create_turmoil_client,
+    get_seed, report_outcome_request, run_scenario_impl, setup_server,
 };
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -43,13 +43,23 @@ pub fn run() {
             let mut enqueued = 0;
             for i in 0..20 {
                 let job_id = format!("lossy-job-{}", i);
+                // Use a retry policy so that when leases expire (due to lost responses),
+                // the jobs get re-scheduled instead of failing permanently
+                let retry_policy = Some(RetryPolicy {
+                    retry_count: 10, // Allow many retries to survive high message loss
+                    initial_interval_ms: 100,
+                    max_interval_ms: 1000,
+                    randomize_interval: false,
+                    backoff_factor: 1.5,
+                });
+
                 match client
                     .enqueue(tonic::Request::new(EnqueueRequest {
                         shard: 0,
                         id: job_id.clone(),
                         priority: i as u32,
                         start_at_ms: 0,
-                        retry_policy: None,
+                        retry_policy,
                         payload: Some(MsgpackBytes {
                             data: rmp_serde::to_vec(&serde_json::json!({"job": i})).unwrap(),
                         }),
