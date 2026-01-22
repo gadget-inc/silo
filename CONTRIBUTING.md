@@ -126,11 +126,8 @@ The DST tests live in `tests/turmoil_runner.rs`. Each test scenario runs in an i
 ### Running DST tests
 
 ```shell
-# Run the fuzzer to test all scenarios for one seed
+# Run the fuzzer to test for one seed, which will choose the scenario automatically based on the seed
 scripts/run-simulation-tests.mjs --seed 123
-
-# Run the fuzzer to test just the chaos scenario for one seed
-scripts/run-simulation-tests.mjs --seed 123 --scenario chaos
 
 # Run the fuzzer to test many random seeds
 scripts/run-simulation-tests.mjs --seeds 100
