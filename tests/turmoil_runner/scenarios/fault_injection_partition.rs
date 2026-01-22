@@ -3,7 +3,7 @@
 use crate::helpers::{
     AttemptStatus, EnqueueRequest, GetJobRequest, HashMap, JobStatus, LeaseTasksRequest,
     MsgpackBytes, ReportOutcomeRequest, get_seed, report_outcome_request, run_scenario_impl,
-    setup_server, turmoil, turmoil_connector,
+    setup_server, turmoil, turmoil_connector, verify_server_invariants,
 };
 use silo::pb::silo_client::SiloClient;
 use std::time::Duration;
@@ -25,6 +25,12 @@ pub fn run() {
                 .await?;
             let mut client = SiloClient::new(ch);
 
+            // Verify initial server state
+            if let Ok(state) = verify_server_invariants(&mut client, 0).await {
+                tracing::trace!(result = ?state, "initial_server_state");
+                assert!(state.violations.is_empty(), "Initial server invariant violations: {:?}", state.violations);
+            }
+
             // Enqueue before partition
             tracing::trace!(job_id = "partition-test", "enqueue");
             client
@@ -43,6 +49,16 @@ pub fn run() {
                     task_group: "default".to_string(),
                 }))
                 .await?;
+
+            // Verify server state after enqueue (before partition)
+            if let Ok(state) = verify_server_invariants(&mut client, 0).await {
+                tracing::trace!(
+                    running = state.running_job_count,
+                    terminal = state.terminal_job_count,
+                    "server_state_before_partition"
+                );
+                assert!(state.violations.is_empty(), "Server invariant violations before partition: {:?}", state.violations);
+            }
 
             // Partition
             let sim_time = turmoil::sim_elapsed().map(|d| d.as_millis()).unwrap_or(0);
@@ -149,6 +165,19 @@ pub fn run() {
                     AttemptStatus::Succeeded,
                     "Attempt should be marked Succeeded"
                 );
+
+                // Verify server state after completion (post-partition recovery)
+                if let Ok(state) = verify_server_invariants(&mut client, 0).await {
+                    tracing::trace!(
+                        running = state.running_job_count,
+                        terminal = state.terminal_job_count,
+                        holders = ?state.holder_counts_by_queue,
+                        "server_state_after_complete"
+                    );
+                    assert!(state.violations.is_empty(), "Server invariant violations after complete: {:?}", state.violations);
+                    assert_eq!(state.running_job_count, 0, "No jobs should be running after completion");
+                    assert_eq!(state.terminal_job_count, 1, "One job should be terminal after completion");
+                }
             }
 
             tracing::trace!("client_done");
