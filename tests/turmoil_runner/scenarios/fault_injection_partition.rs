@@ -1,8 +1,9 @@
 //! Fault injection scenario: Network partition and recovery.
 
 use crate::helpers::{
-    EnqueueRequest, HashMap, LeaseTasksRequest, MsgpackBytes, ReportOutcomeRequest, get_seed,
-    report_outcome_request, run_scenario_impl, setup_server, turmoil, turmoil_connector,
+    AttemptStatus, EnqueueRequest, GetJobRequest, HashMap, JobStatus, LeaseTasksRequest,
+    MsgpackBytes, ReportOutcomeRequest, get_seed, report_outcome_request, run_scenario_impl,
+    setup_server, turmoil, turmoil_connector,
 };
 use silo::pb::silo_client::SiloClient;
 use std::time::Duration;
@@ -75,6 +76,32 @@ pub fn run() {
 
             if !lease.tasks.is_empty() {
                 let task = &lease.tasks[0];
+
+                // INVARIANT: Lease implies job is Running with one running attempt
+                let job_resp = client
+                    .get_job(tonic::Request::new(GetJobRequest {
+                        shard: 0,
+                        id: task.job_id.clone(),
+                        tenant: None,
+                        include_attempts: true,
+                    }))
+                    .await?
+                    .into_inner();
+                let running_attempts = job_resp
+                    .attempts
+                    .iter()
+                    .filter(|attempt| attempt.status() == AttemptStatus::Running)
+                    .count();
+                assert_eq!(
+                    job_resp.status(),
+                    JobStatus::Running,
+                    "Leased job should be Running"
+                );
+                assert_eq!(
+                    running_attempts, 1,
+                    "Running job should have exactly one running attempt"
+                );
+
                 client
                     .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                         shard: 0,
@@ -87,6 +114,41 @@ pub fn run() {
                     }))
                     .await?;
                 tracing::trace!(job_id = %task.job_id, "complete");
+
+                // INVARIANT: Completed job is terminal with no running attempts
+                let job_resp = client
+                    .get_job(tonic::Request::new(GetJobRequest {
+                        shard: 0,
+                        id: task.job_id.clone(),
+                        tenant: None,
+                        include_attempts: true,
+                    }))
+                    .await?
+                    .into_inner();
+                let running_attempts = job_resp
+                    .attempts
+                    .iter()
+                    .filter(|attempt| attempt.status() == AttemptStatus::Running)
+                    .count();
+                assert_eq!(
+                    job_resp.status(),
+                    JobStatus::Succeeded,
+                    "Completed job should be Succeeded"
+                );
+                assert_eq!(
+                    running_attempts, 0,
+                    "Terminal job should not have running attempts"
+                );
+                assert_eq!(
+                    job_resp.attempts.len(),
+                    1,
+                    "Expected exactly one attempt for completed job"
+                );
+                assert_eq!(
+                    job_resp.attempts[0].status(),
+                    AttemptStatus::Succeeded,
+                    "Attempt should be marked Succeeded"
+                );
             }
 
             tracing::trace!("client_done");

@@ -24,8 +24,8 @@ use turmoil::net::TcpListener;
 
 // Re-export common types needed by scenarios
 pub use silo::pb::{
-    ConcurrencyLimit, EnqueueRequest, GetJobRequest, JobStatus, LeaseTasksRequest, Limit,
-    MsgpackBytes, ReportOutcomeRequest, RetryPolicy, Task, limit, report_outcome_request,
+    AttemptStatus, ConcurrencyLimit, EnqueueRequest, GetJobRequest, JobStatus, LeaseTasksRequest,
+    Limit, MsgpackBytes, ReportOutcomeRequest, RetryPolicy, Task, limit, report_outcome_request,
 };
 pub use std::collections::HashMap;
 pub use turmoil;
@@ -649,6 +649,8 @@ impl GlobalConcurrencyTracker {
 /// Tracks job state for invariant verification.
 /// Verifies invariants like:
 /// - noLeasesForTerminal: Terminal jobs have no active leases
+/// - noDoubleLease: A task is never leased twice concurrently
+/// - oneLeasePerJob: A job never has multiple active leases
 /// - validTransitions: Only valid status transitions occur
 /// - noZombieAttempts: Terminal jobs have no running attempts
 #[derive(Debug, Default)]
@@ -714,10 +716,39 @@ impl JobStateTracker {
         }
 
         let mut leases = self.active_leases.lock().unwrap();
-        leases
-            .entry(job_id.to_string())
-            .or_default()
-            .insert(task_id.to_string());
+        let entry = leases.entry(job_id.to_string()).or_default();
+
+        if entry.contains(task_id) {
+            if self.lenient_mode {
+                tracing::warn!(
+                    job_id = job_id,
+                    task_id = task_id,
+                    "task already tracked as leased (duplicate lease response)"
+                );
+            } else {
+                panic!(
+                    "INVARIANT VIOLATION (noDoubleLease): Task '{}' already leased for job '{}'",
+                    task_id, job_id
+                );
+            }
+        } else if !entry.is_empty() {
+            if self.lenient_mode {
+                tracing::warn!(
+                    job_id = job_id,
+                    existing_tasks = ?entry,
+                    new_task_id = task_id,
+                    "job already has active lease (possible stale tracking)"
+                );
+            } else {
+                panic!(
+                    "INVARIANT VIOLATION (oneLeasePerJob): Job '{}' already has active lease(s) {:?} \
+                     but received new task '{}'",
+                    job_id, entry, task_id
+                );
+            }
+        }
+
+        entry.insert(task_id.to_string());
 
         let mut statuses = self.job_statuses.lock().unwrap();
         statuses.insert(job_id.to_string(), JobStatus::Running as i32);
