@@ -382,6 +382,8 @@ export class SiloWorker {
   /** Heartbeat intervals for active tasks (regular tasks and refresh tasks) */
   private _heartbeatIntervals: Map<string, ReturnType<typeof setInterval>> =
     new Map();
+  /** Counter for per-worker round-robin server selection */
+  private _pollCounter: number = 0;
 
   public constructor(options: SiloWorkerOptions) {
     this._client = options.client;
@@ -534,11 +536,17 @@ export class SiloWorker {
     const tasksToRequest = Math.min(availableQueueSlots, this._tasksPerPoll);
 
     // Lease tasks from the server (server handles multi-shard polling)
-    const result = await this._client.leaseTasks({
-      workerId: this._workerId,
-      maxTasks: tasksToRequest,
-      taskGroup: this._taskGroup,
-    });
+    // Use per-worker round-robin counter to cycle through all servers,
+    // ensuring each worker independently polls all servers in order.
+    const serverIndex = this._pollCounter++;
+    const result = await this._client.leaseTasks(
+      {
+        workerId: this._workerId,
+        maxTasks: tasksToRequest,
+        taskGroup: this._taskGroup,
+      },
+      serverIndex
+    );
 
     // Add regular job tasks to the queue
     for (const task of result.tasks) {

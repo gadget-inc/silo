@@ -980,6 +980,19 @@ export class SiloGRPCClient {
   }
 
   /**
+   * Get a client at a specific index (modulo number of connections).
+   * Used by workers to implement per-worker round-robin polling.
+   * @internal
+   */
+  public _getClientAtIndex(index: number): SiloClient {
+    const connections = Array.from(this._connections.values());
+    if (connections.length === 0) {
+      throw new Error("No server connections available");
+    }
+    return connections[index % connections.length].client;
+  }
+
+  /**
    * Get the client for a tenant.
    * @internal
    */
@@ -1408,17 +1421,24 @@ export class SiloGRPCClient {
    * which must be used when reporting outcomes or sending heartbeats.
    *
    * @param options The options for the lease request.
+   * @param serverIndex Optional index for server selection (for per-worker round-robin).
+   *                    If provided, uses that index modulo number of servers.
+   *                    If not provided, uses the shared round-robin counter.
    * @returns Object containing both job tasks and refresh tasks.
    */
   public async leaseTasks(
-    options: LeaseTasksOptions
+    options: LeaseTasksOptions,
+    serverIndex?: number
   ): Promise<LeaseTasksResult> {
     // If shard is specified, route to that shard's server
-    // Otherwise, use any available server (it will poll all its local shards)
+    // Otherwise, use round-robin server selection. If serverIndex is provided,
+    // use it for per-worker round-robin (avoids lock-step with shared counter).
     const client =
       options.shard !== undefined
         ? this._getClientForShard(options.shard)
-        : this._getAnyClient();
+        : serverIndex !== undefined
+          ? this._getClientAtIndex(serverIndex)
+          : this._getAnyClient();
 
     const call = client.leaseTasks(
       {

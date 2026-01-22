@@ -144,11 +144,14 @@ describe("SiloWorker", () => {
       await worker.stop();
 
       expect(leaseTasks).toHaveBeenCalled();
-      expect(leaseTasks).toHaveBeenCalledWith({
-        workerId: "test-worker",
-        maxTasks: expect.any(Number),
-        taskGroup: "default",
-      });
+      expect(leaseTasks).toHaveBeenCalledWith(
+        {
+          workerId: "test-worker",
+          maxTasks: expect.any(Number),
+          taskGroup: "default",
+        },
+        expect.any(Number) // serverIndex for per-worker round-robin
+      );
     });
 
     it("uses multiple concurrent pollers", async () => {

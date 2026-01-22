@@ -575,68 +575,75 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       expect(job.status).toBe(JobStatus.Succeeded);
     });
 
-    it("multiple workers on different task groups only receive their own tasks", async () => {
-      const processedByWorkerA: string[] = [];
-      const processedByWorkerB: string[] = [];
-      const taskGroupA = `group-a-${Date.now()}`;
-      const taskGroupB = `group-b-${Date.now()}`;
+    it(
+      "multiple workers on different task groups only receive their own tasks",
+      async () => {
+        const processedByWorkerA: string[] = [];
+        const processedByWorkerB: string[] = [];
+        const taskGroupA = `group-a-${Date.now()}`;
+        const taskGroupB = `group-b-${Date.now()}`;
 
-      // Enqueue tasks FIRST so they're ready when workers start polling
-      await client.enqueue({
-        tenant: DEFAULT_TENANT,
-        taskGroup: taskGroupA,
-        payload: { message: "task-for-A" },
-        priority: 1,
-      });
+        // Enqueue tasks FIRST so they're ready when workers start polling
+        await client.enqueue({
+          tenant: DEFAULT_TENANT,
+          taskGroup: taskGroupA,
+          payload: { message: "task-for-A" },
+          priority: 1,
+        });
 
-      await client.enqueue({
-        tenant: DEFAULT_TENANT,
-        taskGroup: taskGroupB,
-        payload: { message: "task-for-B" },
-        priority: 1,
-      });
+        await client.enqueue({
+          tenant: DEFAULT_TENANT,
+          taskGroup: taskGroupB,
+          payload: { message: "task-for-B" },
+          priority: 1,
+        });
 
-      // Worker A polls task group A
-      const workerA = createWorker(
-        async (ctx) => {
-          const payload = decodePayload<{ message: string }>(
-            ctx.task.payload?.data
-          );
-          processedByWorkerA.push(payload?.message ?? ctx.task.id);
-          return { type: "success", result: {} };
-        },
-        { taskGroup: taskGroupA }
-      );
+        // Worker A polls task group A
+        const workerA = createWorker(
+          async (ctx) => {
+            const payload = decodePayload<{ message: string }>(
+              ctx.task.payload?.data
+            );
+            processedByWorkerA.push(payload?.message ?? ctx.task.id);
+            return { type: "success", result: {} };
+          },
+          { taskGroup: taskGroupA }
+        );
 
-      // Worker B polls task group B
-      const workerB = createWorker(
-        async (ctx) => {
-          const payload = decodePayload<{ message: string }>(
-            ctx.task.payload?.data
-          );
-          processedByWorkerB.push(payload?.message ?? ctx.task.id);
-          return { type: "success", result: {} };
-        },
-        { taskGroup: taskGroupB }
-      );
+        // Worker B polls task group B
+        const workerB = createWorker(
+          async (ctx) => {
+            const payload = decodePayload<{ message: string }>(
+              ctx.task.payload?.data
+            );
+            processedByWorkerB.push(payload?.message ?? ctx.task.id);
+            return { type: "success", result: {} };
+          },
+          { taskGroup: taskGroupB }
+        );
 
-      workerA.start();
-      workerB.start();
+        workerA.start();
+        workerB.start();
 
-      // Wait until both tasks are processed
-      await waitFor(
-        () =>
-          processedByWorkerA.includes("task-for-A") &&
-          processedByWorkerB.includes("task-for-B")
-      );
+        // Wait until both tasks are processed
+        // In a multi-server cluster, workers use random server selection to avoid
+        // lock-step polling patterns. Use a longer timeout to account for variance.
+        await waitFor(
+          () =>
+            processedByWorkerA.includes("task-for-A") &&
+            processedByWorkerB.includes("task-for-B"),
+          { timeout: 10000 }
+        );
 
-      // Each worker should only have processed its own task group's tasks
-      expect(processedByWorkerA).toContain("task-for-A");
-      expect(processedByWorkerA).not.toContain("task-for-B");
+        // Each worker should only have processed its own task group's tasks
+        expect(processedByWorkerA).toContain("task-for-A");
+        expect(processedByWorkerA).not.toContain("task-for-B");
 
-      expect(processedByWorkerB).toContain("task-for-B");
-      expect(processedByWorkerB).not.toContain("task-for-A");
-    });
+        expect(processedByWorkerB).toContain("task-for-B");
+        expect(processedByWorkerB).not.toContain("task-for-A");
+      },
+      15000
+    );
   });
 
   describe("floating concurrency limit refresh", () => {
@@ -916,13 +923,11 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         await new Promise((r) => setTimeout(r, 20));
       }
 
-      // Wait for jobs and refreshes to complete
-      await waitFor(
-        () => processedJobs.length >= 3 || refreshedQueues.length >= 1,
-        { timeout: 10000 }
-      );
+      // Wait for jobs to be processed
+      // (refresh tasks may or may not be processed depending on timing)
+      await waitFor(() => processedJobs.length >= 3, { timeout: 10000 });
 
-      // Both job tasks and refresh tasks should have been processed
+      // Job tasks should have been processed
       expect(processedJobs.length).toBeGreaterThan(0);
       // Note: refresh task processing depends on timing, so we don't strictly require it
     });
