@@ -5,6 +5,7 @@
 /default.etcd
 /tmp
 /specs/output
+/dst-logs
 /typescript_client/dist
 /typescript_client/node_modules
 

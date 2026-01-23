@@ -10,6 +10,11 @@ import { spawn, spawnSync } from "node:child_process";
 import { parseArgs } from "node:util";
 import { randomInt } from "node:crypto";
 import { cpus } from "node:os";
+import { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
+
+// Directory for storing test output logs
+const LOGS_DIR = "dst-logs";
 
 // All available DST scenarios - must match test function names in main.rs
 const SCENARIOS = [
@@ -56,11 +61,6 @@ const { values: args, positionals } = parseArgs({
       short: "j",
       default: String(defaultParallelism),
     },
-    verbose: {
-      type: "boolean",
-      short: "v",
-      default: false,
-    },
   },
   allowPositionals: true,
   strict: true,
@@ -75,6 +75,8 @@ Fuzz the simulation tests with many random seeds to find failures.
 Each seed runs exactly one scenario, deterministically selected based on the seed.
 Each scenario runs in a separate subprocess to ensure clean state and true determinism.
 
+Failed test output is written to ${LOGS_DIR}/ to avoid memory issues when running many seeds.
+
 Options:
   -h, --help              Show this help message
   -n, --seeds <count>     Number of random seeds to test (default: 100)
@@ -82,7 +84,6 @@ Options:
   -t, --scenario <name>   Run only a specific scenario (overrides seed-based selection)
   -r, --random-seed <n>   Base seed for generating test seeds (for reproducibility)
   -j, --parallelism <n>   Number of tests to run in parallel (default: ${defaultParallelism}, all cores in CI, 3 otherwise)
-  -v, --verbose           Show full output on failure
 
 Available scenarios:
   ${SCENARIOS.join(", ")}
@@ -105,9 +106,6 @@ Examples:
 
   # Run with 8 parallel workers
   ./scripts/run-simulation-tests.mjs -n 100 -j 8
-
-  # Run in CI with verbose output on failure
-  ./scripts/run-simulation-tests.mjs -n 100 -v
 `);
 }
 
@@ -123,7 +121,6 @@ const RANDOM_SEED = args["random-seed"]
   ? parseInt(args["random-seed"], 10)
   : randomInt(0, 2 ** 32);
 const PARALLELISM = parseInt(args.parallelism, 10);
-const VERBOSE = args.verbose;
 
 // Validate scenario if specified
 if (SPECIFIC_SCENARIO && !SCENARIOS.includes(SPECIFIC_SCENARIO)) {
@@ -156,8 +153,16 @@ function selectScenarioFromSeed(seed, scenarios) {
 }
 
 /**
+ * Get the log file path for a test run.
+ */
+function getLogFilePath(scenario, seed) {
+  return join(LOGS_DIR, `${scenario}_seed_${seed}.log`);
+}
+
+/**
  * Run a single scenario with a specific seed in fuzz mode.
  * Each scenario runs in its own subprocess for determinism.
+ * Writes output to a log file to avoid OOM when running many seeds.
  */
 function runScenarioWithSeed(scenario, seed) {
   return new Promise((resolve) => {
@@ -170,27 +175,34 @@ function runScenarioWithSeed(scenario, seed) {
       }
     );
 
-    let stdout = "";
-    let stderr = "";
-    proc.stdout.on("data", (data) => (stdout += data));
-    proc.stderr.on("data", (data) => (stderr += data));
+    const outputChunks = [];
+    proc.stdout.on("data", (data) => outputChunks.push(data));
+    proc.stderr.on("data", (data) => outputChunks.push(data));
 
     proc.on("close", (code) => {
-      const output = stdout + stderr;
+      const output = Buffer.concat(outputChunks).toString();
       const passed = code === 0 && output.includes("test result: ok");
-      resolve({ passed, output, exitCode: code, scenario, seed });
+
+      // Write output to file for failed tests
+      let logFile = null;
+      if (!passed) {
+        logFile = getLogFilePath(scenario, seed);
+        writeFileSync(logFile, output);
+      }
+
+      resolve({ passed, logFile, exitCode: code, scenario, seed });
     });
   });
 }
 
 /**
  * Run tests in parallel using a worker pool pattern.
- * Returns results in the order tests complete.
+ * Processes results via callback to avoid accumulating them in memory.
  */
 async function runTestsInParallel(tasks, parallelism, onResult) {
   const pending = [...tasks];
   const running = new Map(); // Map<Promise, {task, promise}>
-  const results = [];
+  let completed = 0;
   let promiseId = 0;
 
   while (pending.length > 0 || running.size > 0) {
@@ -211,11 +223,9 @@ async function runTestsInParallel(tasks, parallelism, onResult) {
     const { id, result } = await Promise.race(running.values());
     running.delete(id);
 
-    results.push(result);
-    onResult(result, results.length, tasks.length);
+    completed++;
+    onResult(result, completed, tasks.length);
   }
-
-  return results;
 }
 
 async function main() {
@@ -267,6 +277,10 @@ async function main() {
   }
   console.log("");
 
+  // Clean and create logs directory
+  rmSync(LOGS_DIR, { recursive: true, force: true });
+  mkdirSync(LOGS_DIR, { recursive: true });
+
   // Generate all tasks upfront
   const rng = createRng(RANDOM_SEED);
   const tasks = [];
@@ -304,8 +318,9 @@ async function main() {
   if (failures.length > 0) {
     console.log("");
     console.log("Failures:");
-    for (const { seed, scenario } of failures) {
+    for (const { seed, scenario, logFile } of failures) {
       console.log(`  - seed=${seed} scenario=${scenario}`);
+      console.log(`    log: ${logFile}`);
     }
     console.log("");
     console.log("To reproduce a failure:");
@@ -314,14 +329,8 @@ async function main() {
     console.log("");
     console.log("To verify determinism for a seed (runs twice, compares output):");
     console.log("  DST_SEED=<seed> cargo test --test turmoil_runner <scenario> -- --exact");
-
-    if (VERBOSE && failures.length > 0) {
-      console.log("");
-      console.log("==============================================");
-      console.log(`First failure output (${failures[0].scenario} seed=${failures[0].seed}):`);
-      console.log("==============================================");
-      console.log(failures[0].output);
-    }
+    console.log("");
+    console.log(`Failure logs written to: ${LOGS_DIR}/`);
 
     process.exit(1);
   }

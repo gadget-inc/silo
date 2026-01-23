@@ -31,17 +31,17 @@ jobs:
       - name: Run simulation tests
         shell: bash
         run: |
-          args="--seeds ${{ github.event.inputs.num_seeds || '200' }} --verbose"
+          args="--seeds ${{ github.event.inputs.num_seeds || '200' }}"
           if [ -n "${{ github.event.inputs.random_seed }}" ]; then
             args="$args --random-seed ${{ github.event.inputs.random_seed }}"
           fi
           node scripts/run-simulation-tests.mjs $args
 
-      - name: Upload failure artifacts
+      - name: Upload failure logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: dst-failure-logs
-          path: |
-            target/debug/deps/turmoil_runner-*
+          path: dst-logs/
           retention-days: 7
+          if-no-files-found: ignore
