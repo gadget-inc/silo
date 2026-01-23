@@ -9,6 +9,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { parseArgs } from "node:util";
 import { randomInt } from "node:crypto";
+import { cpus } from "node:os";
 
 // All available DST scenarios - must match test function names in main.rs
 const SCENARIOS = [
@@ -20,6 +21,10 @@ const SCENARIOS = [
   "lease_expiry",
   "multiple_workers",
 ];
+
+// Determine default parallelism: all cores in CI, 3 otherwise
+const isCI = process.env.CI === "true" || process.env.CI === "1";
+const defaultParallelism = isCI ? cpus().length : 3;
 
 // Parse command line arguments
 const { values: args, positionals } = parseArgs({
@@ -46,6 +51,11 @@ const { values: args, positionals } = parseArgs({
       type: "string",
       short: "r",
     },
+    parallelism: {
+      type: "string",
+      short: "j",
+      default: String(defaultParallelism),
+    },
     verbose: {
       type: "boolean",
       short: "v",
@@ -71,6 +81,7 @@ Options:
   -s, --seed <seed>       Run a specific seed (for reproduction)
   -t, --scenario <name>   Run only a specific scenario (overrides seed-based selection)
   -r, --random-seed <n>   Base seed for generating test seeds (for reproducibility)
+  -j, --parallelism <n>   Number of tests to run in parallel (default: ${defaultParallelism}, all cores in CI, 3 otherwise)
   -v, --verbose           Show full output on failure
 
 Available scenarios:
@@ -92,6 +103,9 @@ Examples:
   # Run with a reproducible set of random seeds
   ./scripts/run-simulation-tests.mjs -r 999 -n 50
 
+  # Run with 8 parallel workers
+  ./scripts/run-simulation-tests.mjs -n 100 -j 8
+
   # Run in CI with verbose output on failure
   ./scripts/run-simulation-tests.mjs -n 100 -v
 `);
@@ -108,6 +122,7 @@ const SPECIFIC_SCENARIO = args.scenario || null;
 const RANDOM_SEED = args["random-seed"]
   ? parseInt(args["random-seed"], 10)
   : randomInt(0, 2 ** 32);
+const PARALLELISM = parseInt(args.parallelism, 10);
 const VERBOSE = args.verbose;
 
 // Validate scenario if specified
@@ -168,6 +183,41 @@ function runScenarioWithSeed(scenario, seed) {
   });
 }
 
+/**
+ * Run tests in parallel using a worker pool pattern.
+ * Returns results in the order tests complete.
+ */
+async function runTestsInParallel(tasks, parallelism, onResult) {
+  const pending = [...tasks];
+  const running = new Map(); // Map<Promise, {task, promise}>
+  const results = [];
+  let promiseId = 0;
+
+  while (pending.length > 0 || running.size > 0) {
+    // Start new tasks up to parallelism limit
+    while (running.size < parallelism && pending.length > 0) {
+      const task = pending.shift();
+      const id = promiseId++;
+      const promise = runScenarioWithSeed(task.scenario, task.seed).then((result) => ({
+        id,
+        result,
+      }));
+      running.set(id, promise);
+    }
+
+    if (running.size === 0) break;
+
+    // Wait for any task to complete - Promise.race returns the value, not the promise
+    const { id, result } = await Promise.race(running.values());
+    running.delete(id);
+
+    results.push(result);
+    onResult(result, results.length, tasks.length);
+  }
+
+  return results;
+}
+
 async function main() {
   const scenariosToRun = SPECIFIC_SCENARIO ? [SPECIFIC_SCENARIO] : SCENARIOS;
 
@@ -191,6 +241,7 @@ async function main() {
   console.log("Simulation Test Fuzzing");
   console.log("==============================================");
   console.log(`Seeds to test: ${NUM_SEEDS}`);
+  console.log(`Parallelism: ${PARALLELISM} workers${isCI ? " (CI mode)" : ""}`);
   if (SPECIFIC_SCENARIO) {
     console.log(`Scenario: ${SPECIFIC_SCENARIO} (fixed)`);
   } else {
@@ -216,31 +267,34 @@ async function main() {
   }
   console.log("");
 
+  // Generate all tasks upfront
   const rng = createRng(RANDOM_SEED);
+  const tasks = [];
+  for (let i = 0; i < NUM_SEEDS; i++) {
+    const seed = rng();
+    const scenario = SPECIFIC_SCENARIO || selectScenarioFromSeed(seed, SCENARIOS);
+    tasks.push({ seed, scenario, index: i + 1 });
+  }
+
   const failures = [];
   let totalPassed = 0;
   let totalFailed = 0;
 
-  for (let i = 1; i <= NUM_SEEDS; i++) {
-    const seed = rng();
-    // Select scenario: use specific one if provided, otherwise deterministically select based on seed
-    const scenario = SPECIFIC_SCENARIO || selectScenarioFromSeed(seed, SCENARIOS);
+  // Run tests in parallel
+  await runTestsInParallel(tasks, PARALLELISM, (result, completed, total) => {
+    const { passed, scenario, seed } = result;
     const padSeed = String(seed).padEnd(10);
-    const progress = `(${String(i).padStart(3)}/${NUM_SEEDS})`;
+    const progress = `(${String(completed).padStart(3)}/${total})`;
 
-    process.stdout.write(`Seed ${padSeed} ${progress} [${scenario}]: `);
-
-    const result = await runScenarioWithSeed(scenario, seed);
-
-    if (result.passed) {
-      console.log("✓");
+    if (passed) {
+      console.log(`Seed ${padSeed} ${progress} [${scenario}]: ✓`);
       totalPassed += 1;
     } else {
-      console.log("FAILED");
+      console.log(`Seed ${padSeed} ${progress} [${scenario}]: FAILED`);
       totalFailed += 1;
       failures.push(result);
     }
-  }
+  });
 
   console.log("");
   console.log("==============================================");

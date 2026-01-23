@@ -11,7 +11,7 @@ on:
       num_seeds:
         description: "Number of random seeds to test"
         required: false
-        default: "100"
+        default: "200"
       random_seed:
         description: "Base random seed (leave empty for random)"
         required: false
@@ -31,7 +31,7 @@ jobs:
       - name: Run simulation tests
         shell: bash
         run: |
-          args="--seeds ${{ github.event.inputs.num_seeds || '100' }} --verbose"
+          args="--seeds ${{ github.event.inputs.num_seeds || '200' }} --verbose"
           if [ -n "${{ github.event.inputs.random_seed }}" ]; then
             args="$args --random-seed ${{ github.event.inputs.random_seed }}"
           fi
