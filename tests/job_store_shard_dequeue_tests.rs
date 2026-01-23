@@ -107,7 +107,7 @@ async fn heartbeat_renews_lease_when_worker_matches() {
 
         // Heartbeat to renew
         shard
-            .heartbeat_task("-", "worker-1", &task_id)
+            .heartbeat_task("worker-1", &task_id)
             .await
             .expect("heartbeat ok");
 
@@ -145,7 +145,7 @@ async fn heartbeat_rejects_mismatched_worker() {
         let task_id = tasks[0].attempt().task_id().to_string();
 
         let err = shard
-            .heartbeat_task("-", "worker-2", &task_id)
+            .heartbeat_task("worker-2", &task_id)
             .await
             .expect_err("heartbeat should fail");
 
@@ -179,7 +179,6 @@ async fn heartbeat_after_outcome_returns_lease_not_found() {
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success {
                     result: b"ok".to_vec(),
@@ -188,7 +187,7 @@ async fn heartbeat_after_outcome_returns_lease_not_found() {
             .await
             .expect("report ok");
         let err = shard
-            .heartbeat_task("-", "worker-1", &task_id)
+            .heartbeat_task("worker-1", &task_id)
             .await
             .expect_err("hb should fail");
         match err {
@@ -262,7 +261,6 @@ async fn delete_job_before_dequeue_skips_task_and_no_lease_created() {
     assert_eq!(tasks.len(), 1);
     shard
         .report_attempt_outcome(
-            "-",
             tasks[0].attempt().task_id(),
             AttemptOutcome::Success { result: vec![] },
         )

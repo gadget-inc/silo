@@ -143,11 +143,10 @@ impl JobStoreShard {
     /// Updates the floating limit state with the new max concurrency value.
     pub async fn report_refresh_success(
         &self,
-        tenant: &str,
         task_id: &str,
         new_max_concurrency: u32,
     ) -> Result<(), JobStoreShardError> {
-        // Load the lease to get the queue key
+        // Load the lease to get the queue key and tenant
         let lease_key = leased_task_key(task_id);
         let maybe_raw = self.db.get(lease_key.as_bytes()).await?;
         let Some(value_bytes) = maybe_raw else {
@@ -155,6 +154,7 @@ impl JobStoreShard {
         };
 
         let decoded = decode_lease(&value_bytes)?;
+        let tenant = decoded.tenant();
         let queue_key = match decoded.to_task() {
             Task::RefreshFloatingLimit { queue_key, .. } => queue_key,
             _ => {
@@ -216,12 +216,11 @@ impl JobStoreShard {
     /// Schedules a retry with exponential backoff.
     pub async fn report_refresh_failure(
         &self,
-        tenant: &str,
         task_id: &str,
         error_code: &str,
         error_message: &str,
     ) -> Result<(), JobStoreShardError> {
-        // Load the lease to get the task details
+        // Load the lease to get the task details and tenant
         let lease_key = leased_task_key(task_id);
         let maybe_raw = self.db.get(lease_key.as_bytes()).await?;
         let Some(value_bytes) = maybe_raw else {
@@ -229,6 +228,7 @@ impl JobStoreShard {
         };
 
         let decoded = decode_lease(&value_bytes)?;
+        let tenant = decoded.tenant().to_string();
         let (queue_key, current_max_concurrency, last_refreshed_at_ms, metadata, task_group) =
             match decoded.to_task() {
                 Task::RefreshFloatingLimit {
@@ -253,7 +253,7 @@ impl JobStoreShard {
             };
 
         let now_ms = now_epoch_ms();
-        let state_key = floating_limit_state_key(tenant, &queue_key);
+        let state_key = floating_limit_state_key(&tenant, &queue_key);
 
         // Load state (zero-copy read from archived)
         let maybe_state = self.db.get(state_key.as_bytes()).await?;
@@ -282,7 +282,7 @@ impl JobStoreShard {
         let new_task_id = Uuid::new_v4().to_string();
         let refresh_task = Task::RefreshFloatingLimit {
             task_id: new_task_id.clone(),
-            tenant: tenant.to_string(),
+            tenant: tenant.clone(),
             queue_key: queue_key.clone(),
             current_max_concurrency,
             last_refreshed_at_ms,

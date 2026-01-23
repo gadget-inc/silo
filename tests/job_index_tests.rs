@@ -38,7 +38,7 @@ async fn status_index_scheduled_then_running_then_succeeded() {
     // Complete -> Succeeded
     let tid = tasks[0].attempt().task_id().to_string();
     shard
-        .report_attempt_outcome("-", &tid, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&tid, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report");
 
@@ -75,7 +75,6 @@ async fn status_index_failed_and_scheduled_then_order_newest_first() {
         .to_string();
     shard
         .report_attempt_outcome(
-            "-",
             &ta,
             AttemptOutcome::Error {
                 error_code: "E".to_string(),
@@ -116,7 +115,6 @@ async fn status_index_failed_and_scheduled_then_order_newest_first() {
         .to_string();
     shard
         .report_attempt_outcome(
-            "-",
             &tb,
             AttemptOutcome::Error {
                 error_code: "E".to_string(),
@@ -178,7 +176,6 @@ async fn retry_flow_running_to_scheduled_to_running_to_succeeded() {
     // Error -> Scheduled
     shard
         .report_attempt_outcome(
-            "-",
             &t1,
             AttemptOutcome::Error {
                 error_code: "E".to_string(),
@@ -204,7 +201,7 @@ async fn retry_flow_running_to_scheduled_to_running_to_succeeded() {
     assert!(running2.contains(&job_id));
     // Success -> Succeeded
     shard
-        .report_attempt_outcome("-", &t2, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&t2, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report ok");
     let succ = shard
@@ -383,7 +380,7 @@ async fn delete_removes_from_index() {
         .task_id()
         .to_string();
     shard
-        .report_attempt_outcome("-", &tid, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&tid, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report ok");
     // Ensure in Succeeded index
@@ -588,7 +585,7 @@ async fn metadata_index_basic_and_delete_cleanup() {
         .map(|t| t.attempt().task_id().to_string())
         .expect("leased task for A");
     shard
-        .report_attempt_outcome("-", &a_tid, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&a_tid, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("complete A");
     shard.delete_job("-", &a).await.expect("delete a");

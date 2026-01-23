@@ -100,7 +100,6 @@ async fn restart_failed_job() {
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Error {
                     error_code: "TEST_ERROR".to_string(),
@@ -157,7 +156,6 @@ async fn restart_failed_job() {
         let task_id2 = tasks2[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id2,
                 AttemptOutcome::Success {
                     result: b"{}".to_vec(),
@@ -194,7 +192,6 @@ async fn restart_succeeded_job_returns_error() {
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success {
                     result: b"{}".to_vec(),
@@ -272,7 +269,6 @@ async fn restart_running_job_returns_error() {
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success {
                     result: b"{}".to_vec(),
@@ -378,7 +374,6 @@ async fn restart_failed_job_with_retry_policy_resets_retries() {
             let task_id = tasks[0].attempt().task_id().to_string();
             shard
                 .report_attempt_outcome(
-                    "-",
                     &task_id,
                     AttemptOutcome::Error {
                         error_code: "TEST_ERROR".to_string(),
@@ -442,7 +437,6 @@ async fn restart_failed_job_with_retry_policy_resets_retries() {
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success {
                     result: b"ok".to_vec(),
@@ -484,7 +478,7 @@ async fn restart_cancelled_running_job_after_acknowledgement() {
 
         // Worker discovers cancellation via heartbeat
         let hb_result = shard
-            .heartbeat_task("-", "worker-1", &task_id)
+            .heartbeat_task("worker-1", &task_id)
             .await
             .expect("heartbeat");
         assert!(
@@ -494,7 +488,7 @@ async fn restart_cancelled_running_job_after_acknowledgement() {
 
         // Worker acknowledges cancellation
         shard
-            .report_attempt_outcome("-", &task_id, AttemptOutcome::Cancelled)
+            .report_attempt_outcome(&task_id, AttemptOutcome::Cancelled)
             .await
             .expect("report cancelled");
 
@@ -529,7 +523,6 @@ async fn restart_cancelled_running_job_after_acknowledgement() {
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success {
                     result: b"{}".to_vec(),
@@ -566,7 +559,6 @@ async fn multiple_restarts_of_same_job() {
             let task_id = tasks[0].attempt().task_id().to_string();
             shard
                 .report_attempt_outcome(
-                    "-",
                     &task_id,
                     AttemptOutcome::Error {
                         error_code: "TEMP_ERROR".to_string(),
@@ -606,7 +598,6 @@ async fn multiple_restarts_of_same_job() {
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success {
                     result: b"done".to_vec(),

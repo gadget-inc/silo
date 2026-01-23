@@ -186,7 +186,6 @@ async fn delete_job_removes_key_and_is_idempotent() {
     assert_eq!(tasks.len(), 1);
     shard
         .report_attempt_outcome(
-            "-",
             tasks[0].attempt().task_id(),
             AttemptOutcome::Success { result: vec![] },
         )
@@ -327,7 +326,6 @@ async fn cannot_delete_running_job() {
         // Complete the job
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success {
                     result: b"ok".to_vec(),
@@ -383,7 +381,6 @@ async fn cannot_delete_scheduled_job() {
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success {
                     result: b"ok".to_vec(),

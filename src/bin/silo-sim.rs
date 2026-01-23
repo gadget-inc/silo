@@ -208,7 +208,6 @@ async fn main() -> anyhow::Result<()> {
                     }
                     let _ = shard
                         .report_attempt_outcome(
-                            "-",
                             &tid,
                             AttemptOutcome::Success { result: Vec::new() },
                         )

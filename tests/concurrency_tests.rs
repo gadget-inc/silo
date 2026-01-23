@@ -115,7 +115,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
 
     // Complete first task; this should release and grant next request, enqueuing its task
     shard
-        .report_attempt_outcome("-", &t1, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report1");
 
@@ -162,7 +162,6 @@ async fn concurrency_held_queues_propagate_across_retries_and_release_on_finish(
     // Fail attempt 1, should schedule attempt 2 carrying held_queues
     shard
         .report_attempt_outcome(
-            "-",
             &t1,
             AttemptOutcome::Error {
                 error_code: "E".to_string(),
@@ -180,7 +179,7 @@ async fn concurrency_held_queues_propagate_across_retries_and_release_on_finish(
 
     // Finish attempt 2, which should release holder
     shard
-        .report_attempt_outcome("-", &t2, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&t2, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report2");
 
@@ -279,7 +278,6 @@ async fn concurrency_retry_releases_original_holder() {
         .to_string();
     shard
         .report_attempt_outcome(
-            "-",
             &t1,
             AttemptOutcome::Error {
                 error_code: "E".to_string(),
@@ -295,7 +293,7 @@ async fn concurrency_retry_releases_original_holder() {
 
     // Finish attempt 2
     shard
-        .report_attempt_outcome("-", &t2, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&t2, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report2");
 
@@ -356,7 +354,7 @@ async fn concurrency_no_overgrant_after_release() {
 
     // Complete A -> should grant B (durably create one holder)
     shard
-        .report_attempt_outcome("-", &a_tid, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&a_tid, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report a success");
 
@@ -431,7 +429,7 @@ async fn stress_single_queue_no_double_grant() {
         // Capacity is enforced via durable holders + in-memory gating; no double-grant observed via uniqueness assertions above
         let tid = tasks[0].attempt().task_id().to_string();
         shard
-            .report_attempt_outcome("-", &tid, AttemptOutcome::Success { result: vec![] })
+            .report_attempt_outcome(&tid, AttemptOutcome::Success { result: vec![] })
             .await
             .expect("report");
         processed += 1;
@@ -505,7 +503,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
 
     // Release first; only one new task should appear immediately
     shard
-        .report_attempt_outcome("-", &t1, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report1");
     let after = first_kv_with_prefix(shard.db(), "tasks/").await;
@@ -707,7 +705,7 @@ async fn concurrency_multiple_holders_max_greater_than_one() {
 
     // Complete one task -> should grant next
     shard
-        .report_attempt_outcome("-", &t1, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report1");
 
@@ -717,11 +715,11 @@ async fn concurrency_multiple_holders_max_greater_than_one() {
 
     // Complete all
     shard
-        .report_attempt_outcome("-", &t2, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&t2, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report2");
     shard
-        .report_attempt_outcome("-", &t3, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&t3, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report3");
 
@@ -736,7 +734,6 @@ async fn concurrency_multiple_holders_max_greater_than_one() {
         for t in tasks {
             shard
                 .report_attempt_outcome(
-                    "-",
                     t.attempt().task_id(),
                     AttemptOutcome::Success { result: vec![] },
                 )
@@ -810,7 +807,6 @@ async fn concurrency_multiple_queues_per_job() {
     // Complete job -> should release api holder
     shard
         .report_attempt_outcome(
-            "-",
             tasks[0].attempt().task_id(),
             AttemptOutcome::Success { result: vec![] },
         )
@@ -874,7 +870,7 @@ async fn concurrency_future_request_waits_until_ready() {
 
     // Complete job 1 BEFORE job 2 is ready -> should NOT grant yet
     shard
-        .report_attempt_outcome("-", &t1, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report1");
 
@@ -968,7 +964,7 @@ async fn concurrency_request_priority_ordering() {
 
     // Complete job 1 -> should grant job 3 (high priority) not job 2
     shard
-        .report_attempt_outcome("-", &t1, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report1");
 
@@ -985,7 +981,6 @@ async fn concurrency_request_priority_ordering() {
     // Complete and verify job 2 comes last
     shard
         .report_attempt_outcome(
-            "-",
             t2_vec[0].attempt().task_id(),
             AttemptOutcome::Success { result: vec![] },
         )
@@ -1046,7 +1041,6 @@ async fn concurrency_permanent_failure_releases_holder() {
     // Fail job 1 permanently (no retry policy) -> should release holder
     shard
         .report_attempt_outcome(
-            "-",
             &t1,
             AttemptOutcome::Error {
                 error_code: "FAIL".to_string(),
@@ -1063,7 +1057,6 @@ async fn concurrency_permanent_failure_releases_holder() {
     // Complete job 2
     shard
         .report_attempt_outcome(
-            "-",
             t2_vec[0].attempt().task_id(),
             AttemptOutcome::Success { result: vec![] },
         )
@@ -1186,7 +1179,6 @@ async fn concurrency_reap_expired_lease_releases_holder() {
     // Cleanup
     shard
         .report_attempt_outcome(
-            "-",
             t2_vec[0].attempt().task_id(),
             AttemptOutcome::Success { result: vec![] },
         )
@@ -1252,7 +1244,7 @@ async fn concurrency_future_request_granted_after_time_passes() {
 
     // Complete Job 1 BEFORE Job 2's start time -> releases holder but Job 2 not ready yet
     shard
-        .report_attempt_outcome("-", &t1, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report1");
 
@@ -1364,7 +1356,7 @@ async fn cannot_delete_job_with_future_request_ticket() {
 
     // Complete job 1, which will eventually allow job 2 to run
     shard
-        .report_attempt_outcome("-", &t1, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report1");
 }
@@ -1440,7 +1432,7 @@ async fn cannot_delete_job_with_pending_request() {
 
     // Complete job 1 to allow job 2 to run
     shard
-        .report_attempt_outcome("-", &t1, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report1");
 
@@ -1463,7 +1455,6 @@ async fn cannot_delete_job_with_pending_request() {
     // Complete job 2
     shard
         .report_attempt_outcome(
-            "-",
             t2_vec[0].attempt().task_id(),
             AttemptOutcome::Success { result: vec![] },
         )

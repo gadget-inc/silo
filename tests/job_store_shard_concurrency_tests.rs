@@ -75,7 +75,7 @@ async fn concurrency_shared_across_task_groups() {
 
     // Complete alpha job - this should grant the slot to the beta job
     shard
-        .report_attempt_outcome("-", &t1, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report alpha success");
 
@@ -165,7 +165,7 @@ async fn concurrency_queues_jobs_from_multiple_task_groups() {
             // Complete it
             let tid = task.attempt().task_id().to_string();
             shard
-                .report_attempt_outcome("-", &tid, AttemptOutcome::Success { result: vec![] })
+                .report_attempt_outcome(&tid, AttemptOutcome::Success { result: vec![] })
                 .await
                 .expect("report success");
             processed += 1;
@@ -179,7 +179,7 @@ async fn concurrency_queues_jobs_from_multiple_task_groups() {
             for task in &result.tasks {
                 let tid = task.attempt().task_id().to_string();
                 shard
-                    .report_attempt_outcome("-", &tid, AttemptOutcome::Success { result: vec![] })
+                    .report_attempt_outcome(&tid, AttemptOutcome::Success { result: vec![] })
                     .await
                     .expect("report success");
                 processed += 1;
@@ -343,7 +343,6 @@ async fn concurrent_dequeue_many_workers_no_duplicates() {
                     }
                     shard_cl
                         .report_attempt_outcome(
-                            "-",
                             &tid,
                             AttemptOutcome::Success { result: Vec::new() },
                         )
@@ -454,7 +453,6 @@ async fn future_tasks_are_not_dequeued_under_concurrency() {
                         let tid = t.attempt().task_id().to_string();
                         shard_cl
                             .report_attempt_outcome(
-                                "-",
                                 &tid,
                                 AttemptOutcome::Success { result: vec![] },
                             )
@@ -581,7 +579,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
 
     // Complete first task; this should release and grant next request, enqueuing its task
     shard
-        .report_attempt_outcome("-", &t1, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report1");
 
@@ -628,7 +626,6 @@ async fn concurrency_held_queues_propagate_across_retries_and_release_on_finish(
     // Fail attempt 1, should schedule attempt 2 carrying held_queues
     shard
         .report_attempt_outcome(
-            "-",
             &t1,
             AttemptOutcome::Error {
                 error_code: "E".to_string(),
@@ -646,7 +643,7 @@ async fn concurrency_held_queues_propagate_across_retries_and_release_on_finish(
 
     // Finish attempt 2, which should release holder
     shard
-        .report_attempt_outcome("-", &t2, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&t2, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report2");
 
@@ -692,7 +689,6 @@ async fn concurrency_retry_releases_original_holder() {
         .to_string();
     shard
         .report_attempt_outcome(
-            "-",
             &t1,
             AttemptOutcome::Error {
                 error_code: "E".to_string(),
@@ -708,7 +704,7 @@ async fn concurrency_retry_releases_original_holder() {
 
     // Finish attempt 2
     shard
-        .report_attempt_outcome("-", &t2, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&t2, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report2");
 
@@ -769,7 +765,7 @@ async fn concurrency_no_overgrant_after_release() {
 
     // Complete A -> should grant B (durably create one holder)
     shard
-        .report_attempt_outcome("-", &a_tid, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&a_tid, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report a success");
 
@@ -844,7 +840,7 @@ async fn stress_single_queue_no_double_grant() {
         // Capacity is enforced via durable holders + in-memory gating; no double-grant observed via uniqueness assertions above
         let tid = tasks[0].attempt().task_id().to_string();
         shard
-            .report_attempt_outcome("-", &tid, AttemptOutcome::Success { result: vec![] })
+            .report_attempt_outcome(&tid, AttemptOutcome::Success { result: vec![] })
             .await
             .expect("report");
         processed += 1;
@@ -918,7 +914,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
 
     // Release first; only one new task should appear immediately
     shard
-        .report_attempt_outcome("-", &t1, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report1");
     let after = first_kv_with_prefix(shard.db(), "tasks/").await;
@@ -1013,7 +1009,6 @@ async fn retry_with_concurrency_must_reacquire_slot_not_claim_released_slot() {
     // 3. Schedule a retry for A (but the retry must NOT claim to hold the slot!)
     shard
         .report_attempt_outcome(
-            "-",
             &task_a_id,
             AttemptOutcome::Error {
                 error_code: "TEST_FAILURE".to_string(),
@@ -1054,7 +1049,7 @@ async fn retry_with_concurrency_must_reacquire_slot_not_claim_released_slot() {
     // Complete Job B
     let task_b_id = tasks_after_failure[0].attempt().task_id().to_string();
     shard
-        .report_attempt_outcome("-", &task_b_id, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&task_b_id, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report B success");
 
@@ -1154,7 +1149,6 @@ async fn retry_must_wait_for_slot_when_another_job_was_granted() {
     // Fail A - one of B or C should get the slot, A's retry should wait
     shard
         .report_attempt_outcome(
-            "-",
             &task_a_id,
             AttemptOutcome::Error {
                 error_code: "E".to_string(),

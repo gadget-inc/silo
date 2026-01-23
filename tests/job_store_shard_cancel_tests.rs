@@ -156,7 +156,7 @@ async fn heartbeat_returns_cancelled_flag() {
 
         // First heartbeat - not cancelled
         let response1 = shard
-            .heartbeat_task("-", "worker-1", &task_id)
+            .heartbeat_task("worker-1", &task_id)
             .await
             .expect("heartbeat");
         assert!(
@@ -169,7 +169,7 @@ async fn heartbeat_returns_cancelled_flag() {
 
         // Second heartbeat - should report cancelled
         let response2 = shard
-            .heartbeat_task("-", "worker-1", &task_id)
+            .heartbeat_task("worker-1", &task_id)
             .await
             .expect("heartbeat 2");
         assert!(response2.cancelled, "should be cancelled after cancel_job");
@@ -205,7 +205,7 @@ async fn worker_reports_cancelled_outcome() {
 
         // Worker reports Cancelled outcome
         shard
-            .report_attempt_outcome("-", &task_id, AttemptOutcome::Cancelled)
+            .report_attempt_outcome(&task_id, AttemptOutcome::Cancelled)
             .await
             .expect("report cancelled");
 
@@ -377,7 +377,7 @@ async fn cancel_succeeded_job_returns_error() {
         let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
-            .report_attempt_outcome("-", &task_id, AttemptOutcome::Success { result: vec![] })
+            .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: vec![] })
             .await
             .expect("report success");
 
@@ -427,7 +427,6 @@ async fn cancel_failed_job_returns_error() {
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Error {
                     error_code: "TEST".to_string(),
@@ -517,14 +516,14 @@ async fn cancellation_preserved_through_stale_dequeue() {
         // Worker discovers cancellation on heartbeat
         let task_id = tasks[0].attempt().task_id().to_string();
         let response = shard
-            .heartbeat_task("-", "worker-1", &task_id)
+            .heartbeat_task("worker-1", &task_id)
             .await
             .expect("heartbeat");
         assert!(response.cancelled, "heartbeat should report cancellation");
 
         // Worker reports Cancelled outcome
         shard
-            .report_attempt_outcome("-", &task_id, AttemptOutcome::Cancelled)
+            .report_attempt_outcome(&task_id, AttemptOutcome::Cancelled)
             .await
             .expect("report cancelled");
 
@@ -655,7 +654,7 @@ async fn cancel_scheduled_job_with_concurrency_removes_request() {
         // Complete first job - should NOT grant to cancelled j2
         let t1 = tasks1[0].attempt().task_id().to_string();
         shard
-            .report_attempt_outcome("-", &t1, AttemptOutcome::Success { result: vec![] })
+            .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
             .await
             .expect("report1");
 
@@ -811,7 +810,7 @@ async fn dequeue_skips_cancelled_request_ticket_tasks() {
         // Complete j1 to release the slot
         let t1_id = t1[0].attempt().task_id().to_string();
         shard
-            .report_attempt_outcome("-", &t1_id, AttemptOutcome::Success { result: vec![] })
+            .report_attempt_outcome(&t1_id, AttemptOutcome::Success { result: vec![] })
             .await
             .expect("report j1 success");
 
@@ -922,7 +921,7 @@ async fn grant_on_release_skips_multiple_cancelled_requests() {
         // Complete j1 - should skip j2 and j3, grant to j4
         let t1_id = t1[0].attempt().task_id().to_string();
         shard
-            .report_attempt_outcome("-", &t1_id, AttemptOutcome::Success { result: vec![] })
+            .report_attempt_outcome(&t1_id, AttemptOutcome::Success { result: vec![] })
             .await
             .expect("report j1 success");
 
@@ -1065,7 +1064,7 @@ async fn cancelled_requests_are_cleaned_up_on_grant() {
         // Complete j1 to trigger grant-next (which should skip and delete j2's request)
         let t1_id = t1[0].attempt().task_id().to_string();
         shard
-            .report_attempt_outcome("-", &t1_id, AttemptOutcome::Success { result: vec![] })
+            .report_attempt_outcome(&t1_id, AttemptOutcome::Success { result: vec![] })
             .await
             .expect("report j1 success");
 

@@ -359,7 +359,6 @@ async fn worker_loop(
                     let outcome_request = ReportOutcomeRequest {
                         shard: task_shard,
                         task_id: task.id.clone(),
-                        tenant: None, // Server determines tenant from task_id
                         outcome: Some(Outcome::Success(MsgpackBytes {
                             data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
                         })),

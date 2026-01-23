@@ -7,8 +7,8 @@ use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::pb::*;
 use silo::settings::{AppConfig, Backend, DatabaseTemplate};
-use tonic_health::pb::health_client::HealthClient;
 use tonic_health::pb::HealthCheckRequest;
+use tonic_health::pb::health_client::HealthClient;
 
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_health_check_returns_serving() -> anyhow::Result<()> {
@@ -19,9 +19,7 @@ async fn grpc_health_check_returns_serving() -> anyhow::Result<()> {
 
         // Get endpoint for health client
         let endpoint = format!("http://{}", addr);
-        let channel = tonic::transport::Endpoint::new(endpoint)?
-            .connect()
-            .await?;
+        let channel = tonic::transport::Endpoint::new(endpoint)?.connect().await?;
         let mut health_client = HealthClient::new(channel);
 
         // Check overall health (empty service name)
@@ -97,7 +95,7 @@ async fn grpc_server_lease_tasks_multi_shard() -> anyhow::Result<()> {
                     limits: vec![],
                     tenant: None,
                     metadata: std::collections::HashMap::new(),
-                task_group: "default".to_string(),
+                    task_group: "default".to_string(),
                 };
                 let _ = client.enqueue(enq).await?;
             }
@@ -158,7 +156,8 @@ async fn grpc_server_tenant_validation_when_enabled() -> anyhow::Result<()> {
         let mut cfg = AppConfig::load(None).unwrap();
         cfg.tenancy.enabled = true;
 
-        let (mut client, shutdown_tx, server, _addr) = setup_test_server(factory.clone(), cfg).await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), cfg).await?;
 
         // Test 1: Missing tenant when required - should fail
         let res = client
@@ -282,7 +281,8 @@ async fn grpc_server_reset_shards_requires_dev_mode() -> anyhow::Result<()> {
         let mut cfg = AppConfig::load(None).unwrap();
         cfg.server.dev_mode = false;
 
-        let (mut client, shutdown_tx, server, _addr) = setup_test_server(factory.clone(), cfg).await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), cfg).await?;
 
         // reset_shards should fail in non-dev mode
         let res = client.reset_shards(ResetShardsRequest {}).await;
@@ -316,7 +316,8 @@ async fn grpc_server_reset_shards_works_in_dev_mode() -> anyhow::Result<()> {
         let mut cfg = AppConfig::load(None).unwrap();
         cfg.server.dev_mode = true;
 
-        let (mut client, shutdown_tx, server, _addr) = setup_test_server(factory.clone(), cfg).await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), cfg).await?;
 
         // First enqueue a job
         let _ = client
@@ -384,7 +385,6 @@ async fn grpc_server_report_outcome_missing_outcome() -> anyhow::Result<()> {
             .report_outcome(ReportOutcomeRequest {
                 shard: 0,
                 task_id: "fake-task".to_string(),
-                tenant: None,
                 outcome: None, // Missing!
             })
             .await;
@@ -421,7 +421,6 @@ async fn grpc_server_report_refresh_outcome_missing_outcome() -> anyhow::Result<
             .report_refresh_outcome(ReportRefreshOutcomeRequest {
                 shard: 0,
                 task_id: "fake-refresh-task".to_string(),
-                tenant: None,
                 outcome: None, // Missing!
             })
             .await;

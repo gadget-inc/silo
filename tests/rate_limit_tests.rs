@@ -313,7 +313,7 @@ async fn concurrency_then_rate_limit_acquired_in_order() {
     // Complete the task
     let task_id = tasks[0].attempt().task_id().to_string();
     shard
-        .report_attempt_outcome("-", &task_id, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report success");
 }
@@ -357,7 +357,7 @@ async fn rate_limit_then_concurrency_acquired_in_order() {
     // Complete the task
     let task_id = tasks[0].attempt().task_id().to_string();
     shard
-        .report_attempt_outcome("-", &task_id, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report success");
 }
@@ -420,7 +420,7 @@ async fn concurrency_blocked_with_rate_limit_pending() {
     // Complete job1
     let task_id = tasks[0].attempt().task_id().to_string();
     shard
-        .report_attempt_outcome("-", &task_id, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("complete job1");
 
@@ -471,7 +471,7 @@ async fn three_limits_concurrency_rate_concurrency() {
     // Complete and verify cleanup
     let task_id = tasks[0].attempt().task_id().to_string();
     shard
-        .report_attempt_outcome("-", &task_id, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("complete");
 }

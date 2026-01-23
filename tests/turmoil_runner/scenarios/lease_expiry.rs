@@ -181,7 +181,6 @@ pub fn run() {
                             client
                                 .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                                     shard: 0,
-                                    tenant: None,
                                     task_id: task.id.clone(),
                                     outcome: Some(report_outcome_request::Outcome::Success(
                                         MsgpackBytes {

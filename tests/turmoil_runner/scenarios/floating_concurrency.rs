@@ -148,7 +148,6 @@ pub fn run() {
                     match client
                         .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                             shard: 0,
-                            tenant: None,
                             task_id: task.id.clone(),
                             outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
                                 data: rmp_serde::to_vec(&serde_json::json!("done")).unwrap(),
@@ -183,7 +182,6 @@ pub fn run() {
                         .report_refresh_outcome(tonic::Request::new(ReportRefreshOutcomeRequest {
                             shard: 0,
                             task_id: refresh_task.id.clone(),
-                            tenant: None,
                             outcome: Some(
                                 silo::pb::report_refresh_outcome_request::Outcome::Success(
                                     RefreshSuccess {

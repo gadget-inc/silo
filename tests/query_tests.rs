@@ -593,7 +593,6 @@ async fn sql_filter_succeeded_status() {
 
     shard
         .report_attempt_outcome(
-            "-",
             &task_id,
             silo::job_attempt::AttemptOutcome::Success { result: vec![] },
         )
@@ -639,7 +638,6 @@ async fn sql_filter_failed_status() {
 
     shard
         .report_attempt_outcome(
-            "-",
             &task_id,
             silo::job_attempt::AttemptOutcome::Error {
                 error_code: "TEST_ERROR".to_string(),

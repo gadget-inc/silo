@@ -79,7 +79,6 @@ async fn grpc_get_job_includes_status() -> anyhow::Result<()> {
             .report_outcome(ReportOutcomeRequest {
                 shard: 0,
                 task_id: task.id.clone(),
-                tenant: None,
                 outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
                     data: rmp_serde::to_vec(&serde_json::json!({"result": "done"})).unwrap(),
                 })),
@@ -251,7 +250,6 @@ async fn grpc_get_job_result_success() -> anyhow::Result<()> {
             .report_outcome(ReportOutcomeRequest {
                 shard: 0,
                 task_id: task.id.clone(),
-                tenant: None,
                 outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
                     data: result_data.clone(),
                 })),
@@ -337,7 +335,6 @@ async fn grpc_get_job_result_failure() -> anyhow::Result<()> {
             .report_outcome(ReportOutcomeRequest {
                 shard: 0,
                 task_id: task.id.clone(),
-                tenant: None,
                 outcome: Some(report_outcome_request::Outcome::Failure(Failure {
                     code: error_code.clone(),
                     data: error_data.clone(),
@@ -490,7 +487,6 @@ async fn grpc_get_job_result_cancelled_while_running() -> anyhow::Result<()> {
             .report_outcome(ReportOutcomeRequest {
                 shard: 0,
                 task_id: task.id.clone(),
-                tenant: None,
                 outcome: Some(report_outcome_request::Outcome::Cancelled(Cancelled {})),
             })
             .await?;
@@ -700,7 +696,6 @@ async fn grpc_get_job_next_attempt_starts_after() -> anyhow::Result<()> {
             .report_outcome(ReportOutcomeRequest {
                 shard: 0,
                 task_id: task.id.clone(),
-                tenant: None,
                 outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
                     data: rmp_serde::to_vec(&serde_json::json!({"result": "done"})).unwrap(),
                 })),
@@ -784,7 +779,6 @@ async fn grpc_get_job_next_attempt_after_retry() -> anyhow::Result<()> {
             .report_outcome(ReportOutcomeRequest {
                 shard: 0,
                 task_id: task.id.clone(),
-                tenant: None,
                 outcome: Some(report_outcome_request::Outcome::Failure(Failure {
                     code: "TEST_FAILURE".to_string(),
                     data: b"{}".to_vec(),

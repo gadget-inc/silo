@@ -13,7 +13,7 @@ use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt};
 use crate::job_store_shard::helpers::now_epoch_ms;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{attempt_key, floating_limit_state_key, job_info_key, leased_task_key};
-use crate::task::{HeartbeatResult, LeaseRecord, DEFAULT_LEASE_MS};
+use crate::task::{DEFAULT_LEASE_MS, HeartbeatResult, LeaseRecord};
 use tracing::{debug, info_span};
 
 impl JobStoreShard {
@@ -24,7 +24,6 @@ impl JobStoreShard {
     /// Worker can keep heartbeating during graceful shutdown until they report completion.
     pub async fn heartbeat_task(
         &self,
-        tenant: &str,
         worker_id: &str,
         task_id: &str,
     ) -> Result<HeartbeatResult, JobStoreShardError> {
@@ -47,7 +46,8 @@ impl JobStoreShard {
             });
         }
 
-        // Extract job_id for cancellation checking (use helper method)
+        // Extract tenant and job_id from the lease (authoritative source)
+        let tenant = decoded.tenant().to_string();
         let job_id = decoded.job_id().to_string();
 
         // [SILO-HB-3] Renew by creating new record with updated expiry
@@ -66,7 +66,7 @@ impl JobStoreShard {
 
         // Check cancellation status to return in response
         // Worker discovers cancellation via heartbeat response per Alloy spec
-        let cancelled_at_ms = self.get_job_cancellation(tenant, &job_id).await?;
+        let cancelled_at_ms = self.get_job_cancellation(&tenant, &job_id).await?;
 
         Ok(HeartbeatResult {
             cancelled: cancelled_at_ms.is_some(),
@@ -78,7 +78,6 @@ impl JobStoreShard {
     /// Removes the lease and finalizes the attempt state.
     pub async fn report_attempt_outcome(
         &self,
-        tenant: &str,
         task_id: &str,
         outcome: AttemptOutcome,
     ) -> Result<(), JobStoreShardError> {
@@ -92,6 +91,7 @@ impl JobStoreShard {
         let decoded = decode_lease(&value_bytes)?;
 
         // Extract fields using zero-copy accessors
+        let tenant = decoded.tenant().to_string();
         let job_id = decoded.job_id().to_string();
         let attempt_number = decoded.attempt_number();
         let held_queues_local = decoded.held_queues(); // Only allocation needed
@@ -124,7 +124,7 @@ impl JobStoreShard {
             status: attempt_status,
         };
         let attempt_val = encode_attempt(&attempt)?;
-        let attempt_key = attempt_key(tenant, &job_id, attempt_number);
+        let attempt_key = attempt_key(&tenant, &job_id, attempt_number);
 
         // Atomically update attempt and remove lease
         let mut batch = WriteBatch::new();
@@ -144,14 +144,14 @@ impl JobStoreShard {
             // [SILO-SUCC-3] If success: mark job succeeded now (pure write)
             AttemptOutcome::Success { .. } => {
                 let job_status = JobStatus::succeeded(now_ms);
-                self.set_job_status_with_index(&mut batch, tenant, &job_id, job_status)
+                self.set_job_status_with_index(&mut batch, &tenant, &job_id, job_status)
                     .await?;
                 new_job_status_for_dst = Some("Succeeded".to_string());
             }
             // Worker acknowledges cancellation - set job status to Cancelled
             AttemptOutcome::Cancelled => {
                 let job_status = JobStatus::cancelled(now_ms);
-                self.set_job_status_with_index(&mut batch, tenant, &job_id, job_status)
+                self.set_job_status_with_index(&mut batch, &tenant, &job_id, job_status)
                     .await?;
                 new_job_status_for_dst = Some("Cancelled".to_string());
             }
@@ -160,7 +160,7 @@ impl JobStoreShard {
                 let mut scheduled_followup: bool = false;
 
                 // Load job info to get priority and retry policy
-                let job_info_key = job_info_key(tenant, &job_id);
+                let job_info_key = job_info_key(&tenant, &job_id);
                 let maybe_job = self.db.get(job_info_key.as_bytes()).await?;
                 if let Some(jbytes) = maybe_job {
                     let view = JobView::new(jbytes)?;
@@ -184,7 +184,7 @@ impl JobStoreShard {
                             retry_grants = self
                                 .enqueue_limit_task_at_index(
                                     &mut batch,
-                                    tenant,
+                                    &tenant,
                                     &next_task_id,
                                     &job_id,
                                     next_attempt_number,
@@ -200,8 +200,10 @@ impl JobStoreShard {
 
                             // [SILO-RETRY-3] Set job status to Scheduled with next attempt time
                             let job_status = JobStatus::scheduled(now_ms, next_time);
-                            self.set_job_status_with_index(&mut batch, tenant, &job_id, job_status)
-                                .await?;
+                            self.set_job_status_with_index(
+                                &mut batch, &tenant, &job_id, job_status,
+                            )
+                            .await?;
                             scheduled_followup = true;
                             followup_next_time = Some(next_time);
                             new_job_status_for_dst = Some("Scheduled".to_string());
@@ -210,7 +212,7 @@ impl JobStoreShard {
                     // [SILO-FAIL-3] If no follow-up scheduled, mark job as failed (pure write)
                     if !scheduled_followup {
                         let job_status = JobStatus::failed(now_ms);
-                        self.set_job_status_with_index(&mut batch, tenant, &job_id, job_status)
+                        self.set_job_status_with_index(&mut batch, &tenant, &job_id, job_status)
                             .await?;
                         new_job_status_for_dst = Some("Failed".to_string());
                     }
@@ -229,7 +231,7 @@ impl JobStoreShard {
             .release_and_grant_next(
                 &self.db,
                 &mut batch,
-                tenant,
+                &tenant,
                 &held_queues_local,
                 task_id,
                 now_ms,
@@ -241,7 +243,8 @@ impl JobStoreShard {
         if let Err(e) = self.db.write(batch).await {
             // Rollback any grants made during retry scheduling
             for (queue, grant_task_id) in &retry_grants {
-                self.concurrency.rollback_grant(tenant, queue, grant_task_id);
+                self.concurrency
+                    .rollback_grant(&tenant, queue, grant_task_id);
             }
             // Rollback release-and-grant operations
             self.concurrency.rollback_release_grants(&release_rollbacks);
@@ -367,7 +370,7 @@ impl JobStoreShard {
             };
 
             // [SILO-REAP-REL] Release lease and update job/attempt status via report_attempt_outcome
-            let _ = self.report_attempt_outcome(tenant, task_id, outcome).await;
+            let _ = self.report_attempt_outcome(task_id, outcome).await;
             reaped += 1;
         }
 

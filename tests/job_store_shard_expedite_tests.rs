@@ -59,7 +59,6 @@ async fn expedite_future_scheduled_job() {
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success {
                     result: b"{}".to_vec(),
@@ -114,7 +113,6 @@ async fn expedite_mid_retry_job() {
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Error {
                     error_code: "TEMP_ERROR".to_string(),
@@ -159,7 +157,6 @@ async fn expedite_mid_retry_job() {
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success {
                     result: b"{}".to_vec(),
@@ -216,7 +213,6 @@ async fn expedite_succeeded_job_returns_error() {
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success {
                     result: b"{}".to_vec(),
@@ -271,7 +267,6 @@ async fn expedite_failed_job_returns_error() {
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Error {
                     error_code: "PERM_ERROR".to_string(),
@@ -432,7 +427,6 @@ async fn expedite_running_job_returns_error() {
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success {
                     result: b"{}".to_vec(),
@@ -461,7 +455,6 @@ async fn expedite_job_no_pending_task_returns_error() {
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success {
                     result: b"{}".to_vec(),

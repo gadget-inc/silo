@@ -559,7 +559,6 @@ pub fn run() {
                             match client
                                 .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                                     shard: 0,
-                                    tenant: None,
                                     task_id: task.id.clone(),
                                     outcome: Some(outcome),
                                 }))
@@ -616,7 +615,6 @@ pub fn run() {
                     match client
                         .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                             shard: 0,
-                            tenant: None,
                             task_id: task.id.clone(),
                             outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
                                 data: rmp_serde::to_vec(&serde_json::json!("chaos_done")).unwrap(),

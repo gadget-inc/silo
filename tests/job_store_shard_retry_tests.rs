@@ -30,7 +30,6 @@ async fn reporting_attempt_outcome_updates_attempt_and_deletes_lease() {
         // Outcome: success
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success {
                     result: b"ok".to_vec(),
@@ -98,7 +97,6 @@ async fn error_with_no_retries_does_not_enqueue_next_attempt() {
 
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Error {
                     error_code: "TEST".to_string(),
@@ -151,7 +149,6 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
         let t1 = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &t1,
                 AttemptOutcome::Error {
                     error_code: "TEST".to_string(),
@@ -185,7 +182,6 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
         let t2 = tasks2[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &t2,
                 AttemptOutcome::Error {
                     error_code: "TEST".to_string(),
@@ -219,7 +215,6 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
         let t3 = tasks3[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &t3,
                 AttemptOutcome::Error {
                     error_code: "TEST".to_string(),
@@ -254,7 +249,6 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_success() {
         // First report: success
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success {
                     result: b"ok".to_vec(),
@@ -266,7 +260,6 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_success() {
         // Second report: expect LeaseNotFound since lease was removed on first report
         let err = shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success {
                     result: b"ok".to_vec(),
@@ -326,7 +319,6 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_error() {
         // First report: success
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success {
                     result: b"ok".to_vec(),
@@ -338,7 +330,6 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_error() {
         // Second report: error, expect LeaseNotFound
         let err = shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Error {
                     error_code: "TEST".to_string(),
@@ -403,7 +394,6 @@ async fn retry_count_one_boundary_enqueues_attempt2_then_stops_on_second_error()
     let t1 = tasks[0].attempt().task_id().to_string();
     shard
         .report_attempt_outcome(
-            "-",
             &t1,
             AttemptOutcome::Error {
                 error_code: "TEST".to_string(),
@@ -435,7 +425,6 @@ async fn retry_count_one_boundary_enqueues_attempt2_then_stops_on_second_error()
     let t2 = tasks2[0].attempt().task_id().to_string();
     shard
         .report_attempt_outcome(
-            "-",
             &t2,
             AttemptOutcome::Error {
                 error_code: "TEST".to_string(),
@@ -493,7 +482,6 @@ async fn next_retry_time_matches_scheduled_time_smoke() {
         let t1 = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &t1,
                 AttemptOutcome::Error {
                     error_code: "TEST".to_string(),
@@ -558,7 +546,6 @@ async fn duplicate_reporting_error_then_error_is_rejected_and_no_extra_tasks() {
         let t1 = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &t1,
                 AttemptOutcome::Error {
                     error_code: "TEST".to_string(),
@@ -571,7 +558,6 @@ async fn duplicate_reporting_error_then_error_is_rejected_and_no_extra_tasks() {
         // Duplicate error report should fail with LeaseNotFound
         let err = shard
             .report_attempt_outcome(
-                "-",
                 &t1,
                 AttemptOutcome::Error {
                     error_code: "TEST".to_string(),
@@ -607,7 +593,6 @@ async fn duplicate_reporting_error_then_success_is_rejected_and_state_persists()
         let t1 = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &t1,
                 AttemptOutcome::Error {
                     error_code: "TEST".to_string(),
@@ -618,7 +603,6 @@ async fn duplicate_reporting_error_then_success_is_rejected_and_state_persists()
             .expect("report1");
         let err = shard
             .report_attempt_outcome(
-                "-",
                 &t1,
                 AttemptOutcome::Success {
                     result: b"ok".to_vec(),
@@ -676,7 +660,6 @@ async fn attempt_records_exist_across_retries_and_task_ids_distinct() {
         let t1 = tasks1[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &t1,
                 AttemptOutcome::Error {
                     error_code: "TEST".to_string(),
@@ -693,7 +676,6 @@ async fn attempt_records_exist_across_retries_and_task_ids_distinct() {
         assert_ne!(t1, t2, "task ids should be distinct across attempts");
         shard
             .report_attempt_outcome(
-                "-",
                 &t2,
                 AttemptOutcome::Error {
                     error_code: "TEST".to_string(),
@@ -739,7 +721,6 @@ async fn outcome_payload_edge_cases_empty_vectors_round_trip() {
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success { result: Vec::new() },
             )
@@ -776,7 +757,6 @@ async fn outcome_payload_edge_cases_empty_vectors_round_trip() {
         let task2 = tasks2[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task2,
                 AttemptOutcome::Error {
                     error_code: "TEST".to_string(),
@@ -815,7 +795,6 @@ async fn large_outcome_payloads_round_trip() {
         let big_ok = vec![1u8; 2_000_000];
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success {
                     result: big_ok.clone(),
@@ -854,7 +833,6 @@ async fn large_outcome_payloads_round_trip() {
         let big_err = vec![2u8; 2_000_000];
         shard
             .report_attempt_outcome(
-                "-",
                 &task2,
                 AttemptOutcome::Error {
                     error_code: "TEST".to_string(),

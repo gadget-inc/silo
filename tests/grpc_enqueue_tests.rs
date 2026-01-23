@@ -56,7 +56,6 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
             .report_outcome(ReportOutcomeRequest {
                 shard: 0,
                 task_id: task.id.clone(),
-                tenant: None,
                 outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
                     data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
                 })),

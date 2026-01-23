@@ -94,7 +94,7 @@ async fn floating_limit_shared_across_task_groups() {
 
     // Complete alpha job
     shard
-        .report_attempt_outcome("-", &t1, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report alpha success");
 
@@ -265,7 +265,7 @@ async fn floating_limit_refresh_applies_to_all_task_groups() {
 
     // Report successful refresh with increased concurrency
     shard
-        .report_refresh_success("-", &refresh_task_id, 3) // Increase from 1 to 3
+        .report_refresh_success(&refresh_task_id, 3) // Increase from 1 to 3
         .await
         .expect("report refresh success");
 
@@ -372,7 +372,7 @@ async fn floating_limit_queues_jobs_from_multiple_task_groups() {
                 let tid = task.attempt().task_id().to_string();
                 let job_id = task.job().id().to_string();
                 shard
-                    .report_attempt_outcome("-", &tid, AttemptOutcome::Success { result: vec![] })
+                    .report_attempt_outcome(&tid, AttemptOutcome::Success { result: vec![] })
                     .await
                     .expect("report success");
                 processed_jobs.push(job_id);
@@ -657,7 +657,7 @@ async fn floating_limit_refresh_success_updates_state() {
 
     // Report successful refresh
     shard
-        .report_refresh_success("-", &task_id, new_max)
+        .report_refresh_success(&task_id, new_max)
         .await
         .expect("report refresh success");
 
@@ -750,7 +750,7 @@ async fn floating_limit_refresh_failure_triggers_backoff() {
 
     // Report failed refresh
     shard
-        .report_refresh_failure("-", &task_id, "test_error", "simulated failure")
+        .report_refresh_failure(&task_id, "test_error", "simulated failure")
         .await
         .expect("report refresh failure");
 
@@ -944,7 +944,7 @@ async fn floating_limit_uses_dynamic_max_concurrency() {
 
     // Complete j1 - j2 should get a ticket
     shard
-        .report_attempt_outcome("-", &t1_id, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&t1_id, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report j1 success");
 
@@ -1085,7 +1085,7 @@ async fn floating_limit_multiple_retries_increase_backoff() {
     let task_id = result.refresh_tasks[0].task_id.clone();
 
     shard
-        .report_refresh_failure("-", &task_id, "test_error", "simulated failure 1")
+        .report_refresh_failure(&task_id, "test_error", "simulated failure 1")
         .await
         .expect("report failure 1");
 
@@ -1109,7 +1109,7 @@ async fn floating_limit_multiple_retries_increase_backoff() {
     if !result.refresh_tasks.is_empty() {
         let task_id = result.refresh_tasks[0].task_id.clone();
         shard
-            .report_refresh_failure("-", &task_id, "test_error", "simulated failure 2")
+            .report_refresh_failure(&task_id, "test_error", "simulated failure 2")
             .await
             .expect("report failure 2");
 
@@ -1192,7 +1192,7 @@ async fn floating_limit_successful_refresh_resets_backoff() {
     let result = shard.dequeue("worker-1", "default", 10).await.expect("dequeue");
     let task_id = result.refresh_tasks[0].task_id.clone();
     shard
-        .report_refresh_failure("-", &task_id, "test_error", "simulated failure")
+        .report_refresh_failure(&task_id, "test_error", "simulated failure")
         .await
         .expect("report failure");
 
@@ -1213,7 +1213,7 @@ async fn floating_limit_successful_refresh_resets_backoff() {
     if !result.refresh_tasks.is_empty() {
         let task_id = result.refresh_tasks[0].task_id.clone();
         shard
-            .report_refresh_success("-", &task_id, 8)
+            .report_refresh_success(&task_id, 8)
             .await
             .expect("report success");
 
