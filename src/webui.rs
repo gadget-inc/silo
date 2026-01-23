@@ -89,6 +89,8 @@ pub struct MemberRow {
     pub grpc_addr: String,
     pub is_self: bool,
     pub shard_count: usize,
+    pub uptime: String,
+    pub hostname: Option<String>,
 }
 
 #[derive(Template)]
@@ -215,6 +217,38 @@ pub struct QueueParams {
 pub struct SqlQueryParams {
     #[serde(default)]
     q: String,
+}
+
+fn format_uptime(startup_time_ms: Option<i64>) -> String {
+    let Some(startup_ms) = startup_time_ms else {
+        return "unknown".to_string();
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    let uptime_ms = now_ms.saturating_sub(startup_ms);
+    if uptime_ms < 0 {
+        return "unknown".to_string();
+    }
+
+    let total_secs = uptime_ms / 1000;
+    let days = total_secs / 86400;
+    let hours = (total_secs % 86400) / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+
+    if days > 0 {
+        format!("{}d {}h {}m", days, hours, minutes)
+    } else if hours > 0 {
+        format!("{}h {}m {}s", hours, minutes, seconds)
+    } else if minutes > 0 {
+        format!("{}m {}s", minutes, seconds)
+    } else {
+        format!("{}s", seconds)
+    }
 }
 
 fn format_timestamp(ms: i64) -> String {
@@ -890,6 +924,8 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
                     node_id: member_info.node_id,
                     grpc_addr: member_info.grpc_addr,
                     shard_count,
+                    uptime: format_uptime(member_info.startup_time_ms),
+                    hostname: member_info.hostname,
                 });
             }
         }
@@ -988,6 +1024,8 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
             grpc_addr,
             is_self: true,
             shard_count: shards.len(),
+            uptime: "unknown".to_string(),
+            hostname: crate::coordination::get_hostname(),
         });
     }
 

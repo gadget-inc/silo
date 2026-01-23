@@ -32,6 +32,19 @@ pub use none::NoneCoordinator;
 pub struct MemberInfo {
     pub node_id: String,
     pub grpc_addr: String,
+    /// Unix timestamp in milliseconds when this node started
+    #[serde(default)]
+    pub startup_time_ms: Option<i64>,
+    /// Hostname of the machine running this node
+    #[serde(default)]
+    pub hostname: Option<String>,
+}
+
+/// Get the hostname of the current machine
+pub fn get_hostname() -> Option<String> {
+    hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
 }
 
 /// Mapping of shard IDs to their owning node's gRPC address
@@ -194,6 +207,8 @@ pub struct CoordinatorBase {
     pub shutdown_tx: watch::Sender<bool>,
     pub shutdown_rx: watch::Receiver<bool>,
     pub factory: Arc<ShardFactory>,
+    /// Unix timestamp in milliseconds when this node started
+    pub startup_time_ms: Option<i64>,
 }
 
 impl CoordinatorBase {
@@ -205,6 +220,10 @@ impl CoordinatorBase {
         factory: Arc<ShardFactory>,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let startup_time_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .ok();
         Self {
             node_id: node_id.into(),
             grpc_addr: grpc_addr.into(),
@@ -213,6 +232,7 @@ impl CoordinatorBase {
             shutdown_tx,
             shutdown_rx,
             factory,
+            startup_time_ms,
         }
     }
 

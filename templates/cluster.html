@@ -105,15 +105,17 @@
                             <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Node ID</th>
                             <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">gRPC Address</th>
                             <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Shards</th>
+                            <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Uptime</th>
                             <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Role</th>
                         </tr>
                     </thead>
                     <tbody class="divide-y divide-zinc-700">
                         {% for member in members %}
                         <tr class="border-b border-zinc-700 hover:bg-zinc-750 {% if member.is_self %}bg-emerald-900/10{% endif %}">
-                            <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap font-mono">{{ member.node_id }}</td>
+                            <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap font-mono">{{ member.node_id }}{% if let Some(hostname) = member.hostname %} <span class="text-zinc-500">({{ hostname }})</span>{% endif %}</td>
                             <td class="px-3 py-2 text-sm text-zinc-400 whitespace-nowrap font-mono">{{ member.grpc_addr }}</td>
                             <td class="px-3 py-2 text-sm text-emerald-400 whitespace-nowrap">{{ member.shard_count }}</td>
+                            <td class="px-3 py-2 text-sm text-zinc-400 whitespace-nowrap">{{ member.uptime }}</td>
                             <td class="px-3 py-2 text-sm whitespace-nowrap">
                                 {% if member.is_self %}
                                 <span class="px-2 py-0.5 text-xs font-medium bg-emerald-900/50 border border-emerald-700 text-emerald-400">This Node</span>

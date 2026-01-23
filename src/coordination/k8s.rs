@@ -49,8 +49,8 @@ use tracing::{debug, info, warn};
 use crate::factory::ShardFactory;
 
 use super::{
-    compute_desired_shards_for_node, keys, CoordinationError, Coordinator, CoordinatorBase,
-    MemberInfo, ShardOwnerMap, ShardPhase,
+    compute_desired_shards_for_node, get_hostname, keys, CoordinationError, Coordinator,
+    CoordinatorBase, MemberInfo, ShardOwnerMap, ShardPhase,
 };
 
 /// Format a chrono DateTime for K8S MicroTime (RFC3339 with microseconds and Z suffix)
@@ -97,6 +97,13 @@ impl K8sCoordinator {
         let node_id = node_id.into();
         let grpc_addr = grpc_addr.into();
 
+        let base = Arc::new(CoordinatorBase::new(
+            node_id.clone(),
+            grpc_addr.clone(),
+            num_shards,
+            factory,
+        ));
+
         // Create or update membership lease
         let leases: Api<Lease> = Api::namespaced(client.clone(), &namespace);
         let member_lease_name = keys::k8s_member_lease_name(&cluster_prefix, &node_id);
@@ -104,6 +111,8 @@ impl K8sCoordinator {
         let member_info = MemberInfo {
             node_id: node_id.clone(),
             grpc_addr: grpc_addr.clone(),
+            startup_time_ms: base.startup_time_ms,
+            hostname: get_hostname(),
         };
         let member_info_json = serde_json::to_string(&member_info)
             .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
@@ -138,13 +147,6 @@ impl K8sCoordinator {
             )
             .await
             .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
-
-        let base = Arc::new(CoordinatorBase::new(
-            node_id.clone(),
-            grpc_addr,
-            num_shards,
-            factory,
-        ));
         let members_cache = Arc::new(Mutex::new(Vec::new()));
         let membership_changed = Arc::new(Notify::new());
 
@@ -414,6 +416,8 @@ impl K8sCoordinator {
         let member_info = MemberInfo {
             node_id: self.base.node_id.clone(),
             grpc_addr: self.base.grpc_addr.clone(),
+            startup_time_ms: self.base.startup_time_ms,
+            hostname: get_hostname(),
         };
         let member_info_json = serde_json::to_string(&member_info)
             .map_err(|e| CoordinationError::BackendError(e.to_string()))?;

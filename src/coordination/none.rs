@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::factory::ShardFactory;
 
-use super::{CoordinationError, Coordinator, MemberInfo, ShardOwnerMap};
+use super::{CoordinationError, Coordinator, MemberInfo, ShardOwnerMap, get_hostname};
 
 /// A no-op coordinator for single-node deployments.
 ///
@@ -20,6 +20,8 @@ pub struct NoneCoordinator {
     node_id: String,
     grpc_addr: String,
     num_shards: u32,
+    startup_time_ms: Option<i64>,
+    hostname: Option<String>,
 }
 
 impl NoneCoordinator {
@@ -39,10 +41,17 @@ impl NoneCoordinator {
             }
         }
 
+        let startup_time_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .ok();
+
         Self {
             node_id: node_id.into(),
             grpc_addr: grpc_addr.into(),
             num_shards,
+            startup_time_ms,
+            hostname: get_hostname(),
         }
     }
 }
@@ -69,6 +78,8 @@ impl Coordinator for NoneCoordinator {
         Ok(vec![MemberInfo {
             node_id: self.node_id.clone(),
             grpc_addr: self.grpc_addr.clone(),
+            startup_time_ms: self.startup_time_ms,
+            hostname: self.hostname.clone(),
         }])
     }
 

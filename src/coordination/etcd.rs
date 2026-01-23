@@ -9,7 +9,7 @@ use etcd_client::{Client, ConnectOptions, GetOptions, LockOptions, PutOptions};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{watch, Mutex, Notify};
+use tokio::sync::{Mutex, Notify, watch};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
@@ -19,8 +19,8 @@ use crate::factory::ShardFactory;
 pub use super::ShardPhase;
 
 use super::{
-    compute_desired_shards_for_node, keys, CoordinationError, Coordinator, CoordinatorBase,
-    MemberInfo, ShardOwnerMap,
+    CoordinationError, Coordinator, CoordinatorBase, MemberInfo, ShardOwnerMap,
+    compute_desired_shards_for_node, get_hostname, keys,
 };
 
 /// etcd-based coordinator for distributed shard ownership.
@@ -76,11 +76,20 @@ impl EtcdCoordinator {
             .map_err(|e| CoordinationError::BackendError(e.to_string()))?
             .id();
 
+        let base = Arc::new(CoordinatorBase::new(
+            node_id.clone(),
+            grpc_addr.clone(),
+            num_shards,
+            factory,
+        ));
+
         // Write membership key
         let member_key = keys::member_key(&cluster_prefix, &node_id);
         let member_info = MemberInfo {
             node_id: node_id.clone(),
             grpc_addr: grpc_addr.clone(),
+            startup_time_ms: base.startup_time_ms,
+            hostname: get_hostname(),
         };
         let member_value = serde_json::to_string(&member_info)
             .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
@@ -94,13 +103,6 @@ impl EtcdCoordinator {
             )
             .await
             .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
-
-        let base = Arc::new(CoordinatorBase::new(
-            node_id.clone(),
-            grpc_addr,
-            num_shards,
-            factory,
-        ));
 
         let me = Self {
             base: base.clone(),
@@ -531,7 +533,7 @@ impl EtcdShardGuard {
         owned_arc: Arc<Mutex<HashSet<u32>>>,
         factory: Arc<ShardFactory>,
     ) {
-        use tracing::{info_span, Instrument};
+        use tracing::{Instrument, info_span};
 
         loop {
             if *self.shutdown.borrow() {
