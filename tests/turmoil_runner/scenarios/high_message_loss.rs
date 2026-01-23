@@ -11,13 +11,13 @@ use crate::helpers::{
     get_seed, report_outcome_request, run_scenario_impl, setup_server,
 };
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub fn run() {
     let seed = get_seed();
-    run_scenario_impl("high_message_loss", seed, 90, |sim| {
+    run_scenario_impl("high_message_loss", seed, 120, |sim| {
         sim.set_fail_rate(0.15); // 15% message loss
         sim.set_max_message_latency(Duration::from_millis(30));
 
@@ -30,6 +30,7 @@ pub fn run() {
         let job_tracker = Arc::new(JobStateTracker::new());
         let enqueued_jobs: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let total_completed = Arc::new(AtomicU32::new(0));
+        let scenario_done = Arc::new(AtomicBool::new(false));
 
         let producer_tracker = Arc::clone(&job_tracker);
         let producer_jobs = Arc::clone(&enqueued_jobs);
@@ -100,6 +101,7 @@ pub fn run() {
 
         let worker_tracker = Arc::clone(&job_tracker);
         let worker_completed = Arc::clone(&total_completed);
+        let worker_done_flag = Arc::clone(&scenario_done);
         let worker_config = client_config.clone();
         sim.client("worker", async move {
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -108,7 +110,11 @@ pub fn run() {
             let mut consecutive_failures = 0u32;
 
             let mut completed = 0;
-            for _ in 0..30 {
+            for _ in 0..50 {
+                // Exit early if verifier has finished
+                if worker_done_flag.load(Ordering::SeqCst) {
+                    break;
+                }
                 match client
                     .lease_tasks(tonic::Request::new(LeaseTasksRequest {
                         shard: Some(0),
@@ -185,13 +191,12 @@ pub fn run() {
         let verify_tracker = Arc::clone(&job_tracker);
         let verify_completed = Arc::clone(&total_completed);
         let verify_jobs = Arc::clone(&enqueued_jobs);
+        let verify_done_flag = Arc::clone(&scenario_done);
         let verify_config = client_config.clone();
         sim.client("verifier", async move {
-            // Wait for work to complete. 40s is enough for:
-            // - Producer: 20 jobs with delays (~2-5s simulated)
-            // - Worker: 30 rounds × 100ms delay (~3s minimum, more with retries)
-            // - Buffer for message loss and reconnection overhead
-            tokio::time::sleep(Duration::from_secs(40)).await;
+            // Wait for work to complete. With 15% message loss and 2s request timeouts,
+            // requests can take a long time. We wait long enough for reasonable progress.
+            tokio::time::sleep(Duration::from_secs(60)).await;
 
             let mut client = create_turmoil_client("http://server:9904", &verify_config).await?;
             let mut consecutive_failures = 0u32;
@@ -283,6 +288,9 @@ pub fn run() {
 
             // INVARIANT: No terminal job leases
             verify_tracker.verify_no_terminal_leases();
+
+            // Signal worker to exit early
+            verify_done_flag.store(true, Ordering::SeqCst);
 
             tracing::trace!("verifier_done");
             Ok(())

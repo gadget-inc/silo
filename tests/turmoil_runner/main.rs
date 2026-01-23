@@ -90,3 +90,57 @@ fn chaos() {
         verify_determinism("chaos", get_seed());
     }
 }
+
+#[test]
+fn retry_releases_ticket() {
+    if is_subprocess() || is_fuzz_mode() {
+        scenarios::retry_releases_ticket::run();
+    } else {
+        verify_determinism("retry_releases_ticket", get_seed());
+    }
+}
+
+#[test]
+fn cancel_releases_ticket() {
+    if is_subprocess() || is_fuzz_mode() {
+        scenarios::cancel_releases_ticket::run();
+    } else {
+        verify_determinism("cancel_releases_ticket", get_seed());
+    }
+}
+
+#[test]
+fn expedite_concurrency() {
+    if is_subprocess() || is_fuzz_mode() {
+        scenarios::expedite_concurrency::run();
+    } else {
+        verify_determinism("expedite_concurrency", get_seed());
+    }
+}
+
+#[test]
+fn rate_limits() {
+    if is_subprocess() || is_fuzz_mode() {
+        scenarios::rate_limits::run();
+    } else {
+        verify_determinism("rate_limits", get_seed());
+    }
+}
+
+#[test]
+fn floating_concurrency() {
+    if is_subprocess() || is_fuzz_mode() {
+        scenarios::floating_concurrency::run();
+    } else {
+        verify_determinism("floating_concurrency", get_seed());
+    }
+}
+
+#[test]
+fn coordinator_shard_migration() {
+    if is_subprocess() || is_fuzz_mode() {
+        scenarios::coordinator_shard_migration::run();
+    } else {
+        verify_determinism("coordinator_shard_migration", get_seed());
+    }
+}

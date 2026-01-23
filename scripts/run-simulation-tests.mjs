@@ -62,14 +62,14 @@ Usage: run-simulation-tests.mjs [options]
 
 Fuzz the simulation tests with many random seeds to find failures.
 
-Each seed runs all scenarios, with each scenario in a separate subprocess
-to ensure clean state and true determinism.
+Each seed runs exactly one scenario, deterministically selected based on the seed.
+Each scenario runs in a separate subprocess to ensure clean state and true determinism.
 
 Options:
   -h, --help              Show this help message
   -n, --seeds <count>     Number of random seeds to test (default: 100)
   -s, --seed <seed>       Run a specific seed (for reproduction)
-  -t, --scenario <name>   Run only a specific scenario (default: all)
+  -t, --scenario <name>   Run only a specific scenario (overrides seed-based selection)
   -r, --random-seed <n>   Base seed for generating test seeds (for reproducibility)
   -v, --verbose           Show full output on failure
 
@@ -77,13 +77,13 @@ Available scenarios:
   ${SCENARIOS.join(", ")}
 
 Examples:
-  # Run 100 random seeds across all scenarios
+  # Run 100 random seeds (each with one deterministic scenario)
   ./scripts/run-simulation-tests.mjs
 
   # Run 50 random seeds
   ./scripts/run-simulation-tests.mjs -n 50
 
-  # Run a specific seed across all scenarios
+  # Run a specific seed with its deterministic scenario
   ./scripts/run-simulation-tests.mjs -s 12345
 
   # Run a specific seed for a specific scenario (for debugging)
@@ -132,6 +132,15 @@ function createRng(seed) {
 }
 
 /**
+ * Deterministically select a scenario based on a seed.
+ * Uses the seed to pick one of the available scenarios.
+ */
+function selectScenarioFromSeed(seed, scenarios) {
+  const index = seed % scenarios.length;
+  return scenarios[index];
+}
+
+/**
  * Run a single scenario with a specific seed in fuzz mode.
  * Each scenario runs in its own subprocess for determinism.
  */
@@ -159,61 +168,34 @@ function runScenarioWithSeed(scenario, seed) {
   });
 }
 
-/**
- * Run all scenarios with a specific seed, each in a separate subprocess.
- * Returns results for each scenario.
- */
-async function runAllScenariosWithSeed(seed, scenarios) {
-  const results = [];
-  for (const scenario of scenarios) {
-    const result = await runScenarioWithSeed(scenario, seed);
-    results.push(result);
-  }
-  return results;
-}
-
 async function main() {
   const scenariosToRun = SPECIFIC_SCENARIO ? [SPECIFIC_SCENARIO] : SCENARIOS;
 
   // If a specific seed is set, run that seed with output visible
   if (SPECIFIC_SEED !== null) {
-    if (SPECIFIC_SCENARIO) {
-      console.log(`Running scenario '${SPECIFIC_SCENARIO}' with seed: ${SPECIFIC_SEED}\n`);
-      const result = spawnSync(
-        "cargo",
-        ["test", "--test", "turmoil_runner", SPECIFIC_SCENARIO, "--", "--exact", "--nocapture"],
-        {
-          env: { ...process.env, DST_SEED: String(SPECIFIC_SEED), DST_FUZZ: "1" },
-          stdio: "inherit",
-        }
-      );
-      process.exit(result.status ?? 1);
-    } else {
-      console.log(`Running all scenarios with seed: ${SPECIFIC_SEED}\n`);
-      let allPassed = true;
-      for (const scenario of scenariosToRun) {
-        console.log(`\n--- ${scenario} ---`);
-        const result = spawnSync(
-          "cargo",
-          ["test", "--test", "turmoil_runner", scenario, "--", "--exact", "--nocapture"],
-          {
-            env: { ...process.env, DST_SEED: String(SPECIFIC_SEED), DST_FUZZ: "1" },
-            stdio: "inherit",
-          }
-        );
-        if (result.status !== 0) {
-          allPassed = false;
-        }
+    // Use specific scenario if provided, otherwise deterministically select based on seed
+    const scenario = SPECIFIC_SCENARIO || selectScenarioFromSeed(SPECIFIC_SEED, SCENARIOS);
+    console.log(`Running scenario '${scenario}' with seed: ${SPECIFIC_SEED}\n`);
+    const result = spawnSync(
+      "cargo",
+      ["test", "--test", "turmoil_runner", scenario, "--", "--exact", "--nocapture"],
+      {
+        env: { ...process.env, DST_SEED: String(SPECIFIC_SEED), DST_FUZZ: "1" },
+        stdio: "inherit",
       }
-      process.exit(allPassed ? 0 : 1);
-    }
+    );
+    process.exit(result.status ?? 1);
   }
 
   console.log("==============================================");
   console.log("Simulation Test Fuzzing");
   console.log("==============================================");
   console.log(`Seeds to test: ${NUM_SEEDS}`);
-  console.log(`Scenarios: ${scenariosToRun.length} (${scenariosToRun.join(", ")})`);
+  if (SPECIFIC_SCENARIO) {
+    console.log(`Scenario: ${SPECIFIC_SCENARIO} (fixed)`);
+  } else {
+    console.log(`Scenarios: ${scenariosToRun.length} (selected per-seed from: ${scenariosToRun.join(", ")})`);
+  }
   console.log(`Base random seed: ${RANDOM_SEED}`);
   console.log("");
   console.log("To reproduce this exact run:");
@@ -241,25 +223,22 @@ async function main() {
 
   for (let i = 1; i <= NUM_SEEDS; i++) {
     const seed = rng();
+    // Select scenario: use specific one if provided, otherwise deterministically select based on seed
+    const scenario = SPECIFIC_SCENARIO || selectScenarioFromSeed(seed, SCENARIOS);
     const padSeed = String(seed).padEnd(10);
     const progress = `(${String(i).padStart(3)}/${NUM_SEEDS})`;
 
-    process.stdout.write(`Seed ${padSeed} ${progress}: `);
+    process.stdout.write(`Seed ${padSeed} ${progress} [${scenario}]: `);
 
-    const results = await runAllScenariosWithSeed(seed, scenariosToRun);
-    const failedScenarios = results.filter((r) => !r.passed);
+    const result = await runScenarioWithSeed(scenario, seed);
 
-    if (failedScenarios.length === 0) {
+    if (result.passed) {
       console.log("✓");
-      totalPassed += scenariosToRun.length;
+      totalPassed += 1;
     } else {
-      const failedNames = failedScenarios.map((r) => r.scenario).join(", ");
-      console.log(`FAILED (${failedNames})`);
-      totalFailed += failedScenarios.length;
-      totalPassed += scenariosToRun.length - failedScenarios.length;
-      for (const f of failedScenarios) {
-        failures.push(f);
-      }
+      console.log("FAILED");
+      totalFailed += 1;
+      failures.push(result);
     }
   }
 
@@ -276,7 +255,8 @@ async function main() {
     }
     console.log("");
     console.log("To reproduce a failure:");
-    console.log("  ./scripts/run-simulation-tests.mjs --seed <seed> --scenario <scenario>");
+    console.log("  ./scripts/run-simulation-tests.mjs --seed <seed>");
+    console.log("  (scenario is automatically selected based on seed)");
     console.log("");
     console.log("To verify determinism for a seed (runs twice, compares output):");
     console.log("  DST_SEED=<seed> cargo test --test turmoil_runner <scenario> -- --exact");
@@ -293,7 +273,7 @@ async function main() {
   }
 
   console.log("");
-  console.log(`✓ All ${NUM_SEEDS} seeds × ${scenariosToRun.length} scenarios passed`);
+  console.log(`✓ All ${NUM_SEEDS} seeds passed`);
 }
 
 

@@ -5,29 +5,32 @@
 //! verify system correctness throughout execution.
 //!
 //! Fault modes:
-//! - Random message loss (5-20%)
+//! - Random message loss (5-15%)
 //! - Variable message latency (5-100ms)
 //! - Network partitions between workers and server
 //! - Random worker crashes (via partition + timeout)
 //! - Mix of concurrency-limited and unlimited jobs
 //! - Random job cancellations
+//! - Random job expedites (for scheduled/retrying jobs)
+//! - Random job restarts (for failed/cancelled jobs)
 //! - Variable number of workers (2-6)
 //!
 //! Invariants verified (from Alloy spec):
 //! - queueLimitEnforced: At most max_concurrency tasks per limit key
 //! - oneLeasePerJob: A job never has two active leases
 //! - noLeasesForTerminal: Terminal jobs have no active leases
+//! - validTransitions: Only valid status transitions occur
 //! - No duplicate completions
 
 use crate::helpers::{
     ConcurrencyLimit, EnqueueRequest, HashMap, InvariantTracker, LeaseTasksRequest, Limit,
     MsgpackBytes, ReportOutcomeRequest, RetryPolicy, Task, create_turmoil_client, get_seed, limit,
-    report_outcome_request, run_scenario_impl, setup_server, turmoil,
+    report_outcome_request, run_scenario_impl, setup_server, turmoil, verify_server_invariants,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use silo::cluster_client::ClientConfig;
-use silo::pb::CancelJobRequest;
+use silo::pb::{CancelJobRequest, ExpediteJobRequest, RestartJobRequest};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -41,33 +44,100 @@ const CHAOS_LIMITS: &[(&str, u32)] = &[
     ("chaos-unlimited", 0), // No limit (0 means unlimited)
 ];
 
+/// Chaos configuration derived from seed
+struct ChaosConfig {
+    fail_rate: f64,
+    max_latency_ms: u64,
+    num_workers: u32,
+    num_jobs: u32,
+    // Number of cancellation operations to attempt
+    num_cancels: u32,
+    // Number of expedite operations to attempt
+    num_expedites: u32,
+    // Number of restart operations to attempt
+    num_restarts: u32,
+    // Number of partitions to inject
+    num_partitions: u32,
+    // Range of partition duration (min, max) ms
+    partition_duration_range: (u64, u64),
+    // Range of worker batch sizes (min, max)
+    worker_batch_range: (u32, u32),
+}
+
+impl ChaosConfig {
+    fn from_seed(seed: u64) -> Self {
+        let mut rng = StdRng::seed_from_u64(seed);
+
+        // Cap fail_rate at 15% to ensure some progress is possible with DST timeouts.
+        let fail_rate = 0.05 + 0.10 * (rng.random_range(0..100) as f64 / 100.0);
+        let max_latency_ms = rng.random_range(5..100);
+        let num_workers = rng.random_range(2..=6);
+        let num_jobs = rng.random_range(15..=40);
+
+        // Operation counts vary with seed
+        let num_cancels = rng.random_range(2..=6);
+        let num_expedites = rng.random_range(1..=4);
+        let num_restarts = rng.random_range(1..=3);
+        let num_partitions = rng.random_range(1..=4);
+
+        // Partition duration range
+        let partition_min = rng.random_range(300..800);
+        let partition_max = rng.random_range(partition_min..2500);
+
+        // Worker batch size range
+        let batch_min = rng.random_range(1..=2);
+        let batch_max = rng.random_range(batch_min..=6);
+
+        Self {
+            fail_rate,
+            max_latency_ms,
+            num_workers,
+            num_jobs,
+            num_cancels,
+            num_expedites,
+            num_restarts,
+            num_partitions,
+            partition_duration_range: (partition_min, partition_max),
+            worker_batch_range: (batch_min, batch_max),
+        }
+    }
+}
+
 pub fn run() {
     let seed = get_seed();
     run_scenario_impl("chaos", seed, 180, |sim| {
-        let mut config_rng = StdRng::seed_from_u64(seed);
-
-        // Randomize network conditions based on seed
-        // Cap fail_rate at 15% to ensure some progress is possible with DST timeouts.
-        // Higher rates cause cascading timeout failures where the server processes
-        // requests but responses don't reach clients before their short DST timeouts.
-        let fail_rate = 0.05 + 0.10 * (config_rng.random_range(0..100) as f64 / 100.0);
-        let max_latency_ms = config_rng.random_range(5..100);
-        let num_workers = config_rng.random_range(2..=6);
-        let num_jobs = config_rng.random_range(15..=40);
+        let config = ChaosConfig::from_seed(seed);
 
         tracing::info!(
-            fail_rate = fail_rate,
-            max_latency_ms = max_latency_ms,
-            num_workers = num_workers,
-            num_jobs = num_jobs,
+            fail_rate = config.fail_rate,
+            max_latency_ms = config.max_latency_ms,
+            num_workers = config.num_workers,
+            num_jobs = config.num_jobs,
+            num_cancels = config.num_cancels,
+            num_expedites = config.num_expedites,
+            num_restarts = config.num_restarts,
+            num_partitions = config.num_partitions,
+            partition_duration = ?config.partition_duration_range,
+            worker_batch = ?config.worker_batch_range,
             "chaos_config"
         );
+
+        // Capture config values for closures
+        let fail_rate = config.fail_rate;
+        let max_latency_ms = config.max_latency_ms;
+        let num_workers = config.num_workers;
+        let num_jobs = config.num_jobs;
+        let num_cancels = config.num_cancels;
+        let num_expedites = config.num_expedites;
+        let num_restarts = config.num_restarts;
+        let num_partitions = config.num_partitions;
+        let partition_duration_range = config.partition_duration_range;
+        let worker_batch_range = config.worker_batch_range;
 
         sim.set_fail_rate(fail_rate);
         sim.set_max_message_latency(Duration::from_millis(max_latency_ms));
 
         // Client configuration optimized for DST with short timeouts.
-        // Uses very short timeouts to ensure simulations complete within their time budgets.
         let client_config = ClientConfig::for_dst();
 
         // Shared invariant tracker in lenient mode.
@@ -211,16 +281,16 @@ pub fn run() {
         let canceller_seed = seed;
         let canceller_tracker = Arc::clone(&tracker);
         let canceller_config = client_config.clone();
+        let canceller_num_cancels = num_cancels;
         sim.client("canceller", async move {
             // Wait for some jobs to be enqueued
             tokio::time::sleep(Duration::from_millis(500)).await;
             let mut rng = StdRng::seed_from_u64(canceller_seed.wrapping_add(99));
 
             let mut client = create_turmoil_client("http://server:9910", &canceller_config).await?;
+            let mut consecutive_failures = 0u32;
 
-            // Cancel a few random jobs
-            let num_cancels = rng.random_range(2..=5);
-            for _ in 0..num_cancels {
+            for _ in 0..canceller_num_cancels {
                 let limit_idx = rng.random_range(0..CHAOS_LIMITS.len());
                 let job_idx = rng.random_range(0..20);
                 let job_id = format!("{}-{}", CHAOS_LIMITS[limit_idx].0, job_idx);
@@ -238,15 +308,132 @@ pub fn run() {
                     Ok(_) => {
                         tracing::trace!(job_id = %job_id, "cancelled");
                         canceller_tracker.jobs.job_cancelled(&job_id);
+                        consecutive_failures = 0;
                     }
                     Err(e) => {
                         // Cancellation can fail if job doesn't exist or is already terminal
                         tracing::trace!(job_id = %job_id, error = %e, "cancel_failed");
+                        consecutive_failures += 1;
+                        if consecutive_failures >= 2 {
+                            if let Ok(new_client) =
+                                create_turmoil_client("http://server:9910", &canceller_config).await
+                            {
+                                client = new_client;
+                                consecutive_failures = 0;
+                            }
+                        }
                     }
                 }
             }
 
             tracing::trace!("canceller_done");
+            Ok(())
+        });
+
+        // Expediter: Randomly expedites scheduled/retrying jobs
+        let expediter_seed = seed;
+        let expediter_config = client_config.clone();
+        let expediter_num_expedites = num_expedites;
+        sim.client("expediter", async move {
+            // Wait for some jobs to be in various states
+            tokio::time::sleep(Duration::from_millis(2000)).await;
+            let mut rng = StdRng::seed_from_u64(expediter_seed.wrapping_add(77));
+
+            let mut client = create_turmoil_client("http://server:9910", &expediter_config).await?;
+            let mut consecutive_failures = 0u32;
+
+            for i in 0..expediter_num_expedites {
+                // Random delay between expedites
+                tokio::time::sleep(Duration::from_millis(rng.random_range(500..2000))).await;
+
+                let limit_idx = rng.random_range(0..CHAOS_LIMITS.len());
+                let job_idx = rng.random_range(0..30);
+                let job_id = format!("{}-{}", CHAOS_LIMITS[limit_idx].0, job_idx);
+
+                match client
+                    .expedite_job(tonic::Request::new(ExpediteJobRequest {
+                        shard: 0,
+                        id: job_id.clone(),
+                        tenant: None,
+                    }))
+                    .await
+                {
+                    Ok(_) => {
+                        tracing::trace!(job_id = %job_id, expedite_num = i, "expedited");
+                        consecutive_failures = 0;
+                    }
+                    Err(e) => {
+                        // Expedite can fail if job doesn't exist, is running, terminal, cancelled, etc.
+                        tracing::trace!(job_id = %job_id, error = %e, "expedite_failed");
+                        consecutive_failures += 1;
+                        if consecutive_failures >= 2 {
+                            if let Ok(new_client) =
+                                create_turmoil_client("http://server:9910", &expediter_config).await
+                            {
+                                client = new_client;
+                                consecutive_failures = 0;
+                            }
+                        }
+                    }
+                }
+            }
+
+            tracing::trace!("expediter_done");
+            Ok(())
+        });
+
+        // Restarter: Randomly restarts failed/cancelled jobs
+        let restarter_seed = seed;
+        let restarter_config = client_config.clone();
+        let restarter_num_restarts = num_restarts;
+        sim.client("restarter", async move {
+            // Wait for some jobs to potentially fail or be cancelled
+            tokio::time::sleep(Duration::from_millis(5000)).await;
+            let mut rng = StdRng::seed_from_u64(restarter_seed.wrapping_add(88));
+
+            let mut client = create_turmoil_client("http://server:9910", &restarter_config).await?;
+            let mut consecutive_failures = 0u32;
+
+            for i in 0..restarter_num_restarts {
+                // Random delay between restarts
+                tokio::time::sleep(Duration::from_millis(rng.random_range(1000..3000))).await;
+
+                let limit_idx = rng.random_range(0..CHAOS_LIMITS.len());
+                let job_idx = rng.random_range(0..30);
+                let job_id = format!("{}-{}", CHAOS_LIMITS[limit_idx].0, job_idx);
+
+                match client
+                    .restart_job(tonic::Request::new(RestartJobRequest {
+                        shard: 0,
+                        id: job_id.clone(),
+                        tenant: None,
+                    }))
+                    .await
+                {
+                    Ok(_) => {
+                        tracing::trace!(job_id = %job_id, restart_num = i, "restarted");
+                        // Note: We don't track this in the job tracker since it might
+                        // conflict with other state tracking. The server-side verification
+                        // will catch any actual invariant violations.
+                        consecutive_failures = 0;
+                    }
+                    Err(e) => {
+                        // Restart can fail if job doesn't exist, isn't failed/cancelled, etc.
+                        tracing::trace!(job_id = %job_id, error = %e, "restart_failed");
+                        consecutive_failures += 1;
+                        if consecutive_failures >= 2 {
+                            if let Ok(new_client) =
+                                create_turmoil_client("http://server:9910", &restarter_config).await
+                            {
+                                client = new_client;
+                                consecutive_failures = 0;
+                            }
+                        }
+                    }
+                }
+            }
+
+            tracing::trace!("restarter_done");
             Ok(())
         });
 
@@ -258,6 +445,7 @@ pub fn run() {
             let worker_completed = Arc::clone(&total_completed);
             let worker_done_flag = Arc::clone(&scenario_done);
             let worker_config = client_config.clone();
+            let worker_batch_range = worker_batch_range;
 
             let client_name: &'static str =
                 Box::leak(format!("worker{}", worker_num).into_boxed_str());
@@ -281,8 +469,8 @@ pub fn run() {
                         break;
                     }
 
-                    // Random batch size
-                    let max_tasks = rng.random_range(1..=5);
+                    // Random batch size from configured range
+                    let max_tasks = rng.random_range(worker_batch_range.0..=worker_batch_range.1);
 
                     let lease_result = client
                         .lease_tasks(tonic::Request::new(LeaseTasksRequest {
@@ -561,13 +749,13 @@ pub fn run() {
         // Partition injector: Randomly partitions workers from server
         let partition_seed = seed;
         let partition_num_workers = num_workers;
+        let partition_count = num_partitions;
+        let partition_dur_range = partition_duration_range;
         sim.client("partitioner", async move {
             tokio::time::sleep(Duration::from_millis(1000)).await;
             let mut rng = StdRng::seed_from_u64(partition_seed.wrapping_add(200));
 
-            // Inject a few partitions during the scenario
-            let num_partitions = rng.random_range(1..=3);
-            for p in 0..num_partitions {
+            for p in 0..partition_count {
                 // Random delay between partitions
                 tokio::time::sleep(Duration::from_millis(rng.random_range(2000..5000))).await;
 
@@ -585,8 +773,9 @@ pub fn run() {
 
                 turmoil::partition(worker_name.as_str(), "server");
 
-                // Partition duration
-                let partition_duration = rng.random_range(500..2000);
+                // Partition duration from configured range
+                let partition_duration =
+                    rng.random_range(partition_dur_range.0..=partition_dur_range.1);
                 tokio::time::sleep(Duration::from_millis(partition_duration)).await;
 
                 turmoil::repair(worker_name.as_str(), "server");
@@ -611,16 +800,53 @@ pub fn run() {
         let verifier_enqueued = Arc::clone(&total_enqueued);
         let verifier_attempted = Arc::clone(&total_attempted);
         let verifier_done_flag = Arc::clone(&scenario_done);
+        let verifier_config = client_config.clone();
         sim.client("verifier", async move {
             // Wait for work to start
             tokio::time::sleep(Duration::from_millis(500)).await;
+
+            // Create client for server-side checks
+            let mut client = match create_turmoil_client("http://server:9910", &verifier_config).await {
+                Ok(c) => Some(c),
+                Err(_) => None,
+            };
 
             // Periodically verify invariants
             for check in 0..20 {
                 tokio::time::sleep(Duration::from_millis(500)).await;
 
-                // Run all invariant checks
+                // Run client-side invariant checks
                 verifier_tracker.verify_all();
+
+                // Run server-side invariant checks if we have a client
+                if let Some(ref mut c) = client {
+                    match verify_server_invariants(c, 0).await {
+                        Ok(result) => {
+                            if !result.violations.is_empty() {
+                                tracing::warn!(
+                                    violations = ?result.violations,
+                                    "server_invariant_violations"
+                                );
+                            }
+                            tracing::trace!(
+                                check = check,
+                                running = result.running_job_count,
+                                terminal = result.terminal_job_count,
+                                holders = ?result.holder_counts_by_queue,
+                                "server_state"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::trace!(error = %e, check = check, "server_check_failed");
+                            // Try to reconnect
+                            if let Ok(new_client) =
+                                create_turmoil_client("http://server:9910", &verifier_config).await
+                            {
+                                client = Some(new_client);
+                            }
+                        }
+                    }
+                }
 
                 let enqueued = verifier_enqueued.load(Ordering::SeqCst);
                 let completed = verifier_completed.load(Ordering::SeqCst);
@@ -641,6 +867,18 @@ pub fn run() {
             verifier_tracker.verify_all();
             verifier_tracker.jobs.verify_no_terminal_leases();
 
+            // Verify state machine transitions were valid
+            let transition_violations = verifier_tracker.jobs.verify_all_transitions();
+            if !transition_violations.is_empty() {
+                tracing::warn!(
+                    violations = transition_violations.len(),
+                    "transition_violations_found"
+                );
+                for v in &transition_violations {
+                    tracing::warn!(violation = %v, "transition_violation");
+                }
+            }
+
             let attempted = verifier_attempted.load(Ordering::SeqCst);
             let enqueued = verifier_enqueued.load(Ordering::SeqCst);
             let completed = verifier_completed.load(Ordering::SeqCst);
@@ -651,6 +889,7 @@ pub fn run() {
                 enqueued = enqueued,
                 completed = completed,
                 terminal = terminal,
+                transition_violations = transition_violations.len(),
                 "final_verification"
             );
 

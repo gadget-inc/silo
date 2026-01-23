@@ -3,7 +3,7 @@
 use crate::helpers::{
     AttemptStatus, EnqueueRequest, GetJobRequest, HashMap, JobStatus, LeaseTasksRequest,
     MsgpackBytes, ReportOutcomeRequest, get_seed, report_outcome_request, run_scenario_impl,
-    setup_server, turmoil_connector,
+    setup_server, turmoil_connector, verify_server_invariants,
 };
 use silo::pb::silo_client::SiloClient;
 use std::time::Duration;
@@ -22,6 +22,10 @@ pub fn run() {
                 .connect_with_connector(turmoil_connector())
                 .await?;
             let mut client = SiloClient::new(ch);
+
+            // Verify initial server state (no jobs)
+            let initial_state = verify_server_invariants(&mut client, 0).await;
+            tracing::trace!(result = ?initial_state, "initial_server_state");
 
             // Enqueue
             tracing::trace!(job_id = "test-job", "enqueue");
@@ -42,6 +46,16 @@ pub fn run() {
                 }))
                 .await?;
             tracing::trace!(job_id = "test-job", "enqueue_done");
+
+            // Verify server state after enqueue (should have no running jobs, no terminal)
+            if let Ok(state) = verify_server_invariants(&mut client, 0).await {
+                tracing::trace!(
+                    running = state.running_job_count,
+                    terminal = state.terminal_job_count,
+                    "server_state_after_enqueue"
+                );
+                assert!(state.violations.is_empty(), "Server invariant violations after enqueue: {:?}", state.violations);
+            }
 
             // Lease
             let lease = client
@@ -136,6 +150,19 @@ pub fn run() {
                     AttemptStatus::Succeeded,
                     "Attempt should be marked Succeeded"
                 );
+
+                // Verify server state after completion
+                if let Ok(state) = verify_server_invariants(&mut client, 0).await {
+                    tracing::trace!(
+                        running = state.running_job_count,
+                        terminal = state.terminal_job_count,
+                        holders = ?state.holder_counts_by_queue,
+                        "server_state_after_complete"
+                    );
+                    assert!(state.violations.is_empty(), "Server invariant violations after complete: {:?}", state.violations);
+                    assert_eq!(state.running_job_count, 0, "No jobs should be running after completion");
+                    assert_eq!(state.terminal_job_count, 1, "One job should be terminal after completion");
+                }
             }
 
             tracing::trace!("client_done");
