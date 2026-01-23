@@ -33,6 +33,8 @@ use std::sync::Mutex;
 
 use slatedb::{Db, DbIterator, WriteBatch};
 
+use crate::dst_events::{self, DstEvent};
+
 use crate::codec::{
     decode_concurrency_action, encode_concurrency_action, encode_holder, encode_task,
 };
@@ -132,7 +134,14 @@ impl ConcurrencyCounts {
     /// Returns true if the slot was reserved, false if at capacity.
     /// This MUST be called before writing to the DB to prevent TOCTOU races.
     /// If the DB write fails, call `release_reservation` to roll back.
-    pub fn try_reserve(&self, tenant: &str, queue: &str, task_id: &str, limit: usize) -> bool {
+    pub fn try_reserve(
+        &self,
+        tenant: &str,
+        queue: &str,
+        task_id: &str,
+        limit: usize,
+        job_id: &str,
+    ) -> bool {
         let mut h = self.holders.lock().unwrap();
         let key = format!("{}|{}", tenant, queue);
         let set = h.entry(key).or_default();
@@ -144,6 +153,15 @@ impl ConcurrencyCounts {
 
         // Reserve the slot atomically
         set.insert(task_id.to_string());
+
+        // Emit DST event for instrumentation
+        dst_events::emit(DstEvent::ConcurrencyTicketGranted {
+            tenant: tenant.to_string(),
+            queue: queue.to_string(),
+            task_id: task_id.to_string(),
+            job_id: job_id.to_string(),
+        });
+
         true
     }
 
@@ -165,12 +183,26 @@ impl ConcurrencyCounts {
         queue: &str,
         release_task_id: &str,
         reserve_task_id: &str,
+        reserve_job_id: &str,
     ) {
         let mut h = self.holders.lock().unwrap();
         let key = format!("{}|{}", tenant, queue);
         let set = h.entry(key).or_default();
         set.remove(release_task_id);
         set.insert(reserve_task_id.to_string());
+
+        // Emit DST events for instrumentation
+        dst_events::emit(DstEvent::ConcurrencyTicketReleased {
+            tenant: tenant.to_string(),
+            queue: queue.to_string(),
+            task_id: release_task_id.to_string(),
+        });
+        dst_events::emit(DstEvent::ConcurrencyTicketGranted {
+            tenant: tenant.to_string(),
+            queue: queue.to_string(),
+            task_id: reserve_task_id.to_string(),
+            job_id: reserve_job_id.to_string(),
+        });
     }
 
     /// Atomically release a task without granting to another.
@@ -181,6 +213,13 @@ impl ConcurrencyCounts {
         if let Some(set) = h.get_mut(&key) {
             set.remove(task_id);
         }
+
+        // Emit DST event for instrumentation
+        dst_events::emit(DstEvent::ConcurrencyTicketReleased {
+            tenant: tenant.to_string(),
+            queue: queue.to_string(),
+            task_id: task_id.to_string(),
+        });
     }
 
     /// Rollback a release_and_reserve operation if DB write fails.
@@ -268,7 +307,7 @@ impl ConcurrencyManager {
 
         // [SILO-ENQ-CONC-1] Atomically check and reserve if queue has capacity
         // This prevents TOCTOU races by reserving the slot before writing to DB
-        if self.counts.try_reserve(tenant, queue, task_id, max_allowed) {
+        if self.counts.try_reserve(tenant, queue, task_id, max_allowed, job_id) {
             // Grant immediately: [SILO-ENQ-CONC-2] create holder, [SILO-ENQ-CONC-3] create task
             // Note: in-memory slot is already reserved by try_reserve
             append_grant_edits(
@@ -349,7 +388,7 @@ impl ConcurrencyManager {
         tenant: &str,
         queue: &str,
         request_id: &str,
-        _job_id: &str,
+        job_id: &str,
         _attempt_number: u32,
         now_ms: i64,
         job_view: Option<&JobView>,
@@ -370,7 +409,7 @@ impl ConcurrencyManager {
         }
 
         // Atomically check and reserve the slot to prevent TOCTOU races
-        if !self.counts.try_reserve(tenant, queue, request_id, max_allowed) {
+        if !self.counts.try_reserve(tenant, queue, request_id, max_allowed, job_id) {
             return Ok(RequestTicketTaskOutcome::Requested);
         }
 
@@ -425,6 +464,7 @@ impl ConcurrencyManager {
                 .map_err(|e| e.to_string())?;
 
             let mut granted_task_id: Option<String> = None;
+            let mut granted_job_id: Option<String> = None;
 
             while let Some(kv) = iter.next().await.map_err(|e| e.to_string())? {
                 type ArchivedAction = <ConcurrencyAction as rkyv::Archive>::Archived;
@@ -496,6 +536,7 @@ impl ConcurrencyManager {
                         batch.delete(&kv.key);
 
                         granted_task_id = Some(request_id);
+                        granted_job_id = Some(job_id_str.to_string());
 
                         // Only grant one request per release
                         break;
@@ -507,7 +548,8 @@ impl ConcurrencyManager {
             // This prevents a race window where capacity appears available
             if let Some(ref new_task_id) = granted_task_id {
                 // Release old + grant new in one atomic operation
-                self.counts.atomic_release_and_reserve(tenant, queue, finished_task_id, new_task_id);
+                let job_id = granted_job_id.as_deref().unwrap_or("");
+                self.counts.atomic_release_and_reserve(tenant, queue, finished_task_id, new_task_id, job_id);
             } else {
                 // Just release, no grant
                 self.counts.atomic_release(tenant, queue, finished_task_id);

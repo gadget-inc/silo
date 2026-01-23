@@ -73,14 +73,15 @@ impl ChaosConfig {
         let fail_rate = 0.05 + 0.10 * (rng.random_range(0..100) as f64 / 100.0);
         let max_latency_ms = rng.random_range(5..100);
         let num_workers = rng.random_range(2..=5);
-        // Job count capped to ensure completion within 180s simulation budget
-        let num_jobs = rng.random_range(12..=30);
+        // Job count kept moderate to complete within 180s simulation budget.
+        // The goal is testing fault handling, not throughput.
+        let num_jobs = rng.random_range(10..=20);
 
-        // Operation counts vary with seed
-        let num_cancels = rng.random_range(2..=6);
-        let num_expedites = rng.random_range(1..=4);
-        let num_restarts = rng.random_range(1..=3);
-        let num_partitions = rng.random_range(1..=4);
+        // Operation counts - keep moderate to leave time for core work
+        let num_cancels = rng.random_range(1..=4);
+        let num_expedites = rng.random_range(1..=3);
+        let num_restarts = rng.random_range(1..=2);
+        let num_partitions = rng.random_range(1..=3);
 
         // Partition duration range
         let partition_min = rng.random_range(300..800);
@@ -143,12 +144,10 @@ pub fn run() {
         // Client configuration optimized for DST with short timeouts.
         let client_config = ClientConfig::for_dst();
 
-        // Shared invariant tracker in lenient mode.
-        // Lenient mode is necessary because with high message loss and network
-        // delays, lease responses can arrive out-of-order relative to completion
-        // reports, causing apparent invariant violations that are actually just
-        // stale tracking state.
-        let tracker = Arc::new(InvariantTracker::new_lenient());
+        // Shared invariant tracker. State tracking is done via server-side DST events,
+        // which are emitted synchronously by the server and collected in a thread-local
+        // event bus. This eliminates race conditions from client-side tracking.
+        let tracker = Arc::new(InvariantTracker::new());
 
         // Register concurrency limits
         for (key, max_conc) in CHAOS_LIMITS {
@@ -166,7 +165,6 @@ pub fn run() {
         sim.host("server", || async move { setup_server(9910).await });
 
         // Producer: Enqueues jobs with mixed configurations
-        let producer_tracker = Arc::clone(&tracker);
         let producer_enqueued = Arc::clone(&total_enqueued);
         let producer_attempted = Arc::clone(&total_attempted);
         let producer_seed = seed;
@@ -248,7 +246,6 @@ pub fn run() {
                     .await
                 {
                     Ok(_) => {
-                        producer_tracker.jobs.job_enqueued(&job_id);
                         producer_enqueued.fetch_add(1, Ordering::SeqCst);
                         consecutive_failures = 0;
                     }
@@ -280,7 +277,6 @@ pub fn run() {
 
         // Canceller: Randomly cancels some jobs after they're enqueued
         let canceller_seed = seed;
-        let canceller_tracker = Arc::clone(&tracker);
         let canceller_config = client_config.clone();
         let canceller_num_cancels = num_cancels;
         sim.client("canceller", async move {
@@ -308,7 +304,6 @@ pub fn run() {
                 {
                     Ok(_) => {
                         tracing::trace!(job_id = %job_id, "cancelled");
-                        canceller_tracker.jobs.job_cancelled(&job_id);
                         consecutive_failures = 0;
                     }
                     Err(e) => {
@@ -442,7 +437,6 @@ pub fn run() {
         for worker_num in 0..num_workers {
             let worker_seed = seed.wrapping_add(100 + worker_num as u64);
             let worker_id = format!("chaos-worker-{}", worker_num);
-            let worker_tracker = Arc::clone(&tracker);
             let worker_completed = Arc::clone(&total_completed);
             let worker_done_flag = Arc::clone(&scenario_done);
             let worker_config = client_config.clone();
@@ -465,8 +459,8 @@ pub fn run() {
                 let mut processing: Vec<Task> = Vec::new();
                 let mut consecutive_failures = 0u32;
 
-                // 60 rounds should be plenty for processing jobs with network issues
-                for round in 0..60 {
+                // 50 rounds with batch size 2+ should handle 20 jobs with network issues
+                for round in 0..50 {
                     if worker_done_flag.load(Ordering::SeqCst) {
                         break;
                     }
@@ -489,28 +483,13 @@ pub fn run() {
                             let tasks = resp.into_inner().tasks;
 
                             for task in tasks {
-                                // Extract limit key from job_id
+                                // Extract limit key from job_id for logging
                                 let limit_key = task
                                     .job_id
                                     .split('-')
                                     .take(2)
                                     .collect::<Vec<_>>()
                                     .join("-");
-
-                                // Track lease in job state tracker
-                                worker_tracker.jobs.task_leased(&task.job_id, &task.id);
-
-                                // Track in concurrency tracker if this is a limited job
-                                let is_limited = CHAOS_LIMITS
-                                    .iter()
-                                    .any(|(k, c)| *k == limit_key && *c > 0);
-                                if is_limited {
-                                    worker_tracker.concurrency.acquire(
-                                        &limit_key,
-                                        &task.id,
-                                        &task.job_id,
-                                    );
-                                }
 
                                 tracing::trace!(
                                     worker = %worker_id,
@@ -577,26 +556,6 @@ pub fn run() {
                                 })
                             };
 
-                            // Release from tracker BEFORE report_outcome because the server
-                            // will release and potentially grant to another worker immediately
-                            let limit_key = task
-                                .job_id
-                                .split('-')
-                                .take(2)
-                                .collect::<Vec<_>>()
-                                .join("-");
-                            worker_tracker.jobs.task_released(&task.job_id, &task.id);
-                            let is_limited = CHAOS_LIMITS
-                                .iter()
-                                .any(|(k, c)| *k == limit_key && *c > 0);
-                            if is_limited {
-                                worker_tracker.concurrency.release(
-                                    &limit_key,
-                                    &task.id,
-                                    &task.job_id,
-                                );
-                            }
-
                             match client
                                 .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                                     shard: 0,
@@ -607,26 +566,14 @@ pub fn run() {
                                 .await
                             {
                                 Ok(_) => {
-                                    // Releases already done above
-
                                     if should_fail {
                                         tracing::trace!(
                                             worker = %worker_id,
                                             job_id = %task.job_id,
                                             "report_failure"
                                         );
-                                        worker_tracker.jobs.job_retrying(&task.job_id);
                                         failed += 1;
                                     } else {
-                                        // Check for duplicate completion
-                                        let was_new =
-                                            worker_tracker.jobs.job_completed(&task.job_id);
-                                        assert!(
-                                            was_new,
-                                            "INVARIANT VIOLATION: Job '{}' completed twice!",
-                                            task.job_id
-                                        );
-
                                         tracing::trace!(
                                             worker = %worker_id,
                                             job_id = %task.job_id,
@@ -638,15 +585,6 @@ pub fn run() {
                                     indices_to_remove.insert(i);
                                 }
                                 Err(e) => {
-                                    // Re-acquire since we pre-released but the report failed
-                                    worker_tracker.jobs.task_leased(&task.job_id, &task.id);
-                                    if is_limited {
-                                        worker_tracker.concurrency.acquire(
-                                            &limit_key,
-                                            &task.id,
-                                            &task.job_id,
-                                        );
-                                    }
                                     tracing::trace!(
                                         worker = %worker_id,
                                         job_id = %task.job_id,
@@ -675,22 +613,6 @@ pub fn run() {
                     let process_time = rng.random_range(5..30);
                     tokio::time::sleep(Duration::from_millis(process_time)).await;
 
-                    // Release from tracker BEFORE report_outcome
-                    let limit_key = task
-                        .job_id
-                        .split('-')
-                        .take(2)
-                        .collect::<Vec<_>>()
-                        .join("-");
-                    worker_tracker.jobs.task_released(&task.job_id, &task.id);
-                    let is_limited =
-                        CHAOS_LIMITS.iter().any(|(k, c)| *k == limit_key && *c > 0);
-                    if is_limited {
-                        worker_tracker
-                            .concurrency
-                            .release(&limit_key, &task.id, &task.job_id);
-                    }
-
                     match client
                         .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                             shard: 0,
@@ -703,13 +625,8 @@ pub fn run() {
                         .await
                     {
                         Ok(_) => {
-                            // Releases already done above
-
-                            let was_new = worker_tracker.jobs.job_completed(&task.job_id);
-                            if was_new {
-                                completed += 1;
-                                worker_completed.fetch_add(1, Ordering::SeqCst);
-                            }
+                            completed += 1;
+                            worker_completed.fetch_add(1, Ordering::SeqCst);
 
                             tracing::trace!(
                                 worker = %worker_id,
@@ -718,15 +635,6 @@ pub fn run() {
                             );
                         }
                         Err(e) => {
-                            // Re-acquire since we pre-released but the report failed
-                            worker_tracker.jobs.task_leased(&task.job_id, &task.id);
-                            if is_limited {
-                                worker_tracker.concurrency.acquire(
-                                    &limit_key,
-                                    &task.id,
-                                    &task.job_id,
-                                );
-                            }
                             tracing::trace!(
                                 worker = %worker_id,
                                 job_id = %task.job_id,
@@ -797,6 +705,7 @@ pub fn run() {
         });
 
         // Invariant verifier: Periodically checks system invariants
+        // This verifier consumes server-side DST events to track state accurately
         let verifier_tracker = Arc::clone(&tracker);
         let verifier_completed = Arc::clone(&total_completed);
         let verifier_enqueued = Arc::clone(&total_enqueued);
@@ -813,11 +722,15 @@ pub fn run() {
                 Err(_) => None,
             };
 
-            // Periodically verify invariants
-            for check in 0..20 {
+            // Periodically verify invariants. Fewer checks because each check
+            // involves RPC calls that can be delayed by network issues.
+            for check in 0..8 {
                 tokio::time::sleep(Duration::from_millis(500)).await;
 
-                // Run client-side invariant checks
+                // Process DST events from server-side instrumentation
+                verifier_tracker.process_dst_events();
+
+                // Run client-side invariant checks (now based on server events)
                 verifier_tracker.verify_all();
 
                 // Run server-side invariant checks if we have a client
@@ -861,10 +774,14 @@ pub fn run() {
                 );
             }
 
-            // Wait for work to complete. Use 90s to leave time for graceful shutdown
-            // within the 180s simulation budget.
-            tokio::time::sleep(Duration::from_secs(90)).await;
+            // Wait for work to complete. The checks above take real time due to
+            // RPC delays under network chaos, so keep this short to stay within
+            // the 180s simulation budget.
+            tokio::time::sleep(Duration::from_secs(40)).await;
             verifier_done_flag.store(true, Ordering::SeqCst);
+
+            // Process final DST events
+            verifier_tracker.process_dst_events();
 
             // Final invariant verification
             verifier_tracker.verify_all();
@@ -880,6 +797,11 @@ pub fn run() {
                 for v in &transition_violations {
                     tracing::warn!(violation = %v, "transition_violation");
                 }
+                // Fail on transition violations - these are now based on server events
+                panic!(
+                    "INVARIANT VIOLATION: {} invalid state transitions detected",
+                    transition_violations.len()
+                );
             }
 
             let attempted = verifier_attempted.load(Ordering::SeqCst);

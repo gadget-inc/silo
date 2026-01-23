@@ -69,6 +69,7 @@ datafusion-sql = "50"
 
 [features]
 default = []
+dst = []
 k8s = ["kube", "k8s-openapi", "chrono"]
 
 [dev-dependencies]

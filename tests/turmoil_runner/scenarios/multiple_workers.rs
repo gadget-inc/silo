@@ -6,7 +6,7 @@
 //! - All jobs reach terminal state
 
 use crate::helpers::{
-    AttemptStatus, EnqueueRequest, GetJobRequest, HashMap, JobStateTracker, JobStatus,
+    AttemptStatus, EnqueueRequest, GetJobRequest, HashMap, InvariantTracker, JobStatus,
     LeaseTasksRequest, MsgpackBytes, ReportOutcomeRequest, get_seed, report_outcome_request,
     run_scenario_impl, setup_server, turmoil_connector,
 };
@@ -22,15 +22,13 @@ pub fn run() {
         sim.host("server", || async move { setup_server(9902).await });
 
         // Shared state for invariant checking.
-        // Use lenient mode because with multiple workers competing for jobs,
-        // client-side tracking can get out of sync with server state due to
-        // timing issues in the simulated network (e.g., lease responses arriving
-        // out of order, jobs being re-processed after lease expiry, etc.).
-        let job_tracker = Arc::new(JobStateTracker::new_lenient());
+        // State tracking is done via server-side DST events, which are emitted
+        // synchronously by the server and collected in a thread-local event bus.
+        // This eliminates race conditions from client-side tracking.
+        let tracker = Arc::new(InvariantTracker::new());
         let total_completed = Arc::new(AtomicU32::new(0));
         let enqueued_jobs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
-        let producer_tracker = Arc::clone(&job_tracker);
         let producer_jobs = Arc::clone(&enqueued_jobs);
 
         // Enqueue jobs from producer
@@ -62,7 +60,6 @@ pub fn run() {
                     }))
                     .await?;
 
-                producer_tracker.job_enqueued(&job_id);
                 producer_jobs.lock().unwrap().push(job_id);
             }
             tracing::trace!("producer_done");
@@ -70,7 +67,6 @@ pub fn run() {
         });
 
         // Worker 1
-        let w1_tracker = Arc::clone(&job_tracker);
         let w1_completed = Arc::clone(&total_completed);
         sim.client("worker1", async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -93,8 +89,6 @@ pub fn run() {
                     .into_inner();
 
                 for task in &lease.tasks {
-                    // Track lease acquisition
-                    w1_tracker.task_leased(&task.job_id, &task.id);
                     assert_eq!(
                         task.attempt_number, 1,
                         "Unexpected retry attempt in multiple_workers scenario"
@@ -113,15 +107,6 @@ pub fn run() {
                         }))
                         .await?;
 
-                    // Track completion
-                    w1_tracker.task_released(&task.job_id, &task.id);
-                    let was_new = w1_tracker.job_completed(&task.job_id);
-                    assert!(
-                        was_new,
-                        "INVARIANT VIOLATION: Job '{}' completed twice!",
-                        task.job_id
-                    );
-
                     tracing::trace!(worker = "worker1", job_id = %task.job_id, "complete");
                     completed += 1;
                     w1_completed.fetch_add(1, Ordering::SeqCst);
@@ -136,7 +121,6 @@ pub fn run() {
         });
 
         // Worker 2
-        let w2_tracker = Arc::clone(&job_tracker);
         let w2_completed = Arc::clone(&total_completed);
         sim.client("worker2", async move {
             tokio::time::sleep(Duration::from_millis(120)).await;
@@ -159,8 +143,6 @@ pub fn run() {
                     .into_inner();
 
                 for task in &lease.tasks {
-                    // Track lease acquisition
-                    w2_tracker.task_leased(&task.job_id, &task.id);
                     assert_eq!(
                         task.attempt_number, 1,
                         "Unexpected retry attempt in multiple_workers scenario"
@@ -179,15 +161,6 @@ pub fn run() {
                         }))
                         .await?;
 
-                    // Track completion
-                    w2_tracker.task_released(&task.job_id, &task.id);
-                    let was_new = w2_tracker.job_completed(&task.job_id);
-                    assert!(
-                        was_new,
-                        "INVARIANT VIOLATION: Job '{}' completed twice!",
-                        task.job_id
-                    );
-
                     tracing::trace!(worker = "worker2", job_id = %task.job_id, "complete");
                     completed += 1;
                     w2_completed.fetch_add(1, Ordering::SeqCst);
@@ -202,12 +175,16 @@ pub fn run() {
         });
 
         // Verifier: Check all jobs completed exactly once
-        let verify_tracker = Arc::clone(&job_tracker);
+        // This verifier consumes server-side DST events to track state accurately
+        let verify_tracker = Arc::clone(&tracker);
         let verify_completed = Arc::clone(&total_completed);
         let verify_jobs = Arc::clone(&enqueued_jobs);
         sim.client("verifier", async move {
             // Wait for workers to finish
             tokio::time::sleep(Duration::from_secs(30)).await;
+
+            // Process all DST events from server-side instrumentation
+            verify_tracker.process_dst_events();
 
             let ch = Endpoint::new("http://server:9902")?
                 .connect_with_connector(turmoil_connector())
@@ -282,7 +259,24 @@ pub fn run() {
             );
 
             // INVARIANT: No terminal job leases (noLeasesForTerminal)
-            verify_tracker.verify_no_terminal_leases();
+            verify_tracker.verify_all();
+
+            // Verify state machine transitions were valid
+            let transition_violations = verify_tracker.jobs.verify_all_transitions();
+            if !transition_violations.is_empty() {
+                tracing::warn!(
+                    violations = transition_violations.len(),
+                    "transition_violations_found"
+                );
+                for v in &transition_violations {
+                    tracing::warn!(violation = %v, "transition_violation");
+                }
+                // Fail on transition violations - these are now based on server events
+                panic!(
+                    "INVARIANT VIOLATION: {} invalid state transitions detected",
+                    transition_violations.len()
+                );
+            }
 
             tracing::trace!(
                 succeeded = succeeded,

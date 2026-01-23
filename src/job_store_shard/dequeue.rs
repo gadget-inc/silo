@@ -4,6 +4,7 @@ use slatedb::{DbIterator, WriteBatch};
 
 use crate::codec::{decode_task, encode_attempt, encode_lease};
 use crate::concurrency::{ReleaseGrantRollback, RequestTicketTaskOutcome};
+use crate::dst_events::{self, DstEvent};
 use crate::job::{JobStatus, JobView};
 use crate::job_attempt::{AttemptStatus, JobAttempt};
 use crate::job_store_shard::helpers::now_epoch_ms;
@@ -42,6 +43,9 @@ impl JobStoreShard {
         let mut grants_to_rollback: Vec<(String, String, String)> = Vec::new();
         // Track release-and-grant operations for rollback on failure
         let mut release_grants_to_rollback: Vec<ReleaseGrantRollback> = Vec::new();
+        // Track leased tasks for DST event emission after commit
+        // Format: (tenant, job_id, task_id)
+        let mut leased_tasks_for_dst: Vec<(String, String, String)> = Vec::new();
 
         // Loop to process internal tasks until we have tasks that are destined for the worker, or no more ready tasks at all.
         const MAX_INTERNAL_ITERATIONS: usize = 10;
@@ -171,6 +175,13 @@ impl JobStoreShard {
                                 ));
                                 ack_keys.push(entry.key.clone());
                                 // Grant already recorded by try_reserve - no need to call record_grant
+
+                                // Track for DST event emission after commit
+                                leased_tasks_for_dst.push((
+                                    tenant.clone(),
+                                    job_id.clone(),
+                                    request_id.clone(),
+                                ));
 
                                 // Record concurrency ticket metric
                                 if let Some(ref m) = self.metrics {
@@ -429,6 +440,13 @@ impl JobStoreShard {
                     // Defer constructing AttemptView; fetch from DB after batch is written
                     pending_attempts.push((tenant.clone(), view, job_id.clone(), attempt_number));
                     ack_keys.push(entry.key.clone());
+
+                    // Track for DST event emission after commit
+                    leased_tasks_for_dst.push((
+                        tenant.clone(),
+                        job_id.clone(),
+                        task_id.clone(),
+                    ));
                 } else {
                     // If job missing, delete task key to clean up
                     batch.delete(entry.key.as_bytes());
@@ -462,6 +480,21 @@ impl JobStoreShard {
             // DB write succeeded - clear rollback lists for next iteration
             grants_to_rollback.clear();
             release_grants_to_rollback.clear();
+
+            // Emit DST events for leased tasks after successful commit
+            for (tenant, job_id, task_id) in leased_tasks_for_dst.drain(..) {
+                dst_events::emit(DstEvent::TaskLeased {
+                    tenant: tenant.clone(),
+                    job_id: job_id.clone(),
+                    task_id,
+                    worker_id: worker_id.to_string(),
+                });
+                dst_events::emit(DstEvent::JobStatusChanged {
+                    tenant,
+                    job_id,
+                    new_status: "Running".to_string(),
+                });
+            }
 
             // [SILO-DEQ-3] Ack durable and evict from buffer; we no longer use TTL tombstones.
             self.broker.ack_durable(&ack_keys);

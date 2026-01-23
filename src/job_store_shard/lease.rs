@@ -7,6 +7,7 @@ use crate::codec::{
     decode_floating_limit_state, decode_lease, encode_attempt, encode_floating_limit_state,
     encode_lease,
 };
+use crate::dst_events::{self, DstEvent};
 use crate::job::{FloatingLimitState, JobStatus, JobView};
 use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt};
 use crate::job_store_shard::helpers::now_epoch_ms;
@@ -136,6 +137,8 @@ impl JobStoreShard {
         let mut followup_next_time: Option<i64> = None;
         // Track grants from retry scheduling for rollback if DB write fails
         let mut retry_grants: Vec<(String, String)> = Vec::new();
+        // Track the new job status for DST event emission
+        let mut new_job_status_for_dst: Option<String> = None;
 
         match &outcome {
             // [SILO-SUCC-3] If success: mark job succeeded now (pure write)
@@ -143,12 +146,14 @@ impl JobStoreShard {
                 let job_status = JobStatus::succeeded(now_ms);
                 self.set_job_status_with_index(&mut batch, tenant, &job_id, job_status)
                     .await?;
+                new_job_status_for_dst = Some("Succeeded".to_string());
             }
             // Worker acknowledges cancellation - set job status to Cancelled
             AttemptOutcome::Cancelled => {
                 let job_status = JobStatus::cancelled(now_ms);
                 self.set_job_status_with_index(&mut batch, tenant, &job_id, job_status)
                     .await?;
+                new_job_status_for_dst = Some("Cancelled".to_string());
             }
             // Error: maybe enqueue next attempt; otherwise mark job failed
             AttemptOutcome::Error { .. } => {
@@ -199,6 +204,7 @@ impl JobStoreShard {
                                 .await?;
                             scheduled_followup = true;
                             followup_next_time = Some(next_time);
+                            new_job_status_for_dst = Some("Scheduled".to_string());
                         }
                     }
                     // [SILO-FAIL-3] If no follow-up scheduled, mark job as failed (pure write)
@@ -206,6 +212,7 @@ impl JobStoreShard {
                         let job_status = JobStatus::failed(now_ms);
                         self.set_job_status_with_index(&mut batch, tenant, &job_id, job_status)
                             .await?;
+                        new_job_status_for_dst = Some("Failed".to_string());
                     }
                 } else {
                     job_missing_error = Some(JobStoreShardError::JobNotFound(job_id.clone()));
@@ -243,6 +250,20 @@ impl JobStoreShard {
         if let Err(e) = self.db.flush().await {
             // Write succeeded but flush failed - in-memory is correct, don't rollback
             return Err(e.into());
+        }
+
+        // Emit DST events after successful commit
+        dst_events::emit(DstEvent::TaskReleased {
+            tenant: tenant.to_string(),
+            job_id: job_id.clone(),
+            task_id: task_id.to_string(),
+        });
+        if let Some(new_status) = new_job_status_for_dst {
+            dst_events::emit(DstEvent::JobStatusChanged {
+                tenant: tenant.to_string(),
+                job_id: job_id.clone(),
+                new_status,
+            });
         }
 
         // Log and wake broker for any releases/grants

@@ -501,38 +501,22 @@ pub fn verify_determinism(scenario: &str, seed: u64) {
 /// Tracks global concurrency state across all workers for invariant verification.
 /// This verifies the Alloy invariant: queueLimitEnforced - at most max_concurrency
 /// tasks can be leased for a given limit key at any time.
+///
+/// This tracker receives events from server-side instrumentation via DST events,
+/// ensuring accurate tracking without race conditions from client-side tracking.
 #[derive(Debug, Default)]
 pub struct GlobalConcurrencyTracker {
     /// Maps limit_key -> set of (task_id, job_id) pairs currently holding the limit
     holders: Mutex<HashMap<String, HashSet<(String, String)>>>,
     /// Maps limit_key -> max_concurrency for that key
     limits: Mutex<HashMap<String, u32>>,
-    /// If true, log warnings instead of panicking on apparent violations
-    /// (can happen with message loss causing stale tracking state)
-    lenient_mode: bool,
 }
 
 impl GlobalConcurrencyTracker {
-    /// Create a strict-mode tracker (panics on apparent violations).
-    /// Consider using `new_lenient()` for multi-worker scenarios.
+    /// Create a new tracker.
     #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Create a tracker in lenient mode, suitable for chaos testing.
-    ///
-    /// In lenient mode, apparent concurrency limit violations are logged as
-    /// warnings instead of panics. This is necessary for high message loss
-    /// scenarios where the client-side tracker can become stale due to:
-    /// - Pre-releasing before report_outcome
-    /// - Response loss causing re-acquire on failure
-    /// - Server already processed the release but client doesn't know
-    pub fn new_lenient() -> Self {
-        Self {
-            lenient_mode: true,
-            ..Default::default()
-        }
     }
 
     /// Register a limit key and its max concurrency value
@@ -542,8 +526,7 @@ impl GlobalConcurrencyTracker {
     }
 
     /// Record that a task has acquired a concurrency slot.
-    /// In strict mode, panics if this would violate the concurrency limit.
-    /// In lenient mode, logs a warning for apparent violations.
+    /// Panics if this would violate the concurrency limit.
     pub fn acquire(&self, limit_key: &str, task_id: &str, job_id: &str) {
         let mut holders = self.holders.lock().unwrap();
         let limits = self.limits.lock().unwrap();
@@ -553,40 +536,20 @@ impl GlobalConcurrencyTracker {
 
         // Check invariant BEFORE adding
         if entry.len() >= max as usize {
-            if self.lenient_mode {
-                tracing::warn!(
-                    limit_key = limit_key,
-                    max_concurrency = max,
-                    current_holders = ?entry,
-                    new_task_id = task_id,
-                    new_job_id = job_id,
-                    "apparent concurrency limit exceeded (likely stale tracking due to message loss)"
-                );
-                // Still add the task in lenient mode - the tracker is stale, not the server
-            } else {
-                panic!(
-                    "INVARIANT VIOLATION (queueLimitEnforced): Attempting to acquire slot for limit '{}' \
-                     but already at max_concurrency {}. Current holders: {:?}. \
-                     New task_id={}, job_id={}",
-                    limit_key, max, entry, task_id, job_id
-                );
-            }
+            panic!(
+                "INVARIANT VIOLATION (queueLimitEnforced): Attempting to acquire slot for limit '{}' \
+                 but already at max_concurrency {}. Current holders: {:?}. \
+                 New task_id={}, job_id={}",
+                limit_key, max, entry, task_id, job_id
+            );
         }
 
         let inserted = entry.insert((task_id.to_string(), job_id.to_string()));
         if !inserted {
-            if self.lenient_mode {
-                tracing::warn!(
-                    task_id = task_id,
-                    limit_key = limit_key,
-                    "task already tracked as holding limit (duplicate lease tracking)"
-                );
-            } else {
-                panic!(
-                    "INVARIANT VIOLATION (noDoubleLease): Task {} already holds limit '{}'",
-                    task_id, limit_key
-                );
-            }
+            panic!(
+                "INVARIANT VIOLATION (noDoubleLease): Task {} already holds limit '{}'",
+                task_id, limit_key
+            );
         }
 
         tracing::trace!(
@@ -600,25 +563,27 @@ impl GlobalConcurrencyTracker {
     }
 
     /// Record that a task has released a concurrency slot.
-    pub fn release(&self, limit_key: &str, task_id: &str, job_id: &str) {
+    pub fn release(&self, limit_key: &str, task_id: &str) {
         let mut holders = self.holders.lock().unwrap();
 
         if let Some(entry) = holders.get_mut(limit_key) {
-            let removed = entry.remove(&(task_id.to_string(), job_id.to_string()));
-            if !removed {
-                tracing::warn!(
+            // Find and remove any entry matching this task_id (job_id may vary)
+            let to_remove: Option<(String, String)> =
+                entry.iter().find(|(tid, _)| tid == task_id).cloned();
+
+            if let Some(key) = to_remove {
+                entry.remove(&key);
+                tracing::trace!(
                     limit_key = limit_key,
                     task_id = task_id,
-                    job_id = job_id,
-                    "release called for task not in holders set (may have failed/timed out)"
+                    remaining_count = entry.len(),
+                    "concurrency_released"
                 );
             } else {
                 tracing::trace!(
                     limit_key = limit_key,
                     task_id = task_id,
-                    job_id = job_id,
-                    remaining_count = entry.len(),
-                    "concurrency_released"
+                    "release called for task not in holders set (may have been released already)"
                 );
             }
         }
@@ -652,20 +617,11 @@ impl GlobalConcurrencyTracker {
             let mut seen_limits: HashSet<&str> = HashSet::new();
             for (limit_key, task_id) in entries {
                 if !seen_limits.insert(limit_key.as_str()) {
-                    if self.lenient_mode {
-                        tracing::warn!(
-                            job_id = job_id,
-                            limit_key = limit_key,
-                            entries = ?entries,
-                            "job appears to have duplicate task leases (likely stale tracking due to message loss)"
-                        );
-                    } else {
-                        panic!(
-                            "INVARIANT VIOLATION (oneLeasePerJob): Job '{}' has multiple tasks \
-                             holding limit '{}'. Entries: {:?}",
-                            job_id, limit_key, entries
-                        );
-                    }
+                    panic!(
+                        "INVARIANT VIOLATION (oneLeasePerJob): Job '{}' has multiple tasks \
+                         holding limit '{}'. Entries: {:?}",
+                        job_id, limit_key, entries
+                    );
                 }
                 let _ = task_id; // used in debug output above
             }
@@ -680,6 +636,9 @@ impl GlobalConcurrencyTracker {
 /// - oneLeasePerJob: A job never has multiple active leases
 /// - validTransitions: Only valid status transitions occur
 /// - noZombieAttempts: Terminal jobs have no running attempts
+///
+/// This tracker receives events from server-side instrumentation via DST events,
+/// ensuring accurate tracking without race conditions from client-side tracking.
 #[derive(Debug, Default)]
 pub struct JobStateTracker {
     /// Maps job_id -> last known status
@@ -690,8 +649,6 @@ pub struct JobStateTracker {
     terminal_jobs: Mutex<HashSet<String>>,
     /// Set of job_ids that have been successfully completed (for duplicate detection)
     completed_jobs: Mutex<HashSet<String>>,
-    /// If true, allow "stale" leases for terminal jobs (can happen with network delays)
-    lenient_mode: bool,
     /// Track status transition history for validTransitions invariant
     /// Maps job_id -> list of (status, timestamp_ms) transitions
     status_history: Mutex<HashMap<String, Vec<(i32, i64)>>>,
@@ -746,30 +703,14 @@ fn is_valid_status_transition(from: i32, to: i32) -> bool {
 }
 
 impl JobStateTracker {
-    /// Create a strict-mode tracker (panics on apparent violations).
-    /// Consider using `new_lenient()` for multi-worker scenarios.
+    /// Create a new tracker.
     #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Create a tracker in lenient mode, suitable for chaos testing.
-    ///
-    /// In lenient mode, receiving a lease for an already-terminal job is logged
-    /// as a warning rather than causing a panic. This can happen legitimately
-    /// when network delays cause lease responses to arrive out-of-order relative
-    /// to completion reports.
-    pub fn new_lenient() -> Self {
-        Self {
-            lenient_mode: true,
-            ..Default::default()
-        }
-    }
-
-    /// Record a status transition and optionally validate it.
-    ///
-    /// In strict mode, panics on invalid transitions.
-    /// In lenient mode, logs a warning but allows the transition.
+    /// Record a status transition and validate it.
+    /// Panics on invalid transitions.
     fn record_transition(&self, job_id: &str, new_status: i32) {
         let mut history = self.status_history.lock().unwrap();
         let entry = history.entry(job_id.to_string()).or_default();
@@ -777,17 +718,12 @@ impl JobStateTracker {
         // Check if this is a valid transition from the previous state
         if let Some(&(prev_status, _)) = entry.last() {
             if !is_valid_status_transition(prev_status, new_status) {
-                let msg = format!(
+                panic!(
                     "INVARIANT VIOLATION (validTransitions): Job '{}' invalid transition {:?} -> {:?}",
                     job_id,
                     status_name(prev_status),
                     status_name(new_status)
                 );
-                if self.lenient_mode {
-                    tracing::warn!("{}", msg);
-                } else {
-                    panic!("{}", msg);
-                }
             }
         }
 
@@ -822,10 +758,7 @@ impl JobStateTracker {
         }
 
         if !violations.is_empty() {
-            tracing::trace!(
-                violations = violations.len(),
-                "found transition violations"
-            );
+            tracing::trace!(violations = violations.len(), "found transition violations");
         }
 
         violations
@@ -846,27 +779,18 @@ impl JobStateTracker {
         self.record_transition(job_id, JobStatus::Scheduled as i32);
     }
 
-    /// Record that a task was leased for a job
+    /// Record that a task was leased for a job.
+    /// Panics if this would violate noLeasesForTerminal, noDoubleLease, or oneLeasePerJob invariants.
     pub fn task_leased(&self, job_id: &str, task_id: &str) {
         // Check that this job is not terminal
         {
             let terminal = self.terminal_jobs.lock().unwrap();
             if terminal.contains(job_id) {
-                if self.lenient_mode {
-                    // In lenient mode, just log a warning - this can happen with network delays
-                    tracing::warn!(
-                        job_id = job_id,
-                        task_id = task_id,
-                        "received lease for already-terminal job (stale lease due to network delay)"
-                    );
-                    return;
-                } else {
-                    panic!(
-                        "INVARIANT VIOLATION (noLeasesForTerminal): Attempting to lease task {} \
-                         for job {} which is already terminal",
-                        task_id, job_id
-                    );
-                }
+                panic!(
+                    "INVARIANT VIOLATION (noLeasesForTerminal): Attempting to lease task {} \
+                     for job {} which is already terminal",
+                    task_id, job_id
+                );
             }
         }
 
@@ -874,33 +798,16 @@ impl JobStateTracker {
         let entry = leases.entry(job_id.to_string()).or_default();
 
         if entry.contains(task_id) {
-            if self.lenient_mode {
-                tracing::warn!(
-                    job_id = job_id,
-                    task_id = task_id,
-                    "task already tracked as leased (duplicate lease response)"
-                );
-            } else {
-                panic!(
-                    "INVARIANT VIOLATION (noDoubleLease): Task '{}' already leased for job '{}'",
-                    task_id, job_id
-                );
-            }
+            panic!(
+                "INVARIANT VIOLATION (noDoubleLease): Task '{}' already leased for job '{}'",
+                task_id, job_id
+            );
         } else if !entry.is_empty() {
-            if self.lenient_mode {
-                tracing::warn!(
-                    job_id = job_id,
-                    existing_tasks = ?entry,
-                    new_task_id = task_id,
-                    "job already has active lease (possible stale tracking)"
-                );
-            } else {
-                panic!(
-                    "INVARIANT VIOLATION (oneLeasePerJob): Job '{}' already has active lease(s) {:?} \
-                     but received new task '{}'",
-                    job_id, entry, task_id
-                );
-            }
+            panic!(
+                "INVARIANT VIOLATION (oneLeasePerJob): Job '{}' already has active lease(s) {:?} \
+                 but received new task '{}'",
+                job_id, entry, task_id
+            );
         }
 
         entry.insert(task_id.to_string());
@@ -964,8 +871,20 @@ impl JobStateTracker {
         self.record_transition(job_id, JobStatus::Cancelled as i32);
     }
 
-    /// Record that a job is being retried (not terminal)
+    /// Record that a job is being retried/restarted (not terminal).
+    /// This removes the job from the terminal set if it was there,
+    /// allowing it to be leased again.
     pub fn job_retrying(&self, job_id: &str) {
+        // Remove from terminal set if present (for restart scenarios)
+        {
+            let mut terminal = self.terminal_jobs.lock().unwrap();
+            terminal.remove(job_id);
+        }
+        {
+            let mut completed = self.completed_jobs.lock().unwrap();
+            completed.remove(job_id);
+        }
+        
         let mut statuses = self.job_statuses.lock().unwrap();
         statuses.insert(job_id.to_string(), JobStatus::Scheduled as i32);
         drop(statuses);
@@ -985,7 +904,8 @@ impl JobStateTracker {
         terminal.contains(job_id)
     }
 
-    /// Verify that no terminal jobs have active leases
+    /// Verify that no terminal jobs have active leases.
+    /// Panics if any terminal job has active leases.
     pub fn verify_no_terminal_leases(&self) {
         let terminal = self.terminal_jobs.lock().unwrap();
         let leases = self.active_leases.lock().unwrap();
@@ -993,19 +913,11 @@ impl JobStateTracker {
         for job_id in terminal.iter() {
             if let Some(active) = leases.get(job_id) {
                 if !active.is_empty() {
-                    if self.lenient_mode {
-                        tracing::warn!(
-                            job_id = job_id,
-                            active_leases = ?active,
-                            "terminal job still has active leases (possible stale tracking)"
-                        );
-                    } else {
-                        panic!(
-                            "INVARIANT VIOLATION (noLeasesForTerminal): Terminal job '{}' \
-                             still has active leases: {:?}",
-                            job_id, active
-                        );
-                    }
+                    panic!(
+                        "INVARIANT VIOLATION (noLeasesForTerminal): Terminal job '{}' \
+                         still has active leases: {:?}",
+                        job_id, active
+                    );
                 }
             }
         }
@@ -1025,7 +937,10 @@ impl JobStateTracker {
     }
 }
 
-/// Combined invariant tracker for comprehensive verification
+/// Combined invariant tracker for comprehensive verification.
+///
+/// This tracker consumes server-side DST events to track state accurately,
+/// avoiding the race conditions that come with client-side event tracking.
 #[derive(Debug, Default)]
 pub struct InvariantTracker {
     pub concurrency: GlobalConcurrencyTracker,
@@ -1033,29 +948,91 @@ pub struct InvariantTracker {
 }
 
 impl InvariantTracker {
-    /// Create a strict-mode tracker (panics on apparent violations).
-    /// Consider using `new_lenient()` for multi-worker scenarios.
+    /// Create a new tracker.
     #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Create a tracker in lenient mode, suitable for chaos testing.
-    ///
-    /// In lenient mode, certain timing-related invariant "violations" that can
-    /// happen legitimately with network delays are logged as warnings instead
-    /// of causing panics.
-    pub fn new_lenient() -> Self {
-        Self {
-            concurrency: GlobalConcurrencyTracker::new_lenient(),
-            jobs: JobStateTracker::new_lenient(),
-        }
     }
 
     /// Run all invariant checks. Should be called periodically during scenarios.
     pub fn verify_all(&self) {
         self.concurrency.verify_no_duplicate_job_leases();
         self.jobs.verify_no_terminal_leases();
+    }
+
+    /// Process all pending DST events from the server-side instrumentation.
+    ///
+    /// This should be called periodically to consume events emitted by the
+    /// server during test execution. It updates the tracker state based on
+    /// the server's ground-truth events, ensuring accurate tracking without
+    /// race conditions from client-side event tracking.
+    pub fn process_dst_events(&self) {
+        use silo::dst_events::{DstEvent, drain_events};
+
+        for event in drain_events() {
+            match event {
+                DstEvent::JobEnqueued {
+                    tenant: _,
+                    ref job_id,
+                } => {
+                    self.jobs.job_enqueued(job_id);
+                }
+                DstEvent::JobStatusChanged {
+                    tenant: _,
+                    ref job_id,
+                    ref new_status,
+                } => {
+                    match new_status.as_str() {
+                        "Scheduled" => self.jobs.job_retrying(job_id),
+                        "Running" => {
+                            // Running is handled by TaskLeased event - skip here to avoid double transition
+                        }
+                        "Succeeded" => {
+                            self.jobs.job_completed(job_id);
+                        }
+                        "Failed" => {
+                            self.jobs.job_failed(job_id);
+                        }
+                        "Cancelled" => {
+                            self.jobs.job_cancelled(job_id);
+                        }
+                        _ => {
+                            tracing::warn!(new_status = %new_status, "unknown job status in DST event");
+                        }
+                    }
+                }
+                DstEvent::TaskLeased {
+                    tenant: _,
+                    ref job_id,
+                    ref task_id,
+                    worker_id: _,
+                } => {
+                    self.jobs.task_leased(job_id, task_id);
+                }
+                DstEvent::TaskReleased {
+                    tenant: _,
+                    ref job_id,
+                    ref task_id,
+                } => {
+                    self.jobs.task_released(job_id, task_id);
+                }
+                DstEvent::ConcurrencyTicketGranted {
+                    tenant: _,
+                    ref job_id,
+                    ref queue,
+                    ref task_id,
+                } => {
+                    self.concurrency.acquire(queue, task_id, job_id);
+                }
+                DstEvent::ConcurrencyTicketReleased {
+                    tenant: _,
+                    ref queue,
+                    ref task_id,
+                } => {
+                    self.concurrency.release(queue, task_id);
+                }
+            }
+        }
     }
 }
 
@@ -1119,10 +1096,7 @@ pub async fn verify_server_invariants(
             for row_bytes in &response.rows {
                 if let Ok(row) = parse_msgpack_row(&row_bytes.data) {
                     let status = row.get("status_kind").and_then(|v| v.as_str());
-                    let count = row
-                        .get("cnt")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u32;
+                    let count = row.get("cnt").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
                     match status {
                         Some("Running") => result.running_job_count = count,
@@ -1141,8 +1115,7 @@ pub async fn verify_server_invariants(
     }
 
     // Query 2: Get holder counts by queue
-    let holder_query =
-        "SELECT queue_name, COUNT(*) as cnt FROM queues WHERE entry_type = 'holder' GROUP BY queue_name";
+    let holder_query = "SELECT queue_name, COUNT(*) as cnt FROM queues WHERE entry_type = 'holder' GROUP BY queue_name";
     match client
         .query(tonic::Request::new(QueryRequest {
             shard,
@@ -1172,8 +1145,7 @@ pub async fn verify_server_invariants(
     }
 
     // Query 3: Get requester counts by queue
-    let requester_query =
-        "SELECT queue_name, COUNT(*) as cnt FROM queues WHERE entry_type = 'requester' GROUP BY queue_name";
+    let requester_query = "SELECT queue_name, COUNT(*) as cnt FROM queues WHERE entry_type = 'requester' GROUP BY queue_name";
     match client
         .query(tonic::Request::new(QueryRequest {
             shard,

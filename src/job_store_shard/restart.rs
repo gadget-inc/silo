@@ -7,6 +7,7 @@ use slatedb::IsolationLevel;
 use uuid::Uuid;
 
 use crate::codec::encode_job_status;
+use crate::dst_events::{self, DstEvent};
 use crate::job::{JobStatus, JobStatusKind};
 use crate::job_store_shard::helpers::{decode_job_status_owned, now_epoch_ms};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
@@ -188,6 +189,13 @@ impl JobStoreShard {
 
         // Commit the transaction
         txn.commit().await?;
+
+        // Emit DST event after successful commit - job is now back to Scheduled
+        dst_events::emit(DstEvent::JobStatusChanged {
+            tenant: tenant.to_string(),
+            job_id: id.to_string(),
+            new_status: "Scheduled".to_string(),
+        });
 
         // Wake the broker to pick up the new task promptly
         if start_at_ms <= now_epoch_ms() {

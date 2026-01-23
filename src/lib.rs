@@ -4,6 +4,7 @@ pub mod cluster_query;
 pub mod codec;
 pub mod concurrency;
 pub mod coordination;
+pub mod dst_events;
 pub mod factory;
 pub mod gubernator;
 pub mod job;

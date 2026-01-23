@@ -17,8 +17,8 @@
 //! 5. System progress: Jobs complete without deadlock
 
 use crate::helpers::{
-    AttemptStatus, ConcurrencyLimit, EnqueueRequest, GetJobRequest, GlobalConcurrencyTracker,
-    HashMap, JobStateTracker, JobStatus, LeaseTasksRequest, Limit, MsgpackBytes,
+    AttemptStatus, ConcurrencyLimit, EnqueueRequest, GetJobRequest, InvariantTracker,
+    HashMap, JobStatus, LeaseTasksRequest, Limit, MsgpackBytes,
     ReportOutcomeRequest, Task,
     get_seed, limit, report_outcome_request, run_scenario_impl, setup_server, turmoil_connector,
 };
@@ -86,29 +86,23 @@ pub fn run() {
         // Track completed job_ids to detect duplicates (invariant #3)
         let completed_jobs: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
-        // Track job state for lease and terminal invariants.
-        // Use lenient mode because with multiple workers and potential retries,
-        // client-side tracking can get out of sync with server state.
-        let job_tracker = Arc::new(JobStateTracker::new_lenient());
-
-        // INVARIANT #2: Global concurrency tracking (queueLimitEnforced)
-        // Tracks all active leases across all workers to verify system-wide concurrency limits.
-        // Use lenient mode because with message delays and multiple workers, tracking
-        // can become stale (e.g., pre-releasing before report_outcome, response loss).
-        let global_concurrency = Arc::new(GlobalConcurrencyTracker::new_lenient());
+        // Shared invariant tracker. State tracking is done via server-side DST events,
+        // which are emitted synchronously by the server and collected in a thread-local
+        // event bus. This eliminates race conditions from client-side tracking.
+        let tracker = Arc::new(InvariantTracker::new());
 
         // Register all limit keys with their max concurrency values
         for config in LIMIT_CONFIGS {
-            global_concurrency.register_limit(config.key, config.max_concurrency);
+            tracker.concurrency.register_limit(config.key, config.max_concurrency);
         }
 
         sim.host("server", || async move { setup_server(9905).await });
 
         // Producer 1: Enqueues jobs in random order across all limit groups
+        // Note: Job tracking is handled by server-side DST events, not client-side
         let producer_seed = seed;
         let enqueue_counter1 = Arc::clone(&total_enqueued);
         let enqueued_jobs1 = Arc::clone(&enqueued_jobs);
-        let producer_tracker1 = Arc::clone(&job_tracker);
         sim.client("producer1", async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let mut rng = StdRng::seed_from_u64(producer_seed.wrapping_add(1));
@@ -180,7 +174,6 @@ pub fn run() {
                     Ok(_) => {
                         enqueued += 1;
                         enqueue_counter1.fetch_add(1, Ordering::SeqCst);
-                        producer_tracker1.job_enqueued(&job_id);
                         enqueued_jobs1.lock().unwrap().push(job_id);
                     }
                     Err(e) => {
@@ -197,7 +190,6 @@ pub fn run() {
         let producer2_seed = seed;
         let enqueue_counter2 = Arc::clone(&total_enqueued);
         let enqueued_jobs2 = Arc::clone(&enqueued_jobs);
-        let producer_tracker2 = Arc::clone(&job_tracker);
         sim.client("producer2", async move {
             // Start slightly later to create interleaving with producer1
             tokio::time::sleep(Duration::from_millis(80)).await;
@@ -266,7 +258,6 @@ pub fn run() {
                     Ok(_) => {
                         enqueued += 1;
                         enqueue_counter2.fetch_add(1, Ordering::SeqCst);
-                        producer_tracker2.job_enqueued(&job_id);
                         enqueued_jobs2.lock().unwrap().push(job_id);
                     }
                     Err(e) => {
@@ -285,8 +276,6 @@ pub fn run() {
             let worker_id = format!("worker{}", worker_num);
             let completion_counter = Arc::clone(&total_completed);
             let completed_jobs_tracker = Arc::clone(&completed_jobs);
-            let worker_concurrency = Arc::clone(&global_concurrency);
-            let worker_job_tracker = Arc::clone(&job_tracker);
 
             let client_name: &'static str =
                 Box::leak(format!("worker{}", worker_num).into_boxed_str());
@@ -346,11 +335,7 @@ pub fn run() {
                             }
 
                             for task in tasks {
-                                worker_job_tracker.task_leased(&task.job_id, &task.id);
-
-                                // INVARIANT #2: Track global concurrency acquisition
                                 let limit_key = extract_limit_key(&task.job_id);
-                                worker_concurrency.acquire(&limit_key, &task.id, &task.job_id);
 
                                 tracing::trace!(
                                     worker = %worker_id,
@@ -404,13 +389,6 @@ pub fn run() {
                                 })
                             };
 
-                            // IMPORTANT: Release from tracker BEFORE report_outcome because
-                            // the server will release and potentially grant to another worker
-                            // immediately upon receiving report_outcome. If we release after,
-                            // there's a race where another worker acquires before we release.
-                            let limit_key = extract_limit_key(&task.job_id);
-                            worker_concurrency.release(&limit_key, &task.id, &task.job_id);
-
                             match client
                                 .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                                     shard: 0,
@@ -421,16 +399,7 @@ pub fn run() {
                                 .await
                             {
                                 Ok(_) => {
-                                    // Slot already released above
-
                                     if should_fail {
-                                        worker_job_tracker
-                                            .task_released(&task.job_id, &task.id);
-                                        // Use job_retrying instead of job_failed because
-                                        // the server may retry this job based on retry policy.
-                                        // job_failed would mark it terminal, causing tracking
-                                        // issues if it gets retried.
-                                        worker_job_tracker.job_retrying(&task.job_id);
                                         tracing::trace!(
                                             worker = %worker_id,
                                             job_id = %task.job_id,
@@ -438,16 +407,6 @@ pub fn run() {
                                         );
                                         failed += 1;
                                     } else {
-                                        worker_job_tracker
-                                            .task_released(&task.job_id, &task.id);
-                                        let was_new = worker_job_tracker.job_completed(&task.job_id);
-                                        assert!(
-                                            was_new,
-                                            "INVARIANT VIOLATION: Job '{}' completed twice! \
-                                             (job_tracker, worker={}, round={})",
-                                            task.job_id, worker_id, round
-                                        );
-
                                         // INVARIANT #3: No duplicate completions
                                         let was_new = completed_jobs_tracker
                                             .lock()
@@ -471,9 +430,6 @@ pub fn run() {
                                     indices_to_remove.insert(i);
                                 }
                                 Err(e) => {
-                                    // Re-acquire since we pre-released but the report failed
-                                    // The task is still leased on the server
-                                    worker_concurrency.acquire(&limit_key, &task.id, &task.job_id);
                                     tracing::trace!(
                                         worker = %worker_id,
                                         job_id = %task.job_id,
@@ -502,10 +458,6 @@ pub fn run() {
                     let process_time = rng.random_range(5..30);
                     tokio::time::sleep(Duration::from_millis(process_time)).await;
 
-                    // Release from tracker BEFORE report_outcome (see comment above)
-                    let limit_key = extract_limit_key(&task.job_id);
-                    worker_concurrency.release(&limit_key, &task.id, &task.job_id);
-
                     match client
                         .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                             shard: 0,
@@ -518,16 +470,6 @@ pub fn run() {
                         .await
                     {
                         Ok(_) => {
-                            // Slot already released above
-                            worker_job_tracker.task_released(&task.job_id, &task.id);
-                            let was_new = worker_job_tracker.job_completed(&task.job_id);
-                            assert!(
-                                was_new,
-                                "INVARIANT VIOLATION: Job '{}' completed twice! \
-                                 (job_tracker, worker={}, final)",
-                                task.job_id, worker_id
-                            );
-
                             // INVARIANT #3: No duplicate completions
                             let was_new = completed_jobs_tracker
                                 .lock()
@@ -548,8 +490,6 @@ pub fn run() {
                             completion_counter.fetch_add(1, Ordering::SeqCst);
                         }
                         Err(e) => {
-                            // Re-acquire since we pre-released but the report failed
-                            worker_concurrency.acquire(&limit_key, &task.id, &task.job_id);
                             tracing::trace!(
                                 worker = %worker_id,
                                 job_id = %task.job_id,
@@ -572,15 +512,18 @@ pub fn run() {
         }
 
         // Verifier client: waits for work to complete and checks all invariants
+        // This verifier consumes server-side DST events to track state accurately
         let verify_completed = Arc::clone(&total_completed);
         let verify_enqueued = Arc::clone(&total_enqueued);
         let verify_jobs = Arc::clone(&enqueued_jobs);
         let verify_completed_set = Arc::clone(&completed_jobs);
-        let verify_concurrency = Arc::clone(&global_concurrency);
-        let verify_job_tracker = Arc::clone(&job_tracker);
+        let verify_tracker = Arc::clone(&tracker);
         sim.client("verifier", async move {
             // Wait for producers and workers to do their work
             tokio::time::sleep(Duration::from_secs(90)).await;
+
+            // Process all DST events from server-side instrumentation
+            verify_tracker.process_dst_events();
 
             let enqueued = verify_enqueued.load(Ordering::SeqCst);
             let completed = verify_completed.load(Ordering::SeqCst);
@@ -697,16 +640,32 @@ pub fn run() {
 
             // INVARIANT #2: Final global concurrency verification
             // After all work is done, verify no duplicate job leases occurred
-            verify_concurrency.verify_no_duplicate_job_leases();
-            verify_job_tracker.verify_no_terminal_leases();
+            verify_tracker.verify_all();
 
             // Log final concurrency state for all limit keys
             for config in LIMIT_CONFIGS {
-                let holder_count = verify_concurrency.holder_count(config.key);
+                let holder_count = verify_tracker.concurrency.holder_count(config.key);
                 tracing::trace!(
                     limit_key = config.key,
                     remaining_holders = holder_count,
                     "final_concurrency_state"
+                );
+            }
+
+            // Verify state machine transitions were valid
+            let transition_violations = verify_tracker.jobs.verify_all_transitions();
+            if !transition_violations.is_empty() {
+                tracing::warn!(
+                    violations = transition_violations.len(),
+                    "transition_violations_found"
+                );
+                for v in &transition_violations {
+                    tracing::warn!(violation = %v, "transition_violation");
+                }
+                // Fail on transition violations - these are now based on server events
+                panic!(
+                    "INVARIANT VIOLATION: {} invalid state transitions detected",
+                    transition_violations.len()
                 );
             }
 

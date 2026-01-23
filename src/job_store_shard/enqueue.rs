@@ -4,6 +4,7 @@ use slatedb::WriteBatch;
 use uuid::Uuid;
 
 use crate::codec::{encode_job_info, encode_job_status};
+use crate::dst_events::{self, DstEvent};
 use crate::job::{JobInfo, JobStatus, Limit};
 use crate::job_store_shard::helpers::{now_epoch_ms, put_task};
 use crate::job_store_shard::JobStoreShard;
@@ -101,6 +102,18 @@ impl JobStoreShard {
             }
             return Err(e.into());
         }
+
+        // Emit DST event immediately after successful write, BEFORE flush.
+        // This is critical for DST: the flush() yields to the scheduler, which could
+        // allow a dequeue to run and lease this job's task before we emit JobEnqueued.
+        // By emitting before flush, we ensure events are in the correct order.
+        // Note: We only emit JobEnqueued, not JobStatusChanged(Scheduled), because
+        // job_enqueued() already records the Scheduled status.
+        dst_events::emit(DstEvent::JobEnqueued {
+            tenant: tenant.to_string(),
+            job_id: job_id.clone(),
+        });
+
         if let Err(e) = self.db.flush().await {
             // Note: write succeeded but flush failed - the grants are committed,
             // so we don't rollback here
