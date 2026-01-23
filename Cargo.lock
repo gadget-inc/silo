@@ -5460,6 +5460,7 @@ dependencies = [
  "tracing-perfetto",
  "tracing-subscriber",
  "turmoil",
+ "url",
  "usdt",
  "uuid",
 ]
