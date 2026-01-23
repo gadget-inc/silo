@@ -179,6 +179,10 @@ jobs:
     permissions:
       contents: "read"
       id-token: "write"
+    outputs:
+      image-tag: ${{ steps.push.outputs.image-tag }}
+      image-sha-tag: ${{ steps.push.outputs.image-sha-tag }}
+      full-image-sha: ${{ steps.push.outputs.full-image-sha }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -212,12 +216,31 @@ jobs:
 
       - name: Tag and push image
         if: github.ref == 'refs/heads/main'
+        id: push
         run: |
           sha=$(git rev-parse --short HEAD)
           registry="us-central1-docker.pkg.dev/gadget-core-production/core-production/silo"
 
-          docker tag silo:latest "${registry}/silo:sha-${sha}"
-          docker push "${registry}/silo:sha-${sha}"
+          sha_image="${registry}/silo:sha-${sha}"
+          latest_image="${registry}/silo:latest"
 
-          docker tag silo:latest "${registry}/silo:latest"
-          docker push "${registry}/silo:latest"
+          echo "🏷️  Tagging images..."
+          docker tag silo:latest "${sha_image}"
+          docker tag silo:latest "${latest_image}"
+
+          echo "📤 Pushing SHA-tagged image..."
+          docker push "${sha_image}"
+
+          echo "📤 Pushing latest tag..."
+          docker push "${latest_image}"
+
+          echo ""
+          echo "✅ Successfully pushed Docker images:"
+          echo "   - ${sha_image}"
+          echo "   - ${latest_image}"
+          echo ""
+
+          # Set outputs for GitHub Actions UI
+          echo "image-tag=sha-${sha}" >> $GITHUB_OUTPUT
+          echo "image-sha-tag=sha-${sha}" >> $GITHUB_OUTPUT
+          echo "full-image-sha=${sha_image}" >> $GITHUB_OUTPUT
