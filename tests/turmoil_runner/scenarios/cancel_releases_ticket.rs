@@ -213,7 +213,7 @@ pub fn run() {
 
         // Worker: Processes jobs, heartbeats to detect cancellation
         let worker_a_leased = Arc::clone(&job_a_leased_time);
-        let worker_a_cancelled = Arc::clone(&job_a_cancelled_time);
+        let _worker_a_cancelled = Arc::clone(&job_a_cancelled_time);
         let worker_b_leased = Arc::clone(&job_b_leased_time);
         let worker_b_complete = Arc::clone(&job_b_complete_time);
         let worker_c_leased = Arc::clone(&job_c_leased_time);

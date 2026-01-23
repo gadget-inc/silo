@@ -118,6 +118,10 @@ impl ClientConfig {
 /// retry logic with exponential backoff. Retries are attempted when the initial
 /// connection fails.
 ///
+/// Each connection attempt is wrapped with a hard timeout to ensure we don't hang
+/// indefinitely when TCP/HTTP2 gets into a bad state (e.g., due to packet loss or
+/// network partitions that leave the connection half-open).
+///
 /// # Arguments
 /// * `uri` - The server URI (e.g., "http://localhost:9910")
 /// * `config` - Client configuration with timeout and retry settings
@@ -142,11 +146,20 @@ pub async fn create_silo_client(
         .configure_endpoint(&full_uri)
         .map_err(|e| ClusterClientError::ConnectionFailed(full_uri.clone(), e.to_string()))?;
 
+    // Hard timeout per connection attempt. The endpoint has a connect_timeout, but
+    // in practice TCP/HTTP2 can get into states where the timeout doesn't fire
+    // (e.g., half-open connections, corrupted h2 streams). This ensures we don't
+    // hang indefinitely on any single attempt.
+    let attempt_timeout = config.connect_timeout + Duration::from_secs(1);
+
     let mut last_error = None;
     for attempt in 0..config.max_retries {
-        match endpoint.connect().await {
-            Ok(channel) => return Ok(SiloClient::new(channel)),
-            Err(e) => {
+        let connect_result =
+            tokio::time::timeout(attempt_timeout, endpoint.connect()).await;
+
+        match connect_result {
+            Ok(Ok(channel)) => return Ok(SiloClient::new(channel)),
+            Ok(Err(e)) => {
                 trace!(
                     attempt = attempt,
                     max_retries = config.max_retries,
@@ -154,19 +167,28 @@ pub async fn create_silo_client(
                     uri = %full_uri,
                     "connection attempt failed, retrying"
                 );
-                last_error = Some(e);
-                if attempt + 1 < config.max_retries {
-                    tokio::time::sleep(config.backoff_for_attempt(attempt)).await;
-                }
+                last_error = Some(e.to_string());
             }
+            Err(_elapsed) => {
+                trace!(
+                    attempt = attempt,
+                    max_retries = config.max_retries,
+                    uri = %full_uri,
+                    timeout_secs = ?attempt_timeout,
+                    "connection attempt timed out, retrying"
+                );
+                last_error = Some(format!("connection timed out after {:?}", attempt_timeout));
+            }
+        }
+
+        if attempt + 1 < config.max_retries {
+            tokio::time::sleep(config.backoff_for_attempt(attempt)).await;
         }
     }
 
     Err(ClusterClientError::ConnectionFailed(
         full_uri,
-        last_error
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "no connection attempts made".into()),
+        last_error.unwrap_or_else(|| "no connection attempts made".into()),
     ))
 }
 

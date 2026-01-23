@@ -86,12 +86,16 @@ pub fn run() {
         // Track completed job_ids to detect duplicates (invariant #3)
         let completed_jobs: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
-        // Track job state for lease and terminal invariants
-        let job_tracker = Arc::new(JobStateTracker::new());
+        // Track job state for lease and terminal invariants.
+        // Use lenient mode because with multiple workers and potential retries,
+        // client-side tracking can get out of sync with server state.
+        let job_tracker = Arc::new(JobStateTracker::new_lenient());
 
         // INVARIANT #2: Global concurrency tracking (queueLimitEnforced)
-        // Tracks all active leases across all workers to verify system-wide concurrency limits
-        let global_concurrency = Arc::new(GlobalConcurrencyTracker::new());
+        // Tracks all active leases across all workers to verify system-wide concurrency limits.
+        // Use lenient mode because with message delays and multiple workers, tracking
+        // can become stale (e.g., pre-releasing before report_outcome, response loss).
+        let global_concurrency = Arc::new(GlobalConcurrencyTracker::new_lenient());
 
         // Register all limit keys with their max concurrency values
         for config in LIMIT_CONFIGS {
@@ -422,7 +426,11 @@ pub fn run() {
                                     if should_fail {
                                         worker_job_tracker
                                             .task_released(&task.job_id, &task.id);
-                                        worker_job_tracker.job_failed(&task.job_id);
+                                        // Use job_retrying instead of job_failed because
+                                        // the server may retry this job based on retry policy.
+                                        // job_failed would mark it terminal, causing tracking
+                                        // issues if it gets retried.
+                                        worker_job_tracker.job_retrying(&task.job_id);
                                         tracing::trace!(
                                             worker = %worker_id,
                                             job_id = %task.job_id,

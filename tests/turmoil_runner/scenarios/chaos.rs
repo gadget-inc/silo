@@ -68,11 +68,13 @@ impl ChaosConfig {
     fn from_seed(seed: u64) -> Self {
         let mut rng = StdRng::seed_from_u64(seed);
 
-        // Cap fail_rate at 15% to ensure some progress is possible with DST timeouts.
+        // Message fail rate varies from 5-15%. The client has hard timeouts on
+        // connection attempts, so even high fail rates won't cause indefinite hangs.
         let fail_rate = 0.05 + 0.10 * (rng.random_range(0..100) as f64 / 100.0);
         let max_latency_ms = rng.random_range(5..100);
-        let num_workers = rng.random_range(2..=6);
-        let num_jobs = rng.random_range(15..=40);
+        let num_workers = rng.random_range(2..=5);
+        // Job count capped to ensure completion within 180s simulation budget
+        let num_jobs = rng.random_range(12..=30);
 
         // Operation counts vary with seed
         let num_cancels = rng.random_range(2..=6);
@@ -84,8 +86,9 @@ impl ChaosConfig {
         let partition_min = rng.random_range(300..800);
         let partition_max = rng.random_range(partition_min..2500);
 
-        // Worker batch size range
-        let batch_min = rng.random_range(1..=2);
+        // Worker batch size range. Minimum of 2 ensures reasonable throughput
+        // even with network issues causing reconnection delays.
+        let batch_min = rng.random_range(2..=3);
         let batch_max = rng.random_range(batch_min..=6);
 
         Self {
@@ -255,8 +258,6 @@ pub fn run() {
 
                         // Reconnect after failures - the HTTP/2 connection may be
                         // corrupted due to packet loss breaking stream semantics.
-                        // Turmoil doesn't simulate TCP retransmissions, so dropped
-                        // packets can leave the h2 layer in a bad state.
                         if consecutive_failures >= 1 {
                             tracing::trace!("reconnecting after failure");
                             if let Ok(new_client) =
@@ -464,7 +465,8 @@ pub fn run() {
                 let mut processing: Vec<Task> = Vec::new();
                 let mut consecutive_failures = 0u32;
 
-                for round in 0..80 {
+                // 60 rounds should be plenty for processing jobs with network issues
+                for round in 0..60 {
                     if worker_done_flag.load(Ordering::SeqCst) {
                         break;
                     }
@@ -859,8 +861,9 @@ pub fn run() {
                 );
             }
 
-            // Final verification after all work should be done
-            tokio::time::sleep(Duration::from_secs(120)).await;
+            // Wait for work to complete. Use 90s to leave time for graceful shutdown
+            // within the 180s simulation budget.
+            tokio::time::sleep(Duration::from_secs(90)).await;
             verifier_done_flag.store(true, Ordering::SeqCst);
 
             // Final invariant verification

@@ -136,6 +136,9 @@ pub use silo::cluster_client::ClientConfig;
 /// This is the turmoil equivalent of `silo::cluster_client::create_silo_client`.
 /// It uses the turmoil connector for simulated networking while applying the
 /// same timeout and retry configuration used in production.
+///
+/// Like the production client, each connection attempt is wrapped with a hard timeout
+/// to ensure we don't hang indefinitely when the simulated network is degraded.
 pub async fn create_turmoil_client(
     uri: &str,
     config: &ClientConfig,
@@ -145,11 +148,20 @@ pub async fn create_turmoil_client(
         .connect_timeout(config.connect_timeout)
         .timeout(config.request_timeout);
 
+    // Hard timeout per connection attempt, matching production behavior.
+    let attempt_timeout = config.connect_timeout + Duration::from_secs(1);
+
     let mut last_error = None;
     for attempt in 0..config.max_retries {
-        match endpoint.connect_with_connector(turmoil_connector()).await {
-            Ok(channel) => return Ok(silo::pb::silo_client::SiloClient::new(channel)),
-            Err(e) => {
+        let connect_result = tokio::time::timeout(
+            attempt_timeout,
+            endpoint.connect_with_connector(turmoil_connector()),
+        )
+        .await;
+
+        match connect_result {
+            Ok(Ok(channel)) => return Ok(silo::pb::silo_client::SiloClient::new(channel)),
+            Ok(Err(e)) => {
                 tracing::trace!(
                     attempt = attempt,
                     max_retries = config.max_retries,
@@ -158,10 +170,21 @@ pub async fn create_turmoil_client(
                     "connection attempt failed, retrying"
                 );
                 last_error = Some(e.to_string());
-                if attempt + 1 < config.max_retries {
-                    tokio::time::sleep(config.backoff_for_attempt(attempt)).await;
-                }
             }
+            Err(_elapsed) => {
+                tracing::trace!(
+                    attempt = attempt,
+                    max_retries = config.max_retries,
+                    uri = uri,
+                    timeout_secs = ?attempt_timeout,
+                    "connection attempt timed out, retrying"
+                );
+                last_error = Some(format!("connection timed out after {:?}", attempt_timeout));
+            }
+        }
+
+        if attempt + 1 < config.max_retries {
+            tokio::time::sleep(config.backoff_for_attempt(attempt)).await;
         }
     }
 
@@ -490,6 +513,9 @@ pub struct GlobalConcurrencyTracker {
 }
 
 impl GlobalConcurrencyTracker {
+    /// Create a strict-mode tracker (panics on apparent violations).
+    /// Consider using `new_lenient()` for multi-worker scenarios.
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -720,6 +746,9 @@ fn is_valid_status_transition(from: i32, to: i32) -> bool {
 }
 
 impl JobStateTracker {
+    /// Create a strict-mode tracker (panics on apparent violations).
+    /// Consider using `new_lenient()` for multi-worker scenarios.
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -1004,6 +1033,9 @@ pub struct InvariantTracker {
 }
 
 impl InvariantTracker {
+    /// Create a strict-mode tracker (panics on apparent violations).
+    /// Consider using `new_lenient()` for multi-worker scenarios.
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -1050,6 +1082,8 @@ pub struct ServerInvariantResult {
 }
 
 impl ServerInvariantResult {
+    /// Check if all server invariants passed.
+    #[allow(dead_code)]
     pub fn is_ok(&self) -> bool {
         self.violations.is_empty()
     }
