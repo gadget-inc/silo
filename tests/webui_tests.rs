@@ -10,7 +10,7 @@ use silo::cluster_query::ClusterQueryEngine;
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::settings::{AppConfig, Backend, DatabaseTemplate};
-use silo::webui::{create_router, AppState};
+use silo::webui::{AppState, create_router};
 use std::sync::Arc;
 use tower::ServiceExt;
 

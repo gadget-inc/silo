@@ -10,7 +10,7 @@ use crate::job_attempt::{AttemptStatus, JobAttempt};
 use crate::job_store_shard::helpers::now_epoch_ms;
 use crate::job_store_shard::{DequeueResult, JobStoreShard, JobStoreShardError};
 use crate::keys::{attempt_key, job_info_key, leased_task_key};
-use crate::task::{LeaseRecord, LeasedRefreshTask, LeasedTask, Task, DEFAULT_LEASE_MS};
+use crate::task::{DEFAULT_LEASE_MS, LeaseRecord, LeasedRefreshTask, LeasedTask, Task};
 use crate::task_broker::BrokerTask;
 
 impl JobStoreShard {
@@ -56,7 +56,10 @@ impl JobStoreShard {
             }
 
             // [SILO-DEQ-1] Claim from the broker buffer for the specified task_group
-            let claimed: Vec<BrokerTask> = self.broker.claim_ready_or_nudge(task_group, remaining).await;
+            let claimed: Vec<BrokerTask> = self
+                .broker
+                .claim_ready_or_nudge(task_group, remaining)
+                .await;
 
             if claimed.is_empty() {
                 break;
@@ -442,11 +445,7 @@ impl JobStoreShard {
                     ack_keys.push(entry.key.clone());
 
                     // Track for DST event emission after commit
-                    leased_tasks_for_dst.push((
-                        tenant.clone(),
-                        job_id.clone(),
-                        task_id.clone(),
-                    ));
+                    leased_tasks_for_dst.push((tenant.clone(), job_id.clone(), task_id.clone()));
                 } else {
                     // If job missing, delete task key to clean up
                     batch.delete(entry.key.as_bytes());
@@ -461,7 +460,8 @@ impl JobStoreShard {
                     self.concurrency.rollback_grant(tenant, queue, task_id);
                 }
                 // Rollback all release-and-grant operations
-                self.concurrency.rollback_release_grants(&release_grants_to_rollback);
+                self.concurrency
+                    .rollback_release_grants(&release_grants_to_rollback);
                 // Put back all claimed entries since we didn't lease them durably
                 self.broker.requeue(claimed);
                 return Err(JobStoreShardError::Slate(e));
@@ -593,10 +593,10 @@ impl JobStoreShard {
                 Some(v) => v,
                 None => continue,
             };
-            if let Ok(ts) = ts_part.parse::<u64>() {
-                if ts > now_ms as u64 {
-                    continue;
-                }
+            if let Ok(ts) = ts_part.parse::<u64>()
+                && ts > now_ms as u64
+            {
+                continue;
             }
 
             let task = match decode_task(&kv.value) {

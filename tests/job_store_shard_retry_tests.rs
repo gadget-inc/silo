@@ -1,10 +1,10 @@
 mod test_helpers;
 
-use silo::codec::{decode_lease, decode_task, encode_lease};
 use rkyv::Archive;
+use silo::codec::{decode_lease, decode_task, encode_lease};
 use silo::job_attempt::{AttemptOutcome, AttemptStatus};
 use silo::job_store_shard::JobStoreShardError;
-use silo::retry::{next_retry_time_ms, RetryPolicy};
+use silo::retry::{RetryPolicy, next_retry_time_ms};
 use silo::task::{LeaseRecord, Task};
 
 use test_helpers::*;
@@ -19,11 +19,25 @@ async fn reporting_attempt_outcome_updates_attempt_and_deletes_lease() {
         let now_ms = now_ms();
 
         let job_id = shard
-            .enqueue("-", None, priority, now_ms, None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                priority,
+                now_ms,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         assert_eq!(tasks.len(), 1);
         let task_id = tasks[0].attempt().task_id().to_string();
 
@@ -87,12 +101,16 @@ async fn error_with_no_retries_does_not_enqueue_next_attempt() {
                 payload,
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue");
 
-        let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("w", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
 
         shard
@@ -139,13 +157,17 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
                 payload,
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue");
 
         // Run attempt 1 and error
-        let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("w", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         let t1 = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
@@ -178,7 +200,11 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
         assert_eq!(attempt, 2);
 
         // Dequeue attempt 2 and error again
-        let tasks2 = shard.dequeue("w", "default", 1).await.expect("dequeue2").tasks;
+        let tasks2 = shard
+            .dequeue("w", "default", 1)
+            .await
+            .expect("dequeue2")
+            .tasks;
         let t2 = tasks2[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
@@ -211,7 +237,11 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
         assert_eq!(attempt3, 3);
 
         // Dequeue attempt 3 and error again — but no further tasks since retries exhausted
-        let tasks3 = shard.dequeue("w", "default", 1).await.expect("dequeue3").tasks;
+        let tasks3 = shard
+            .dequeue("w", "default", 1)
+            .await
+            .expect("dequeue3")
+            .tasks;
         let t3 = tasks3[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
@@ -238,11 +268,25 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_success() {
         let now_ms = now_ms();
 
         let job_id = shard
-            .enqueue("-", None, priority, now_ms, None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                priority,
+                now_ms,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         assert_eq!(tasks.len(), 1);
         let task_id = tasks[0].attempt().task_id().to_string();
 
@@ -308,11 +352,25 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_error() {
         let now_ms = now_ms();
 
         let job_id = shard
-            .enqueue("-", None, priority, now_ms, None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                priority,
+                now_ms,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         assert_eq!(tasks.len(), 1);
         let task_id = tasks[0].attempt().task_id().to_string();
 
@@ -390,7 +448,11 @@ async fn retry_count_one_boundary_enqueues_attempt2_then_stops_on_second_error()
         .expect("enqueue");
 
     // Attempt 1 fails -> attempt 2 should be enqueued
-    let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue1").tasks;
+    let tasks = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue1")
+        .tasks;
     let t1 = tasks[0].attempt().task_id().to_string();
     shard
         .report_attempt_outcome(
@@ -421,7 +483,11 @@ async fn retry_count_one_boundary_enqueues_attempt2_then_stops_on_second_error()
     assert_eq!(attempt2, 2);
 
     // Run attempt 2 and fail -> no attempt 3
-    let tasks2 = shard.dequeue("w", "default", 1).await.expect("dequeue2").tasks;
+    let tasks2 = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue2")
+        .tasks;
     let t2 = tasks2[0].attempt().task_id().to_string();
     shard
         .report_attempt_outcome(
@@ -473,12 +539,16 @@ async fn next_retry_time_matches_scheduled_time_smoke() {
                 payload.clone(),
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue");
 
-        let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("w", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         let t1 = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
@@ -537,12 +607,16 @@ async fn duplicate_reporting_error_then_error_is_rejected_and_no_extra_tasks() {
                 payload,
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue");
 
-        let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("w", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         let t1 = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
@@ -585,11 +659,25 @@ async fn duplicate_reporting_error_then_success_is_rejected_and_state_persists()
         let priority = 10u8;
         let now = now_ms();
         let job_id = shard
-            .enqueue("-", None, priority, now, None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                priority,
+                now,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         let t1 = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
@@ -651,12 +739,16 @@ async fn attempt_records_exist_across_retries_and_task_ids_distinct() {
                 payload,
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue");
 
-        let tasks1 = shard.dequeue("w", "default", 1).await.expect("dequeue1").tasks;
+        let tasks1 = shard
+            .dequeue("w", "default", 1)
+            .await
+            .expect("dequeue1")
+            .tasks;
         let t1 = tasks1[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
@@ -671,7 +763,11 @@ async fn attempt_records_exist_across_retries_and_task_ids_distinct() {
         let (_k2, _v2) = first_kv_with_prefix(shard.db(), "tasks/")
             .await
             .expect("task2");
-        let tasks2 = shard.dequeue("w", "default", 1).await.expect("dequeue2").tasks;
+        let tasks2 = shard
+            .dequeue("w", "default", 1)
+            .await
+            .expect("dequeue2")
+            .tasks;
         let t2 = tasks2[0].attempt().task_id().to_string();
         assert_ne!(t1, t2, "task ids should be distinct across attempts");
         shard
@@ -714,16 +810,27 @@ async fn outcome_payload_edge_cases_empty_vectors_round_trip() {
         let priority = 10u8;
         let now = now_ms();
         let job_id = shard
-            .enqueue("-", None, priority, now, None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                priority,
+                now,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
-        let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("w", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
-            .report_attempt_outcome(
-                &task_id,
-                AttemptOutcome::Success { result: Vec::new() },
-            )
+            .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: Vec::new() })
             .await
             .expect("report ok");
         let a1 = shard
@@ -749,11 +856,15 @@ async fn outcome_payload_edge_cases_empty_vectors_round_trip() {
                 test_helpers::msgpack_payload(&serde_json::json!({"k": "v2"})),
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue2");
-        let tasks2 = shard.dequeue("w", "default", 1).await.expect("dequeue2").tasks;
+        let tasks2 = shard
+            .dequeue("w", "default", 1)
+            .await
+            .expect("dequeue2")
+            .tasks;
         let task2 = tasks2[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
@@ -787,10 +898,24 @@ async fn large_outcome_payloads_round_trip() {
         let priority = 10u8;
         let now = now_ms();
         let job_id = shard
-            .enqueue("-", None, priority, now, None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                priority,
+                now,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
-        let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("w", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         let big_ok = vec![1u8; 2_000_000];
         shard
@@ -824,11 +949,15 @@ async fn large_outcome_payloads_round_trip() {
                 test_helpers::msgpack_payload(&serde_json::json!({"k": "v2"})),
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue2");
-        let tasks2 = shard.dequeue("w", "default", 1).await.expect("dequeue2").tasks;
+        let tasks2 = shard
+            .dequeue("w", "default", 1)
+            .await
+            .expect("dequeue2")
+            .tasks;
         let task2 = tasks2[0].attempt().task_id().to_string();
         let big_err = vec![2u8; 2_000_000];
         shard
@@ -869,11 +998,25 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         backoff_factor: 1.0,
     };
     let job_id = shard
-        .enqueue("-", None, 10u8, now, Some(policy), payload, vec![], None, "default")
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            Some(policy),
+            payload,
+            vec![],
+            None,
+            "default",
+        )
         .await
         .expect("enqueue");
 
-    let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
+    let tasks = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
     let _leased_task_id = tasks[0].attempt().task_id().to_string();
 
     // Find the lease and rewrite expiry to the past
@@ -889,7 +1032,8 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
             tenant,
             job_id,
             attempt_number,
-            held_queues: _, ..
+            held_queues: _,
+            ..
         } => Task::RunAttempt {
             id: id.as_str().to_string(),
             tenant: tenant.as_str().to_string(),
@@ -959,4 +1103,3 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
     };
     assert_eq!(attempt2, 2);
 }
-

@@ -1,7 +1,7 @@
 mod test_helpers;
 
-use silo::codec::{decode_lease, encode_lease};
 use rkyv::Archive;
+use silo::codec::{decode_lease, encode_lease};
 use silo::job::JobStatusKind;
 use silo::job_attempt::{AttemptOutcome, AttemptStatus};
 use silo::job_store_shard::JobStoreShardError;
@@ -19,7 +19,17 @@ async fn cancel_scheduled_job_sets_cancelled_and_removes_task() {
         let now = now_ms();
 
         let job_id = shard
-            .enqueue("-", None, priority, now, None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                priority,
+                now,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
@@ -64,7 +74,11 @@ async fn cancel_scheduled_job_sets_cancelled_and_removes_task() {
         );
 
         // Dequeue should skip the cancelled task and clean it up
-        let dequeued = shard.dequeue("w1", "default", 10).await.expect("dequeue").tasks;
+        let dequeued = shard
+            .dequeue("w1", "default", 10)
+            .await
+            .expect("dequeue")
+            .tasks;
         assert!(
             dequeued.is_empty(),
             "dequeue should return empty for cancelled job"
@@ -92,12 +106,26 @@ async fn cancel_running_job_sets_flag_status_stays_running() {
         let now = now_ms();
 
         let job_id = shard
-            .enqueue("-", None, priority, now, None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                priority,
+                now,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
         // Dequeue to make it Running
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         assert_eq!(tasks.len(), 1);
 
         // Verify job is Running
@@ -146,12 +174,26 @@ async fn heartbeat_returns_cancelled_flag() {
         let now = now_ms();
 
         let job_id = shard
-            .enqueue("-", None, priority, now, None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                priority,
+                now,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
         // Dequeue
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
 
         // First heartbeat - not cancelled
@@ -192,12 +234,26 @@ async fn worker_reports_cancelled_outcome() {
         let now = now_ms();
 
         let job_id = shard
-            .enqueue("-", None, priority, now, None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                priority,
+                now,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
         // Dequeue
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
 
         // Cancel the job
@@ -248,7 +304,11 @@ async fn reap_expired_lease_cancelled_job_sets_cancelled_status() {
             .await
             .expect("enqueue");
 
-        let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("w", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         let _leased_task_id = tasks[0].attempt().task_id().to_string();
 
         // Cancel the job while it's running
@@ -267,7 +327,8 @@ async fn reap_expired_lease_cancelled_job_sets_cancelled_status() {
                 tenant,
                 job_id,
                 attempt_number,
-                held_queues: _, ..
+                held_queues: _,
+                ..
             } => Task::RunAttempt {
                 id: id.as_str().to_string(),
                 tenant: tenant.as_str().to_string(),
@@ -337,7 +398,17 @@ async fn cancel_already_cancelled_job_returns_error() {
         let now = now_ms();
 
         let job_id = shard
-            .enqueue("-", None, priority, now, None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                priority,
+                now,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
@@ -369,12 +440,26 @@ async fn cancel_succeeded_job_returns_error() {
         let now = now_ms();
 
         let job_id = shard
-            .enqueue("-", None, priority, now, None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                priority,
+                now,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
         // Dequeue and complete successfully
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: vec![] })
@@ -418,12 +503,26 @@ async fn cancel_failed_job_returns_error() {
 
         // No retry policy - will fail permanently
         let job_id = shard
-            .enqueue("-", None, priority, now, None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                priority,
+                now,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
         // Dequeue and fail
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
@@ -475,12 +574,26 @@ async fn cancellation_preserved_through_stale_dequeue() {
         let now = now_ms();
 
         let job_id = shard
-            .enqueue("-", None, priority, now, None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                priority,
+                now,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
         // Dequeue to make job Running
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].job().id(), job_id);
 
@@ -496,10 +609,12 @@ async fn cancellation_preserved_through_stale_dequeue() {
         shard.cancel_job("-", &job_id).await.expect("cancel_job");
 
         // Key property: Cancellation flag is set independently of status
-        assert!(shard
-            .is_job_cancelled("-", &job_id)
-            .await
-            .expect("is_cancelled"));
+        assert!(
+            shard
+                .is_job_cancelled("-", &job_id)
+                .await
+                .expect("is_cancelled")
+        );
 
         // Status still shows Running (per Alloy spec: cancellation is orthogonal to status)
         let status_after = shard
@@ -565,7 +680,17 @@ async fn delete_cancelled_job_succeeds() {
 
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
-            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
@@ -614,7 +739,7 @@ async fn cancel_scheduled_job_with_concurrency_removes_request() {
                     max_concurrency: 1,
                 })],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue1");
@@ -635,7 +760,7 @@ async fn cancel_scheduled_job_with_concurrency_removes_request() {
                     max_concurrency: 1,
                 })],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue2");
@@ -688,7 +813,7 @@ async fn dequeue_skips_cancelled_run_attempt_tasks() {
                 test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue j1");
@@ -703,7 +828,7 @@ async fn dequeue_skips_cancelled_run_attempt_tasks() {
                 test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue j2");
@@ -712,7 +837,11 @@ async fn dequeue_skips_cancelled_run_attempt_tasks() {
         shard.cancel_job("-", &j1).await.expect("cancel j1");
 
         // Dequeue should skip j1 and return j2
-        let tasks = shard.dequeue("w1", "default", 10).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("w1", "default", 10)
+            .await
+            .expect("dequeue")
+            .tasks;
         assert_eq!(tasks.len(), 1, "should return one task");
         assert_eq!(
             tasks[0].job().id(),
@@ -758,7 +887,7 @@ async fn dequeue_skips_cancelled_request_ticket_tasks() {
                     max_concurrency: 1,
                 })],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue j1");
@@ -781,7 +910,7 @@ async fn dequeue_skips_cancelled_request_ticket_tasks() {
                     max_concurrency: 1,
                 })],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue j2");
@@ -799,7 +928,7 @@ async fn dequeue_skips_cancelled_request_ticket_tasks() {
                     max_concurrency: 1,
                 })],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue j3");
@@ -818,7 +947,11 @@ async fn dequeue_skips_cancelled_request_ticket_tasks() {
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         // Dequeue should skip j2's RequestTicket and process j3's
-        let tasks = shard.dequeue("w2", "default", 10).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("w2", "default", 10)
+            .await
+            .expect("dequeue")
+            .tasks;
 
         // We should get j3, not j2
         if !tasks.is_empty() {
@@ -851,7 +984,7 @@ async fn grant_on_release_skips_multiple_cancelled_requests() {
                     max_concurrency: 1,
                 })],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue j1");
@@ -873,7 +1006,7 @@ async fn grant_on_release_skips_multiple_cancelled_requests() {
                     max_concurrency: 1,
                 })],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue j2");
@@ -891,7 +1024,7 @@ async fn grant_on_release_skips_multiple_cancelled_requests() {
                     max_concurrency: 1,
                 })],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue j3");
@@ -909,7 +1042,7 @@ async fn grant_on_release_skips_multiple_cancelled_requests() {
                     max_concurrency: 1,
                 })],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue j4");
@@ -929,7 +1062,11 @@ async fn grant_on_release_skips_multiple_cancelled_requests() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Dequeue should return j4
-        let tasks = shard.dequeue("w2", "default", 10).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("w2", "default", 10)
+            .await
+            .expect("dequeue")
+            .tasks;
         assert_eq!(tasks.len(), 1, "should return one task");
         assert_eq!(tasks[0].job().id(), j4, "should return j4");
 
@@ -972,7 +1109,7 @@ async fn dequeue_works_normally_without_cancellation() {
                     test_helpers::msgpack_payload(&serde_json::json!({"j": i})),
                     vec![],
                     None,
-            "default",
+                    "default",
                 )
                 .await
                 .expect("enqueue");
@@ -980,7 +1117,11 @@ async fn dequeue_works_normally_without_cancellation() {
         }
 
         // Dequeue all - should work normally
-        let tasks = shard.dequeue("w1", "default", 10).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("w1", "default", 10)
+            .await
+            .expect("dequeue")
+            .tasks;
         assert_eq!(tasks.len(), 5, "should return all 5 tasks");
 
         // Verify order matches enqueue order (by start time)
@@ -1020,7 +1161,7 @@ async fn cancelled_requests_are_cleaned_up_on_grant() {
                     max_concurrency: 1,
                 })],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue j1");
@@ -1042,7 +1183,7 @@ async fn cancelled_requests_are_cleaned_up_on_grant() {
                     max_concurrency: 1,
                 })],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue j2");

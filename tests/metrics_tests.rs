@@ -1,10 +1,10 @@
 //! Tests for the Prometheus metrics endpoint.
 
 use axum::{
+    Router,
     body::Body,
     http::{Request, StatusCode},
     routing::get,
-    Router,
 };
 use http_body_util::BodyExt;
 use silo::metrics;
@@ -62,10 +62,7 @@ async fn test_metrics_endpoint_returns_prometheus_format() {
         .get("content-type")
         .expect("content-type header");
     assert!(
-        content_type
-            .to_str()
-            .unwrap()
-            .contains("text/plain"),
+        content_type.to_str().unwrap().contains("text/plain"),
         "content-type should be text/plain"
     );
 

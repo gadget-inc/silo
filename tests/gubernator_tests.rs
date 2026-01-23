@@ -1,5 +1,6 @@
 use silo::gubernator::{
-    GubernatorConfig, GubernatorClient, GubernatorError, MockGubernatorClient, NullGubernatorClient, RateLimitClient,
+    GubernatorClient, GubernatorConfig, GubernatorError, MockGubernatorClient,
+    NullGubernatorClient, RateLimitClient,
 };
 use silo::pb::gubernator::Algorithm;
 
@@ -113,14 +114,30 @@ async fn test_mock_reset_key() {
     // Use some of the quota for user1
     for _ in 0..5 {
         client
-            .check_rate_limit("test-limit", "user1", 1, 10, 1000, Algorithm::TokenBucket, 0)
+            .check_rate_limit(
+                "test-limit",
+                "user1",
+                1,
+                10,
+                1000,
+                Algorithm::TokenBucket,
+                0,
+            )
             .await
             .unwrap();
     }
 
     // Verify user1 has used some quota
     let result = client
-        .check_rate_limit("test-limit", "user1", 1, 10, 1000, Algorithm::TokenBucket, 0)
+        .check_rate_limit(
+            "test-limit",
+            "user1",
+            1,
+            10,
+            1000,
+            Algorithm::TokenBucket,
+            0,
+        )
         .await
         .unwrap();
     assert_eq!(result.remaining, 4); // 10 - 6 = 4
@@ -130,7 +147,15 @@ async fn test_mock_reset_key() {
 
     // user1 should have full quota again
     let result = client
-        .check_rate_limit("test-limit", "user1", 1, 10, 1000, Algorithm::TokenBucket, 0)
+        .check_rate_limit(
+            "test-limit",
+            "user1",
+            1,
+            10,
+            1000,
+            Algorithm::TokenBucket,
+            0,
+        )
         .await
         .unwrap();
     assert_eq!(result.remaining, 9); // Full quota minus 1 hit
@@ -143,11 +168,27 @@ async fn test_mock_reset_key_preserves_other_keys() {
     // Use quota for both user1 and user2
     for _ in 0..5 {
         client
-            .check_rate_limit("test-limit", "user1", 1, 10, 1000, Algorithm::TokenBucket, 0)
+            .check_rate_limit(
+                "test-limit",
+                "user1",
+                1,
+                10,
+                1000,
+                Algorithm::TokenBucket,
+                0,
+            )
             .await
             .unwrap();
         client
-            .check_rate_limit("test-limit", "user2", 1, 10, 1000, Algorithm::TokenBucket, 0)
+            .check_rate_limit(
+                "test-limit",
+                "user2",
+                1,
+                10,
+                1000,
+                Algorithm::TokenBucket,
+                0,
+            )
             .await
             .unwrap();
     }
@@ -157,14 +198,30 @@ async fn test_mock_reset_key_preserves_other_keys() {
 
     // user1 should have full quota
     let result = client
-        .check_rate_limit("test-limit", "user1", 1, 10, 1000, Algorithm::TokenBucket, 0)
+        .check_rate_limit(
+            "test-limit",
+            "user1",
+            1,
+            10,
+            1000,
+            Algorithm::TokenBucket,
+            0,
+        )
         .await
         .unwrap();
     assert_eq!(result.remaining, 9);
 
     // user2 should still have reduced quota
     let result = client
-        .check_rate_limit("test-limit", "user2", 1, 10, 1000, Algorithm::TokenBucket, 0)
+        .check_rate_limit(
+            "test-limit",
+            "user2",
+            1,
+            10,
+            1000,
+            Algorithm::TokenBucket,
+            0,
+        )
         .await
         .unwrap();
     assert_eq!(result.remaining, 4); // 10 - 6 = 4

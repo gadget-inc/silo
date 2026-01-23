@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info};
 
-use silo::coordination::{create_coordinator, Coordinator};
+use silo::coordination::{Coordinator, create_coordinator};
 use silo::factory::ShardFactory;
 use silo::gubernator::{GubernatorClient, NullGubernatorClient, RateLimitClient};
 use silo::metrics::{self, Metrics};
@@ -187,7 +187,10 @@ async fn main() -> anyhow::Result<()> {
         let metrics_shutdown = shutdown_tx.subscribe();
         let metrics_for_server = m.clone();
         Some(tokio::spawn(async move {
-            if let Err(e) = metrics::run_metrics_server(metrics_addr, metrics_for_server, metrics_shutdown).await {
+            if let Err(e) =
+                metrics::run_metrics_server(metrics_addr, metrics_for_server, metrics_shutdown)
+                    .await
+            {
                 error!(error = %e, "metrics server error");
             }
         }))
@@ -219,7 +222,7 @@ async fn main() -> anyhow::Result<()> {
 
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{signal, SignalKind};
+            use tokio::signal::unix::{SignalKind, signal};
             let mut sigterm =
                 signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
             tokio::select! {

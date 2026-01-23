@@ -168,46 +168,43 @@ impl JobStoreShard {
                     let task_group = view.task_group();
                     let limits = view.limits();
                     let failures_so_far = attempt_number;
-                    if let Some(policy_rt) = view.retry_policy() {
-                        if let Some(next_time) =
+                    if let Some(policy_rt) = view.retry_policy()
+                        && let Some(next_time) =
                             crate::retry::next_retry_time_ms(now_ms, failures_so_far, &policy_rt)
-                        {
-                            // [SILO-RETRY-5] Enqueue new task to DB queue for retry
-                            // [SILO-RETRY-5-CONC] Retry task starts with no held queues, so it must
-                            // re-acquire any concurrency tickets. Combined with [SILO-RETRY-REL] releasing
-                            // the current task's tickets below, this allows other jobs to run during
-                            // the retry backoff period.
-                            let next_attempt_number = attempt_number + 1;
-                            let next_task_id = Uuid::new_v4().to_string();
+                    {
+                        // [SILO-RETRY-5] Enqueue new task to DB queue for retry
+                        // [SILO-RETRY-5-CONC] Retry task starts with no held queues, so it must
+                        // re-acquire any concurrency tickets. Combined with [SILO-RETRY-REL] releasing
+                        // the current task's tickets below, this allows other jobs to run during
+                        // the retry backoff period.
+                        let next_attempt_number = attempt_number + 1;
+                        let next_task_id = Uuid::new_v4().to_string();
 
-                            // Track any immediate grants for rollback if DB write fails
-                            retry_grants = self
-                                .enqueue_limit_task_at_index(
-                                    &mut batch,
-                                    &tenant,
-                                    &next_task_id,
-                                    &job_id,
-                                    next_attempt_number,
-                                    0, // start from first limit
-                                    &limits,
-                                    priority,
-                                    next_time,
-                                    now_ms,
-                                    Vec::new(), // no held queues - must re-acquire
-                                    task_group,
-                                )
-                                .await?;
-
-                            // [SILO-RETRY-3] Set job status to Scheduled with next attempt time
-                            let job_status = JobStatus::scheduled(now_ms, next_time);
-                            self.set_job_status_with_index(
-                                &mut batch, &tenant, &job_id, job_status,
+                        // Track any immediate grants for rollback if DB write fails
+                        retry_grants = self
+                            .enqueue_limit_task_at_index(
+                                &mut batch,
+                                &tenant,
+                                &next_task_id,
+                                &job_id,
+                                next_attempt_number,
+                                0, // start from first limit
+                                &limits,
+                                priority,
+                                next_time,
+                                now_ms,
+                                Vec::new(), // no held queues - must re-acquire
+                                task_group,
                             )
                             .await?;
-                            scheduled_followup = true;
-                            followup_next_time = Some(next_time);
-                            new_job_status_for_dst = Some("Scheduled".to_string());
-                        }
+
+                        // [SILO-RETRY-3] Set job status to Scheduled with next attempt time
+                        let job_status = JobStatus::scheduled(now_ms, next_time);
+                        self.set_job_status_with_index(&mut batch, &tenant, &job_id, job_status)
+                            .await?;
+                        scheduled_followup = true;
+                        followup_next_time = Some(next_time);
+                        new_job_status_for_dst = Some("Scheduled".to_string());
                     }
                     // [SILO-FAIL-3] If no follow-up scheduled, mark job as failed (pure write)
                     if !scheduled_followup {
@@ -286,10 +283,10 @@ impl JobStoreShard {
             self.broker.wakeup();
         }
         // If we scheduled a follow-up that is ready now, wake the scanner
-        if let Some(nt) = followup_next_time {
-            if nt <= now_epoch_ms() {
-                self.broker.wakeup();
-            }
+        if let Some(nt) = followup_next_time
+            && nt <= now_epoch_ms()
+        {
+            self.broker.wakeup();
         }
         if let Some(err) = job_missing_error {
             return Err(err);

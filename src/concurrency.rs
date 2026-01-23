@@ -307,7 +307,10 @@ impl ConcurrencyManager {
 
         // [SILO-ENQ-CONC-1] Atomically check and reserve if queue has capacity
         // This prevents TOCTOU races by reserving the slot before writing to DB
-        if self.counts.try_reserve(tenant, queue, task_id, max_allowed, job_id) {
+        if self
+            .counts
+            .try_reserve(tenant, queue, task_id, max_allowed, job_id)
+        {
             // Grant immediately: [SILO-ENQ-CONC-2] create holder, [SILO-ENQ-CONC-3] create task
             // Note: in-memory slot is already reserved by try_reserve
             append_grant_edits(
@@ -409,7 +412,10 @@ impl ConcurrencyManager {
         }
 
         // Atomically check and reserve the slot to prevent TOCTOU races
-        if !self.counts.try_reserve(tenant, queue, request_id, max_allowed, job_id) {
+        if !self
+            .counts
+            .try_reserve(tenant, queue, request_id, max_allowed, job_id)
+        {
             return Ok(RequestTicketTaskOutcome::Requested);
         }
 
@@ -501,7 +507,8 @@ impl ConcurrencyManager {
                         }
 
                         let req_key_str = String::from_utf8_lossy(&kv.key).to_string();
-                        let request_id = req_key_str.split('/').next_back().unwrap_or("").to_string();
+                        let request_id =
+                            req_key_str.split('/').next_back().unwrap_or("").to_string();
 
                         if *start_time_ms > now_ms {
                             // Not ready yet; leave request for later and stop searching
@@ -530,7 +537,14 @@ impl ConcurrencyManager {
                         };
                         let tval = encode_task(&task)?;
                         batch.put(
-                            task_key(task_group_str, *start_time_ms, *priority, job_id_str, *attempt_number).as_bytes(),
+                            task_key(
+                                task_group_str,
+                                *start_time_ms,
+                                *priority,
+                                job_id_str,
+                                *attempt_number,
+                            )
+                            .as_bytes(),
                             &tval,
                         );
                         batch.delete(&kv.key);
@@ -549,7 +563,13 @@ impl ConcurrencyManager {
             if let Some(ref new_task_id) = granted_task_id {
                 // Release old + grant new in one atomic operation
                 let job_id = granted_job_id.as_deref().unwrap_or("");
-                self.counts.atomic_release_and_reserve(tenant, queue, finished_task_id, new_task_id, job_id);
+                self.counts.atomic_release_and_reserve(
+                    tenant,
+                    queue,
+                    finished_task_id,
+                    new_task_id,
+                    job_id,
+                );
             } else {
                 // Just release, no grant
                 self.counts.atomic_release(tenant, queue, finished_task_id);
@@ -570,9 +590,15 @@ impl ConcurrencyManager {
     pub fn rollback_release_grants(&self, rollbacks: &[ReleaseGrantRollback]) {
         for rb in rollbacks {
             if let Some(ref granted) = rb.granted_task_id {
-                self.counts.rollback_release_and_reserve(&rb.tenant, &rb.queue, &rb.released_task_id, granted);
+                self.counts.rollback_release_and_reserve(
+                    &rb.tenant,
+                    &rb.queue,
+                    &rb.released_task_id,
+                    granted,
+                );
             } else {
-                self.counts.rollback_release(&rb.tenant, &rb.queue, &rb.released_task_id);
+                self.counts
+                    .rollback_release(&rb.tenant, &rb.queue, &rb.released_task_id);
             }
         }
     }
@@ -651,4 +677,3 @@ fn append_request_edits(
     batch.put(req_key.as_bytes(), &action_val);
     Ok(())
 }
-

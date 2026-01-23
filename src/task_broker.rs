@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 use std::str;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
 
@@ -119,10 +119,10 @@ impl TaskBroker {
                 Some(x) => x,
                 None => continue,
             };
-            if let Ok(ts_val) = ts_part.parse::<u64>() {
-                if ts_val > now_ms as u64 {
-                    continue;
-                }
+            if let Ok(ts_val) = ts_part.parse::<u64>()
+                && ts_val > now_ms as u64
+            {
+                continue;
             }
 
             // [SILO-SCAN-3] Skip inflight tasks

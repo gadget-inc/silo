@@ -7,8 +7,8 @@ mod test_helpers;
 
 use datafusion::arrow::array::{Int64Array, StringArray};
 use silo::cluster_query::ClusterQueryEngine;
-use silo::coordination::etcd::EtcdCoordinator;
 use silo::coordination::Coordinator;
+use silo::coordination::etcd::EtcdCoordinator;
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::pb::silo_client::SiloClient;
@@ -73,7 +73,7 @@ async fn enqueue_job(
         limits: vec![],
         tenant: tenant.map(|s| s.to_string()),
         metadata: HashMap::new(),
-            task_group: "default".to_string(),
+        task_group: "default".to_string(),
     };
     client
         .enqueue(request)

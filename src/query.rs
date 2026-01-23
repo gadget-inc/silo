@@ -1,14 +1,14 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, ArrayRef, Int64Array, StringArray, UInt32Array, UInt8Array};
+use datafusion::arrow::array::{Array, ArrayRef, Int64Array, StringArray, UInt8Array, UInt32Array};
 use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session as CatalogSession;
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DfResult};
-use datafusion::execution::context::SessionContext;
 use datafusion::execution::TaskContext;
+use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -20,8 +20,8 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::DataFrame;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 
 const DEFAULT_SCAN_LIMIT: usize = 10_000;
 
@@ -38,11 +38,11 @@ pub async fn explain_dataframe(ctx: &SessionContext, query: &str) -> DfResult<St
     for batch in batches {
         for row in 0..batch.num_rows() {
             for col in 0..batch.num_columns() {
-                if let Some(arr) = batch.column(col).as_any().downcast_ref::<StringArray>() {
-                    if !arr.is_null(row) {
-                        output.push_str(arr.value(row));
-                        output.push('\n');
-                    }
+                if let Some(arr) = batch.column(col).as_any().downcast_ref::<StringArray>()
+                    && !arr.is_null(row)
+                {
+                    output.push_str(arr.value(row));
+                    output.push('\n');
                 }
             }
         }
@@ -881,10 +881,10 @@ impl Scan for QueuesScanner {
                         if parts.len() >= 4 && parts[0] == "holders" {
                             let tenant = crate::keys::decode_tenant(parts[1]);
                             // Filter by queue if specified
-                            if let Some(ref q) = queue_filter {
-                                if parts[2] != q.as_str() {
-                                    continue;
-                                }
+                            if let Some(ref q) = queue_filter
+                                && parts[2] != q.as_str()
+                            {
+                                continue;
                             }
                             let queue_name = parts[2].to_string();
                             let task_id = parts[3].to_string();
@@ -930,10 +930,10 @@ impl Scan for QueuesScanner {
                         if parts.len() >= 6 && parts[0] == "requests" {
                             let tenant = crate::keys::decode_tenant(parts[1]);
                             // Filter by queue if specified
-                            if let Some(ref q) = queue_filter {
-                                if parts[2] != q.as_str() {
-                                    continue;
-                                }
+                            if let Some(ref q) = queue_filter
+                                && parts[2] != q.as_str()
+                            {
+                                continue;
                             }
                             let queue_name = parts[2].to_string();
                             let start_time_ms: i64 = parts[3].parse().unwrap_or(0);
@@ -1133,20 +1133,18 @@ fn parse_metadata_eq_filter(expr: &Expr) -> Option<(String, String)> {
             };
 
             // Try left is indexed metadata, right is literal
-            if let Some(key) = extract_metadata_key_from_expr(left.as_ref()) {
-                if let Expr::Literal(s, _) = right.as_ref() {
-                    if let Some(val) = lit_str(s) {
-                        return Some((key, val));
-                    }
-                }
+            if let Some(key) = extract_metadata_key_from_expr(left.as_ref())
+                && let Expr::Literal(s, _) = right.as_ref()
+                && let Some(val) = lit_str(s)
+            {
+                return Some((key, val));
             }
             // Or right is indexed metadata, left is literal
-            if let Some(key) = extract_metadata_key_from_expr(right.as_ref()) {
-                if let Expr::Literal(s, _) = left.as_ref() {
-                    if let Some(val) = lit_str(s) {
-                        return Some((key, val));
-                    }
-                }
+            if let Some(key) = extract_metadata_key_from_expr(right.as_ref())
+                && let Expr::Literal(s, _) = left.as_ref()
+                && let Some(val) = lit_str(s)
+            {
+                return Some((key, val));
             }
             None
         }
@@ -1189,16 +1187,16 @@ fn extract_metadata_key_from_expr(expr: &Expr) -> Option<String> {
         // element_at(metadata, 'key')
         if func.func.name() == "element_at" && func.args.len() == 2 {
             // First arg should be Column("metadata")
-            if let Expr::Column(col) = &func.args[0] {
-                if col.name == "metadata" {
-                    // Second arg should be the literal key
-                    if let Expr::Literal(
-                        ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)),
-                        _,
-                    ) = &func.args[1]
-                    {
-                        return Some(v.clone());
-                    }
+            if let Expr::Column(col) = &func.args[0]
+                && col.name == "metadata"
+            {
+                // Second arg should be the literal key
+                if let Expr::Literal(
+                    ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)),
+                    _,
+                ) = &func.args[1]
+                {
+                    return Some(v.clone());
                 }
             }
         }
@@ -1272,7 +1270,7 @@ fn write_arrow_value_to_msgpack(
     row_idx: usize,
 ) -> Result<(), String> {
     use datafusion::arrow::array::{
-        BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int8Array,
+        BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
         LargeStringArray, TimestampMillisecondArray, UInt16Array, UInt64Array,
     };
 

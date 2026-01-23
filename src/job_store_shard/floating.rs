@@ -4,8 +4,8 @@ use slatedb::WriteBatch;
 use uuid::Uuid;
 
 use crate::codec::{
-    decode_floating_limit_state, decode_lease, encode_floating_limit_state, encode_task,
-    DecodedFloatingLimitState,
+    DecodedFloatingLimitState, decode_floating_limit_state, decode_lease,
+    encode_floating_limit_state, encode_task,
 };
 use crate::job::{FloatingConcurrencyLimit, FloatingLimitState};
 use crate::job_store_shard::helpers::now_epoch_ms;
@@ -160,7 +160,7 @@ impl JobStoreShard {
             _ => {
                 return Err(JobStoreShardError::Rkyv(
                     "task is not a RefreshFloatingLimit".to_string(),
-                ))
+                ));
             }
         };
 
@@ -248,7 +248,7 @@ impl JobStoreShard {
                 _ => {
                     return Err(JobStoreShardError::Rkyv(
                         "task is not a RefreshFloatingLimit".to_string(),
-                    ))
+                    ));
                 }
             };
 

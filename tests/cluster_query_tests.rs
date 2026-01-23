@@ -111,7 +111,7 @@ async fn cluster_query_single_shard_basic() {
                 test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue");
@@ -149,7 +149,7 @@ async fn cluster_query_single_shard_count() {
                 test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue");
@@ -191,7 +191,7 @@ async fn cluster_query_multi_shard_combines_results() {
                 test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue");
@@ -233,7 +233,7 @@ async fn cluster_query_shard_id_column() {
                 test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue");
@@ -289,7 +289,7 @@ async fn cluster_query_group_by_shard_id() {
                 test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue");
@@ -307,7 +307,7 @@ async fn cluster_query_group_by_shard_id() {
                 test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue");
@@ -392,7 +392,7 @@ async fn cluster_query_multi_shard_count_aggregates_correctly() {
                     test_helpers::msgpack_payload(&serde_json::json!({})),
                     vec![],
                     None,
-            "default",
+                    "default",
                 )
                 .await
                 .expect("enqueue");
@@ -432,7 +432,7 @@ async fn cluster_query_multi_shard_group_by() {
                 test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue");
@@ -479,7 +479,7 @@ async fn cluster_query_multi_shard_group_by() {
                 test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue");
@@ -540,7 +540,10 @@ async fn cluster_query_multi_shard_filter_pushdown() {
         .expect("enqueue");
 
     // Make one job running
-    shard0.dequeue("worker", "default", 1).await.expect("dequeue");
+    shard0
+        .dequeue("worker", "default", 1)
+        .await
+        .expect("dequeue");
 
     let engine = ClusterQueryEngine::new(factory.clone(), None, 2)
         .await
@@ -577,7 +580,7 @@ async fn cluster_query_multi_shard_empty_some_shards() {
                 test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue");
@@ -636,7 +639,7 @@ async fn cluster_query_multi_shard_limit() {
                     test_helpers::msgpack_payload(&serde_json::json!({})),
                     vec![],
                     None,
-            "default",
+                    "default",
                 )
                 .await
                 .expect("enqueue");
@@ -682,7 +685,10 @@ async fn cluster_query_queues_table_multi_shard() {
         )
         .await
         .expect("enqueue");
-    shard0.dequeue("worker", "default", 1).await.expect("dequeue");
+    shard0
+        .dequeue("worker", "default", 1)
+        .await
+        .expect("dequeue");
 
     let shard1 = factory.get("1").unwrap();
     shard1
@@ -702,7 +708,10 @@ async fn cluster_query_queues_table_multi_shard() {
         )
         .await
         .expect("enqueue");
-    shard1.dequeue("worker", "default", 1).await.expect("dequeue");
+    shard1
+        .dequeue("worker", "default", 1)
+        .await
+        .expect("dequeue");
 
     let engine = ClusterQueryEngine::new(factory.clone(), None, 2)
         .await
@@ -1291,7 +1300,7 @@ async fn cluster_query_count_no_tenant_filter() {
                 test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue");
@@ -1310,7 +1319,7 @@ async fn cluster_query_count_no_tenant_filter() {
                 test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue");

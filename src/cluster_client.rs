@@ -154,8 +154,7 @@ pub async fn create_silo_client(
 
     let mut last_error = None;
     for attempt in 0..config.max_retries {
-        let connect_result =
-            tokio::time::timeout(attempt_timeout, endpoint.connect()).await;
+        let connect_result = tokio::time::timeout(attempt_timeout, endpoint.connect()).await;
 
         match connect_result {
             Ok(Ok(channel)) => return Ok(SiloClient::new(channel)),

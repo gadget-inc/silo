@@ -36,7 +36,11 @@ async fn concurrency_immediate_grant_enqueues_task_and_writes_holder() {
         .expect("enqueue");
 
     // Task should be ready immediately
-    let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
+    let tasks = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
     assert_eq!(tasks.len(), 1);
     let t = &tasks[0];
     assert_eq!(t.job().id(), job_id);
@@ -211,7 +215,11 @@ async fn concurrency_tickets_are_tenant_scoped() {
         )
         .await
         .expect("enqueue A");
-    let tasks_a = shard.dequeue("wA", "default", 1).await.expect("deq A").tasks;
+    let tasks_a = shard
+        .dequeue("wA", "default", 1)
+        .await
+        .expect("deq A")
+        .tasks;
     assert_eq!(tasks_a.len(), 1);
 
     // Tenant B should be able to get its own slot independently
@@ -232,7 +240,11 @@ async fn concurrency_tickets_are_tenant_scoped() {
         )
         .await
         .expect("enqueue B");
-    let tasks_b = shard.dequeue("wB", "default", 1).await.expect("deq B").tasks;
+    let tasks_b = shard
+        .dequeue("wB", "default", 1)
+        .await
+        .expect("deq B")
+        .tasks;
     assert_eq!(
         tasks_b.len(),
         1,
@@ -329,7 +341,11 @@ async fn concurrency_no_overgrant_after_release() {
         )
         .await
         .expect("enqueue a");
-    let a_task = shard.dequeue("wa", "default", 1).await.expect("deq a").tasks;
+    let a_task = shard
+        .dequeue("wa", "default", 1)
+        .await
+        .expect("deq a")
+        .tasks;
     assert_eq!(a_task.len(), 1);
     let a_tid = a_task[0].attempt().task_id().to_string();
 
@@ -409,7 +425,7 @@ async fn stress_single_queue_no_double_grant() {
                     max_concurrency: 1,
                 })],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue");
@@ -417,7 +433,11 @@ async fn stress_single_queue_no_double_grant() {
 
     let mut processed = 0usize;
     loop {
-        let tasks = shard.dequeue("w-stress", "default", 1).await.expect("deq").tasks;
+        let tasks = shard
+            .dequeue("w-stress", "default", 1)
+            .await
+            .expect("deq")
+            .tasks;
         if tasks.is_empty() {
             if processed >= total {
                 break;
@@ -465,7 +485,11 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
         )
         .await
         .expect("enqueue1");
-    let tasks1 = shard.dequeue("w-hold", "default", 1).await.expect("deq1").tasks;
+    let tasks1 = shard
+        .dequeue("w-hold", "default", 1)
+        .await
+        .expect("deq1")
+        .tasks;
     assert_eq!(tasks1.len(), 1);
     let t1 = tasks1[0].attempt().task_id().to_string();
 
@@ -485,7 +509,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
                     max_concurrency: 1,
                 })],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue add");
@@ -524,11 +548,25 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         backoff_factor: 1.0,
     };
     let job_id = shard
-        .enqueue("-", None, 10u8, now, Some(policy), payload, vec![], None, "default")
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            Some(policy),
+            payload,
+            vec![],
+            None,
+            "default",
+        )
         .await
         .expect("enqueue");
 
-    let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
+    let tasks = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
     let _leased_task_id = tasks[0].attempt().task_id().to_string();
 
     // Find the lease and rewrite expiry to the past
@@ -544,7 +582,8 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
             tenant,
             job_id,
             attempt_number,
-            held_queues: _, ..
+            held_queues: _,
+            ..
         } => Task::RunAttempt {
             id: id.as_str().to_string(),
             tenant: tenant.as_str().to_string(),
@@ -628,7 +667,11 @@ async fn reap_ignores_unexpired_leases() {
         .await
         .expect("enqueue");
 
-    let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
+    let tasks = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
     let _task_id = tasks[0].attempt().task_id().to_string();
 
     // Do not mutate the lease; it should not be reaped
@@ -681,7 +724,7 @@ async fn concurrency_multiple_holders_max_greater_than_one() {
                     max_concurrency: 3,
                 })],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue");
@@ -726,7 +769,11 @@ async fn concurrency_multiple_holders_max_greater_than_one() {
     // Drain remaining
     let mut processed = 3;
     while processed < 5 {
-        let tasks = shard.dequeue("w2", "default", 5).await.expect("deq remaining").tasks;
+        let tasks = shard
+            .dequeue("w2", "default", 5)
+            .await
+            .expect("deq remaining")
+            .tasks;
         if tasks.is_empty() {
             tokio::task::yield_now().await;
             continue;
@@ -1132,7 +1179,8 @@ async fn concurrency_reap_expired_lease_releases_holder() {
             tenant,
             job_id,
             attempt_number,
-            held_queues, ..
+            held_queues,
+            ..
         } => Task::RunAttempt {
             id: id.as_str().to_string(),
             tenant: tenant.as_str().to_string(),

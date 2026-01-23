@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use silo::coordination::{etcd::EtcdConnection, Coordinator, EtcdCoordinator};
+use silo::coordination::{Coordinator, EtcdCoordinator, etcd::EtcdConnection};
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::settings::{Backend, DatabaseTemplate};
@@ -218,12 +218,18 @@ async fn adding_a_node_rebalances_shards() {
         .collect();
     let expected: HashSet<u32> = (0..num_shards).collect();
     assert_eq!(all, expected);
-    assert!(HashSet::<u32>::from_iter(s1.iter().copied())
-        .is_disjoint(&HashSet::from_iter(s2.iter().copied())));
-    assert!(HashSet::<u32>::from_iter(s1.iter().copied())
-        .is_disjoint(&HashSet::from_iter(s3.iter().copied())));
-    assert!(HashSet::<u32>::from_iter(s2.iter().copied())
-        .is_disjoint(&HashSet::from_iter(s3.iter().copied())));
+    assert!(
+        HashSet::<u32>::from_iter(s1.iter().copied())
+            .is_disjoint(&HashSet::from_iter(s2.iter().copied()))
+    );
+    assert!(
+        HashSet::<u32>::from_iter(s1.iter().copied())
+            .is_disjoint(&HashSet::from_iter(s3.iter().copied()))
+    );
+    assert!(
+        HashSet::<u32>::from_iter(s2.iter().copied())
+            .is_disjoint(&HashSet::from_iter(s3.iter().copied()))
+    );
 
     c1.shutdown().await.unwrap();
     c2.shutdown().await.unwrap();
@@ -291,8 +297,10 @@ async fn removing_a_node_rebalances_shards() {
     let all: HashSet<u32> = s1.iter().copied().chain(s2.iter().copied()).collect();
     let expected: HashSet<u32> = (0..num_shards).collect();
     assert_eq!(all, expected);
-    assert!(HashSet::<u32>::from_iter(s1.iter().copied())
-        .is_disjoint(&HashSet::from_iter(s2.iter().copied())));
+    assert!(
+        HashSet::<u32>::from_iter(s1.iter().copied())
+            .is_disjoint(&HashSet::from_iter(s2.iter().copied()))
+    );
 
     c1.shutdown().await.unwrap();
     c2.shutdown().await.unwrap();

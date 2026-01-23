@@ -96,7 +96,7 @@ async fn grpc_restart_cancelled_job() -> anyhow::Result<()> {
                 shard: Some(0),
                 worker_id: "worker-1".to_string(),
                 max_tasks: 1,
-            task_group: "default".to_string(),
+                task_group: "default".to_string(),
             })
             .await?
             .into_inner();
@@ -167,7 +167,7 @@ async fn grpc_restart_failed_job() -> anyhow::Result<()> {
                 shard: Some(0),
                 worker_id: "worker-1".to_string(),
                 max_tasks: 1,
-            task_group: "default".to_string(),
+                task_group: "default".to_string(),
             })
             .await?
             .into_inner();
@@ -224,7 +224,7 @@ async fn grpc_restart_failed_job() -> anyhow::Result<()> {
                 shard: Some(0),
                 worker_id: "worker-2".to_string(),
                 max_tasks: 1,
-            task_group: "default".to_string(),
+                task_group: "default".to_string(),
             })
             .await?
             .into_inner();
@@ -327,7 +327,7 @@ async fn grpc_restart_running_job_fails() -> anyhow::Result<()> {
                 shard: Some(0),
                 worker_id: "worker-1".to_string(),
                 max_tasks: 1,
-            task_group: "default".to_string(),
+                task_group: "default".to_string(),
             })
             .await?
             .into_inner();
@@ -420,7 +420,7 @@ async fn grpc_restart_succeeded_job_fails() -> anyhow::Result<()> {
                 shard: Some(0),
                 worker_id: "worker-1".to_string(),
                 max_tasks: 1,
-            task_group: "default".to_string(),
+                task_group: "default".to_string(),
             })
             .await?
             .into_inner();

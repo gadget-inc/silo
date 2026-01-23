@@ -5,18 +5,18 @@
 //! a single RPC call for efficiency.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, error};
 
 use crate::pb::gubernator::{
-    v1_client::V1Client, Algorithm, GetRateLimitsReq, RateLimitReq, RateLimitResp, Status,
+    Algorithm, GetRateLimitsReq, RateLimitReq, RateLimitResp, Status, v1_client::V1Client,
 };
 
 /// Error types for Gubernator client operations

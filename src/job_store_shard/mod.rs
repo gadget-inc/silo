@@ -205,60 +205,60 @@ impl JobStoreShard {
         self.broker.stop();
 
         // If we have a local WAL with flush_on_close enabled, flush memtable to SSTs first
-        if let Some(ref wal_config) = self.wal_close_config {
-            if wal_config.flush_on_close {
-                tracing::info!(
-                    shard = %self.name,
-                    wal_path = %wal_config.path,
-                    "flushing memtable to object storage before close"
-                );
+        if let Some(ref wal_config) = self.wal_close_config
+            && wal_config.flush_on_close
+        {
+            tracing::info!(
+                shard = %self.name,
+                wal_path = %wal_config.path,
+                "flushing memtable to object storage before close"
+            );
 
-                // Flush memtable to SST to ensure all data is in object storage
-                // This converts all in-memory data (and WAL data) to SSTs
-                self.db
-                    .flush_with_options(slatedb::config::FlushOptions {
-                        flush_type: slatedb::config::FlushType::MemTable,
-                    })
-                    .await
-                    .map_err(JobStoreShardError::from)?;
+            // Flush memtable to SST to ensure all data is in object storage
+            // This converts all in-memory data (and WAL data) to SSTs
+            self.db
+                .flush_with_options(slatedb::config::FlushOptions {
+                    flush_type: slatedb::config::FlushType::MemTable,
+                })
+                .await
+                .map_err(JobStoreShardError::from)?;
 
-                tracing::debug!(
-                    shard = %self.name,
-                    "memtable flushed to SST, closing database"
-                );
-            }
+            tracing::debug!(
+                shard = %self.name,
+                "memtable flushed to SST, closing database"
+            );
         }
 
         // Close the database
         self.db.close().await.map_err(JobStoreShardError::from)?;
 
         // After closing, clean up the local WAL directory if configured
-        if let Some(ref wal_config) = self.wal_close_config {
-            if wal_config.flush_on_close {
-                tracing::info!(
-                    shard = %self.name,
-                    wal_path = %wal_config.path,
-                    "removing local WAL directory after successful close"
-                );
+        if let Some(ref wal_config) = self.wal_close_config
+            && wal_config.flush_on_close
+        {
+            tracing::info!(
+                shard = %self.name,
+                wal_path = %wal_config.path,
+                "removing local WAL directory after successful close"
+            );
 
-                if let Err(e) = tokio::fs::remove_dir_all(&wal_config.path).await {
-                    // Log but don't fail if WAL directory removal fails
-                    // The data is already durably in object storage
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!(
-                            shard = %self.name,
-                            wal_path = %wal_config.path,
-                            error = %e,
-                            "failed to remove local WAL directory (data is still safe in object storage)"
-                        );
-                    }
-                } else {
-                    tracing::debug!(
+            if let Err(e) = tokio::fs::remove_dir_all(&wal_config.path).await {
+                // Log but don't fail if WAL directory removal fails
+                // The data is already durably in object storage
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
                         shard = %self.name,
                         wal_path = %wal_config.path,
-                        "local WAL directory removed successfully"
+                        error = %e,
+                        "failed to remove local WAL directory (data is still safe in object storage)"
                     );
                 }
+            } else {
+                tracing::debug!(
+                    shard = %self.name,
+                    wal_path = %wal_config.path,
+                    "local WAL directory removed successfully"
+                );
             }
         }
 
@@ -455,10 +455,10 @@ impl JobStoreShard {
 
         // Check if job is running or has pending state
         let status = self.get_job_status(tenant, id).await?;
-        if let Some(status) = status {
-            if !status.is_terminal() {
-                return Err(JobStoreShardError::JobInProgress(id.to_string()));
-            }
+        if let Some(status) = status
+            && !status.is_terminal()
+        {
+            return Err(JobStoreShardError::JobInProgress(id.to_string()));
         }
 
         let job_info_key_str: String = job_info_key(tenant, id);

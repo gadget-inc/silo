@@ -1,6 +1,6 @@
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 
-use crate::codec::{decode_job_info, CodecError, DecodedJobInfo};
+use crate::codec::{CodecError, DecodedJobInfo, decode_job_info};
 use crate::job_store_shard::JobStoreShardError;
 use crate::retry::RetryPolicy;
 

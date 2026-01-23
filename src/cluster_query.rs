@@ -17,8 +17,8 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session as CatalogSession;
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DfResult};
-use datafusion::execution::context::SessionContext;
 use datafusion::execution::TaskContext;
+use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::display::{DisplayAs, DisplayFormatType};
@@ -30,8 +30,8 @@ use datafusion::physical_plan::{
 use datafusion::prelude::DataFrame;
 use datafusion_sql::unparser::Unparser;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tracing::{debug, warn};
 
@@ -39,9 +39,9 @@ use crate::arrow_ipc::ipc_to_batches_only;
 use crate::coordination::Coordinator;
 use crate::factory::ShardFactory;
 use crate::job_store_shard::JobStoreShard;
-use crate::pb::silo_client::SiloClient;
 use crate::pb::QueryArrowRequest;
-use crate::query::{explain_dataframe, JobsScanner, QueuesScanner, ScannerRef};
+use crate::pb::silo_client::SiloClient;
+use crate::query::{JobsScanner, QueuesScanner, ScannerRef, explain_dataframe};
 
 /// Cluster-wide SQL query engine using DataFusion.
 ///

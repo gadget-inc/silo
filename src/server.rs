@@ -269,20 +269,20 @@ impl SiloService {
         let owned_shards = coord.owned_shards().await;
         let members = coord.get_members().await.ok();
 
-        if let Some(computed_owner_node) = owner_map.shard_to_node.get(&shard_id) {
-            if computed_owner_node == this_node_id {
-                // We're computed to own this shard but don't have it locally
-                tracing::warn!(
-                    shard_id,
-                    node_id = %this_node_id,
-                    owned_shards = ?owned_shards,
-                    members = ?members.as_ref().map(|m| m.iter().map(|mi| &mi.node_id).collect::<Vec<_>>()),
-                    "shard not ready: this node is computed owner but shard not yet acquired"
-                );
-                return Err(Status::unavailable(
-                    "shard not ready: acquisition in progress",
-                ));
-            }
+        if let Some(computed_owner_node) = owner_map.shard_to_node.get(&shard_id)
+            && computed_owner_node == this_node_id
+        {
+            // We're computed to own this shard but don't have it locally
+            tracing::warn!(
+                shard_id,
+                node_id = %this_node_id,
+                owned_shards = ?owned_shards,
+                members = ?members.as_ref().map(|m| m.iter().map(|mi| &mi.node_id).collect::<Vec<_>>()),
+                "shard not ready: this node is computed owner but shard not yet acquired"
+            );
+            return Err(Status::unavailable(
+                "shard not ready: acquisition in progress",
+            ));
         }
 
         // Log details about the routing mismatch to help diagnose production issues
@@ -310,10 +310,10 @@ impl SiloService {
             );
         }
 
-        if let Some(node) = owner_map.shard_to_node.get(&shard_id) {
-            if let Ok(val) = node.parse() {
-                metadata.insert(SHARD_OWNER_NODE_METADATA_KEY, val);
-            }
+        if let Some(node) = owner_map.shard_to_node.get(&shard_id)
+            && let Ok(val) = node.parse()
+        {
+            metadata.insert(SHARD_OWNER_NODE_METADATA_KEY, val);
         }
 
         Err(status)
@@ -799,10 +799,10 @@ impl Silo for SiloService {
             }
 
             // Record dequeue metrics per shard
-            if let Some(ref m) = self.metrics {
-                if tasks_added > 0 {
-                    m.record_dequeue(&shard_str, &r.task_group, tasks_added as u64);
-                }
+            if let Some(ref m) = self.metrics
+                && tasks_added > 0
+            {
+                m.record_dequeue(&shard_str, &r.task_group, tasks_added as u64);
             }
 
             remaining = remaining.saturating_sub(tasks_added);

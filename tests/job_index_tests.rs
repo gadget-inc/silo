@@ -26,7 +26,11 @@ async fn status_index_scheduled_then_running_then_succeeded() {
     assert!(s.contains(&job_id));
 
     // Dequeue -> Running
-    let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
+    let tasks = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
     assert_eq!(tasks.len(), 1);
 
     let running = shard
@@ -455,7 +459,7 @@ async fn pagination_and_ordering_newest_first() {
                 test_helpers::msgpack_payload(&serde_json::json!({"i": i})),
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .unwrap();
@@ -578,7 +582,11 @@ async fn metadata_index_basic_and_delete_cleanup() {
     assert_eq!(kw, vec![c.clone()]);
 
     // Complete A so it reaches a terminal state, then delete and verify cleanup
-    let tasks = shard.dequeue("w", "default", 3).await.expect("dequeue").tasks;
+    let tasks = shard
+        .dequeue("w", "default", 3)
+        .await
+        .expect("dequeue")
+        .tasks;
     let a_tid = tasks
         .iter()
         .find(|t| t.job().id() == a)
@@ -664,7 +672,7 @@ async fn scan_jobs_unfiltered_basic_and_ordering() {
                 test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue");

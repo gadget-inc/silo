@@ -29,7 +29,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
                 limits: vec![],
                 tenant: None,
                 metadata: md,
-            task_group: "default".to_string(),
+                task_group: "default".to_string(),
             };
             let _ = client.enqueue(enq).await?;
         }
@@ -198,7 +198,7 @@ async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
             limits: vec![],
             tenant: None,
             metadata: std::collections::HashMap::new(),
-                task_group: "default".to_string(),
+            task_group: "default".to_string(),
         };
         let _ = client.enqueue(enq).await?;
 
@@ -270,18 +270,24 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
             .into_inner();
 
         // Verify schema includes data types (helpful for TypeScript codegen)
-        assert!(query_resp
-            .columns
-            .iter()
-            .any(|c| c.name == "id" && c.data_type.contains("Utf8")));
-        assert!(query_resp
-            .columns
-            .iter()
-            .any(|c| c.name == "priority" && c.data_type.contains("UInt8")));
-        assert!(query_resp
-            .columns
-            .iter()
-            .any(|c| c.name == "enqueue_time_ms" && c.data_type.contains("Int64")));
+        assert!(
+            query_resp
+                .columns
+                .iter()
+                .any(|c| c.name == "id" && c.data_type.contains("Utf8"))
+        );
+        assert!(
+            query_resp
+                .columns
+                .iter()
+                .any(|c| c.name == "priority" && c.data_type.contains("UInt8"))
+        );
+        assert!(
+            query_resp
+                .columns
+                .iter()
+                .any(|c| c.name == "enqueue_time_ms" && c.data_type.contains("Int64"))
+        );
 
         // Verify row is valid JSON that TypeScript can deserialize
         let row: serde_json::Value = rmp_serde::from_slice(&query_resp.rows[0].data)?;
@@ -382,11 +388,12 @@ async fn grpc_server_query_msgpack_data_types() -> anyhow::Result<()> {
 
         // Enqueue jobs with different priorities and start times to test numeric types
         for i in 0..3 {
-            let payload_bytes = rmp_serde::to_vec(&serde_json::json!({ "value": i * 100 })).unwrap();
+            let payload_bytes =
+                rmp_serde::to_vec(&serde_json::json!({ "value": i * 100 })).unwrap();
             let enq = EnqueueRequest {
                 shard: 0,
                 id: format!("type_test_{}", i),
-                priority: (i * 50) as u32, // 0, 50, 100
+                priority: (i * 50) as u32,                   // 0, 50, 100
                 start_at_ms: 1000000000 + (i as i64 * 1000), // Different timestamps
                 retry_policy: None,
                 payload: Some(MsgpackBytes {
@@ -419,7 +426,8 @@ async fn grpc_server_query_msgpack_data_types() -> anyhow::Result<()> {
                         CASE WHEN priority = 0 THEN NULL ELSE enqueue_time_ms END as nullable_time
                     FROM jobs 
                     ORDER BY id
-                "#.to_string(),
+                "#
+                .to_string(),
                 tenant: None,
             })
             .await?
@@ -469,7 +477,8 @@ async fn grpc_server_query_msgpack_data_types() -> anyhow::Result<()> {
                         MIN(priority) as min_val,
                         MAX(priority) as max_val
                     FROM jobs
-                "#.to_string(),
+                "#
+                .to_string(),
                 tenant: None,
             })
             .await?

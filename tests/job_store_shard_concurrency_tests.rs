@@ -8,8 +8,8 @@ use silo::retry::RetryPolicy;
 use silo::task::Task;
 use std::collections::HashSet;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
 };
 
 use test_helpers::*;
@@ -43,7 +43,11 @@ async fn concurrency_shared_across_task_groups() {
         .expect("enqueue alpha");
 
     // Dequeue from alpha task_group - should get the job
-    let tasks1 = shard.dequeue("w1", "alpha", 1).await.expect("deq alpha").tasks;
+    let tasks1 = shard
+        .dequeue("w1", "alpha", 1)
+        .await
+        .expect("deq alpha")
+        .tasks;
     assert_eq!(tasks1.len(), 1);
     assert_eq!(tasks1[0].job().id(), j1);
     let t1 = tasks1[0].attempt().task_id().to_string();
@@ -68,10 +72,21 @@ async fn concurrency_shared_across_task_groups() {
         .expect("enqueue beta");
 
     // Dequeue from beta task_group - should get nothing (waiting for concurrency)
-    let tasks2 = shard.dequeue("w2", "beta", 1).await.expect("deq beta").tasks;
+    let tasks2 = shard
+        .dequeue("w2", "beta", 1)
+        .await
+        .expect("deq beta")
+        .tasks;
     // Should only have RequestTicket, not RunAttempt
-    let run_attempts: Vec<_> = tasks2.iter().filter(|t| t.attempt().task_id().len() > 0).collect();
-    assert_eq!(run_attempts.len(), 0, "beta job should be waiting for concurrency");
+    let run_attempts: Vec<_> = tasks2
+        .iter()
+        .filter(|t| t.attempt().task_id().len() > 0)
+        .collect();
+    assert_eq!(
+        run_attempts.len(),
+        0,
+        "beta job should be waiting for concurrency"
+    );
 
     // Complete alpha job - this should grant the slot to the beta job
     shard
@@ -80,7 +95,11 @@ async fn concurrency_shared_across_task_groups() {
         .expect("report alpha success");
 
     // Now dequeue from beta - should get the job
-    let tasks3 = shard.dequeue("w2", "beta", 1).await.expect("deq beta after").tasks;
+    let tasks3 = shard
+        .dequeue("w2", "beta", 1)
+        .await
+        .expect("deq beta after")
+        .tasks;
     assert_eq!(tasks3.len(), 1, "beta job should now be runnable");
     assert_eq!(tasks3[0].job().id(), j2);
 }
@@ -160,7 +179,10 @@ async fn concurrency_queues_jobs_from_multiple_task_groups() {
     let mut processed = 0;
     for (_job_id, task_group) in &jobs {
         // Try to get a task from each task group
-        let result = shard.dequeue("worker", task_group, 1).await.expect("dequeue");
+        let result = shard
+            .dequeue("worker", task_group, 1)
+            .await
+            .expect("dequeue");
         for task in &result.tasks {
             // Complete it
             let tid = task.attempt().task_id().to_string();
@@ -175,7 +197,10 @@ async fn concurrency_queues_jobs_from_multiple_task_groups() {
     // Keep processing until all jobs are done
     while processed < 3 {
         for (_job_id, task_group) in &jobs {
-            let result = shard.dequeue("worker", task_group, 1).await.expect("dequeue");
+            let result = shard
+                .dequeue("worker", task_group, 1)
+                .await
+                .expect("dequeue");
             for task in &result.tasks {
                 let tid = task.attempt().task_id().to_string();
                 shard
@@ -275,8 +300,16 @@ async fn concurrency_allows_multiple_slots_across_task_groups() {
         .expect("enqueue 4");
 
     // Both task groups should be able to get 1 task each (2 total for the queue)
-    let tasks_a = shard.dequeue("wa", "workers-a", 2).await.expect("deq a").tasks;
-    let tasks_b = shard.dequeue("wb", "workers-b", 2).await.expect("deq b").tasks;
+    let tasks_a = shard
+        .dequeue("wa", "workers-a", 2)
+        .await
+        .expect("deq a")
+        .tasks;
+    let tasks_b = shard
+        .dequeue("wb", "workers-b", 2)
+        .await
+        .expect("deq b")
+        .tasks;
 
     // Total runnable tasks should be at most 2 (the max_concurrency)
     let total_running = tasks_a.len() + tasks_b.len();
@@ -359,7 +392,17 @@ async fn concurrent_dequeue_many_workers_no_duplicates() {
             for i in 0..total_jobs {
                 let payload = test_helpers::msgpack_payload(&serde_json::json!({"i": i}));
                 shard_prod
-                    .enqueue("-", None, (i % 50) as u8, now, None, payload, vec![], None, "default")
+                    .enqueue(
+                        "-",
+                        None,
+                        (i % 50) as u8,
+                        now,
+                        None,
+                        payload,
+                        vec![],
+                        None,
+                        "default",
+                    )
                     .await
                     .expect("enqueue");
                 // Yield occasionally to allow scanner/workers to run
@@ -404,7 +447,7 @@ async fn future_tasks_are_not_dequeued_under_concurrency() {
                     test_helpers::msgpack_payload(&serde_json::json!({"r": i})),
                     vec![],
                     None,
-            "default",
+                    "default",
                 )
                 .await
                 .expect("enqueue ready");
@@ -421,7 +464,7 @@ async fn future_tasks_are_not_dequeued_under_concurrency() {
                     test_helpers::msgpack_payload(&serde_json::json!({"f": i})),
                     vec![],
                     None,
-            "default",
+                    "default",
                 )
                 .await
                 .expect("enqueue future");
@@ -500,7 +543,11 @@ async fn concurrency_immediate_grant_enqueues_task_and_writes_holder() {
         .expect("enqueue");
 
     // Task should be ready immediately
-    let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
+    let tasks = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
     assert_eq!(tasks.len(), 1);
     let t = &tasks[0];
     assert_eq!(t.job().id(), job_id);
@@ -740,7 +787,11 @@ async fn concurrency_no_overgrant_after_release() {
         )
         .await
         .expect("enqueue a");
-    let a_task = shard.dequeue("wa", "default", 1).await.expect("deq a").tasks;
+    let a_task = shard
+        .dequeue("wa", "default", 1)
+        .await
+        .expect("deq a")
+        .tasks;
     assert_eq!(a_task.len(), 1);
     let a_tid = a_task[0].attempt().task_id().to_string();
 
@@ -820,7 +871,7 @@ async fn stress_single_queue_no_double_grant() {
                     max_concurrency: 1,
                 })],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue");
@@ -828,7 +879,11 @@ async fn stress_single_queue_no_double_grant() {
 
     let mut processed = 0usize;
     loop {
-        let tasks = shard.dequeue("w-stress", "default", 1).await.expect("deq").tasks;
+        let tasks = shard
+            .dequeue("w-stress", "default", 1)
+            .await
+            .expect("deq")
+            .tasks;
         if tasks.is_empty() {
             if processed >= total {
                 break;
@@ -876,7 +931,11 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
         )
         .await
         .expect("enqueue1");
-    let tasks1 = shard.dequeue("w-hold", "default", 1).await.expect("deq1").tasks;
+    let tasks1 = shard
+        .dequeue("w-hold", "default", 1)
+        .await
+        .expect("deq1")
+        .tasks;
     assert_eq!(tasks1.len(), 1);
     let t1 = tasks1[0].attempt().task_id().to_string();
 
@@ -896,7 +955,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
                     max_concurrency: 1,
                 })],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue add");
@@ -963,7 +1022,11 @@ async fn retry_with_concurrency_must_reacquire_slot_not_claim_released_slot() {
         .expect("enqueue A");
 
     // Dequeue Job A - it gets the slot
-    let tasks_a = shard.dequeue("worker", "default", 1).await.expect("dequeue A").tasks;
+    let tasks_a = shard
+        .dequeue("worker", "default", 1)
+        .await
+        .expect("dequeue A")
+        .tasks;
     assert_eq!(tasks_a.len(), 1, "Job A should be dequeued");
     assert_eq!(tasks_a[0].job().id(), job_a);
     let task_a_id = tasks_a[0].attempt().task_id().to_string();
@@ -996,7 +1059,11 @@ async fn retry_with_concurrency_must_reacquire_slot_not_claim_released_slot() {
         .expect("enqueue B");
 
     // Job B should NOT be runnable yet (mutex is held by A)
-    let tasks_while_a_running = shard.dequeue("worker", "default", 1).await.expect("dequeue while A running").tasks;
+    let tasks_while_a_running = shard
+        .dequeue("worker", "default", 1)
+        .await
+        .expect("dequeue while A running")
+        .tasks;
     assert_eq!(
         tasks_while_a_running.len(),
         0,
@@ -1020,7 +1087,11 @@ async fn retry_with_concurrency_must_reacquire_slot_not_claim_released_slot() {
 
     // Now dequeue - we should get EXACTLY ONE task (Job B which was granted the slot)
     // The bug would cause us to get BOTH Job B AND Job A's retry
-    let tasks_after_failure = shard.dequeue("worker", "default", 10).await.expect("dequeue after failure").tasks;
+    let tasks_after_failure = shard
+        .dequeue("worker", "default", 10)
+        .await
+        .expect("dequeue after failure")
+        .tasks;
 
     // Critical assertion: only ONE task should be runnable with max_concurrency=1
     assert_eq!(
@@ -1029,7 +1100,10 @@ async fn retry_with_concurrency_must_reacquire_slot_not_claim_released_slot() {
         "BUG: Got {} tasks but max_concurrency=1, only 1 should be runnable. \
          Jobs returned: {:?}",
         tasks_after_failure.len(),
-        tasks_after_failure.iter().map(|t| t.job().id()).collect::<Vec<_>>()
+        tasks_after_failure
+            .iter()
+            .map(|t| t.job().id())
+            .collect::<Vec<_>>()
     );
 
     // That one task should be Job B (which was granted the slot)
@@ -1041,10 +1115,7 @@ async fn retry_with_concurrency_must_reacquire_slot_not_claim_released_slot() {
 
     // Verify only one holder exists
     let holder_count = count_with_prefix(shard.db(), "holders/").await;
-    assert_eq!(
-        holder_count, 1,
-        "Should have exactly 1 holder (for Job B)"
-    );
+    assert_eq!(holder_count, 1, "Should have exactly 1 holder (for Job B)");
 
     // Complete Job B
     let task_b_id = tasks_after_failure[0].attempt().task_id().to_string();
@@ -1054,7 +1125,11 @@ async fn retry_with_concurrency_must_reacquire_slot_not_claim_released_slot() {
         .expect("report B success");
 
     // Now Job A's retry should be able to run (after B released the slot)
-    let tasks_after_b = shard.dequeue("worker", "default", 10).await.expect("dequeue after B").tasks;
+    let tasks_after_b = shard
+        .dequeue("worker", "default", 10)
+        .await
+        .expect("dequeue after B")
+        .tasks;
     assert_eq!(
         tasks_after_b.len(),
         1,
@@ -1159,16 +1234,27 @@ async fn retry_must_wait_for_slot_when_another_job_was_granted() {
         .expect("report A fail");
 
     // Should get exactly 1 task (either B or C, but NOT A's retry)
-    let tasks = shard.dequeue("w", "default", 10).await.expect("deq after A fail").tasks;
-    assert_eq!(tasks.len(), 1, "Only one of B/C should be runnable, not A's retry");
-    
+    let tasks = shard
+        .dequeue("w", "default", 10)
+        .await
+        .expect("deq after A fail")
+        .tasks;
+    assert_eq!(
+        tasks.len(),
+        1,
+        "Only one of B/C should be runnable, not A's retry"
+    );
+
     let returned_job_id = tasks[0].job().id();
     assert!(
         returned_job_id == job_b || returned_job_id == job_c,
         "Should be B or C, not A's retry. Got job_id={}, job_a={}, job_b={}, job_c={}",
-        returned_job_id, job_a, job_b, job_c
+        returned_job_id,
+        job_a,
+        job_b,
+        job_c
     );
-    
+
     // Critical: the returned job should NOT be A (its retry shouldn't claim the slot)
     assert_ne!(
         returned_job_id, job_a,
@@ -1181,4 +1267,3 @@ async fn retry_must_wait_for_slot_when_another_job_was_granted() {
         "At most 1 holder should exist"
     );
 }
-

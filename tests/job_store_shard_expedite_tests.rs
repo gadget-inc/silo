@@ -1,9 +1,9 @@
 mod test_helpers;
 
 use silo::job::JobStatusKind;
-use silo::job_attempt::{AttemptOutcome};
+use silo::job_attempt::AttemptOutcome;
 use silo::job_store_shard::JobStoreShardError;
-use silo::retry::{RetryPolicy};
+use silo::retry::RetryPolicy;
 
 use test_helpers::*;
 
@@ -16,7 +16,17 @@ async fn expedite_future_scheduled_job() {
         // Schedule job for 1 hour in the future
         let future_time_ms = now_ms() + 3_600_000;
         let job_id = shard
-            .enqueue("-", None, 10u8, future_time_ms, None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                future_time_ms,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
@@ -29,7 +39,11 @@ async fn expedite_future_scheduled_job() {
         assert_eq!(status.kind, JobStatusKind::Scheduled);
 
         // Verify task is future-scheduled (not dequeue-able yet)
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         assert!(tasks.is_empty(), "future task should not be dequeued yet");
 
         // Expedite the job
@@ -51,7 +65,11 @@ async fn expedite_future_scheduled_job() {
         );
 
         // Now the task should be dequeue-able
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         assert_eq!(tasks.len(), 1, "expedited task should be dequeue-able");
         assert_eq!(tasks[0].job().id(), job_id);
 
@@ -102,13 +120,17 @@ async fn expedite_mid_retry_job() {
                 payload,
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue");
 
         // Dequeue and fail (triggers retry with backoff)
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         assert_eq!(tasks.len(), 1);
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
@@ -131,7 +153,11 @@ async fn expedite_mid_retry_job() {
         assert_eq!(status.kind, JobStatusKind::Scheduled);
 
         // Task should NOT be dequeue-able yet (waiting for backoff)
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         assert!(tasks.is_empty(), "retry task should be waiting for backoff");
 
         // Expedite the job to skip backoff
@@ -141,7 +167,11 @@ async fn expedite_mid_retry_job() {
             .expect("expedite_job");
 
         // Now the retry task should be dequeue-able
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         assert_eq!(
             tasks.len(),
             1,
@@ -204,12 +234,26 @@ async fn expedite_succeeded_job_returns_error() {
 
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
-            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
         // Complete the job successfully
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
@@ -258,12 +302,26 @@ async fn expedite_failed_job_returns_error() {
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         // No retry policy - job will fail permanently
         let job_id = shard
-            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
         // Fail the job
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
@@ -314,7 +372,17 @@ async fn expedite_cancelled_job_returns_error() {
         // Schedule job for the future
         let future_time_ms = now_ms() + 3_600_000;
         let job_id = shard
-            .enqueue("-", None, 10u8, future_time_ms, None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                future_time_ms,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
@@ -355,7 +423,17 @@ async fn expedite_already_ready_job_returns_error() {
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         // Schedule job for NOW (immediately ready)
         let job_id = shard
-            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
@@ -389,12 +467,26 @@ async fn expedite_running_job_returns_error() {
 
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
-            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
         // Dequeue to start running
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         assert_eq!(tasks.len(), 1);
 
         // Verify job is running
@@ -446,12 +538,26 @@ async fn expedite_job_no_pending_task_returns_error() {
 
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
-            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
         // Dequeue and complete the job
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
@@ -492,7 +598,17 @@ async fn double_expedite_fails_second_time() {
         // Schedule job for 1 hour in the future
         let future_time_ms = now_ms() + 3_600_000;
         let job_id = shard
-            .enqueue("-", None, 10u8, future_time_ms, None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                future_time_ms,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
@@ -520,4 +636,3 @@ async fn double_expedite_fails_second_time() {
         }
     });
 }
-

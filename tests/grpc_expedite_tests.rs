@@ -64,7 +64,10 @@ async fn grpc_expedite_future_scheduled_job() -> anyhow::Result<()> {
             })
             .await?
             .into_inner();
-        assert!(lease_resp.tasks.is_empty(), "future job should not be leased yet");
+        assert!(
+            lease_resp.tasks.is_empty(),
+            "future job should not be leased yet"
+        );
 
         // Expedite the job
         client
