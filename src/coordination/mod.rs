@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{watch, Mutex, Notify};
+use tokio::sync::{Mutex, Notify, watch};
 use tracing::debug;
 
 use crate::factory::ShardFactory;
@@ -42,9 +42,7 @@ pub struct MemberInfo {
 
 /// Get the hostname of the current machine
 pub fn get_hostname() -> Option<String> {
-    hostname::get()
-        .ok()
-        .and_then(|h| h.into_string().ok())
+    hostname::get().ok().and_then(|h| h.into_string().ok())
 }
 
 /// Mapping of shard IDs to their owning node's gRPC address
@@ -257,11 +255,11 @@ impl CoordinatorBase {
         let mut shard_to_node = HashMap::new();
 
         for shard_id in 0..self.num_shards {
-            if let Some(owner_node) = select_owner_for_shard(shard_id, &member_ids) {
-                if let Some(addr) = addr_map.get(&owner_node) {
-                    shard_to_addr.insert(shard_id, addr.clone());
-                    shard_to_node.insert(shard_id, owner_node);
-                }
+            if let Some(owner_node) = select_owner_for_shard(shard_id, &member_ids)
+                && let Some(addr) = addr_map.get(&owner_node)
+            {
+                shard_to_addr.insert(shard_id, addr.clone());
+                shard_to_node.insert(shard_id, owner_node);
             }
         }
 
@@ -440,10 +438,10 @@ pub fn compute_desired_shards_for_node(
 ) -> HashSet<u32> {
     let mut desired: HashSet<u32> = HashSet::new();
     for s in 0..num_shards {
-        if let Some(owner) = select_owner_for_shard(s, member_ids) {
-            if owner == node_id {
-                desired.insert(s);
-            }
+        if let Some(owner) = select_owner_for_shard(s, member_ids)
+            && owner == node_id
+        {
+            desired.insert(s);
         }
     }
     desired

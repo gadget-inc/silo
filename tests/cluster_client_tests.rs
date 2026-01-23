@@ -221,7 +221,9 @@ async fn cluster_client_get_job_not_found() {
     let client = ClusterClient::new(factory.clone(), None);
 
     // Get non-existent job
-    let result = client.get_job(0, "test-tenant", "non-existent", false).await;
+    let result = client
+        .get_job(0, "test-tenant", "non-existent", false)
+        .await;
 
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -360,7 +362,10 @@ async fn cluster_client_query_local_shard_sql_error() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
-        matches!(err, silo::cluster_client::ClusterClientError::QueryFailed(_)),
+        matches!(
+            err,
+            silo::cluster_client::ClusterClientError::QueryFailed(_)
+        ),
         "expected QueryFailed error, got {:?}",
         err
     );
@@ -381,7 +386,10 @@ async fn cluster_client_query_local_shard_invalid_column() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
-        matches!(err, silo::cluster_client::ClusterClientError::QueryFailed(_)),
+        matches!(
+            err,
+            silo::cluster_client::ClusterClientError::QueryFailed(_)
+        ),
         "expected QueryFailed error, got {:?}",
         err
     );
@@ -401,7 +409,10 @@ async fn cluster_client_cancel_nonexistent_job() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
-        matches!(err, silo::cluster_client::ClusterClientError::QueryFailed(_)),
+        matches!(
+            err,
+            silo::cluster_client::ClusterClientError::QueryFailed(_)
+        ),
         "expected QueryFailed error for non-existent job, got {:?}",
         err
     );
@@ -416,9 +427,7 @@ async fn cluster_client_cancel_job_on_remote_shard_without_coordinator() {
     let client = ClusterClient::new(factory.clone(), None);
 
     // Try to cancel job on shard we don't own (without coordinator)
-    let result = client
-        .cancel_job(999, "test-tenant", "some-job")
-        .await;
+    let result = client.cancel_job(999, "test-tenant", "some-job").await;
 
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -438,9 +447,7 @@ async fn cluster_client_get_job_on_remote_shard_without_coordinator() {
     let client = ClusterClient::new(factory.clone(), None);
 
     // Try to get job on shard we don't own (without coordinator)
-    let result = client
-        .get_job(999, "test-tenant", "some-job", false)
-        .await;
+    let result = client.get_job(999, "test-tenant", "some-job", false).await;
 
     assert!(result.is_err());
     let err = result.unwrap_err();

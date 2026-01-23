@@ -1,10 +1,10 @@
 use std::sync::{Mutex, Once};
 
-use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::KeyValue;
+use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::{runtime, trace as sdktrace, Resource};
-use tracing_subscriber::{filter::LevelFilter, prelude::*, EnvFilter};
+use opentelemetry_sdk::{Resource, runtime, trace as sdktrace};
+use tracing_subscriber::{EnvFilter, filter::LevelFilter, prelude::*};
 
 use crate::settings::LogFormat;
 

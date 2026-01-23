@@ -26,7 +26,11 @@ async fn status_index_scheduled_then_running_then_succeeded() {
     assert!(s.contains(&job_id));
 
     // Dequeue -> Running
-    let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
+    let tasks = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
     assert_eq!(tasks.len(), 1);
 
     let running = shard
@@ -38,7 +42,7 @@ async fn status_index_scheduled_then_running_then_succeeded() {
     // Complete -> Succeeded
     let tid = tasks[0].attempt().task_id().to_string();
     shard
-        .report_attempt_outcome("-", &tid, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&tid, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report");
 
@@ -75,7 +79,6 @@ async fn status_index_failed_and_scheduled_then_order_newest_first() {
         .to_string();
     shard
         .report_attempt_outcome(
-            "-",
             &ta,
             AttemptOutcome::Error {
                 error_code: "E".to_string(),
@@ -116,7 +119,6 @@ async fn status_index_failed_and_scheduled_then_order_newest_first() {
         .to_string();
     shard
         .report_attempt_outcome(
-            "-",
             &tb,
             AttemptOutcome::Error {
                 error_code: "E".to_string(),
@@ -178,7 +180,6 @@ async fn retry_flow_running_to_scheduled_to_running_to_succeeded() {
     // Error -> Scheduled
     shard
         .report_attempt_outcome(
-            "-",
             &t1,
             AttemptOutcome::Error {
                 error_code: "E".to_string(),
@@ -204,7 +205,7 @@ async fn retry_flow_running_to_scheduled_to_running_to_succeeded() {
     assert!(running2.contains(&job_id));
     // Success -> Succeeded
     shard
-        .report_attempt_outcome("-", &t2, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&t2, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report ok");
     let succ = shard
@@ -383,7 +384,7 @@ async fn delete_removes_from_index() {
         .task_id()
         .to_string();
     shard
-        .report_attempt_outcome("-", &tid, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&tid, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report ok");
     // Ensure in Succeeded index
@@ -458,7 +459,7 @@ async fn pagination_and_ordering_newest_first() {
                 test_helpers::msgpack_payload(&serde_json::json!({"i": i})),
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .unwrap();
@@ -581,14 +582,18 @@ async fn metadata_index_basic_and_delete_cleanup() {
     assert_eq!(kw, vec![c.clone()]);
 
     // Complete A so it reaches a terminal state, then delete and verify cleanup
-    let tasks = shard.dequeue("w", "default", 3).await.expect("dequeue").tasks;
+    let tasks = shard
+        .dequeue("w", "default", 3)
+        .await
+        .expect("dequeue")
+        .tasks;
     let a_tid = tasks
         .iter()
         .find(|t| t.job().id() == a)
         .map(|t| t.attempt().task_id().to_string())
         .expect("leased task for A");
     shard
-        .report_attempt_outcome("-", &a_tid, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&a_tid, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("complete A");
     shard.delete_job("-", &a).await.expect("delete a");
@@ -667,7 +672,7 @@ async fn scan_jobs_unfiltered_basic_and_ordering() {
                 test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue");

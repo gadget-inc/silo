@@ -10,10 +10,10 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use askama::Template;
 use axum::{
+    Router,
     extract::{Query, State},
     response::{Html, IntoResponse},
     routing::{get, post},
-    Router,
 };
 use datafusion::arrow::array::Array;
 use tokio::sync::broadcast;

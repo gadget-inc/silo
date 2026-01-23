@@ -94,12 +94,15 @@ async fn floating_limit_shared_across_task_groups() {
 
     // Complete alpha job
     shard
-        .report_attempt_outcome("-", &t1, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report alpha success");
 
     // Now dequeue from beta - should get the job
-    let result3 = shard.dequeue("w2", "beta", 1).await.expect("deq beta after");
+    let result3 = shard
+        .dequeue("w2", "beta", 1)
+        .await
+        .expect("deq beta after");
     assert_eq!(result3.tasks.len(), 1, "beta job should now be runnable");
     assert_eq!(result3.tasks[0].job().id(), j2);
 }
@@ -181,7 +184,8 @@ async fn floating_limit_state_shared_across_task_groups() {
         .expect("state should exist");
     let decoded = silo::codec::decode_floating_limit_state(&state_raw).expect("decode state");
     assert_eq!(
-        decoded.archived().current_max_concurrency, 5,
+        decoded.archived().current_max_concurrency,
+        5,
         "state should be reused, not recreated"
     );
 }
@@ -246,7 +250,10 @@ async fn floating_limit_refresh_applies_to_all_task_groups() {
         .expect("enqueue beta");
 
     // Dequeue from alpha - should get job and refresh task
-    let result1 = shard.dequeue("w1", "alpha", 10).await.expect("dequeue alpha");
+    let result1 = shard
+        .dequeue("w1", "alpha", 10)
+        .await
+        .expect("dequeue alpha");
     // Note: refresh tasks are returned regardless of task_group since they're system tasks
 
     // Dequeue from beta
@@ -265,7 +272,7 @@ async fn floating_limit_refresh_applies_to_all_task_groups() {
 
     // Report successful refresh with increased concurrency
     shard
-        .report_refresh_success("-", &refresh_task_id, 3) // Increase from 1 to 3
+        .report_refresh_success(&refresh_task_id, 3) // Increase from 1 to 3
         .await
         .expect("report refresh success");
 
@@ -279,7 +286,8 @@ async fn floating_limit_refresh_applies_to_all_task_groups() {
         .expect("state should exist");
     let decoded = silo::codec::decode_floating_limit_state(&state_raw).expect("decode state");
     assert_eq!(
-        decoded.archived().current_max_concurrency, 3,
+        decoded.archived().current_max_concurrency,
+        3,
         "max_concurrency should be updated to 3"
     );
 }
@@ -372,7 +380,7 @@ async fn floating_limit_queues_jobs_from_multiple_task_groups() {
                 let tid = task.attempt().task_id().to_string();
                 let job_id = task.job().id().to_string();
                 shard
-                    .report_attempt_outcome("-", &tid, AttemptOutcome::Success { result: vec![] })
+                    .report_attempt_outcome(&tid, AttemptOutcome::Success { result: vec![] })
                     .await
                     .expect("report success");
                 processed_jobs.push(job_id);
@@ -574,7 +582,10 @@ async fn floating_concurrency_limit_dequeue_returns_refresh_tasks() {
         .expect("enqueue j2");
 
     // Dequeue should return the refresh task
-    let result = shard.dequeue("worker-1", "default", 10).await.expect("dequeue");
+    let result = shard
+        .dequeue("worker-1", "default", 10)
+        .await
+        .expect("dequeue");
 
     // Should have job tasks and refresh tasks
     assert!(
@@ -650,14 +661,17 @@ async fn floating_limit_refresh_success_updates_state() {
         .expect("enqueue j2");
 
     // Dequeue to get the refresh task
-    let result = shard.dequeue("worker-1", "default", 10).await.expect("dequeue");
+    let result = shard
+        .dequeue("worker-1", "default", 10)
+        .await
+        .expect("dequeue");
     assert!(!result.refresh_tasks.is_empty());
     let task_id = result.refresh_tasks[0].task_id.clone();
     let new_max = 10u32;
 
     // Report successful refresh
     shard
-        .report_refresh_success("-", &task_id, new_max)
+        .report_refresh_success(&task_id, new_max)
         .await
         .expect("report refresh success");
 
@@ -744,13 +758,16 @@ async fn floating_limit_refresh_failure_triggers_backoff() {
         .expect("enqueue j2");
 
     // Dequeue to get the refresh task
-    let result = shard.dequeue("worker-1", "default", 10).await.expect("dequeue");
+    let result = shard
+        .dequeue("worker-1", "default", 10)
+        .await
+        .expect("dequeue");
     assert!(!result.refresh_tasks.is_empty());
     let task_id = result.refresh_tasks[0].task_id.clone();
 
     // Report failed refresh
     shard
-        .report_refresh_failure("-", &task_id, "test_error", "simulated failure")
+        .report_refresh_failure(&task_id, "test_error", "simulated failure")
         .await
         .expect("report refresh failure");
 
@@ -844,7 +861,7 @@ async fn floating_limit_concurrent_enqueues_no_duplicate_refresh() {
                     },
                 )],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue");
@@ -938,13 +955,16 @@ async fn floating_limit_uses_dynamic_max_concurrency() {
     assert_eq!(j2_status.kind, JobStatusKind::Scheduled);
 
     // Dequeue j1
-    let result = shard.dequeue("worker-1", "default", 1).await.expect("dequeue");
+    let result = shard
+        .dequeue("worker-1", "default", 1)
+        .await
+        .expect("dequeue");
     assert_eq!(result.tasks.len(), 1);
     let t1_id = result.tasks[0].attempt().task_id().to_string();
 
     // Complete j1 - j2 should get a ticket
     shard
-        .report_attempt_outcome("-", &t1_id, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&t1_id, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report j1 success");
 
@@ -1011,12 +1031,14 @@ async fn floating_limit_job_persists_limit_type() {
             assert_eq!(fl.default_max_concurrency, 10);
             assert_eq!(fl.refresh_interval_ms, 5000);
             assert_eq!(fl.metadata.len(), 2);
-            assert!(fl
-                .metadata
-                .contains(&("org_id".to_string(), "123".to_string())));
-            assert!(fl
-                .metadata
-                .contains(&("env".to_string(), "prod".to_string())));
+            assert!(
+                fl.metadata
+                    .contains(&("org_id".to_string(), "123".to_string()))
+            );
+            assert!(
+                fl.metadata
+                    .contains(&("env".to_string(), "prod".to_string()))
+            );
         }
         _ => panic!("expected FloatingConcurrency limit"),
     }
@@ -1080,12 +1102,15 @@ async fn floating_limit_multiple_retries_increase_backoff() {
         .expect("enqueue j2");
 
     // First failure
-    let result = shard.dequeue("worker-1", "default", 10).await.expect("dequeue");
+    let result = shard
+        .dequeue("worker-1", "default", 10)
+        .await
+        .expect("dequeue");
     assert!(!result.refresh_tasks.is_empty());
     let task_id = result.refresh_tasks[0].task_id.clone();
 
     shard
-        .report_refresh_failure("-", &task_id, "test_error", "simulated failure 1")
+        .report_refresh_failure(&task_id, "test_error", "simulated failure 1")
         .await
         .expect("report failure 1");
 
@@ -1105,11 +1130,14 @@ async fn floating_limit_multiple_retries_increase_backoff() {
     tokio::time::advance(std::time::Duration::from_millis(10_000)).await;
 
     // Second failure
-    let result = shard.dequeue("worker-1", "default", 10).await.expect("dequeue 2");
+    let result = shard
+        .dequeue("worker-1", "default", 10)
+        .await
+        .expect("dequeue 2");
     if !result.refresh_tasks.is_empty() {
         let task_id = result.refresh_tasks[0].task_id.clone();
         shard
-            .report_refresh_failure("-", &task_id, "test_error", "simulated failure 2")
+            .report_refresh_failure(&task_id, "test_error", "simulated failure 2")
             .await
             .expect("report failure 2");
 
@@ -1189,10 +1217,13 @@ async fn floating_limit_successful_refresh_resets_backoff() {
         .expect("enqueue j2");
 
     // First failure to set retry_count
-    let result = shard.dequeue("worker-1", "default", 10).await.expect("dequeue");
+    let result = shard
+        .dequeue("worker-1", "default", 10)
+        .await
+        .expect("dequeue");
     let task_id = result.refresh_tasks[0].task_id.clone();
     shard
-        .report_refresh_failure("-", &task_id, "test_error", "simulated failure")
+        .report_refresh_failure(&task_id, "test_error", "simulated failure")
         .await
         .expect("report failure");
 
@@ -1209,11 +1240,14 @@ async fn floating_limit_successful_refresh_resets_backoff() {
     // Advance time and succeed
     tokio::time::advance(std::time::Duration::from_millis(10_000)).await;
 
-    let result = shard.dequeue("worker-1", "default", 10).await.expect("dequeue 2");
+    let result = shard
+        .dequeue("worker-1", "default", 10)
+        .await
+        .expect("dequeue 2");
     if !result.refresh_tasks.is_empty() {
         let task_id = result.refresh_tasks[0].task_id.clone();
         shard
-            .report_refresh_success("-", &task_id, 8)
+            .report_refresh_success(&task_id, 8)
             .await
             .expect("report success");
 
@@ -1289,7 +1323,10 @@ async fn floating_limit_refresh_task_lease_expiry_allows_rescheduling() {
         .expect("enqueue j2");
 
     // Dequeue to get the refresh task - this creates a lease
-    let result = shard.dequeue("worker-1", "default", 10).await.expect("dequeue");
+    let result = shard
+        .dequeue("worker-1", "default", 10)
+        .await
+        .expect("dequeue");
     assert!(
         !result.refresh_tasks.is_empty(),
         "should have refresh task after dequeue"
@@ -1466,7 +1503,10 @@ async fn floating_limit_refresh_task_lease_expiry_preserves_state() {
         .expect("enqueue j2");
 
     // Dequeue to get the refresh task and create a lease
-    let result = shard.dequeue("worker-1", "default", 10).await.expect("dequeue");
+    let result = shard
+        .dequeue("worker-1", "default", 10)
+        .await
+        .expect("dequeue");
     assert!(!result.refresh_tasks.is_empty(), "should have refresh task");
     let task_id = result.refresh_tasks[0].task_id.clone();
 

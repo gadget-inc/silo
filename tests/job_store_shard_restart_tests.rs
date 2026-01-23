@@ -1,10 +1,10 @@
 mod test_helpers;
 
 use silo::job::JobStatusKind;
-use silo::job_attempt::{AttemptOutcome};
+use silo::job_attempt::AttemptOutcome;
 use silo::job_store_shard::JobStoreShardError;
-use silo::retry::{RetryPolicy};
-use silo::task::{Task};
+use silo::retry::RetryPolicy;
+use silo::task::Task;
 
 use test_helpers::*;
 
@@ -15,7 +15,17 @@ async fn restart_cancelled_scheduled_job() {
 
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
-            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
@@ -29,10 +39,12 @@ async fn restart_cancelled_scheduled_job() {
             .expect("get status")
             .expect("exists");
         assert_eq!(status.kind, JobStatusKind::Cancelled);
-        assert!(shard
-            .is_job_cancelled("-", &job_id)
-            .await
-            .expect("is_cancelled"));
+        assert!(
+            shard
+                .is_job_cancelled("-", &job_id)
+                .await
+                .expect("is_cancelled")
+        );
 
         // [SILO-RESTART-*] Restart the job
         shard.restart_job("-", &job_id).await.expect("restart_job");
@@ -90,17 +102,30 @@ async fn restart_failed_job() {
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         // No retry policy - job will fail permanently on first error
         let job_id = shard
-            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
         // Dequeue and fail the job
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         assert_eq!(tasks.len(), 1);
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Error {
                     error_code: "TEST_ERROR".to_string(),
@@ -152,12 +177,15 @@ async fn restart_failed_job() {
         }
 
         // Dequeue and complete successfully this time
-        let tasks2 = shard.dequeue("worker-2", "default", 1).await.expect("dequeue").tasks;
+        let tasks2 = shard
+            .dequeue("worker-2", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         assert_eq!(tasks2.len(), 1);
         let task_id2 = tasks2[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id2,
                 AttemptOutcome::Success {
                     result: b"{}".to_vec(),
@@ -185,16 +213,29 @@ async fn restart_succeeded_job_returns_error() {
 
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
-            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
         // Complete the job successfully
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success {
                     result: b"{}".to_vec(),
@@ -237,12 +278,26 @@ async fn restart_running_job_returns_error() {
 
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
-            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
         // Dequeue to make it Running
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         assert_eq!(tasks.len(), 1);
 
         // Verify job is Running
@@ -272,7 +327,6 @@ async fn restart_running_job_returns_error() {
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success {
                     result: b"{}".to_vec(),
@@ -292,7 +346,17 @@ async fn restart_scheduled_job_returns_error() {
 
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
-            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
@@ -366,19 +430,22 @@ async fn restart_failed_job_with_retry_policy_resets_retries() {
                 payload,
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue");
 
         // Fail the job 3 times (1 initial + 2 retries = 3 attempts)
         for attempt in 1..=3 {
-            let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+            let tasks = shard
+                .dequeue("worker-1", "default", 1)
+                .await
+                .expect("dequeue")
+                .tasks;
             assert_eq!(tasks.len(), 1, "should have task for attempt {}", attempt);
             let task_id = tasks[0].attempt().task_id().to_string();
             shard
                 .report_attempt_outcome(
-                    "-",
                     &task_id,
                     AttemptOutcome::Error {
                         error_code: "TEST_ERROR".to_string(),
@@ -438,11 +505,14 @@ async fn restart_failed_job_with_retry_policy_resets_retries() {
         }
 
         // Successfully complete the restarted job
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success {
                     result: b"ok".to_vec(),
@@ -470,12 +540,26 @@ async fn restart_cancelled_running_job_after_acknowledgement() {
 
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
-            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
         // Dequeue to make job Running
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         assert_eq!(tasks.len(), 1);
         let task_id = tasks[0].attempt().task_id().to_string();
 
@@ -484,7 +568,7 @@ async fn restart_cancelled_running_job_after_acknowledgement() {
 
         // Worker discovers cancellation via heartbeat
         let hb_result = shard
-            .heartbeat_task("-", "worker-1", &task_id)
+            .heartbeat_task("worker-1", &task_id)
             .await
             .expect("heartbeat");
         assert!(
@@ -494,7 +578,7 @@ async fn restart_cancelled_running_job_after_acknowledgement() {
 
         // Worker acknowledges cancellation
         shard
-            .report_attempt_outcome("-", &task_id, AttemptOutcome::Cancelled)
+            .report_attempt_outcome(&task_id, AttemptOutcome::Cancelled)
             .await
             .expect("report cancelled");
 
@@ -525,11 +609,14 @@ async fn restart_cancelled_running_job_after_acknowledgement() {
         );
 
         // Complete the restarted job
-        let tasks = shard.dequeue("worker-2", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-2", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success {
                     result: b"{}".to_vec(),
@@ -556,17 +643,30 @@ async fn multiple_restarts_of_same_job() {
 
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"iteration": 0}));
         let job_id = shard
-            .enqueue("-", None, 10u8, now_ms(), None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
         for iteration in 1..=3 {
             // Dequeue and fail
-            let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+            let tasks = shard
+                .dequeue("worker-1", "default", 1)
+                .await
+                .expect("dequeue")
+                .tasks;
             let task_id = tasks[0].attempt().task_id().to_string();
             shard
                 .report_attempt_outcome(
-                    "-",
                     &task_id,
                     AttemptOutcome::Error {
                         error_code: "TEMP_ERROR".to_string(),
@@ -602,11 +702,14 @@ async fn multiple_restarts_of_same_job() {
         }
 
         // Finally succeed
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success {
                     result: b"done".to_vec(),

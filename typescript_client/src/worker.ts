@@ -8,13 +8,7 @@ import type {
   RefreshOutcome,
   HeartbeatResult,
 } from "./client";
-
-export { Task };
-
-/**
- * Reason why a task was cancelled.
- */
-export type CancellationReason = "server" | "client" | "worker_shutdown";
+import { TaskExecution } from "./TaskExecution";
 
 /**
  * Context passed to task handlers with utilities for the current task.
@@ -56,155 +50,6 @@ export interface TaskContext {
    * ```
    */
   cancel(): Promise<void>;
-}
-
-/**
- * Internal class to manage the state of a single task execution.
- * Tracks the abort controller, cancellation state, and provides methods
- * to coordinate cancellation from various sources.
- * @internal
- */
-class TaskExecution {
-  /** The task being executed */
-  public readonly task: Task;
-  /** The shard this task came from */
-  public readonly shard: number;
-  /** The worker ID */
-  public readonly workerId: string;
-  /** Tenant for this task */
-  public readonly tenant: string | undefined;
-
-  /** Abort controller for this specific task */
-  private readonly _taskAbortController: AbortController;
-  /** Combined signal that aborts on task cancel OR worker shutdown */
-  private readonly _combinedSignal: AbortSignal;
-  /** Whether the task has been cancelled (by server or client) */
-  private _cancelled: boolean = false;
-  /** The reason for cancellation if cancelled */
-  private _cancellationReason: CancellationReason | undefined;
-  /** Promise resolving when cancel RPC completes (if initiated by client) */
-  private _cancelPromise: Promise<void> | undefined;
-  /** Reference to the client for cancel RPC */
-  private readonly _client: SiloGRPCClient;
-
-  constructor(
-    task: Task,
-    shard: number,
-    workerId: string,
-    tenant: string | undefined,
-    workerAbortSignal: AbortSignal,
-    client: SiloGRPCClient
-  ) {
-    this.task = task;
-    this.shard = shard;
-    this.workerId = workerId;
-    this.tenant = tenant;
-    this._client = client;
-
-    this._taskAbortController = new AbortController();
-
-    // Create a combined signal that aborts when EITHER the task or worker is aborted
-    this._combinedSignal = combineAbortSignals(
-      workerAbortSignal,
-      this._taskAbortController.signal
-    );
-
-    // Track when worker shutdown causes abort
-    workerAbortSignal.addEventListener(
-      "abort",
-      () => {
-        if (!this._cancelled) {
-          this._cancelled = true;
-          this._cancellationReason = "worker_shutdown";
-        }
-      },
-      { once: true }
-    );
-  }
-
-  /** The combined abort signal for this task */
-  get signal(): AbortSignal {
-    return this._combinedSignal;
-  }
-
-  /** Whether this task has been cancelled */
-  get isCancelled(): boolean {
-    return this._cancelled;
-  }
-
-  /** The reason for cancellation, if cancelled */
-  get cancellationReason(): CancellationReason | undefined {
-    return this._cancellationReason;
-  }
-
-  /** Whether the cancellation was due to server-side cancel (should report Cancelled outcome) */
-  get shouldReportCancelled(): boolean {
-    return (
-      this._cancelled &&
-      (this._cancellationReason === "server" ||
-        this._cancellationReason === "client")
-    );
-  }
-
-  /**
-   * Called when heartbeat detects server-side cancellation.
-   * Aborts the task signal immediately.
-   */
-  public markCancelledByServer(): void {
-    if (this._cancelled) return;
-    this._cancelled = true;
-    this._cancellationReason = "server";
-    this._taskAbortController.abort();
-  }
-
-  /**
-   * Cancel this task from the client side.
-   * Calls the server to cancel the job and aborts the task signal.
-   */
-  public async cancelFromClient(): Promise<void> {
-    if (this._cancelled) return;
-
-    this._cancelled = true;
-    this._cancellationReason = "client";
-
-    // Abort the signal immediately so the handler can stop work
-    this._taskAbortController.abort();
-
-    // Call the server to persist the cancellation
-    // We store the promise so we can await it if needed
-    this._cancelPromise = this._client
-      .cancelJob(this.task.jobId, this.tenant)
-      .catch(() => {
-        // Ignore errors - the job may already be cancelled or completed
-      });
-
-    await this._cancelPromise;
-  }
-}
-
-/**
- * Combine multiple abort signals into one that aborts when ANY input signal aborts.
- * @internal
- */
-function combineAbortSignals(...signals: AbortSignal[]): AbortSignal {
-  const controller = new AbortController();
-
-  for (const signal of signals) {
-    if (signal.aborted) {
-      controller.abort();
-      return controller.signal;
-    }
-
-    signal.addEventListener(
-      "abort",
-      () => {
-        controller.abort();
-      },
-      { once: true }
-    );
-  }
-
-  return controller.signal;
 }
 
 /**
@@ -362,7 +207,6 @@ export class SiloWorker {
   private readonly _taskGroup: string;
   private readonly _handler: TaskHandler;
   private readonly _refreshHandler: RefreshHandler | undefined;
-  private readonly _tenant: string | undefined;
   private readonly _concurrentPollers: number;
   private readonly _maxConcurrentTasks: number;
   private readonly _tasksPerPoll: number;
@@ -391,7 +235,6 @@ export class SiloWorker {
     this._taskGroup = options.taskGroup;
     this._handler = options.handler;
     this._refreshHandler = options.refreshHandler;
-    this._tenant = options.tenant;
     this._concurrentPollers = options.concurrentPollers ?? 1;
     this._maxConcurrentTasks = options.maxConcurrentTasks ?? 10;
     this._tasksPerPoll =
@@ -579,7 +422,6 @@ export class SiloWorker {
       task,
       shard,
       this._workerId,
-      this._tenant,
       this._abortController?.signal ?? new AbortController().signal,
       this._client
     );
@@ -697,7 +539,6 @@ export class SiloWorker {
         taskId: execution.task.id,
         shard: execution.shard,
         outcome: { type: "cancelled" },
-        tenant: this._tenant,
       });
       return;
     }
@@ -707,7 +548,6 @@ export class SiloWorker {
       taskId: execution.task.id,
       shard: execution.shard,
       outcome,
-      tenant: this._tenant,
     });
   }
 
@@ -749,7 +589,6 @@ export class SiloWorker {
       taskId: task.id,
       shard,
       outcome,
-      tenant: this._tenant,
     });
   }
 
@@ -766,7 +605,6 @@ export class SiloWorker {
       this._workerId,
       execution.task.id,
       execution.shard,
-      this._tenant
     );
 
     // If the server reports cancellation, mark the execution as cancelled
@@ -779,7 +617,7 @@ export class SiloWorker {
    * Send a heartbeat for a task (for refresh tasks that don't need TaskExecution).
    */
   private async _sendHeartbeat(taskId: string, shard: number): Promise<void> {
-    await this._client.heartbeat(this._workerId, taskId, shard, this._tenant);
+    await this._client.heartbeat(this._workerId, taskId, shard);
   }
 
   /**

@@ -34,23 +34,23 @@ use chrono::Utc;
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
 use kube::{
-    api::{Api, ListParams, Patch, PatchParams, PostParams},
-    runtime::watcher::{watcher, Config as WatcherConfig, Event},
     Client,
+    api::{Api, ListParams, Patch, PatchParams, PostParams},
+    runtime::watcher::{Config as WatcherConfig, Event, watcher},
 };
 use std::collections::{HashMap, HashSet};
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{watch, Mutex, Notify};
+use tokio::sync::{Mutex, Notify, watch};
 use tokio_stream::StreamExt;
 use tracing::{debug, info, warn};
 
 use crate::factory::ShardFactory;
 
 use super::{
-    compute_desired_shards_for_node, get_hostname, keys, CoordinationError, Coordinator,
-    CoordinatorBase, MemberInfo, ShardOwnerMap, ShardPhase,
+    CoordinationError, Coordinator, CoordinatorBase, MemberInfo, ShardOwnerMap, ShardPhase,
+    compute_desired_shards_for_node, get_hostname, keys,
 };
 
 /// Format a chrono DateTime for K8S MicroTime (RFC3339 with microseconds and Z suffix)

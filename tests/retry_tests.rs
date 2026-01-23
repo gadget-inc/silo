@@ -1,4 +1,4 @@
-use silo::retry::{next_retry_time_ms, RetryPolicy};
+use silo::retry::{RetryPolicy, next_retry_time_ms};
 
 #[test]
 fn next_retry_no_retries_returns_none() {

@@ -1,9 +1,10 @@
 use rkyv::Deserialize as RkyvDeserialize;
 use silo::codec::{
-    decode_attempt, decode_concurrency_action, decode_holder, decode_job_status, decode_lease,
-    decode_task, encode_attempt, encode_concurrency_action, encode_holder, encode_job_status,
-    encode_lease, encode_task, CodecError, CONCURRENCY_ACTION_VERSION, HOLDER_RECORD_VERSION,
-    JOB_ATTEMPT_VERSION, JOB_STATUS_VERSION, LEASE_RECORD_VERSION, TASK_VERSION,
+    CONCURRENCY_ACTION_VERSION, CodecError, HOLDER_RECORD_VERSION, JOB_ATTEMPT_VERSION,
+    JOB_STATUS_VERSION, LEASE_RECORD_VERSION, TASK_VERSION, decode_attempt,
+    decode_concurrency_action, decode_holder, decode_job_status, decode_lease, decode_task,
+    encode_attempt, encode_concurrency_action, encode_holder, encode_job_status, encode_lease,
+    encode_task,
 };
 use silo::job::{JobStatus, JobStatusKind};
 use silo::job_attempt::{AttemptStatus, JobAttempt};

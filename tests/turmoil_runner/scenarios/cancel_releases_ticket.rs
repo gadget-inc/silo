@@ -237,7 +237,6 @@ pub fn run() {
                             shard: 0,
                             worker_id: "worker-1".into(),
                             task_id: task_id.clone(),
-                            tenant: None,
                         }))
                         .await;
 
@@ -260,7 +259,6 @@ pub fn run() {
                                 match client
                                     .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                                         shard: 0,
-                                        tenant: None,
                                         task_id: task_id.clone(),
                                         outcome: Some(report_outcome_request::Outcome::Cancelled(
                                             silo::pb::Cancelled {},
@@ -302,7 +300,6 @@ pub fn run() {
                         match client
                             .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                                 shard: 0,
-                                tenant: None,
                                 task_id: task_id.clone(),
                                 outcome: Some(report_outcome_request::Outcome::Success(
                                     MsgpackBytes {

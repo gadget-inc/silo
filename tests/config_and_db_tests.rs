@@ -2,8 +2,8 @@ use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::job_store_shard::JobStoreShard;
 use silo::settings::{
-    expand_env_vars_for_test, AppConfig, Backend, DatabaseConfig, DatabaseTemplate,
-    GubernatorSettings, LoggingConfig, WalConfig, WebUiConfig,
+    AppConfig, Backend, DatabaseConfig, DatabaseTemplate, GubernatorSettings, LoggingConfig,
+    WalConfig, WebUiConfig, expand_env_vars_for_test,
 };
 use silo::storage::resolve_object_store;
 

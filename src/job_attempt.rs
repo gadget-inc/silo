@@ -2,7 +2,7 @@ use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
 
-use crate::codec::{decode_attempt, CodecError, DecodedAttempt};
+use crate::codec::{CodecError, DecodedAttempt, decode_attempt};
 use crate::job_store_shard::JobStoreShardError;
 
 fn codec_error_to_shard_error(e: CodecError) -> JobStoreShardError {
@@ -12,8 +12,13 @@ fn codec_error_to_shard_error(e: CodecError) -> JobStoreShardError {
 /// Outcome passed by callers when reporting an attempt's completion.
 #[derive(Debug, Clone)]
 pub enum AttemptOutcome {
-    Success { result: Vec<u8> },
-    Error { error_code: String, error: Vec<u8> },
+    Success {
+        result: Vec<u8>,
+    },
+    Error {
+        error_code: String,
+        error: Vec<u8>,
+    },
     /// Worker acknowledges cancellation after discovering it via heartbeat.
     /// This is the clean shutdown path where worker reports it has stopped work.
     Cancelled,

@@ -47,8 +47,8 @@ export {
   type TaskHandler,
   type RefreshTaskContext,
   type RefreshHandler,
-  type CancellationReason,
 } from "./worker";
+export { type CancellationReason } from "./TaskExecution";
 export { JobHandle } from "./JobHandle";
 export type {
   QueryResponse,

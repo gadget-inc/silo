@@ -1,11 +1,11 @@
 mod test_helpers;
 
-use silo::codec::{decode_lease};
 use rkyv::Archive;
+use silo::codec::decode_lease;
 use silo::job::JobStatusKind;
 use silo::job_attempt::{AttemptOutcome, AttemptStatus};
 use silo::job_store_shard::JobStoreShardError;
-use silo::task::{Task};
+use silo::task::Task;
 
 use test_helpers::*;
 
@@ -19,10 +19,24 @@ async fn dequeue_moves_tasks_to_leased_with_uuid() {
         let now_ms = now_ms();
 
         let job_id = shard
-            .enqueue("-", None, priority, now_ms, None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                priority,
+                now_ms,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         assert_eq!(tasks.len(), 1);
         // Job status should transition to Running after dequeue
         let status = shard
@@ -88,11 +102,25 @@ async fn heartbeat_renews_lease_when_worker_matches() {
         let now_ms = now_ms();
 
         let _job_id = shard
-            .enqueue("-", None, priority, now_ms, None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                priority,
+                now_ms,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         assert_eq!(tasks.len(), 1);
         let task_id = tasks[0].attempt().task_id().to_string();
 
@@ -107,7 +135,7 @@ async fn heartbeat_renews_lease_when_worker_matches() {
 
         // Heartbeat to renew
         shard
-            .heartbeat_task("-", "worker-1", &task_id)
+            .heartbeat_task("worker-1", &task_id)
             .await
             .expect("heartbeat ok");
 
@@ -136,16 +164,30 @@ async fn heartbeat_rejects_mismatched_worker() {
         let now_ms = now_ms();
 
         let _job_id = shard
-            .enqueue("-", None, priority, now_ms, None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                priority,
+                now_ms,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         assert_eq!(tasks.len(), 1);
         let task_id = tasks[0].attempt().task_id().to_string();
 
         let err = shard
-            .heartbeat_task("-", "worker-2", &task_id)
+            .heartbeat_task("worker-2", &task_id)
             .await
             .expect_err("heartbeat should fail");
 
@@ -172,14 +214,27 @@ async fn heartbeat_after_outcome_returns_lease_not_found() {
         let priority = 10u8;
         let now = now_ms();
         let _job_id = shard
-            .enqueue("-", None, priority, now, None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                priority,
+                now,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
-        let tasks = shard.dequeue("worker-1", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success {
                     result: b"ok".to_vec(),
@@ -188,7 +243,7 @@ async fn heartbeat_after_outcome_returns_lease_not_found() {
             .await
             .expect("report ok");
         let err = shard
-            .heartbeat_task("-", "worker-1", &task_id)
+            .heartbeat_task("worker-1", &task_id)
             .await
             .expect_err("hb should fail");
         match err {
@@ -209,7 +264,11 @@ async fn reap_ignores_unexpired_leases() {
         .await
         .expect("enqueue");
 
-    let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
+    let tasks = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
     let _task_id = tasks[0].attempt().task_id().to_string();
 
     // Do not mutate the lease; it should not be reaped
@@ -249,7 +308,17 @@ async fn delete_job_before_dequeue_skips_task_and_no_lease_created() {
     let now_ms = now_ms();
 
     let job_id = shard
-        .enqueue("-", None, priority, now_ms, None, payload, vec![], None, "default")
+        .enqueue(
+            "-",
+            None,
+            priority,
+            now_ms,
+            None,
+            payload,
+            vec![],
+            None,
+            "default",
+        )
         .await
         .expect("enqueue");
 
@@ -258,11 +327,14 @@ async fn delete_job_before_dequeue_skips_task_and_no_lease_created() {
     assert_eq!(peek.len(), 1);
 
     // Dequeue and complete the job first
-    let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
+    let tasks = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
     assert_eq!(tasks.len(), 1);
     shard
         .report_attempt_outcome(
-            "-",
             tasks[0].attempt().task_id(),
             AttemptOutcome::Success { result: vec![] },
         )
@@ -292,7 +364,17 @@ async fn dequeue_gracefully_handles_missing_job_info() {
     let now_ms = now_ms();
 
     let job_id = shard
-        .enqueue("-", None, priority, now_ms, None, payload, vec![], None, "default")
+        .enqueue(
+            "-",
+            None,
+            priority,
+            now_ms,
+            None,
+            payload,
+            vec![],
+            None,
+            "default",
+        )
         .await
         .expect("enqueue");
 
@@ -316,7 +398,11 @@ async fn dequeue_gracefully_handles_missing_job_info() {
 
     // Dequeue should gracefully skip the task (since job missing) and return nothing
     // This tests graceful degradation when database is in an inconsistent state
-    let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
+    let tasks = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
     assert!(
         tasks.is_empty(),
         "no tasks should be returned when job info missing"
@@ -337,4 +423,3 @@ async fn dequeue_gracefully_handles_missing_job_info() {
         "no lease should be created for orphaned task"
     );
 }
-

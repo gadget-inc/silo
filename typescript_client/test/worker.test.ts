@@ -441,13 +441,8 @@ describe("SiloWorker", () => {
       await worker.stop();
 
       // Should have sent multiple heartbeats
-      // heartbeat(workerId, taskId, shard, tenant)
-      expect(heartbeat).toHaveBeenCalledWith(
-        "test-worker",
-        "task-hb",
-        0,
-        undefined
-      );
+      // heartbeat(workerId, taskId, shard)
+      expect(heartbeat).toHaveBeenCalledWith("test-worker", "task-hb", 0);
       expect(heartbeat.mock.calls.length).toBeGreaterThanOrEqual(2);
     });
 

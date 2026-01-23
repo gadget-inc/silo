@@ -25,10 +25,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
+use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use prometheus::{
-    core::Collector, Counter, CounterVec, Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec,
-    Opts, Registry, TextEncoder,
+    Counter, CounterVec, Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry,
+    TextEncoder, core::Collector,
 };
 use slatedb::stats::StatRegistry;
 use tokio::sync::broadcast;

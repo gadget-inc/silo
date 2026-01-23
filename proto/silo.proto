@@ -262,10 +262,10 @@ message LeaseTasksResponse {
 }
 
 // Request to report the outcome of a completed task.
+// Note: tenant is determined from the task lease, not from the request.
 message ReportOutcomeRequest {
   uint32 shard = 1;          // Shard the task came from.
   string task_id = 2;        // The task's unique ID.
-  optional string tenant = 5; // Tenant ID if multi-tenancy is enabled.
   oneof outcome {
     MsgpackBytes success = 3;   // Job succeeded. Contains result data (MessagePack).
     Failure failure = 4;        // Job failed. Contains error details.
@@ -286,10 +286,10 @@ message Cancelled {}
 message ReportOutcomeResponse {}
 
 // Request to report the outcome of a floating limit refresh task.
+// Note: tenant is determined from the task lease, not from the request.
 message ReportRefreshOutcomeRequest {
   uint32 shard = 1;          // Shard the task came from.
   string task_id = 2;        // The task's unique ID.
-  optional string tenant = 3; // Tenant ID if multi-tenancy is enabled.
   oneof outcome {
     RefreshSuccess success = 4; // Refresh succeeded with new max concurrency.
     RefreshFailure failure = 5; // Refresh failed.
@@ -312,11 +312,11 @@ message ReportRefreshOutcomeResponse {}
 
 // Request to extend a task lease and check for cancellation.
 // Workers must heartbeat before lease_ms expires to keep the task.
+// Note: tenant is determined from the task lease, not from the request.
 message HeartbeatRequest {
   uint32 shard = 1;          // Shard the task came from.
   string worker_id = 2;      // Worker ID that holds the lease.
   string task_id = 3;        // The task's unique ID.
-  optional string tenant = 4; // Tenant ID if multi-tenancy is enabled.
 }
 
 // Response indicating if the lease was extended and if the job was cancelled.

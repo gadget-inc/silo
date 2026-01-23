@@ -37,8 +37,8 @@ async fn create_gubernator_client() -> Arc<GubernatorClient> {
 }
 
 /// Open a temp shard with the real Gubernator client
-async fn open_shard_with_gubernator(
-) -> (tempfile::TempDir, Arc<JobStoreShard>, Arc<GubernatorClient>) {
+async fn open_shard_with_gubernator()
+-> (tempfile::TempDir, Arc<JobStoreShard>, Arc<GubernatorClient>) {
     let gubernator = create_gubernator_client().await;
     let tmp = tempfile::tempdir().unwrap();
     let cfg = DatabaseConfig {
@@ -134,7 +134,11 @@ async fn rate_limit_single_dequeue_returns_task() {
     // 1. Process the CheckRateLimit task internally
     // 2. Insert the RunAttempt task into the broker
     // 3. Claim and return the RunAttempt in the same call
-    let tasks = shard.dequeue("worker1", "default", 1).await.expect("dequeue").tasks;
+    let tasks = shard
+        .dequeue("worker1", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
 
     assert_eq!(
         tasks.len(),
@@ -168,7 +172,11 @@ async fn rate_limit_passes_and_job_becomes_runnable() {
         .expect("enqueue");
 
     // Single dequeue - internal loop processes CheckRateLimit and returns RunAttempt
-    let tasks = shard.dequeue("worker1", "default", 1).await.expect("dequeue").tasks;
+    let tasks = shard
+        .dequeue("worker1", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
 
     assert_eq!(tasks.len(), 1, "should get one runnable task");
     assert_eq!(tasks[0].job().id(), job_id);
@@ -231,7 +239,11 @@ async fn rate_limit_exceeded_then_passes_after_window() {
         .expect("enqueue");
 
     // First few dequeues should return nothing (rate limited)
-    let _tasks = shard.dequeue("worker1", "default", 1).await.expect("dequeue1").tasks;
+    let _tasks = shard
+        .dequeue("worker1", "default", 1)
+        .await
+        .expect("dequeue1")
+        .tasks;
     // May or may not be empty depending on timing
 
     // Wait for the rate limit window to reset, then retry
@@ -268,7 +280,11 @@ async fn multiple_rate_limits_acquired_in_order() {
         .expect("enqueue");
 
     // Single dequeue - internal loop processes both rate limits and returns RunAttempt
-    let tasks = shard.dequeue("worker1", "default", 1).await.expect("dequeue").tasks;
+    let tasks = shard
+        .dequeue("worker1", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
 
     assert_eq!(tasks.len(), 1, "should get task after all rate limits pass");
     assert_eq!(tasks[0].job().id(), job_id);
@@ -305,7 +321,11 @@ async fn concurrency_then_rate_limit_acquired_in_order() {
         .expect("enqueue");
 
     // Single dequeue - internal loop acquires concurrency ticket, then checks rate limit
-    let tasks = shard.dequeue("worker1", "default", 1).await.expect("dequeue").tasks;
+    let tasks = shard
+        .dequeue("worker1", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
 
     assert_eq!(tasks.len(), 1, "should get runnable task");
     assert_eq!(tasks[0].job().id(), job_id);
@@ -313,7 +333,7 @@ async fn concurrency_then_rate_limit_acquired_in_order() {
     // Complete the task
     let task_id = tasks[0].attempt().task_id().to_string();
     shard
-        .report_attempt_outcome("-", &task_id, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report success");
 }
@@ -349,7 +369,11 @@ async fn rate_limit_then_concurrency_acquired_in_order() {
         .expect("enqueue");
 
     // Single dequeue - internal loop checks rate limit first, then acquires concurrency
-    let tasks = shard.dequeue("worker1", "default", 1).await.expect("dequeue").tasks;
+    let tasks = shard
+        .dequeue("worker1", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
 
     assert_eq!(tasks.len(), 1, "should get runnable task");
     assert_eq!(tasks[0].job().id(), job_id);
@@ -357,7 +381,7 @@ async fn rate_limit_then_concurrency_acquired_in_order() {
     // Complete the task
     let task_id = tasks[0].attempt().task_id().to_string();
     shard
-        .report_attempt_outcome("-", &task_id, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report success");
 }
@@ -413,19 +437,27 @@ async fn concurrency_blocked_with_rate_limit_pending() {
         .expect("enqueue job2");
 
     // Single dequeue - only job1 should be runnable (job2 blocked on concurrency)
-    let tasks = shard.dequeue("worker1", "default", 2).await.expect("dequeue").tasks;
+    let tasks = shard
+        .dequeue("worker1", "default", 2)
+        .await
+        .expect("dequeue")
+        .tasks;
     assert_eq!(tasks.len(), 1, "only one task should be runnable");
     assert_eq!(tasks[0].job().id(), job1_id);
 
     // Complete job1
     let task_id = tasks[0].attempt().task_id().to_string();
     shard
-        .report_attempt_outcome("-", &task_id, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("complete job1");
 
     // Now job2 should become runnable - single dequeue handles internal processing
-    let tasks2 = shard.dequeue("worker1", "default", 1).await.expect("dequeue2").tasks;
+    let tasks2 = shard
+        .dequeue("worker1", "default", 1)
+        .await
+        .expect("dequeue2")
+        .tasks;
     assert_eq!(tasks2.len(), 1, "job2 should now be runnable");
 }
 
@@ -464,14 +496,18 @@ async fn three_limits_concurrency_rate_concurrency() {
         .await
         .expect("enqueue");
 
-    let tasks = shard.dequeue("worker1", "default", 1).await.expect("dequeue").tasks;
+    let tasks = shard
+        .dequeue("worker1", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].job().id(), job_id);
 
     // Complete and verify cleanup
     let task_id = tasks[0].attempt().task_id().to_string();
     shard
-        .report_attempt_outcome("-", &task_id, AttemptOutcome::Success { result: vec![] })
+        .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("complete");
 }
@@ -507,7 +543,7 @@ async fn rate_limit_counts_hits_correctly() {
                 test_helpers::msgpack_payload(&serde_json::json!({"job": i})),
                 vec![Limit::RateLimit(rate_limit.clone())],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue");
@@ -515,7 +551,11 @@ async fn rate_limit_counts_hits_correctly() {
     }
 
     // Single dequeue - all 5 jobs should be processed (each consumes 1 hit)
-    let tasks = shard.dequeue("worker1", "default", 5).await.expect("dequeue").tasks;
+    let tasks = shard
+        .dequeue("worker1", "default", 5)
+        .await
+        .expect("dequeue")
+        .tasks;
     assert_eq!(tasks.len(), 5, "all 5 jobs should pass rate limit");
 
     // Verify the rate limit is now exhausted by checking directly

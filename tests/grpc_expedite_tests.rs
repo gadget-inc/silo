@@ -64,7 +64,10 @@ async fn grpc_expedite_future_scheduled_job() -> anyhow::Result<()> {
             })
             .await?
             .into_inner();
-        assert!(lease_resp.tasks.is_empty(), "future job should not be leased yet");
+        assert!(
+            lease_resp.tasks.is_empty(),
+            "future job should not be leased yet"
+        );
 
         // Expedite the job
         client
@@ -94,7 +97,6 @@ async fn grpc_expedite_future_scheduled_job() -> anyhow::Result<()> {
             .report_outcome(ReportOutcomeRequest {
                 shard: 0,
                 task_id: task.id.clone(),
-                tenant: None,
                 outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
                     data: rmp_serde::to_vec(&serde_json::json!("expedited success")).unwrap(),
                 })),
@@ -232,7 +234,6 @@ async fn grpc_expedite_running_job_fails() -> anyhow::Result<()> {
             .report_outcome(ReportOutcomeRequest {
                 shard: 0,
                 task_id: task.id.clone(),
-                tenant: None,
                 outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
                     data: rmp_serde::to_vec(&serde_json::json!("done")).unwrap(),
                 })),

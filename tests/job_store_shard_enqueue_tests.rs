@@ -182,11 +182,14 @@ async fn delete_job_removes_key_and_is_idempotent() {
     assert!(shard.get_job("-", &id).await.expect("get_job").is_some());
 
     // Complete the job first (can't delete while scheduled/running)
-    let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
+    let tasks = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
     assert_eq!(tasks.len(), 1);
     shard
         .report_attempt_outcome(
-            "-",
             tasks[0].attempt().task_id(),
             AttemptOutcome::Success { result: vec![] },
         )
@@ -217,7 +220,17 @@ async fn peek_omits_future_scheduled_tasks() {
     let future_ms = now_ms + 60_000;
 
     let _ = shard
-        .enqueue("-", None, priority, future_ms, None, payload_bytes, vec![], None, "default")
+        .enqueue(
+            "-",
+            None,
+            priority,
+            future_ms,
+            None,
+            payload_bytes,
+            vec![],
+            None,
+            "default",
+        )
         .await
         .expect("enqueue");
 
@@ -308,10 +321,24 @@ async fn cannot_delete_running_job() {
         let priority = 10u8;
         let now = now_ms();
         let job_id = shard
-            .enqueue("-", None, priority, now, None, payload_bytes, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                priority,
+                now,
+                None,
+                payload_bytes,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
-        let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("w", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
 
         // Attempt to delete while running - should fail
@@ -327,7 +354,6 @@ async fn cannot_delete_running_job() {
         // Complete the job
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success {
                     result: b"ok".to_vec(),
@@ -356,7 +382,17 @@ async fn cannot_delete_scheduled_job() {
         let priority = 10u8;
         let now = now_ms();
         let job_id = shard
-            .enqueue("-", None, priority, now, None, payload_bytes, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                priority,
+                now,
+                None,
+                payload_bytes,
+                vec![],
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
@@ -379,11 +415,14 @@ async fn cannot_delete_scheduled_job() {
         }
 
         // Complete the job first
-        let tasks = shard.dequeue("w", "default", 1).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("w", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
         shard
             .report_attempt_outcome(
-                "-",
                 &task_id,
                 AttemptOutcome::Success {
                     result: b"ok".to_vec(),
@@ -417,7 +456,7 @@ async fn priority_ordering_when_start_times_equal() {
                 test_helpers::msgpack_payload(&serde_json::json!({"j": "hi"})),
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue hi");
@@ -431,13 +470,17 @@ async fn priority_ordering_when_start_times_equal() {
                 test_helpers::msgpack_payload(&serde_json::json!({"j": "lo"})),
                 vec![],
                 None,
-            "default",
+                "default",
             )
             .await
             .expect("enqueue lo");
 
         // Dequeue two tasks; with equal times, lower priority number should come first
-        let tasks = shard.dequeue("w", "default", 2).await.expect("dequeue").tasks;
+        let tasks = shard
+            .dequeue("w", "default", 2)
+            .await
+            .expect("dequeue")
+            .tasks;
         assert_eq!(tasks.len(), 2);
         let t1 = &tasks[0];
         let t2 = &tasks[1];

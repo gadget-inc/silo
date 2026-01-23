@@ -2,7 +2,7 @@ default:
     @just --list
 
 fmt:
-    cargo clippy --fix --allow-dirty && rustfmt --edition=2021 **/*.rs
+    cargo clippy --fix --allow-dirty && rustfmt --edition=2024 **/*.rs
 
 run *ARGS:
     cargo run {{ARGS}}

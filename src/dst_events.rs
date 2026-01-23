@@ -11,10 +11,7 @@
 #[derive(Debug, Clone)]
 pub enum DstEvent {
     /// A job was successfully enqueued.
-    JobEnqueued {
-        tenant: String,
-        job_id: String,
-    },
+    JobEnqueued { tenant: String, job_id: String },
 
     /// A job's status changed.
     JobStatusChanged {
@@ -77,9 +74,7 @@ pub fn emit(_event: DstEvent) {
 /// Drain all pending DST events. Returns empty vec when `dst` feature is disabled.
 #[cfg(feature = "dst")]
 pub fn drain_events() -> Vec<DstEvent> {
-    DST_EVENTS.with(|events| {
-        std::mem::take(&mut *events.borrow_mut())
-    })
+    DST_EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
 }
 
 /// Drain all pending DST events. Returns empty vec when `dst` feature is disabled.

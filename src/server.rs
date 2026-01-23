@@ -5,8 +5,8 @@ use rand::seq::SliceRandom;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
-use tokio_stream::wrappers::TcpListenerStream;
 use tokio_stream::Stream;
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
 use tonic_health::server::health_reporter;
 use tonic_reflection::server::Builder as ReflectionBuilder;
@@ -269,20 +269,20 @@ impl SiloService {
         let owned_shards = coord.owned_shards().await;
         let members = coord.get_members().await.ok();
 
-        if let Some(computed_owner_node) = owner_map.shard_to_node.get(&shard_id) {
-            if computed_owner_node == this_node_id {
-                // We're computed to own this shard but don't have it locally
-                tracing::warn!(
-                    shard_id,
-                    node_id = %this_node_id,
-                    owned_shards = ?owned_shards,
-                    members = ?members.as_ref().map(|m| m.iter().map(|mi| &mi.node_id).collect::<Vec<_>>()),
-                    "shard not ready: this node is computed owner but shard not yet acquired"
-                );
-                return Err(Status::unavailable(
-                    "shard not ready: acquisition in progress",
-                ));
-            }
+        if let Some(computed_owner_node) = owner_map.shard_to_node.get(&shard_id)
+            && computed_owner_node == this_node_id
+        {
+            // We're computed to own this shard but don't have it locally
+            tracing::warn!(
+                shard_id,
+                node_id = %this_node_id,
+                owned_shards = ?owned_shards,
+                members = ?members.as_ref().map(|m| m.iter().map(|mi| &mi.node_id).collect::<Vec<_>>()),
+                "shard not ready: this node is computed owner but shard not yet acquired"
+            );
+            return Err(Status::unavailable(
+                "shard not ready: acquisition in progress",
+            ));
         }
 
         // Log details about the routing mismatch to help diagnose production issues
@@ -310,10 +310,10 @@ impl SiloService {
             );
         }
 
-        if let Some(node) = owner_map.shard_to_node.get(&shard_id) {
-            if let Ok(val) = node.parse() {
-                metadata.insert(SHARD_OWNER_NODE_METADATA_KEY, val);
-            }
+        if let Some(node) = owner_map.shard_to_node.get(&shard_id)
+            && let Ok(val) = node.parse()
+        {
+            metadata.insert(SHARD_OWNER_NODE_METADATA_KEY, val);
         }
 
         Err(status)
@@ -799,10 +799,10 @@ impl Silo for SiloService {
             }
 
             // Record dequeue metrics per shard
-            if let Some(ref m) = self.metrics {
-                if tasks_added > 0 {
-                    m.record_dequeue(&shard_str, &r.task_group, tasks_added as u64);
-                }
+            if let Some(ref m) = self.metrics
+                && tasks_added > 0
+            {
+                m.record_dequeue(&shard_str, &r.task_group, tasks_added as u64);
             }
 
             remaining = remaining.saturating_sub(tasks_added);
@@ -821,7 +821,6 @@ impl Silo for SiloService {
         let r = req.into_inner();
         let shard_str = r.shard.to_string();
         let shard = self.shard_with_redirect(r.shard).await?;
-        let tenant = self.validate_tenant(r.tenant.as_deref())?;
         let (outcome, status_str) = match r
             .outcome
             .ok_or_else(|| Status::invalid_argument("missing outcome"))?
@@ -841,7 +840,7 @@ impl Silo for SiloService {
             }
         };
         shard
-            .report_attempt_outcome(&tenant, &r.task_id, outcome)
+            .report_attempt_outcome(&r.task_id, outcome)
             .await
             .map_err(map_err)?;
 
@@ -859,7 +858,7 @@ impl Silo for SiloService {
     ) -> Result<Response<ReportRefreshOutcomeResponse>, Status> {
         let r = req.into_inner();
         let shard = self.shard_with_redirect(r.shard).await?;
-        let tenant = self.validate_tenant(r.tenant.as_deref())?;
+        // Tenant is extracted from the lease on the server side, not from the request
         let outcome = r
             .outcome
             .ok_or_else(|| Status::invalid_argument("missing outcome"))?;
@@ -867,13 +866,13 @@ impl Silo for SiloService {
         match outcome {
             report_refresh_outcome_request::Outcome::Success(s) => {
                 shard
-                    .report_refresh_success(&tenant, &r.task_id, s.new_max_concurrency)
+                    .report_refresh_success(&r.task_id, s.new_max_concurrency)
                     .await
                     .map_err(map_err)?;
             }
             report_refresh_outcome_request::Outcome::Failure(f) => {
                 shard
-                    .report_refresh_failure(&tenant, &r.task_id, &f.code, &f.message)
+                    .report_refresh_failure(&r.task_id, &f.code, &f.message)
                     .await
                     .map_err(map_err)?;
             }
@@ -887,9 +886,9 @@ impl Silo for SiloService {
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let r = req.into_inner();
         let shard = self.shard_with_redirect(r.shard).await?;
-        let tenant = self.validate_tenant(r.tenant.as_deref())?;
+        // Tenant is extracted from the lease on the server side, not from the request
         let result = shard
-            .heartbeat_task(&tenant, &r.worker_id, &r.task_id)
+            .heartbeat_task(&r.worker_id, &r.task_id)
             .await
             .map_err(map_err)?;
         Ok(Response::new(HeartbeatResponse {
