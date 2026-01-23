@@ -305,7 +305,6 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       await client.reportOutcome({
         shard: task!.shard,
         taskId: task!.id,
-        tenant,
         outcome: {
           type: "success",
           result: { processed: true, output: "done" },
@@ -347,7 +346,6 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       await client.reportOutcome({
         shard: task!.shard,
         taskId: task!.id,
-        tenant,
         outcome: {
           type: "failure",
           code: "PROCESSING_ERROR",
@@ -381,12 +379,11 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       const task = result.tasks.find((t) => t.jobId === handle.id);
       expect(task).toBeDefined();
 
-      await client.heartbeat("test-worker-3", task!.id, task!.shard, tenant);
+      await client.heartbeat("test-worker-3", task!.id, task!.shard);
 
       await client.reportOutcome({
         shard: task!.shard,
         taskId: task!.id,
-        tenant,
         outcome: { type: "success", result: {} },
       });
     });
@@ -429,7 +426,6 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       await client.reportOutcome({
         shard: task!.shard,
         taskId: task!.id,
-        tenant,
         outcome: { type: "success", result: {} },
       });
 
@@ -494,7 +490,6 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       await client.reportOutcome({
         shard: task!.shard,
         taskId: task!.id,
-        tenant,
         outcome: { type: "success", result: { expedited: true } },
       });
 
@@ -551,7 +546,6 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       await client.reportOutcome({
         shard: task!.shard,
         taskId: task!.id,
-        tenant,
         outcome: { type: "success", result: {} },
       });
     });
@@ -771,7 +765,6 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       await client.reportOutcome({
         shard: task!.shard,
         taskId: task!.id,
-        tenant,
         outcome: { type: "success", result: {} },
       });
 
@@ -814,7 +807,6 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       await client.reportOutcome({
         shard: task!.shard,
         taskId: task!.id,
-        tenant,
         outcome: { type: "success", result: resultData },
       });
 
@@ -859,7 +851,6 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       await client.reportOutcome({
         shard: task!.shard,
         taskId: task!.id,
-        tenant,
         outcome: {
           type: "failure",
           code: "TEST_ERROR",
@@ -999,7 +990,6 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       await client.reportRefreshOutcome({
         taskId: refreshTask!.id,
         shard: refreshTask!.shard,
-        tenant,
         outcome: {
           type: "success",
           newMaxConcurrency: 10,
@@ -1011,7 +1001,6 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         await client.reportOutcome({
           taskId: task.id,
           shard: task.shard,
-          tenant,
           outcome: { type: "success", result: {} },
         });
       }
@@ -1075,7 +1064,6 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       await client.reportRefreshOutcome({
         taskId: refreshTask!.id,
         shard: refreshTask!.shard,
-        tenant,
         outcome: {
           type: "failure",
           code: "API_UNAVAILABLE",
@@ -1090,7 +1078,6 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         await client.reportOutcome({
           taskId: task.id,
           shard: task.shard,
-          tenant,
           outcome: { type: "success", result: {} },
         });
       }
@@ -1141,7 +1128,6 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         await client.reportOutcome({
           taskId: task.id,
           shard: task.shard,
-          tenant,
           outcome: { type: "success", result: {} },
         });
       }

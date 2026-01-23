@@ -568,8 +568,6 @@ export interface ReportOutcomeOptions {
   shard: number;
   /** The outcome of the task */
   outcome: TaskOutcome;
-  /** Tenant ID. Required when server has tenancy enabled. */
-  tenant?: string;
 }
 
 /**
@@ -624,8 +622,6 @@ export interface ReportRefreshOutcomeOptions {
   shard: number;
   /** The outcome of the refresh */
   outcome: RefreshOutcome;
-  /** Tenant ID. Required when server has tenancy enabled. */
-  tenant?: string;
 }
 
 /** Result from a heartbeat request */
@@ -1512,7 +1508,6 @@ export class SiloGRPCClient {
         {
           shard: options.shard,
           taskId: options.taskId,
-          tenant: options.tenant,
           outcome,
         },
         this._rpcOptions()
@@ -1561,7 +1556,6 @@ export class SiloGRPCClient {
         {
           shard: options.shard,
           taskId: options.taskId,
-          tenant: options.tenant,
           outcome,
         },
         this._rpcOptions()
@@ -1579,15 +1573,13 @@ export class SiloGRPCClient {
    * @param workerId The worker ID that owns the task.
    * @param taskId   The task ID.
    * @param shard    The shard the task came from (from Task.shard).
-   * @param tenant   The tenant ID (required when tenancy is enabled).
    * @returns HeartbeatResult indicating if the job was cancelled.
    * @throws TaskNotFoundError if the task (lease) doesn't exist.
    */
   public async heartbeat(
     workerId: string,
     taskId: string,
-    shard: number,
-    tenant?: string
+    shard: number
   ): Promise<HeartbeatResult> {
     try {
       const client = this._getClientForShard(shard);
@@ -1596,7 +1588,6 @@ export class SiloGRPCClient {
           shard,
           workerId,
           taskId,
-          tenant,
         },
         this._rpcOptions()
       );

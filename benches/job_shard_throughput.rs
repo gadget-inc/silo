@@ -117,7 +117,6 @@ async fn measure_dequeue_throughput(
                     let tid = t.attempt().task_id().to_string();
                     shard
                         .report_attempt_outcome(
-                            "-",
                             &tid,
                             silo::job_attempt::AttemptOutcome::Success { result: Vec::new() },
                         )
