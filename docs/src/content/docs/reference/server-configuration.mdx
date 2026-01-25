@@ -1,6 +1,387 @@
 ---
 title: Server Configuration
+description: Complete reference for Silo server configuration options
 ---
 
-- document configuration format
-- link to slatedb's compaction
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Silo is configured using a TOML configuration file. You can specify the configuration file path using the `-c` or `--config` CLI flag:
+
+```bash
+silo -c /path/to/config.toml
+```
+
+If no configuration file is specified, Silo uses sensible defaults suitable for local development.
+
+## CLI Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `-c`, `--config <path>` | Path to a TOML configuration file |
+| `-v` | Enable verbose output |
+
+## Validating your config
+
+Validate your configuration without starting the server using the `validate-config` subcommand:
+
+```bash
+silo validate-config -c config.toml 
+```
+
+## Server Configuration
+
+The `[server]` section configures the main gRPC server.
+
+```toml
+[server]
+grpc_addr = "127.0.0.1:50051"
+dev_mode = false
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `grpc_addr` | string | `"127.0.0.1:50051"` | Address and port for the gRPC server to listen on |
+| `dev_mode` | bool | `false` | Enable development mode features like `ResetShards` RPC. **Never enable in production.** |
+
+<Aside type="danger">
+`dev_mode` allows destructive operations like resetting shard data. Only enable this for local development and testing.
+</Aside>
+
+---
+
+## Database Configuration
+
+The `[database]` section configures how Silo stores job data. Silo uses [SlateDB](https://slatedb.io/) as its embedded database, which stores data in object storage.
+
+```toml
+[database]
+backend = "gcs"
+path = "gs://my-bucket/silo/data-%shard%"
+apply_wal_on_close = true
+
+# Optional: separate WAL storage
+[database.wal]
+backend = "fs"
+path = "/var/lib/silo/wal-%shard%"
+```
+
+### Database Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `backend` | string | `"fs"` | Storage backend type (see below) |
+| `path` | string | `"/tmp/silo-%shard%"` | Path or URL for data storage. Use `%shard%` as a placeholder for the shard number. |
+| `apply_wal_on_close` | bool | `true` | Flush WAL to object storage before closing shards (recommended for durability) |
+
+### Storage Backends
+
+| Backend | Description | Path Format |
+|---------|-------------|-------------|
+| `fs` | Local filesystem | `/var/lib/silo/data-%shard%` |
+| `s3` | Amazon S3 | `s3://bucket-name/prefix-%shard%` |
+| `gcs` | Google Cloud Storage | `gs://bucket-name/prefix-%shard%` |
+| `memory` | In-memory (testing only) | Any string |
+| `url` | Generic URL-based object store | URL understood by SlateDB |
+
+### Cloud Storage Authentication
+
+For S3 and GCS backends, Silo uses the standard credential chain:
+
+- **S3**: AWS credential chain (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, instance profiles, etc.)
+- **GCS**: `GOOGLE_APPLICATION_CREDENTIALS` environment variable or GKE Workload Identity
+
+### WAL Configuration
+
+By default, the Write-Ahead Log (WAL) uses the same backend and location as the main data store. For better write performance, you can configure a separate local WAL:
+
+```toml
+[database]
+backend = "gcs"
+path = "gs://my-bucket/silo/data-%shard%"
+
+[database.wal]
+backend = "fs"
+path = "/var/lib/silo/wal-%shard%"
+```
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `backend` | string | Storage backend for WAL |
+| `path` | string | Path for WAL storage (supports `%shard%` placeholder) |
+
+When using a local WAL with cloud object storage:
+- Writes are faster because they go to local disk first
+- On shard close (or node shutdown), WAL is flushed to object storage to ensure durabiliy
+- The local WAL directory is deleted after successful flush
+
+#### `apply_wal_on_close`
+
+When running on pure object storage, your Silo instances don't necessarily need to apply the WAL to the rest of the storage before shutting down. But, when running with a split WAL, where the WAL is not on object storage, you should apply the WAL to the rest of the storage before shutting down to ensure durability. `apply_wal_on_close` is set to `true` by default, which triggers this behavior.
+
+### SlateDB Configuration
+
+Silo uses SlateDB for storage, which has additional configuration options for compaction, caching, and performance tuning. While Silo doesn't expose all SlateDB options directly, you can refer to the [SlateDB Configuration Documentation](https://slatedb.io/docs/reference/configuration) for details on how the underlying storage engine works.
+
+Currently exposed SlateDB options:
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `flush_interval_ms` | number | SlateDB default | Interval for flushing memtable to SSTs (internal use only) |
+
+<Aside>
+Most SlateDB options use sensible defaults. The `flush_interval_ms` option is primarily used for testing and simulation scenarios.
+</Aside>
+
+---
+
+## Coordination Configuration
+
+The `[coordination]` section configures how Silo nodes discover each other and coordinate shard ownership in a cluster.
+
+```toml
+[coordination]
+backend = "etcd"
+cluster_prefix = "silo-prod"
+num_shards = 8
+lease_ttl_secs = 10
+```
+
+### Coordination Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `backend` | string | `"none"` | Coordination backend: `"none"`, `"etcd"`, or `"k8s"` |
+| `cluster_prefix` | string | `"silo"` | Prefix for namespacing coordination keys/leases |
+| `num_shards` | number | `8` | Total number of shards in the cluster |
+| `lease_ttl_secs` | number | `10` | TTL for coordination leases in seconds |
+| `advertised_grpc_addr` | string | (none) | Address other nodes use to connect to this node |
+
+### Coordination Backends
+
+<Tabs>
+<TabItem label="None (Single Node)">
+
+For local development or single-node deployments:
+
+```toml
+[coordination]
+backend = "none"
+```
+
+In this mode, a single Silo instance owns all shards and no coordination is needed.
+
+</TabItem>
+<TabItem label="etcd">
+
+For distributed deployments using etcd:
+
+```toml
+[coordination]
+backend = "etcd"
+cluster_prefix = "silo-prod"
+num_shards = 16
+lease_ttl_secs = 10
+etcd_endpoints = ["http://etcd-0:2379", "http://etcd-1:2379", "http://etcd-2:2379"]
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `etcd_endpoints` | array | `["http://127.0.0.1:2379"]` | List of etcd endpoint URLs |
+
+</TabItem>
+<TabItem label="Kubernetes">
+
+For Kubernetes deployments using native Lease objects:
+
+```toml
+[coordination]
+backend = "k8s"
+cluster_prefix = "silo-prod"
+num_shards = 16
+lease_ttl_secs = 15
+k8s_namespace = "silo"
+advertised_grpc_addr = "${POD_IP}:50051"
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `k8s_namespace` | string | `"default"` | Kubernetes namespace for Lease objects |
+
+The `k8s` backend uses Kubernetes Lease objects for coordination. Each shard gets a Lease named `{cluster_prefix}-shard-{n}`.
+
+</TabItem>
+</Tabs>
+
+### Advertised gRPC Address
+
+In clustered deployments, the `advertised_grpc_addr` tells other nodes how to connect to this node. This is important when:
+
+- You bind to `0.0.0.0` but need to advertise a specific IP
+- You're running in Kubernetes and need to advertise the pod IP
+
+```toml
+[server]
+grpc_addr = "0.0.0.0:50051"  # Bind to all interfaces
+
+[coordination]
+backend = "k8s"
+# Advertise the pod IP (injected via Downward API)
+advertised_grpc_addr = "${POD_IP}:50051"
+```
+
+---
+
+## Web UI Configuration
+
+The `[webui]` section configures the built-in web dashboard.
+
+```toml
+[webui]
+enabled = true
+addr = "127.0.0.1:8080"
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | bool | `true` | Enable the web UI server |
+| `addr` | string | `"127.0.0.1:8080"` | Address and port for the web UI |
+
+The web UI provides:
+- Cluster overview and health status
+- Queue inspection and job browsing
+- SQL query interface for debugging
+- Configuration viewer
+
+---
+
+## Metrics Configuration
+
+The `[metrics]` section configures the Prometheus metrics endpoint.
+
+```toml
+[metrics]
+enabled = true
+addr = "127.0.0.1:9090"
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | bool | `true` | Enable the Prometheus metrics endpoint |
+| `addr` | string | `"127.0.0.1:9090"` | Address and port for the metrics server |
+
+Metrics are exposed in Prometheus format at `/metrics`. See the [Observability Guide](/guides/observability) for available metrics.
+
+---
+
+## Logging Configuration
+
+The `[logging]` section configures log output format.
+
+```toml
+[logging]
+format = "json"
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `format` | string | `"text"` | Log format: `"text"` (human-readable) or `"json"` (structured) |
+
+Use `json` format for production deployments to enable log aggregation and analysis.
+
+---
+
+## Gubernator (Rate Limiting) Configuration
+
+The `[gubernator]` section configures integration with [Gubernator](https://github.com/gubernator-io/gubernator) for distributed rate limiting.
+
+```toml
+[gubernator]
+address = "http://gubernator:9991"
+coalesce_interval_ms = 5
+max_batch_size = 100
+connect_timeout_ms = 5000
+request_timeout_ms = 10000
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `address` | string | (none) | Gubernator server URL. If not set, rate limiting is disabled. |
+| `coalesce_interval_ms` | number | `5` | Max time to wait before sending a batch |
+| `max_batch_size` | number | `100` | Max requests to batch together |
+| `connect_timeout_ms` | number | `5000` | Connection timeout in milliseconds |
+| `request_timeout_ms` | number | `10000` | Request timeout in milliseconds |
+
+<Aside>
+If `address` is not configured, rate limit tasks will fail. Only configure this if you're using Silo's rate limiting features.
+</Aside>
+
+---
+
+## Tenancy Configuration
+
+The `[tenancy]` section enables multi-tenant features.
+
+```toml
+[tenancy]
+enabled = true
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable multi-tenancy support |
+
+---
+
+## Environment Variable Substitution
+
+Silo supports environment variable substitution in configuration values using shell-like syntax:
+
+- `${VAR}` - Expands to the value of `VAR`, or empty string if not set
+- `${VAR:-default}` - Expands to the value of `VAR`, or `"default"` if not set
+
+For example:
+
+```toml
+[database]
+# If DATABASE_PATH is set to "/data/silo", this becomes "/data/silo/shard-%shard%"
+# If DATABASE_PATH is not set, this becomes "/var/lib/silo/shard-%shard%"
+path = "${DATABASE_PATH:-/var/lib/silo}/shard-%shard%"
+```
+
+### Substituting pod IPs in for advertised_grpc_addr in Kubernetes
+
+You can use environment variable substitution in Kubernetes to inject values via the Downward API, which is required for configuring dynamic values that aren't known in advance like `advertised_grpc_addr`:
+
+```toml
+[coordination]
+# Inject pod IP from Kubernetes Downward API
+advertised_grpc_addr = "${POD_IP}:50051"
+
+# Use a default if the env var isn't set
+cluster_prefix = "${CLUSTER_NAME:-silo-default}"
+```
+
+For example, if you pass the `POD_IP` environment variable to your Silo pod via the downward API like so:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: silo
+spec:
+  containers:
+    - name: silo
+      image: ghcr.io/gadget-inc/silo:latest
+      env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+      args:
+        - "-c"
+        - "/etc/silo/config.toml"
+      volumeMounts:
+        - name: config
+          mountPath: /etc/silo
+# ...
+```
