@@ -76,6 +76,9 @@ impl JobStoreShard {
         self.set_job_status_with_index(&mut batch, tenant, &job_id, job_status)
             .await?;
 
+        // Increment total jobs counter for this shard
+        self.increment_total_jobs_counter(&mut batch);
+
         // Process limits starting from index 0. For concurrency limits, we try immediate
         // grant as an optimization. Returns all grants made for potential rollback.
         let grants = self

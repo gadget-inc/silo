@@ -949,45 +949,24 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
         .map(|c| c.num_shards())
         .unwrap_or_else(|| state.factory.instances().len() as u32);
 
-    // Initialize all shards with 0 job count
-    let mut shard_job_counts: HashMap<u32, usize> = HashMap::new();
-    for shard_id in 0..num_shards {
-        shard_job_counts.insert(shard_id, 0);
-    }
-
-    // Query all jobs with shard_id and count per shard in Rust
-    // (GROUP BY shard_id doesn't work well with the virtual shard_id column)
-    let sql = "SELECT shard_id FROM jobs";
+    // Get job counts from counters for all shards (local and remote)
+    // This uses the GetShardCounters RPC for remote shards
     let mut error: Option<String> = None;
-
-    match state.query_engine.sql(sql).await {
-        Ok(df) => match df.collect().await {
-            Ok(batches) => {
-                for batch in batches {
-                    if let Some(shard_col) = batch.column_by_name("shard_id").and_then(|c| {
-                        c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::UInt32Array>()
-                    }) {
-                        for i in 0..batch.num_rows() {
-                            let shard_id = shard_col.value(i);
-                            *shard_job_counts.entry(shard_id).or_insert(0) += 1;
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "failed to collect query results");
-                error = Some(format!("Query execution error: {}", e));
-            }
-        },
+    let shard_counters = match state.cluster_client.get_all_shard_counters().await {
+        Ok(counters) => counters,
         Err(e) => {
-            warn!(error = %e, "failed to query shards");
-            error = Some(format!("Query error: {}", e));
+            warn!(error = %e, "failed to get counters from all shards");
+            error = Some(format!("Failed to get shard counters: {}", e));
+            HashMap::new()
         }
-    }
+    };
 
-    // Build shard rows from the counts map
-    for (shard_id, job_count) in shard_job_counts {
+    // Build shard rows from the counters map, filling in 0 for missing shards
+    for shard_id in 0..num_shards {
+        let job_count = shard_counters
+            .get(&shard_id)
+            .map(|c| c.total_jobs as usize)
+            .unwrap_or(0);
         let owner = if let Some(ref map) = owner_map {
             if state.cluster_client.owns_shard(shard_id) {
                 "local".to_string()

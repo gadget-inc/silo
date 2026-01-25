@@ -146,6 +146,8 @@ impl JobStoreShard {
                 let job_status = JobStatus::succeeded(now_ms);
                 self.set_job_status_with_index(&mut batch, &tenant, &job_id, job_status)
                     .await?;
+                // Increment completed jobs counter - job reached terminal state
+                self.increment_completed_jobs_counter(&mut batch);
                 new_job_status_for_dst = Some("Succeeded".to_string());
             }
             // Worker acknowledges cancellation - set job status to Cancelled
@@ -153,6 +155,8 @@ impl JobStoreShard {
                 let job_status = JobStatus::cancelled(now_ms);
                 self.set_job_status_with_index(&mut batch, &tenant, &job_id, job_status)
                     .await?;
+                // Increment completed jobs counter - job reached terminal state
+                self.increment_completed_jobs_counter(&mut batch);
                 new_job_status_for_dst = Some("Cancelled".to_string());
             }
             // Error: maybe enqueue next attempt; otherwise mark job failed
@@ -211,6 +215,8 @@ impl JobStoreShard {
                         let job_status = JobStatus::failed(now_ms);
                         self.set_job_status_with_index(&mut batch, &tenant, &job_id, job_status)
                             .await?;
+                        // Increment completed jobs counter - job reached terminal state (failed permanently)
+                        self.increment_completed_jobs_counter(&mut batch);
                         new_job_status_for_dst = Some("Failed".to_string());
                     }
                 } else {

@@ -29,8 +29,18 @@ async fn restart_cancelled_scheduled_job() {
             .await
             .expect("enqueue");
 
+        // Verify counters after enqueue
+        let counters = shard.get_counters().await.expect("get_counters");
+        assert_eq!(counters.total_jobs, 1);
+        assert_eq!(counters.completed_jobs, 0);
+
         // Cancel the scheduled job
         shard.cancel_job("-", &job_id).await.expect("cancel_job");
+
+        // Verify counters after cancel - completed_jobs should be 1 (terminal state)
+        let counters = shard.get_counters().await.expect("get_counters");
+        assert_eq!(counters.total_jobs, 1);
+        assert_eq!(counters.completed_jobs, 1);
 
         // Verify job is cancelled
         let status = shard
@@ -48,6 +58,14 @@ async fn restart_cancelled_scheduled_job() {
 
         // [SILO-RESTART-*] Restart the job
         shard.restart_job("-", &job_id).await.expect("restart_job");
+
+        // Verify counters after restart - completed_jobs should be 0 (back to scheduled)
+        let counters = shard.get_counters().await.expect("get_counters");
+        assert_eq!(counters.total_jobs, 1);
+        assert_eq!(
+            counters.completed_jobs, 0,
+            "completed_jobs should be 0 after restart"
+        );
 
         // [SILO-RESTART-6] Verify status is now Scheduled
         let status_after = shard

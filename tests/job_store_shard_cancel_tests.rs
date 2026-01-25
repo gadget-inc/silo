@@ -33,6 +33,11 @@ async fn cancel_scheduled_job_sets_cancelled_and_removes_task() {
             .await
             .expect("enqueue");
 
+        // Verify counters after enqueue
+        let counters = shard.get_counters().await.expect("get_counters");
+        assert_eq!(counters.total_jobs, 1);
+        assert_eq!(counters.completed_jobs, 0);
+
         // Verify job is Scheduled
         let status = shard
             .get_job_status("-", &job_id)
@@ -47,6 +52,14 @@ async fn cancel_scheduled_job_sets_cancelled_and_removes_task() {
 
         // Cancel the job
         shard.cancel_job("-", &job_id).await.expect("cancel_job");
+
+        // Verify counters after cancel - completed_jobs incremented because scheduled job immediately becomes Cancelled
+        let counters = shard.get_counters().await.expect("get_counters");
+        assert_eq!(counters.total_jobs, 1);
+        assert_eq!(
+            counters.completed_jobs, 1,
+            "completed_jobs should be 1 after cancelling scheduled job"
+        );
 
         // Verify status is now Cancelled
         let status_after = shard

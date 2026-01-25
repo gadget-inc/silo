@@ -464,3 +464,169 @@ async fn grpc_server_report_refresh_outcome_missing_outcome() -> anyhow::Result<
     .expect("test timed out")?;
     Ok(())
 }
+
+/// Test that GetShardCounters returns correct counts for empty shard
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_get_shard_counters_empty() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        // Get counters for empty shard
+        let resp = client
+            .get_shard_counters(GetShardCountersRequest { shard: 0 })
+            .await?
+            .into_inner();
+
+        assert_eq!(resp.total_jobs, 0, "empty shard should have 0 total_jobs");
+        assert_eq!(
+            resp.completed_jobs, 0,
+            "empty shard should have 0 completed_jobs"
+        );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// Test that GetShardCounters correctly tracks job lifecycle
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_get_shard_counters_tracks_lifecycle() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        // Initially empty
+        let resp = client
+            .get_shard_counters(GetShardCountersRequest { shard: 0 })
+            .await?
+            .into_inner();
+        assert_eq!(resp.total_jobs, 0);
+        assert_eq!(resp.completed_jobs, 0);
+
+        // Enqueue a job
+        let enq_resp = client
+            .enqueue(EnqueueRequest {
+                shard: 0,
+                id: "test-job-1".to_string(),
+                priority: 5,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(MsgpackBytes {
+                    data: rmp_serde::to_vec(&serde_json::json!({"test": true})).unwrap(),
+                }),
+                limits: vec![],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
+            })
+            .await?
+            .into_inner();
+        assert_eq!(enq_resp.id, "test-job-1");
+
+        // Check counters after enqueue
+        let resp = client
+            .get_shard_counters(GetShardCountersRequest { shard: 0 })
+            .await?
+            .into_inner();
+        assert_eq!(resp.total_jobs, 1, "should have 1 total job after enqueue");
+        assert_eq!(
+            resp.completed_jobs, 0,
+            "should have 0 completed jobs (still scheduled)"
+        );
+
+        // Enqueue another job
+        let _ = client
+            .enqueue(EnqueueRequest {
+                shard: 0,
+                id: "test-job-2".to_string(),
+                priority: 5,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(MsgpackBytes {
+                    data: rmp_serde::to_vec(&serde_json::json!({"test": true})).unwrap(),
+                }),
+                limits: vec![],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
+            })
+            .await?;
+
+        // Check counters after second enqueue
+        let resp = client
+            .get_shard_counters(GetShardCountersRequest { shard: 0 })
+            .await?
+            .into_inner();
+        assert_eq!(resp.total_jobs, 2, "should have 2 total jobs");
+        assert_eq!(resp.completed_jobs, 0, "should have 0 completed jobs");
+
+        // Lease and complete a job
+        let lease_resp = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: Some(0),
+                worker_id: "test-worker".to_string(),
+                max_tasks: 1,
+                task_group: "default".to_string(),
+            })
+            .await?
+            .into_inner();
+        assert_eq!(lease_resp.tasks.len(), 1);
+
+        let task = &lease_resp.tasks[0];
+        client
+            .report_outcome(ReportOutcomeRequest {
+                shard: 0,
+                task_id: task.id.clone(),
+                outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
+                    data: rmp_serde::to_vec(&serde_json::json!({"result": "done"})).unwrap(),
+                })),
+            })
+            .await?;
+
+        // Check counters after completion
+        let resp = client
+            .get_shard_counters(GetShardCountersRequest { shard: 0 })
+            .await?
+            .into_inner();
+        assert_eq!(
+            resp.total_jobs, 2,
+            "should still have 2 total jobs (completed jobs count toward total)"
+        );
+        assert_eq!(
+            resp.completed_jobs, 1,
+            "should have 1 completed job after success"
+        );
+
+        // Delete the completed job
+        client
+            .delete_job(DeleteJobRequest {
+                shard: 0,
+                id: task.job_id.clone(),
+                tenant: None,
+            })
+            .await?;
+
+        // Check counters after deletion
+        let resp = client
+            .get_shard_counters(GetShardCountersRequest { shard: 0 })
+            .await?
+            .into_inner();
+        assert_eq!(resp.total_jobs, 1, "should have 1 total job after deletion");
+        assert_eq!(
+            resp.completed_jobs, 0,
+            "should have 0 completed jobs after deleting the completed one"
+        );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
