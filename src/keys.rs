@@ -180,3 +180,15 @@ pub fn floating_limit_state_key(tenant: &str, queue_key: &str) -> String {
         escape_segment(queue_key)
     )
 }
+
+/// Key for the total jobs counter for this shard.
+/// This counts all jobs that exist in the shard (not deleted).
+pub fn shard_total_jobs_counter_key() -> &'static str {
+    "counters/total_jobs"
+}
+
+/// Key for the completed jobs counter for this shard.
+/// This counts jobs that have reached a terminal state (Succeeded, Failed, or Cancelled).
+pub fn shard_completed_jobs_counter_key() -> &'static str {
+    "counters/completed_jobs"
+}

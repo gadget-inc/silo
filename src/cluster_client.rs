@@ -22,10 +22,11 @@ use tracing::{debug, trace, warn};
 
 use crate::coordination::{Coordinator, ShardOwnerMap};
 use crate::factory::ShardFactory;
+use crate::job_store_shard::ShardCounters;
 use crate::pb::silo_client::SiloClient;
 use crate::pb::{
-    CancelJobRequest, ColumnInfo, GetJobRequest, GetJobResponse, JobStatus, MsgpackBytes,
-    QueryRequest,
+    CancelJobRequest, ColumnInfo, GetJobRequest, GetJobResponse, GetShardCountersRequest,
+    JobStatus, MsgpackBytes, QueryRequest,
 };
 
 /// Configuration for gRPC client connections.
@@ -428,6 +429,79 @@ impl ClusterClient {
                 Ok(r) => Some(r),
                 Err(e) => {
                     warn!(shard_id = shard_id, error = %e, "failed to query shard");
+                    None
+                }
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Get counters for a specific shard, routing to the appropriate node
+    pub async fn get_shard_counters(
+        &self,
+        shard_id: u32,
+    ) -> Result<ShardCounters, ClusterClientError> {
+        let shard_name = shard_id.to_string();
+
+        // Check if shard is local first
+        if let Some(shard) = self.factory.get(&shard_name) {
+            debug!(shard_id = shard_id, "getting counters from local shard");
+            return shard
+                .get_counters()
+                .await
+                .map_err(|e| ClusterClientError::QueryFailed(e.to_string()));
+        }
+
+        // Shard is not local, need to query remote node
+        let addr = self.get_shard_addr(shard_id).await?;
+        debug!(shard_id = shard_id, addr = %addr, "getting counters from remote shard");
+        self.get_remote_shard_counters(shard_id, &addr).await
+    }
+
+    /// Get counters from a remote shard via gRPC
+    async fn get_remote_shard_counters(
+        &self,
+        shard_id: u32,
+        addr: &str,
+    ) -> Result<ShardCounters, ClusterClientError> {
+        let mut client = self.get_client(addr).await?;
+
+        let request = GetShardCountersRequest { shard: shard_id };
+        let response = client
+            .get_shard_counters(request)
+            .await
+            .map_err(|e| {
+                warn!(shard_id = shard_id, addr = %addr, error = %e, "remote shard counters failed");
+                ClusterClientError::QueryFailed(e.to_string())
+            })?
+            .into_inner();
+
+        Ok(ShardCounters {
+            total_jobs: response.total_jobs,
+            completed_jobs: response.completed_jobs,
+        })
+    }
+
+    /// Get counters from all shards in the cluster
+    pub async fn get_all_shard_counters(
+        &self,
+    ) -> Result<HashMap<u32, ShardCounters>, ClusterClientError> {
+        let shard_ids = self.get_all_shard_ids().await?;
+
+        // Query all shards in parallel
+        let futures: Vec<_> = shard_ids
+            .into_iter()
+            .map(|shard_id| async move { (shard_id, self.get_shard_counters(shard_id).await) })
+            .collect();
+
+        let results: HashMap<u32, ShardCounters> = join_all(futures)
+            .await
+            .into_iter()
+            .filter_map(|(shard_id, result)| match result {
+                Ok(counters) => Some((shard_id, counters)),
+                Err(e) => {
+                    warn!(shard_id = shard_id, error = %e, "failed to get counters for shard");
                     None
                 }
             })

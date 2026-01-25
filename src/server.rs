@@ -1046,6 +1046,21 @@ impl Silo for SiloService {
             shards_reset: reset_count,
         }))
     }
+
+    async fn get_shard_counters(
+        &self,
+        req: Request<GetShardCountersRequest>,
+    ) -> Result<Response<GetShardCountersResponse>, Status> {
+        let r = req.into_inner();
+        let shard = self.shard_with_redirect(r.shard).await?;
+
+        let counters = shard.get_counters().await.map_err(map_err)?;
+
+        Ok(Response::new(GetShardCountersResponse {
+            total_jobs: counters.total_jobs,
+            completed_jobs: counters.completed_jobs,
+        }))
+    }
 }
 
 /// Run the gRPC server and a periodic reaper task together until shutdown.

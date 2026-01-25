@@ -377,6 +377,18 @@ message GetClusterInfoResponse {
   string this_grpc_addr = 4;            // gRPC address of the server responding.
 }
 
+// Request to get job counters for a shard.
+// Used for efficient job count queries without scanning all jobs.
+message GetShardCountersRequest {
+  uint32 shard = 1; // Shard ID to get counters for.
+}
+
+// Response with shard job counters.
+message GetShardCountersResponse {
+  int64 total_jobs = 1;     // Total number of jobs in the shard (not deleted).
+  int64 completed_jobs = 2; // Number of jobs in terminal states (Succeeded, Failed, Cancelled).
+}
+
 // Request to reset all shards owned by this server.
 // WARNING: Destructive operation. Only available in dev mode.
 message ResetShardsRequest {}
@@ -451,6 +463,11 @@ service Silo {
   // First message contains schema, subsequent messages contain record batches.
   rpc QueryArrow(QueryArrowRequest) returns (stream ArrowIpcMessage);
   
+
+  // Get job counters for a shard.
+  // Returns total jobs and completed jobs without scanning all job data.
+  rpc GetShardCounters(GetShardCountersRequest) returns (GetShardCountersResponse);
+
   // Reset all shards owned by this server.
   // WARNING: Destructive operation. Only available in dev mode.
   // Clears all jobs, tasks, queues, and other data.

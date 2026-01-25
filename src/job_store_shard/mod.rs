@@ -13,6 +13,7 @@
 //! - `scan`: Scanning and query operations
 
 mod cancel;
+mod counters;
 mod dequeue;
 mod enqueue;
 mod expedite;
@@ -23,6 +24,7 @@ mod rate_limit;
 mod restart;
 mod scan;
 
+pub use counters::ShardCounters;
 pub use expedite::JobNotExpediteableError;
 pub use restart::JobNotRestartableError;
 
@@ -128,7 +130,9 @@ impl JobStoreShard {
 
         // Use the canonical path for both object store AND DbBuilder to ensure consistency
         let mut db_builder =
-            slatedb::DbBuilder::new(resolved.canonical_path.as_str(), resolved.store);
+            slatedb::DbBuilder::new(resolved.canonical_path.as_str(), resolved.store)
+                // Add merge operator for counter keys (total_jobs, completed_jobs)
+                .with_merge_operator(counters::counter_merge_operator());
 
         // Configure separate WAL object store if specified, and track for cleanup on close
         let wal_close_config = if let Some(wal_cfg) = &cfg.wal {
@@ -455,17 +459,29 @@ impl JobStoreShard {
 
         // Check if job is running or has pending state
         let status = self.get_job_status(tenant, id).await?;
-        if let Some(status) = status
+        if let Some(ref status) = status
             && !status.is_terminal()
         {
             return Err(JobStoreShardError::JobInProgress(id.to_string()));
+        }
+
+        // Check if job even exists (status.is_none() means job doesn't exist)
+        // If job doesn't exist, just return Ok (idempotent delete)
+        if status.is_none()
+            && self
+                .db
+                .get(job_info_key(tenant, id).as_bytes())
+                .await?
+                .is_none()
+        {
+            return Ok(());
         }
 
         let job_info_key_str: String = job_info_key(tenant, id);
         let job_status_key_str: String = job_status_key(tenant, id);
         let mut batch = WriteBatch::new();
         // Clean up secondary index entries if present
-        if let Some(status) = self.get_job_status(tenant, id).await? {
+        if let Some(ref status) = status {
             let timek = crate::keys::idx_status_time_key(
                 tenant,
                 status.kind.as_str(),
@@ -486,6 +502,14 @@ impl JobStoreShard {
         batch.delete(job_status_key_str.as_bytes());
         // Also delete cancellation record if present
         batch.delete(crate::keys::job_cancelled_key(tenant, id).as_bytes());
+
+        // Update counters: always decrement total, and if terminal also decrement completed
+        self.decrement_total_jobs_counter(&mut batch);
+        if status.is_some() {
+            // Job was in terminal state (we already checked it's terminal above)
+            self.decrement_completed_jobs_counter(&mut batch);
+        }
+
         self.db.write(batch).await?;
         self.db.flush().await?;
         Ok(())

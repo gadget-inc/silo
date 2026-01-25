@@ -124,6 +124,9 @@ impl JobStoreShard {
                 id,
             );
             txn.put(new_time.as_bytes(), [])?;
+
+            // Increment completed jobs counter - job reached terminal state immediately
+            self.increment_completed_jobs_counter_txn(&txn)?;
         }
 
         // Commit the transaction - this will detect conflicts with concurrent modifications

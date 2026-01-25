@@ -11,6 +11,11 @@ use test_helpers::*;
 async fn enqueue_round_trip_with_explicit_id() {
     let (_tmp, shard) = open_temp_shard().await;
 
+    // Verify initial counter state
+    let counters = shard.get_counters().await.expect("get_counters");
+    assert_eq!(counters.total_jobs, 0);
+    assert_eq!(counters.completed_jobs, 0);
+
     let payload = serde_json::json!({"hello": "world"});
     let payload_bytes = test_helpers::msgpack_payload(&payload);
     let id = "job-123".to_string();
@@ -32,6 +37,11 @@ async fn enqueue_round_trip_with_explicit_id() {
         .await
         .expect("enqueue");
     assert_eq!(got_id, id);
+
+    // Verify counter incremented after enqueue
+    let counters = shard.get_counters().await.expect("get_counters");
+    assert_eq!(counters.total_jobs, 1);
+    assert_eq!(counters.completed_jobs, 0);
 
     // Job status should be Scheduled after enqueue
     let status = shard
@@ -178,6 +188,11 @@ async fn delete_job_removes_key_and_is_idempotent() {
         .expect("enqueue");
     assert_eq!(got_id, id);
 
+    // Verify counter state after enqueue
+    let counters = shard.get_counters().await.expect("get_counters");
+    assert_eq!(counters.total_jobs, 1);
+    assert_eq!(counters.completed_jobs, 0);
+
     // Ensure it exists
     assert!(shard.get_job("-", &id).await.expect("get_job").is_some());
 
@@ -196,8 +211,24 @@ async fn delete_job_removes_key_and_is_idempotent() {
         .await
         .expect("complete job");
 
+    // Verify counter state after completion
+    let counters = shard.get_counters().await.expect("get_counters");
+    assert_eq!(counters.total_jobs, 1);
+    assert_eq!(counters.completed_jobs, 1);
+
     // Now delete it
     shard.delete_job("-", &id).await.expect("delete_job");
+
+    // Verify counters after delete
+    let counters = shard.get_counters().await.expect("get_counters");
+    assert_eq!(
+        counters.total_jobs, 0,
+        "total_jobs should be 0 after delete"
+    );
+    assert_eq!(
+        counters.completed_jobs, 0,
+        "completed_jobs should be 0 after delete"
+    );
 
     // Ensure it's gone
     let got = shard.get_job("-", &id).await.expect("get_job");
