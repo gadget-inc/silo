@@ -517,8 +517,10 @@ async fn grpc_server_get_shard_counters_tracks_lifecycle() -> anyhow::Result<()>
                 priority: 5,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(MsgpackBytes {
-                    data: rmp_serde::to_vec(&serde_json::json!({"test": true})).unwrap(),
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({"test": true})).unwrap(),
+                    )),
                 }),
                 limits: vec![],
                 tenant: None,
@@ -548,8 +550,10 @@ async fn grpc_server_get_shard_counters_tracks_lifecycle() -> anyhow::Result<()>
                 priority: 5,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(MsgpackBytes {
-                    data: rmp_serde::to_vec(&serde_json::json!({"test": true})).unwrap(),
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({"test": true})).unwrap(),
+                    )),
                 }),
                 limits: vec![],
                 tenant: None,
@@ -583,8 +587,10 @@ async fn grpc_server_get_shard_counters_tracks_lifecycle() -> anyhow::Result<()>
             .report_outcome(ReportOutcomeRequest {
                 shard: 0,
                 task_id: task.id.clone(),
-                outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
-                    data: rmp_serde::to_vec(&serde_json::json!({"result": "done"})).unwrap(),
+                outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({"result": "done"})).unwrap(),
+                    )),
                 })),
             })
             .await?;

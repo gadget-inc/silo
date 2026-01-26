@@ -403,6 +403,10 @@ impl Coordinator for EtcdCoordinator {
                 guard.notify.notify_one();
             }
         }
+
+        // Give guards time to release shards and cancel ongoing acquisitions
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
         let _ = self
             .client
             .clone()
