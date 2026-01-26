@@ -630,6 +630,20 @@ export interface Task {
      * @generated from protobuf field: string task_group = 8
      */
     taskGroup: string; // Task group this task belongs to.
+    /**
+     * @generated from protobuf field: optional string tenant_id = 9
+     */
+    tenantId?: string; // Tenant ID if multi-tenancy is enabled.
+    /**
+     * @generated from protobuf field: bool is_last_attempt = 10
+     */
+    isLastAttempt: boolean; // True if this is the final attempt (no more retries after this).
+    /**
+     * @generated from protobuf field: map<string, string> metadata = 11
+     */
+    metadata: {
+        [key: string]: string;
+    }; // Metadata key/value pairs from the job.
 }
 /**
  * Task for refreshing a floating concurrency limit.
@@ -672,6 +686,10 @@ export interface RefreshFloatingLimitTask {
      * @generated from protobuf field: string task_group = 8
      */
     taskGroup: string; // Task group this refresh task belongs to.
+    /**
+     * @generated from protobuf field: optional string tenant_id = 9
+     */
+    tenantId?: string; // Tenant ID if multi-tenancy is enabled.
 }
 /**
  * Response containing tasks leased to a worker.
@@ -2896,7 +2914,10 @@ class Task$Type extends MessageType<Task> {
             { no: 5, name: "payload", kind: "message", T: () => MsgpackBytes },
             { no: 6, name: "priority", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
             { no: 7, name: "shard", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
-            { no: 8, name: "task_group", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+            { no: 8, name: "task_group", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 9, name: "tenant_id", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
+            { no: 10, name: "is_last_attempt", kind: "scalar", T: 8 /*ScalarType.BOOL*/ },
+            { no: 11, name: "metadata", kind: "map", K: 9 /*ScalarType.STRING*/, V: { kind: "scalar", T: 9 /*ScalarType.STRING*/ } }
         ]);
     }
     create(value?: PartialMessage<Task>): Task {
@@ -2908,6 +2929,8 @@ class Task$Type extends MessageType<Task> {
         message.priority = 0;
         message.shard = 0;
         message.taskGroup = "";
+        message.isLastAttempt = false;
+        message.metadata = {};
         if (value !== undefined)
             reflectionMergePartial<Task>(this, message, value);
         return message;
@@ -2941,6 +2964,15 @@ class Task$Type extends MessageType<Task> {
                 case /* string task_group */ 8:
                     message.taskGroup = reader.string();
                     break;
+                case /* optional string tenant_id */ 9:
+                    message.tenantId = reader.string();
+                    break;
+                case /* bool is_last_attempt */ 10:
+                    message.isLastAttempt = reader.bool();
+                    break;
+                case /* map<string, string> metadata */ 11:
+                    this.binaryReadMap11(message.metadata, reader, options);
+                    break;
                 default:
                     let u = options.readUnknownField;
                     if (u === "throw")
@@ -2951,6 +2983,22 @@ class Task$Type extends MessageType<Task> {
             }
         }
         return message;
+    }
+    private binaryReadMap11(map: Task["metadata"], reader: IBinaryReader, options: BinaryReadOptions): void {
+        let len = reader.uint32(), end = reader.pos + len, key: keyof Task["metadata"] | undefined, val: Task["metadata"][any] | undefined;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case 1:
+                    key = reader.string();
+                    break;
+                case 2:
+                    val = reader.string();
+                    break;
+                default: throw new globalThis.Error("unknown map entry field for silo.v1.Task.metadata");
+            }
+        }
+        map[key ?? ""] = val ?? "";
     }
     internalBinaryWrite(message: Task, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
         /* string id = 1; */
@@ -2977,6 +3025,15 @@ class Task$Type extends MessageType<Task> {
         /* string task_group = 8; */
         if (message.taskGroup !== "")
             writer.tag(8, WireType.LengthDelimited).string(message.taskGroup);
+        /* optional string tenant_id = 9; */
+        if (message.tenantId !== undefined)
+            writer.tag(9, WireType.LengthDelimited).string(message.tenantId);
+        /* bool is_last_attempt = 10; */
+        if (message.isLastAttempt !== false)
+            writer.tag(10, WireType.Varint).bool(message.isLastAttempt);
+        /* map<string, string> metadata = 11; */
+        for (let k of globalThis.Object.keys(message.metadata))
+            writer.tag(11, WireType.LengthDelimited).fork().tag(1, WireType.LengthDelimited).string(k).tag(2, WireType.LengthDelimited).string(message.metadata[k]).join();
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -2998,7 +3055,8 @@ class RefreshFloatingLimitTask$Type extends MessageType<RefreshFloatingLimitTask
             { no: 5, name: "metadata", kind: "map", K: 9 /*ScalarType.STRING*/, V: { kind: "scalar", T: 9 /*ScalarType.STRING*/ } },
             { no: 6, name: "lease_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
             { no: 7, name: "shard", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
-            { no: 8, name: "task_group", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+            { no: 8, name: "task_group", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 9, name: "tenant_id", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ }
         ]);
     }
     create(value?: PartialMessage<RefreshFloatingLimitTask>): RefreshFloatingLimitTask {
@@ -3043,6 +3101,9 @@ class RefreshFloatingLimitTask$Type extends MessageType<RefreshFloatingLimitTask
                     break;
                 case /* string task_group */ 8:
                     message.taskGroup = reader.string();
+                    break;
+                case /* optional string tenant_id */ 9:
+                    message.tenantId = reader.string();
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -3096,6 +3157,9 @@ class RefreshFloatingLimitTask$Type extends MessageType<RefreshFloatingLimitTask
         /* string task_group = 8; */
         if (message.taskGroup !== "")
             writer.tag(8, WireType.LengthDelimited).string(message.taskGroup);
+        /* optional string tenant_id = 9; */
+        if (message.tenantId !== undefined)
+            writer.tag(9, WireType.LengthDelimited).string(message.tenantId);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);

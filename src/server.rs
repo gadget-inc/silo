@@ -771,6 +771,23 @@ impl Silo for SiloService {
                     m.inc_task_leases_active(&shard_str, &task_group);
                 }
 
+                // Determine if this is the last attempt based on retry policy
+                let max_attempts = job
+                    .retry_policy()
+                    .map(|p| p.retry_count + 1) // retry_count is retries after first attempt
+                    .unwrap_or(1); // No retry policy means only 1 attempt
+                let is_last_attempt = attempt_number >= max_attempts;
+
+                // Get tenant_id, using None if it's the default "-" tenant
+                let tenant_id = {
+                    let tid = lt.tenant_id();
+                    if tid == "-" {
+                        None
+                    } else {
+                        Some(tid.to_string())
+                    }
+                };
+
                 all_tasks.push(Task {
                     id: attempt.task_id().to_string(),
                     job_id: job.id().to_string(),
@@ -782,10 +799,20 @@ impl Silo for SiloService {
                     priority: job.priority() as u32,
                     shard: shard_id,
                     task_group,
+                    tenant_id,
+                    is_last_attempt,
+                    metadata: job.metadata().into_iter().collect(),
                 });
             }
 
             for rt in result.refresh_tasks {
+                // Get tenant_id, using None if it's the default "-" tenant
+                let tenant_id = if rt.tenant_id == "-" {
+                    None
+                } else {
+                    Some(rt.tenant_id)
+                };
+
                 all_refresh_tasks.push(RefreshFloatingLimitTask {
                     id: rt.task_id,
                     queue_key: rt.queue_key,
@@ -795,6 +822,7 @@ impl Silo for SiloService {
                     lease_ms: DEFAULT_LEASE_MS,
                     shard: shard_id,
                     task_group: rt.task_group,
+                    tenant_id,
                 });
             }
 

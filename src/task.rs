@@ -136,13 +136,22 @@ pub enum ConcurrencyAction {
 /// Represents a leased task with the associated job metadata necessary to execute it.
 #[derive(Debug, Clone)]
 pub struct LeasedTask {
+    tenant_id: String,
     job: JobView,
     attempt: JobAttemptView,
 }
 
 impl LeasedTask {
-    pub fn new(job: JobView, attempt: JobAttemptView) -> Self {
-        Self { job, attempt }
+    pub fn new(tenant_id: String, job: JobView, attempt: JobAttemptView) -> Self {
+        Self {
+            tenant_id,
+            job,
+            attempt,
+        }
+    }
+
+    pub fn tenant_id(&self) -> &str {
+        &self.tenant_id
     }
 
     pub fn job(&self) -> &JobView {
@@ -168,6 +177,7 @@ pub struct HeartbeatResult {
 #[derive(Debug, Clone)]
 pub struct LeasedRefreshTask {
     pub task_id: String,
+    pub tenant_id: String,
     pub queue_key: String,
     pub current_max_concurrency: u32,
     pub last_refreshed_at_ms: i64,

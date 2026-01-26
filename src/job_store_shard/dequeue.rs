@@ -313,7 +313,7 @@ impl JobStoreShard {
                     }
                     Task::RefreshFloatingLimit {
                         task_id,
-                        tenant: _task_tenant,
+                        tenant: task_tenant,
                         queue_key,
                         current_max_concurrency,
                         last_refreshed_at_ms,
@@ -333,6 +333,7 @@ impl JobStoreShard {
 
                         refresh_out.push(LeasedRefreshTask {
                             task_id: task_id.clone(),
+                            tenant_id: task_tenant.clone(),
                             queue_key: queue_key.clone(),
                             current_max_concurrency: *current_max_concurrency,
                             last_refreshed_at_ms: *last_refreshed_at_ms,
@@ -525,7 +526,7 @@ impl JobStoreShard {
                 .ok_or_else(|| {
                     JobStoreShardError::Rkyv("attempt not found after dequeue".to_string())
                 })?;
-            out.push(LeasedTask::new(job_view, attempt_view));
+            out.push(LeasedTask::new(tenant, job_view, attempt_view));
         }
         tracing::debug!(
             worker_id = %worker_id,

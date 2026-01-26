@@ -240,6 +240,9 @@ message Task {
   uint32 priority = 6;        // Job priority (for informational purposes).
   uint32 shard = 7;           // Shard this task came from (needed for reporting outcome).
   string task_group = 8;      // Task group this task belongs to.
+  optional string tenant_id = 9;       // Tenant ID if multi-tenancy is enabled.
+  bool is_last_attempt = 10;           // True if this is the final attempt (no more retries after this).
+  map<string, string> metadata = 11;   // Metadata key/value pairs from the job.
 }
 
 // Task for refreshing a floating concurrency limit.
@@ -253,6 +256,7 @@ message RefreshFloatingLimitTask {
   int64 lease_ms = 6;                  // How long the lease lasts. Heartbeat before this expires.
   uint32 shard = 7;                    // Shard this task came from (needed for reporting outcome).
   string task_group = 8;               // Task group this refresh task belongs to.
+  optional string tenant_id = 9;       // Tenant ID if multi-tenancy is enabled.
 }
 
 // Response containing tasks leased to a worker.

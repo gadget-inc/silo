@@ -41,6 +41,8 @@ function createTask(id: string, jobId: string, shard: number = 0): Task {
     priority: 10,
     shard,
     taskGroup: "default",
+    isLastAttempt: false,
+    metadata: {},
   };
 }
 
