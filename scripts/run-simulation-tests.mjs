@@ -10,7 +10,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { parseArgs } from "node:util";
 import { randomInt } from "node:crypto";
 import { cpus } from "node:os";
-import { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, unlinkSync, rmSync, createWriteStream } from "node:fs";
 import { join } from "node:path";
 
 // Directory for storing test output logs
@@ -162,10 +162,13 @@ function getLogFilePath(scenario, seed) {
 /**
  * Run a single scenario with a specific seed in fuzz mode.
  * Each scenario runs in its own subprocess for determinism.
- * Writes output to a log file to avoid OOM when running many seeds.
+ * Writes output directly to a log file to avoid OOM when running many seeds.
  */
 function runScenarioWithSeed(scenario, seed) {
   return new Promise((resolve) => {
+    const logFile = getLogFilePath(scenario, seed);
+    const logStream = createWriteStream(logFile);
+
     const proc = spawn(
       "cargo",
       ["test", "--test", "turmoil_runner", scenario, "--", "--exact", "--nocapture"],
@@ -175,22 +178,32 @@ function runScenarioWithSeed(scenario, seed) {
       }
     );
 
-    const outputChunks = [];
-    proc.stdout.on("data", (data) => outputChunks.push(data));
-    proc.stderr.on("data", (data) => outputChunks.push(data));
+    // Stream output directly to file instead of buffering in memory
+    proc.stdout.pipe(logStream, { end: false });
+    proc.stderr.pipe(logStream, { end: false });
 
     proc.on("close", (code) => {
-      const output = Buffer.concat(outputChunks).toString();
-      const passed = code === 0 && output.includes("test result: ok");
+      // End the log stream and clean up
+      logStream.end(() => {
+        const passed = code === 0;
 
-      // Write output to file for failed tests
-      let logFile = null;
-      if (!passed) {
-        logFile = getLogFilePath(scenario, seed);
-        writeFileSync(logFile, output);
-      }
+        // Delete log file for passing tests to save disk space
+        if (passed) {
+          try {
+            unlinkSync(logFile);
+          } catch {
+            // Ignore deletion errors
+          }
+          resolve({ passed, logFile: null, exitCode: code, scenario, seed });
+        } else {
+          resolve({ passed, logFile, exitCode: code, scenario, seed });
+        }
+      });
+    });
 
-      resolve({ passed, logFile, exitCode: code, scenario, seed });
+    proc.on("error", (err) => {
+      logStream.end();
+      resolve({ passed: false, logFile, exitCode: -1, scenario, seed, error: err.message });
     });
   });
 }
