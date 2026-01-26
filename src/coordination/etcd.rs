@@ -121,50 +121,132 @@ impl EtcdCoordinator {
         let mut watch_bg = client.watch_client();
         let mut lock_bg = client.lock_client();
 
+        // CRITICAL: Establish keepalive streams BEFORE spawning any tasks.
+        //
+        // This prevents a race condition where the main coordinator task starts
+        // reconciliation (which triggers lock acquisition) before the keepalive
+        // streams are established.
+        //
+        // When many shard guards concurrently acquire etcd locks (e.g., 128 shards
+        // per node), we can exceed etcd's HTTP/2 MAX_CONCURRENT_STREAMS limit (~100).
+        // Each lock() call is a unary RPC requiring a NEW HTTP/2 stream, so excess
+        // requests queue. This causes simple operations like kv.get() to take 1-4s.
+        //
+        // Lease keepalives use a BIDIRECTIONAL STREAMING RPC that establishes ONE
+        // long-lived stream. By establishing these streams BEFORE any lock requests:
+        // 1. The keepalive streams are ready before we hit stream limits
+        // 2. All keepalives flow through these established streams
+        // 3. Keepalives bypass the "new stream" queue entirely
+        // 4. Leases remain alive regardless of lock contention
+
+        // Establish membership keepalive stream (with retries)
+        let (mut memb_keeper, memb_stream) = loop {
+            if *shutdown_rx.borrow() {
+                return Err(CoordinationError::BackendError(
+                    "shutdown during keepalive setup".to_string(),
+                ));
+            }
+            match lease_bg.keep_alive(membership_lease).await {
+                Ok(x) => {
+                    debug!(node_id = %nid, lease_id = membership_lease, "membership lease keepalive channel established");
+                    break x;
+                }
+                Err(e) => {
+                    warn!(node_id = %nid, error = %e, "failed to start membership keepalive, retrying...");
+                    sleep(Duration::from_millis(200)).await;
+                }
+            }
+        };
+
+        // Establish liveness keepalive stream (with retries)
+        let (mut live_keeper, live_stream) = loop {
+            if *shutdown_rx.borrow() {
+                return Err(CoordinationError::BackendError(
+                    "shutdown during keepalive setup".to_string(),
+                ));
+            }
+            match lease_bg.keep_alive(liveness_lease).await {
+                Ok(x) => {
+                    debug!(node_id = %nid, lease_id = liveness_lease, "liveness lease keepalive channel established");
+                    break x;
+                }
+                Err(e) => {
+                    warn!(node_id = %nid, error = %e, "failed to start liveness keepalive, retrying...");
+                    sleep(Duration::from_millis(200)).await;
+                }
+            }
+        };
+
+        // Send initial keepalive requests - this is REQUIRED to keep the lease alive!
+        // etcd-client's keep_alive() only establishes the channel, you must call
+        // keeper.keep_alive() to actually send keepalive requests.
+        if let Err(e) = memb_keeper.keep_alive().await {
+            error!(node_id = %nid, error = %e, "failed to send initial membership keepalive");
+        }
+        if let Err(e) = live_keeper.keep_alive().await {
+            error!(node_id = %nid, error = %e, "failed to send initial liveness keepalive");
+        }
+
+        // NOW spawn the keepalive loop task - streams are already established
+        let keepalive_shutdown_rx = shutdown_rx.clone();
+        let keepalive_nid = nid.clone();
+        tokio::spawn(async move {
+            let mut memb_stream = memb_stream;
+            let mut live_stream = live_stream;
+
+            // Send keepalives at 1/3 of TTL to ensure lease doesn't expire
+            let keepalive_interval_secs = (ttl_secs / 3).max(1) as u64;
+            let mut keepalive_timer =
+                tokio::time::interval(Duration::from_secs(keepalive_interval_secs));
+            debug!(node_id = %keepalive_nid, interval_secs = keepalive_interval_secs, "starting keepalive timer");
+
+            loop {
+                tokio::select! {
+                    _ = keepalive_timer.tick() => {
+                        if *keepalive_shutdown_rx.borrow() { break; }
+                        // Send keepalive requests to both leases
+                        if let Err(e) = memb_keeper.keep_alive().await {
+                            error!(node_id = %keepalive_nid, error = %e, "failed to send membership keepalive");
+                        }
+                        if let Err(e) = live_keeper.keep_alive().await {
+                            error!(node_id = %keepalive_nid, error = %e, "failed to send liveness keepalive");
+                        }
+                    }
+                    resp = memb_stream.message() => {
+                        if *keepalive_shutdown_rx.borrow() { break; }
+                        match resp {
+                            Ok(Some(ka_resp)) => {
+                                debug!(node_id = %keepalive_nid, ttl = ka_resp.ttl(), "membership keepalive response received");
+                            }
+                            Ok(None) => {
+                                error!(node_id = %keepalive_nid, "membership lease keepalive stream closed! Lease will expire.");
+                                break;
+                            }
+                            Err(e) => {
+                                error!(node_id = %keepalive_nid, error = %e, "membership lease keepalive error");
+                            }
+                        }
+                    }
+                    resp = live_stream.message() => {
+                        if *keepalive_shutdown_rx.borrow() { break; }
+                        match resp {
+                            Ok(Some(ka_resp)) => {
+                                debug!(node_id = %keepalive_nid, ttl = ka_resp.ttl(), "liveness keepalive response received");
+                            }
+                            Ok(None) => {
+                                error!(node_id = %keepalive_nid, "liveness lease keepalive stream closed! Lease will expire.");
+                                break;
+                            }
+                            Err(e) => {
+                                error!(node_id = %keepalive_nid, error = %e, "liveness lease keepalive error");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         let handle = tokio::spawn(async move {
-            // Start lease keepalives with retries
-            let (mut memb_keeper, mut memb_stream) = loop {
-                if *shutdown_rx.borrow() {
-                    return;
-                }
-                match lease_bg.keep_alive(membership_lease).await {
-                    Ok(x) => {
-                        debug!(node_id = %nid, lease_id = membership_lease, "membership lease keepalive channel established");
-                        break x;
-                    }
-                    Err(e) => {
-                        warn!(node_id = %nid, error = %e, "failed to start membership keepalive, retrying...");
-                        sleep(Duration::from_millis(200)).await;
-                    }
-                }
-            };
-
-            let (mut live_keeper, mut live_stream) = loop {
-                if *shutdown_rx.borrow() {
-                    return;
-                }
-                match lease_bg.keep_alive(liveness_lease).await {
-                    Ok(x) => {
-                        debug!(node_id = %nid, lease_id = liveness_lease, "liveness lease keepalive channel established");
-                        break x;
-                    }
-                    Err(e) => {
-                        warn!(node_id = %nid, error = %e, "failed to start liveness keepalive, retrying...");
-                        sleep(Duration::from_millis(200)).await;
-                    }
-                }
-            };
-
-            // Send initial keepalive requests - this is REQUIRED to keep the lease alive!
-            // etcd-client's keep_alive() only establishes the channel, you must call
-            // keeper.keep_alive() to actually send keepalive requests.
-            if let Err(e) = memb_keeper.keep_alive().await {
-                error!(node_id = %nid, error = %e, "failed to send initial membership keepalive");
-            }
-            if let Err(e) = live_keeper.keep_alive().await {
-                error!(node_id = %nid, error = %e, "failed to send initial liveness keepalive");
-            }
-
             // Establish member watch with retries
             let members_prefix = keys::members_prefix(&cprefix);
             debug!(node_id = %nid, "starting coordinator background tasks");
@@ -196,26 +278,11 @@ impl EtcdCoordinator {
                 warn!(node_id = %nid, error = %err, "initial reconcile failed");
             }
 
-            // Main loop: reconcile on membership events, periodic resync, and send keepalives
+            // Main loop: reconcile on membership events and periodic resync
             let mut resync = tokio::time::interval(Duration::from_secs(1));
-            // Send keepalives at 1/3 of TTL to ensure lease doesn't expire
-            let keepalive_interval_secs = (ttl_secs / 3).max(1) as u64;
-            let mut keepalive_timer =
-                tokio::time::interval(Duration::from_secs(keepalive_interval_secs));
-            debug!(node_id = %nid, interval_secs = keepalive_interval_secs, "starting keepalive timer");
 
             loop {
                 tokio::select! {
-                    _ = keepalive_timer.tick() => {
-                        if *shutdown_rx.borrow() { break; }
-                        // Send keepalive requests to both leases
-                        if let Err(e) = memb_keeper.keep_alive().await {
-                            error!(node_id = %nid, error = %e, "failed to send membership keepalive");
-                        }
-                        if let Err(e) = live_keeper.keep_alive().await {
-                            error!(node_id = %nid, error = %e, "failed to send liveness keepalive");
-                        }
-                    }
                     _ = resync.tick() => {
                         if *shutdown_rx.borrow() { break; }
                         if let Err(err) = me_bg.reconcile_shards(&mut lock_bg).await {
@@ -237,34 +304,6 @@ impl EtcdCoordinator {
                             }
                             Err(e) => {
                                 warn!(node_id = %nid, error = %e, "members watch error, continuing with periodic resync");
-                            }
-                        }
-                    }
-                    resp = memb_stream.message() => {
-                        if *shutdown_rx.borrow() { break; }
-                        match resp {
-                            Ok(Some(ka_resp)) => {
-                                debug!(node_id = %nid, ttl = ka_resp.ttl(), "membership keepalive response received");
-                            }
-                            Ok(None) => {
-                                error!(node_id = %nid, "membership lease keepalive stream closed! Lease will expire.");
-                            }
-                            Err(e) => {
-                                error!(node_id = %nid, error = %e, "membership lease keepalive error");
-                            }
-                        }
-                    }
-                    resp = live_stream.message() => {
-                        if *shutdown_rx.borrow() { break; }
-                        match resp {
-                            Ok(Some(ka_resp)) => {
-                                debug!(node_id = %nid, ttl = ka_resp.ttl(), "liveness keepalive response received");
-                            }
-                            Ok(None) => {
-                                error!(node_id = %nid, "liveness lease keepalive stream closed! Lease will expire.");
-                            }
-                            Err(e) => {
-                                error!(node_id = %nid, error = %e, "liveness lease keepalive error");
                             }
                         }
                     }
@@ -403,6 +442,10 @@ impl Coordinator for EtcdCoordinator {
                 guard.notify.notify_one();
             }
         }
+
+        // Give guards time to release shards and cancel ongoing acquisitions
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
         let _ = self
             .client
             .clone()
