@@ -19,8 +19,10 @@ async fn grpc_get_job_includes_status() -> anyhow::Result<()> {
             priority: 10,
             start_at_ms: 0,
             retry_policy: None,
-            payload: Some(MsgpackBytes {
-                data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                    rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                )),
             }),
             limits: vec![],
             tenant: None,
@@ -79,8 +81,10 @@ async fn grpc_get_job_includes_status() -> anyhow::Result<()> {
             .report_outcome(ReportOutcomeRequest {
                 shard: 0,
                 task_id: task.id.clone(),
-                outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
-                    data: rmp_serde::to_vec(&serde_json::json!({"result": "done"})).unwrap(),
+                outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({"result": "done"})).unwrap(),
+                    )),
                 })),
             })
             .await?;
@@ -150,8 +154,10 @@ async fn grpc_get_job_result_not_terminal() -> anyhow::Result<()> {
             priority: 10,
             start_at_ms: 0,
             retry_policy: None,
-            payload: Some(MsgpackBytes {
-                data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                    rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                )),
             }),
             limits: vec![],
             tenant: None,
@@ -222,8 +228,10 @@ async fn grpc_get_job_result_success() -> anyhow::Result<()> {
             priority: 10,
             start_at_ms: 0,
             retry_policy: None,
-            payload: Some(MsgpackBytes {
-                data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                    rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                )),
             }),
             limits: vec![],
             tenant: None,
@@ -250,8 +258,8 @@ async fn grpc_get_job_result_success() -> anyhow::Result<()> {
             .report_outcome(ReportOutcomeRequest {
                 shard: 0,
                 task_id: task.id.clone(),
-                outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
-                    data: result_data.clone(),
+                outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(result_data.clone())),
                 })),
             })
             .await?;
@@ -272,7 +280,11 @@ async fn grpc_get_job_result_success() -> anyhow::Result<()> {
 
         match result.result {
             Some(get_job_result_response::Result::SuccessData(data)) => {
-                assert_eq!(data.data, result_data);
+                let actual_data = match data.encoding {
+                    Some(serialized_bytes::Encoding::Msgpack(d)) => d,
+                    None => vec![],
+                };
+                assert_eq!(actual_data, result_data);
             }
             _ => panic!("expected success_data, got {:?}", result.result),
         }
@@ -306,8 +318,10 @@ async fn grpc_get_job_result_failure() -> anyhow::Result<()> {
                 randomize_interval: false,
                 backoff_factor: 1.0,
             }),
-            payload: Some(MsgpackBytes {
-                data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                    rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                )),
             }),
             limits: vec![],
             tenant: None,
@@ -337,7 +351,9 @@ async fn grpc_get_job_result_failure() -> anyhow::Result<()> {
                 task_id: task.id.clone(),
                 outcome: Some(report_outcome_request::Outcome::Failure(Failure {
                     code: error_code.clone(),
-                    data: error_data.clone(),
+                    data: Some(SerializedBytes {
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(error_data.clone())),
+                    }),
                 })),
             })
             .await?;
@@ -359,7 +375,14 @@ async fn grpc_get_job_result_failure() -> anyhow::Result<()> {
         match result.result {
             Some(get_job_result_response::Result::Failure(failure)) => {
                 assert_eq!(failure.error_code, error_code);
-                assert_eq!(failure.error_data, error_data);
+                let actual_error_data = failure
+                    .error_data
+                    .and_then(|e| match e.encoding {
+                        Some(serialized_bytes::Encoding::Msgpack(d)) => Some(d),
+                        None => None,
+                    })
+                    .unwrap_or_default();
+                assert_eq!(actual_error_data, error_data);
             }
             _ => panic!("expected failure, got {:?}", result.result),
         }
@@ -387,8 +410,10 @@ async fn grpc_get_job_result_cancelled() -> anyhow::Result<()> {
             priority: 10,
             start_at_ms: 0,
             retry_policy: None,
-            payload: Some(MsgpackBytes {
-                data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                    rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                )),
             }),
             limits: vec![],
             tenant: None,
@@ -450,8 +475,10 @@ async fn grpc_get_job_result_cancelled_while_running() -> anyhow::Result<()> {
             priority: 10,
             start_at_ms: 0,
             retry_policy: None,
-            payload: Some(MsgpackBytes {
-                data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                    rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                )),
             }),
             limits: vec![],
             tenant: None,
@@ -535,8 +562,10 @@ async fn grpc_server_get_job_result_for_non_terminal_job() -> anyhow::Result<()>
                 priority: 5,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(MsgpackBytes {
-                    data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                    )),
                 }),
                 limits: vec![],
                 tenant: None,
@@ -594,8 +623,10 @@ async fn grpc_get_job_next_attempt_starts_after() -> anyhow::Result<()> {
             priority: 10,
             start_at_ms: 0,
             retry_policy: None,
-            payload: Some(MsgpackBytes {
-                data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                    rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                )),
             }),
             limits: vec![],
             tenant: None,
@@ -634,8 +665,10 @@ async fn grpc_get_job_next_attempt_starts_after() -> anyhow::Result<()> {
             priority: 10,
             start_at_ms: future_ms,
             retry_policy: None,
-            payload: Some(MsgpackBytes {
-                data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                    rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                )),
             }),
             limits: vec![],
             tenant: None,
@@ -696,8 +729,10 @@ async fn grpc_get_job_next_attempt_starts_after() -> anyhow::Result<()> {
             .report_outcome(ReportOutcomeRequest {
                 shard: 0,
                 task_id: task.id.clone(),
-                outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
-                    data: rmp_serde::to_vec(&serde_json::json!({"result": "done"})).unwrap(),
+                outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({"result": "done"})).unwrap(),
+                    )),
                 })),
             })
             .await?;
@@ -752,8 +787,10 @@ async fn grpc_get_job_next_attempt_after_retry() -> anyhow::Result<()> {
                 randomize_interval: false,
                 backoff_factor: 2.0,
             }),
-            payload: Some(MsgpackBytes {
-                data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                    rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                )),
             }),
             limits: vec![],
             tenant: None,
@@ -781,7 +818,9 @@ async fn grpc_get_job_next_attempt_after_retry() -> anyhow::Result<()> {
                 task_id: task.id.clone(),
                 outcome: Some(report_outcome_request::Outcome::Failure(Failure {
                     code: "TEST_FAILURE".to_string(),
-                    data: b"{}".to_vec(),
+                    data: Some(SerializedBytes {
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(b"{}".to_vec())),
+                    }),
                 })),
             })
             .await?;
@@ -835,8 +874,10 @@ async fn grpc_get_job_next_attempt_cancelled() -> anyhow::Result<()> {
             priority: 10,
             start_at_ms: 0,
             retry_policy: None,
-            payload: Some(MsgpackBytes {
-                data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                    rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                )),
             }),
             limits: vec![],
             tenant: None,

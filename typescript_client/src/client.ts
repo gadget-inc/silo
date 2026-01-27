@@ -7,7 +7,7 @@ import { pack, unpack } from "msgpackr";
 import { SiloClient } from "./pb/silo.client";
 import type {
   Limit,
-  MsgpackBytes,
+  SerializedBytes,
   QueryResponse,
   RetryPolicy,
   Task,
@@ -695,8 +695,10 @@ function protoJobStatusToPublic(status: ProtoJobStatus): JobStatus {
       return JobStatus.Failed;
     case ProtoJobStatus.CANCELLED:
       return JobStatus.Cancelled;
-    default:
-      throw new Error(`Unknown job status: ${status}`);
+    default: {
+      const _exhaustive: never = status;
+      throw new Error(`Unknown job status: ${String(_exhaustive)}`);
+    }
   }
 }
 
@@ -714,8 +716,10 @@ function protoAttemptStatusToPublic(status: ProtoAttemptStatus): AttemptStatus {
       return AttemptStatus.Failed;
     case ProtoAttemptStatus.CANCELLED:
       return AttemptStatus.Cancelled;
-    default:
-      throw new Error(`Unknown attempt status: ${status}`);
+    default: {
+      const _exhaustive: never = status;
+      throw new Error(`Unknown attempt status: ${String(_exhaustive)}`);
+    }
   }
 }
 
@@ -731,9 +735,15 @@ function protoAttemptToPublic(attempt: ProtoJobAttempt): JobAttempt {
     status: protoAttemptStatusToPublic(attempt.status),
     startedAtMs: attempt.startedAtMs,
     finishedAtMs: attempt.finishedAtMs,
-    result: attempt.result,
+    result:
+      attempt.result?.encoding.oneofKind === "msgpack"
+        ? decodeBytes(attempt.result.encoding.msgpack, "result")
+        : undefined,
     errorCode: attempt.errorCode,
-    errorData: attempt.errorData ? decodeBytes(attempt.errorData, "errorData") : undefined,
+    errorData:
+      attempt.errorData?.encoding.oneofKind === "msgpack"
+        ? decodeBytes(attempt.errorData.encoding.msgpack, "errorData")
+        : undefined,
   };
 }
 
@@ -1116,7 +1126,9 @@ export class SiloGRPCClient {
             priority: options.priority ?? 50,
             startAtMs: options.startAtMs ?? BigInt(Date.now()),
             retryPolicy: options.retryPolicy,
-            payload: { data: encodeBytes(options.payload) },
+            payload: {
+              encoding: { oneofKind: "msgpack", msgpack: encodeBytes(options.payload) },
+            },
             limits: options.limits?.map(toProtoLimit) ?? [],
             tenant: options.tenant,
             metadata: options.metadata ?? {},
@@ -1163,7 +1175,12 @@ export class SiloGRPCClient {
           id: response.id,
           priority: response.priority,
           enqueueTimeMs: response.enqueueTimeMs,
-          payload: response.payload,
+          payload: decodeBytes(
+            response.payload?.encoding.oneofKind === "msgpack"
+              ? response.payload.encoding.msgpack
+              : undefined,
+            "payload"
+          ),
           retryPolicy: response.retryPolicy,
           limits: response.limits
             .map(fromProtoLimit)
@@ -1346,9 +1363,13 @@ export class SiloGRPCClient {
           let result: T | undefined;
           if (
             response.result.oneofKind === "successData" &&
-            response.result.successData.data.length > 0
+            response.result.successData.encoding.oneofKind === "msgpack" &&
+            response.result.successData.encoding.msgpack.length > 0
           ) {
-            result = decodeBytes<T>(response.result.successData.data, "successData");
+            result = decodeBytes<T>(
+              response.result.successData.encoding.msgpack,
+              "successData"
+            );
           }
           return { status: JobStatus.Succeeded, result };
         }
@@ -1357,9 +1378,13 @@ export class SiloGRPCClient {
           let errorData: unknown;
           if (
             response.result.oneofKind === "failure" &&
-            response.result.failure.errorData.length > 0
+            response.result.failure.errorData?.encoding.oneofKind === "msgpack" &&
+            response.result.failure.errorData.encoding.msgpack.length > 0
           ) {
-            errorData = decodeBytes(response.result.failure.errorData, "failure");
+            errorData = decodeBytes(
+              response.result.failure.errorData.encoding.msgpack,
+              "failure"
+            );
           }
           return {
             status: JobStatus.Failed,
@@ -1472,24 +1497,29 @@ export class SiloGRPCClient {
    */
   public async reportOutcome(options: ReportOutcomeOptions): Promise<void> {
     let outcome:
-      | { oneofKind: "success"; success: { data: Uint8Array } }
-      | { oneofKind: "failure"; failure: { code: string; data: Uint8Array } }
+      | { oneofKind: "success"; success: SerializedBytes }
+      | { oneofKind: "failure"; failure: { code: string; data?: SerializedBytes } }
       | { oneofKind: "cancelled"; cancelled: Record<string, never> };
 
     if (options.outcome.type === "success") {
       outcome = {
         oneofKind: "success" as const,
-        success: { data: encodeBytes(options.outcome.result) },
+        success: {
+          encoding: { oneofKind: "msgpack", msgpack: encodeBytes(options.outcome.result) },
+        },
       };
     } else if (options.outcome.type === "failure") {
+      const errorData =
+        options.outcome.data instanceof Uint8Array
+          ? options.outcome.data
+          : encodeBytes(options.outcome.data);
       outcome = {
         oneofKind: "failure" as const,
         failure: {
           code: options.outcome.code,
-          data:
-            options.outcome.data instanceof Uint8Array
-              ? options.outcome.data
-              : encodeBytes(options.outcome.data),
+          data: {
+            encoding: { oneofKind: "msgpack", msgpack: errorData },
+          },
         },
       };
     } else {

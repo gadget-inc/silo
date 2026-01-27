@@ -24,8 +24,8 @@ use crate::coordination::{Coordinator, ShardOwnerMap};
 use crate::factory::ShardFactory;
 use crate::pb::silo_client::SiloClient;
 use crate::pb::{
-    CancelJobRequest, ColumnInfo, GetJobRequest, GetJobResponse, JobStatus, MsgpackBytes,
-    QueryRequest,
+    CancelJobRequest, ColumnInfo, GetJobRequest, GetJobResponse, JobStatus, QueryRequest,
+    SerializedBytes, serialized_bytes,
 };
 
 /// Configuration for gRPC client connections.
@@ -213,8 +213,8 @@ pub enum ClusterClientError {
 pub struct QueryResult {
     /// Column schema information
     pub columns: Vec<ColumnInfo>,
-    /// Rows as MessagePack-encoded objects
-    pub rows: Vec<MsgpackBytes>,
+    /// Rows as serialized objects (MessagePack by default)
+    pub rows: Vec<SerializedBytes>,
     /// Number of rows returned
     pub row_count: i32,
     /// Which shard this result came from
@@ -356,9 +356,11 @@ impl ClusterClient {
         // Convert batches directly to MessagePack rows
         let row_bytes = crate::query::record_batches_to_msgpack(&batches)
             .map_err(ClusterClientError::QueryFailed)?;
-        let rows: Vec<MsgpackBytes> = row_bytes
+        let rows: Vec<SerializedBytes> = row_bytes
             .into_iter()
-            .map(|data| MsgpackBytes { data })
+            .map(|data| SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(data)),
+            })
             .collect();
 
         let row_count = rows.len() as i32;
@@ -557,8 +559,10 @@ impl ClusterClient {
                 id: job_view.id().to_string(),
                 priority: job_view.priority() as u32,
                 enqueue_time_ms: job_view.enqueue_time_ms(),
-                payload: Some(MsgpackBytes {
-                    data: job_view.payload_bytes().to_vec(),
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        job_view.payload_bytes().to_vec(),
+                    )),
                 }),
                 retry_policy,
                 limits: job_view

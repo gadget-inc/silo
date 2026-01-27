@@ -18,8 +18,8 @@
 //! - queueLimitEnforced: Never more than 1 holder for the limit
 
 use crate::helpers::{
-    ConcurrencyLimit, EnqueueRequest, HashMap, LeaseTasksRequest, Limit, MsgpackBytes,
-    ReportOutcomeRequest, RetryPolicy, check_holder_limits, get_seed, limit,
+    ConcurrencyLimit, EnqueueRequest, HashMap, LeaseTasksRequest, Limit, SerializedBytes,
+    ReportOutcomeRequest, RetryPolicy, check_holder_limits, get_seed, limit, serialized_bytes,
     report_outcome_request, run_scenario_impl, setup_server, turmoil_connector,
     verify_server_invariants,
 };
@@ -75,8 +75,8 @@ pub fn run() {
                         randomize_interval: false, // Deterministic for testing
                         backoff_factor: 1.0,       // No exponential backoff
                     }),
-                    payload: Some(MsgpackBytes {
-                        data: rmp_serde::to_vec(&serde_json::json!({"job": "A"})).unwrap(),
+                    payload: Some(SerializedBytes {
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"job": "A"})).unwrap())),
                     }),
                     limits: vec![Limit {
                         limit: Some(limit::Limit::Concurrency(ConcurrencyLimit {
@@ -101,8 +101,8 @@ pub fn run() {
                     priority: 10, // Same priority as A
                     start_at_ms: 0,
                     retry_policy: None, // No retry
-                    payload: Some(MsgpackBytes {
-                        data: rmp_serde::to_vec(&serde_json::json!({"job": "B"})).unwrap(),
+                    payload: Some(SerializedBytes {
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"job": "B"})).unwrap())),
                     }),
                     limits: vec![Limit {
                         limit: Some(limit::Limit::Concurrency(ConcurrencyLimit {
@@ -197,7 +197,7 @@ pub fn run() {
                                     outcome: Some(report_outcome_request::Outcome::Failure(
                                         silo::pb::Failure {
                                             code: "intentional_failure".into(),
-                                            data: vec![],
+                                            data: None,
                                         },
                                     )),
                                 }))
@@ -234,9 +234,9 @@ pub fn run() {
                                     shard: 0,
                                     task_id: task.id.clone(),
                                     outcome: Some(report_outcome_request::Outcome::Success(
-                                        MsgpackBytes {
-                                            data: rmp_serde::to_vec(&serde_json::json!("done"))
-                                                .unwrap(),
+                                        SerializedBytes {
+                                            encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!("done"))
+                                                .unwrap())),
                                         },
                                     )),
                                 }))
@@ -313,8 +313,8 @@ pub fn run() {
                                 shard: 0,
                                 task_id: task.id.clone(),
                                 outcome: Some(report_outcome_request::Outcome::Success(
-                                    MsgpackBytes {
-                                        data: rmp_serde::to_vec(&serde_json::json!("done")).unwrap(),
+                                    SerializedBytes {
+                                        encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!("done")).unwrap())),
                                     },
                                 )),
                             }))

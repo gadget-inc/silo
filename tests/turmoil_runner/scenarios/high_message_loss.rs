@@ -7,7 +7,7 @@
 
 use crate::helpers::{
     AttemptStatus, ClientConfig, EnqueueRequest, GetJobRequest, HashMap, JobStateTracker, JobStatus,
-    LeaseTasksRequest, MsgpackBytes, ReportOutcomeRequest, RetryPolicy, create_turmoil_client,
+    LeaseTasksRequest, SerializedBytes, ReportOutcomeRequest, RetryPolicy, create_turmoil_client, serialized_bytes,
     get_seed, report_outcome_request, run_scenario_impl, setup_server,
 };
 use std::collections::HashSet;
@@ -61,8 +61,8 @@ pub fn run() {
                         priority: i as u32,
                         start_at_ms: 0,
                         retry_policy,
-                        payload: Some(MsgpackBytes {
-                            data: rmp_serde::to_vec(&serde_json::json!({"job": i})).unwrap(),
+                        payload: Some(SerializedBytes {
+                            encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"job": i})).unwrap())),
                         }),
                         limits: vec![],
                         tenant: None,
@@ -135,9 +135,9 @@ pub fn run() {
                                     shard: 0,
                                     task_id: task.id.clone(),
                                     outcome: Some(report_outcome_request::Outcome::Success(
-                                        MsgpackBytes {
-                                            data: rmp_serde::to_vec(&serde_json::json!("done"))
-                                                .unwrap(),
+                                        SerializedBytes {
+                                            encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!("done"))
+                                                .unwrap())),
                                         },
                                     )),
                                 }))

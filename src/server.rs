@@ -151,7 +151,9 @@ pub fn job_attempt_view_to_proto(
             AttemptStatus::Succeeded,
             None,
             Some(finished_at_ms),
-            Some(MsgpackBytes { data: result }),
+            Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(result)),
+            }),
             None,
             None,
         ),
@@ -165,7 +167,9 @@ pub fn job_attempt_view_to_proto(
             Some(finished_at_ms),
             None,
             Some(error_code),
-            Some(error),
+            Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(error)),
+            }),
         ),
         JobAttemptStatus::Cancelled { finished_at_ms } => (
             AttemptStatus::Cancelled,
@@ -418,7 +422,11 @@ impl Silo for SiloService {
         let payload_bytes = r
             .payload
             .as_ref()
-            .map(|p| p.data.clone())
+            .and_then(|p| {
+                p.encoding
+                    .as_ref()
+                    .map(|serialized_bytes::Encoding::Msgpack(data)| data.clone())
+            })
             .unwrap_or_default();
         let retry = r.retry_policy.map(|rp| crate::retry::RetryPolicy {
             retry_count: rp.retry_count,
@@ -542,8 +550,10 @@ impl Silo for SiloService {
             id: view.id().to_string(),
             priority: view.priority() as u32,
             enqueue_time_ms: view.enqueue_time_ms(),
-            payload: Some(MsgpackBytes {
-                data: view.payload_bytes().to_vec(),
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                    view.payload_bytes().to_vec(),
+                )),
             }),
             retry_policy,
             limits: view
@@ -618,9 +628,11 @@ impl Silo for SiloService {
                 id: r.id,
                 status: JobStatus::Succeeded.into(),
                 finished_at_ms,
-                result: Some(get_job_result_response::Result::SuccessData(MsgpackBytes {
-                    data: result,
-                })),
+                result: Some(get_job_result_response::Result::SuccessData(
+                    SerializedBytes {
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(result)),
+                    },
+                )),
             })),
             crate::job_attempt::AttemptStatus::Failed {
                 finished_at_ms,
@@ -632,7 +644,9 @@ impl Silo for SiloService {
                 finished_at_ms,
                 result: Some(get_job_result_response::Result::Failure(JobFailure {
                     error_code,
-                    error_data: error,
+                    error_data: Some(SerializedBytes {
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(error)),
+                    }),
                 })),
             })),
             crate::job_attempt::AttemptStatus::Cancelled { finished_at_ms } => {
@@ -793,8 +807,10 @@ impl Silo for SiloService {
                     job_id: job.id().to_string(),
                     attempt_number,
                     lease_ms: DEFAULT_LEASE_MS,
-                    payload: Some(MsgpackBytes {
-                        data: job.payload_bytes().to_vec(),
+                    payload: Some(SerializedBytes {
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(
+                            job.payload_bytes().to_vec(),
+                        )),
                     }),
                     priority: job.priority() as u32,
                     shard: shard_id,
@@ -854,15 +870,28 @@ impl Silo for SiloService {
             .ok_or_else(|| Status::invalid_argument("missing outcome"))?
         {
             report_outcome_request::Outcome::Success(s) => {
-                (AttemptOutcome::Success { result: s.data }, "succeeded")
+                let result = match s.encoding {
+                    Some(serialized_bytes::Encoding::Msgpack(data)) => data,
+                    None => Vec::new(),
+                };
+                (AttemptOutcome::Success { result }, "succeeded")
             }
-            report_outcome_request::Outcome::Failure(f) => (
-                AttemptOutcome::Error {
-                    error_code: f.code,
-                    error: f.data,
-                },
-                "failed",
-            ),
+            report_outcome_request::Outcome::Failure(f) => {
+                let error = f
+                    .data
+                    .and_then(|d| {
+                        d.encoding
+                            .map(|serialized_bytes::Encoding::Msgpack(data)| data)
+                    })
+                    .unwrap_or_default();
+                (
+                    AttemptOutcome::Error {
+                        error_code: f.code,
+                        error,
+                    },
+                    "failed",
+                )
+            }
             report_outcome_request::Outcome::Cancelled(_) => {
                 (AttemptOutcome::Cancelled, "cancelled")
             }
@@ -966,9 +995,11 @@ impl Silo for SiloService {
         // Convert batches directly to MessagePack rows
         let row_bytes =
             crate::query::record_batches_to_msgpack(&batches).map_err(Status::internal)?;
-        let rows: Vec<MsgpackBytes> = row_bytes
+        let rows: Vec<SerializedBytes> = row_bytes
             .into_iter()
-            .map(|data| MsgpackBytes { data })
+            .map(|data| SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(data)),
+            })
             .collect();
 
         let row_count = rows.len() as i32;

@@ -24,7 +24,7 @@
 
 use crate::helpers::{
     ConcurrencyLimit, EnqueueRequest, HashMap, InvariantTracker, LeaseTasksRequest, Limit,
-    MsgpackBytes, ReportOutcomeRequest, RetryPolicy, Task, create_turmoil_client, get_seed, limit,
+    SerializedBytes, ReportOutcomeRequest, RetryPolicy, Task, create_turmoil_client, get_seed, limit, serialized_bytes,
     report_outcome_request, run_scenario_impl, setup_server, turmoil, verify_server_invariants,
 };
 use rand::rngs::StdRng;
@@ -230,13 +230,13 @@ pub fn run() {
                         priority,
                         start_at_ms: 0,
                         retry_policy: retry_policy.clone(),
-                        payload: Some(MsgpackBytes {
-                            data: rmp_serde::to_vec(&serde_json::json!({
+                        payload: Some(SerializedBytes {
+                            encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({
                                 "chaos": true,
                                 "limit": limit_key,
                                 "idx": i
                             }))
-                            .unwrap(),
+                            .unwrap())),
                         }),
                         limits: limits.clone(),
                         tenant: None,
@@ -547,12 +547,12 @@ pub fn run() {
                             let outcome = if should_fail {
                                 report_outcome_request::Outcome::Failure(silo::pb::Failure {
                                     code: "chaos_failure".into(),
-                                    data: vec![],
+                                    data: None,
                                 })
                             } else {
-                                report_outcome_request::Outcome::Success(MsgpackBytes {
-                                    data: rmp_serde::to_vec(&serde_json::json!("chaos_done"))
-                                        .unwrap(),
+                                report_outcome_request::Outcome::Success(SerializedBytes {
+                                    encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!("chaos_done"))
+                                        .unwrap())),
                                 })
                             };
 
@@ -616,8 +616,8 @@ pub fn run() {
                         .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                             shard: 0,
                             task_id: task.id.clone(),
-                            outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
-                                data: rmp_serde::to_vec(&serde_json::json!("chaos_done")).unwrap(),
+                            outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
+                                encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!("chaos_done")).unwrap())),
                             })),
                         }))
                         .await

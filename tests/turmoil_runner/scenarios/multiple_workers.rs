@@ -7,7 +7,7 @@
 
 use crate::helpers::{
     AttemptStatus, EnqueueRequest, GetJobRequest, HashMap, InvariantTracker, JobStatus,
-    LeaseTasksRequest, MsgpackBytes, ReportOutcomeRequest, get_seed, report_outcome_request,
+    LeaseTasksRequest, SerializedBytes, ReportOutcomeRequest, get_seed, report_outcome_request, serialized_bytes,
     run_scenario_impl, setup_server, turmoil_connector,
 };
 use silo::pb::silo_client::SiloClient;
@@ -50,8 +50,8 @@ pub fn run() {
                         priority: i as u32,
                         start_at_ms: 0,
                         retry_policy: None,
-                        payload: Some(MsgpackBytes {
-                            data: rmp_serde::to_vec(&serde_json::json!({"job": i})).unwrap(),
+                        payload: Some(SerializedBytes {
+                            encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"job": i})).unwrap())),
                         }),
                         limits: vec![],
                         tenant: None,
@@ -100,8 +100,8 @@ pub fn run() {
                         .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                             shard: 0,
                             task_id: task.id.clone(),
-                            outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
-                                data: rmp_serde::to_vec(&serde_json::json!("ok")).unwrap(),
+                            outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
+                                encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!("ok")).unwrap())),
                             })),
                         }))
                         .await?;
@@ -153,8 +153,8 @@ pub fn run() {
                         .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                             shard: 0,
                             task_id: task.id.clone(),
-                            outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
-                                data: rmp_serde::to_vec(&serde_json::json!("ok")).unwrap(),
+                            outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
+                                encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!("ok")).unwrap())),
                             })),
                         }))
                         .await?;

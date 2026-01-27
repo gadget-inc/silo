@@ -8,7 +8,7 @@
 
 use crate::helpers::{
     AttemptStatus, EnqueueRequest, GetJobRequest, HashMap, JobStateTracker, JobStatus,
-    LeaseTasksRequest, MsgpackBytes, ReportOutcomeRequest, RetryPolicy, get_seed,
+    LeaseTasksRequest, SerializedBytes, ReportOutcomeRequest, RetryPolicy, get_seed, serialized_bytes,
     report_outcome_request, run_scenario_impl, setup_server, turmoil, turmoil_connector,
 };
 use silo::pb::silo_client::SiloClient;
@@ -61,8 +61,8 @@ pub fn run() {
                         randomize_interval: false,
                         backoff_factor: 1.0,
                     }),
-                    payload: Some(MsgpackBytes {
-                        data: rmp_serde::to_vec(&serde_json::json!({"test": "lease"})).unwrap(),
+                    payload: Some(SerializedBytes {
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"test": "lease"})).unwrap())),
                     }),
                     limits: vec![],
                     tenant: None,
@@ -183,11 +183,11 @@ pub fn run() {
                                     shard: 0,
                                     task_id: task.id.clone(),
                                     outcome: Some(report_outcome_request::Outcome::Success(
-                                        MsgpackBytes {
-                                            data: rmp_serde::to_vec(&serde_json::json!(
+                                        SerializedBytes {
+                                            encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!(
                                                 "recovered"
                                             ))
-                                            .unwrap(),
+                                            .unwrap())),
                                         },
                                     )),
                                 }))

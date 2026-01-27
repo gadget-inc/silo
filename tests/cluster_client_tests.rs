@@ -315,8 +315,12 @@ async fn cluster_client_json_serialization_preserves_data() {
     assert_eq!(result.row_count, 1);
 
     // Parse the JSON row to verify it's valid
+    let row_data = match &result.rows[0].encoding {
+        Some(silo::pb::serialized_bytes::Encoding::Msgpack(data)) => data,
+        None => panic!("expected msgpack encoding"),
+    };
     let row_json: serde_json::Value =
-        rmp_serde::from_slice(&result.rows[0].data).expect("row should be valid MessagePack");
+        rmp_serde::from_slice(row_data).expect("row should be valid MessagePack");
 
     assert_eq!(row_json["id"], "job-complex");
 

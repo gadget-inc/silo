@@ -298,7 +298,12 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       expect(task?.attemptNumber).toBe(1);
       expect(task?.priority).toBe(1);
 
-      const taskPayload = decodeBytes(task?.payload?.data, "payload");
+      const taskPayload = decodeBytes(
+        task?.payload?.encoding.oneofKind === "msgpack"
+          ? task.payload.encoding.msgpack
+          : undefined,
+        "payload"
+      );
       expect(taskPayload).toEqual(payload);
 
       await client.reportOutcome({
@@ -638,7 +643,12 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       expect(result.rowCount).toBe(1);
       expect(result.columns.some((c) => c.name === "count")).toBe(true);
 
-      const row = decodeBytes<{ count: number }>(result.rows[0]?.data, "row");
+      const row = decodeBytes<{ count: number }>(
+        result.rows[0]?.encoding.oneofKind === "msgpack"
+          ? result.rows[0].encoding.msgpack
+          : undefined,
+        "row"
+      );
       expect(typeof row?.count).toBe("number");
     });
   });

@@ -50,7 +50,12 @@ export function transformTask<Payload = unknown, Metadata extends Record<string,
     jobId: protoTask.jobId,
     attemptNumber: protoTask.attemptNumber,
     leaseMs: protoTask.leaseMs,
-    payload: decodeBytes<Payload>(protoTask.payload?.data, "payload"),
+    payload: decodeBytes<Payload>(
+      protoTask.payload?.encoding.oneofKind === "msgpack"
+        ? protoTask.payload.encoding.msgpack
+        : undefined,
+      "payload"
+    ),
     priority: protoTask.priority,
     shard: protoTask.shard,
     taskGroup: protoTask.taskGroup,

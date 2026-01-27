@@ -38,7 +38,9 @@ function createTask(id: string, jobId: string, shard: number = 0): Task {
     jobId,
     attemptNumber: 1,
     leaseMs: 30000n,
-    payload: { data: encodeBytes({ test: "data" }) },
+    payload: {
+      encoding: { oneofKind: "msgpack", msgpack: encodeBytes({ test: "data" }) },
+    },
     priority: 10,
     shard,
     taskGroup: "default",
@@ -621,7 +623,7 @@ describe("SiloWorker", () => {
 
       const handler: TaskHandler = async (ctx) => {
         receivedSignal = ctx.signal;
-        receivedCancel = ctx.cancel;
+        receivedCancel = ctx.cancel.bind(ctx);
         return { type: "success", result: {} };
       };
 
