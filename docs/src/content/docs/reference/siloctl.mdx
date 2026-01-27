@@ -1,0 +1,377 @@
+---
+title: siloctl CLI Reference
+description: Command-line tool for administering Silo clusters
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+`siloctl` is a command-line tool for administering Silo clusters. It connects to Silo servers via gRPC and provides commands for cluster inspection, job management, and debugging.
+
+## Installation
+
+`siloctl` is included in the Silo distribution. Build it with:
+
+```bash
+cargo build --release --bin siloctl
+```
+
+The binary will be at `target/release/siloctl`.
+
+## Global Options
+
+These options apply to all commands:
+
+| Option | Description |
+|--------|-------------|
+| `-a`, `--address <URL>` | Silo server address (default: `http://localhost:50051`) |
+| `-t`, `--tenant <ID>` | Tenant ID for multi-tenant clusters |
+| `--json` | Output in JSON format instead of human-readable tables |
+| `-h`, `--help` | Print help information |
+| `-V`, `--version` | Print version information |
+
+## Commands
+
+### cluster info
+
+Show cluster topology and shard ownership information.
+
+```bash
+siloctl cluster info
+```
+
+**Example output:**
+
+```
+Cluster Information
+===================
+Total shards: 8
+Connected to: node-1 (10.0.0.5:50051)
+
+Shard Ownership:
+   Shard               Node ID  gRPC Address
+------------------------------------------------------------
+       0                node-1  10.0.0.5:50051
+       1                node-1  10.0.0.5:50051
+       2                node-2  10.0.0.6:50051
+       3                node-2  10.0.0.6:50051
+       4                node-3  10.0.0.7:50051
+       5                node-3  10.0.0.7:50051
+       6                node-4  10.0.0.8:50051
+       7                node-4  10.0.0.8:50051
+```
+
+**JSON output:**
+
+```bash
+siloctl --json cluster info
+```
+
+```json
+{
+  "num_shards": 8,
+  "this_node_id": "node-1",
+  "this_grpc_addr": "10.0.0.5:50051",
+  "shard_owners": [
+    {"shard_id": 0, "node_id": "node-1", "grpc_addr": "10.0.0.5:50051"},
+    {"shard_id": 1, "node_id": "node-1", "grpc_addr": "10.0.0.5:50051"}
+  ]
+}
+```
+
+---
+
+### job get
+
+Get detailed information about a specific job.
+
+```bash
+siloctl job get <shard> <id> [--attempts]
+```
+
+| Argument | Description |
+|----------|-------------|
+| `<shard>` | Shard ID where the job is stored |
+| `<id>` | Job ID |
+| `--attempts` | Include attempt history |
+
+**Example:**
+
+```bash
+siloctl job get 0 abc123-def456
+```
+
+```
+Job Details
+===========
+ID:              abc123-def456
+Status:          running
+Priority:        50
+Task Group:      default
+Enqueued:        1706123456 (1706123456000ms)
+Status Changed:  1706123460 (1706123460000ms)
+
+Metadata:
+  user_id: 12345
+  request_id: req-789
+```
+
+**With attempts:**
+
+```bash
+siloctl job get 0 abc123-def456 --attempts
+```
+
+```
+Job Details
+===========
+ID:              abc123-def456
+Status:          failed
+Priority:        50
+Task Group:      default
+Enqueued:        1706123456 (1706123456000ms)
+Status Changed:  1706123500 (1706123500000ms)
+
+Attempts:
+ Attempt                              Task ID      Status              Finished
+--------------------------------------------------------------------------------
+       1      task-111-222-333-444      failed      1706123480 (1706123480000ms)
+       2      task-555-666-777-888      failed      1706123500 (1706123500000ms)
+```
+
+---
+
+### job cancel
+
+Cancel a running or scheduled job. Workers will be notified via heartbeat and should stop processing.
+
+```bash
+siloctl job cancel <shard> <id>
+```
+
+| Argument | Description |
+|----------|-------------|
+| `<shard>` | Shard ID where the job is stored |
+| `<id>` | Job ID |
+
+**Example:**
+
+```bash
+siloctl job cancel 3 job-to-cancel
+```
+
+```
+Job job-to-cancel cancelled successfully
+```
+
+<Aside type="note">
+Cancellation is asynchronous for running jobs. The worker will be notified on its next heartbeat and should acknowledge the cancellation.
+</Aside>
+
+---
+
+### job restart
+
+Restart a cancelled or failed job. The job will be rescheduled with a fresh set of retry attempts.
+
+```bash
+siloctl job restart <shard> <id>
+```
+
+| Argument | Description |
+|----------|-------------|
+| `<shard>` | Shard ID where the job is stored |
+| `<id>` | Job ID |
+
+**Example:**
+
+```bash
+siloctl job restart 2 failed-job-123
+```
+
+```
+Job failed-job-123 restarted successfully
+```
+
+<Aside type="caution">
+You can only restart jobs that are in a terminal state (failed or cancelled). Attempting to restart a running or scheduled job will fail.
+</Aside>
+
+---
+
+### job expedite
+
+Expedite a scheduled job to run immediately. This is useful for:
+
+- Dragging forward a job scheduled for the future
+- Skipping retry backoff delays for a job that's waiting to retry
+
+```bash
+siloctl job expedite <shard> <id>
+```
+
+| Argument | Description |
+|----------|-------------|
+| `<shard>` | Shard ID where the job is stored |
+| `<id>` | Job ID |
+
+**Example:**
+
+```bash
+siloctl job expedite 1 scheduled-job-456
+```
+
+```
+Job scheduled-job-456 expedited successfully
+```
+
+<Aside type="note">
+You can only expedite jobs that are scheduled for the future or waiting for retry backoff. Jobs that are already running, completed, or ready to run cannot be expedited.
+</Aside>
+
+---
+
+### job delete
+
+Permanently delete a job and all its data.
+
+```bash
+siloctl job delete <shard> <id>
+```
+
+| Argument | Description |
+|----------|-------------|
+| `<shard>` | Shard ID where the job is stored |
+| `<id>` | Job ID |
+
+**Example:**
+
+```bash
+siloctl job delete 0 old-job-789
+```
+
+```
+Job old-job-789 deleted successfully
+```
+
+<Aside type="danger">
+This permanently removes the job. Running jobs should be cancelled first. This operation cannot be undone.
+</Aside>
+
+---
+
+### query
+
+Execute an SQL query against a shard's data. Useful for debugging and inspection.
+
+```bash
+siloctl query <shard> "<sql>"
+```
+
+| Argument | Description |
+|----------|-------------|
+| `<shard>` | Shard ID to query |
+| `<sql>` | SQL query string |
+
+**Example:**
+
+```bash
+siloctl query 0 "SELECT id, status, task_group FROM jobs LIMIT 5"
+```
+
+```
+              id |          status |      task_group
+----------------------------------------------------
+   abc123-def456 |        running |         default
+   ghi789-jkl012 |      scheduled |         default
+   mno345-pqr678 |      succeeded |       payments
+   stu901-vwx234 |         failed |       payments
+   yza567-bcd890 |      scheduled |         emails
+               
+5 row(s) returned
+```
+
+**JSON output for scripting:**
+
+```bash
+siloctl --json query 0 "SELECT id, status FROM jobs WHERE status = 'failed' LIMIT 10"
+```
+
+```json
+{
+  "columns": [
+    {"name": "id", "data_type": "Utf8"},
+    {"name": "status", "data_type": "Utf8"}
+  ],
+  "row_count": 2,
+  "rows": [
+    {"id": "job-123", "status": "failed"},
+    {"id": "job-456", "status": "failed"}
+  ]
+}
+```
+
+---
+
+## Common Workflows
+
+### Debugging a Stuck Job
+
+1. **Find the job status:**
+
+```bash
+siloctl job get 0 problematic-job-id --attempts
+```
+
+2. **If the job is stuck in retry backoff, expedite it:**
+
+```bash
+siloctl job expedite 0 problematic-job-id
+```
+
+3. **Or cancel and restart it:**
+
+```bash
+siloctl job cancel 0 problematic-job-id
+siloctl job restart 0 problematic-job-id
+```
+
+### Inspecting Cluster Health
+
+```bash
+# Check cluster topology
+siloctl cluster info
+
+# Query job counts per status
+siloctl query 0 "SELECT status, COUNT(*) as count FROM jobs GROUP BY status"
+```
+
+### Scripting with JSON Output
+
+```bash
+# Get all failed jobs and process with jq
+siloctl --json query 0 "SELECT id FROM jobs WHERE status = 'failed'" \
+  | jq -r '.rows[].id' \
+  | while read job_id; do
+      siloctl job restart 0 "$job_id"
+    done
+```
+
+### Multi-Tenant Operations
+
+When working with a multi-tenant cluster, always specify the tenant:
+
+```bash
+siloctl -t customer-123 job get 0 job-id
+siloctl -t customer-123 job cancel 0 job-id
+```
+
+### Connecting to a Remote Cluster
+
+```bash
+# Connect to production
+siloctl -a http://silo.production.internal:50051 cluster info
+
+# Or set an environment variable (not directly supported, but you can alias)
+alias siloctl-prod='siloctl -a http://silo.production.internal:50051'
+siloctl-prod cluster info
+```
