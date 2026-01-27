@@ -25,8 +25,8 @@ use turmoil::net::TcpListener;
 // Re-export common types needed by scenarios
 pub use silo::pb::{
     AttemptStatus, ConcurrencyLimit, EnqueueRequest, GetJobRequest, JobStatus, LeaseTasksRequest,
-    Limit, MsgpackBytes, QueryRequest, ReportOutcomeRequest, RetryPolicy, Task, limit,
-    report_outcome_request,
+    Limit, QueryRequest, ReportOutcomeRequest, RetryPolicy, SerializedBytes, Task, limit,
+    report_outcome_request, serialized_bytes,
 };
 pub use std::collections::HashMap;
 pub use turmoil;
@@ -884,7 +884,7 @@ impl JobStateTracker {
             let mut completed = self.completed_jobs.lock().unwrap();
             completed.remove(job_id);
         }
-        
+
         let mut statuses = self.job_statuses.lock().unwrap();
         statuses.insert(job_id.to_string(), JobStatus::Scheduled as i32);
         drop(statuses);
@@ -1094,16 +1094,18 @@ pub async fn verify_server_invariants(
         Ok(resp) => {
             let response = resp.into_inner();
             for row_bytes in &response.rows {
-                if let Ok(row) = parse_msgpack_row(&row_bytes.data) {
-                    let status = row.get("status_kind").and_then(|v| v.as_str());
-                    let count = row.get("cnt").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                if let Some(serialized_bytes::Encoding::Msgpack(data)) = &row_bytes.encoding {
+                    if let Ok(row) = parse_msgpack_row(data) {
+                        let status = row.get("status_kind").and_then(|v| v.as_str());
+                        let count = row.get("cnt").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
-                    match status {
-                        Some("Running") => result.running_job_count = count,
-                        Some("Succeeded") | Some("Failed") | Some("Cancelled") => {
-                            result.terminal_job_count += count;
+                        match status {
+                            Some("Running") => result.running_job_count = count,
+                            Some("Succeeded") | Some("Failed") | Some("Cancelled") => {
+                                result.terminal_job_count += count;
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
@@ -1127,14 +1129,16 @@ pub async fn verify_server_invariants(
         Ok(resp) => {
             let response = resp.into_inner();
             for row_bytes in &response.rows {
-                if let Ok(row) = parse_msgpack_row(&row_bytes.data) {
-                    if let (Some(queue_name), Some(count)) = (
-                        row.get("queue_name").and_then(|v| v.as_str()),
-                        row.get("cnt").and_then(|v| v.as_u64()),
-                    ) {
-                        result
-                            .holder_counts_by_queue
-                            .insert(queue_name.to_string(), count as u32);
+                if let Some(serialized_bytes::Encoding::Msgpack(data)) = &row_bytes.encoding {
+                    if let Ok(row) = parse_msgpack_row(data) {
+                        if let (Some(queue_name), Some(count)) = (
+                            row.get("queue_name").and_then(|v| v.as_str()),
+                            row.get("cnt").and_then(|v| v.as_u64()),
+                        ) {
+                            result
+                                .holder_counts_by_queue
+                                .insert(queue_name.to_string(), count as u32);
+                        }
                     }
                 }
             }
@@ -1157,14 +1161,16 @@ pub async fn verify_server_invariants(
         Ok(resp) => {
             let response = resp.into_inner();
             for row_bytes in &response.rows {
-                if let Ok(row) = parse_msgpack_row(&row_bytes.data) {
-                    if let (Some(queue_name), Some(count)) = (
-                        row.get("queue_name").and_then(|v| v.as_str()),
-                        row.get("cnt").and_then(|v| v.as_u64()),
-                    ) {
-                        result
-                            .requester_counts_by_queue
-                            .insert(queue_name.to_string(), count as u32);
+                if let Some(serialized_bytes::Encoding::Msgpack(data)) = &row_bytes.encoding {
+                    if let Ok(row) = parse_msgpack_row(data) {
+                        if let (Some(queue_name), Some(count)) = (
+                            row.get("queue_name").and_then(|v| v.as_str()),
+                            row.get("cnt").and_then(|v| v.as_u64()),
+                        ) {
+                            result
+                                .requester_counts_by_queue
+                                .insert(queue_name.to_string(), count as u32);
+                        }
                     }
                 }
             }

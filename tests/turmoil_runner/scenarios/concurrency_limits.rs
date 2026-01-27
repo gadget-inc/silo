@@ -18,7 +18,7 @@
 
 use crate::helpers::{
     AttemptStatus, ConcurrencyLimit, EnqueueRequest, GetJobRequest, InvariantTracker,
-    HashMap, JobStatus, LeaseTasksRequest, Limit, MsgpackBytes,
+    HashMap, JobStatus, LeaseTasksRequest, Limit, SerializedBytes, serialized_bytes,
     ReportOutcomeRequest, Task,
     get_seed, limit, report_outcome_request, run_scenario_impl, setup_server, turmoil_connector,
 };
@@ -152,12 +152,12 @@ pub fn run() {
                         priority,
                         start_at_ms: 0,
                         retry_policy: None,
-                        payload: Some(MsgpackBytes {
-                            data: rmp_serde::to_vec(&serde_json::json!({
+                        payload: Some(SerializedBytes {
+                            encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({
                                 "limit_key": config.key,
                                 "job_num": job_num
                             }))
-                            .unwrap(),
+                            .unwrap())),
                         }),
                         limits: vec![Limit {
                             limit: Some(limit::Limit::Concurrency(ConcurrencyLimit {
@@ -236,12 +236,12 @@ pub fn run() {
                         priority,
                         start_at_ms: 0,
                         retry_policy: None,
-                        payload: Some(MsgpackBytes {
-                            data: rmp_serde::to_vec(&serde_json::json!({
+                        payload: Some(SerializedBytes {
+                            encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({
                                 "limit_key": config.key,
                                 "job_num": job_num
                             }))
-                            .unwrap(),
+                            .unwrap())),
                         }),
                         limits: vec![Limit {
                             limit: Some(limit::Limit::Concurrency(ConcurrencyLimit {
@@ -381,11 +381,11 @@ pub fn run() {
                             let outcome = if should_fail {
                                 report_outcome_request::Outcome::Failure(silo::pb::Failure {
                                     code: "random_failure".into(),
-                                    data: vec![],
+                                    data: None,
                                 })
                             } else {
-                                report_outcome_request::Outcome::Success(MsgpackBytes {
-                                    data: rmp_serde::to_vec(&serde_json::json!("done")).unwrap(),
+                                report_outcome_request::Outcome::Success(SerializedBytes {
+                                    encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!("done")).unwrap())),
                                 })
                             };
 
@@ -461,8 +461,8 @@ pub fn run() {
                         .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                             shard: 0,
                             task_id: task.id.clone(),
-                            outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
-                                data: rmp_serde::to_vec(&serde_json::json!("done")).unwrap(),
+                            outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
+                                encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!("done")).unwrap())),
                             })),
                         }))
                         .await

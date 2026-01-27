@@ -13,8 +13,8 @@ use rand::Rng;
 use silo::pb::report_outcome_request::Outcome;
 use silo::pb::silo_client::SiloClient;
 use silo::pb::{
-    ConcurrencyLimit, EnqueueRequest, GetClusterInfoRequest, LeaseTasksRequest, Limit,
-    MsgpackBytes, ReportOutcomeRequest,
+    serialized_bytes, ConcurrencyLimit, EnqueueRequest, GetClusterInfoRequest, LeaseTasksRequest,
+    Limit, ReportOutcomeRequest, SerializedBytes,
 };
 use silo::settings::LogFormat;
 use silo::trace;
@@ -359,8 +359,10 @@ async fn worker_loop(
                     let outcome_request = ReportOutcomeRequest {
                         shard: task_shard,
                         task_id: task.id.clone(),
-                        outcome: Some(Outcome::Success(MsgpackBytes {
-                            data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                        outcome: Some(Outcome::Success(SerializedBytes {
+                            encoding: Some(serialized_bytes::Encoding::Msgpack(
+                                rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                            )),
                         })),
                     };
 
@@ -462,8 +464,10 @@ async fn enqueuer_loop(
             priority: (job_counter % 100) as u32,
             start_at_ms: now_ms(),
             retry_policy: None,
-            payload: Some(MsgpackBytes {
-                data: rmp_serde::to_vec(&payload).unwrap(),
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                    rmp_serde::to_vec(&payload).unwrap(),
+                )),
             }),
             limits: vec![Limit {
                 limit: Some(silo::pb::limit::Limit::Concurrency(ConcurrencyLimit {

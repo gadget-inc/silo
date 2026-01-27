@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import {
   SiloGRPCClient,
   JobStatus,
-  decodePayload,
+  decodeBytes,
   GubernatorAlgorithm,
 } from "../src/client";
 
@@ -124,9 +124,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       expect(job?.priority).toBe(10);
       expect(job?.metadata?.source).toBe("integration-test");
 
-      // Decode and verify payload
-      const retrievedPayload = decodePayload(job?.payload?.data);
-      expect(retrievedPayload).toEqual(payload);
+      // Verify payload is already decoded
+      expect(job?.payload).toEqual(payload);
     });
 
     it("enqueues a job with custom id", async () => {
@@ -299,7 +298,12 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       expect(task?.attemptNumber).toBe(1);
       expect(task?.priority).toBe(1);
 
-      const taskPayload = decodePayload(task?.payload?.data);
+      const taskPayload = decodeBytes(
+        task?.payload?.encoding.oneofKind === "msgpack"
+          ? task.payload.encoding.msgpack
+          : undefined,
+        "payload"
+      );
       expect(taskPayload).toEqual(payload);
 
       await client.reportOutcome({
@@ -639,7 +643,12 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       expect(result.rowCount).toBe(1);
       expect(result.columns.some((c) => c.name === "count")).toBe(true);
 
-      const row = decodePayload<{ count: number }>(result.rows[0]?.data);
+      const row = decodeBytes<{ count: number }>(
+        result.rows[0]?.encoding.oneofKind === "msgpack"
+          ? result.rows[0].encoding.msgpack
+          : undefined,
+        "row"
+      );
       expect(typeof row?.count).toBe("number");
     });
   });
@@ -674,7 +683,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       expect(job).toBeDefined();
       expect(job?.id).toBe(handle.id);
       expect(job?.priority).toBe(15);
-      expect(decodePayload(job?.payload?.data)).toEqual(payload);
+      expect(job?.payload).toEqual(payload);
     });
 
     it("can get job status through handle", async () => {
@@ -1278,7 +1287,7 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
           const job = await client.getJob(handles[tenant].id, tenant);
           expect(job?.id).toBe(handles[tenant].id);
 
-          const payload = decodePayload<{ tenant: string }>(job?.payload?.data);
+          const payload = job?.payload as { tenant: string };
           expect(payload?.tenant).toBe(tenant);
         }
       } finally {

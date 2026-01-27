@@ -24,8 +24,10 @@ async fn grpc_restart_cancelled_job() -> anyhow::Result<()> {
                 priority: 10,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(MsgpackBytes {
-                    data: rmp_serde::to_vec(&serde_json::json!({"test": true})).unwrap(),
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({"test": true})).unwrap(),
+                    )),
                 }),
                 limits: vec![],
                 tenant: None,
@@ -107,8 +109,10 @@ async fn grpc_restart_cancelled_job() -> anyhow::Result<()> {
             .report_outcome(ReportOutcomeRequest {
                 shard: 0,
                 task_id: task.id.clone(),
-                outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
-                    data: rmp_serde::to_vec(&serde_json::json!("done")).unwrap(),
+                outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!("done")).unwrap(),
+                    )),
                 })),
             })
             .await?;
@@ -149,8 +153,10 @@ async fn grpc_restart_failed_job() -> anyhow::Result<()> {
                 priority: 10,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(MsgpackBytes {
-                    data: rmp_serde::to_vec(&serde_json::json!({"test": true})).unwrap(),
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({"test": true})).unwrap(),
+                    )),
                 }),
                 limits: vec![],
                 tenant: None,
@@ -180,7 +186,11 @@ async fn grpc_restart_failed_job() -> anyhow::Result<()> {
                 task_id: task.id.clone(),
                 outcome: Some(report_outcome_request::Outcome::Failure(Failure {
                     code: "TEST_ERROR".to_string(),
-                    data: b"test failure".to_vec(),
+                    data: Some(SerializedBytes {
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(
+                            b"test failure".to_vec(),
+                        )),
+                    }),
                 })),
             })
             .await?;
@@ -235,8 +245,10 @@ async fn grpc_restart_failed_job() -> anyhow::Result<()> {
             .report_outcome(ReportOutcomeRequest {
                 shard: 0,
                 task_id: task.id.clone(),
-                outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
-                    data: rmp_serde::to_vec(&serde_json::json!("success after restart")).unwrap(),
+                outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!("success after restart")).unwrap(),
+                    )),
                 })),
             })
             .await?;
@@ -309,8 +321,10 @@ async fn grpc_restart_running_job_fails() -> anyhow::Result<()> {
                 priority: 10,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(MsgpackBytes {
-                    data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                    )),
                 }),
                 limits: vec![],
                 tenant: None,
@@ -372,8 +386,10 @@ async fn grpc_restart_running_job_fails() -> anyhow::Result<()> {
             .report_outcome(ReportOutcomeRequest {
                 shard: 0,
                 task_id: task.id.clone(),
-                outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
-                    data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                    )),
                 })),
             })
             .await?;
@@ -402,8 +418,10 @@ async fn grpc_restart_succeeded_job_fails() -> anyhow::Result<()> {
                 priority: 10,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(MsgpackBytes {
-                    data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                    )),
                 }),
                 limits: vec![],
                 tenant: None,
@@ -430,8 +448,10 @@ async fn grpc_restart_succeeded_job_fails() -> anyhow::Result<()> {
             .report_outcome(ReportOutcomeRequest {
                 shard: 0,
                 task_id: task.id.clone(),
-                outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
-                    data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                    )),
                 })),
             })
             .await?;

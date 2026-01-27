@@ -55,3 +55,4 @@
 - [ ] much more simulation testing
 - [ ] rust best practices review
 - [ ] benchmarks in CI, codspeed or similar regression tracker
+- [ ] make sure failure data is also stored using msgpack

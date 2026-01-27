@@ -2,7 +2,7 @@
 
 use crate::helpers::{
     AttemptStatus, EnqueueRequest, GetJobRequest, HashMap, JobStatus, LeaseTasksRequest,
-    MsgpackBytes, ReportOutcomeRequest, get_seed, report_outcome_request, run_scenario_impl,
+    SerializedBytes, ReportOutcomeRequest, get_seed, report_outcome_request, run_scenario_impl, serialized_bytes,
     setup_server, turmoil_connector, verify_server_invariants,
 };
 use silo::pb::silo_client::SiloClient;
@@ -36,8 +36,8 @@ pub fn run() {
                     priority: 1,
                     start_at_ms: 0,
                     retry_policy: None,
-                    payload: Some(MsgpackBytes {
-                        data: rmp_serde::to_vec(&serde_json::json!({"test": true})).unwrap(),
+                    payload: Some(SerializedBytes {
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"test": true})).unwrap())),
                     }),
                     limits: vec![],
                     tenant: None,
@@ -108,8 +108,8 @@ pub fn run() {
                     .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                         shard: 0,
                         task_id: task.id.clone(),
-                        outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
-                            data: rmp_serde::to_vec(&serde_json::json!({"result": "ok"})).unwrap(),
+                        outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
+                            encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"result": "ok"})).unwrap())),
                         })),
                     }))
                     .await?;

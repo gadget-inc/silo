@@ -3,7 +3,6 @@ import {
   SiloGRPCClient,
   JobStatus,
   JobNotFoundError,
-  decodePayload,
 } from "../src/client";
 
 // Support comma-separated list of servers for multi-node testing
@@ -87,7 +86,7 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
       expect(job.priority).toBe(25);
       expect(job.status).toBe(JobStatus.Scheduled);
       expect(job.metadata?.source).toBe("job-handle-test");
-      expect(decodePayload(job.payload?.data)).toEqual(payload);
+      expect(job.payload).toEqual(payload);
     });
 
     it("throws JobNotFoundError when job does not exist", async () => {

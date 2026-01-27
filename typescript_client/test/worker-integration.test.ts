@@ -7,7 +7,7 @@ import {
   beforeEach,
   afterEach,
 } from "vitest";
-import { SiloGRPCClient, decodePayload, JobStatus } from "../src/client";
+import { SiloGRPCClient, JobStatus } from "../src/client";
 import {
   SiloWorker,
   type TaskHandler,
@@ -49,7 +49,8 @@ async function waitFor(
 
 describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
   let client: SiloGRPCClient;
-  let activeWorkers: SiloWorker[] = [];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let activeWorkers: SiloWorker<any, any, any>[] = [];
 
   beforeAll(async () => {
     client = new SiloGRPCClient({
@@ -83,13 +84,17 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
   // Default task group for all tests
   const DEFAULT_TASK_GROUP = "test-task-group";
 
-  function createWorker(
-    handler: TaskHandler,
+  function createWorker<
+    Payload = unknown,
+    Metadata extends Record<string, string> = Record<string, string>,
+    Result = unknown,
+  >(
+    handler: TaskHandler<Payload, Metadata, Result>,
     options?: Partial<
-      Omit<SiloWorkerOptions, "client" | "workerId" | "handler">
+      Omit<SiloWorkerOptions<Payload, Metadata, Result>, "client" | "workerId" | "handler">
     >
-  ): SiloWorker {
-    const worker = new SiloWorker({
+  ): SiloWorker<Payload, Metadata, Result> {
+    const worker = new SiloWorker<Payload, Metadata, Result>({
       client,
       workerId: `test-worker-${Date.now()}-${Math.random()
         .toString(36)
@@ -109,11 +114,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
     it("processes a single task from any shard", async () => {
       const processedJobs: string[] = [];
 
-      const handler: TaskHandler = async (ctx) => {
-        const payload = decodePayload<{ message: string }>(
-          ctx.task.payload?.data
-        );
-        processedJobs.push(payload?.message ?? "");
+      const handler: TaskHandler<{ message: string }> = async (ctx) => {
+        processedJobs.push(ctx.task.payload.message);
         return { type: "success", result: { processed: true } };
       };
 
@@ -140,14 +142,11 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       let maxConcurrent = 0;
       let currentConcurrent = 0;
 
-      const handler: TaskHandler = async (ctx) => {
-        const payload = decodePayload<{ index: number }>(
-          ctx.task.payload?.data
-        );
+      const handler: TaskHandler<{ index: number }> = async (ctx) => {
         currentConcurrent++;
         maxConcurrent = Math.max(maxConcurrent, currentConcurrent);
         await new Promise((resolve) => setTimeout(resolve, 20));
-        processedOrder.push(payload?.index ?? -1);
+        processedOrder.push(ctx.task.payload.index);
         currentConcurrent--;
         return { type: "success", result: {} };
       };
@@ -219,13 +218,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
     it("processes multiple jobs from the same tenant", async () => {
       const processedPayloads = new Set<string>();
 
-      const handler: TaskHandler = async (ctx) => {
-        const payload = decodePayload<{ label: string }>(
-          ctx.task.payload?.data
-        );
-        if (payload?.label) {
-          processedPayloads.add(payload.label);
-        }
+      const handler: TaskHandler<{ label: string }> = async (ctx) => {
+        processedPayloads.add(ctx.task.payload.label);
         return { type: "success", result: {} };
       };
 
@@ -475,7 +469,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       let receivedShard: number | undefined;
 
       const handler: TaskHandler = async (ctx) => {
-        receivedShard = ctx.shard;
+        receivedShard = ctx.task.shard;
         return { type: "success", result: {} };
       };
 
@@ -504,11 +498,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       const otherTaskGroup = `other-group-${Date.now()}`;
 
       // Worker polling the default task group
-      const defaultHandler: TaskHandler = async (ctx) => {
-        const payload = decodePayload<{ message: string }>(
-          ctx.task.payload?.data
-        );
-        processedByDefaultWorker.push(payload?.message ?? ctx.task.id);
+      const defaultHandler: TaskHandler<{ message: string }> = async (ctx) => {
+        processedByDefaultWorker.push(ctx.task.payload.message);
         return { type: "success", result: {} };
       };
 
@@ -542,11 +533,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       const specificTaskGroup = `specific-group-${Date.now()}`;
 
       // Worker polling the specific task group
-      const specificHandler: TaskHandler = async (ctx) => {
-        const payload = decodePayload<{ message: string }>(
-          ctx.task.payload?.data
-        );
-        processedBySpecificWorker.push(payload?.message ?? ctx.task.id);
+      const specificHandler: TaskHandler<{ message: string }> = async (ctx) => {
+        processedBySpecificWorker.push(ctx.task.payload.message);
         return { type: "success", result: {} };
       };
 
@@ -599,28 +587,18 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         });
 
         // Worker A polls task group A
-        const workerA = createWorker(
-          async (ctx) => {
-            const payload = decodePayload<{ message: string }>(
-              ctx.task.payload?.data
-            );
-            processedByWorkerA.push(payload?.message ?? ctx.task.id);
-            return { type: "success", result: {} };
-          },
-          { taskGroup: taskGroupA }
-        );
+        const handlerA: TaskHandler<{ message: string }> = async (ctx) => {
+          processedByWorkerA.push(ctx.task.payload.message);
+          return { type: "success", result: {} };
+        };
+        const workerA = createWorker(handlerA, { taskGroup: taskGroupA });
 
         // Worker B polls task group B
-        const workerB = createWorker(
-          async (ctx) => {
-            const payload = decodePayload<{ message: string }>(
-              ctx.task.payload?.data
-            );
-            processedByWorkerB.push(payload?.message ?? ctx.task.id);
-            return { type: "success", result: {} };
-          },
-          { taskGroup: taskGroupB }
-        );
+        const handlerB: TaskHandler<{ message: string }> = async (ctx) => {
+          processedByWorkerB.push(ctx.task.payload.message);
+          return { type: "success", result: {} };
+        };
+        const workerB = createWorker(handlerB, { taskGroup: taskGroupB });
 
         workerA.start();
         workerB.start();
@@ -647,17 +625,21 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
   });
 
   describe("floating concurrency limit refresh", () => {
-    function createWorkerWithRefresh(
-      handler: TaskHandler,
+    function createWorkerWithRefresh<
+      Payload = unknown,
+      Metadata extends Record<string, string> = Record<string, string>,
+      Result = unknown,
+    >(
+      handler: TaskHandler<Payload, Metadata, Result>,
       refreshHandler: RefreshHandler,
       options?: Partial<
         Omit<
-          SiloWorkerOptions,
+          SiloWorkerOptions<Payload, Metadata, Result>,
           "client" | "workerId" | "handler" | "refreshHandler"
         >
       >
-    ): SiloWorker {
-      const worker = new SiloWorker({
+    ): SiloWorker<Payload, Metadata, Result> {
+      const worker = new SiloWorker<Payload, Metadata, Result>({
         client,
         workerId: `test-refresh-worker-${Date.now()}-${Math.random()
           .toString(36)
@@ -679,11 +661,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       const processedJobs: string[] = [];
       const queueKey = `worker-refresh-test-${Date.now()}`;
 
-      const handler: TaskHandler = async (ctx) => {
-        const payload = decodePayload<{ message: string }>(
-          ctx.task.payload?.data
-        );
-        processedJobs.push(payload?.message ?? ctx.task.id);
+      const handler: TaskHandler<{ message: string }> = async (ctx) => {
+        processedJobs.push(ctx.task.payload.message);
         return { type: "success", result: { processed: true } };
       };
 
@@ -881,13 +860,10 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       const refreshedQueues: string[] = [];
       const queueKey = `concurrent-refresh-${Date.now()}`;
 
-      const handler: TaskHandler = async (ctx) => {
-        const payload = decodePayload<{ index: number }>(
-          ctx.task.payload?.data
-        );
+      const handler: TaskHandler<{ index: number }> = async (ctx) => {
         // Simulate some work
         await new Promise((r) => setTimeout(r, 50));
-        processedJobs.push(`job-${payload?.index}`);
+        processedJobs.push(`job-${ctx.task.payload.index}`);
         return { type: "success", result: {} };
       };
 
@@ -1249,25 +1225,23 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       const abortedTasks: string[] = [];
       const completedTasks: string[] = [];
 
-      const handler: TaskHandler = async (ctx) => {
-        const payload = decodePayload<{ index: number; shouldWait: boolean }>(
-          ctx.task.payload?.data
-        );
-        const taskKey = `task-${payload?.index}`;
+      const handler: TaskHandler<{ index: number; shouldWait: boolean }> =
+        async (ctx) => {
+          const taskKey = `task-${ctx.task.payload.index}`;
 
-        if (payload?.shouldWait) {
-          // These tasks wait for abort
-          while (!ctx.signal.aborted) {
-            await new Promise((resolve) => setTimeout(resolve, 50));
+          if (ctx.task.payload.shouldWait) {
+            // These tasks wait for abort
+            while (!ctx.signal.aborted) {
+              await new Promise((resolve) => setTimeout(resolve, 50));
+            }
+            abortedTasks.push(taskKey);
+          } else {
+            // These tasks complete immediately
+            completedTasks.push(taskKey);
           }
-          abortedTasks.push(taskKey);
-        } else {
-          // These tasks complete immediately
-          completedTasks.push(taskKey);
-        }
 
-        return { type: "success", result: {} };
-      };
+          return { type: "success", result: {} };
+        };
 
       const worker = createWorker(handler, {
         heartbeatIntervalMs: 100,

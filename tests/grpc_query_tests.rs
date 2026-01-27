@@ -23,8 +23,8 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
                 priority: (10 + i) as u32,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(MsgpackBytes {
-                    data: payload_bytes,
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(payload_bytes)),
                 }),
                 limits: vec![],
                 tenant: None,
@@ -55,7 +55,11 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
         );
 
         // Verify rows are returned as MessagePack
-        let first_row: serde_json::Value = rmp_serde::from_slice(&query_resp.rows[0].data)?;
+        let first_row: serde_json::Value =
+            rmp_serde::from_slice(match &query_resp.rows[0].encoding {
+                Some(serialized_bytes::Encoding::Msgpack(d)) => d,
+                None => panic!("expected msgpack encoding"),
+            })?;
         assert!(first_row.get("id").is_some(), "row should have id field");
 
         // Test 2: Query with WHERE clause
@@ -84,7 +88,11 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
             .into_inner();
 
         assert_eq!(query_resp.row_count, 1, "aggregation should return 1 row");
-        let count_row: serde_json::Value = rmp_serde::from_slice(&query_resp.rows[0].data)?;
+        let count_row: serde_json::Value =
+            rmp_serde::from_slice(match &query_resp.rows[0].encoding {
+                Some(serialized_bytes::Encoding::Msgpack(d)) => d,
+                None => panic!("expected msgpack encoding"),
+            })?;
         assert_eq!(count_row["count"], 3, "count should be 3");
 
         shutdown_server(shutdown_tx, server).await?;
@@ -192,8 +200,8 @@ async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
             priority: 10,
             start_at_ms: 0,
             retry_policy: None,
-            payload: Some(MsgpackBytes {
-                data: payload_bytes,
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(payload_bytes)),
             }),
             limits: vec![],
             tenant: None,
@@ -249,8 +257,8 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
             priority: 5,
             start_at_ms: 1234567890,
             retry_policy: None,
-            payload: Some(MsgpackBytes {
-                data: payload_bytes,
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(payload_bytes)),
             }),
             limits: vec![],
             tenant: None,
@@ -290,7 +298,10 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
         );
 
         // Verify row is valid JSON that TypeScript can deserialize
-        let row: serde_json::Value = rmp_serde::from_slice(&query_resp.rows[0].data)?;
+        let row: serde_json::Value = rmp_serde::from_slice(match &query_resp.rows[0].encoding {
+            Some(serialized_bytes::Encoding::Msgpack(d)) => d,
+            None => panic!("expected msgpack encoding"),
+        })?;
         assert_eq!(row["id"], "complex_job");
         assert_eq!(row["priority"], 5);
         assert_eq!(row["enqueue_time_ms"], 1234567890);
@@ -327,8 +338,8 @@ async fn grpc_server_query_without_tenant() -> anyhow::Result<()> {
                 priority: 10,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(MsgpackBytes {
-                    data: empty_payload.clone(),
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(empty_payload.clone())),
                 }),
                 limits: vec![],
                 tenant: None, // Will use default tenant
@@ -396,8 +407,8 @@ async fn grpc_server_query_msgpack_data_types() -> anyhow::Result<()> {
                 priority: (i * 50) as u32,                   // 0, 50, 100
                 start_at_ms: 1000000000 + (i as i64 * 1000), // Different timestamps
                 retry_policy: None,
-                payload: Some(MsgpackBytes {
-                    data: payload_bytes,
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(payload_bytes)),
                 }),
                 limits: vec![],
                 tenant: None,
@@ -439,7 +450,13 @@ async fn grpc_server_query_msgpack_data_types() -> anyhow::Result<()> {
         let rows: Vec<serde_json::Value> = query_resp
             .rows
             .iter()
-            .map(|r| rmp_serde::from_slice(&r.data).unwrap())
+            .map(|r| {
+                let data = match &r.encoding {
+                    Some(serialized_bytes::Encoding::Msgpack(d)) => d,
+                    None => panic!("expected msgpack encoding"),
+                };
+                rmp_serde::from_slice(data).unwrap()
+            })
             .collect();
 
         // Row 0: priority=0, enqueue_time_ms=1000000000
@@ -485,7 +502,10 @@ async fn grpc_server_query_msgpack_data_types() -> anyhow::Result<()> {
             .into_inner();
 
         assert_eq!(agg_resp.row_count, 1);
-        let agg_row: serde_json::Value = rmp_serde::from_slice(&agg_resp.rows[0].data)?;
+        let agg_row: serde_json::Value = rmp_serde::from_slice(match &agg_resp.rows[0].encoding {
+            Some(serialized_bytes::Encoding::Msgpack(d)) => d,
+            None => panic!("expected msgpack encoding"),
+        })?;
 
         assert_eq!(agg_row["count_val"], 3); // COUNT returns Int64
         assert_eq!(agg_row["sum_val"], 150); // SUM of 0+50+100
@@ -521,8 +541,8 @@ async fn grpc_server_query_arrow_without_tenant() -> anyhow::Result<()> {
                 priority: 10,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(MsgpackBytes {
-                    data: empty_payload.clone(),
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(empty_payload.clone())),
                 }),
                 limits: vec![],
                 tenant: None,

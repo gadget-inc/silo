@@ -5,8 +5,8 @@ import {
   JobNotFoundError,
   JobNotTerminalError,
   TaskNotFoundError,
-  encodePayload,
-  decodePayload,
+  encodeBytes,
+  decodeBytes,
   fnv1a32,
   defaultTenantToShard,
   type EnqueueJobOptions,
@@ -107,67 +107,69 @@ describe("defaultTenantToShard", () => {
   });
 });
 
-describe("encodePayload", () => {
+describe("encodeBytes", () => {
   it("encodes a string as msgpack bytes", () => {
-    const result = encodePayload("hello");
+    const result = encodeBytes("hello");
     // Verify roundtrip works
-    expect(decodePayload<string>(result)).toBe("hello");
+    expect(decodeBytes<string>(result, "test")).toBe("hello");
   });
 
   it("encodes an object as msgpack bytes", () => {
-    const result = encodePayload({ foo: "bar", count: 42 });
-    expect(decodePayload(result)).toEqual({ foo: "bar", count: 42 });
+    const result = encodeBytes({ foo: "bar", count: 42 });
+    expect(decodeBytes(result, "test")).toEqual({ foo: "bar", count: 42 });
   });
 
   it("encodes null as msgpack bytes", () => {
-    const result = encodePayload(null);
-    expect(decodePayload(result)).toBe(null);
+    const result = encodeBytes(null);
+    expect(decodeBytes(result, "test")).toBe(null);
   });
 
   it("encodes an array as msgpack bytes", () => {
-    const result = encodePayload([1, 2, 3]);
-    expect(decodePayload(result)).toEqual([1, 2, 3]);
+    const result = encodeBytes([1, 2, 3]);
+    expect(decodeBytes(result, "test")).toEqual([1, 2, 3]);
   });
 
   it("encodes nested objects as msgpack bytes", () => {
-    const result = encodePayload({ outer: { inner: "value" } });
-    expect(decodePayload(result)).toEqual({ outer: { inner: "value" } });
+    const result = encodeBytes({ outer: { inner: "value" } });
+    expect(decodeBytes(result, "test")).toEqual({ outer: { inner: "value" } });
   });
 });
 
-describe("decodePayload", () => {
+describe("decodeBytes", () => {
   it("decodes msgpack bytes as a string", () => {
-    const bytes = encodePayload("hello");
-    const result = decodePayload<string>(bytes);
+    const bytes = encodeBytes("hello");
+    const result = decodeBytes<string>(bytes, "test");
     expect(result).toBe("hello");
   });
 
   it("decodes msgpack bytes as an object", () => {
-    const bytes = encodePayload({ foo: "bar", count: 42 });
-    const result = decodePayload<{ foo: string; count: number }>(bytes);
+    const bytes = encodeBytes({ foo: "bar", count: 42 });
+    const result = decodeBytes<{ foo: string; count: number }>(bytes, "test");
     expect(result).toEqual({ foo: "bar", count: 42 });
   });
 
   it("decodes msgpack bytes as null", () => {
-    const bytes = encodePayload(null);
-    const result = decodePayload<null>(bytes);
+    const bytes = encodeBytes(null);
+    const result = decodeBytes<null>(bytes, "test");
     expect(result).toBe(null);
   });
 
   it("decodes msgpack bytes as an array", () => {
-    const bytes = encodePayload([1, 2, 3]);
-    const result = decodePayload<number[]>(bytes);
+    const bytes = encodeBytes([1, 2, 3]);
+    const result = decodeBytes<number[]>(bytes, "test");
     expect(result).toEqual([1, 2, 3]);
   });
 
-  it("returns undefined for undefined input", () => {
-    const result = decodePayload(undefined);
-    expect(result).toBeUndefined();
+  it("throws for undefined input", () => {
+    expect(() => decodeBytes(undefined, "test")).toThrow(
+      "No bytes to decode for field test"
+    );
   });
 
-  it("returns undefined for empty byte array", () => {
-    const result = decodePayload(new Uint8Array(0));
-    expect(result).toBeUndefined();
+  it("throws for empty byte array", () => {
+    expect(() => decodeBytes(new Uint8Array(0), "test")).toThrow(
+      "No bytes to decode for field test"
+    );
   });
 });
 

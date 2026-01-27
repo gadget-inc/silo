@@ -19,8 +19,8 @@
 //! - Jobs eventually complete despite rate limit processing
 
 use crate::helpers::{
-    EnqueueRequest, GetJobRequest, HashMap, JobStatus, LeaseTasksRequest, Limit, MsgpackBytes,
-    ReportOutcomeRequest, get_seed, limit, report_outcome_request, run_scenario_impl,
+    EnqueueRequest, GetJobRequest, HashMap, JobStatus, LeaseTasksRequest, Limit, SerializedBytes,
+    ReportOutcomeRequest, get_seed, limit, report_outcome_request, run_scenario_impl, serialized_bytes,
     setup_server, turmoil_connector, verify_server_invariants,
 };
 use silo::pb::silo_client::SiloClient;
@@ -65,8 +65,8 @@ pub fn run() {
                         priority: 10,
                         start_at_ms: 0,
                         retry_policy: None,
-                        payload: Some(MsgpackBytes {
-                            data: rmp_serde::to_vec(&serde_json::json!({"job": i})).unwrap(),
+                        payload: Some(SerializedBytes {
+                            encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"job": i})).unwrap())),
                         }),
                         limits: vec![Limit {
                             limit: Some(limit::Limit::RateLimit(GubernatorRateLimit {
@@ -117,8 +117,8 @@ pub fn run() {
                         priority: 10,
                         start_at_ms: 0,
                         retry_policy: None,
-                        payload: Some(MsgpackBytes {
-                            data: rmp_serde::to_vec(&serde_json::json!({"combined": i})).unwrap(),
+                        payload: Some(SerializedBytes {
+                            encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"combined": i})).unwrap())),
                         }),
                         limits: vec![
                             // Rate limit
@@ -210,8 +210,8 @@ pub fn run() {
                         .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                             shard: 0,
                             task_id: task.id.clone(),
-                            outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
-                                data: rmp_serde::to_vec(&serde_json::json!("done")).unwrap(),
+                            outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
+                                encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!("done")).unwrap())),
                             })),
                         }))
                         .await

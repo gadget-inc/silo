@@ -22,8 +22,8 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
             priority: 10,
             start_at_ms: 0,
             retry_policy: None,
-            payload: Some(MsgpackBytes {
-                data: payload_bytes.clone(),
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(payload_bytes.clone())),
             }),
             limits: vec![],
             tenant: None,
@@ -47,7 +47,10 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
         let task = &lease_resp.tasks[0];
         assert_eq!(task.job_id, job_id);
         assert_eq!(
-            task.payload.as_ref().map(|p| p.data.clone()),
+            task.payload.as_ref().and_then(|p| match &p.encoding {
+                Some(serialized_bytes::Encoding::Msgpack(data)) => Some(data.clone()),
+                None => None,
+            }),
             Some(payload_bytes.clone())
         );
 
@@ -56,8 +59,10 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
             .report_outcome(ReportOutcomeRequest {
                 shard: 0,
                 task_id: task.id.clone(),
-                outcome: Some(report_outcome_request::Outcome::Success(MsgpackBytes {
-                    data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                    )),
                 })),
             })
             .await?;
@@ -135,8 +140,10 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
                 priority: 1,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(MsgpackBytes {
-                    data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                    )),
                 }),
                 limits: vec![],
                 tenant: None,
@@ -157,8 +164,10 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
                 priority: 1,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(MsgpackBytes {
-                    data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                    )),
                 }),
                 limits: vec![],
                 tenant: None,
@@ -182,8 +191,10 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
                 priority: 1,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(MsgpackBytes {
-                    data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                    )),
                 }),
                 limits: vec![],
                 tenant: None,
@@ -216,8 +227,10 @@ async fn grpc_server_enqueue_with_rate_limit() -> anyhow::Result<()> {
                 priority: 5,
                 start_at_ms: 0,
                 retry_policy: None,
-                payload: Some(MsgpackBytes {
-                    data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                    )),
                 }),
                 limits: vec![Limit {
                     limit: Some(limit::Limit::RateLimit(silo::pb::GubernatorRateLimit {
@@ -294,8 +307,10 @@ async fn grpc_enqueue_requires_tenant_when_tenancy_enabled() -> anyhow::Result<(
             priority: 1,
             start_at_ms: 0,
             retry_policy: None,
-            payload: Some(MsgpackBytes {
-                data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                    rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                )),
             }),
             limits: vec![],
             tenant: None,
@@ -322,8 +337,10 @@ async fn grpc_enqueue_requires_tenant_when_tenancy_enabled() -> anyhow::Result<(
             priority: 1,
             start_at_ms: 0,
             retry_policy: None,
-            payload: Some(MsgpackBytes {
-                data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                    rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                )),
             }),
             limits: vec![],
             tenant: Some("".to_string()),
@@ -350,8 +367,10 @@ async fn grpc_enqueue_requires_tenant_when_tenancy_enabled() -> anyhow::Result<(
             priority: 1,
             start_at_ms: 0,
             retry_policy: None,
-            payload: Some(MsgpackBytes {
-                data: rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                    rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                )),
             }),
             limits: vec![],
             tenant: Some("my-tenant".to_string()),

@@ -23,9 +23,9 @@
 //! - queueLimitEnforced: Never more than 1 holder for the limit
 
 use crate::helpers::{
-    ConcurrencyLimit, EnqueueRequest, HashMap, LeaseTasksRequest, Limit, MsgpackBytes,
+    ConcurrencyLimit, EnqueueRequest, HashMap, LeaseTasksRequest, Limit, SerializedBytes,
     ReportOutcomeRequest, check_holder_limits, get_seed, limit, report_outcome_request,
-    run_scenario_impl, setup_server, turmoil_connector, verify_server_invariants,
+    run_scenario_impl, serialized_bytes, setup_server, turmoil_connector, verify_server_invariants,
 };
 use silo::pb::silo_client::SiloClient;
 use silo::pb::{CancelJobRequest, HeartbeatRequest};
@@ -72,8 +72,8 @@ pub fn run() {
                     priority: 10,
                     start_at_ms: 0,
                     retry_policy: None,
-                    payload: Some(MsgpackBytes {
-                        data: rmp_serde::to_vec(&serde_json::json!({"job": "A"})).unwrap(),
+                    payload: Some(SerializedBytes {
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"job": "A"})).unwrap())),
                     }),
                     limits: vec![Limit {
                         limit: Some(limit::Limit::Concurrency(ConcurrencyLimit {
@@ -98,8 +98,8 @@ pub fn run() {
                     priority: 10,
                     start_at_ms: 0,
                     retry_policy: None,
-                    payload: Some(MsgpackBytes {
-                        data: rmp_serde::to_vec(&serde_json::json!({"job": "B"})).unwrap(),
+                    payload: Some(SerializedBytes {
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"job": "B"})).unwrap())),
                     }),
                     limits: vec![Limit {
                         limit: Some(limit::Limit::Concurrency(ConcurrencyLimit {
@@ -124,8 +124,8 @@ pub fn run() {
                     priority: 10,
                     start_at_ms: 0,
                     retry_policy: None,
-                    payload: Some(MsgpackBytes {
-                        data: rmp_serde::to_vec(&serde_json::json!({"job": "C"})).unwrap(),
+                    payload: Some(SerializedBytes {
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"job": "C"})).unwrap())),
                     }),
                     limits: vec![Limit {
                         limit: Some(limit::Limit::Concurrency(ConcurrencyLimit {
@@ -302,9 +302,9 @@ pub fn run() {
                                 shard: 0,
                                 task_id: task_id.clone(),
                                 outcome: Some(report_outcome_request::Outcome::Success(
-                                    MsgpackBytes {
-                                        data: rmp_serde::to_vec(&serde_json::json!("done"))
-                                            .unwrap(),
+                                    SerializedBytes {
+                                        encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!("done"))
+                                            .unwrap())),
                                     },
                                 )),
                             }))

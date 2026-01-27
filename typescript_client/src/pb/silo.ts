@@ -12,16 +12,26 @@ import type { PartialMessage } from "@protobuf-ts/runtime";
 import { reflectionMergePartial } from "@protobuf-ts/runtime";
 import { MessageType } from "@protobuf-ts/runtime";
 /**
- * Container for arbitrary data stored as raw MessagePack bytes.
- * Used for job payloads, results, and query response rows.
+ * Container for arbitrary serialized data with support for multiple encoding formats.
+ * Currently only MessagePack is supported, but structured as a union for forward compatibility
+ * to add new serialization formats in the future (e.g., JSON, Protobuf).
+ * Used for job payloads, results, error data, and query response rows.
  *
- * @generated from protobuf message silo.v1.MsgpackBytes
+ * @generated from protobuf message silo.v1.SerializedBytes
  */
-export interface MsgpackBytes {
+export interface SerializedBytes {
     /**
-     * @generated from protobuf field: bytes data = 1
+     * @generated from protobuf oneof: encoding
      */
-    data: Uint8Array; // Raw MessagePack bytes. Callers should serialize/deserialize using MessagePack.
+    encoding: {
+        oneofKind: "msgpack";
+        /**
+         * @generated from protobuf field: bytes msgpack = 1
+         */
+        msgpack: Uint8Array; // Raw MessagePack bytes. Callers should serialize/deserialize using MessagePack.
+    } | {
+        oneofKind: undefined;
+    };
 }
 /**
  * Configuration for automatic job retry on failure.
@@ -217,9 +227,9 @@ export interface EnqueueRequest {
      */
     retryPolicy?: RetryPolicy; // Retry configuration. If absent, job fails on first error.
     /**
-     * @generated from protobuf field: silo.v1.MsgpackBytes payload = 6
+     * @generated from protobuf field: silo.v1.SerializedBytes payload = 6
      */
-    payload?: MsgpackBytes; // Opaque MessagePack payload passed to workers.
+    payload?: SerializedBytes; // Opaque serialized payload passed to workers.
     /**
      * @generated from protobuf field: repeated silo.v1.Limit limits = 7
      */
@@ -304,17 +314,17 @@ export interface JobAttempt {
      */
     finishedAtMs?: bigint; // Unix timestamp (ms) when attempt finished. Present if completed.
     /**
-     * @generated from protobuf field: optional silo.v1.MsgpackBytes result = 7
+     * @generated from protobuf field: optional silo.v1.SerializedBytes result = 7
      */
-    result?: MsgpackBytes; // Result data if attempt succeeded (MessagePack).
+    result?: SerializedBytes; // Result data if attempt succeeded.
     /**
      * @generated from protobuf field: optional string error_code = 8
      */
     errorCode?: string; // Error code if attempt failed.
     /**
-     * @generated from protobuf field: optional bytes error_data = 9
+     * @generated from protobuf field: optional silo.v1.SerializedBytes error_data = 9
      */
-    errorData?: Uint8Array; // Error details if attempt failed (MessagePack).
+    errorData?: SerializedBytes; // Error details if attempt failed.
 }
 /**
  * Full details of a job including its current state.
@@ -335,9 +345,9 @@ export interface GetJobResponse {
      */
     enqueueTimeMs: bigint; // Unix timestamp (ms) when job was enqueued.
     /**
-     * @generated from protobuf field: silo.v1.MsgpackBytes payload = 4
+     * @generated from protobuf field: silo.v1.SerializedBytes payload = 4
      */
-    payload?: MsgpackBytes; // The job's payload data (MessagePack).
+    payload?: SerializedBytes; // The job's payload data.
     /**
      * @generated from protobuf field: optional silo.v1.RetryPolicy retry_policy = 5
      */
@@ -419,9 +429,9 @@ export interface GetJobResultResponse {
     result: {
         oneofKind: "successData";
         /**
-         * @generated from protobuf field: silo.v1.MsgpackBytes success_data = 4
+         * @generated from protobuf field: silo.v1.SerializedBytes success_data = 4
          */
-        successData: MsgpackBytes; // Present if status == SUCCEEDED. Contains job result (MessagePack).
+        successData: SerializedBytes; // Present if status == SUCCEEDED. Contains job result.
     } | {
         oneofKind: "failure";
         /**
@@ -449,9 +459,9 @@ export interface JobFailure {
      */
     errorCode: string; // Application-defined error code.
     /**
-     * @generated from protobuf field: bytes error_data = 2
+     * @generated from protobuf field: silo.v1.SerializedBytes error_data = 2
      */
-    errorData: Uint8Array; // Error details (MessagePack-encoded).
+    errorData?: SerializedBytes; // Serialized error details.
 }
 /**
  * Information about a cancelled job.
@@ -615,9 +625,9 @@ export interface Task {
      */
     leaseMs: bigint; // How long the lease lasts. Heartbeat before this expires.
     /**
-     * @generated from protobuf field: silo.v1.MsgpackBytes payload = 5
+     * @generated from protobuf field: silo.v1.SerializedBytes payload = 5
      */
-    payload?: MsgpackBytes; // The job's payload for the worker to process (MessagePack).
+    payload?: SerializedBytes; // The job's payload for the worker to process.
     /**
      * @generated from protobuf field: uint32 priority = 6
      */
@@ -727,9 +737,9 @@ export interface ReportOutcomeRequest {
     outcome: {
         oneofKind: "success";
         /**
-         * @generated from protobuf field: silo.v1.MsgpackBytes success = 3
+         * @generated from protobuf field: silo.v1.SerializedBytes success = 3
          */
-        success: MsgpackBytes; // Job succeeded. Contains result data (MessagePack).
+        success: SerializedBytes; // Job succeeded. Contains result data from executing the job.
     } | {
         oneofKind: "failure";
         /**
@@ -757,9 +767,9 @@ export interface Failure {
      */
     code: string; // Application-defined error code.
     /**
-     * @generated from protobuf field: bytes data = 2
+     * @generated from protobuf field: silo.v1.SerializedBytes data = 2
      */
-    data: Uint8Array; // Error details (MessagePack-encoded).
+    data?: SerializedBytes; // Serialized error details.
 }
 /**
  * Marker indicating the worker acknowledges the job was cancelled.
@@ -914,7 +924,7 @@ export interface ColumnInfo {
     dataType: string; // Arrow/DataFusion type as string (e.g., "Utf8", "Int64").
 }
 /**
- * Query results with rows as MessagePack.
+ * Query results with rows as serialized objects.
  *
  * @generated from protobuf message silo.v1.QueryResponse
  */
@@ -924,9 +934,9 @@ export interface QueryResponse {
      */
     columns: ColumnInfo[]; // Schema information for the result columns.
     /**
-     * @generated from protobuf field: repeated silo.v1.MsgpackBytes rows = 2
+     * @generated from protobuf field: repeated silo.v1.SerializedBytes rows = 2
      */
-    rows: MsgpackBytes[]; // Each row as a MessagePack-encoded object.
+    rows: SerializedBytes[]; // Each row as a serialized object.
     /**
      * @generated from protobuf field: int32 row_count = 3
      */
@@ -1162,26 +1172,29 @@ export enum AttemptStatus {
     CANCELLED = 3
 }
 // @generated message type with reflection information, may provide speed optimized methods
-class MsgpackBytes$Type extends MessageType<MsgpackBytes> {
+class SerializedBytes$Type extends MessageType<SerializedBytes> {
     constructor() {
-        super("silo.v1.MsgpackBytes", [
-            { no: 1, name: "data", kind: "scalar", T: 12 /*ScalarType.BYTES*/ }
+        super("silo.v1.SerializedBytes", [
+            { no: 1, name: "msgpack", kind: "scalar", oneof: "encoding", T: 12 /*ScalarType.BYTES*/ }
         ]);
     }
-    create(value?: PartialMessage<MsgpackBytes>): MsgpackBytes {
+    create(value?: PartialMessage<SerializedBytes>): SerializedBytes {
         const message = globalThis.Object.create((this.messagePrototype!));
-        message.data = new Uint8Array(0);
+        message.encoding = { oneofKind: undefined };
         if (value !== undefined)
-            reflectionMergePartial<MsgpackBytes>(this, message, value);
+            reflectionMergePartial<SerializedBytes>(this, message, value);
         return message;
     }
-    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: MsgpackBytes): MsgpackBytes {
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: SerializedBytes): SerializedBytes {
         let message = target ?? this.create(), end = reader.pos + length;
         while (reader.pos < end) {
             let [fieldNo, wireType] = reader.tag();
             switch (fieldNo) {
-                case /* bytes data */ 1:
-                    message.data = reader.bytes();
+                case /* bytes msgpack */ 1:
+                    message.encoding = {
+                        oneofKind: "msgpack",
+                        msgpack: reader.bytes()
+                    };
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -1194,10 +1207,10 @@ class MsgpackBytes$Type extends MessageType<MsgpackBytes> {
         }
         return message;
     }
-    internalBinaryWrite(message: MsgpackBytes, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
-        /* bytes data = 1; */
-        if (message.data.length)
-            writer.tag(1, WireType.LengthDelimited).bytes(message.data);
+    internalBinaryWrite(message: SerializedBytes, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* bytes msgpack = 1; */
+        if (message.encoding.oneofKind === "msgpack")
+            writer.tag(1, WireType.LengthDelimited).bytes(message.encoding.msgpack);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -1205,9 +1218,9 @@ class MsgpackBytes$Type extends MessageType<MsgpackBytes> {
     }
 }
 /**
- * @generated MessageType for protobuf message silo.v1.MsgpackBytes
+ * @generated MessageType for protobuf message silo.v1.SerializedBytes
  */
-export const MsgpackBytes = new MsgpackBytes$Type();
+export const SerializedBytes = new SerializedBytes$Type();
 // @generated message type with reflection information, may provide speed optimized methods
 class RetryPolicy$Type extends MessageType<RetryPolicy> {
     constructor() {
@@ -1681,7 +1694,7 @@ class EnqueueRequest$Type extends MessageType<EnqueueRequest> {
             { no: 3, name: "priority", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
             { no: 4, name: "start_at_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
             { no: 5, name: "retry_policy", kind: "message", T: () => RetryPolicy },
-            { no: 6, name: "payload", kind: "message", T: () => MsgpackBytes },
+            { no: 6, name: "payload", kind: "message", T: () => SerializedBytes },
             { no: 7, name: "limits", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => Limit },
             { no: 8, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
             { no: 9, name: "metadata", kind: "map", K: 9 /*ScalarType.STRING*/, V: { kind: "scalar", T: 9 /*ScalarType.STRING*/ } },
@@ -1721,8 +1734,8 @@ class EnqueueRequest$Type extends MessageType<EnqueueRequest> {
                 case /* optional silo.v1.RetryPolicy retry_policy */ 5:
                     message.retryPolicy = RetryPolicy.internalBinaryRead(reader, reader.uint32(), options, message.retryPolicy);
                     break;
-                case /* silo.v1.MsgpackBytes payload */ 6:
-                    message.payload = MsgpackBytes.internalBinaryRead(reader, reader.uint32(), options, message.payload);
+                case /* silo.v1.SerializedBytes payload */ 6:
+                    message.payload = SerializedBytes.internalBinaryRead(reader, reader.uint32(), options, message.payload);
                     break;
                 case /* repeated silo.v1.Limit limits */ 7:
                     message.limits.push(Limit.internalBinaryRead(reader, reader.uint32(), options));
@@ -1779,9 +1792,9 @@ class EnqueueRequest$Type extends MessageType<EnqueueRequest> {
         /* optional silo.v1.RetryPolicy retry_policy = 5; */
         if (message.retryPolicy)
             RetryPolicy.internalBinaryWrite(message.retryPolicy, writer.tag(5, WireType.LengthDelimited).fork(), options).join();
-        /* silo.v1.MsgpackBytes payload = 6; */
+        /* silo.v1.SerializedBytes payload = 6; */
         if (message.payload)
-            MsgpackBytes.internalBinaryWrite(message.payload, writer.tag(6, WireType.LengthDelimited).fork(), options).join();
+            SerializedBytes.internalBinaryWrite(message.payload, writer.tag(6, WireType.LengthDelimited).fork(), options).join();
         /* repeated silo.v1.Limit limits = 7; */
         for (let i = 0; i < message.limits.length; i++)
             Limit.internalBinaryWrite(message.limits[i], writer.tag(7, WireType.LengthDelimited).fork(), options).join();
@@ -1931,9 +1944,9 @@ class JobAttempt$Type extends MessageType<JobAttempt> {
             { no: 4, name: "status", kind: "enum", T: () => ["silo.v1.AttemptStatus", AttemptStatus, "ATTEMPT_STATUS_"] },
             { no: 5, name: "started_at_ms", kind: "scalar", opt: true, T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
             { no: 6, name: "finished_at_ms", kind: "scalar", opt: true, T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
-            { no: 7, name: "result", kind: "message", T: () => MsgpackBytes },
+            { no: 7, name: "result", kind: "message", T: () => SerializedBytes },
             { no: 8, name: "error_code", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
-            { no: 9, name: "error_data", kind: "scalar", opt: true, T: 12 /*ScalarType.BYTES*/ }
+            { no: 9, name: "error_data", kind: "message", T: () => SerializedBytes }
         ]);
     }
     create(value?: PartialMessage<JobAttempt>): JobAttempt {
@@ -1969,14 +1982,14 @@ class JobAttempt$Type extends MessageType<JobAttempt> {
                 case /* optional int64 finished_at_ms */ 6:
                     message.finishedAtMs = reader.int64().toBigInt();
                     break;
-                case /* optional silo.v1.MsgpackBytes result */ 7:
-                    message.result = MsgpackBytes.internalBinaryRead(reader, reader.uint32(), options, message.result);
+                case /* optional silo.v1.SerializedBytes result */ 7:
+                    message.result = SerializedBytes.internalBinaryRead(reader, reader.uint32(), options, message.result);
                     break;
                 case /* optional string error_code */ 8:
                     message.errorCode = reader.string();
                     break;
-                case /* optional bytes error_data */ 9:
-                    message.errorData = reader.bytes();
+                case /* optional silo.v1.SerializedBytes error_data */ 9:
+                    message.errorData = SerializedBytes.internalBinaryRead(reader, reader.uint32(), options, message.errorData);
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -2008,15 +2021,15 @@ class JobAttempt$Type extends MessageType<JobAttempt> {
         /* optional int64 finished_at_ms = 6; */
         if (message.finishedAtMs !== undefined)
             writer.tag(6, WireType.Varint).int64(message.finishedAtMs);
-        /* optional silo.v1.MsgpackBytes result = 7; */
+        /* optional silo.v1.SerializedBytes result = 7; */
         if (message.result)
-            MsgpackBytes.internalBinaryWrite(message.result, writer.tag(7, WireType.LengthDelimited).fork(), options).join();
+            SerializedBytes.internalBinaryWrite(message.result, writer.tag(7, WireType.LengthDelimited).fork(), options).join();
         /* optional string error_code = 8; */
         if (message.errorCode !== undefined)
             writer.tag(8, WireType.LengthDelimited).string(message.errorCode);
-        /* optional bytes error_data = 9; */
-        if (message.errorData !== undefined)
-            writer.tag(9, WireType.LengthDelimited).bytes(message.errorData);
+        /* optional silo.v1.SerializedBytes error_data = 9; */
+        if (message.errorData)
+            SerializedBytes.internalBinaryWrite(message.errorData, writer.tag(9, WireType.LengthDelimited).fork(), options).join();
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -2034,7 +2047,7 @@ class GetJobResponse$Type extends MessageType<GetJobResponse> {
             { no: 1, name: "id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
             { no: 2, name: "priority", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
             { no: 3, name: "enqueue_time_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
-            { no: 4, name: "payload", kind: "message", T: () => MsgpackBytes },
+            { no: 4, name: "payload", kind: "message", T: () => SerializedBytes },
             { no: 5, name: "retry_policy", kind: "message", T: () => RetryPolicy },
             { no: 6, name: "limits", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => Limit },
             { no: 7, name: "metadata", kind: "map", K: 9 /*ScalarType.STRING*/, V: { kind: "scalar", T: 9 /*ScalarType.STRING*/ } },
@@ -2074,8 +2087,8 @@ class GetJobResponse$Type extends MessageType<GetJobResponse> {
                 case /* int64 enqueue_time_ms */ 3:
                     message.enqueueTimeMs = reader.int64().toBigInt();
                     break;
-                case /* silo.v1.MsgpackBytes payload */ 4:
-                    message.payload = MsgpackBytes.internalBinaryRead(reader, reader.uint32(), options, message.payload);
+                case /* silo.v1.SerializedBytes payload */ 4:
+                    message.payload = SerializedBytes.internalBinaryRead(reader, reader.uint32(), options, message.payload);
                     break;
                 case /* optional silo.v1.RetryPolicy retry_policy */ 5:
                     message.retryPolicy = RetryPolicy.internalBinaryRead(reader, reader.uint32(), options, message.retryPolicy);
@@ -2138,9 +2151,9 @@ class GetJobResponse$Type extends MessageType<GetJobResponse> {
         /* int64 enqueue_time_ms = 3; */
         if (message.enqueueTimeMs !== 0n)
             writer.tag(3, WireType.Varint).int64(message.enqueueTimeMs);
-        /* silo.v1.MsgpackBytes payload = 4; */
+        /* silo.v1.SerializedBytes payload = 4; */
         if (message.payload)
-            MsgpackBytes.internalBinaryWrite(message.payload, writer.tag(4, WireType.LengthDelimited).fork(), options).join();
+            SerializedBytes.internalBinaryWrite(message.payload, writer.tag(4, WireType.LengthDelimited).fork(), options).join();
         /* optional silo.v1.RetryPolicy retry_policy = 5; */
         if (message.retryPolicy)
             RetryPolicy.internalBinaryWrite(message.retryPolicy, writer.tag(5, WireType.LengthDelimited).fork(), options).join();
@@ -2244,7 +2257,7 @@ class GetJobResultResponse$Type extends MessageType<GetJobResultResponse> {
             { no: 1, name: "id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
             { no: 2, name: "status", kind: "enum", T: () => ["silo.v1.JobStatus", JobStatus, "JOB_STATUS_"] },
             { no: 3, name: "finished_at_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
-            { no: 4, name: "success_data", kind: "message", oneof: "result", T: () => MsgpackBytes },
+            { no: 4, name: "success_data", kind: "message", oneof: "result", T: () => SerializedBytes },
             { no: 5, name: "failure", kind: "message", oneof: "result", T: () => JobFailure },
             { no: 6, name: "cancelled", kind: "message", oneof: "result", T: () => JobCancelled }
         ]);
@@ -2273,10 +2286,10 @@ class GetJobResultResponse$Type extends MessageType<GetJobResultResponse> {
                 case /* int64 finished_at_ms */ 3:
                     message.finishedAtMs = reader.int64().toBigInt();
                     break;
-                case /* silo.v1.MsgpackBytes success_data */ 4:
+                case /* silo.v1.SerializedBytes success_data */ 4:
                     message.result = {
                         oneofKind: "successData",
-                        successData: MsgpackBytes.internalBinaryRead(reader, reader.uint32(), options, (message.result as any).successData)
+                        successData: SerializedBytes.internalBinaryRead(reader, reader.uint32(), options, (message.result as any).successData)
                     };
                     break;
                 case /* silo.v1.JobFailure failure */ 5:
@@ -2312,9 +2325,9 @@ class GetJobResultResponse$Type extends MessageType<GetJobResultResponse> {
         /* int64 finished_at_ms = 3; */
         if (message.finishedAtMs !== 0n)
             writer.tag(3, WireType.Varint).int64(message.finishedAtMs);
-        /* silo.v1.MsgpackBytes success_data = 4; */
+        /* silo.v1.SerializedBytes success_data = 4; */
         if (message.result.oneofKind === "successData")
-            MsgpackBytes.internalBinaryWrite(message.result.successData, writer.tag(4, WireType.LengthDelimited).fork(), options).join();
+            SerializedBytes.internalBinaryWrite(message.result.successData, writer.tag(4, WireType.LengthDelimited).fork(), options).join();
         /* silo.v1.JobFailure failure = 5; */
         if (message.result.oneofKind === "failure")
             JobFailure.internalBinaryWrite(message.result.failure, writer.tag(5, WireType.LengthDelimited).fork(), options).join();
@@ -2336,13 +2349,12 @@ class JobFailure$Type extends MessageType<JobFailure> {
     constructor() {
         super("silo.v1.JobFailure", [
             { no: 1, name: "error_code", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
-            { no: 2, name: "error_data", kind: "scalar", T: 12 /*ScalarType.BYTES*/ }
+            { no: 2, name: "error_data", kind: "message", T: () => SerializedBytes }
         ]);
     }
     create(value?: PartialMessage<JobFailure>): JobFailure {
         const message = globalThis.Object.create((this.messagePrototype!));
         message.errorCode = "";
-        message.errorData = new Uint8Array(0);
         if (value !== undefined)
             reflectionMergePartial<JobFailure>(this, message, value);
         return message;
@@ -2355,8 +2367,8 @@ class JobFailure$Type extends MessageType<JobFailure> {
                 case /* string error_code */ 1:
                     message.errorCode = reader.string();
                     break;
-                case /* bytes error_data */ 2:
-                    message.errorData = reader.bytes();
+                case /* silo.v1.SerializedBytes error_data */ 2:
+                    message.errorData = SerializedBytes.internalBinaryRead(reader, reader.uint32(), options, message.errorData);
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -2373,9 +2385,9 @@ class JobFailure$Type extends MessageType<JobFailure> {
         /* string error_code = 1; */
         if (message.errorCode !== "")
             writer.tag(1, WireType.LengthDelimited).string(message.errorCode);
-        /* bytes error_data = 2; */
-        if (message.errorData.length)
-            writer.tag(2, WireType.LengthDelimited).bytes(message.errorData);
+        /* silo.v1.SerializedBytes error_data = 2; */
+        if (message.errorData)
+            SerializedBytes.internalBinaryWrite(message.errorData, writer.tag(2, WireType.LengthDelimited).fork(), options).join();
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -2911,7 +2923,7 @@ class Task$Type extends MessageType<Task> {
             { no: 2, name: "job_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
             { no: 3, name: "attempt_number", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
             { no: 4, name: "lease_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
-            { no: 5, name: "payload", kind: "message", T: () => MsgpackBytes },
+            { no: 5, name: "payload", kind: "message", T: () => SerializedBytes },
             { no: 6, name: "priority", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
             { no: 7, name: "shard", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
             { no: 8, name: "task_group", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
@@ -2952,8 +2964,8 @@ class Task$Type extends MessageType<Task> {
                 case /* int64 lease_ms */ 4:
                     message.leaseMs = reader.int64().toBigInt();
                     break;
-                case /* silo.v1.MsgpackBytes payload */ 5:
-                    message.payload = MsgpackBytes.internalBinaryRead(reader, reader.uint32(), options, message.payload);
+                case /* silo.v1.SerializedBytes payload */ 5:
+                    message.payload = SerializedBytes.internalBinaryRead(reader, reader.uint32(), options, message.payload);
                     break;
                 case /* uint32 priority */ 6:
                     message.priority = reader.uint32();
@@ -3013,9 +3025,9 @@ class Task$Type extends MessageType<Task> {
         /* int64 lease_ms = 4; */
         if (message.leaseMs !== 0n)
             writer.tag(4, WireType.Varint).int64(message.leaseMs);
-        /* silo.v1.MsgpackBytes payload = 5; */
+        /* silo.v1.SerializedBytes payload = 5; */
         if (message.payload)
-            MsgpackBytes.internalBinaryWrite(message.payload, writer.tag(5, WireType.LengthDelimited).fork(), options).join();
+            SerializedBytes.internalBinaryWrite(message.payload, writer.tag(5, WireType.LengthDelimited).fork(), options).join();
         /* uint32 priority = 6; */
         if (message.priority !== 0)
             writer.tag(6, WireType.Varint).uint32(message.priority);
@@ -3231,7 +3243,7 @@ class ReportOutcomeRequest$Type extends MessageType<ReportOutcomeRequest> {
         super("silo.v1.ReportOutcomeRequest", [
             { no: 1, name: "shard", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
             { no: 2, name: "task_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
-            { no: 3, name: "success", kind: "message", oneof: "outcome", T: () => MsgpackBytes },
+            { no: 3, name: "success", kind: "message", oneof: "outcome", T: () => SerializedBytes },
             { no: 4, name: "failure", kind: "message", oneof: "outcome", T: () => Failure },
             { no: 6, name: "cancelled", kind: "message", oneof: "outcome", T: () => Cancelled }
         ]);
@@ -3256,10 +3268,10 @@ class ReportOutcomeRequest$Type extends MessageType<ReportOutcomeRequest> {
                 case /* string task_id */ 2:
                     message.taskId = reader.string();
                     break;
-                case /* silo.v1.MsgpackBytes success */ 3:
+                case /* silo.v1.SerializedBytes success */ 3:
                     message.outcome = {
                         oneofKind: "success",
-                        success: MsgpackBytes.internalBinaryRead(reader, reader.uint32(), options, (message.outcome as any).success)
+                        success: SerializedBytes.internalBinaryRead(reader, reader.uint32(), options, (message.outcome as any).success)
                     };
                     break;
                 case /* silo.v1.Failure failure */ 4:
@@ -3292,9 +3304,9 @@ class ReportOutcomeRequest$Type extends MessageType<ReportOutcomeRequest> {
         /* string task_id = 2; */
         if (message.taskId !== "")
             writer.tag(2, WireType.LengthDelimited).string(message.taskId);
-        /* silo.v1.MsgpackBytes success = 3; */
+        /* silo.v1.SerializedBytes success = 3; */
         if (message.outcome.oneofKind === "success")
-            MsgpackBytes.internalBinaryWrite(message.outcome.success, writer.tag(3, WireType.LengthDelimited).fork(), options).join();
+            SerializedBytes.internalBinaryWrite(message.outcome.success, writer.tag(3, WireType.LengthDelimited).fork(), options).join();
         /* silo.v1.Failure failure = 4; */
         if (message.outcome.oneofKind === "failure")
             Failure.internalBinaryWrite(message.outcome.failure, writer.tag(4, WireType.LengthDelimited).fork(), options).join();
@@ -3316,13 +3328,12 @@ class Failure$Type extends MessageType<Failure> {
     constructor() {
         super("silo.v1.Failure", [
             { no: 1, name: "code", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
-            { no: 2, name: "data", kind: "scalar", T: 12 /*ScalarType.BYTES*/ }
+            { no: 2, name: "data", kind: "message", T: () => SerializedBytes }
         ]);
     }
     create(value?: PartialMessage<Failure>): Failure {
         const message = globalThis.Object.create((this.messagePrototype!));
         message.code = "";
-        message.data = new Uint8Array(0);
         if (value !== undefined)
             reflectionMergePartial<Failure>(this, message, value);
         return message;
@@ -3335,8 +3346,8 @@ class Failure$Type extends MessageType<Failure> {
                 case /* string code */ 1:
                     message.code = reader.string();
                     break;
-                case /* bytes data */ 2:
-                    message.data = reader.bytes();
+                case /* silo.v1.SerializedBytes data */ 2:
+                    message.data = SerializedBytes.internalBinaryRead(reader, reader.uint32(), options, message.data);
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -3353,9 +3364,9 @@ class Failure$Type extends MessageType<Failure> {
         /* string code = 1; */
         if (message.code !== "")
             writer.tag(1, WireType.LengthDelimited).string(message.code);
-        /* bytes data = 2; */
-        if (message.data.length)
-            writer.tag(2, WireType.LengthDelimited).bytes(message.data);
+        /* silo.v1.SerializedBytes data = 2; */
+        if (message.data)
+            SerializedBytes.internalBinaryWrite(message.data, writer.tag(2, WireType.LengthDelimited).fork(), options).join();
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -3897,7 +3908,7 @@ class QueryResponse$Type extends MessageType<QueryResponse> {
     constructor() {
         super("silo.v1.QueryResponse", [
             { no: 1, name: "columns", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => ColumnInfo },
-            { no: 2, name: "rows", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => MsgpackBytes },
+            { no: 2, name: "rows", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => SerializedBytes },
             { no: 3, name: "row_count", kind: "scalar", T: 5 /*ScalarType.INT32*/ }
         ]);
     }
@@ -3918,8 +3929,8 @@ class QueryResponse$Type extends MessageType<QueryResponse> {
                 case /* repeated silo.v1.ColumnInfo columns */ 1:
                     message.columns.push(ColumnInfo.internalBinaryRead(reader, reader.uint32(), options));
                     break;
-                case /* repeated silo.v1.MsgpackBytes rows */ 2:
-                    message.rows.push(MsgpackBytes.internalBinaryRead(reader, reader.uint32(), options));
+                case /* repeated silo.v1.SerializedBytes rows */ 2:
+                    message.rows.push(SerializedBytes.internalBinaryRead(reader, reader.uint32(), options));
                     break;
                 case /* int32 row_count */ 3:
                     message.rowCount = reader.int32();
@@ -3939,9 +3950,9 @@ class QueryResponse$Type extends MessageType<QueryResponse> {
         /* repeated silo.v1.ColumnInfo columns = 1; */
         for (let i = 0; i < message.columns.length; i++)
             ColumnInfo.internalBinaryWrite(message.columns[i], writer.tag(1, WireType.LengthDelimited).fork(), options).join();
-        /* repeated silo.v1.MsgpackBytes rows = 2; */
+        /* repeated silo.v1.SerializedBytes rows = 2; */
         for (let i = 0; i < message.rows.length; i++)
-            MsgpackBytes.internalBinaryWrite(message.rows[i], writer.tag(2, WireType.LengthDelimited).fork(), options).join();
+            SerializedBytes.internalBinaryWrite(message.rows[i], writer.tag(2, WireType.LengthDelimited).fork(), options).join();
         /* int32 row_count = 3; */
         if (message.rowCount !== 0)
             writer.tag(3, WireType.Varint).int32(message.rowCount);

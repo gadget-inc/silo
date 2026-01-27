@@ -7,7 +7,7 @@ import { pack, unpack } from "msgpackr";
 import { SiloClient } from "./pb/silo.client";
 import type {
   Limit,
-  MsgpackBytes,
+  SerializedBytes,
   QueryResponse,
   RetryPolicy,
   Task,
@@ -21,8 +21,7 @@ import {
 } from "./pb/silo";
 import type { JobAttempt as ProtoJobAttempt } from "./pb/silo";
 import { JobHandle } from "./JobHandle";
-
-export type { QueryResponse, RetryPolicy, Task, ShardOwner };
+export type { QueryResponse, RetryPolicy, ShardOwner };
 export { GubernatorAlgorithm, GubernatorBehavior };
 
 /**
@@ -299,7 +298,7 @@ export type JobLimit =
   | FloatingConcurrencyLimitConfig;
 
 /** Job details returned from getJob */
-export interface Job {
+export interface Job<Payload = unknown, Result = unknown> {
   /** The job ID */
   id: string;
   /** Priority 0-99, where 0 is highest priority */
@@ -307,7 +306,7 @@ export interface Job {
   /** Timestamp when the job was enqueued (epoch ms) */
   enqueueTimeMs: bigint;
   /** The job payload as MessagePack bytes */
-  payload?: MsgpackBytes;
+  payload: Payload;
   /** Retry policy if configured */
   retryPolicy?: RetryPolicy;
   /** Limits (concurrency limits and/or rate limits) */
@@ -319,7 +318,7 @@ export interface Job {
   /** Timestamp when the status last changed (epoch ms) */
   statusChangedAtMs: bigint;
   /** All attempts for this job. Only populated if includeAttempts was true in the request to fetch the job. */
-  attempts?: JobAttempt[];
+  attempts?: JobAttempt<Result>[];
   /**
    * Timestamp (epoch ms) when the next attempt will start.
    * Present for scheduled jobs (initial or after retry), absent for running or terminal jobs.
@@ -347,7 +346,7 @@ export enum AttemptStatus {
 }
 
 /** A single execution attempt of a job */
-export interface JobAttempt {
+export interface JobAttempt<Result = unknown> {
   /** The job ID */
   jobId: string;
   /** Which attempt this is (1 = first attempt) */
@@ -360,12 +359,12 @@ export interface JobAttempt {
   startedAtMs?: bigint;
   /** Timestamp when attempt finished (epoch ms). Present if completed. */
   finishedAtMs?: bigint;
-  /** Result data if attempt succeeded (MessagePack) */
-  result?: MsgpackBytes;
+  /** Result data if attempt succeeded */
+  result?: Result;
   /** Error code if attempt failed */
   errorCode?: string;
   /** Error data if attempt failed */
-  errorData?: Uint8Array;
+  errorData?: Record<string, unknown>;
 }
 
 /** Options for getJob */
@@ -538,10 +537,10 @@ export interface LeaseTasksOptions {
 }
 
 /** Outcome for reporting task success */
-export interface SuccessOutcome {
+export interface SuccessOutcome<Result = unknown> {
   type: "success";
   /** The JSON-serializable result data */
-  result: unknown;
+  result: Result;
 }
 
 /** Outcome for reporting task failure */
@@ -550,7 +549,7 @@ export interface FailureOutcome {
   /** Error code */
   code: string;
   /** Optional error data as JSON-serializable object or raw bytes (Uint8Array) */
-  data?: unknown;
+  data?: Record<string, unknown>;
 }
 
 /** Outcome for reporting task cancellation */
@@ -558,16 +557,16 @@ export interface CancelledOutcome {
   type: "cancelled";
 }
 
-export type TaskOutcome = SuccessOutcome | FailureOutcome | CancelledOutcome;
+export type TaskOutcome<Result, > = SuccessOutcome<Result> | FailureOutcome | CancelledOutcome;
 
 /** Options for reporting task outcome */
-export interface ReportOutcomeOptions {
+export interface ReportOutcomeOptions<Result = unknown> {
   /** The task ID to report outcome for */
   taskId: string;
   /** The shard the task came from (from Task.shard) */
   shard: number;
   /** The outcome of the task */
-  outcome: TaskOutcome;
+  outcome: TaskOutcome<Result>;
 }
 
 /**
@@ -696,8 +695,10 @@ function protoJobStatusToPublic(status: ProtoJobStatus): JobStatus {
       return JobStatus.Failed;
     case ProtoJobStatus.CANCELLED:
       return JobStatus.Cancelled;
-    default:
-      throw new Error(`Unknown job status: ${status}`);
+    default: {
+      const _exhaustive: never = status;
+      throw new Error(`Unknown job status: ${String(_exhaustive)}`);
+    }
   }
 }
 
@@ -715,8 +716,10 @@ function protoAttemptStatusToPublic(status: ProtoAttemptStatus): AttemptStatus {
       return AttemptStatus.Failed;
     case ProtoAttemptStatus.CANCELLED:
       return AttemptStatus.Cancelled;
-    default:
-      throw new Error(`Unknown attempt status: ${status}`);
+    default: {
+      const _exhaustive: never = status;
+      throw new Error(`Unknown attempt status: ${String(_exhaustive)}`);
+    }
   }
 }
 
@@ -732,9 +735,15 @@ function protoAttemptToPublic(attempt: ProtoJobAttempt): JobAttempt {
     status: protoAttemptStatusToPublic(attempt.status),
     startedAtMs: attempt.startedAtMs,
     finishedAtMs: attempt.finishedAtMs,
-    result: attempt.result,
+    result:
+      attempt.result?.encoding.oneofKind === "msgpack"
+        ? decodeBytes(attempt.result.encoding.msgpack, "result")
+        : undefined,
     errorCode: attempt.errorCode,
-    errorData: attempt.errorData,
+    errorData:
+      attempt.errorData?.encoding.oneofKind === "msgpack"
+        ? decodeBytes(attempt.errorData.encoding.msgpack, "errorData")
+        : undefined,
   };
 }
 
@@ -1117,7 +1126,9 @@ export class SiloGRPCClient {
             priority: options.priority ?? 50,
             startAtMs: options.startAtMs ?? BigInt(Date.now()),
             retryPolicy: options.retryPolicy,
-            payload: { data: encodePayload(options.payload) },
+            payload: {
+              encoding: { oneofKind: "msgpack", msgpack: encodeBytes(options.payload) },
+            },
             limits: options.limits?.map(toProtoLimit) ?? [],
             tenant: options.tenant,
             metadata: options.metadata ?? {},
@@ -1164,7 +1175,12 @@ export class SiloGRPCClient {
           id: response.id,
           priority: response.priority,
           enqueueTimeMs: response.enqueueTimeMs,
-          payload: response.payload,
+          payload: decodeBytes(
+            response.payload?.encoding.oneofKind === "msgpack"
+              ? response.payload.encoding.msgpack
+              : undefined,
+            "payload"
+          ),
           retryPolicy: response.retryPolicy,
           limits: response.limits
             .map(fromProtoLimit)
@@ -1347,9 +1363,13 @@ export class SiloGRPCClient {
           let result: T | undefined;
           if (
             response.result.oneofKind === "successData" &&
-            response.result.successData.data.length > 0
+            response.result.successData.encoding.oneofKind === "msgpack" &&
+            response.result.successData.encoding.msgpack.length > 0
           ) {
-            result = decodePayload<T>(response.result.successData.data);
+            result = decodeBytes<T>(
+              response.result.successData.encoding.msgpack,
+              "successData"
+            );
           }
           return { status: JobStatus.Succeeded, result };
         }
@@ -1358,9 +1378,13 @@ export class SiloGRPCClient {
           let errorData: unknown;
           if (
             response.result.oneofKind === "failure" &&
-            response.result.failure.errorData.length > 0
+            response.result.failure.errorData?.encoding.oneofKind === "msgpack" &&
+            response.result.failure.errorData.encoding.msgpack.length > 0
           ) {
-            errorData = decodePayload(response.result.failure.errorData);
+            errorData = decodeBytes(
+              response.result.failure.errorData.encoding.msgpack,
+              "failure"
+            );
           }
           return {
             status: JobStatus.Failed,
@@ -1473,24 +1497,29 @@ export class SiloGRPCClient {
    */
   public async reportOutcome(options: ReportOutcomeOptions): Promise<void> {
     let outcome:
-      | { oneofKind: "success"; success: { data: Uint8Array } }
-      | { oneofKind: "failure"; failure: { code: string; data: Uint8Array } }
+      | { oneofKind: "success"; success: SerializedBytes }
+      | { oneofKind: "failure"; failure: { code: string; data?: SerializedBytes } }
       | { oneofKind: "cancelled"; cancelled: Record<string, never> };
 
     if (options.outcome.type === "success") {
       outcome = {
         oneofKind: "success" as const,
-        success: { data: encodePayload(options.outcome.result) },
+        success: {
+          encoding: { oneofKind: "msgpack", msgpack: encodeBytes(options.outcome.result) },
+        },
       };
     } else if (options.outcome.type === "failure") {
+      const errorData =
+        options.outcome.data instanceof Uint8Array
+          ? options.outcome.data
+          : encodeBytes(options.outcome.data);
       outcome = {
         oneofKind: "failure" as const,
         failure: {
           code: options.outcome.code,
-          data:
-            options.outcome.data instanceof Uint8Array
-              ? options.outcome.data
-              : encodePayload(options.outcome.data),
+          data: {
+            encoding: { oneofKind: "msgpack", msgpack: errorData },
+          },
         },
       };
     } else {
@@ -1684,7 +1713,7 @@ export class SiloGRPCClient {
  * @param value The value to encode.
  * @returns The encoded value as MessagePack bytes.
  */
-export function encodePayload(value: unknown): Uint8Array {
+export function encodeBytes(value: unknown): Uint8Array {
   return pack(value);
 }
 
@@ -1693,9 +1722,9 @@ export function encodePayload(value: unknown): Uint8Array {
  * @param bytes The MessagePack bytes to decode.
  * @returns The decoded value.
  */
-export function decodePayload<T = unknown>(bytes: Uint8Array | undefined): T {
+export function decodeBytes<T = unknown>(bytes: Uint8Array | undefined, field: string): T {
   if (!bytes || bytes.length === 0) {
-    return undefined as T;
+    throw new Error(`No bytes to decode for field ${field}`);
   }
   return unpack(bytes) as T;
 }
