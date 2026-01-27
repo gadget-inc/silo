@@ -10,6 +10,47 @@ use uuid::Uuid;
 
 use crate::coordination::{SplitCleanupStatus, SplitPhase};
 
+/// Generate a deterministic UUID from a seed and index.
+/// Uses a simple derivation: combines seed bytes with index to create a reproducible UUID.
+fn deterministic_uuid(seed: u64, index: u32) -> Uuid {
+    use std::hash::{Hash, Hasher};
+    use std::collections::hash_map::DefaultHasher;
+    
+    // Create a hasher and hash the seed + index
+    let mut hasher = DefaultHasher::new();
+    seed.hash(&mut hasher);
+    index.hash(&mut hasher);
+    let hash1 = hasher.finish();
+    
+    // Hash again to get more bytes
+    let mut hasher2 = DefaultHasher::new();
+    hash1.hash(&mut hasher2);
+    (index as u64).wrapping_add(1).hash(&mut hasher2);
+    let hash2 = hasher2.finish();
+    
+    // Combine into UUID bytes
+    let bytes: [u8; 16] = [
+        (hash1 >> 56) as u8,
+        (hash1 >> 48) as u8,
+        (hash1 >> 40) as u8,
+        (hash1 >> 32) as u8,
+        (hash1 >> 24) as u8,
+        (hash1 >> 16) as u8,
+        (hash1 >> 8) as u8,
+        hash1 as u8,
+        (hash2 >> 56) as u8,
+        (hash2 >> 48) as u8,
+        (hash2 >> 40) as u8,
+        (hash2 >> 32) as u8,
+        (hash2 >> 24) as u8,
+        (hash2 >> 16) as u8,
+        (hash2 >> 8) as u8,
+        hash2 as u8,
+    ];
+    
+    Uuid::from_bytes(bytes)
+}
+
 /// A unique identifier for a shard.
 ///
 /// Shards have immutable identities that persist across restarts and
@@ -422,6 +463,19 @@ impl ShardMap {
     /// For example, with 16 shards, each shard owns 1/16th of the keyspace
     /// based on the first hex digit of the tenant ID hash.
     pub fn create_initial(shard_count: u32) -> Result<Self, ShardMapError> {
+        // Use random UUIDs (via Uuid::new_v4)
+        Self::create_initial_impl(shard_count, None)
+    }
+
+    /// Create an initial shard map with deterministic shard IDs based on a seed.
+    ///
+    /// This is useful for deterministic simulation testing where the global RNG
+    /// may not be properly seeded or may be consumed in non-deterministic order.
+    pub fn create_initial_seeded(shard_count: u32, seed: u64) -> Result<Self, ShardMapError> {
+        Self::create_initial_impl(shard_count, Some(seed))
+    }
+
+    fn create_initial_impl(shard_count: u32, seed: Option<u64>) -> Result<Self, ShardMapError> {
         if shard_count == 0 {
             return Err(ShardMapError::InvalidShardCount(
                 "shard count must be positive".to_string(),
@@ -430,9 +484,17 @@ impl ShardMap {
 
         let mut shards = Vec::with_capacity(shard_count as usize);
 
+        // Helper to create a shard ID - either deterministic or random
+        let make_shard_id = |index: u32| -> ShardId {
+            match seed {
+                Some(s) => ShardId::from_uuid(deterministic_uuid(s, index)),
+                None => ShardId::new(),
+            }
+        };
+
         if shard_count == 1 {
             // Single shard covers entire keyspace
-            shards.push(ShardInfo::new(ShardId::new(), ShardRange::full()));
+            shards.push(ShardInfo::new(make_shard_id(0), ShardRange::full()));
         } else {
             // Divide keyspace into equal ranges
             // We use a simple approach: divide into ranges based on first character
@@ -452,7 +514,7 @@ impl ShardMap {
                     boundaries[i].clone()
                 };
 
-                shards.push(ShardInfo::new(ShardId::new(), ShardRange::new(start, end)));
+                shards.push(ShardInfo::new(make_shard_id(i as u32), ShardRange::new(start, end)));
             }
         }
 

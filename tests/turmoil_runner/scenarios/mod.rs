@@ -11,6 +11,8 @@ pub mod fault_injection_partition;
 pub mod floating_concurrency;
 pub mod grpc_end_to_end;
 pub mod high_message_loss;
+#[cfg(feature = "k8s")]
+pub mod k8s_coordination;
 pub mod lease_expiry;
 pub mod multiple_workers;
 pub mod rate_limits;

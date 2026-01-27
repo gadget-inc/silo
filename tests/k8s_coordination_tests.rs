@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 
 use silo::coordination::CoordinationError;
 use silo::coordination::k8s::K8sShardGuard;
-use silo::coordination::{Coordinator, K8sCoordinator};
+use silo::coordination::{Coordinator, K8sCoordinator, KubeBackend};
 use silo::coordination::{ShardSplitter, SplitCleanupStatus, SplitPhase};
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
@@ -749,14 +749,14 @@ async fn make_k8s_guard(
     shard_id: ShardId,
 ) -> Result<
     (
-        Arc<K8sShardGuard>,
+        Arc<K8sShardGuard<KubeBackend>>,
         Arc<Mutex<HashSet<ShardId>>>,
         tokio::sync::watch::Sender<bool>,
         tokio::task::JoinHandle<()>,
     ),
     String,
 > {
-    let client = kube::Client::try_default()
+    let backend = KubeBackend::try_default()
         .await
         .map_err(|e| format!("K8S not available: {}", e))?;
 
@@ -765,7 +765,7 @@ async fn make_k8s_guard(
 
     let guard = K8sShardGuard::new(
         shard_id,
-        client,
+        backend,
         namespace.to_string(),
         cluster_prefix.to_string(),
         node_id.to_string(),

@@ -18,13 +18,20 @@ const LOGS_DIR = "dst-logs";
 
 // All available DST scenarios - must match test function names in main.rs
 const SCENARIOS = [
+  "cancel_releases_ticket",
   "chaos",
   "concurrency_limits",
+  "coordinator_shard_migration",
+  "expedite_concurrency",
   "fault_injection_partition",
+  "floating_concurrency",
   "grpc_end_to_end",
   "high_message_loss",
+  "k8s_coordination",
   "lease_expiry",
   "multiple_workers",
+  "rate_limits",
+  "retry_releases_ticket",
 ];
 
 // Determine default parallelism: all cores in CI, 3 otherwise

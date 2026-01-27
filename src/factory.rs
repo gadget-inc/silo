@@ -214,9 +214,14 @@ impl ShardFactory {
     pub async fn close_all(&self) -> Result<(), CloseAllError> {
         let mut errors: Vec<(ShardId, JobStoreShardError)> = Vec::new();
         let instances = self.instances.read().await;
-        for (shard_id, shard) in instances.iter() {
-            if let Err(e) = shard.close().await {
-                errors.push((*shard_id, e));
+        // Sort shard IDs for deterministic shutdown order
+        let mut shard_ids: Vec<ShardId> = instances.keys().copied().collect();
+        shard_ids.sort_unstable();
+        for shard_id in shard_ids {
+            if let Some(shard) = instances.get(&shard_id) {
+                if let Err(e) = shard.close().await {
+                    errors.push((shard_id, e));
+                }
             }
         }
         if errors.is_empty() {

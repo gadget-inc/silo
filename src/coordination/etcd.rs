@@ -445,9 +445,9 @@ impl EtcdCoordinator {
         };
         debug!(node_id = %self.base.node_id, desired_len = desired.len(), have_locks = ?current_locks, "reconcile: computed desired vs current");
 
-        // Release undesired shards
+        // Release undesired shards (sorted for deterministic ordering)
         {
-            let to_release: Vec<ShardId> = {
+            let mut to_release: Vec<ShardId> = {
                 let guards = self.shard_guards.lock().await;
                 let mut v = Vec::new();
                 for (sid, guard) in guards.iter() {
@@ -457,14 +457,16 @@ impl EtcdCoordinator {
                 }
                 v
             };
+            to_release.sort_unstable();
             for sid in to_release {
                 self.ensure_shard_guard(sid).await.set_desired(false).await;
             }
         }
 
-        // Acquire desired shards
+        // Acquire desired shards (sorted for deterministic ordering)
         {
-            let snapshot: Vec<ShardId> = desired.iter().copied().collect();
+            let mut snapshot: Vec<ShardId> = desired.iter().copied().collect();
+            snapshot.sort_unstable();
             for shard_id in snapshot {
                 self.ensure_shard_guard(shard_id)
                     .await
@@ -764,17 +766,28 @@ impl Coordinator for EtcdCoordinator {
     }
 
     async fn shutdown(&self) -> Result<(), CoordinationError> {
-        self.base.signal_shutdown();
-        {
+        // Collect guards in sorted order for deterministic shutdown
+        let guards_sorted: Vec<(ShardId, Arc<EtcdShardGuard>)> = {
             let guards = self.shard_guards.lock().await;
-            for (_sid, guard) in guards.iter() {
-                guard.set_desired(false).await;
-                guard.notify.notify_one();
-            }
+            let mut shard_ids: Vec<ShardId> = guards.keys().copied().collect();
+            shard_ids.sort_unstable();
+            shard_ids
+                .into_iter()
+                .filter_map(|sid| guards.get(&sid).map(|g| (sid, g.clone())))
+                .collect()
+        };
+
+        // Shut down each guard sequentially for deterministic ordering
+        // We trigger shutdown on each guard individually rather than using
+        // signal_shutdown() which would notify all guards concurrently
+        for (_sid, guard) in guards_sorted {
+            guard.trigger_shutdown().await;
+            guard.notify.notify_one();
+            guard.wait_shutdown(Duration::from_millis(5000)).await;
         }
 
-        // Give guards time to release shards and cancel ongoing acquisitions
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Signal shutdown to stop background tasks
+        self.base.signal_shutdown();
 
         let _ = self
             .client
@@ -887,6 +900,33 @@ impl EtcdShardGuard {
             debug!(shard_id = %self.shard_id, prev_desired = prev_desired, desired = desired, phase = %prev_phase, "shard: set_desired");
             self.notify.notify_one();
         }
+    }
+
+    /// Trigger shutdown for this specific guard (sets phase to ShuttingDown).
+    pub async fn trigger_shutdown(&self) {
+        let mut st = self.state.lock().await;
+        if !matches!(st.phase, ShardPhase::ShutDown | ShardPhase::ShuttingDown) {
+            debug!(shard_id = %self.shard_id, "trigger_shutdown: transitioning to ShuttingDown");
+            st.phase = ShardPhase::ShuttingDown;
+        }
+    }
+
+    /// Wait for this guard to complete shutdown (phase becomes ShutDown).
+    /// Returns immediately if already shut down.
+    pub async fn wait_shutdown(&self, timeout: Duration) {
+        let poll_interval = Duration::from_millis(10);
+        let max_iterations = (timeout.as_millis() / poll_interval.as_millis()).max(1) as usize;
+
+        for _ in 0..max_iterations {
+            {
+                let st = self.state.lock().await;
+                if st.phase == ShardPhase::ShutDown {
+                    return;
+                }
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+        debug!(shard_id = %self.shard_id, "wait_shutdown: timed out");
     }
 
     pub async fn run(
