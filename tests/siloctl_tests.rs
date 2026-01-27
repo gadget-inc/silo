@@ -5,10 +5,15 @@
 
 mod grpc_integration_helpers;
 
+use std::sync::Mutex;
+
 use grpc_integration_helpers::{create_test_factory, setup_test_server, shutdown_server};
 use silo::pb::*;
 use silo::settings::AppConfig;
 use silo::siloctl::{self, GlobalOptions};
+
+// Global mutex to serialize profile tests - only one CPU profiler can run at a time system-wide
+static PROFILE_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
 fn opts_for_addr(addr: &std::net::SocketAddr) -> GlobalOptions {
     GlobalOptions {
@@ -533,7 +538,13 @@ async fn siloctl_query() -> anyhow::Result<()> {
         // Test JSON output
         let opts_json = opts_for_addr_json(&addr);
         let mut json_output = Vec::new();
-        siloctl::query(&opts_json, &mut json_output, 0, "SELECT id FROM jobs LIMIT 10").await?;
+        siloctl::query(
+            &opts_json,
+            &mut json_output,
+            0,
+            "SELECT id FROM jobs LIMIT 10",
+        )
+        .await?;
         let json_stdout = String::from_utf8(json_output)?;
 
         let parsed: serde_json::Value = serde_json::from_str(&json_stdout)
@@ -660,5 +671,108 @@ async fn siloctl_connection_error() -> anyhow::Result<()> {
 
     assert!(result.is_err(), "should fail when server is not running");
 
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn siloctl_profile() -> anyhow::Result<()> {
+    // Only one CPU profiler can run at a time system-wide
+    let _profile_lock = PROFILE_TEST_MUTEX.lock().unwrap();
+
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(60000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (_client, shutdown_tx, server, addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        let opts = opts_for_addr(&addr);
+        let mut output = Vec::new();
+
+        // Create temp directory for profile output
+        let tmp_dir = tempfile::tempdir()?;
+        let output_path = tmp_dir.path().join("test-profile.pb.gz");
+
+        // Run a short profile (2 seconds)
+        siloctl::profile(
+            &opts,
+            &mut output,
+            2, // 2 second duration for test
+            100,
+            Some(output_path.to_string_lossy().to_string()),
+        )
+        .await?;
+
+        let stdout = String::from_utf8(output)?;
+        assert!(
+            stdout.contains("Profile saved to:"),
+            "should confirm save: {}",
+            stdout
+        );
+        assert!(output_path.exists(), "profile file should exist");
+
+        // Verify it's a valid gzip file with some data
+        let metadata = std::fs::metadata(&output_path)?;
+        assert!(metadata.len() > 0, "profile should not be empty");
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn siloctl_profile_json_output() -> anyhow::Result<()> {
+    // Only one CPU profiler can run at a time system-wide
+    let _profile_lock = PROFILE_TEST_MUTEX.lock().unwrap();
+
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(60000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (_client, shutdown_tx, server, addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        let opts = opts_for_addr_json(&addr);
+        let mut output = Vec::new();
+
+        // Create temp directory for profile output
+        let tmp_dir = tempfile::tempdir()?;
+        let output_path = tmp_dir.path().join("test-profile-json.pb.gz");
+
+        // Run a short profile (2 seconds) with JSON output
+        siloctl::profile(
+            &opts,
+            &mut output,
+            2,
+            100,
+            Some(output_path.to_string_lossy().to_string()),
+        )
+        .await?;
+
+        let stdout = String::from_utf8(output)?;
+
+        // Parse JSON output
+        let parsed: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|_| panic!("Failed to parse JSON output: {}", stdout));
+
+        assert_eq!(parsed["status"], "completed", "status should be completed");
+        assert!(
+            parsed.get("output_file").is_some(),
+            "JSON should have output_file"
+        );
+        assert!(
+            parsed.get("duration_seconds").is_some(),
+            "JSON should have duration_seconds"
+        );
+        assert!(parsed.get("samples").is_some(), "JSON should have samples");
+        assert!(
+            parsed.get("profile_bytes").is_some(),
+            "JSON should have profile_bytes"
+        );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
     Ok(())
 }

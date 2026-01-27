@@ -38,6 +38,10 @@
         strictDeps = true;
         nativeBuildInputs = [ pkgs.protobuf ];
         cargoExtraArgs = "--features k8s";
+        # Enable frame pointers for profiling support - pprof uses frame-pointer
+        # based unwinding, which requires the compiler to actually preserve them
+        CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "1";  # Better inlining visibility
+        RUSTFLAGS = "-C force-frame-pointers=yes";
       };
       
       # Build dependencies separately for caching

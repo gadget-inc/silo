@@ -312,6 +312,65 @@ siloctl --json query 0 "SELECT id, status FROM jobs WHERE status = 'failed' LIMI
 
 ---
 
+### profile
+
+Capture a CPU profile from the connected Silo node. Useful for performance debugging in production.
+
+```bash
+siloctl profile [OPTIONS]
+```
+
+| Option | Description |
+|--------|-------------|
+| `-d`, `--duration <SECONDS>` | Profile duration in seconds (1-300, default: 30) |
+| `-f`, `--frequency <HZ>` | Sampling frequency in Hz (1-1000, default: 100) |
+| `-o`, `--output <FILE>` | Output file path (default: `profile-{timestamp}.pb.gz`) |
+
+**Example:**
+
+```bash
+siloctl -a http://silo-node:50051 profile --duration 30
+```
+
+```
+Starting CPU profile for 30 seconds at 100Hz...
+
+Profile saved to: profile-1706123456.pb.gz
+Duration: 30s, Samples: 2847, Size: 45632 bytes
+
+Analyze with:
+  pprof -http=:8080 profile-1706123456.pb.gz
+  go tool pprof -http=:8080 profile-1706123456.pb.gz
+```
+
+**With custom options:**
+
+```bash
+siloctl profile --duration 60 --frequency 250 --output my-profile.pb.gz
+```
+
+**JSON output:**
+
+```bash
+siloctl --json profile --duration 10
+```
+
+```json
+{
+  "status": "completed",
+  "output_file": "profile-1706123456.pb.gz",
+  "duration_seconds": 10,
+  "samples": 987,
+  "profile_bytes": 12345
+}
+```
+
+<Aside type="note">
+Profiling uses sampling and has low overhead (~1-2%). The default 100Hz frequency is safe for production. Higher frequencies provide more detail but slightly increase overhead.
+</Aside>
+
+---
+
 ## Common Workflows
 
 ### Debugging a Stuck Job

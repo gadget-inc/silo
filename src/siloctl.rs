@@ -5,11 +5,16 @@
 
 use std::io::Write;
 
+use std::fs::File;
+use std::path::Path;
+
 use crate::pb::silo_client::SiloClient;
 use crate::pb::{
-    CancelJobRequest, DeleteJobRequest, ExpediteJobRequest, GetClusterInfoRequest, GetJobRequest,
-    QueryRequest, RestartJobRequest,
+    CancelJobRequest, CpuProfileRequest, DeleteJobRequest, ExpediteJobRequest,
+    GetClusterInfoRequest, GetJobRequest, QueryRequest, RestartJobRequest,
 };
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use tonic::transport::Channel;
 
 /// Global options that apply to all siloctl commands
@@ -109,10 +114,14 @@ pub async fn cluster_info<W: Write>(opts: &GlobalOptions, out: &mut W) -> anyhow
         writeln!(out, "Cluster Information")?;
         writeln!(out, "===================")?;
         writeln!(out, "Total shards: {}", response.num_shards)?;
-        writeln!(out, "Connected to: {} ({})", response.this_node_id, response.this_grpc_addr)?;
+        writeln!(
+            out,
+            "Connected to: {} ({})",
+            response.this_node_id, response.this_grpc_addr
+        )?;
         writeln!(out)?;
         writeln!(out, "Shard Ownership:")?;
-        writeln!(out, "{:>8}  {:>20}  {}", "Shard", "Node ID", "gRPC Address")?;
+        writeln!(out, "{:>8}  {:>20}  gRPC Address", "Shard", "Node ID")?;
         writeln!(out, "{}", "-".repeat(60))?;
         for owner in &response.shard_owners {
             writeln!(
@@ -162,15 +171,21 @@ pub async fn job_get<W: Write>(
         }
 
         if include_attempts && !response.attempts.is_empty() {
-            json_output["attempts"] = serde_json::json!(response.attempts.iter().map(|a| {
-                serde_json::json!({
-                    "attempt_number": a.attempt_number,
-                    "task_id": a.task_id,
-                    "status": attempt_status_to_string(a.status),
-                    "started_at_ms": a.started_at_ms,
-                    "finished_at_ms": a.finished_at_ms,
-                })
-            }).collect::<Vec<_>>());
+            json_output["attempts"] = serde_json::json!(
+                response
+                    .attempts
+                    .iter()
+                    .map(|a| {
+                        serde_json::json!({
+                            "attempt_number": a.attempt_number,
+                            "task_id": a.task_id,
+                            "status": attempt_status_to_string(a.status),
+                            "started_at_ms": a.started_at_ms,
+                            "finished_at_ms": a.finished_at_ms,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            );
         }
 
         writeln!(out, "{}", serde_json::to_string_pretty(&json_output)?)?;
@@ -178,14 +193,30 @@ pub async fn job_get<W: Write>(
         writeln!(out, "Job Details")?;
         writeln!(out, "===========")?;
         writeln!(out, "ID:              {}", response.id)?;
-        writeln!(out, "Status:          {}", job_status_to_string(response.status))?;
+        writeln!(
+            out,
+            "Status:          {}",
+            job_status_to_string(response.status)
+        )?;
         writeln!(out, "Priority:        {}", response.priority)?;
         writeln!(out, "Task Group:      {}", response.task_group)?;
-        writeln!(out, "Enqueued:        {}", format_timestamp_ms(response.enqueue_time_ms))?;
-        writeln!(out, "Status Changed:  {}", format_timestamp_ms(response.status_changed_at_ms))?;
+        writeln!(
+            out,
+            "Enqueued:        {}",
+            format_timestamp_ms(response.enqueue_time_ms)
+        )?;
+        writeln!(
+            out,
+            "Status Changed:  {}",
+            format_timestamp_ms(response.status_changed_at_ms)
+        )?;
 
         if let Some(next_attempt) = response.next_attempt_starts_after_ms {
-            writeln!(out, "Next Attempt:    {}", format_timestamp_ms(next_attempt))?;
+            writeln!(
+                out,
+                "Next Attempt:    {}",
+                format_timestamp_ms(next_attempt)
+            )?;
         }
 
         if !response.metadata.is_empty() {
@@ -199,12 +230,16 @@ pub async fn job_get<W: Write>(
         if include_attempts && !response.attempts.is_empty() {
             writeln!(out)?;
             writeln!(out, "Attempts:")?;
-            writeln!(out, "{:>8}  {:>36}  {:>10}  {:>20}", "Attempt", "Task ID", "Status", "Finished")?;
+            writeln!(
+                out,
+                "{:>8}  {:>36}  {:>10}  {:>20}",
+                "Attempt", "Task ID", "Status", "Finished"
+            )?;
             writeln!(out, "{}", "-".repeat(80))?;
             for attempt in &response.attempts {
                 let finished = attempt
                     .finished_at_ms
-                    .map(|ms| format_timestamp_ms(ms))
+                    .map(format_timestamp_ms)
                     .unwrap_or_else(|| "-".to_string());
                 writeln!(
                     out,
@@ -418,6 +453,92 @@ pub async fn query<W: Write>(
 
         writeln!(out)?;
         writeln!(out, "{} row(s) returned", response.row_count)?;
+    }
+
+    Ok(())
+}
+
+/// Capture a CPU profile from the connected Silo node
+pub async fn profile<W: Write>(
+    opts: &GlobalOptions,
+    out: &mut W,
+    duration: u32,
+    frequency: u32,
+    output_path: Option<String>,
+) -> anyhow::Result<()> {
+    let mut client = connect(&opts.address).await?;
+
+    if !opts.json {
+        writeln!(
+            out,
+            "Starting CPU profile for {} seconds at {}Hz...",
+            duration, frequency
+        )?;
+        out.flush()?;
+    }
+
+    let response = client
+        .cpu_profile(CpuProfileRequest {
+            duration_seconds: duration,
+            frequency,
+        })
+        .await?
+        .into_inner();
+
+    // Generate output filename with timestamp if not provided
+    let output_file = output_path.unwrap_or_else(|| {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!("profile-{}.pb.gz", timestamp)
+    });
+
+    // Ensure output path ends with .pb.gz for gzip compressed pprof
+    let output_file = if !output_file.ends_with(".pb.gz") && !output_file.ends_with(".pb") {
+        format!("{}.pb.gz", output_file)
+    } else {
+        output_file
+    };
+
+    // Write profile data (gzip compressed if .gz extension)
+    if output_file.ends_with(".gz") {
+        let file = File::create(&output_file)?;
+        let mut encoder = GzEncoder::new(file, Compression::default());
+        std::io::Write::write_all(&mut encoder, &response.profile_data)?;
+        encoder.finish()?;
+    } else {
+        std::fs::write(&output_file, &response.profile_data)?;
+    }
+
+    if opts.json {
+        let json_output = serde_json::json!({
+            "status": "completed",
+            "output_file": output_file,
+            "duration_seconds": response.duration_seconds,
+            "samples": response.samples,
+            "profile_bytes": response.profile_data.len(),
+        });
+        writeln!(out, "{}", serde_json::to_string_pretty(&json_output)?)?;
+    } else {
+        writeln!(out)?;
+        writeln!(out, "Profile saved to: {}", output_file)?;
+        writeln!(
+            out,
+            "Duration: {}s, Samples: {}, Size: {} bytes",
+            response.duration_seconds,
+            response.samples,
+            response.profile_data.len()
+        )?;
+        writeln!(out)?;
+        writeln!(out, "Analyze with:")?;
+
+        let display_path = Path::new(&output_file)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or(output_file.clone());
+        writeln!(out, "  pprof -http=:8080 {}", display_path)?;
+        writeln!(out, "  go tool pprof -http=:8080 {}", display_path)?;
     }
 
     Ok(())

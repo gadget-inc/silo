@@ -59,6 +59,18 @@ enum Command {
         /// SQL query string
         sql: String,
     },
+    /// Capture a CPU profile from a Silo node
+    Profile {
+        /// Duration in seconds (1-300)
+        #[arg(long, short = 'd', default_value = "30")]
+        duration: u32,
+        /// Sampling frequency in Hz (1-1000)
+        #[arg(long, short = 'f', default_value = "100")]
+        frequency: u32,
+        /// Output file path (default: profile-{timestamp}.pb.gz)
+        #[arg(long, short = 'o')]
+        output: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -135,6 +147,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
             }
         },
         Command::Query { shard, sql } => siloctl::query(&opts, &mut stdout, *shard, sql).await,
+        Command::Profile {
+            duration,
+            frequency,
+            output,
+        } => siloctl::profile(&opts, &mut stdout, *duration, *frequency, output.clone()).await,
     }
 }
 

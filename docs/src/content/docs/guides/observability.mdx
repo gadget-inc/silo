@@ -199,3 +199,88 @@ Key log events to monitor:
 - `lease expired` - Worker crashes or timeouts
 - `rate limit check failed` - Gubernator connectivity issues
 - `failed to close shard` - Graceful shutdown problems
+
+## CPU Profiling
+
+Silo supports on-demand CPU profiling for production debugging. Profiles are captured using [pprof-rs](https://github.com/tikv/pprof-rs), a low-overhead sampling profiler, and returned in standard pprof protobuf format.
+
+### Capturing a Profile
+
+Use `siloctl` to capture a CPU profile from a running node:
+
+```bash
+siloctl -a http://silo-node:50051 profile --duration 30
+```
+
+Options:
+- `--duration`, `-d`: Profile duration in seconds (1-300, default 30)
+- `--frequency`, `-f`: Sampling frequency in Hz (1-1000, default 100)
+- `--output`, `-o`: Output file path (default: `profile-{timestamp}.pb.gz`)
+
+Example with all options:
+
+```bash
+siloctl -a http://silo-node:50051 profile \
+  --duration 60 \
+  --frequency 250 \
+  --output my-profile.pb.gz
+```
+
+### Analyzing Profiles
+
+Profiles are saved in pprof protobuf format (gzip compressed). Analyze with either of these tools:
+
+**Using pprof CLI:**
+
+```bash
+# Install pprof if needed
+go install github.com/google/pprof@latest
+
+# Open interactive web UI
+pprof -http=:8080 profile-1706123456.pb.gz
+```
+
+**Using go tool pprof:**
+
+```bash
+go tool pprof -http=:8080 profile-1706123456.pb.gz
+```
+
+Both tools open an interactive web UI with:
+- Flame graphs for visualizing hot paths
+- Top functions by CPU time
+- Call graphs showing function relationships
+- Source code annotation (if source is available)
+
+### Production Considerations
+
+- **Low overhead**: Profiling uses sampling at the configured frequency, typically adding only 1-2% overhead
+- **Safe defaults**: The default 100Hz frequency is safe for production use
+- **Higher detail**: Increase frequency (up to 1000Hz) for more detail, but expect slightly higher overhead
+- **Profile size**: Typical 30-second profiles are 10-100KB compressed
+- **Single profile at a time**: Only one profile can be captured per node at a time; concurrent requests will wait
+
+### Common Profiling Scenarios
+
+**Investigating high CPU usage:**
+
+```bash
+# Capture a 60-second profile during high load
+siloctl -a http://silo-node:50051 profile --duration 60
+
+# Open in pprof and look at the flame graph
+pprof -http=:8080 profile-*.pb.gz
+```
+
+**Comparing before/after a change:**
+
+```bash
+# Capture baseline profile
+siloctl profile --output baseline.pb.gz
+
+# Deploy change, then capture new profile
+siloctl profile --output after-change.pb.gz
+
+# Compare using pprof's diff mode
+pprof -http=:8080 -diff_base=baseline.pb.gz after-change.pb.gz
+```
