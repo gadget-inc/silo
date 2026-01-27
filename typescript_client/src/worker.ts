@@ -1,6 +1,6 @@
 import PQueue from "p-queue";
 import { serializeError } from "serialize-error";
-import type { Task } from "./pb/silo";
+import type { Task as ProtoTask } from "./pb/silo";
 import type {
   SiloGRPCClient,
   TaskOutcome,
@@ -8,18 +8,16 @@ import type {
   RefreshOutcome,
   HeartbeatResult,
 } from "./client";
-import { TaskExecution } from "./TaskExecution";
+import { Task, TaskExecution, transformTask } from "./TaskExecution";
 
 /**
  * Context passed to task handlers with utilities for the current task.
+ *
+ * @typeParam T The type of the decoded payload. Defaults to `unknown`.
  */
-export interface TaskContext {
-  /** The task being executed */
-  task: Task;
-  /** The shard the task is from (for reference) */
-  shard: number;
-  /** The worker ID processing this task */
-  workerId: string;
+export interface TaskContext<Payload = unknown, Metadata extends Record<string, string> = Record<string, string>> {
+  /** The task being executed, with decoded payload */
+  task: Task<Payload, Metadata>;
   /**
    * Signal that is aborted when the task should stop processing.
    * This signal is triggered when:
@@ -54,8 +52,12 @@ export interface TaskContext {
 
 /**
  * Function that handles a task and returns its outcome.
+ *
+ * @typeParam T The type of the decoded payload. Defaults to `unknown`.
  */
-export type TaskHandler = (context: TaskContext) => Promise<TaskOutcome>;
+export type TaskHandler<Payload = unknown, Metadata extends Record<string, string> = Record<string, string>, Result = unknown> = (
+  context: TaskContext<Payload, Metadata>
+) => Promise<TaskOutcome<Result>>;
 
 /**
  * Context passed to refresh handlers for floating concurrency limit refreshes.
@@ -96,8 +98,10 @@ export type RefreshHandler = (context: RefreshTaskContext) => Promise<number>;
 
 /**
  * Options for configuring a {@link SiloWorker}.
+ *
+ * @typeParam T The type of the decoded payload. Defaults to `unknown`.
  */
-export interface SiloWorkerOptions {
+export interface SiloWorkerOptions<Payload = unknown, Metadata extends Record<string, string> = Record<string, string>, Result = unknown> {
   /** The silo client to use for communication */
   client: SiloGRPCClient;
   /** Unique identifier for this worker */
@@ -109,7 +113,7 @@ export interface SiloWorkerOptions {
    */
   taskGroup: string;
   /** The function that will handle each task */
-  handler: TaskHandler;
+  handler: TaskHandler<Payload, Metadata, Result>;
   /**
    * Optional handler for floating limit refresh tasks.
    *
@@ -176,15 +180,26 @@ export interface SiloWorkerOptions {
  * Each task includes a `shard` field that is automatically used for
  * heartbeats and reporting outcomes.
  *
+ * The payload is automatically decoded from MessagePack bytes. You can
+ * specify the payload type as a generic parameter for type safety.
+ *
+ * @typeParam T The type of the decoded payload. Defaults to `unknown`.
+ *
  * @example
  * ```typescript
- * const worker = new SiloWorker({
+ * interface MyPayload {
+ *   userId: string;
+ *   action: string;
+ * }
+ *
+ * const worker = new SiloWorker<MyPayload>({
  *   client,
  *   workerId: "worker-1",
  *   concurrentPollers: 2,
  *   maxConcurrentTasks: 10,
  *   handler: async (ctx) => {
- *     const payload = decodePayload(ctx.task.payload?.data);
+ *     // ctx.task.payload is typed as MyPayload
+ *     console.log(ctx.task.payload.userId);
  *     // Process the task...
  *     return { type: "success", result: { processed: true } };
  *   },
@@ -201,11 +216,11 @@ export interface SiloWorkerOptions {
  * await worker.stop();
  * ```
  */
-export class SiloWorker {
+export class SiloWorker<Payload = unknown, Metadata extends Record<string, string> = Record<string, string>, Result = unknown> {
   private readonly _client: SiloGRPCClient;
   private readonly _workerId: string;
   private readonly _taskGroup: string;
-  private readonly _handler: TaskHandler;
+  private readonly _handler: TaskHandler<Payload, Metadata, Result>;
   private readonly _refreshHandler: RefreshHandler | undefined;
   private readonly _concurrentPollers: number;
   private readonly _maxConcurrentTasks: number;
@@ -229,7 +244,7 @@ export class SiloWorker {
   /** Counter for per-worker round-robin server selection */
   private _pollCounter: number = 0;
 
-  public constructor(options: SiloWorkerOptions) {
+  public constructor(options: SiloWorkerOptions<Payload, Metadata, Result>) {
     this._client = options.client;
     this._workerId = options.workerId;
     this._taskGroup = options.taskGroup;
@@ -413,14 +428,12 @@ export class SiloWorker {
   /**
    * Add a task to the execution queue.
    */
-  private _enqueueTask(task: Task): void {
-    // Shard is now a number from the proto
-    const shard = task.shard;
+  private _enqueueTask(protoTask: ProtoTask): void {
+    const task = transformTask<Payload, Metadata>(protoTask);
 
     // Create TaskExecution to manage this task's state
     const execution = new TaskExecution(
       task,
-      shard,
       this._workerId,
       this._abortController?.signal ?? new AbortController().signal,
       this._client
@@ -511,17 +524,15 @@ export class SiloWorker {
    * Execute a single task with its TaskExecution and report its outcome.
    */
   private async _executeTaskWithExecution(
-    execution: TaskExecution
+    execution: TaskExecution<Payload, Metadata>
   ): Promise<void> {
-    const context: TaskContext = {
+    const context: TaskContext<Payload, Metadata> = {
       task: execution.task,
-      shard: execution.shard,
-      workerId: execution.workerId,
       signal: execution.signal,
       cancel: () => execution.cancelFromClient(),
     };
 
-    let outcome: TaskOutcome;
+    let outcome: TaskOutcome<Result>;
     try {
       outcome = await this._handler(context);
     } catch (error) {
@@ -537,7 +548,7 @@ export class SiloWorker {
     if (execution.shouldReportCancelled) {
       await this._client.reportOutcome({
         taskId: execution.task.id,
-        shard: execution.shard,
+        shard: execution.task.shard,
         outcome: { type: "cancelled" },
       });
       return;
@@ -546,7 +557,7 @@ export class SiloWorker {
     // Report the outcome to the correct shard
     await this._client.reportOutcome({
       taskId: execution.task.id,
-      shard: execution.shard,
+      shard: execution.task.shard,
       outcome,
     });
   }
@@ -604,7 +615,7 @@ export class SiloWorker {
     const result: HeartbeatResult = await this._client.heartbeat(
       this._workerId,
       execution.task.id,
-      execution.shard,
+      execution.task.shard,
     );
 
     // If the server reports cancellation, mark the execution as cancelled

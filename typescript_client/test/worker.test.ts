@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { SiloWorker, type TaskHandler } from "../src/worker";
 import type { SiloGRPCClient, LeaseTasksResult } from "../src/client";
+import { encodeBytes } from "../src/client";
 import type { Task } from "../src/pb/silo";
 
 // Mock client for unit tests
@@ -37,7 +38,7 @@ function createTask(id: string, jobId: string, shard: number = 0): Task {
     jobId,
     attemptNumber: 1,
     leaseMs: 30000n,
-    payload: { data: new TextEncoder().encode('{"test":"data"}') },
+    payload: { data: encodeBytes({ test: "data" }) },
     priority: 10,
     shard,
     taskGroup: "default",
@@ -225,8 +226,11 @@ describe("SiloWorker", () => {
 
       expect(handler).toHaveBeenCalledWith(
         expect.objectContaining({
-          task,
-          workerId: "test-worker",
+          task: expect.objectContaining({
+            id: task.id,
+            jobId: task.jobId,
+            payload: { test: "data" }, // Decoded payload
+          }),
         })
       );
 

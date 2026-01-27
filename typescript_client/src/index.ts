@@ -5,8 +5,6 @@ export {
   JobNotFoundError,
   JobNotTerminalError,
   TaskNotFoundError,
-  encodePayload,
-  decodePayload,
   fnv1a32,
   defaultTenantToShard,
   GubernatorAlgorithm,
@@ -48,12 +46,11 @@ export {
   type RefreshTaskContext,
   type RefreshHandler,
 } from "./worker";
-export { type CancellationReason } from "./TaskExecution";
+export { type CancellationReason, type Task } from "./TaskExecution";
 export { JobHandle } from "./JobHandle";
 export type {
   QueryResponse,
   RetryPolicy,
-  Task,
   ColumnInfo,
   Failure,
 } from "./pb/silo";
