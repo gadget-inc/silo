@@ -1,18 +1,19 @@
 //! High message loss scenario: Testing resilience under 15% packet loss.
 //!
-//! Invariants verified:
+//! Invariants verified (using DST events, not RPCs):
 //! - System makes progress despite message loss
 //! - Jobs that are successfully enqueued eventually complete or fail
 //! - No duplicate completions despite retries
+//! - Valid state transitions
+//! - No leases for terminal jobs
 
 use crate::helpers::{
-    AttemptStatus, ClientConfig, EnqueueRequest, GetJobRequest, HashMap, JobStateTracker, JobStatus,
-    LeaseTasksRequest, SerializedBytes, ReportOutcomeRequest, RetryPolicy, create_turmoil_client, serialized_bytes,
-    get_seed, report_outcome_request, run_scenario_impl, setup_server,
+    ClientConfig, EnqueueRequest, HashMap, InvariantTracker, LeaseTasksRequest,
+    ReportOutcomeRequest, RetryPolicy, SerializedBytes, create_turmoil_client, get_seed,
+    report_outcome_request, run_scenario_impl, serialized_bytes, setup_server,
 };
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub fn run() {
@@ -26,14 +27,13 @@ pub fn run() {
 
         sim.host("server", || async move { setup_server(9904).await });
 
-        // Shared tracking state
-        let job_tracker = Arc::new(JobStateTracker::new());
-        let enqueued_jobs: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        // DST event-based tracking - no network involved, reliable under message loss
+        let tracker = Arc::new(InvariantTracker::new());
         let total_completed = Arc::new(AtomicU32::new(0));
+        let total_enqueued = Arc::new(AtomicU32::new(0));
         let scenario_done = Arc::new(AtomicBool::new(false));
 
-        let producer_tracker = Arc::clone(&job_tracker);
-        let producer_jobs = Arc::clone(&enqueued_jobs);
+        let producer_enqueued = Arc::clone(&total_enqueued);
         let producer_config = client_config.clone();
         sim.client("producer", async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -62,7 +62,9 @@ pub fn run() {
                         start_at_ms: 0,
                         retry_policy,
                         payload: Some(SerializedBytes {
-                            encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"job": i})).unwrap())),
+                            encoding: Some(serialized_bytes::Encoding::Msgpack(
+                                rmp_serde::to_vec(&serde_json::json!({"job": i})).unwrap(),
+                            )),
                         }),
                         limits: vec![],
                         tenant: None,
@@ -73,8 +75,7 @@ pub fn run() {
                 {
                     Ok(_) => {
                         tracing::trace!(job_id = %job_id, "enqueue");
-                        producer_tracker.job_enqueued(&job_id);
-                        producer_jobs.lock().unwrap().insert(job_id);
+                        producer_enqueued.fetch_add(1, Ordering::SeqCst);
                         enqueued += 1;
                         consecutive_failures = 0;
                     }
@@ -99,7 +100,6 @@ pub fn run() {
             Ok(())
         });
 
-        let worker_tracker = Arc::clone(&job_tracker);
         let worker_completed = Arc::clone(&total_completed);
         let worker_done_flag = Arc::clone(&scenario_done);
         let worker_config = client_config.clone();
@@ -128,7 +128,6 @@ pub fn run() {
                         consecutive_failures = 0;
                         let tasks = resp.into_inner().tasks;
                         for task in &tasks {
-                            worker_tracker.task_leased(&task.job_id, &task.id);
                             tracing::trace!(job_id = %task.job_id, "lease");
                             match client
                                 .report_outcome(tonic::Request::new(ReportOutcomeRequest {
@@ -136,29 +135,21 @@ pub fn run() {
                                     task_id: task.id.clone(),
                                     outcome: Some(report_outcome_request::Outcome::Success(
                                         SerializedBytes {
-                                            encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!("done"))
-                                                .unwrap())),
+                                            encoding: Some(serialized_bytes::Encoding::Msgpack(
+                                                rmp_serde::to_vec(&serde_json::json!("done"))
+                                                    .unwrap(),
+                                            )),
                                         },
                                     )),
                                 }))
                                 .await
                             {
                                 Ok(_) => {
-                                    worker_tracker.task_released(&task.job_id, &task.id);
-                                    let was_new = worker_tracker.job_completed(&task.job_id);
-                                    if was_new {
-                                        tracing::trace!(job_id = %task.job_id, "complete");
-                                        completed += 1;
-                                        worker_completed.fetch_add(1, Ordering::SeqCst);
-                                    } else {
-                                        // Already completed - this can happen with message loss
-                                        // if our completion ACK was lost but the server processed it
-                                        tracing::trace!(job_id = %task.job_id, "already_completed");
-                                    }
+                                    tracing::trace!(job_id = %task.job_id, "complete");
+                                    completed += 1;
+                                    worker_completed.fetch_add(1, Ordering::SeqCst);
                                 }
                                 Err(_) => {
-                                    // Completion failed - release tracking, job will be retried
-                                    worker_tracker.task_released(&task.job_id, &task.id);
                                     tracing::trace!(job_id = %task.job_id, "complete_failed");
                                 }
                             }
@@ -186,114 +177,61 @@ pub fn run() {
             Ok(())
         });
 
-        // Verifier: Check final state
-        let verify_tracker = Arc::clone(&job_tracker);
-        let verify_completed = Arc::clone(&total_completed);
-        let verify_jobs = Arc::clone(&enqueued_jobs);
-        let verify_done_flag = Arc::clone(&scenario_done);
-        let verify_config = client_config.clone();
+        // Verifier: Check final state using DST events (no RPCs needed).
+        // DST events are emitted synchronously by the server and collected via a
+        // thread-local event bus - no network involved, so verification is reliable.
+        let verifier_tracker = Arc::clone(&tracker);
+        let verifier_completed = Arc::clone(&total_completed);
+        let verifier_enqueued = Arc::clone(&total_enqueued);
+        let verifier_done_flag = Arc::clone(&scenario_done);
         sim.client("verifier", async move {
-            // Wait for work to complete. With 15% message loss and 2s request timeouts,
-            // requests can take a long time. We wait long enough for reasonable progress.
+            // Wait for work to complete
             tokio::time::sleep(Duration::from_secs(60)).await;
 
-            let mut client = create_turmoil_client("http://server:9904", &verify_config).await?;
-            let mut consecutive_failures = 0u32;
+            // Process DST events from server-side instrumentation
+            verifier_tracker.process_dst_events();
 
-            let enqueued = verify_jobs.lock().unwrap().clone();
-            let completed = verify_completed.load(Ordering::SeqCst);
-
-            tracing::trace!(
-                enqueued = enqueued.len(),
-                completed = completed,
-                "verification_start"
-            );
-
-            // Check server state for all attempted enqueues
-            let mut server_succeeded = 0u32;
-            let mut server_exists = 0u32;
-            for job_id in &enqueued {
-                match client
-                    .get_job(tonic::Request::new(GetJobRequest {
-                        shard: 0,
-                        id: job_id.clone(),
-                        tenant: None,
-                        include_attempts: true,
-                    }))
-                    .await
-                {
-                    Ok(resp) => {
-                        consecutive_failures = 0;
-                        server_exists += 1;
-                        let job = resp.into_inner();
-                        let status = job.status();
-                        if status == JobStatus::Succeeded {
-                            server_succeeded += 1;
-                        }
-                        let running_attempts = job
-                            .attempts
-                            .iter()
-                            .filter(|attempt| attempt.status() == AttemptStatus::Running)
-                            .count();
-                        if status == JobStatus::Running {
-                            assert_eq!(
-                                running_attempts, 1,
-                                "Running job should have exactly one running attempt"
-                            );
-                        } else {
-                            assert_eq!(
-                                running_attempts, 0,
-                                "Non-running job should not have running attempts"
-                            );
-                        }
-                    }
-                    Err(_) => {
-                        // Job may not exist if enqueue failed due to message loss
-                        consecutive_failures += 1;
-
-                        // Reconnect after failures - HTTP/2 connection may be corrupted
-                        if consecutive_failures >= 1 {
-                            tracing::trace!("reconnecting after get_job failure");
-                            if let Ok(new_client) =
-                                create_turmoil_client("http://server:9904", &verify_config).await
-                            {
-                                client = new_client;
-                                consecutive_failures = 0;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Re-read completion count just before assertion - the worker may have
-            // completed jobs while we were doing get_job calls (which can timeout)
-            let final_completed = verify_completed.load(Ordering::SeqCst);
+            let enqueued = verifier_enqueued.load(Ordering::SeqCst);
+            let completed = verifier_completed.load(Ordering::SeqCst);
+            let terminal = verifier_tracker.jobs.terminal_count();
 
             tracing::info!(
-                server_exists = server_exists,
-                server_succeeded = server_succeeded,
-                client_completed = final_completed,
+                enqueued = enqueued,
+                client_completed = completed,
+                terminal = terminal,
                 "verification_results"
             );
 
-            // INVARIANT: At least some jobs should have completed
-            // With 15% message loss, server queries may also fail, so we check both:
-            // - client_completed: worker reported successful completion (most reliable)
-            // - server_succeeded: server confirms success (may fail due to get_job drops)
-            // - enqueued is empty: no jobs were successfully enqueued from client's view
+            // Run invariant checks based on DST events
+            verifier_tracker.verify_all();
+            verifier_tracker.jobs.verify_no_terminal_leases();
+
+            // Verify state machine transitions were valid
+            let transition_violations = verifier_tracker.jobs.verify_all_transitions();
+            if !transition_violations.is_empty() {
+                for v in &transition_violations {
+                    tracing::warn!(violation = %v, "transition_violation");
+                }
+                panic!(
+                    "INVARIANT VIOLATION: {} invalid state transitions detected",
+                    transition_violations.len()
+                );
+            }
+
+            // INVARIANT: At least some jobs should have completed (from client's view)
+            // or reached terminal state (from server's DST events).
+            // With 15% message loss, client may not see all completions, but DST events
+            // give us ground truth about what actually happened on the server.
             assert!(
-                final_completed > 0 || server_succeeded > 0 || enqueued.is_empty(),
-                "No progress made: client_completed={}, server_succeeded={}, enqueued={}",
-                final_completed,
-                server_succeeded,
-                enqueued.len()
+                completed > 0 || terminal > 0 || enqueued == 0,
+                "No progress made: client_completed={}, terminal={}, enqueued={}",
+                completed,
+                terminal,
+                enqueued
             );
 
-            // INVARIANT: No terminal job leases
-            verify_tracker.verify_no_terminal_leases();
-
             // Signal worker to exit early
-            verify_done_flag.store(true, Ordering::SeqCst);
+            verifier_done_flag.store(true, Ordering::SeqCst);
 
             tracing::trace!("verifier_done");
             Ok(())
