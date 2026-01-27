@@ -265,10 +265,14 @@ pub fn run() {
                 }
             }
 
+            // Re-read completion count just before assertion - the worker may have
+            // completed jobs while we were doing get_job calls (which can timeout)
+            let final_completed = verify_completed.load(Ordering::SeqCst);
+
             tracing::info!(
                 server_exists = server_exists,
                 server_succeeded = server_succeeded,
-                client_completed = completed,
+                client_completed = final_completed,
                 "verification_results"
             );
 
@@ -278,9 +282,9 @@ pub fn run() {
             // - server_succeeded: server confirms success (may fail due to get_job drops)
             // - enqueued is empty: no jobs were successfully enqueued from client's view
             assert!(
-                completed > 0 || server_succeeded > 0 || enqueued.is_empty(),
+                final_completed > 0 || server_succeeded > 0 || enqueued.is_empty(),
                 "No progress made: client_completed={}, server_succeeded={}, enqueued={}",
-                completed,
+                final_completed,
                 server_succeeded,
                 enqueued.len()
             );
