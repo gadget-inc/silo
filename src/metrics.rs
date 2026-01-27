@@ -265,18 +265,18 @@ impl Metrics {
                 .set(stat.get() as f64);
         }
 
-        // Compactor stats
-        if let Some(stat) = stats.lookup(slatedb::compactor_stats::BYTES_COMPACTED) {
+        // Compactor stats (using string literals as the constants are not exported in slatedb 0.10)
+        if let Some(stat) = stats.lookup("compactor/bytes_compacted") {
             self.slatedb_bytes_compacted
                 .with_label_values(&[shard])
                 .set(stat.get() as f64);
         }
-        if let Some(stat) = stats.lookup(slatedb::compactor_stats::RUNNING_COMPACTIONS) {
+        if let Some(stat) = stats.lookup("compactor/running_compactions") {
             self.slatedb_running_compactions
                 .with_label_values(&[shard])
                 .set(stat.get() as f64);
         }
-        if let Some(stat) = stats.lookup(slatedb::compactor_stats::LAST_COMPACTION_TS_SEC) {
+        if let Some(stat) = stats.lookup("compactor/last_compaction_timestamp_sec") {
             self.slatedb_last_compaction_ts_sec
                 .with_label_values(&[shard])
                 .set(stat.get() as f64);

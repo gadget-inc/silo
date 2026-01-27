@@ -170,6 +170,9 @@ impl JobStoreShard {
         );
         txn.put(new_time.as_bytes(), [])?;
 
+        // Decrement completed jobs counter - job is going from terminal to scheduled
+        self.decrement_completed_jobs_counter_txn(&txn)?;
+
         // [SILO-RESTART-5] Post: Create new task in DB queue with attempt 1 (fresh retries)
         let new_task_id = Uuid::new_v4().to_string();
         let task_group = job_view.task_group().to_string();

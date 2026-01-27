@@ -18,8 +18,8 @@ fn unique_prefix() -> String {
     format!("test-{}", nanos)
 }
 
-fn make_test_factory(node_id: &str) -> Arc<ShardFactory> {
-    let tmpdir = std::env::temp_dir().join(format!("silo-coord-test-{}", node_id));
+fn make_test_factory(prefix: &str, node_id: &str) -> Arc<ShardFactory> {
+    let tmpdir = std::env::temp_dir().join(format!("silo-coord-test-{}-{}", prefix, node_id));
     Arc::new(ShardFactory::new(
         DatabaseTemplate {
             backend: Backend::Memory,
@@ -54,7 +54,7 @@ async fn multiple_nodes_own_unique_shards() {
         "http://127.0.0.1:50051",
         num_shards,
         10,
-        make_test_factory("n1"),
+        make_test_factory(&prefix, "n1"),
     )
     .await
     .expect("start c1");
@@ -65,7 +65,7 @@ async fn multiple_nodes_own_unique_shards() {
         "http://127.0.0.1:50052",
         num_shards,
         10,
-        make_test_factory("n2"),
+        make_test_factory(&prefix, "n2"),
     )
     .await
     .expect("start c2");
@@ -76,7 +76,7 @@ async fn multiple_nodes_own_unique_shards() {
         "http://127.0.0.1:50053",
         num_shards,
         10,
-        make_test_factory("n3"),
+        make_test_factory(&prefix, "n3"),
     )
     .await
     .expect("start c3");
@@ -163,7 +163,7 @@ async fn adding_a_node_rebalances_shards() {
         "http://127.0.0.1:50051",
         num_shards,
         10,
-        make_test_factory("n1"),
+        make_test_factory(&prefix, "n1"),
     )
     .await
     .unwrap();
@@ -174,7 +174,7 @@ async fn adding_a_node_rebalances_shards() {
         "http://127.0.0.1:50052",
         num_shards,
         10,
-        make_test_factory("n2"),
+        make_test_factory(&prefix, "n2"),
     )
     .await
     .unwrap();
@@ -198,7 +198,7 @@ async fn adding_a_node_rebalances_shards() {
         "http://127.0.0.1:50053",
         num_shards,
         10,
-        make_test_factory("n3"),
+        make_test_factory(&prefix, "n3"),
     )
     .await
     .unwrap();
@@ -255,7 +255,7 @@ async fn removing_a_node_rebalances_shards() {
         "http://127.0.0.1:50051",
         num_shards,
         10,
-        make_test_factory("n1"),
+        make_test_factory(&prefix, "n1"),
     )
     .await
     .unwrap();
@@ -266,7 +266,7 @@ async fn removing_a_node_rebalances_shards() {
         "http://127.0.0.1:50052",
         num_shards,
         10,
-        make_test_factory("n2"),
+        make_test_factory(&prefix, "n2"),
     )
     .await
     .unwrap();
@@ -277,7 +277,7 @@ async fn removing_a_node_rebalances_shards() {
         "http://127.0.0.1:50053",
         num_shards,
         10,
-        make_test_factory("n3"),
+        make_test_factory(&prefix, "n3"),
     )
     .await
     .unwrap();
@@ -325,7 +325,7 @@ async fn rapid_membership_churn_converges() {
         "http://127.0.0.1:50051",
         num_shards,
         10,
-        make_test_factory("n1"),
+        make_test_factory(&prefix, "n1"),
     )
     .await
     .unwrap();
@@ -337,7 +337,7 @@ async fn rapid_membership_churn_converges() {
         "http://127.0.0.1:50052",
         num_shards,
         10,
-        make_test_factory("n2"),
+        make_test_factory(&prefix, "n2"),
     )
     .await
     .unwrap();
@@ -349,7 +349,7 @@ async fn rapid_membership_churn_converges() {
         "http://127.0.0.1:50053",
         num_shards,
         10,
-        make_test_factory("n3"),
+        make_test_factory(&prefix, "n3"),
     )
     .await
     .unwrap();
@@ -366,7 +366,7 @@ async fn rapid_membership_churn_converges() {
         "http://127.0.0.1:50052",
         num_shards,
         10,
-        make_test_factory("n2b"),
+        make_test_factory(&prefix, "n2b"),
     )
     .await
     .unwrap();
@@ -433,7 +433,7 @@ async fn membership_persists_beyond_lease_ttl() {
         "http://127.0.0.1:50051",
         num_shards,
         lease_ttl_secs,
-        make_test_factory("n1"),
+        make_test_factory(&prefix, "n1"),
     )
     .await
     .expect("start coordinator");
@@ -508,7 +508,7 @@ async fn multi_node_ownership_stable_over_time() {
         "http://127.0.0.1:50051",
         num_shards,
         lease_ttl_secs,
-        make_test_factory("n1"),
+        make_test_factory(&prefix, "n1"),
     )
     .await
     .unwrap();
@@ -520,7 +520,7 @@ async fn multi_node_ownership_stable_over_time() {
         "http://127.0.0.1:50052",
         num_shards,
         lease_ttl_secs,
-        make_test_factory("n2"),
+        make_test_factory(&prefix, "n2"),
     )
     .await
     .unwrap();
@@ -583,7 +583,7 @@ async fn shard_owner_map_matches_actual_ownership() {
         "http://127.0.0.1:50061",
         num_shards,
         lease_ttl_secs,
-        make_test_factory("n1"),
+        make_test_factory(&prefix, "n1"),
     )
     .await
     .unwrap();
@@ -595,7 +595,7 @@ async fn shard_owner_map_matches_actual_ownership() {
         "http://127.0.0.1:50062",
         num_shards,
         lease_ttl_secs,
-        make_test_factory("n2"),
+        make_test_factory(&prefix, "n2"),
     )
     .await
     .unwrap();
