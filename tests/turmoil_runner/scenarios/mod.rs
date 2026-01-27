@@ -5,12 +5,15 @@
 pub mod cancel_releases_ticket;
 pub mod chaos;
 pub mod concurrency_limits;
-pub mod coordinator_shard_migration;
 pub mod expedite_concurrency;
 pub mod fault_injection_partition;
 pub mod floating_concurrency;
 pub mod grpc_end_to_end;
 pub mod high_message_loss;
+#[cfg(feature = "k8s")]
+pub mod k8s_coordination;
+#[cfg(feature = "k8s")]
+pub mod k8s_worker_during_membership_changes;
 pub mod lease_expiry;
 pub mod multiple_workers;
 pub mod rate_limits;

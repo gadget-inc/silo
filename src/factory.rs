@@ -239,9 +239,14 @@ impl ShardFactory {
     /// Close all shards gracefully. Returns all errors if any shards fail to close.
     pub async fn close_all(&self) -> Result<(), CloseAllError> {
         let mut errors: Vec<(ShardId, JobStoreShardError)> = Vec::new();
-        for entry in self.instances.iter() {
-            let shard_id = *entry.key();
-            let Some(shard) = entry.value().get() else {
+        // Collect and sort shard IDs for deterministic shutdown order
+        let mut shard_ids: Vec<ShardId> = self.instances.iter().map(|e| *e.key()).collect();
+        shard_ids.sort_unstable();
+        for shard_id in shard_ids {
+            let Some(entry) = self.instances.get(&shard_id) else {
+                continue;
+            };
+            let Some(shard) = entry.get() else {
                 continue;
             };
             if let Err(e) = shard.close().await {

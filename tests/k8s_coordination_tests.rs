@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 
 use silo::coordination::CoordinationError;
 use silo::coordination::k8s::K8sShardGuard;
-use silo::coordination::{Coordinator, K8sCoordinator};
+use silo::coordination::{Coordinator, K8sCoordinator, KubeBackend};
 use silo::coordination::{ShardSplitter, SplitCleanupStatus, SplitPhase};
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
@@ -743,14 +743,14 @@ async fn make_k8s_guard(
     shard_id: ShardId,
 ) -> Result<
     (
-        Arc<K8sShardGuard>,
+        Arc<K8sShardGuard<KubeBackend>>,
         Arc<Mutex<HashSet<ShardId>>>,
         tokio::sync::watch::Sender<bool>,
         tokio::task::JoinHandle<()>,
     ),
     String,
 > {
-    let client = kube::Client::try_default()
+    let backend = KubeBackend::try_default()
         .await
         .map_err(|e| format!("K8S not available: {}", e))?;
 
@@ -759,7 +759,7 @@ async fn make_k8s_guard(
 
     let guard = K8sShardGuard::new(
         shard_id,
-        client,
+        backend,
         namespace.to_string(),
         cluster_prefix.to_string(),
         node_id.to_string(),
@@ -3002,20 +3002,24 @@ async fn k8s_split_in_multi_node_cluster() {
     assert!(c1.wait_converged(Duration::from_secs(20)).await);
     assert!(c2.wait_converged(Duration::from_secs(20)).await);
 
-    // Wait for c1 to own at least one shard
-    let c1_has_shards = wait_until(Duration::from_secs(10), || async {
-        !c1.owned_shards().await.is_empty()
-    })
-    .await;
-    assert!(c1_has_shards, "c1 should own at least one shard");
-
-    // Get a shard owned by c1
+    // With rendezvous hashing and 2 shards, either coordinator could own both.
+    // Use whichever coordinator owns at least one shard.
     let c1_shards = c1.owned_shards().await;
-    assert!(!c1_shards.is_empty());
-    let shard_to_split = c1_shards[0];
+    let c2_shards = c2.owned_shards().await;
+    assert!(
+        !c1_shards.is_empty() || !c2_shards.is_empty(),
+        "at least one coordinator should own shards"
+    );
+
+    // Pick the coordinator that owns shards (prefer c1 if both have shards)
+    let (splitter_coord, shard_to_split) = if !c1_shards.is_empty() {
+        (&c1, c1_shards[0])
+    } else {
+        (&c2, c2_shards[0])
+    };
 
     // Get the shard's range and compute a valid split point
-    let shard_map = c1.get_shard_map().await.unwrap();
+    let shard_map = splitter_coord.get_shard_map().await.unwrap();
     let shard_info = shard_map
         .get_shard(&shard_to_split)
         .expect("find shard in map");
@@ -3024,23 +3028,22 @@ async fn k8s_split_in_multi_node_cluster() {
         .midpoint()
         .expect("shard range should have a midpoint");
 
-    // Create orchestrator for c1 and split the shard
-
-    let orchestrator = ShardSplitter::new(&c1);
+    // Create orchestrator for the coordinator that owns the shard and split it
+    let orchestrator = ShardSplitter::new(splitter_coord);
 
     let split = orchestrator
         .request_split(shard_to_split, split_point)
         .await
         .expect("request_split");
     orchestrator
-        .execute_split(shard_to_split, || c1.get_shard_owner_map())
+        .execute_split(shard_to_split, || splitter_coord.get_shard_owner_map())
         .await
         .expect("execute_split");
 
-    // Verify c1 sees the updated shard map immediately (it performed the split)
+    // Verify the coordinator sees the updated shard map immediately (it performed the split)
     // After splitting one shard: 8 original - 1 split + 2 children = 9 shards
-    let map1 = c1.get_shard_map().await.unwrap();
-    assert_eq!(map1.len(), 9, "c1 should see 9 shards");
+    let map1 = splitter_coord.get_shard_map().await.unwrap();
+    assert_eq!(map1.len(), 9, "splitter_coord should see 9 shards");
     assert!(map1.get_shard(&split.left_child_id).is_some());
     assert!(map1.get_shard(&split.right_child_id).is_some());
 

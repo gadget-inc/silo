@@ -34,13 +34,7 @@ use chrono::Utc;
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
-use kube::{
-    Client,
-    api::{Api, ListParams, Patch, PatchParams, PostParams},
-    runtime::watcher::{Config as WatcherConfig, Event, watcher},
-};
 use std::collections::{HashMap, HashSet};
-use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, watch};
@@ -50,6 +44,7 @@ use tracing::{debug, info, warn};
 use crate::factory::ShardFactory;
 use crate::shard_range::{ShardId, ShardMap, SplitInProgress};
 
+use super::k8s_backend::{K8sBackend, KubeBackend, LeaseWatchEvent};
 use super::{
     CoordinationError, Coordinator, CoordinatorBase, MemberInfo, ShardOwnerMap, ShardPhase,
     SplitCleanupStatus, SplitStorageBackend, compute_desired_shards_for_node, get_hostname, keys,
@@ -61,23 +56,30 @@ fn format_microtime(dt: chrono::DateTime<Utc>) -> String {
 }
 
 /// Kubernetes Lease-based coordinator for distributed shard ownership.
+///
+/// This coordinator is generic over `K8sBackend`, allowing it to work with either:
+/// - `KubeBackend`: Real Kubernetes API via kube-rs (production)
+/// - Test backends: Simulated K8s API for deterministic testing
 #[derive(Clone)]
-pub struct K8sCoordinator {
+pub struct K8sCoordinator<B: K8sBackend> {
     /// Shared coordinator state (node_id, grpc_addr, owned set, shutdown, factory)
     base: Arc<CoordinatorBase>,
-    client: Client,
+    backend: B,
     namespace: String,
     cluster_prefix: String,
     lease_duration_secs: i32,
-    shard_guards: Arc<Mutex<HashMap<ShardId, Arc<K8sShardGuard>>>>,
+    shard_guards: Arc<Mutex<HashMap<ShardId, Arc<K8sShardGuard<B>>>>>,
     /// Cache of active members, updated by the watcher
     members_cache: Arc<Mutex<Vec<MemberInfo>>>,
     /// Notifier for membership changes (from watcher)
     membership_changed: Arc<Notify>,
 }
 
-impl K8sCoordinator {
-    /// Start the K8S coordinator.
+/// Convenience type alias for K8sCoordinator with the real Kubernetes backend.
+pub type K8sCoordinatorDefault = K8sCoordinator<KubeBackend>;
+
+impl K8sCoordinator<KubeBackend> {
+    /// Start the K8S coordinator using the default Kubernetes client.
     ///
     /// The coordinator will manage shard ownership and automatically open/close
     /// shards in the factory as ownership changes.
@@ -90,10 +92,35 @@ impl K8sCoordinator {
         lease_duration_secs: i64,
         factory: Arc<ShardFactory>,
     ) -> Result<(Self, tokio::task::JoinHandle<()>), CoordinationError> {
-        let client = Client::try_default()
-            .await
-            .map_err(|e| CoordinationError::ConnectionFailed(e.to_string()))?;
+        let backend = KubeBackend::try_default().await?;
+        Self::start_with_backend(
+            backend,
+            namespace,
+            cluster_prefix,
+            node_id,
+            grpc_addr,
+            initial_shard_count,
+            lease_duration_secs,
+            factory,
+        )
+        .await
+    }
+}
 
+impl<B: K8sBackend> K8sCoordinator<B> {
+    /// Start the K8S coordinator with a custom backend.
+    ///
+    /// This method allows using alternative backends for testing.
+    pub async fn start_with_backend(
+        backend: B,
+        namespace: &str,
+        cluster_prefix: &str,
+        node_id: impl Into<String>,
+        grpc_addr: impl Into<String>,
+        initial_shard_count: u32,
+        lease_duration_secs: i64,
+        factory: Arc<ShardFactory>,
+    ) -> Result<(Self, tokio::task::JoinHandle<()>), CoordinationError> {
         let namespace = namespace.to_string();
         let cluster_prefix = cluster_prefix.to_string();
         let node_id = node_id.into();
@@ -101,7 +128,7 @@ impl K8sCoordinator {
 
         // Load or create the shard map in a ConfigMap
         let shard_map = Self::load_or_create_shard_map(
-            &client,
+            &backend,
             &namespace,
             &cluster_prefix,
             initial_shard_count,
@@ -116,7 +143,6 @@ impl K8sCoordinator {
         ));
 
         // Create or update membership lease
-        let leases: Api<Lease> = Api::namespaced(client.clone(), &namespace);
         let member_lease_name = keys::k8s_member_lease_name(&cluster_prefix, &node_id);
 
         let member_info = MemberInfo {
@@ -150,20 +176,16 @@ impl K8sCoordinator {
             }
         });
 
-        leases
-            .patch(
-                &member_lease_name,
-                &PatchParams::apply("silo-coordinator").force(),
-                &Patch::Apply(&lease_spec),
-            )
-            .await
-            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+        backend
+            .patch_lease_apply(&namespace, &member_lease_name, lease_spec)
+            .await?;
+
         let members_cache = Arc::new(Mutex::new(Vec::new()));
         let membership_changed = Arc::new(Notify::new());
 
         let me = Self {
             base: base.clone(),
-            client: client.clone(),
+            backend: backend.clone(),
             namespace: namespace.clone(),
             cluster_prefix: cluster_prefix.clone(),
             lease_duration_secs: lease_duration_secs as i32,
@@ -205,17 +227,16 @@ impl K8sCoordinator {
     /// This function handles the initial cluster bootstrapping where the first
     /// node to start creates the shard map.
     async fn load_or_create_shard_map(
-        client: &Client,
+        backend: &B,
         namespace: &str,
         cluster_prefix: &str,
         initial_shard_count: u32,
     ) -> Result<ShardMap, CoordinationError> {
-        let configmaps: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
         let configmap_name = format!("{}-shard-map", cluster_prefix);
 
         // Try to get the existing ConfigMap
-        match configmaps.get(&configmap_name).await {
-            Ok(cm) => {
+        match backend.get_configmap(namespace, &configmap_name).await? {
+            Some(cm) => {
                 // ConfigMap exists, parse the shard map
                 let data = cm
                     .data
@@ -238,7 +259,7 @@ impl K8sCoordinator {
                 );
                 Ok(shard_map)
             }
-            Err(kube::Error::Api(e)) if e.code == 404 => {
+            None => {
                 // ConfigMap doesn't exist, create initial shard map
                 let shard_map = ShardMap::create_initial(initial_shard_count).map_err(|e| {
                     CoordinationError::BackendError(format!(
@@ -250,27 +271,25 @@ impl K8sCoordinator {
                 let shard_map_json = serde_json::to_string(&shard_map)
                     .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
 
-                let cm = serde_json::json!({
-                    "apiVersion": "v1",
-                    "kind": "ConfigMap",
-                    "metadata": {
-                        "name": configmap_name,
-                        "labels": {
-                            "silo.dev/type": "shard-map",
-                            "silo.dev/cluster": cluster_prefix
-                        }
+                let cm = ConfigMap {
+                    metadata: kube::api::ObjectMeta {
+                        name: Some(configmap_name.clone()),
+                        labels: Some(
+                            [
+                                ("silo.dev/type".to_string(), "shard-map".to_string()),
+                                ("silo.dev/cluster".to_string(), cluster_prefix.to_string()),
+                            ]
+                            .into(),
+                        ),
+                        ..Default::default()
                     },
-                    "data": {
-                        "shard_map.json": shard_map_json
-                    }
-                });
+                    data: Some([("shard_map.json".to_string(), shard_map_json)].into()),
+                    ..Default::default()
+                };
 
                 // Use create with optimistic concurrency - if another node creates
                 // it first, we'll get a conflict and retry
-                match configmaps
-                    .create(&PostParams::default(), &serde_json::from_value(cm).unwrap())
-                    .await
-                {
+                match backend.create_configmap(namespace, &cm).await {
                     Ok(_) => {
                         info!(
                             num_shards = shard_map.len(),
@@ -278,13 +297,19 @@ impl K8sCoordinator {
                         );
                         Ok(shard_map)
                     }
-                    Err(kube::Error::Api(e)) if e.code == 409 => {
+                    Err(CoordinationError::BackendError(msg))
+                        if msg.contains("conflict") || msg.contains("already exists") =>
+                    {
                         // Another node created it first - load it
                         debug!("shard map ConfigMap already created by another node, loading");
-                        let cm = configmaps
-                            .get(&configmap_name)
-                            .await
-                            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+                        let cm = backend
+                            .get_configmap(namespace, &configmap_name)
+                            .await?
+                            .ok_or_else(|| {
+                                CoordinationError::BackendError(
+                                    "shard map ConfigMap disappeared".into(),
+                                )
+                            })?;
 
                         let data = cm
                             .data
@@ -304,24 +329,20 @@ impl K8sCoordinator {
                         })?;
                         Ok(shard_map)
                     }
-                    Err(e) => Err(CoordinationError::BackendError(e.to_string())),
+                    Err(e) => Err(e),
                 }
             }
-            Err(e) => Err(CoordinationError::BackendError(e.to_string())),
         }
     }
 
     /// Run the membership watcher - watches for lease changes and updates the members cache
     async fn run_membership_watcher(&self, mut shutdown_rx: watch::Receiver<bool>) {
-        let leases: Api<Lease> = Api::namespaced(self.client.clone(), &self.namespace);
-
-        // Create watcher with automatic reconnection
-        let watcher_config = WatcherConfig::default().labels(&format!(
+        let label_selector = format!(
             "silo.dev/type=member,silo.dev/cluster={}",
             self.cluster_prefix
-        ));
-        let watch_stream = watcher(leases, watcher_config);
-        let mut watch_stream = pin!(watch_stream);
+        );
+        let mut watch_stream =
+            std::pin::pin!(self.backend.watch_leases(&self.namespace, &label_selector));
 
         loop {
             tokio::select! {
@@ -335,7 +356,7 @@ impl K8sCoordinator {
                     match event {
                         Some(Ok(ev)) => {
                             match ev {
-                                Event::Apply(lease) | Event::InitApply(lease) => {
+                                LeaseWatchEvent::Applied(lease) => {
                                     let lease_name = lease.metadata.name.as_deref().unwrap_or("unknown");
                                     debug!(node_id = %self.base.node_id, lease = %lease_name, "membership lease changed");
                                     // Refresh the full member list from cache
@@ -344,7 +365,7 @@ impl K8sCoordinator {
                                     }
                                     self.membership_changed.notify_waiters();
                                 }
-                                Event::Delete(lease) => {
+                                LeaseWatchEvent::Deleted(lease) => {
                                     let lease_name = lease.metadata.name.as_deref().unwrap_or("unknown");
                                     debug!(node_id = %self.base.node_id, lease = %lease_name, "membership lease deleted");
                                     if let Err(e) = self.refresh_members_cache().await {
@@ -352,10 +373,10 @@ impl K8sCoordinator {
                                     }
                                     self.membership_changed.notify_waiters();
                                 }
-                                Event::Init => {
+                                LeaseWatchEvent::Init => {
                                     debug!(node_id = %self.base.node_id, "membership watcher initialized");
                                 }
-                                Event::InitDone => {
+                                LeaseWatchEvent::InitDone => {
                                     debug!(node_id = %self.base.node_id, "membership watcher init done");
                                     if let Err(e) = self.refresh_members_cache().await {
                                         warn!(node_id = %self.base.node_id, error = %e, "failed to refresh members cache on init");
@@ -366,7 +387,7 @@ impl K8sCoordinator {
                         }
                         Some(Err(e)) => {
                             warn!(node_id = %self.base.node_id, error = %e, "membership watcher error, will retry");
-                            // The watcher automatically reconnects on errors
+                            // Watchers should automatically reconnect on errors
                         }
                         None => {
                             debug!(node_id = %self.base.node_id, "membership watcher stream ended");
@@ -447,16 +468,15 @@ impl K8sCoordinator {
 
     /// List all active (non-expired) members from K8s
     async fn list_active_members(&self) -> Result<Vec<MemberInfo>, CoordinationError> {
-        let leases: Api<Lease> = Api::namespaced(self.client.clone(), &self.namespace);
-        let lp = ListParams::default().labels(&format!(
+        let label_selector = format!(
             "silo.dev/type=member,silo.dev/cluster={}",
             self.cluster_prefix
-        ));
+        );
 
-        let lease_list = leases
-            .list(&lp)
-            .await
-            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+        let lease_list = self
+            .backend
+            .list_leases(&self.namespace, &label_selector)
+            .await?;
 
         let now = Utc::now();
         let mut members = Vec::new();
@@ -483,12 +503,11 @@ impl K8sCoordinator {
             }
 
             // Parse member info from annotation
-            if let Some(metadata) = &lease.metadata.annotations {
-                if let Some(info_json) = metadata.get("silo.dev/member-info") {
-                    if let Ok(info) = serde_json::from_str::<MemberInfo>(info_json) {
-                        members.push(info);
-                    }
-                }
+            if let Some(metadata) = &lease.metadata.annotations
+                && let Some(info_json) = metadata.get("silo.dev/member-info")
+                && let Ok(info) = serde_json::from_str::<MemberInfo>(info_json)
+            {
+                members.push(info);
             }
         }
 
@@ -501,21 +520,17 @@ impl K8sCoordinator {
     /// We verify that we're still the holder before updating, and use CAS to ensure
     /// we don't accidentally renew someone else's lease if ours expired.
     async fn renew_membership_lease(&self) -> Result<(), CoordinationError> {
-        let leases: Api<Lease> = Api::namespaced(self.client.clone(), &self.namespace);
         let member_lease_name =
             keys::k8s_member_lease_name(&self.cluster_prefix, &self.base.node_id);
 
         // Get current lease to verify we still own it
-        let existing = match leases.get(&member_lease_name).await {
-            Ok(l) => l,
-            Err(kube::Error::Api(e)) if e.code == 404 => {
-                // Our lease was deleted - this is a critical error
-                return Err(CoordinationError::BackendError(
-                    "membership lease was deleted".into(),
-                ));
-            }
-            Err(e) => return Err(CoordinationError::BackendError(e.to_string())),
-        };
+        let existing = self
+            .backend
+            .get_lease(&self.namespace, &member_lease_name)
+            .await?
+            .ok_or_else(|| {
+                CoordinationError::BackendError("membership lease was deleted".into())
+            })?;
 
         // Verify we're still the holder
         let holder = existing
@@ -564,19 +579,10 @@ impl K8sCoordinator {
             }),
         };
 
-        match leases
-            .replace(&member_lease_name, &PostParams::default(), &updated_lease)
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(kube::Error::Api(e)) if e.code == 409 => {
-                // Conflict - someone else modified our lease
-                Err(CoordinationError::BackendError(
-                    "CAS conflict during membership renewal".into(),
-                ))
-            }
-            Err(e) => Err(CoordinationError::BackendError(e.to_string())),
-        }
+        self.backend
+            .replace_lease(&self.namespace, &member_lease_name, &updated_lease)
+            .await?;
+        Ok(())
     }
 
     async fn reconcile_shards(&self) -> Result<(), CoordinationError> {
@@ -601,9 +607,9 @@ impl K8sCoordinator {
         let desired = compute_desired_shards_for_node(&shard_ids, &self.base.node_id, &members);
         debug!(node_id = %self.base.node_id, members = ?members, desired = ?desired, "reconcile: begin");
 
-        // Release undesired shards
+        // Release undesired shards (sorted for deterministic ordering)
         {
-            let to_release: Vec<ShardId> = {
+            let mut to_release: Vec<ShardId> = {
                 let guards = self.shard_guards.lock().await;
                 let mut v = Vec::new();
                 for (sid, guard) in guards.iter() {
@@ -613,14 +619,16 @@ impl K8sCoordinator {
                 }
                 v
             };
+            to_release.sort_unstable();
             for sid in to_release {
                 self.ensure_shard_guard(sid).await.set_desired(false).await;
             }
         }
 
-        // Acquire desired shards
+        // Acquire desired shards (sorted for deterministic ordering)
         {
-            let snapshot: Vec<ShardId> = desired.iter().copied().collect();
+            let mut snapshot: Vec<ShardId> = desired.iter().copied().collect();
+            snapshot.sort_unstable();
             for shard_id in snapshot {
                 self.ensure_shard_guard(shard_id)
                     .await
@@ -632,7 +640,7 @@ impl K8sCoordinator {
         Ok(())
     }
 
-    async fn ensure_shard_guard(&self, shard_id: ShardId) -> Arc<K8sShardGuard> {
+    async fn ensure_shard_guard(&self, shard_id: ShardId) -> Arc<K8sShardGuard<B>> {
         {
             let guards = self.shard_guards.lock().await;
             if let Some(g) = guards.get(&shard_id) {
@@ -646,7 +654,7 @@ impl K8sCoordinator {
         debug!(shard_id = %shard_id, "creating new shard guard");
         let guard = K8sShardGuard::new(
             shard_id,
-            self.client.clone(),
+            self.backend.clone(),
             self.namespace.clone(),
             self.cluster_prefix.clone(),
             self.base.node_id.clone(),
@@ -669,12 +677,15 @@ impl K8sCoordinator {
 
     /// Reload the shard map from ConfigMap into local cache.
     async fn reload_shard_map(&self) -> Result<(), CoordinationError> {
-        let configmaps: Api<ConfigMap> = Api::namespaced(self.client.clone(), &self.namespace);
         let configmap_name = format!("{}-shard-map", self.cluster_prefix);
 
-        let cm = configmaps.get(&configmap_name).await.map_err(|e| {
-            CoordinationError::BackendError(format!("failed to read shard map: {}", e))
-        })?;
+        let cm = self
+            .backend
+            .get_configmap(&self.namespace, &configmap_name)
+            .await?
+            .ok_or_else(|| {
+                CoordinationError::BackendError("shard map ConfigMap not found".into())
+            })?;
 
         let data = cm
             .data
@@ -696,13 +707,16 @@ impl K8sCoordinator {
         &self,
         split: &SplitInProgress,
     ) -> Result<(), CoordinationError> {
-        let configmaps: Api<ConfigMap> = Api::namespaced(self.client.clone(), &self.namespace);
         let configmap_name = format!("{}-shard-map", self.cluster_prefix);
 
         // Read current shard map
-        let existing = configmaps.get(&configmap_name).await.map_err(|e| {
-            CoordinationError::BackendError(format!("failed to read shard map: {}", e))
-        })?;
+        let existing = self
+            .backend
+            .get_configmap(&self.namespace, &configmap_name)
+            .await?
+            .ok_or_else(|| {
+                CoordinationError::BackendError("shard map ConfigMap not found".into())
+            })?;
 
         let current_rv = existing.metadata.resource_version.as_ref().ok_or_else(|| {
             CoordinationError::BackendError("no resourceVersion on shard map".into())
@@ -744,8 +758,9 @@ impl K8sCoordinator {
             ..Default::default()
         };
 
-        match configmaps
-            .replace(&configmap_name, &PostParams::default(), &updated_cm)
+        match self
+            .backend
+            .replace_configmap(&self.namespace, &configmap_name, &updated_cm)
             .await
         {
             Ok(_) => {
@@ -762,25 +777,25 @@ impl K8sCoordinator {
 
                 Ok(())
             }
-            Err(kube::Error::Api(e)) if e.code == 409 => Err(CoordinationError::BackendError(
-                "shard map was modified concurrently".to_string(),
-            )),
-            Err(e) => Err(CoordinationError::BackendError(e.to_string())),
+            Err(e) => Err(e),
         }
     }
 }
 
 #[async_trait]
-impl SplitStorageBackend for K8sCoordinator {
+impl<B: K8sBackend> SplitStorageBackend for K8sCoordinator<B> {
     async fn load_split(
         &self,
         parent_shard_id: &ShardId,
     ) -> Result<Option<SplitInProgress>, CoordinationError> {
-        let configmaps: Api<ConfigMap> = Api::namespaced(self.client.clone(), &self.namespace);
         let configmap_name = keys::k8s_split_configmap_name(&self.cluster_prefix, parent_shard_id);
 
-        match configmaps.get(&configmap_name).await {
-            Ok(cm) => {
+        match self
+            .backend
+            .get_configmap(&self.namespace, &configmap_name)
+            .await?
+        {
+            Some(cm) => {
                 let data = cm
                     .data
                     .as_ref()
@@ -797,13 +812,11 @@ impl SplitStorageBackend for K8sCoordinator {
 
                 Ok(Some(split))
             }
-            Err(kube::Error::Api(e)) if e.code == 404 => Ok(None),
-            Err(e) => Err(CoordinationError::BackendError(e.to_string())),
+            None => Ok(None),
         }
     }
 
     async fn store_split(&self, split: &SplitInProgress) -> Result<(), CoordinationError> {
-        let configmaps: Api<ConfigMap> = Api::namespaced(self.client.clone(), &self.namespace);
         let configmap_name =
             keys::k8s_split_configmap_name(&self.cluster_prefix, &split.parent_shard_id);
 
@@ -826,30 +839,18 @@ impl SplitStorageBackend for K8sCoordinator {
             }
         });
 
-        configmaps
-            .patch(
-                &configmap_name,
-                &PatchParams::apply("silo-coordinator").force(),
-                &Patch::Apply(&cm),
-            )
-            .await
-            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+        self.backend
+            .patch_configmap_apply(&self.namespace, &configmap_name, cm)
+            .await?;
 
         Ok(())
     }
 
     async fn delete_split(&self, parent_shard_id: &ShardId) -> Result<(), CoordinationError> {
-        let configmaps: Api<ConfigMap> = Api::namespaced(self.client.clone(), &self.namespace);
         let configmap_name = keys::k8s_split_configmap_name(&self.cluster_prefix, parent_shard_id);
-
-        match configmaps
-            .delete(&configmap_name, &Default::default())
+        self.backend
+            .delete_configmap(&self.namespace, &configmap_name)
             .await
-        {
-            Ok(_) => Ok(()),
-            Err(kube::Error::Api(e)) if e.code == 404 => Ok(()), // Already deleted
-            Err(e) => Err(CoordinationError::BackendError(e.to_string())),
-        }
     }
 
     async fn update_shard_map_for_split(
@@ -870,13 +871,16 @@ impl SplitStorageBackend for K8sCoordinator {
         shard_id: ShardId,
         status: SplitCleanupStatus,
     ) -> Result<(), CoordinationError> {
-        let configmaps: Api<ConfigMap> = Api::namespaced(self.client.clone(), &self.namespace);
         let configmap_name = format!("{}-shard-map", self.cluster_prefix);
 
         // Read current shard map
-        let existing = configmaps.get(&configmap_name).await.map_err(|e| {
-            CoordinationError::BackendError(format!("failed to read shard map: {}", e))
-        })?;
+        let existing = self
+            .backend
+            .get_configmap(&self.namespace, &configmap_name)
+            .await?
+            .ok_or_else(|| {
+                CoordinationError::BackendError("shard map ConfigMap not found".into())
+            })?;
 
         let current_rv = existing.metadata.resource_version.as_ref().ok_or_else(|| {
             CoordinationError::BackendError("no resourceVersion on shard map".into())
@@ -913,8 +917,9 @@ impl SplitStorageBackend for K8sCoordinator {
             ..Default::default()
         };
 
-        match configmaps
-            .replace(&configmap_name, &PostParams::default(), &updated_cm)
+        match self
+            .backend
+            .replace_configmap(&self.namespace, &configmap_name, &updated_cm)
             .await
         {
             Ok(_) => {
@@ -924,24 +929,20 @@ impl SplitStorageBackend for K8sCoordinator {
                 debug!(shard_id = %shard_id, status = %status, "cleanup status updated (k8s)");
                 Ok(())
             }
-            Err(kube::Error::Api(e)) if e.code == 409 => Err(CoordinationError::BackendError(
-                "shard map was modified concurrently".to_string(),
-            )),
-            Err(e) => Err(CoordinationError::BackendError(e.to_string())),
+            Err(e) => Err(e),
         }
     }
 
     async fn list_all_splits(&self) -> Result<Vec<SplitInProgress>, CoordinationError> {
-        let configmaps: Api<ConfigMap> = Api::namespaced(self.client.clone(), &self.namespace);
-        let lp = ListParams::default().labels(&format!(
+        let label_selector = format!(
             "silo.dev/type=split,silo.dev/cluster={}",
             self.cluster_prefix
-        ));
+        );
 
-        let cm_list = configmaps
-            .list(&lp)
-            .await
-            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+        let cm_list = self
+            .backend
+            .list_configmaps(&self.namespace, &label_selector)
+            .await?;
 
         let mut splits = Vec::new();
         for cm in cm_list {
@@ -959,29 +960,42 @@ impl SplitStorageBackend for K8sCoordinator {
 }
 
 #[async_trait]
-impl Coordinator for K8sCoordinator {
+impl<B: K8sBackend> Coordinator for K8sCoordinator<B> {
     fn base(&self) -> &CoordinatorBase {
         &self.base
     }
 
     async fn shutdown(&self) -> Result<(), CoordinationError> {
-        self.base.signal_shutdown();
-        {
+        // Collect guards in sorted order for deterministic shutdown
+        let guards_sorted: Vec<(ShardId, Arc<K8sShardGuard<B>>)> = {
             let guards = self.shard_guards.lock().await;
-            for (_sid, guard) in guards.iter() {
-                guard.set_desired(false).await;
-                guard.notify.notify_one();
-            }
+            let mut shard_ids: Vec<ShardId> = guards.keys().copied().collect();
+            shard_ids.sort_unstable();
+            shard_ids
+                .into_iter()
+                .filter_map(|sid| guards.get(&sid).map(|g| (sid, g.clone())))
+                .collect()
+        };
+
+        // Shut down each guard sequentially for deterministic ordering
+        // We trigger shutdown on each guard individually rather than using
+        // signal_shutdown() which would notify all guards concurrently
+        for (_sid, guard) in guards_sorted {
+            guard.trigger_shutdown().await;
+            guard.notify.notify_one();
+            guard.wait_shutdown(Duration::from_millis(5000)).await;
         }
 
-        // Give guards time to release
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Signal shutdown to stop background tasks
+        self.base.signal_shutdown();
 
         // Delete membership lease
-        let leases: Api<Lease> = Api::namespaced(self.client.clone(), &self.namespace);
         let member_lease_name =
             keys::k8s_member_lease_name(&self.cluster_prefix, &self.base.node_id);
-        let _ = leases.delete(&member_lease_name, &Default::default()).await;
+        let _ = self
+            .backend
+            .delete_lease(&self.namespace, &member_lease_name)
+            .await;
 
         Ok(())
     }
@@ -1050,9 +1064,9 @@ pub struct ShardState {
 /// - We only consider ourselves the owner if we have a valid resource_version
 /// - All lease modifications use optimistic concurrency (resourceVersion checks)
 /// - Release clears holderIdentity instead of deleting to avoid races
-pub struct K8sShardGuard {
+pub struct K8sShardGuard<B: K8sBackend> {
     pub shard_id: ShardId,
-    pub client: Client,
+    pub backend: B,
     pub namespace: String,
     pub cluster_prefix: String,
     pub node_id: String,
@@ -1062,10 +1076,10 @@ pub struct K8sShardGuard {
     pub shutdown: watch::Receiver<bool>,
 }
 
-impl K8sShardGuard {
+impl<B: K8sBackend> K8sShardGuard<B> {
     pub fn new(
         shard_id: ShardId,
-        client: Client,
+        backend: B,
         namespace: String,
         cluster_prefix: String,
         node_id: String,
@@ -1074,7 +1088,7 @@ impl K8sShardGuard {
     ) -> Arc<Self> {
         Arc::new(Self {
             shard_id,
-            client,
+            backend,
             namespace,
             cluster_prefix,
             node_id,
@@ -1115,13 +1129,39 @@ impl K8sShardGuard {
         }
     }
 
+    /// Trigger shutdown for this specific guard (sets phase to ShuttingDown).
+    pub async fn trigger_shutdown(&self) {
+        let mut st = self.state.lock().await;
+        if !matches!(st.phase, ShardPhase::ShutDown | ShardPhase::ShuttingDown) {
+            debug!(shard_id = %self.shard_id, "trigger_shutdown: transitioning to ShuttingDown");
+            st.phase = ShardPhase::ShuttingDown;
+        }
+    }
+
+    /// Wait for this guard to complete shutdown (phase becomes ShutDown).
+    /// Returns immediately if already shut down.
+    pub async fn wait_shutdown(&self, timeout: Duration) {
+        let poll_interval = Duration::from_millis(10);
+        let max_iterations = (timeout.as_millis() / poll_interval.as_millis()).max(1) as usize;
+
+        for _ in 0..max_iterations {
+            {
+                let st = self.state.lock().await;
+                if st.phase == ShardPhase::ShutDown {
+                    return;
+                }
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+        debug!(shard_id = %self.shard_id, "wait_shutdown: timed out");
+    }
+
     pub async fn run(
         self: Arc<Self>,
         owned_arc: Arc<Mutex<HashSet<ShardId>>>,
         factory: Arc<ShardFactory>,
         shard_map: Arc<Mutex<ShardMap>>,
     ) {
-        let leases: Api<Lease> = Api::namespaced(self.client.clone(), &self.namespace);
         let lease_name = self.lease_name();
 
         loop {
@@ -1166,7 +1206,7 @@ impl K8sShardGuard {
                         }
 
                         // Try to acquire the lease with CAS semantics
-                        match self.try_acquire_lease_cas(&leases, &lease_name).await {
+                        match self.try_acquire_lease_cas(&lease_name).await {
                             Ok((rv, uid)) => {
                                 // Look up the shard's range from the shard map
                                 let range = {
@@ -1175,8 +1215,7 @@ impl K8sShardGuard {
                                         Some(info) => info.range.clone(),
                                         None => {
                                             tracing::error!(shard_id = %self.shard_id, "shard not found in shard map");
-                                            let _ =
-                                                self.release_lease_cas(&leases, &lease_name).await;
+                                            let _ = self.release_lease_cas(&lease_name).await;
                                             continue;
                                         }
                                     }
@@ -1202,7 +1241,6 @@ impl K8sShardGuard {
                                             .run_renewal_loop(
                                                 owned_arc.clone(),
                                                 factory.clone(),
-                                                &leases,
                                                 &lease_name,
                                             )
                                             .await;
@@ -1211,7 +1249,7 @@ impl K8sShardGuard {
                                     Err(e) => {
                                         // Failed to open - release the lease and retry
                                         tracing::error!(shard_id = %self.shard_id, error = %e, "failed to open shard, releasing lease");
-                                        let _ = self.release_lease_cas(&leases, &lease_name).await;
+                                        let _ = self.release_lease_cas(&lease_name).await;
                                         // Exponential backoff before retry
                                         let backoff_ms = 200 * (1 << attempt.min(5));
                                         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
@@ -1237,7 +1275,11 @@ impl K8sShardGuard {
                     }
                 }
                 ShardPhase::Releasing => {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    // Add deterministic jitter based on shard ID for DST determinism
+                    // This ensures releases happen in a consistent order when multiple
+                    // guards are released simultaneously
+                    let jitter_ms = (self.shard_id.as_uuid().as_u64_pair().0.wrapping_mul(17)) % 50;
+                    tokio::time::sleep(Duration::from_millis(100 + jitter_ms)).await;
 
                     let cancelled = {
                         let mut st = self.state.lock().await;
@@ -1264,7 +1306,7 @@ impl K8sShardGuard {
                         };
 
                         if has_rv {
-                            match self.release_lease_cas(&leases, &lease_name).await {
+                            match self.release_lease_cas(&lease_name).await {
                                 Ok(_) => {
                                     debug!(
                                         shard_id = %self.shard_id,
@@ -1302,7 +1344,7 @@ impl K8sShardGuard {
                     };
 
                     if has_rv {
-                        let _ = self.release_lease_cas(&leases, &lease_name).await;
+                        let _ = self.release_lease_cas(&lease_name).await;
                     }
 
                     {
@@ -1331,7 +1373,6 @@ impl K8sShardGuard {
     /// Returns (resourceVersion, Option<uid>) on success.
     async fn try_acquire_lease_cas(
         &self,
-        leases: &Api<Lease>,
         lease_name: &str,
     ) -> Result<(String, Option<String>), CoordinationError> {
         let now = Utc::now();
@@ -1341,8 +1382,8 @@ impl K8sShardGuard {
         );
 
         // First, try to get existing lease
-        match leases.get(lease_name).await {
-            Ok(existing) => {
+        match self.backend.get_lease(&self.namespace, lease_name).await? {
+            Some(existing) => {
                 let existing_rv = existing.metadata.resource_version.clone();
                 let existing_uid = existing.metadata.uid.clone();
                 let spec = existing.spec.as_ref();
@@ -1399,38 +1440,20 @@ impl K8sShardGuard {
                     };
 
                     // Use replace which does CAS based on resourceVersion
-                    match leases
-                        .replace(lease_name, &PostParams::default(), &updated_lease)
-                        .await
-                    {
-                        Ok(result) => {
-                            let new_rv = result.metadata.resource_version.ok_or_else(|| {
-                                CoordinationError::BackendError(
-                                    "no resource_version in response".into(),
-                                )
-                            })?;
-                            debug!(
-                                shard_id = %self.shard_id,
-                                old_rv = %rv,
-                                new_rv = %new_rv,
-                                "try_acquire_lease_cas: CAS succeeded"
-                            );
-                            return Ok((new_rv, result.metadata.uid));
-                        }
-                        Err(kube::Error::Api(e)) if e.code == 409 => {
-                            // Conflict - someone else modified the lease
-                            debug!(
-                                shard_id = %self.shard_id,
-                                "try_acquire_lease_cas: CAS conflict, someone else acquired"
-                            );
-                            return Err(CoordinationError::BackendError(
-                                "CAS conflict: lease was modified".into(),
-                            ));
-                        }
-                        Err(e) => {
-                            return Err(CoordinationError::BackendError(e.to_string()));
-                        }
-                    }
+                    let result = self
+                        .backend
+                        .replace_lease(&self.namespace, lease_name, &updated_lease)
+                        .await?;
+                    let new_rv = result.metadata.resource_version.ok_or_else(|| {
+                        CoordinationError::BackendError("no resource_version in response".into())
+                    })?;
+                    debug!(
+                        shard_id = %self.shard_id,
+                        old_rv = %rv,
+                        new_rv = %new_rv,
+                        "try_acquire_lease_cas: CAS succeeded"
+                    );
+                    return Ok((new_rv, result.metadata.uid));
                 }
 
                 // Lease is held by someone else and not expired
@@ -1444,7 +1467,7 @@ impl K8sShardGuard {
                     "lease held by another node".into(),
                 ))
             }
-            Err(kube::Error::Api(e)) if e.code == 404 => {
+            None => {
                 // Lease doesn't exist, create it
                 debug!(
                     shard_id = %self.shard_id,
@@ -1472,47 +1495,21 @@ impl K8sShardGuard {
                     }),
                 };
 
-                match leases.create(&PostParams::default(), &lease_spec).await {
-                    Ok(result) => {
-                        let rv = result.metadata.resource_version.ok_or_else(|| {
-                            CoordinationError::BackendError("no resource_version".into())
-                        })?;
-                        debug!(
-                            shard_id = %self.shard_id,
-                            lease_name,
-                            rv = %rv,
-                            "try_acquire_lease_cas: created successfully"
-                        );
-                        Ok((rv, result.metadata.uid))
-                    }
-                    Err(kube::Error::Api(e)) if e.code == 409 => {
-                        // Already exists - race with another node
-                        debug!(
-                            shard_id = %self.shard_id,
-                            "try_acquire_lease_cas: create conflict, lease already exists"
-                        );
-                        Err(CoordinationError::BackendError(
-                            "create conflict: lease already exists".into(),
-                        ))
-                    }
-                    Err(e) => {
-                        debug!(
-                            shard_id = %self.shard_id,
-                            lease_name,
-                            error = %e,
-                            "try_acquire_lease_cas: create failed"
-                        );
-                        Err(CoordinationError::BackendError(e.to_string()))
-                    }
-                }
-            }
-            Err(e) => {
+                let result = self
+                    .backend
+                    .create_lease(&self.namespace, &lease_spec)
+                    .await?;
+                let rv = result
+                    .metadata
+                    .resource_version
+                    .ok_or_else(|| CoordinationError::BackendError("no resource_version".into()))?;
                 debug!(
                     shard_id = %self.shard_id,
-                    error = %e,
-                    "try_acquire_lease_cas: unexpected error getting lease"
+                    lease_name,
+                    rv = %rv,
+                    "try_acquire_lease_cas: created successfully"
                 );
-                Err(CoordinationError::BackendError(e.to_string()))
+                Ok((rv, result.metadata.uid))
             }
         }
     }
@@ -1520,18 +1517,15 @@ impl K8sShardGuard {
     /// Release the lease using CAS - clears holderIdentity instead of deleting.
     /// We always verify we're still the holder before releasing to avoid clearing
     /// someone else's lease.
-    async fn release_lease_cas(
-        &self,
-        leases: &Api<Lease>,
-        lease_name: &str,
-    ) -> Result<String, CoordinationError> {
+    async fn release_lease_cas(&self, lease_name: &str) -> Result<String, CoordinationError> {
         let now = Utc::now();
 
         // Get current lease to verify we still own it
-        let existing = leases
-            .get(lease_name)
-            .await
-            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+        let existing = self
+            .backend
+            .get_lease(&self.namespace, lease_name)
+            .await?
+            .ok_or_else(|| CoordinationError::BackendError("lease not found".into()))?;
 
         let current_rv = existing
             .metadata
@@ -1569,10 +1563,10 @@ impl K8sShardGuard {
             }),
         };
 
-        let result = leases
-            .replace(lease_name, &PostParams::default(), &updated_lease)
-            .await
-            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+        let result = self
+            .backend
+            .replace_lease(&self.namespace, lease_name, &updated_lease)
+            .await?;
 
         let new_rv = result
             .metadata
@@ -1592,7 +1586,6 @@ impl K8sShardGuard {
         self: Arc<Self>,
         owned_arc: Arc<Mutex<HashSet<ShardId>>>,
         factory: Arc<ShardFactory>,
-        leases: &Api<Lease>,
         lease_name: &str,
     ) {
         let renew_interval = Duration::from_secs((self.lease_duration_secs / 3).max(1) as u64);
@@ -1627,7 +1620,7 @@ impl K8sShardGuard {
             }
 
             // Renew with CAS to detect if we lost the lease
-            match self.renew_lease_cas(leases, lease_name).await {
+            match self.renew_lease_cas(lease_name).await {
                 Ok(new_rv) => {
                     // Update our fencing token
                     let mut st = self.state.lock().await;
@@ -1656,18 +1649,15 @@ impl K8sShardGuard {
 
     /// Renew the lease with CAS semantics.
     /// We fetch the current lease, verify we're still the holder, then update with CAS.
-    async fn renew_lease_cas(
-        &self,
-        leases: &Api<Lease>,
-        lease_name: &str,
-    ) -> Result<String, CoordinationError> {
+    async fn renew_lease_cas(&self, lease_name: &str) -> Result<String, CoordinationError> {
         let now = Utc::now();
 
         // Get current lease to verify we still own it and get current state
-        let existing = leases
-            .get(lease_name)
-            .await
-            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+        let existing = self
+            .backend
+            .get_lease(&self.namespace, lease_name)
+            .await?
+            .ok_or_else(|| CoordinationError::BackendError("lease not found".into()))?;
 
         let current_rv = existing
             .metadata
@@ -1707,23 +1697,13 @@ impl K8sShardGuard {
             }),
         };
 
-        match leases
-            .replace(lease_name, &PostParams::default(), &updated_lease)
-            .await
-        {
-            Ok(result) => {
-                let new_rv = result.metadata.resource_version.ok_or_else(|| {
-                    CoordinationError::BackendError("no resource_version in response".into())
-                })?;
-                Ok(new_rv)
-            }
-            Err(kube::Error::Api(e)) if e.code == 409 => {
-                // Conflict - someone else modified the lease
-                Err(CoordinationError::BackendError(
-                    "CAS conflict during renewal".into(),
-                ))
-            }
-            Err(e) => Err(CoordinationError::BackendError(e.to_string())),
-        }
+        let result = self
+            .backend
+            .replace_lease(&self.namespace, lease_name, &updated_lease)
+            .await?;
+        let new_rv = result.metadata.resource_version.ok_or_else(|| {
+            CoordinationError::BackendError("no resource_version in response".into())
+        })?;
+        Ok(new_rv)
     }
 }
