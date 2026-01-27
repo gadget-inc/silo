@@ -69,6 +69,8 @@ tower-http = { version = "0.5", features = ["fs"] }
 rand = "0.9"
 datafusion-sql = "50"
 hostname = "0.4"
+pprof = { version = "0.15", features = ["prost-codec", "frame-pointer"] }
+flate2 = "1"
 
 [features]
 default = []
@@ -95,6 +97,10 @@ protoc-bin-vendored = "3.0"
 [profile.release]
 debug = 1     # debug info with line tables only for profiling
 strip = false # do not strip symbols for profiling
+# NOTE: pprof uses frame-pointer based stack unwinding. The nix build in
+# nix/modules/rust.nix sets RUSTFLAGS="-C force-frame-pointers=yes" to ensure
+# frame pointers are preserved. Without this, production profiles will have
+# incomplete call stacks.
 
 [[bench]]
 name = "job_shard_throughput"

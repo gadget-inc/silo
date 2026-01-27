@@ -1120,6 +1120,72 @@ impl Silo for SiloService {
             completed_jobs: counters.completed_jobs,
         }))
     }
+
+    async fn cpu_profile(
+        &self,
+        req: Request<CpuProfileRequest>,
+    ) -> Result<Response<CpuProfileResponse>, Status> {
+        let r = req.into_inner();
+
+        // Validate and clamp duration (1-300 seconds, default 30)
+        let duration = if r.duration_seconds == 0 {
+            30
+        } else {
+            r.duration_seconds.clamp(1, 300)
+        };
+
+        // Validate and clamp frequency (1-1000 Hz, default 100)
+        let frequency = if r.frequency == 0 {
+            100
+        } else {
+            r.frequency.clamp(1, 1000)
+        };
+
+        tracing::info!(
+            duration_seconds = duration,
+            frequency_hz = frequency,
+            "starting CPU profile"
+        );
+
+        // Start the profiler
+        let guard = pprof::ProfilerGuardBuilder::default()
+            .frequency(frequency as i32)
+            .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+            .build()
+            .map_err(|e| Status::internal(format!("failed to start profiler: {}", e)))?;
+
+        // Profile for the requested duration
+        tokio::time::sleep(std::time::Duration::from_secs(duration as u64)).await;
+
+        // Generate pprof protobuf report
+        let report = guard
+            .report()
+            .build()
+            .map_err(|e| Status::internal(format!("failed to build report: {}", e)))?;
+
+        let samples = report.data.len() as u64;
+
+        let profile = report
+            .pprof()
+            .map_err(|e| Status::internal(format!("failed to generate pprof: {}", e)))?;
+
+        // Use the Message trait from pprof's protos module (prost 0.12 compatible)
+        use pprof::protos::Message;
+        let profile_data = profile.encode_to_vec();
+
+        tracing::info!(
+            duration_seconds = duration,
+            samples = samples,
+            profile_bytes = profile_data.len(),
+            "CPU profile completed"
+        );
+
+        Ok(Response::new(CpuProfileResponse {
+            profile_data,
+            duration_seconds: duration,
+            samples,
+        }))
+    }
 }
 
 /// Run the gRPC server and a periodic reaper task together until shutdown.

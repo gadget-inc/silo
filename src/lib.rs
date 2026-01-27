@@ -31,3 +31,4 @@ pub mod pb {
     }
 }
 pub mod server;
+pub mod siloctl;

@@ -406,6 +406,21 @@ message ResetShardsResponse {
   uint32 shards_reset = 1; // Number of shards that were cleared.
 }
 
+// Request to capture a CPU profile from this node.
+// Used for production debugging and performance analysis.
+message CpuProfileRequest {
+  uint32 duration_seconds = 1;  // How long to profile (1-300 seconds). Default 30.
+  uint32 frequency = 2;         // Sampling frequency in Hz (1-1000). Default 100.
+}
+
+// CPU profile data in pprof protobuf format.
+// Can be analyzed with `pprof` or `go tool pprof`.
+message CpuProfileResponse {
+  bytes profile_data = 1;       // pprof protobuf bytes (not gzip compressed).
+  uint32 duration_seconds = 2;  // Actual duration profiled.
+  uint64 samples = 3;           // Number of samples collected.
+}
+
 // The Silo job queue service.
 service Silo {
   // Get cluster topology for client-side routing.
@@ -480,5 +495,10 @@ service Silo {
   // WARNING: Destructive operation. Only available in dev mode.
   // Clears all jobs, tasks, queues, and other data.
   rpc ResetShards(ResetShardsRequest) returns (ResetShardsResponse);
+  
+  // Capture a CPU profile from this node.
+  // Returns pprof protobuf data that can be analyzed with pprof or go tool pprof.
+  // The profile captures CPU usage for the specified duration.
+  rpc CpuProfile(CpuProfileRequest) returns (CpuProfileResponse);
 }
 
