@@ -69,8 +69,8 @@ jobs:
         # Run K8S tests single-threaded to prevent interference between tests
         run: cargo test --features k8s k8s_ -- --test-threads=1
 
-  alloy:
-    name: Alloy model verification
+  alloy-job-shard:
+    name: Alloy verification (job_shard)
     runs-on: ubuntu-latest-l
     steps:
       - uses: actions/checkout@v4
@@ -80,12 +80,21 @@ jobs:
       - name: Verify job_shard.als
         shell: bash
         run: node scripts/run-alloy-verification.mjs specs/job_shard.als
-      - name: Verify coordination.als
-        shell: bash
-        run: node scripts/run-alloy-verification.mjs specs/coordination.als
       - name: Validate SILO tags synchronized
         shell: bash
         run: node scripts/validate-silo-tags.js
+
+  alloy-coordination:
+    name: Alloy verification (coordination)
+    runs-on: ubuntu-latest-l
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-test-env
+        with:
+          cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - name: Verify coordination.als
+        shell: bash
+        run: node scripts/run-alloy-verification.mjs specs/coordination.als
 
   typescript-client-lint:
     name: TypeScript lints
