@@ -17,7 +17,7 @@ use crate::arrow_ipc::batch_to_ipc;
 /// File descriptor set for gRPC reflection
 pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("silo_descriptor");
 
-use crate::coordination::Coordinator;
+use crate::coordination::{Coordinator, ShardSplitter};
 use crate::factory::{CloseAllError, ShardFactory};
 use crate::job::{GubernatorAlgorithm, GubernatorRateLimit, JobStatusKind, RateLimitRetryPolicy};
 use crate::job_attempt::{AttemptOutcome, AttemptStatus as JobAttemptStatus};
@@ -246,11 +246,27 @@ impl SiloService {
     ///
     /// If this node is the computed owner but hasn't finished acquiring the shard,
     /// returns UNAVAILABLE to signal the client should retry after a delay.
+    ///
+    /// If the shard has an active split in a traffic-pausing
+    /// phase, returns UNAVAILABLE to signal the client should retry after the split
+    /// completes.
     async fn shard_with_redirect(
         &self,
         shard_id: &crate::shard_range::ShardId,
     ) -> Result<Arc<JobStoreShard>, Status> {
         if let Some(shard) = self.factory.get(shard_id) {
+            // [SILO-ROUTE-PAUSED-1] Check if this shard is paused for split
+            if let Some(coord) = &self.coordinator
+                && coord.is_shard_paused(*shard_id).await
+            {
+                tracing::debug!(
+                    shard_id = %shard_id,
+                    "shard is paused for split, returning UNAVAILABLE"
+                );
+                return Err(Status::unavailable(
+                    "shard is temporarily unavailable: split in progress",
+                ));
+            }
             return Ok(shard);
         }
 
@@ -1180,7 +1196,15 @@ impl Silo for SiloService {
 
         let mut reset_count = 0u32;
         for shard_id in shard_ids {
-            match self.factory.reset(&shard_id).await {
+            // Get the shard's current range before resetting
+            let range = match self.factory.get(&shard_id) {
+                Some(shard) => shard.get_range(),
+                None => {
+                    tracing::warn!(shard = %shard_id, "shard not found for reset, skipping");
+                    continue;
+                }
+            };
+            match self.factory.reset(&shard_id, &range).await {
                 Ok(_) => {
                     reset_count += 1;
                     tracing::debug!(shard = %shard_id, "reset shard successfully");
@@ -1281,6 +1305,97 @@ impl Silo for SiloService {
             duration_seconds: duration,
             samples,
         }))
+    }
+
+    async fn request_split(
+        &self,
+        req: Request<RequestSplitRequest>,
+    ) -> Result<Response<RequestSplitResponse>, Status> {
+        let r = req.into_inner();
+
+        let shard_id = Self::parse_shard_id(&r.shard_id)?;
+        if r.split_point.is_empty() {
+            return Err(Status::invalid_argument("split_point is required"));
+        }
+
+        let coord = self.coordinator.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "shard splitting requires distributed coordination (not available in single-node mode)",
+            )
+        })?;
+
+        let orchestrator = ShardSplitter::new(coord.as_ref());
+
+        let split = orchestrator
+            .request_split(shard_id, r.split_point)
+            .await
+            .map_err(|e| match e {
+                crate::coordination::CoordinationError::NotShardOwner(_) => {
+                    Status::failed_precondition("this node does not own the shard")
+                }
+                crate::coordination::CoordinationError::ShardNotFound(_) => {
+                    Status::not_found("shard not found")
+                }
+                crate::coordination::CoordinationError::SplitAlreadyInProgress(_) => {
+                    Status::failed_precondition("a split is already in progress for this shard")
+                }
+                crate::coordination::CoordinationError::ShardMapError(ref sme) => {
+                    Status::invalid_argument(format!("invalid split: {}", sme))
+                }
+                other => Status::internal(format!("split request failed: {}", other)),
+            })?;
+
+        Ok(Response::new(RequestSplitResponse {
+            left_child_id: split.left_child_id.to_string(),
+            right_child_id: split.right_child_id.to_string(),
+            phase: split.phase.to_string(),
+        }))
+    }
+
+    async fn get_split_status(
+        &self,
+        req: Request<GetSplitStatusRequest>,
+    ) -> Result<Response<GetSplitStatusResponse>, Status> {
+        let r = req.into_inner();
+
+        // Parse the shard ID
+        let shard_id = Self::parse_shard_id(&r.shard_id)?;
+
+        // We need a coordinator to check split status
+        let coord = self.coordinator.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "shard splitting requires distributed coordination (not available in single-node mode)",
+            )
+        })?;
+
+        // Create orchestrator
+        let orchestrator = ShardSplitter::new(coord.as_ref());
+
+        let split_opt = orchestrator
+            .get_split_status(shard_id)
+            .await
+            .map_err(|e| Status::internal(format!("failed to get split status: {}", e)))?;
+
+        match split_opt {
+            Some(split) => Ok(Response::new(GetSplitStatusResponse {
+                in_progress: true,
+                phase: split.phase.to_string(),
+                left_child_id: split.left_child_id.to_string(),
+                right_child_id: split.right_child_id.to_string(),
+                split_point: split.split_point,
+                initiator_node_id: split.initiator_node_id,
+                requested_at_ms: split.requested_at_ms,
+            })),
+            None => Ok(Response::new(GetSplitStatusResponse {
+                in_progress: false,
+                phase: String::new(),
+                left_child_id: String::new(),
+                right_child_id: String::new(),
+                split_point: String::new(),
+                initiator_node_id: String::new(),
+                requested_at_ms: 0,
+            })),
+        }
     }
 }
 

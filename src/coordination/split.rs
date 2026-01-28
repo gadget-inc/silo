@@ -1,0 +1,528 @@
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::fmt;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tracing::{debug, info};
+
+use crate::factory::ShardFactory;
+use crate::shard_range::{ShardId, ShardMap, SplitInProgress};
+
+use super::{CoordinationError, ShardOwnerMap};
+
+/// Status of post-split cleanup for a shard.
+///
+/// After a split, child shards contain defunct data (keys outside their new range).
+/// This status tracks the progression through cleanup phases:
+/// CleanupPending -> CleanupRunning -> CleanupDone -> CompactionDone
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SplitCleanupStatus {
+    /// Initial state for new shards or shards that don't need cleanup
+    #[default]
+    CompactionDone,
+    /// Just created from split, cleanup has not started yet
+    CleanupPending,
+    /// Cleanup is in progress (deleting defunct data)
+    CleanupRunning,
+    /// Cleanup complete, ready for compaction
+    CleanupDone,
+}
+
+impl SplitCleanupStatus {
+    /// Returns true if cleanup is still pending or in progress
+    pub fn needs_work(&self) -> bool {
+        matches!(
+            self,
+            Self::CleanupPending | Self::CleanupRunning | Self::CleanupDone
+        )
+    }
+}
+
+impl fmt::Display for SplitCleanupStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SplitCleanupStatus::CleanupPending => write!(f, "CleanupPending"),
+            SplitCleanupStatus::CleanupRunning => write!(f, "CleanupRunning"),
+            SplitCleanupStatus::CleanupDone => write!(f, "CleanupDone"),
+            SplitCleanupStatus::CompactionDone => write!(f, "CompactionDone"),
+        }
+    }
+}
+
+/// [SILO-SPLIT-REQ-1] Phases of a shard split operation.
+///
+/// A split operation divides one parent shard into two child shards at a
+/// specified split point. The phases ensure traffic is paused, data is cloned,
+/// and the shard map is atomically updated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SplitPhase {
+    /// Split has been requested but not started
+    SplitRequested,
+    /// Traffic to parent shard is being paused (returning retryable errors)
+    SplitPausing,
+    /// SlateDB clone operation is in progress
+    SplitCloning,
+    /// Shard map is being updated atomically
+    SplitUpdatingMap,
+    /// Split is complete, children are active
+    SplitComplete,
+}
+
+impl SplitPhase {
+    /// Returns true if traffic to the parent shard should be paused
+    /// (returning retryable errors to clients)
+    pub fn traffic_paused(&self) -> bool {
+        matches!(
+            self,
+            SplitPhase::SplitPausing | SplitPhase::SplitCloning | SplitPhase::SplitUpdatingMap
+        )
+    }
+
+    /// Returns true if this is an early phase (before children exist in the map).
+    /// [SILO-SPLIT-CRASH-1] Early phase crashes abandon the split.
+    pub fn is_early_phase(&self) -> bool {
+        matches!(
+            self,
+            SplitPhase::SplitRequested | SplitPhase::SplitPausing | SplitPhase::SplitCloning
+        )
+    }
+
+    /// Returns true if this is a late phase (children exist in the map).
+    /// [SILO-SPLIT-CRASH-2] Late phase crashes preserve the split state for resumption.
+    pub fn is_late_phase(&self) -> bool {
+        matches!(
+            self,
+            SplitPhase::SplitUpdatingMap | SplitPhase::SplitComplete
+        )
+    }
+}
+
+impl fmt::Display for SplitPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SplitPhase::SplitRequested => write!(f, "SplitRequested"),
+            SplitPhase::SplitPausing => write!(f, "SplitPausing"),
+            SplitPhase::SplitCloning => write!(f, "SplitCloning"),
+            SplitPhase::SplitUpdatingMap => write!(f, "SplitUpdatingMap"),
+            SplitPhase::SplitComplete => write!(f, "SplitComplete"),
+        }
+    }
+}
+
+/// Backend-specific operations needed for shard splitting.
+///
+/// This trait abstracts over the storage operations that differ between coordination backends (etcd, k8s). The orchestrator uses this trait to perform the actual persistence operations while managing the overall split state machine.
+#[async_trait]
+pub trait SplitStorageBackend: Send + Sync {
+    /// Load a split-in-progress record from storage.
+    async fn load_split(
+        &self,
+        parent_shard_id: &ShardId,
+    ) -> Result<Option<SplitInProgress>, CoordinationError>;
+
+    /// Store a split-in-progress record to storage.
+    async fn store_split(&self, split: &SplitInProgress) -> Result<(), CoordinationError>;
+
+    /// Delete a split-in-progress record from storage.
+    async fn delete_split(&self, parent_shard_id: &ShardId) -> Result<(), CoordinationError>;
+
+    /// Update the shard map atomically after a split.
+    ///
+    /// This should:
+    /// 1. Read the current shard map from storage
+    /// 2. Apply the split (using ShardMap::split_shard)
+    /// 3. Write the updated shard map atomically (CAS)
+    /// 4. Update the local shard map cache
+    async fn update_shard_map_for_split(
+        &self,
+        split: &SplitInProgress,
+    ) -> Result<(), CoordinationError>;
+
+    /// Reload the shard map from storage into the local cache.
+    async fn reload_shard_map(&self) -> Result<(), CoordinationError>;
+
+    /// Update cleanup status for a shard in the shard map.
+    ///
+    /// This should use CAS semantics to ensure atomic updates.
+    async fn update_cleanup_status_in_shard_map(
+        &self,
+        shard_id: ShardId,
+        status: SplitCleanupStatus,
+    ) -> Result<(), CoordinationError>;
+
+    /// List all split records (for recovery scanning).
+    async fn list_all_splits(&self) -> Result<Vec<SplitInProgress>, CoordinationError>;
+}
+
+/// Context for split operations, containing references to shared coordinator state.
+///
+/// This is passed to the orchestrator to provide access to:
+/// - The node's identity and owned shards
+/// - The shard map
+/// - The shard factory for cloning/opening shards
+/// - Shard owner computation
+pub struct ShardSplitContext {
+    /// This node's ID
+    pub node_id: String,
+    /// The shard map (protected by mutex)
+    pub shard_map: Arc<Mutex<ShardMap>>,
+    /// Set of shards owned by this node (protected by mutex)
+    pub owned: Arc<Mutex<HashSet<ShardId>>>,
+    /// Factory for shard operations (clone, open, close)
+    pub factory: Arc<ShardFactory>,
+}
+
+impl ShardSplitContext {
+    /// Create a new context from coordinator base components.
+    pub fn new(
+        node_id: String,
+        shard_map: Arc<Mutex<ShardMap>>,
+        owned: Arc<Mutex<HashSet<ShardId>>>,
+        factory: Arc<ShardFactory>,
+    ) -> Self {
+        Self {
+            node_id,
+            shard_map,
+            owned,
+            factory,
+        }
+    }
+
+    /// Check if this node owns the specified shard.
+    pub async fn owns_shard(&self, shard_id: &ShardId) -> bool {
+        self.owned.lock().await.contains(shard_id)
+    }
+}
+
+use super::Coordinator;
+
+/// Orchestrator for shard split operations.
+///
+/// This struct encapsulates all the shared split logic, using the coordinator's `SplitStorageBackend` implementation for backend-specific storage operations.
+pub struct ShardSplitter<'a> {
+    /// The coordinator (which implements SplitStorageBackend)
+    coordinator: &'a dyn Coordinator,
+    /// Shared context with coordinator state (owned, constructed from coordinator)
+    ctx: ShardSplitContext,
+}
+
+impl<'a> ShardSplitter<'a> {
+    /// Create a new shard split orchestrator from a coordinator.
+    pub fn new(coordinator: &'a dyn Coordinator) -> Self {
+        let base = coordinator.base();
+        let ctx = ShardSplitContext::new(
+            coordinator.node_id().to_string(),
+            Arc::clone(&base.shard_map),
+            Arc::clone(&base.owned),
+            Arc::clone(&base.factory),
+        );
+
+        Self { coordinator, ctx }
+    }
+
+    /// [SILO-SPLIT-REQ-1] Request a shard split.
+    ///
+    /// Validates that this node owns the shard, the split point is valid,
+    /// and no split is already in progress. Then creates and stores the
+    /// split record.
+    pub async fn request_split(
+        &self,
+        shard_id: ShardId,
+        split_point: String,
+    ) -> Result<SplitInProgress, CoordinationError> {
+        // Verify this node owns the shard
+        if !self.ctx.owns_shard(&shard_id).await {
+            return Err(CoordinationError::NotShardOwner(shard_id));
+        }
+
+        // Verify the shard exists in the shard map and validate split point
+        {
+            let shard_map = self.ctx.shard_map.lock().await;
+            let shard_info = shard_map
+                .get_shard(&shard_id)
+                .ok_or(CoordinationError::ShardNotFound(shard_id))?;
+
+            if !shard_info.range.contains(&split_point) {
+                return Err(CoordinationError::ShardMapError(
+                    crate::shard_range::ShardMapError::InvalidSplitPoint(format!(
+                        "split point '{}' is not within shard range {}",
+                        split_point, shard_info.range
+                    )),
+                ));
+            }
+        }
+
+        // Check if a split is already in progress
+        if self.coordinator.load_split(&shard_id).await?.is_some() {
+            return Err(CoordinationError::SplitAlreadyInProgress(shard_id));
+        }
+
+        // Create and store the split record
+        let split = SplitInProgress::new(shard_id, split_point, self.ctx.node_id.clone());
+        self.coordinator.store_split(&split).await?;
+
+        info!(
+            shard_id = %shard_id,
+            split_point = %split.split_point,
+            left_child = %split.left_child_id,
+            right_child = %split.right_child_id,
+            "split requested"
+        );
+
+        Ok(split)
+    }
+
+    /// Get the current split status for a shard.
+    pub async fn get_split_status(
+        &self,
+        parent_shard_id: ShardId,
+    ) -> Result<Option<SplitInProgress>, CoordinationError> {
+        self.coordinator.load_split(&parent_shard_id).await
+    }
+
+    /// Check if a shard is currently paused for split.
+    pub async fn is_shard_paused(&self, shard_id: ShardId) -> bool {
+        match self.coordinator.load_split(&shard_id).await {
+            Ok(Some(split)) => split.phase.traffic_paused(),
+            _ => false,
+        }
+    }
+
+    /// Update the cleanup status for a shard.
+    pub async fn update_cleanup_status(
+        &self,
+        shard_id: ShardId,
+        status: SplitCleanupStatus,
+    ) -> Result<(), CoordinationError> {
+        self.coordinator
+            .update_cleanup_status_in_shard_map(shard_id, status)
+            .await
+    }
+
+    /// Advance the split to the next phase.
+    ///
+    /// This is primarily for testing to control the split state machine step by step.
+    pub async fn advance_split_phase(
+        &self,
+        parent_shard_id: ShardId,
+    ) -> Result<(), CoordinationError> {
+        let mut split = self
+            .coordinator
+            .load_split(&parent_shard_id)
+            .await?
+            .ok_or(CoordinationError::NoSplitInProgress(parent_shard_id))?;
+
+        // Verify ownership for early phases
+        if split.phase.is_early_phase() && !self.ctx.owns_shard(&parent_shard_id).await {
+            return Err(CoordinationError::NotShardOwner(parent_shard_id));
+        }
+
+        split.advance_phase();
+        self.coordinator.store_split(&split).await?;
+
+        debug!(
+            parent_shard_id = %parent_shard_id,
+            phase = %split.phase,
+            "split phase advanced"
+        );
+
+        Ok(())
+    }
+
+    /// Execute a split operation through all phases to completion.
+    ///
+    /// This method drives the split through the state machine:
+    /// SplitRequested -> SplitPausing -> SplitCloning -> SplitUpdatingMap -> SplitComplete
+    ///
+    /// The `get_shard_owner_map` closure is used to compute ownership after the shard map
+    /// is updated, since this requires backend-specific member information.
+    pub async fn execute_split<F, Fut>(
+        &self,
+        parent_shard_id: ShardId,
+        get_shard_owner_map: F,
+    ) -> Result<(), CoordinationError>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<ShardOwnerMap, CoordinationError>>,
+    {
+        loop {
+            // Load current split state
+            let mut split = self
+                .coordinator
+                .load_split(&parent_shard_id)
+                .await?
+                .ok_or(CoordinationError::NoSplitInProgress(parent_shard_id))?;
+
+            // Verify we own the shard (for early phases)
+            if split.phase.is_early_phase() && !self.ctx.owns_shard(&parent_shard_id).await {
+                return Err(CoordinationError::NotShardOwner(parent_shard_id));
+            }
+
+            match split.phase {
+                SplitPhase::SplitRequested => {
+                    // Advance to SplitPausing
+                    split.advance_phase();
+                    self.coordinator.store_split(&split).await?;
+                    info!(
+                        parent_shard_id = %parent_shard_id,
+                        phase = %split.phase,
+                        "split advanced to pausing phase"
+                    );
+                }
+                SplitPhase::SplitPausing => {
+                    // Traffic is now paused. Advance to SplitCloning.
+                    split.advance_phase();
+                    self.coordinator.store_split(&split).await?;
+                    info!(
+                        parent_shard_id = %parent_shard_id,
+                        phase = %split.phase,
+                        "split advanced to cloning phase"
+                    );
+                }
+                SplitPhase::SplitCloning => {
+                    // Clone the database for both children
+                    info!(
+                        parent_shard_id = %parent_shard_id,
+                        left_child = %split.left_child_id,
+                        right_child = %split.right_child_id,
+                        "cloning database for split"
+                    );
+
+                    // Clone for left child
+                    self.ctx
+                        .factory
+                        .clone_shard(&parent_shard_id, &split.left_child_id)
+                        .await
+                        .map_err(|e| {
+                            CoordinationError::BackendError(format!(
+                                "failed to clone left child: {}",
+                                e
+                            ))
+                        })?;
+
+                    // Clone for right child
+                    self.ctx
+                        .factory
+                        .clone_shard(&parent_shard_id, &split.right_child_id)
+                        .await
+                        .map_err(|e| {
+                            CoordinationError::BackendError(format!(
+                                "failed to clone right child: {}",
+                                e
+                            ))
+                        })?;
+
+                    // Advance to SplitUpdatingMap
+                    split.advance_phase();
+                    self.coordinator.store_split(&split).await?;
+                    info!(
+                        parent_shard_id = %parent_shard_id,
+                        phase = %split.phase,
+                        "cloning complete, advancing to map update phase"
+                    );
+                }
+                SplitPhase::SplitUpdatingMap => {
+                    // Update the shard map atomically
+                    self.coordinator.update_shard_map_for_split(&split).await?;
+
+                    // Reload the shard map to update local cache
+                    self.coordinator.reload_shard_map().await?;
+
+                    // Update local ownership state: remove parent, add children if we own them
+                    let owner_map = get_shard_owner_map().await?;
+                    let children_to_open: Vec<ShardId> = {
+                        let mut owned = self.ctx.owned.lock().await;
+                        owned.remove(&parent_shard_id);
+
+                        let mut to_open = Vec::new();
+                        for child_id in [split.left_child_id, split.right_child_id] {
+                            if let Some(owner_node_id) = owner_map.shard_to_node.get(&child_id)
+                                && *owner_node_id == self.ctx.node_id
+                            {
+                                owned.insert(child_id);
+                                to_open.push(child_id);
+                            }
+                        }
+                        to_open
+                    };
+
+                    // Open the child shards we now own
+                    for child_id in children_to_open {
+                        // Look up the child's range from the reloaded shard map
+                        let range = {
+                            let map = self.ctx.shard_map.lock().await;
+                            map.get_shard(&child_id)
+                                .ok_or(CoordinationError::ShardNotFound(child_id))?
+                                .range
+                                .clone()
+                        };
+                        self.ctx
+                            .factory
+                            .open(&child_id, &range)
+                            .await
+                            .map_err(|e| {
+                                CoordinationError::BackendError(format!(
+                                    "failed to open child shard {}: {}",
+                                    child_id, e
+                                ))
+                            })?;
+                        info!(
+                            child_shard_id = %child_id,
+                            range = %range,
+                            "opened child shard after split"
+                        );
+                    }
+
+                    // Advance to SplitComplete
+                    split.advance_phase();
+                    self.coordinator.store_split(&split).await?;
+                    info!(
+                        parent_shard_id = %parent_shard_id,
+                        phase = %split.phase,
+                        "shard map updated, split complete"
+                    );
+                }
+                SplitPhase::SplitComplete => {
+                    // Clean up: delete the split record
+                    self.coordinator.delete_split(&parent_shard_id).await?;
+                    info!(
+                        parent_shard_id = %parent_shard_id,
+                        "split record cleaned up"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Recover from stale split operations after a node restart.
+    ///
+    /// Scans for split records initiated by this node and either:
+    /// - [SILO-SPLIT-CRASH-1] Abandons early-phase splits
+    /// - [SILO-SPLIT-CRASH-2] Preserves late-phase splits for resumption
+    pub async fn recover_stale_splits(&self) -> Result<(), CoordinationError> {
+        let splits = self.coordinator.list_all_splits().await?;
+
+        for split in splits {
+            // Only process splits initiated by this node
+            if split.initiator_node_id != self.ctx.node_id {
+                continue;
+            }
+
+            if split.phase.is_early_phase() {
+                info!(
+                    parent_shard_id = %split.parent_shard_id,
+                    phase = %split.phase,
+                    "abandoning stale early-phase split"
+                );
+                self.coordinator
+                    .delete_split(&split.parent_shard_id)
+                    .await?;
+            }
+            // Late-phase splits are preserved for resumption via execute_split()
+        }
+
+        Ok(())
+    }
+}

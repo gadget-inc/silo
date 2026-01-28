@@ -11,7 +11,10 @@ version = "0.1.0"
 clap = { version = "4.3.14", features = ["derive"] }
 futures = "0.3"
 # Use moka cache instead of foyer to avoid slow System::new_all() calls during initialization
-slatedb = { version = "0.10.1", default-features = false, features = ["aws", "moka"] }
+slatedb = { version = "0.10.1", default-features = false, features = [
+    "aws",
+    "moka",
+] }
 object_store = { version = "0.12", features = ["gcp"] }
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -73,7 +76,7 @@ pprof = { version = "0.15", features = ["prost-codec", "frame-pointer"] }
 flate2 = "1"
 
 [features]
-default = []
+default = ["k8s"]
 dst = []
 k8s = ["kube", "k8s-openapi", "chrono"]
 

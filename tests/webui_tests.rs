@@ -10,7 +10,7 @@ use silo::cluster_query::ClusterQueryEngine;
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::settings::{AppConfig, Backend, DatabaseTemplate};
-use silo::shard_range::ShardMap;
+use silo::shard_range::{ShardMap, ShardRange};
 use silo::webui::{AppState, create_router};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -34,7 +34,10 @@ async fn setup_test_state() -> (tempfile::TempDir, AppState, ShardMap) {
     // Create a single-shard ShardMap and open that shard
     let shard_map = ShardMap::create_initial(1).expect("failed to create shard map");
     let shard_id = shard_map.shards()[0].id;
-    factory.open(&shard_id).await.expect("open shard");
+    factory
+        .open(&shard_id, &ShardRange::full())
+        .await
+        .expect("open shard");
 
     let factory = Arc::new(factory);
     let cluster_client = Arc::new(ClusterClient::new(factory.clone(), None));
@@ -395,7 +398,7 @@ async fn setup_multi_shard_state(num_shards: usize) -> (tempfile::TempDir, AppSt
         ShardMap::create_initial(num_shards as u32).expect("failed to create shard map");
     for shard_info in shard_map.shards() {
         factory
-            .open(&shard_info.id)
+            .open(&shard_info.id, &ShardRange::full())
             .await
             .expect(&format!("open shard {}", shard_info.id));
     }

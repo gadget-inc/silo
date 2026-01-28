@@ -16,7 +16,7 @@ use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::server::run_server_with_incoming;
 use silo::settings::{AppConfig, Backend, GubernatorSettings, LoggingConfig, WebUiConfig};
-use silo::shard_range::ShardId;
+use silo::shard_range::{ShardId, ShardRange};
 use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tower::Service;
@@ -224,7 +224,7 @@ pub async fn setup_server(port: u16) -> turmoil::Result<()> {
     // For DST tests, use a fixed shard ID (zero UUID) for simplicity
     let test_shard_id = ShardId::parse("00000000-0000-0000-0000-000000000000").unwrap();
     let _ = factory
-        .open(&test_shard_id)
+        .open(&test_shard_id, &ShardRange::full())
         .await
         .map_err(|e| e.to_string())?;
     let factory = Arc::new(factory);

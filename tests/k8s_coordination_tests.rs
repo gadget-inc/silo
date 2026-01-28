@@ -1,9 +1,9 @@
 //! Integration tests for Kubernetes Lease-based coordination.
 //!
-//! These tests require the `k8s` feature and a running Kubernetes cluster.
+//! These tests require the `k8s` feature (enabled by default) and a running Kubernetes cluster.
 //!
 //! **IMPORTANT**: These tests must be run single-threaded to prevent interference:
-//!   cargo test --features k8s k8s_ -- --test-threads=1
+//!   cargo test k8s_ -- --test-threads=1
 //!
 //! Local development:
 //!   Uses orbstack's built-in K8S (or any cluster where `kubectl cluster-info` works)
@@ -16,14 +16,16 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::Mutex;
 
+use silo::coordination::CoordinationError;
 use silo::coordination::k8s::K8sShardGuard;
 use silo::coordination::{Coordinator, K8sCoordinator};
+use silo::coordination::{ShardSplitter, SplitCleanupStatus, SplitPhase};
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::settings::{Backend, DatabaseTemplate};
-use silo::shard_range::ShardId;
-use tokio::sync::Mutex;
+use silo::shard_range::{ShardId, ShardInfo, ShardMap, ShardRange};
 
 // Atomic counter for truly unique prefixes even within the same nanosecond
 static PREFIX_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -46,7 +48,8 @@ fn make_test_factory(node_id: &str) -> Arc<ShardFactory> {
     let tmpdir = std::env::temp_dir().join(format!("silo-k8s-test-{}", node_id));
     Arc::new(ShardFactory::new(
         DatabaseTemplate {
-            backend: Backend::Memory,
+            // Use Fs backend for split tests because SlateDB cloning requires a real object store
+            backend: Backend::Fs,
             path: tmpdir.join("%shard%").to_string_lossy().to_string(),
             wal: None,
             apply_wal_on_close: true,
@@ -95,10 +98,6 @@ macro_rules! start_coordinator {
         }
     }};
 }
-
-// =============================================================================
-// COORDINATOR-LEVEL TESTS
-// =============================================================================
 
 /// Test that a single K8S coordinator owns all shards when alone.
 #[silo::test(flavor = "multi_thread", worker_threads = 2)]
@@ -312,6 +311,33 @@ async fn k8s_three_nodes_even_distribution() {
     assert!(c2.wait_converged(Duration::from_secs(30)).await);
     assert!(c3.wait_converged(Duration::from_secs(30)).await);
 
+    // Wait for all shards to be covered by the three coordinators
+    let expected: HashSet<ShardId> = c1
+        .get_shard_map()
+        .await
+        .unwrap()
+        .shard_ids()
+        .into_iter()
+        .collect();
+
+    let all_shards_covered = wait_until(Duration::from_secs(10), || async {
+        let s1: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+        let s2: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
+        let s3: HashSet<ShardId> = c3.owned_shards().await.into_iter().collect();
+        let all: HashSet<ShardId> = s1
+            .iter()
+            .chain(s2.iter())
+            .chain(s3.iter())
+            .copied()
+            .collect();
+        all == expected
+    })
+    .await;
+    assert!(
+        all_shards_covered,
+        "all shards should be covered after convergence"
+    );
+
     let s1: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
     let s2: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
     let s3: HashSet<ShardId> = c3.owned_shards().await.into_iter().collect();
@@ -322,13 +348,6 @@ async fn k8s_three_nodes_even_distribution() {
         .chain(s2.iter())
         .chain(s3.iter())
         .copied()
-        .collect();
-    let expected: HashSet<ShardId> = c1
-        .get_shard_map()
-        .await
-        .unwrap()
-        .shard_ids()
-        .into_iter()
         .collect();
     assert_eq!(all, expected, "all shards should be owned exactly once");
 
@@ -514,6 +533,33 @@ async fn k8s_rapid_membership_churn_converges() {
         "c3 should converge post-churn"
     );
 
+    // Wait for all shards to be covered by the three coordinators
+    let expected: HashSet<ShardId> = c1
+        .get_shard_map()
+        .await
+        .unwrap()
+        .shard_ids()
+        .into_iter()
+        .collect();
+
+    let all_shards_covered = wait_until(Duration::from_secs(10), || async {
+        let s1: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+        let s2: HashSet<ShardId> = c2b.owned_shards().await.into_iter().collect();
+        let s3: HashSet<ShardId> = c3.owned_shards().await.into_iter().collect();
+        let all: HashSet<ShardId> = s1
+            .iter()
+            .chain(s2.iter())
+            .chain(s3.iter())
+            .copied()
+            .collect();
+        all == expected
+    })
+    .await;
+    assert!(
+        all_shards_covered,
+        "all shards should be covered after churn"
+    );
+
     // Validate ownership
     let s1: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
     let s2: HashSet<ShardId> = c2b.owned_shards().await.into_iter().collect();
@@ -524,13 +570,6 @@ async fn k8s_rapid_membership_churn_converges() {
         .chain(s2.iter())
         .chain(s3.iter())
         .copied()
-        .collect();
-    let expected: HashSet<ShardId> = c1
-        .get_shard_map()
-        .await
-        .unwrap()
-        .shard_ids()
-        .into_iter()
         .collect();
     assert_eq!(all, expected, "all shards covered after churn");
     assert!(s1.is_disjoint(&s2), "s1 and s2 disjoint");
@@ -737,8 +776,12 @@ async fn make_k8s_guard(
     let runner = guard.clone();
     let owned_arc = owned.clone();
     let factory = make_test_factory(node_id);
+    // Create a shard map with this shard registered so the guard can look up its range
+    let mut shard_map_inner = ShardMap::default();
+    shard_map_inner.add_shard(ShardInfo::new(shard_id, ShardRange::full()));
+    let shard_map = Arc::new(Mutex::new(shard_map_inner));
     let handle = tokio::spawn(async move {
-        runner.run(owned_arc, factory).await;
+        runner.run(owned_arc, factory, shard_map).await;
     });
 
     Ok((guard, owned, tx, handle))
@@ -2212,4 +2255,980 @@ async fn k8s_graceful_shutdown_releases_shards_promptly() {
     // Cleanup
     c1.shutdown().await.unwrap();
     h1.abort();
+}
+
+/// Test that request_split creates a split record in k8s.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_request_split_creates_split_record() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 1; // Use 1 shard so it covers the entire keyspace
+
+    let (coord, handle) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "split-test-1",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+
+    assert!(
+        coord.wait_converged(Duration::from_secs(15)).await,
+        "coordinator should converge"
+    );
+
+    // Get the first shard we own
+    let owned = coord.owned_shards().await;
+    assert!(!owned.is_empty(), "should own at least one shard");
+    let shard_id = owned[0];
+
+    // Use a simple split point - with 1 shard the range is unbounded so "m" is valid
+    let split_point = "m".to_string();
+
+    // Create orchestrator
+
+    let orchestrator = ShardSplitter::new(&coord);
+
+    // Request a split
+    let split = orchestrator
+        .request_split(shard_id, split_point.clone())
+        .await
+        .expect("request_split should succeed");
+
+    assert_eq!(split.parent_shard_id, shard_id);
+    assert_eq!(split.split_point, split_point);
+    assert_eq!(split.phase, SplitPhase::SplitRequested);
+
+    // Verify we can retrieve the split status
+    let status = orchestrator
+        .get_split_status(shard_id)
+        .await
+        .expect("get_split_status should succeed");
+    assert!(status.is_some(), "split status should exist");
+    let status = status.unwrap();
+    assert_eq!(status.parent_shard_id, shard_id);
+    assert_eq!(status.split_point, split_point);
+    assert_eq!(status.left_child_id, split.left_child_id);
+    assert_eq!(status.right_child_id, split.right_child_id);
+
+    // Cleanup
+    coord.shutdown().await.unwrap();
+    handle.abort();
+}
+
+/// Test that request_split fails if not the shard owner.
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k8s_request_split_fails_if_not_owner() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 8;
+
+    let (c1, h1) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "split-owner-1",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+    let (c2, h2) = K8sCoordinator::start(
+        &namespace,
+        &prefix,
+        "split-owner-2",
+        "http://127.0.0.1:50052",
+        num_shards,
+        10,
+        make_test_factory("split-owner-2"),
+    )
+    .await
+    .expect("start c2");
+
+    assert!(c1.wait_converged(Duration::from_secs(20)).await);
+    assert!(c2.wait_converged(Duration::from_secs(20)).await);
+
+    // Find a shard owned by c1
+    let c1_owned: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    let c2_owned: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
+    assert!(
+        c1_owned.is_disjoint(&c2_owned),
+        "ownership should be disjoint"
+    );
+
+    let c1_shard = *c1_owned
+        .iter()
+        .next()
+        .expect("c1 should own at least one shard");
+
+    // Create orchestrator for c2 and try to split a shard owned by c1
+
+    let orchestrator2 = ShardSplitter::new(&c2);
+
+    let result = orchestrator2
+        .request_split(c1_shard, "mmmmm".to_string())
+        .await;
+    assert!(
+        matches!(result, Err(CoordinationError::NotShardOwner(_))),
+        "should fail with NotShardOwner, got: {:?}",
+        result
+    );
+
+    // Cleanup
+    c1.shutdown().await.unwrap();
+    c2.shutdown().await.unwrap();
+    h1.abort();
+    h2.abort();
+}
+
+/// Test that request_split fails if a split is already in progress.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_request_split_fails_if_already_in_progress() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 1; // Use 1 shard so it covers the entire keyspace
+
+    let (coord, handle) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "split-dup-1",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+
+    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+
+    let owned = coord.owned_shards().await;
+    let shard_id = owned[0];
+
+    // Create orchestrator
+
+    let orchestrator = ShardSplitter::new(&coord);
+
+    // First split request should succeed
+    let _split = orchestrator
+        .request_split(shard_id, "m".to_string())
+        .await
+        .expect("first request_split should succeed");
+
+    // Second split request should fail
+    let result = orchestrator.request_split(shard_id, "n".to_string()).await;
+    assert!(
+        matches!(result, Err(CoordinationError::SplitAlreadyInProgress(_))),
+        "should fail with SplitAlreadyInProgress, got: {:?}",
+        result
+    );
+
+    // Cleanup
+    coord.shutdown().await.unwrap();
+    handle.abort();
+}
+
+/// Test that request_split fails for invalid split points.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_request_split_fails_for_invalid_split_point() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 2; // Use 2 shards so at least one has a bounded range
+
+    let (coord, handle) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "split-invalid-1",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+
+    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+
+    let owned = coord.owned_shards().await;
+    let shard_id = owned[0];
+
+    // Get the shard's range
+    let shard_map = coord.get_shard_map().await.unwrap();
+    let shard_info = shard_map.get_shard(&shard_id).unwrap();
+
+    // Try to split at a point outside the shard's range
+    // This depends on where the shard's range is - find a point definitely outside
+    let invalid_point = if shard_info.range.end.is_empty() {
+        // If unbounded end, skip this test case
+        coord.shutdown().await.unwrap();
+        handle.abort();
+        return;
+    } else {
+        // Use a point after the end
+        format!("{}z", shard_info.range.end)
+    };
+
+    // Create orchestrator and try split
+
+    let orchestrator = ShardSplitter::new(&coord);
+
+    let result = orchestrator.request_split(shard_id, invalid_point).await;
+    assert!(
+        matches!(result, Err(CoordinationError::ShardMapError(_))),
+        "should fail with ShardMapError for out-of-range split point, got: {:?}",
+        result
+    );
+
+    // Cleanup
+    coord.shutdown().await.unwrap();
+    handle.abort();
+}
+
+/// Test that update_cleanup_status works correctly.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_update_cleanup_status_works() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 1; // Use 1 shard for simplicity
+
+    let (coord, handle) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "cleanup-status-1",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+
+    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+
+    let owned = coord.owned_shards().await;
+    let shard_id = owned[0];
+
+    // Create orchestrator and update cleanup status
+
+    let orchestrator = ShardSplitter::new(&coord);
+
+    orchestrator
+        .update_cleanup_status(shard_id, SplitCleanupStatus::CleanupRunning)
+        .await
+        .expect("update_cleanup_status should succeed");
+
+    // Verify the status was updated in the shard map
+    let shard_map = coord.get_shard_map().await.unwrap();
+    let shard_info = shard_map.get_shard(&shard_id).unwrap();
+    assert_eq!(
+        shard_info.cleanup_status,
+        SplitCleanupStatus::CleanupRunning,
+        "cleanup status should be updated"
+    );
+
+    // Cleanup
+    coord.shutdown().await.unwrap();
+    handle.abort();
+}
+
+/// Test that is_shard_paused returns correct values based on split phase.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_is_shard_paused_returns_correct_values() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 1; // Use 1 shard so it covers the entire keyspace
+
+    let (coord, handle) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "paused-test-1",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+
+    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+
+    let owned = coord.owned_shards().await;
+    let shard_id = owned[0];
+
+    // Create orchestrator
+
+    let orchestrator = ShardSplitter::new(&coord);
+
+    // Initially not paused
+    let paused = orchestrator.is_shard_paused(shard_id).await;
+    assert!(!paused, "shard should not be paused initially");
+
+    // Request a split - still not paused in SplitRequested phase
+    let _split = orchestrator
+        .request_split(shard_id, "m".to_string())
+        .await
+        .expect("request_split should succeed");
+
+    // In SplitRequested phase, traffic is NOT paused yet
+    let paused = orchestrator.is_shard_paused(shard_id).await;
+    assert!(
+        !paused,
+        "shard should not be paused in SplitRequested phase"
+    );
+
+    // Cleanup
+    coord.shutdown().await.unwrap();
+    handle.abort();
+}
+
+/// Test that split state persists across coordinator restart.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_split_state_persists_across_restart() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 1; // Use 1 shard so it covers the entire keyspace
+
+    // Start first coordinator
+    let (c1, h1) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "persist-test-1",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+
+    assert!(c1.wait_converged(Duration::from_secs(15)).await);
+
+    let owned = c1.owned_shards().await;
+    let shard_id = owned[0];
+
+    // Create orchestrator and request a split
+
+    let orchestrator1 = ShardSplitter::new(&c1);
+
+    let split = orchestrator1
+        .request_split(shard_id, "m".to_string())
+        .await
+        .expect("request_split should succeed");
+
+    // Shutdown the coordinator
+    c1.shutdown().await.unwrap();
+    h1.abort();
+
+    // Small delay
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Start new coordinator with same prefix (simulates restart)
+    let (c2, h2) = K8sCoordinator::start(
+        &namespace,
+        &prefix,
+        "persist-test-1",
+        "http://127.0.0.1:50051",
+        num_shards,
+        10,
+        make_test_factory("persist-test-1-restart"),
+    )
+    .await
+    .expect("restart coordinator");
+
+    assert!(c2.wait_converged(Duration::from_secs(15)).await);
+
+    // Create orchestrator for c2 and verify the split state persisted
+
+    let orchestrator2 = ShardSplitter::new(&c2);
+
+    let status = orchestrator2
+        .get_split_status(shard_id)
+        .await
+        .expect("get_split_status should succeed");
+    assert!(
+        status.is_some(),
+        "split status should persist after restart"
+    );
+    let status = status.unwrap();
+    assert_eq!(status.parent_shard_id, shard_id);
+    assert_eq!(status.split_point, "m");
+    assert_eq!(status.left_child_id, split.left_child_id);
+    assert_eq!(status.right_child_id, split.right_child_id);
+
+    // Cleanup
+    c2.shutdown().await.unwrap();
+    h2.abort();
+}
+
+/// Test that get_split_status returns None for nonexistent splits.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_get_split_status_returns_none_for_nonexistent() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 4;
+
+    let (coord, handle) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "nonexist-test-1",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+
+    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+
+    // Create orchestrator and query for a split that doesn't exist
+
+    let orchestrator = ShardSplitter::new(&coord);
+
+    let random_shard_id = ShardId::new();
+    let status = orchestrator
+        .get_split_status(random_shard_id)
+        .await
+        .expect("get_split_status should succeed");
+    assert!(
+        status.is_none(),
+        "split status should be None for nonexistent split"
+    );
+
+    // Cleanup
+    coord.shutdown().await.unwrap();
+    handle.abort();
+}
+
+/// Test that execute_split completes a full split cycle in k8s.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_execute_split_completes_full_cycle() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 1;
+
+    let (coord, handle) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "split-exec-1",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+
+    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+
+    let owned = coord.owned_shards().await;
+    let shard_id = owned[0];
+
+    // Create orchestrator
+
+    let orchestrator = ShardSplitter::new(&coord);
+
+    // Request and execute the split
+    let split = orchestrator
+        .request_split(shard_id, "m".to_string())
+        .await
+        .expect("request_split should succeed");
+
+    orchestrator
+        .execute_split(shard_id, || coord.get_shard_owner_map())
+        .await
+        .expect("execute_split should succeed");
+
+    // Verify split is complete
+    let status = orchestrator
+        .get_split_status(shard_id)
+        .await
+        .expect("get_split_status");
+    assert!(
+        status.is_none(),
+        "split record should be cleaned up after completion"
+    );
+
+    // Verify shard map has been updated
+    let shard_map = coord.get_shard_map().await.expect("get_shard_map");
+    assert_eq!(shard_map.len(), 2, "should have 2 shards after split");
+
+    assert!(
+        shard_map.get_shard(&shard_id).is_none(),
+        "parent should be removed"
+    );
+    assert!(
+        shard_map.get_shard(&split.left_child_id).is_some(),
+        "left child should exist"
+    );
+    assert!(
+        shard_map.get_shard(&split.right_child_id).is_some(),
+        "right child should exist"
+    );
+
+    // Children should have CleanupPending status
+    let left_info = shard_map.get_shard(&split.left_child_id).unwrap();
+    let right_info = shard_map.get_shard(&split.right_child_id).unwrap();
+    assert_eq!(left_info.cleanup_status, SplitCleanupStatus::CleanupPending);
+    assert_eq!(
+        right_info.cleanup_status,
+        SplitCleanupStatus::CleanupPending
+    );
+
+    coord.shutdown().await.unwrap();
+    handle.abort();
+}
+
+/// Test that shard is paused during split execution phases.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_shard_paused_during_split_execution() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 1;
+
+    let (coord, handle) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "split-pause-1",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+
+    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+
+    let owned = coord.owned_shards().await;
+    let shard_id = owned[0];
+
+    // Create orchestrator
+
+    let orchestrator = ShardSplitter::new(&coord);
+
+    // Request split but don't execute
+    let _split = orchestrator
+        .request_split(shard_id, "m".to_string())
+        .await
+        .expect("request_split");
+
+    // In SplitRequested, not paused
+    assert!(
+        !orchestrator.is_shard_paused(shard_id).await,
+        "SplitRequested should not pause traffic"
+    );
+
+    // Advance to SplitPausing
+    orchestrator
+        .advance_split_phase(shard_id)
+        .await
+        .expect("advance to pausing");
+
+    // Now should be paused
+    assert!(
+        orchestrator.is_shard_paused(shard_id).await,
+        "SplitPausing should pause traffic"
+    );
+
+    let status = orchestrator
+        .get_split_status(shard_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.phase, SplitPhase::SplitPausing);
+
+    // Complete the split to clean up
+    orchestrator
+        .execute_split(shard_id, || coord.get_shard_owner_map())
+        .await
+        .expect("execute_split");
+
+    coord.shutdown().await.unwrap();
+    handle.abort();
+}
+
+/// Test execute_split fails without a prior request.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_execute_split_fails_without_request() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 1;
+
+    let (coord, handle) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "split-no-req-1",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+
+    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+
+    let owned = coord.owned_shards().await;
+    let shard_id = owned[0];
+
+    // Create orchestrator
+
+    let orchestrator = ShardSplitter::new(&coord);
+
+    // Try to execute without requesting first
+    let result = orchestrator
+        .execute_split(shard_id, || coord.get_shard_owner_map())
+        .await;
+    assert!(result.is_err(), "execute_split should fail without request");
+
+    coord.shutdown().await.unwrap();
+    handle.abort();
+}
+
+/// Test that execute_split resumes from partial state.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_execute_split_resumes_from_partial_state() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 1;
+
+    let (coord, handle) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "split-resume-1",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+
+    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+
+    let owned = coord.owned_shards().await;
+    let shard_id = owned[0];
+
+    // Create orchestrator
+
+    let orchestrator = ShardSplitter::new(&coord);
+
+    // Request and advance to SplitPausing
+    let split = orchestrator
+        .request_split(shard_id, "m".to_string())
+        .await
+        .expect("request_split");
+    orchestrator
+        .advance_split_phase(shard_id)
+        .await
+        .expect("advance to pausing");
+
+    // Verify partial state
+    let status = orchestrator
+        .get_split_status(shard_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.phase, SplitPhase::SplitPausing);
+
+    // Execute should resume and complete
+    orchestrator
+        .execute_split(shard_id, || coord.get_shard_owner_map())
+        .await
+        .expect("execute_split from partial");
+
+    // Verify completion
+    let status = orchestrator
+        .get_split_status(shard_id)
+        .await
+        .expect("get status");
+    assert!(status.is_none(), "split should be complete");
+
+    let shard_map = coord.get_shard_map().await.unwrap();
+    assert_eq!(shard_map.len(), 2);
+    assert!(shard_map.get_shard(&split.left_child_id).is_some());
+    assert!(shard_map.get_shard(&split.right_child_id).is_some());
+
+    coord.shutdown().await.unwrap();
+    handle.abort();
+}
+
+/// Test sequential splits work correctly.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_sequential_splits_work_correctly() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 1;
+
+    let (coord, handle) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "split-seq-1",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+
+    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+
+    let owned = coord.owned_shards().await;
+    let shard_id = owned[0];
+
+    // Create orchestrator
+
+    let orchestrator = ShardSplitter::new(&coord);
+
+    // First split at "m"
+    let split1 = orchestrator
+        .request_split(shard_id, "m".to_string())
+        .await
+        .expect("first request_split");
+    orchestrator
+        .execute_split(shard_id, || coord.get_shard_owner_map())
+        .await
+        .expect("first execute_split");
+
+    let shard_map = coord.get_shard_map().await.unwrap();
+    assert_eq!(shard_map.len(), 2);
+
+    // Second split: split left child at "g"
+    let left_child_id = split1.left_child_id;
+    let split2 = orchestrator
+        .request_split(left_child_id, "g".to_string())
+        .await
+        .expect("second request_split");
+    orchestrator
+        .execute_split(left_child_id, || coord.get_shard_owner_map())
+        .await
+        .expect("second execute_split");
+
+    let shard_map = coord.get_shard_map().await.unwrap();
+    assert_eq!(shard_map.len(), 3);
+
+    // Verify tenant routing
+    let tenant_a = shard_map.shard_for_tenant("a").unwrap();
+    let tenant_h = shard_map.shard_for_tenant("h").unwrap();
+    let tenant_z = shard_map.shard_for_tenant("z").unwrap();
+
+    assert_eq!(tenant_a.id, split2.left_child_id);
+    assert_eq!(tenant_h.id, split2.right_child_id);
+    assert_eq!(tenant_z.id, split1.right_child_id);
+
+    coord.shutdown().await.unwrap();
+    handle.abort();
+}
+
+/// Test split works in multi-node k8s cluster.
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k8s_split_in_multi_node_cluster() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 2;
+
+    let (c1, h1) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "split-multi-1",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+
+    let (c2, h2) = K8sCoordinator::start(
+        &namespace,
+        &prefix,
+        "split-multi-2",
+        "http://127.0.0.1:50052",
+        num_shards,
+        10,
+        make_test_factory("split-multi-2"),
+    )
+    .await
+    .expect("start c2");
+
+    assert!(c1.wait_converged(Duration::from_secs(20)).await);
+    assert!(c2.wait_converged(Duration::from_secs(20)).await);
+
+    // Wait for c1 to own at least one shard
+    let c1_has_shards = wait_until(Duration::from_secs(10), || async {
+        !c1.owned_shards().await.is_empty()
+    })
+    .await;
+    assert!(c1_has_shards, "c1 should own at least one shard");
+
+    // Get a shard owned by c1
+    let c1_shards = c1.owned_shards().await;
+    assert!(!c1_shards.is_empty());
+    let shard_to_split = c1_shards[0];
+
+    // Get the shard's range and compute a valid split point
+    let shard_map = c1.get_shard_map().await.unwrap();
+    let shard_info = shard_map
+        .get_shard(&shard_to_split)
+        .expect("find shard in map");
+    let split_point = shard_info
+        .range
+        .midpoint()
+        .expect("shard range should have a midpoint");
+
+    // Create orchestrator for c1 and split the shard
+
+    let orchestrator = ShardSplitter::new(&c1);
+
+    let split = orchestrator
+        .request_split(shard_to_split, split_point)
+        .await
+        .expect("request_split");
+    orchestrator
+        .execute_split(shard_to_split, || c1.get_shard_owner_map())
+        .await
+        .expect("execute_split");
+
+    // Verify c1 sees the updated shard map immediately (it performed the split)
+    let map1 = c1.get_shard_map().await.unwrap();
+    assert_eq!(map1.len(), 3, "c1 should see 3 shards");
+    assert!(map1.get_shard(&split.left_child_id).is_some());
+    assert!(map1.get_shard(&split.right_child_id).is_some());
+
+    // Note: Unlike etcd which has a watch on the shard map, k8s doesn't automatically
+    // propagate shard map changes to other nodes. c2 will see the changes on next
+    // shard map reload (during shard acquisition). For now, just verify c1 is correct.
+
+    c1.shutdown().await.unwrap();
+    c2.shutdown().await.unwrap();
+    h1.abort();
+    h2.abort();
+}
+
+/// Test crash recovery during early phase abandons the split.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_crash_recovery_early_phase_abandons_split() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 1;
+
+    // Start first coordinator
+    let (c1, h1) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "crash-early-1",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+
+    assert!(c1.wait_converged(Duration::from_secs(15)).await);
+
+    let owned = c1.owned_shards().await;
+    let shard_id = owned[0];
+
+    // Create orchestrator and request split, advance to SplitPausing (early phase)
+
+    let orchestrator1 = ShardSplitter::new(&c1);
+
+    let _split = orchestrator1
+        .request_split(shard_id, "m".to_string())
+        .await
+        .expect("request_split");
+    orchestrator1
+        .advance_split_phase(shard_id)
+        .await
+        .expect("advance to pausing");
+
+    // Simulate crash
+    c1.shutdown().await.unwrap();
+    h1.abort();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Start new coordinator
+    let (c2, h2) = K8sCoordinator::start(
+        &namespace,
+        &prefix,
+        "crash-early-1",
+        "http://127.0.0.1:50051",
+        num_shards,
+        10,
+        make_test_factory("crash-early-1-restart"),
+    )
+    .await
+    .expect("restart coordinator");
+
+    assert!(c2.wait_converged(Duration::from_secs(15)).await);
+
+    // Create orchestrator for c2
+
+    let orchestrator2 = ShardSplitter::new(&c2);
+
+    // Early phase crash should abandon the split
+    orchestrator2
+        .recover_stale_splits()
+        .await
+        .expect("recover_stale_splits");
+
+    let status = orchestrator2
+        .get_split_status(shard_id)
+        .await
+        .expect("get status");
+    assert!(
+        status.is_none(),
+        "early phase split should be abandoned after crash"
+    );
+
+    // Shard map should still have original shard
+    let shard_map = c2.get_shard_map().await.unwrap();
+    assert_eq!(shard_map.len(), 1);
+    assert!(shard_map.get_shard(&shard_id).is_some());
+
+    c2.shutdown().await.unwrap();
+    h2.abort();
+}
+
+/// Test crash recovery during late phase resumes the split.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_crash_recovery_late_phase_resumes_split() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 1;
+
+    // Start first coordinator
+    let (c1, h1) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "crash-late-1",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+
+    assert!(c1.wait_converged(Duration::from_secs(15)).await);
+
+    let owned = c1.owned_shards().await;
+    let shard_id = owned[0];
+
+    // Create orchestrator and request split, advance to SplitUpdatingMap (late phase)
+
+    let orchestrator1 = ShardSplitter::new(&c1);
+
+    let split = orchestrator1
+        .request_split(shard_id, "m".to_string())
+        .await
+        .expect("request_split");
+
+    orchestrator1.advance_split_phase(shard_id).await.unwrap(); // -> SplitPausing
+    orchestrator1.advance_split_phase(shard_id).await.unwrap(); // -> SplitCloning
+    orchestrator1.advance_split_phase(shard_id).await.unwrap(); // -> SplitUpdatingMap
+
+    let status = orchestrator1
+        .get_split_status(shard_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.phase, SplitPhase::SplitUpdatingMap);
+
+    // Simulate crash
+    c1.shutdown().await.unwrap();
+    h1.abort();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Start new coordinator
+    let (c2, h2) = K8sCoordinator::start(
+        &namespace,
+        &prefix,
+        "crash-late-1",
+        "http://127.0.0.1:50051",
+        num_shards,
+        10,
+        make_test_factory("crash-late-1-restart"),
+    )
+    .await
+    .expect("restart coordinator");
+
+    assert!(c2.wait_converged(Duration::from_secs(15)).await);
+
+    // Create orchestrator for c2
+
+    let orchestrator2 = ShardSplitter::new(&c2);
+
+    // Late phase split should be preserved
+    let status = orchestrator2
+        .get_split_status(shard_id)
+        .await
+        .expect("get status");
+    assert!(status.is_some(), "late phase split should be preserved");
+    assert_eq!(status.unwrap().phase, SplitPhase::SplitUpdatingMap);
+
+    // Resume and complete the split
+    orchestrator2
+        .execute_split(shard_id, || c2.get_shard_owner_map())
+        .await
+        .expect("resume split should succeed");
+
+    // Verify completion
+    let status = orchestrator2
+        .get_split_status(shard_id)
+        .await
+        .expect("get status");
+    assert!(status.is_none(), "split should complete");
+
+    let shard_map = c2.get_shard_map().await.unwrap();
+    assert_eq!(shard_map.len(), 2);
+    assert!(shard_map.get_shard(&split.left_child_id).is_some());
+    assert!(shard_map.get_shard(&split.right_child_id).is_some());
+
+    c2.shutdown().await.unwrap();
+    h2.abort();
 }

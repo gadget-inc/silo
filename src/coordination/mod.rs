@@ -15,12 +15,16 @@ use tokio::sync::{Mutex, Notify, watch};
 use tracing::debug;
 
 use crate::factory::ShardFactory;
-use crate::shard_range::{ShardId, ShardMap};
+use crate::shard_range::{ShardId, ShardMap, ShardMapError};
 
 pub mod etcd;
 #[cfg(feature = "k8s")]
 pub mod k8s;
 pub mod none;
+pub mod split;
+
+// Re-export the split orchestrator types and split enums
+pub use split::{ShardSplitter, SplitCleanupStatus, SplitPhase, SplitStorageBackend};
 
 // Re-export the backends
 pub use etcd::EtcdCoordinator;
@@ -98,6 +102,18 @@ pub enum CoordinationError {
     ShuttingDown,
     #[error("not supported by this backend")]
     NotSupported,
+    #[error("shard not found: {0}")]
+    ShardNotFound(ShardId),
+    #[error("shard map error: {0}")]
+    ShardMapError(#[from] ShardMapError),
+    #[error("split already in progress for shard: {0}")]
+    SplitAlreadyInProgress(ShardId),
+    #[error("no split in progress for shard: {0}")]
+    NoSplitInProgress(ShardId),
+    #[error("shard is paused for split")]
+    ShardPausedForSplit(ShardId),
+    #[error("node does not own shard: {0}")]
+    NotShardOwner(ShardId),
 }
 
 /// Phase of a shard guard's lifecycle.
@@ -225,9 +241,8 @@ impl ShardGuardContext {
 }
 
 /// Shared state and helpers for coordinator implementations.
-///
-/// This struct contains the common state that both etcd and k8s coordinators
-/// need, and provides shared implementations for common operations.
+/// Contains all the common state that all coordinators need, and is presented at coordinator.base()
+#[derive(Clone)]
 pub struct CoordinatorBase {
     pub node_id: String,
     pub grpc_addr: String,
@@ -378,10 +393,14 @@ impl CoordinatorBase {
 ///
 /// This trait abstracts over different coordination mechanisms (etcd, K8S Leases, etc.)
 /// to allow Silo to run in different environments.
+///
+/// Implementations only need to provide `base()` and a few backend-specific methods.
+/// Common functionality is provided via default implementations that delegate to the base.
 #[async_trait]
-pub trait Coordinator: Send + Sync {
-    /// Get the list of shard IDs currently owned by this node.
-    async fn owned_shards(&self) -> Vec<ShardId>;
+pub trait Coordinator: SplitStorageBackend + Send + Sync {
+    /// Get the coordinator base containing shared state.
+    /// This is the only required method for accessing common state.
+    fn base(&self) -> &CoordinatorBase;
 
     /// Gracefully shutdown the coordinator, releasing all owned shards.
     async fn shutdown(&self) -> Result<(), CoordinationError>;
@@ -394,20 +413,46 @@ pub trait Coordinator: Send + Sync {
     /// Get all member information from the cluster.
     async fn get_members(&self) -> Result<Vec<MemberInfo>, CoordinationError>;
 
-    /// Get the current shard map defining all shards and their ranges.
-    async fn get_shard_map(&self) -> Result<ShardMap, CoordinationError>;
-
     /// Compute a mapping of shard IDs to their owning node's address.
     async fn get_shard_owner_map(&self) -> Result<ShardOwnerMap, CoordinationError>;
 
+    // === Default implementations derived from base() ===
+
+    /// Get the list of shard IDs currently owned by this node.
+    async fn owned_shards(&self) -> Vec<ShardId> {
+        self.base().owned_shards().await
+    }
+
+    /// Get the current shard map defining all shards and their ranges.
+    async fn get_shard_map(&self) -> Result<ShardMap, CoordinationError> {
+        Ok(self.base().get_shard_map().await)
+    }
+
     /// Get the number of shards in the cluster.
-    async fn num_shards(&self) -> usize;
+    async fn num_shards(&self) -> usize {
+        self.base().num_shards().await
+    }
 
     /// Get this node's ID.
-    fn node_id(&self) -> &str;
+    fn node_id(&self) -> &str {
+        &self.base().node_id
+    }
 
     /// Get this node's gRPC address.
-    fn grpc_addr(&self) -> &str;
+    fn grpc_addr(&self) -> &str {
+        &self.base().grpc_addr
+    }
+
+    /// Check if a shard is currently paused for split.
+    ///
+    /// Returns true if the shard has an in-progress split in a traffic-pausing phase.
+    /// Callers should return retryable errors when this returns true.
+    async fn is_shard_paused(&self, shard_id: ShardId) -> bool {
+        match self.load_split(&shard_id).await {
+            Ok(Some(split)) => split.phase.traffic_paused(),
+            _ => false,
+        }
+    }
 }
 
 /// Dynamically create a coordinator based on configuration.
@@ -548,6 +593,17 @@ pub mod keys {
         format!("{}{}/owner", shards_prefix(cluster_prefix), shard_id)
     }
 
+    /// Prefix for all split operations.
+    pub fn splits_prefix(cluster_prefix: &str) -> String {
+        format!("{}/coord/splits/", cluster_prefix)
+    }
+
+    /// Key for tracking an in-progress split operation.
+    /// Stored as JSON-serialized SplitInProgress.
+    pub fn split_key(cluster_prefix: &str, parent_shard_id: &ShardId) -> String {
+        format!("{}{}", splits_prefix(cluster_prefix), parent_shard_id)
+    }
+
     // K8S-specific naming (Lease object names must be DNS-compatible)
     pub fn k8s_member_lease_name(cluster_prefix: &str, node_id: &str) -> String {
         format!("{}-member-{}", cluster_prefix, node_id)
@@ -555,5 +611,9 @@ pub mod keys {
     /// K8S lease name for shard ownership (uses UUID, which is DNS-compatible).
     pub fn k8s_shard_lease_name(cluster_prefix: &str, shard_id: &ShardId) -> String {
         format!("{}-shard-{}", cluster_prefix, shard_id)
+    }
+    /// K8S ConfigMap name for split state (uses parent shard UUID, which is DNS-compatible).
+    pub fn k8s_split_configmap_name(cluster_prefix: &str, parent_shard_id: &ShardId) -> String {
+        format!("{}-split-{}", cluster_prefix, parent_shard_id)
     }
 }

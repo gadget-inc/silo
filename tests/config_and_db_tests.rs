@@ -5,7 +5,7 @@ use silo::settings::{
     AppConfig, Backend, DatabaseConfig, DatabaseTemplate, GubernatorSettings, LoggingConfig,
     WalConfig, WebUiConfig, expand_env_vars_for_test,
 };
-use silo::shard_range::ShardMap;
+use silo::shard_range::{ShardMap, ShardRange};
 use silo::storage::resolve_object_store;
 
 #[silo::test]
@@ -32,17 +32,16 @@ async fn open_fs_db_from_config() {
     let factory = ShardFactory::new(cfg.database.clone(), rate_limiter, None);
     let shard_map = ShardMap::create_initial(1).expect("create shard map");
     let shard_id = shard_map.shards()[0].id;
-    let shard = factory.open(&shard_id).await.expect("open shard");
+    let shard = factory
+        .open(&shard_id, &ShardRange::full())
+        .await
+        .expect("open shard");
 
     shard.db().put(b"k", b"v").await.expect("put");
     shard.db().flush().await.expect("flush");
     let got = shard.db().get(b"k").await.expect("get");
     assert_eq!(got.unwrap(), slatedb::bytes::Bytes::from_static(b"v"));
 }
-
-// =============================================================================
-// WAL Flush Before Close Tests
-// =============================================================================
 
 /// Helper to check if a directory exists and has files in it
 async fn dir_has_files(path: &std::path::Path) -> bool {
@@ -74,7 +73,7 @@ async fn shard_with_local_wal_has_wal_close_config() {
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
-    let shard = JobStoreShard::open(&cfg, rate_limiter, None)
+    let shard = JobStoreShard::open(&cfg, rate_limiter, None, ShardRange::full())
         .await
         .expect("open shard");
 
@@ -106,7 +105,7 @@ async fn shard_without_local_wal_has_no_wal_close_config() {
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
-    let shard = JobStoreShard::open(&cfg, rate_limiter, None)
+    let shard = JobStoreShard::open(&cfg, rate_limiter, None, ShardRange::full())
         .await
         .expect("open shard");
 
@@ -136,7 +135,7 @@ async fn close_with_flush_wal_removes_local_wal_directory() {
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
-    let shard = JobStoreShard::open(&cfg, rate_limiter, None)
+    let shard = JobStoreShard::open(&cfg, rate_limiter, None, ShardRange::full())
         .await
         .expect("open shard");
 
@@ -183,7 +182,7 @@ async fn close_without_flush_wal_preserves_local_wal_directory() {
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
-    let shard = JobStoreShard::open(&cfg, rate_limiter, None)
+    let shard = JobStoreShard::open(&cfg, rate_limiter, None, ShardRange::full())
         .await
         .expect("open shard");
 
@@ -229,7 +228,7 @@ async fn data_persists_after_close_with_flush_and_reopen() {
         };
 
         let rate_limiter = MockGubernatorClient::new_arc();
-        let shard = JobStoreShard::open(&cfg, rate_limiter, None)
+        let shard = JobStoreShard::open(&cfg, rate_limiter, None, ShardRange::full())
             .await
             .expect("open shard");
 
@@ -261,7 +260,7 @@ async fn data_persists_after_close_with_flush_and_reopen() {
         };
 
         let rate_limiter = MockGubernatorClient::new_arc();
-        let shard = JobStoreShard::open(&cfg, rate_limiter, None)
+        let shard = JobStoreShard::open(&cfg, rate_limiter, None, ShardRange::full())
             .await
             .expect("reopen shard");
 
@@ -303,8 +302,14 @@ async fn factory_close_all_flushes_all_shards_wal() {
     let shard_map = ShardMap::create_initial(2).expect("create shard map");
     let shard0_id = shard_map.shards()[0].id;
     let shard1_id = shard_map.shards()[1].id;
-    let shard0 = factory.open(&shard0_id).await.expect("open shard 0");
-    let shard1 = factory.open(&shard1_id).await.expect("open shard 1");
+    let shard0 = factory
+        .open(&shard0_id, &ShardRange::full())
+        .await
+        .expect("open shard 0");
+    let shard1 = factory
+        .open(&shard1_id, &ShardRange::full())
+        .await
+        .expect("open shard 1");
 
     // Write to both
     shard0.db().put(b"key0", b"value0").await.expect("put 0");
@@ -357,10 +362,6 @@ async fn wal_config_is_local_storage_detection() {
         "Url backend should not be local"
     );
 }
-
-// =============================================================================
-// Environment Variable Expansion Tests
-// =============================================================================
 
 #[silo::test]
 fn expand_env_vars_no_vars() {
@@ -442,10 +443,6 @@ fn expand_env_vars_real_k8s_example() {
     unsafe { std::env::remove_var("POD_IP") };
 }
 
-// =============================================================================
-// Storage Tests
-// =============================================================================
-
 #[silo::test]
 fn resolve_object_store_fs_creates_directory() {
     let tmp = tempfile::tempdir().unwrap();
@@ -468,9 +465,10 @@ fn resolve_object_store_fs_canonicalizes_path() {
 
     let result = resolve_object_store(&Backend::Fs, &path).unwrap();
 
-    // Canonical path should not contain ".." or "." and should be absolute
-    assert!(result.canonical_path.starts_with('/'));
-    assert!(!result.canonical_path.contains(".."));
+    // Root path should not contain ".." or "." and should be absolute
+    // (canonical_path is empty for LocalFileSystem since the root is set in the prefix)
+    assert!(result.root_path.starts_with('/'));
+    assert!(!result.root_path.contains(".."));
 }
 
 #[silo::test]

@@ -6,7 +6,7 @@ use silo::cluster_client::ClusterClient;
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::settings::{Backend, DatabaseTemplate};
-use silo::shard_range::ShardMap;
+use silo::shard_range::{ShardMap, ShardRange};
 use std::sync::Arc;
 
 /// Create a test factory with memory backend and a ShardMap
@@ -44,8 +44,14 @@ async fn cluster_client_owns_shard_after_opening() {
     let shard0_id = shard_map.shards()[0].id;
     let shard1_id = shard_map.shards()[1].id;
     let shard2_id = shard_map.shards()[2].id;
-    factory.open(&shard0_id).await.expect("open shard 0");
-    factory.open(&shard1_id).await.expect("open shard 1");
+    factory
+        .open(&shard0_id, &ShardRange::full())
+        .await
+        .expect("open shard 0");
+    factory
+        .open(&shard1_id, &ShardRange::full())
+        .await
+        .expect("open shard 1");
 
     let client = ClusterClient::new(factory.clone(), None);
 
@@ -58,7 +64,10 @@ async fn cluster_client_owns_shard_after_opening() {
 async fn cluster_client_query_local_shard() {
     let (factory, shard_map) = make_test_factory_with_shards(1);
     let shard_id = shard_map.shards()[0].id;
-    factory.open(&shard_id).await.expect("open shard");
+    factory
+        .open(&shard_id, &ShardRange::full())
+        .await
+        .expect("open shard");
 
     // Enqueue a job
     let shard = factory.get(&shard_id).unwrap();
@@ -95,7 +104,10 @@ async fn cluster_client_query_local_shard() {
 async fn cluster_client_query_local_shard_empty_results() {
     let (factory, shard_map) = make_test_factory_with_shards(1);
     let shard_id = shard_map.shards()[0].id;
-    factory.open(&shard_id).await.expect("open shard");
+    factory
+        .open(&shard_id, &ShardRange::full())
+        .await
+        .expect("open shard");
 
     let client = ClusterClient::new(factory.clone(), None);
 
@@ -117,8 +129,14 @@ async fn cluster_client_query_all_local_shards() {
     let (factory, shard_map) = make_test_factory_with_shards(2);
     let shard0_id = shard_map.shards()[0].id;
     let shard1_id = shard_map.shards()[1].id;
-    factory.open(&shard0_id).await.expect("open shard 0");
-    factory.open(&shard1_id).await.expect("open shard 1");
+    factory
+        .open(&shard0_id, &ShardRange::full())
+        .await
+        .expect("open shard 0");
+    factory
+        .open(&shard1_id, &ShardRange::full())
+        .await
+        .expect("open shard 1");
 
     // Enqueue jobs to each shard
     let shard0 = factory.get(&shard0_id).unwrap();
@@ -177,7 +195,10 @@ async fn cluster_client_query_shard_not_found_without_coordinator() {
     let (factory, shard_map) = make_test_factory_with_shards(2);
     let shard0_id = shard_map.shards()[0].id;
     let shard1_id = shard_map.shards()[1].id; // We won't open this one
-    factory.open(&shard0_id).await.expect("open shard 0");
+    factory
+        .open(&shard0_id, &ShardRange::full())
+        .await
+        .expect("open shard 0");
 
     let client = ClusterClient::new(factory.clone(), None);
 
@@ -197,7 +218,10 @@ async fn cluster_client_query_shard_not_found_without_coordinator() {
 async fn cluster_client_get_job_local() {
     let (factory, shard_map) = make_test_factory_with_shards(1);
     let shard_id = shard_map.shards()[0].id;
-    factory.open(&shard_id).await.expect("open shard");
+    factory
+        .open(&shard_id, &ShardRange::full())
+        .await
+        .expect("open shard");
 
     let shard = factory.get(&shard_id).unwrap();
     shard
@@ -232,7 +256,10 @@ async fn cluster_client_get_job_local() {
 async fn cluster_client_get_job_not_found() {
     let (factory, shard_map) = make_test_factory_with_shards(1);
     let shard_id = shard_map.shards()[0].id;
-    factory.open(&shard_id).await.expect("open shard");
+    factory
+        .open(&shard_id, &ShardRange::full())
+        .await
+        .expect("open shard");
 
     let client = ClusterClient::new(factory.clone(), None);
 
@@ -254,7 +281,10 @@ async fn cluster_client_get_job_not_found() {
 async fn cluster_client_cancel_job_local() {
     let (factory, shard_map) = make_test_factory_with_shards(1);
     let shard_id = shard_map.shards()[0].id;
-    factory.open(&shard_id).await.expect("open shard");
+    factory
+        .open(&shard_id, &ShardRange::full())
+        .await
+        .expect("open shard");
 
     let shard = factory.get(&shard_id).unwrap();
     shard
@@ -296,7 +326,10 @@ async fn cluster_client_cancel_job_local() {
 async fn cluster_client_json_serialization_preserves_data() {
     let (factory, shard_map) = make_test_factory_with_shards(1);
     let shard_id = shard_map.shards()[0].id;
-    factory.open(&shard_id).await.expect("open shard");
+    factory
+        .open(&shard_id, &ShardRange::full())
+        .await
+        .expect("open shard");
 
     // Enqueue jobs with various JSON payload types
     let shard = factory.get(&shard_id).unwrap();
@@ -378,7 +411,10 @@ async fn cluster_client_get_shard_owner_map_without_coordinator() {
 async fn cluster_client_query_local_shard_sql_error() {
     let (factory, shard_map) = make_test_factory_with_shards(1);
     let shard_id = shard_map.shards()[0].id;
-    factory.open(&shard_id).await.expect("open shard");
+    factory
+        .open(&shard_id, &ShardRange::full())
+        .await
+        .expect("open shard");
 
     let client = ClusterClient::new(factory.clone(), None);
 
@@ -403,7 +439,10 @@ async fn cluster_client_query_local_shard_sql_error() {
 async fn cluster_client_query_local_shard_invalid_column() {
     let (factory, shard_map) = make_test_factory_with_shards(1);
     let shard_id = shard_map.shards()[0].id;
-    factory.open(&shard_id).await.expect("open shard");
+    factory
+        .open(&shard_id, &ShardRange::full())
+        .await
+        .expect("open shard");
 
     let client = ClusterClient::new(factory.clone(), None);
 
@@ -428,7 +467,10 @@ async fn cluster_client_query_local_shard_invalid_column() {
 async fn cluster_client_cancel_nonexistent_job() {
     let (factory, shard_map) = make_test_factory_with_shards(1);
     let shard_id = shard_map.shards()[0].id;
-    factory.open(&shard_id).await.expect("open shard");
+    factory
+        .open(&shard_id, &ShardRange::full())
+        .await
+        .expect("open shard");
 
     let client = ClusterClient::new(factory.clone(), None);
 
@@ -455,7 +497,10 @@ async fn cluster_client_cancel_job_on_remote_shard_without_coordinator() {
     let (factory, shard_map) = make_test_factory_with_shards(2);
     let shard0_id = shard_map.shards()[0].id;
     let unopened_shard_id = shard_map.shards()[1].id; // NOT opened
-    factory.open(&shard0_id).await.expect("open shard 0");
+    factory
+        .open(&shard0_id, &ShardRange::full())
+        .await
+        .expect("open shard 0");
 
     let client = ClusterClient::new(factory.clone(), None);
 
@@ -478,7 +523,10 @@ async fn cluster_client_get_job_on_remote_shard_without_coordinator() {
     let (factory, shard_map) = make_test_factory_with_shards(2);
     let shard0_id = shard_map.shards()[0].id;
     let unopened_shard_id = shard_map.shards()[1].id; // NOT opened
-    factory.open(&shard0_id).await.expect("open shard 0");
+    factory
+        .open(&shard0_id, &ShardRange::full())
+        .await
+        .expect("open shard 0");
 
     let client = ClusterClient::new(factory.clone(), None);
 
@@ -502,9 +550,18 @@ async fn cluster_client_query_all_local_shards_with_mixed_results() {
     let shard0_id = shard_map.shards()[0].id;
     let shard1_id = shard_map.shards()[1].id;
     let shard2_id = shard_map.shards()[2].id;
-    factory.open(&shard0_id).await.expect("open shard 0");
-    factory.open(&shard1_id).await.expect("open shard 1");
-    factory.open(&shard2_id).await.expect("open shard 2");
+    factory
+        .open(&shard0_id, &ShardRange::full())
+        .await
+        .expect("open shard 0");
+    factory
+        .open(&shard1_id, &ShardRange::full())
+        .await
+        .expect("open shard 1");
+    factory
+        .open(&shard2_id, &ShardRange::full())
+        .await
+        .expect("open shard 2");
 
     // Only add jobs to shards 0 and 2
     let shard0 = factory.get(&shard0_id).unwrap();

@@ -3,6 +3,7 @@
 use silo::gubernator::{MockGubernatorClient, RateLimitClient};
 use silo::job_store_shard::JobStoreShard;
 use silo::settings::{Backend, DatabaseConfig};
+use silo::shard_range::ShardRange;
 use slatedb::{Db, DbIterator};
 use std::sync::Arc;
 
@@ -37,6 +38,26 @@ pub async fn open_temp_shard() -> (tempfile::TempDir, std::sync::Arc<JobStoreSha
     open_temp_shard_with_rate_limiter(rate_limiter).await
 }
 
+/// Open a temp shard with a specific range (useful for testing split-aware behavior)
+pub async fn open_temp_shard_with_range(
+    range: ShardRange,
+) -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>) {
+    let rate_limiter = MockGubernatorClient::new_arc();
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = DatabaseConfig {
+        name: "test".to_string(),
+        backend: Backend::Fs,
+        path: tmp.path().to_string_lossy().to_string(),
+        flush_interval_ms: Some(10),
+        wal: None,
+        apply_wal_on_close: true,
+    };
+    let shard = JobStoreShard::open(&cfg, rate_limiter, None, range)
+        .await
+        .expect("open shard");
+    (tmp, shard)
+}
+
 /// Open a temp shard with a custom rate limiter (useful for testing rate limit behavior)
 pub async fn open_temp_shard_with_rate_limiter(
     rate_limiter: Arc<dyn RateLimitClient>,
@@ -51,7 +72,7 @@ pub async fn open_temp_shard_with_rate_limiter(
         wal: None,
         apply_wal_on_close: true,
     };
-    let shard = JobStoreShard::open(&cfg, rate_limiter, None)
+    let shard = JobStoreShard::open(&cfg, rate_limiter, None, ShardRange::full())
         .await
         .expect("open shard");
     (tmp, shard)
@@ -94,7 +115,7 @@ pub async fn open_temp_shard_with_local_wal_and_rate_limiter(
         apply_wal_on_close: flush_on_close,
     };
 
-    let shard = JobStoreShard::open(&cfg, rate_limiter, None)
+    let shard = JobStoreShard::open(&cfg, rate_limiter, None, ShardRange::full())
         .await
         .expect("open shard with local WAL");
 

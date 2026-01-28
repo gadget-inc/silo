@@ -134,6 +134,10 @@ async fn main() -> anyhow::Result<()> {
     let mut shards: std::collections::HashMap<silo::shard_range::ShardId, Arc<JobStoreShard>> =
         std::collections::HashMap::new();
     for shard_id in &shard_ids {
+        let range = shard_map
+            .get_shard(shard_id)
+            .map(|info| info.range.clone())
+            .expect("shard should exist in shard map");
         let cfg = DatabaseConfig {
             name: shard_id.to_string(),
             backend: Backend::Fs,
@@ -146,7 +150,7 @@ async fn main() -> anyhow::Result<()> {
             wal: None,
             apply_wal_on_close: true,
         };
-        let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None).await?;
+        let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, range).await?;
         shards.insert(*shard_id, shard);
     }
 

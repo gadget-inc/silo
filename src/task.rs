@@ -68,6 +68,18 @@ pub enum Task {
     },
 }
 
+impl Task {
+    /// Get the tenant ID from any Task variant.
+    pub fn tenant(&self) -> &str {
+        match self {
+            Task::RunAttempt { tenant, .. } => tenant,
+            Task::RequestTicket { tenant, .. } => tenant,
+            Task::CheckRateLimit { tenant, .. } => tenant,
+            Task::RefreshFloatingLimit { tenant, .. } => tenant,
+        }
+    }
+}
+
 /// Serializable rate limit data stored with CheckRateLimit tasks
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
 #[archive(check_bytes)]

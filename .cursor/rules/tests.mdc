@@ -4,10 +4,10 @@ alwaysApply: true
 
 When running tests, assume the background services required are already running.
 
-You can run rust tests with `cargo test`. Some cargo tests are disabled by default:
+You can run rust tests with `cargo test`. Some cargo tests have special requirements:
 
-- the k8s coordination tests, which you can run with `cargo test --features k8s k8s_ -- --test-threads=1`
-- the turmoil DST tests which you don't need to run
+- the k8s coordination tests must run single-threaded: `cargo test k8s_ -- --test-threads=1`
+- the turmoil DST tests which you don't need to run unless told to
 
 You can run TypeScript client tests with
 

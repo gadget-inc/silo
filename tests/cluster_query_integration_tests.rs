@@ -617,8 +617,6 @@ async fn cluster_two_nodes_queues_table() {
 /// properly applied to results from both local and remote shards.
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_two_nodes_projection_remote_shards() {
-    use datafusion::arrow::array::UInt32Array;
-
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load config");
 

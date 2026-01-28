@@ -423,6 +423,36 @@ message CpuProfileResponse {
   uint64 samples = 3;           // Number of samples collected.
 }
 
+// Request to initiate a shard split operation.
+message RequestSplitRequest {
+  string shard_id = 1;     // Shard ID (UUID) of the shard to split.
+  string split_point = 2;  // Tenant ID where to split the keyspace.
+}
+
+// Response after initiating a shard split.
+message RequestSplitResponse {
+  string left_child_id = 1;   // UUID of the left child shard [parent_start, split_point).
+  string right_child_id = 2;  // UUID of the right child shard [split_point, parent_end).
+  string phase = 3;           // Current split phase (e.g., "SplitRequested").
+}
+
+// Request to get the status of a shard split operation.
+message GetSplitStatusRequest {
+  string shard_id = 1;  // Parent shard ID (UUID) of the split operation.
+}
+
+// Response with the current split status.
+// Returns empty if no split is in progress for the shard.
+message GetSplitStatusResponse {
+  bool in_progress = 1;        // True if a split is in progress for this shard.
+  string phase = 2;            // Current split phase (empty if not in progress).
+  string left_child_id = 3;    // UUID of the left child shard (empty if not in progress).
+  string right_child_id = 4;   // UUID of the right child shard (empty if not in progress).
+  string split_point = 5;      // Tenant ID at which the split occurs (empty if not in progress).
+  string initiator_node_id = 6; // Node ID that initiated the split.
+  int64 requested_at_ms = 7;   // Unix timestamp (ms) when split was requested.
+}
+
 // The Silo job queue service.
 service Silo {
   // Get cluster topology for client-side routing.
@@ -502,5 +532,17 @@ service Silo {
   // Returns pprof protobuf data that can be analyzed with pprof or go tool pprof.
   // The profile captures CPU usage for the specified duration.
   rpc CpuProfile(CpuProfileRequest) returns (CpuProfileResponse);
+  
+  // Request a shard split operation.
+  // Initiates splitting a shard into two child shards at the specified split point.
+  // Returns FAILED_PRECONDITION if a split is already in progress.
+  // Returns NOT_FOUND if the shard doesn't exist on this node.
+  // Returns INVALID_ARGUMENT if the split point is outside the shard's range.
+  rpc RequestSplit(RequestSplitRequest) returns (RequestSplitResponse);
+  
+  // Get the status of a shard split operation.
+  // Returns the current phase and child shard IDs if a split is in progress.
+  // If no split is in progress, returns with in_progress=false.
+  rpc GetSplitStatus(GetSplitStatusRequest) returns (GetSplitStatusResponse);
 }
 
