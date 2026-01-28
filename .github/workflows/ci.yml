@@ -69,8 +69,34 @@ jobs:
         # Run K8S tests single-threaded to prevent interference between tests
         run: cargo test --features k8s k8s_ -- --test-threads=1
 
+  alloy-changes:
+    name: Detect Alloy changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      job-shard: ${{ steps.filter.outputs.job-shard }}
+      coordination: ${{ steps.filter.outputs.coordination }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            job-shard:
+              - 'specs/job_shard.als'
+              - 'scripts/run-alloy-verification.mjs'
+              - 'flake.lock'
+            coordination:
+              - 'specs/coordination.als'
+              - 'scripts/run-alloy-verification.mjs'
+              - 'flake.lock'
+
   alloy-job-shard:
     name: Alloy verification (job_shard)
+    needs: alloy-changes
+    if: needs.alloy-changes.outputs.job-shard == 'true'
     runs-on: ubuntu-latest-l
     steps:
       - uses: actions/checkout@v4
@@ -86,6 +112,8 @@ jobs:
 
   alloy-coordination:
     name: Alloy verification (coordination)
+    needs: alloy-changes
+    if: needs.alloy-changes.outputs.coordination == 'true'
     runs-on: ubuntu-latest-l
     steps:
       - uses: actions/checkout@v4
