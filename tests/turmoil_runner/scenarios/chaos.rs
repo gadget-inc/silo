@@ -24,8 +24,8 @@
 
 use crate::helpers::{
     ConcurrencyLimit, EnqueueRequest, HashMap, InvariantTracker, LeaseTasksRequest, Limit,
-    SerializedBytes, ReportOutcomeRequest, RetryPolicy, Task, create_turmoil_client, get_seed, limit, serialized_bytes,
-    report_outcome_request, run_scenario_impl, setup_server, turmoil, verify_server_invariants,
+    ReportOutcomeRequest, RetryPolicy, SerializedBytes, Task, create_turmoil_client, get_seed,
+    limit, report_outcome_request, run_scenario_impl, serialized_bytes, setup_server, turmoil,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -231,12 +231,14 @@ pub fn run() {
                         start_at_ms: 0,
                         retry_policy: retry_policy.clone(),
                         payload: Some(SerializedBytes {
-                            encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({
-                                "chaos": true,
-                                "limit": limit_key,
-                                "idx": i
-                            }))
-                            .unwrap())),
+                            encoding: Some(serialized_bytes::Encoding::Msgpack(
+                                rmp_serde::to_vec(&serde_json::json!({
+                                    "chaos": true,
+                                    "limit": limit_key,
+                                    "idx": i
+                                }))
+                                .unwrap(),
+                            )),
                         }),
                         limits: limits.clone(),
                         tenant: None,
@@ -702,64 +704,28 @@ pub fn run() {
             Ok(())
         });
 
-        // Invariant verifier: Periodically checks system invariants
-        // This verifier consumes server-side DST events to track state accurately
+        // Invariant verifier: Periodically checks system invariants using DST events.
+        // DST events are emitted synchronously by the server and collected via a
+        // thread-local event bus - no network involved. This ensures verification
+        // is reliable even under chaotic network conditions.
         let verifier_tracker = Arc::clone(&tracker);
         let verifier_completed = Arc::clone(&total_completed);
         let verifier_enqueued = Arc::clone(&total_enqueued);
         let verifier_attempted = Arc::clone(&total_attempted);
         let verifier_done_flag = Arc::clone(&scenario_done);
-        let verifier_config = client_config.clone();
         sim.client("verifier", async move {
             // Wait for work to start
             tokio::time::sleep(Duration::from_millis(500)).await;
 
-            // Create client for server-side checks
-            let mut client = match create_turmoil_client("http://server:9910", &verifier_config).await {
-                Ok(c) => Some(c),
-                Err(_) => None,
-            };
-
-            // Periodically verify invariants. Fewer checks because each check
-            // involves RPC calls that can be delayed by network issues.
+            // Periodically verify invariants using DST events (no RPCs needed).
             for check in 0..8 {
                 tokio::time::sleep(Duration::from_millis(500)).await;
 
                 // Process DST events from server-side instrumentation
                 verifier_tracker.process_dst_events();
 
-                // Run client-side invariant checks (now based on server events)
+                // Run invariant checks based on server events
                 verifier_tracker.verify_all();
-
-                // Run server-side invariant checks if we have a client
-                if let Some(ref mut c) = client {
-                    match verify_server_invariants(c, 0).await {
-                        Ok(result) => {
-                            if !result.violations.is_empty() {
-                                tracing::warn!(
-                                    violations = ?result.violations,
-                                    "server_invariant_violations"
-                                );
-                            }
-                            tracing::trace!(
-                                check = check,
-                                running = result.running_job_count,
-                                terminal = result.terminal_job_count,
-                                holders = ?result.holder_counts_by_queue,
-                                "server_state"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::trace!(error = %e, check = check, "server_check_failed");
-                            // Try to reconnect
-                            if let Ok(new_client) =
-                                create_turmoil_client("http://server:9910", &verifier_config).await
-                            {
-                                client = Some(new_client);
-                            }
-                        }
-                    }
-                }
 
                 let enqueued = verifier_enqueued.load(Ordering::SeqCst);
                 let completed = verifier_completed.load(Ordering::SeqCst);
@@ -772,9 +738,7 @@ pub fn run() {
                 );
             }
 
-            // Wait for work to complete. The checks above take real time due to
-            // RPC delays under network chaos, so keep this short to stay within
-            // the 180s simulation budget.
+            // Wait for work to complete
             tokio::time::sleep(Duration::from_secs(40)).await;
             verifier_done_flag.store(true, Ordering::SeqCst);
 
