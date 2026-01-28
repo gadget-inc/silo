@@ -101,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
         &cfg.coordination,
         &node_id,
         advertised_grpc_addr,
-        cfg.coordination.num_shards,
+        cfg.coordination.initial_shard_count,
         factory.clone(),
     )
     .await;

@@ -19,14 +19,14 @@
 //! - Jobs eventually complete despite rate limit processing
 
 use crate::helpers::{
-    EnqueueRequest, GetJobRequest, HashMap, JobStatus, LeaseTasksRequest, Limit, SerializedBytes,
-    ReportOutcomeRequest, get_seed, limit, report_outcome_request, run_scenario_impl, serialized_bytes,
-    setup_server, turmoil_connector, verify_server_invariants,
+    EnqueueRequest, GetJobRequest, HashMap, JobStatus, LeaseTasksRequest, Limit,
+    ReportOutcomeRequest, SerializedBytes, TEST_SHARD_ID, get_seed, limit, report_outcome_request,
+    run_scenario_impl, serialized_bytes, setup_server, turmoil_connector, verify_server_invariants,
 };
 use silo::pb::silo_client::SiloClient;
 use silo::pb::{GubernatorAlgorithm, GubernatorRateLimit, RateLimitRetryPolicy};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tonic::transport::Endpoint;
 
@@ -60,20 +60,22 @@ pub fn run() {
 
                 match client
                     .enqueue(tonic::Request::new(EnqueueRequest {
-                        shard: 0,
+                        shard: TEST_SHARD_ID.to_string(),
                         id: job_id.clone(),
                         priority: 10,
                         start_at_ms: 0,
                         retry_policy: None,
                         payload: Some(SerializedBytes {
-                            encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"job": i})).unwrap())),
+                            encoding: Some(serialized_bytes::Encoding::Msgpack(
+                                rmp_serde::to_vec(&serde_json::json!({"job": i})).unwrap(),
+                            )),
                         }),
                         limits: vec![Limit {
                             limit: Some(limit::Limit::RateLimit(GubernatorRateLimit {
                                 name: RATE_LIMIT_NAME.to_string(),
                                 unique_key: format!("test-key-{}", i % 2), // Use 2 different keys
-                                limit: 100,      // Generous limit
-                                duration_ms: 60000, // 1 minute window
+                                limit: 100,                                // Generous limit
+                                duration_ms: 60000,                        // 1 minute window
                                 hits: 1,
                                 algorithm: GubernatorAlgorithm::TokenBucket as i32,
                                 behavior: 0,
@@ -112,13 +114,15 @@ pub fn run() {
 
                 match client
                     .enqueue(tonic::Request::new(EnqueueRequest {
-                        shard: 0,
+                        shard: TEST_SHARD_ID.to_string(),
                         id: job_id.clone(),
                         priority: 10,
                         start_at_ms: 0,
                         retry_policy: None,
                         payload: Some(SerializedBytes {
-                            encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"combined": i})).unwrap())),
+                            encoding: Some(serialized_bytes::Encoding::Msgpack(
+                                rmp_serde::to_vec(&serde_json::json!({"combined": i})).unwrap(),
+                            )),
                         }),
                         limits: vec![
                             // Rate limit
@@ -141,10 +145,12 @@ pub fn run() {
                             },
                             // Concurrency limit
                             Limit {
-                                limit: Some(limit::Limit::Concurrency(silo::pb::ConcurrencyLimit {
-                                    key: "combined-concurrency".to_string(),
-                                    max_concurrency: 2,
-                                })),
+                                limit: Some(limit::Limit::Concurrency(
+                                    silo::pb::ConcurrencyLimit {
+                                        key: "combined-concurrency".to_string(),
+                                        max_concurrency: 2,
+                                    },
+                                )),
                             },
                         ],
                         tenant: None,
@@ -187,7 +193,7 @@ pub fn run() {
             for _round in 0..80 {
                 let lease = client
                     .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                        shard: Some(0),
+                        shard: Some(TEST_SHARD_ID.to_string()),
                         worker_id: "worker-1".into(),
                         max_tasks: 3,
                         task_group: "default".to_string(),
@@ -208,11 +214,15 @@ pub fn run() {
                     // Complete the task
                     match client
                         .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                            shard: 0,
+                            shard: TEST_SHARD_ID.to_string(),
                             task_id: task.id.clone(),
-                            outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
-                                encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!("done")).unwrap())),
-                            })),
+                            outcome: Some(report_outcome_request::Outcome::Success(
+                                SerializedBytes {
+                                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                                        rmp_serde::to_vec(&serde_json::json!("done")).unwrap(),
+                                    )),
+                                },
+                            )),
                         }))
                         .await
                     {
@@ -252,7 +262,7 @@ pub fn run() {
             let mut client = SiloClient::new(ch);
 
             // Verify server state
-            if let Ok(state) = verify_server_invariants(&mut client, 0).await {
+            if let Ok(state) = verify_server_invariants(&mut client, TEST_SHARD_ID).await {
                 assert!(
                     state.violations.is_empty(),
                     "Server invariant violations: {:?}",
@@ -275,7 +285,7 @@ pub fn run() {
                 let job_id = format!("rate-limited-job-{}", i);
                 if let Ok(resp) = client
                     .get_job(tonic::Request::new(GetJobRequest {
-                        shard: 0,
+                        shard: TEST_SHARD_ID.to_string(),
                         id: job_id.clone(),
                         tenant: None,
                         include_attempts: false,
@@ -302,7 +312,7 @@ pub fn run() {
                 let job_id = format!("combined-limit-job-{}", i);
                 if let Ok(resp) = client
                     .get_job(tonic::Request::new(GetJobRequest {
-                        shard: 0,
+                        shard: TEST_SHARD_ID.to_string(),
                         id: job_id.clone(),
                         tenant: None,
                         include_attempts: false,
@@ -339,10 +349,7 @@ pub fn run() {
 
             // Verify progress - with rate limits, all jobs should still complete
             // given our generous limits
-            assert!(
-                completed > 0,
-                "At least some jobs should have completed"
-            );
+            assert!(completed > 0, "At least some jobs should have completed");
 
             // Verify most jobs are terminal
             let expected_terminal = (enqueued as f64 * 0.5) as u32;

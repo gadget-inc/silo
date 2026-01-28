@@ -17,7 +17,7 @@
 //!
 //! 1. Create a new file in `scenarios/` with a `pub fn run()` function
 //! 2. Add it to `scenarios/mod.rs`
-//! 3. Add a `#[test] fn your_name()` in this file that calls the scenario
+//! 3. Add a `#[silo::test] fn your_name()` in this file that calls the scenario
 
 mod helpers;
 mod scenarios;
@@ -27,6 +27,10 @@ use helpers::{get_seed, is_fuzz_mode, is_subprocess, verify_determinism};
 // ============================================================================
 // Test Functions
 // ============================================================================
+
+// DST tests use plain #[test] instead of #[silo::test] because they set up
+// their own deterministic tracing subscriber in init_deterministic_tracing().
+// Using #[silo::test] would set up a global subscriber first, causing a conflict.
 
 #[test]
 fn grpc_end_to_end() {

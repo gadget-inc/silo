@@ -6,12 +6,13 @@ use silo::cluster_client::ClusterClient;
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::settings::{Backend, DatabaseTemplate};
+use silo::shard_range::ShardMap;
 use std::sync::Arc;
 
-/// Create a test factory with memory backend
-fn make_test_factory() -> Arc<ShardFactory> {
+/// Create a test factory with memory backend and a ShardMap
+fn make_test_factory_with_shards(num_shards: u32) -> (Arc<ShardFactory>, ShardMap) {
     let tmpdir = tempfile::tempdir().unwrap();
-    Arc::new(ShardFactory::new(
+    let factory = Arc::new(ShardFactory::new(
         DatabaseTemplate {
             backend: Backend::Memory,
             path: tmpdir.path().join("%shard%").to_string_lossy().to_string(),
@@ -20,39 +21,47 @@ fn make_test_factory() -> Arc<ShardFactory> {
         },
         MockGubernatorClient::new_arc(),
         None,
-    ))
+    ));
+    let shard_map = ShardMap::create_initial(num_shards).expect("create shard map");
+    (factory, shard_map)
 }
 
 #[silo::test]
 async fn cluster_client_new_without_coordinator() {
-    let factory = make_test_factory();
+    let (factory, shard_map) = make_test_factory_with_shards(2);
     let client = ClusterClient::new(factory.clone(), None);
 
     // Without coordinator, owns_shard should return false for unopened shards
-    assert!(!client.owns_shard(0));
-    assert!(!client.owns_shard(1));
+    let shard0_id = shard_map.shards()[0].id;
+    let shard1_id = shard_map.shards()[1].id;
+    assert!(!client.owns_shard(&shard0_id));
+    assert!(!client.owns_shard(&shard1_id));
 }
 
 #[silo::test]
 async fn cluster_client_owns_shard_after_opening() {
-    let factory = make_test_factory();
-    factory.open(0).await.expect("open shard 0");
-    factory.open(1).await.expect("open shard 1");
+    let (factory, shard_map) = make_test_factory_with_shards(3);
+    let shard0_id = shard_map.shards()[0].id;
+    let shard1_id = shard_map.shards()[1].id;
+    let shard2_id = shard_map.shards()[2].id;
+    factory.open(&shard0_id).await.expect("open shard 0");
+    factory.open(&shard1_id).await.expect("open shard 1");
 
     let client = ClusterClient::new(factory.clone(), None);
 
-    assert!(client.owns_shard(0));
-    assert!(client.owns_shard(1));
-    assert!(!client.owns_shard(2));
+    assert!(client.owns_shard(&shard0_id));
+    assert!(client.owns_shard(&shard1_id));
+    assert!(!client.owns_shard(&shard2_id));
 }
 
 #[silo::test]
 async fn cluster_client_query_local_shard() {
-    let factory = make_test_factory();
-    factory.open(0).await.expect("open shard");
+    let (factory, shard_map) = make_test_factory_with_shards(1);
+    let shard_id = shard_map.shards()[0].id;
+    factory.open(&shard_id).await.expect("open shard");
 
     // Enqueue a job
-    let shard = factory.get("0").unwrap();
+    let shard = factory.get(&shard_id).unwrap();
     shard
         .enqueue(
             "test-tenant",
@@ -72,11 +81,11 @@ async fn cluster_client_query_local_shard() {
 
     // Query the local shard
     let result = client
-        .query_shard(0, "SELECT id FROM jobs")
+        .query_shard(&shard_id, "SELECT id FROM jobs")
         .await
         .expect("query should succeed");
 
-    assert_eq!(result.shard_id, 0);
+    assert_eq!(result.shard_id, shard_id);
     assert_eq!(result.row_count, 1);
     assert_eq!(result.columns.len(), 1);
     assert_eq!(result.columns[0].name, "id");
@@ -84,18 +93,19 @@ async fn cluster_client_query_local_shard() {
 
 #[silo::test]
 async fn cluster_client_query_local_shard_empty_results() {
-    let factory = make_test_factory();
-    factory.open(0).await.expect("open shard");
+    let (factory, shard_map) = make_test_factory_with_shards(1);
+    let shard_id = shard_map.shards()[0].id;
+    factory.open(&shard_id).await.expect("open shard");
 
     let client = ClusterClient::new(factory.clone(), None);
 
     // Query the local shard with no jobs
     let result = client
-        .query_shard(0, "SELECT id FROM jobs")
+        .query_shard(&shard_id, "SELECT id FROM jobs")
         .await
         .expect("query should succeed");
 
-    assert_eq!(result.shard_id, 0);
+    assert_eq!(result.shard_id, shard_id);
     assert_eq!(result.row_count, 0);
     assert_eq!(result.rows.len(), 0);
     // Schema should still be present even with no rows
@@ -104,12 +114,14 @@ async fn cluster_client_query_local_shard_empty_results() {
 
 #[silo::test]
 async fn cluster_client_query_all_local_shards() {
-    let factory = make_test_factory();
-    factory.open(0).await.expect("open shard 0");
-    factory.open(1).await.expect("open shard 1");
+    let (factory, shard_map) = make_test_factory_with_shards(2);
+    let shard0_id = shard_map.shards()[0].id;
+    let shard1_id = shard_map.shards()[1].id;
+    factory.open(&shard0_id).await.expect("open shard 0");
+    factory.open(&shard1_id).await.expect("open shard 1");
 
     // Enqueue jobs to each shard
-    let shard0 = factory.get("0").unwrap();
+    let shard0 = factory.get(&shard0_id).unwrap();
     shard0
         .enqueue(
             "test-tenant",
@@ -125,7 +137,7 @@ async fn cluster_client_query_all_local_shards() {
         .await
         .expect("enqueue job on shard 0");
 
-    let shard1 = factory.get("1").unwrap();
+    let shard1 = factory.get(&shard1_id).unwrap();
     shard1
         .enqueue(
             "test-tenant",
@@ -155,20 +167,22 @@ async fn cluster_client_query_all_local_shards() {
     assert_eq!(total_rows, 2, "should have 2 jobs total");
 
     // Verify we got results from different shards
-    let shard_ids: Vec<u32> = results.iter().map(|r| r.shard_id).collect();
-    assert!(shard_ids.contains(&0));
-    assert!(shard_ids.contains(&1));
+    let shard_ids: Vec<silo::shard_range::ShardId> = results.iter().map(|r| r.shard_id).collect();
+    assert!(shard_ids.contains(&shard0_id));
+    assert!(shard_ids.contains(&shard1_id));
 }
 
 #[silo::test]
 async fn cluster_client_query_shard_not_found_without_coordinator() {
-    let factory = make_test_factory();
-    factory.open(0).await.expect("open shard 0");
+    let (factory, shard_map) = make_test_factory_with_shards(2);
+    let shard0_id = shard_map.shards()[0].id;
+    let shard1_id = shard_map.shards()[1].id; // We won't open this one
+    factory.open(&shard0_id).await.expect("open shard 0");
 
     let client = ClusterClient::new(factory.clone(), None);
 
     // Without coordinator, querying a shard we don't own should return NoCoordinator error
-    let result = client.query_shard(999, "SELECT id FROM jobs").await;
+    let result = client.query_shard(&shard1_id, "SELECT id FROM jobs").await;
 
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -181,10 +195,11 @@ async fn cluster_client_query_shard_not_found_without_coordinator() {
 
 #[silo::test]
 async fn cluster_client_get_job_local() {
-    let factory = make_test_factory();
-    factory.open(0).await.expect("open shard");
+    let (factory, shard_map) = make_test_factory_with_shards(1);
+    let shard_id = shard_map.shards()[0].id;
+    factory.open(&shard_id).await.expect("open shard");
 
-    let shard = factory.get("0").unwrap();
+    let shard = factory.get(&shard_id).unwrap();
     shard
         .enqueue(
             "test-tenant",
@@ -204,7 +219,7 @@ async fn cluster_client_get_job_local() {
 
     // Get the job
     let response = client
-        .get_job(0, "test-tenant", "job-001", false)
+        .get_job(&shard_id, "test-tenant", "job-001", false)
         .await
         .expect("get job should succeed");
 
@@ -215,14 +230,15 @@ async fn cluster_client_get_job_local() {
 
 #[silo::test]
 async fn cluster_client_get_job_not_found() {
-    let factory = make_test_factory();
-    factory.open(0).await.expect("open shard");
+    let (factory, shard_map) = make_test_factory_with_shards(1);
+    let shard_id = shard_map.shards()[0].id;
+    factory.open(&shard_id).await.expect("open shard");
 
     let client = ClusterClient::new(factory.clone(), None);
 
     // Get non-existent job
     let result = client
-        .get_job(0, "test-tenant", "non-existent", false)
+        .get_job(&shard_id, "test-tenant", "non-existent", false)
         .await;
 
     assert!(result.is_err());
@@ -236,10 +252,11 @@ async fn cluster_client_get_job_not_found() {
 
 #[silo::test]
 async fn cluster_client_cancel_job_local() {
-    let factory = make_test_factory();
-    factory.open(0).await.expect("open shard");
+    let (factory, shard_map) = make_test_factory_with_shards(1);
+    let shard_id = shard_map.shards()[0].id;
+    factory.open(&shard_id).await.expect("open shard");
 
-    let shard = factory.get("0").unwrap();
+    let shard = factory.get(&shard_id).unwrap();
     shard
         .enqueue(
             "test-tenant",
@@ -259,13 +276,16 @@ async fn cluster_client_cancel_job_local() {
 
     // Cancel the job
     client
-        .cancel_job(0, "test-tenant", "job-to-cancel")
+        .cancel_job(&shard_id, "test-tenant", "job-to-cancel")
         .await
         .expect("cancel should succeed");
 
     // Verify the job was cancelled by checking it's gone from scheduled
     let result = client
-        .query_shard(0, "SELECT id FROM jobs WHERE status_kind = 'Scheduled'")
+        .query_shard(
+            &shard_id,
+            "SELECT id FROM jobs WHERE status_kind = 'Scheduled'",
+        )
         .await
         .expect("query should succeed");
 
@@ -274,11 +294,12 @@ async fn cluster_client_cancel_job_local() {
 
 #[silo::test]
 async fn cluster_client_json_serialization_preserves_data() {
-    let factory = make_test_factory();
-    factory.open(0).await.expect("open shard");
+    let (factory, shard_map) = make_test_factory_with_shards(1);
+    let shard_id = shard_map.shards()[0].id;
+    factory.open(&shard_id).await.expect("open shard");
 
     // Enqueue jobs with various JSON payload types
-    let shard = factory.get("0").unwrap();
+    let shard = factory.get(&shard_id).unwrap();
 
     // Complex nested JSON
     shard
@@ -308,7 +329,7 @@ async fn cluster_client_json_serialization_preserves_data() {
 
     // Query and verify the payload column is properly serialized
     let result = client
-        .query_shard(0, "SELECT id, payload FROM jobs")
+        .query_shard(&shard_id, "SELECT id, payload FROM jobs")
         .await
         .expect("query should succeed");
 
@@ -339,7 +360,7 @@ async fn cluster_client_json_serialization_preserves_data() {
 
 #[silo::test]
 async fn cluster_client_get_shard_owner_map_without_coordinator() {
-    let factory = make_test_factory();
+    let (factory, _shard_map) = make_test_factory_with_shards(1);
     let client = ClusterClient::new(factory.clone(), None);
 
     let result = client.get_shard_owner_map().await;
@@ -355,13 +376,16 @@ async fn cluster_client_get_shard_owner_map_without_coordinator() {
 
 #[silo::test]
 async fn cluster_client_query_local_shard_sql_error() {
-    let factory = make_test_factory();
-    factory.open(0).await.expect("open shard");
+    let (factory, shard_map) = make_test_factory_with_shards(1);
+    let shard_id = shard_map.shards()[0].id;
+    factory.open(&shard_id).await.expect("open shard");
 
     let client = ClusterClient::new(factory.clone(), None);
 
     // Query with invalid SQL should fail
-    let result = client.query_shard(0, "SELECT FROM WHERE INVALID").await;
+    let result = client
+        .query_shard(&shard_id, "SELECT FROM WHERE INVALID")
+        .await;
 
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -377,14 +401,15 @@ async fn cluster_client_query_local_shard_sql_error() {
 
 #[silo::test]
 async fn cluster_client_query_local_shard_invalid_column() {
-    let factory = make_test_factory();
-    factory.open(0).await.expect("open shard");
+    let (factory, shard_map) = make_test_factory_with_shards(1);
+    let shard_id = shard_map.shards()[0].id;
+    factory.open(&shard_id).await.expect("open shard");
 
     let client = ClusterClient::new(factory.clone(), None);
 
     // Query with non-existent column should fail
     let result = client
-        .query_shard(0, "SELECT nonexistent_column FROM jobs")
+        .query_shard(&shard_id, "SELECT nonexistent_column FROM jobs")
         .await;
 
     assert!(result.is_err());
@@ -401,13 +426,16 @@ async fn cluster_client_query_local_shard_invalid_column() {
 
 #[silo::test]
 async fn cluster_client_cancel_nonexistent_job() {
-    let factory = make_test_factory();
-    factory.open(0).await.expect("open shard");
+    let (factory, shard_map) = make_test_factory_with_shards(1);
+    let shard_id = shard_map.shards()[0].id;
+    factory.open(&shard_id).await.expect("open shard");
 
     let client = ClusterClient::new(factory.clone(), None);
 
     // Cancel a job that doesn't exist - should return an error
-    let result = client.cancel_job(0, "test-tenant", "nonexistent-job").await;
+    let result = client
+        .cancel_job(&shard_id, "test-tenant", "nonexistent-job")
+        .await;
 
     // cancel_job returns error for non-existent jobs
     assert!(result.is_err());
@@ -424,14 +452,17 @@ async fn cluster_client_cancel_nonexistent_job() {
 
 #[silo::test]
 async fn cluster_client_cancel_job_on_remote_shard_without_coordinator() {
-    let factory = make_test_factory();
-    factory.open(0).await.expect("open shard 0");
-    // Note: Shard 999 is NOT opened
+    let (factory, shard_map) = make_test_factory_with_shards(2);
+    let shard0_id = shard_map.shards()[0].id;
+    let unopened_shard_id = shard_map.shards()[1].id; // NOT opened
+    factory.open(&shard0_id).await.expect("open shard 0");
 
     let client = ClusterClient::new(factory.clone(), None);
 
     // Try to cancel job on shard we don't own (without coordinator)
-    let result = client.cancel_job(999, "test-tenant", "some-job").await;
+    let result = client
+        .cancel_job(&unopened_shard_id, "test-tenant", "some-job")
+        .await;
 
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -444,14 +475,17 @@ async fn cluster_client_cancel_job_on_remote_shard_without_coordinator() {
 
 #[silo::test]
 async fn cluster_client_get_job_on_remote_shard_without_coordinator() {
-    let factory = make_test_factory();
-    factory.open(0).await.expect("open shard 0");
-    // Note: Shard 999 is NOT opened
+    let (factory, shard_map) = make_test_factory_with_shards(2);
+    let shard0_id = shard_map.shards()[0].id;
+    let unopened_shard_id = shard_map.shards()[1].id; // NOT opened
+    factory.open(&shard0_id).await.expect("open shard 0");
 
     let client = ClusterClient::new(factory.clone(), None);
 
     // Try to get job on shard we don't own (without coordinator)
-    let result = client.get_job(999, "test-tenant", "some-job", false).await;
+    let result = client
+        .get_job(&unopened_shard_id, "test-tenant", "some-job", false)
+        .await;
 
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -464,13 +498,16 @@ async fn cluster_client_get_job_on_remote_shard_without_coordinator() {
 
 #[silo::test]
 async fn cluster_client_query_all_local_shards_with_mixed_results() {
-    let factory = make_test_factory();
-    factory.open(0).await.expect("open shard 0");
-    factory.open(1).await.expect("open shard 1");
-    factory.open(2).await.expect("open shard 2");
+    let (factory, shard_map) = make_test_factory_with_shards(3);
+    let shard0_id = shard_map.shards()[0].id;
+    let shard1_id = shard_map.shards()[1].id;
+    let shard2_id = shard_map.shards()[2].id;
+    factory.open(&shard0_id).await.expect("open shard 0");
+    factory.open(&shard1_id).await.expect("open shard 1");
+    factory.open(&shard2_id).await.expect("open shard 2");
 
     // Only add jobs to shards 0 and 2
-    let shard0 = factory.get("0").unwrap();
+    let shard0 = factory.get(&shard0_id).unwrap();
     shard0
         .enqueue(
             "test-tenant",
@@ -486,7 +523,7 @@ async fn cluster_client_query_all_local_shards_with_mixed_results() {
         .await
         .expect("enqueue on shard 0");
 
-    let shard2 = factory.get("2").unwrap();
+    let shard2 = factory.get(&shard2_id).unwrap();
     shard2
         .enqueue(
             "test-tenant",

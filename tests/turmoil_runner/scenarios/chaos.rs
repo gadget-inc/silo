@@ -24,8 +24,9 @@
 
 use crate::helpers::{
     ConcurrencyLimit, EnqueueRequest, HashMap, InvariantTracker, LeaseTasksRequest, Limit,
-    ReportOutcomeRequest, RetryPolicy, SerializedBytes, Task, create_turmoil_client, get_seed,
-    limit, report_outcome_request, run_scenario_impl, serialized_bytes, setup_server, turmoil,
+    ReportOutcomeRequest, RetryPolicy, SerializedBytes, TEST_SHARD_ID, Task, create_turmoil_client,
+    get_seed, limit, report_outcome_request, run_scenario_impl, serialized_bytes, setup_server,
+    turmoil,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -225,7 +226,7 @@ pub fn run() {
                 producer_attempted.fetch_add(1, Ordering::SeqCst);
                 match client
                     .enqueue(tonic::Request::new(EnqueueRequest {
-                        shard: 0,
+                        shard: TEST_SHARD_ID.to_string(),
                         id: job_id.clone(),
                         priority,
                         start_at_ms: 0,
@@ -298,7 +299,7 @@ pub fn run() {
 
                 match client
                     .cancel_job(tonic::Request::new(CancelJobRequest {
-                        shard: 0,
+                        shard: TEST_SHARD_ID.to_string(),
                         id: job_id.clone(),
                         tenant: None,
                     }))
@@ -350,7 +351,7 @@ pub fn run() {
 
                 match client
                     .expedite_job(tonic::Request::new(ExpediteJobRequest {
-                        shard: 0,
+                        shard: TEST_SHARD_ID.to_string(),
                         id: job_id.clone(),
                         tenant: None,
                     }))
@@ -402,7 +403,7 @@ pub fn run() {
 
                 match client
                     .restart_job(tonic::Request::new(RestartJobRequest {
-                        shard: 0,
+                        shard: TEST_SHARD_ID.to_string(),
                         id: job_id.clone(),
                         tenant: None,
                     }))
@@ -472,7 +473,7 @@ pub fn run() {
 
                     let lease_result = client
                         .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                            shard: Some(0),
+                            shard: Some(TEST_SHARD_ID.to_string()),
                             worker_id: worker_id.clone(),
                             max_tasks,
                             task_group: "default".to_string(),
@@ -560,7 +561,7 @@ pub fn run() {
 
                             match client
                                 .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                                    shard: 0,
+                                    shard: TEST_SHARD_ID.to_string(),
                                     task_id: task.id.clone(),
                                     outcome: Some(outcome),
                                 }))
@@ -616,7 +617,7 @@ pub fn run() {
 
                     match client
                         .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                            shard: 0,
+                            shard: TEST_SHARD_ID.to_string(),
                             task_id: task.id.clone(),
                             outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
                                 encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!("chaos_done")).unwrap())),

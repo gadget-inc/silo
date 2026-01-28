@@ -6,6 +6,7 @@ use silo::coordination::{Coordinator, EtcdCoordinator, etcd::EtcdConnection};
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::settings::{Backend, DatabaseTemplate};
+use silo::shard_range::ShardId;
 
 // Global mutex to serialize coordination tests
 static COORDINATION_TEST_MUTEX: Mutex<()> = Mutex::new(());
@@ -104,35 +105,38 @@ async fn multiple_nodes_own_unique_shards() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // Ensure coverage: wait for convergence on all nodes and union must equal 0..num_shards
+    // Ensure coverage: wait for convergence on all nodes and union must equal all shards
     assert!(c1.wait_converged(Duration::from_secs(20)).await);
     assert!(c2.wait_converged(Duration::from_secs(20)).await);
     assert!(c3.wait_converged(Duration::from_secs(20)).await);
     let s1 = c1.owned_shards().await;
     let s2 = c2.owned_shards().await;
     let s3 = c3.owned_shards().await;
-    let all: HashSet<u32> = s1
+    let all: HashSet<ShardId> = s1
         .iter()
         .copied()
         .chain(s2.iter().copied())
         .chain(s3.iter().copied())
         .collect();
-    let expected: HashSet<u32> = (0..num_shards).collect();
+    // Get the expected shard IDs from the shard map
+    let shard_map = c1.get_shard_map().await.expect("get shard map");
+    let expected: HashSet<ShardId> = shard_map.shards().iter().map(|s| s.id).collect();
     assert_eq!(all, expected, "all shards should be owned exactly once");
 
     // Ensure uniqueness: no overlaps between nodes
-    let set1: HashSet<u32> = s1.iter().copied().collect();
-    let set2: HashSet<u32> = s2.iter().copied().collect();
-    let set3: HashSet<u32> = s3.iter().copied().collect();
+    let set1: HashSet<ShardId> = s1.iter().copied().collect();
+    let set2: HashSet<ShardId> = s2.iter().copied().collect();
+    let set3: HashSet<ShardId> = s3.iter().copied().collect();
     assert!(set1.is_disjoint(&set2));
     assert!(set1.is_disjoint(&set3));
     assert!(set2.is_disjoint(&set3));
 
-    // validate distribution sanity with a reasonable tolerance (10% of shards)
+    // validate distribution sanity with a reasonable tolerance
+    // With UUID-based shard IDs, distribution variance can be higher due to randomness
     let sizes = [set1.len(), set2.len(), set3.len()];
     let max = *sizes.iter().max().unwrap();
     let min = *sizes.iter().min().unwrap();
-    let tolerance = ((num_shards as f32) * 0.10).ceil() as usize; // 10%
+    let tolerance = ((num_shards as f32) * 0.20).ceil() as usize; // 20% - relaxed for UUID randomness
     assert!(
         max - min <= tolerance,
         "distribution should be roughly even: {:?}",
@@ -181,13 +185,14 @@ async fn adding_a_node_rebalances_shards() {
     assert!(c1.wait_converged(std::time::Duration::from_secs(20)).await);
     assert!(c2.wait_converged(std::time::Duration::from_secs(20)).await);
 
-    let before_union: HashSet<u32> = c1
+    let before_union: HashSet<ShardId> = c1
         .owned_shards()
         .await
         .into_iter()
         .chain(c2.owned_shards().await.into_iter())
         .collect();
-    let expected: HashSet<u32> = (0..num_shards).collect();
+    let shard_map = c1.get_shard_map().await.expect("get shard map");
+    let expected: HashSet<ShardId> = shard_map.shards().iter().map(|s| s.id).collect();
     assert_eq!(before_union, expected);
 
     // Add new node
@@ -210,24 +215,24 @@ async fn adding_a_node_rebalances_shards() {
     let s1 = c1.owned_shards().await;
     let s2 = c2.owned_shards().await;
     let s3 = c3.owned_shards().await;
-    let all: HashSet<u32> = s1
+    let all: HashSet<ShardId> = s1
         .iter()
         .copied()
         .chain(s2.iter().copied())
         .chain(s3.iter().copied())
         .collect();
-    let expected: HashSet<u32> = (0..num_shards).collect();
+    let expected: HashSet<ShardId> = shard_map.shards().iter().map(|s| s.id).collect();
     assert_eq!(all, expected);
     assert!(
-        HashSet::<u32>::from_iter(s1.iter().copied())
+        HashSet::<ShardId>::from_iter(s1.iter().copied())
             .is_disjoint(&HashSet::from_iter(s2.iter().copied()))
     );
     assert!(
-        HashSet::<u32>::from_iter(s1.iter().copied())
+        HashSet::<ShardId>::from_iter(s1.iter().copied())
             .is_disjoint(&HashSet::from_iter(s3.iter().copied()))
     );
     assert!(
-        HashSet::<u32>::from_iter(s2.iter().copied())
+        HashSet::<ShardId>::from_iter(s2.iter().copied())
             .is_disjoint(&HashSet::from_iter(s3.iter().copied()))
     );
 
@@ -294,11 +299,12 @@ async fn removing_a_node_rebalances_shards() {
     assert!(c2.wait_converged(std::time::Duration::from_secs(10)).await);
     let s1 = c1.owned_shards().await;
     let s2 = c2.owned_shards().await;
-    let all: HashSet<u32> = s1.iter().copied().chain(s2.iter().copied()).collect();
-    let expected: HashSet<u32> = (0..num_shards).collect();
+    let all: HashSet<ShardId> = s1.iter().copied().chain(s2.iter().copied()).collect();
+    let shard_map = c1.get_shard_map().await.expect("get shard map");
+    let expected: HashSet<ShardId> = shard_map.shards().iter().map(|s| s.id).collect();
     assert_eq!(all, expected);
     assert!(
-        HashSet::<u32>::from_iter(s1.iter().copied())
+        HashSet::<ShardId>::from_iter(s1.iter().copied())
             .is_disjoint(&HashSet::from_iter(s2.iter().copied()))
     );
 
@@ -381,24 +387,26 @@ async fn rapid_membership_churn_converges() {
     let s1 = c1.owned_shards().await;
     let s2 = c2b.owned_shards().await;
     let s3 = c3.owned_shards().await;
-    let all: std::collections::HashSet<u32> = s1
+    let all: std::collections::HashSet<ShardId> = s1
         .iter()
         .copied()
         .chain(s2.iter().copied())
         .chain(s3.iter().copied())
         .collect();
-    let expected: std::collections::HashSet<u32> = (0..num_shards).collect();
+    let shard_map = c1.get_shard_map().await.expect("get shard map");
+    let expected: std::collections::HashSet<ShardId> =
+        shard_map.shards().iter().map(|s| s.id).collect();
     assert_eq!(all, expected);
     assert!(
-        std::collections::HashSet::<u32>::from_iter(s1.iter().copied())
+        std::collections::HashSet::<ShardId>::from_iter(s1.iter().copied())
             .is_disjoint(&std::collections::HashSet::from_iter(s2.iter().copied()))
     );
     assert!(
-        std::collections::HashSet::<u32>::from_iter(s1.iter().copied())
+        std::collections::HashSet::<ShardId>::from_iter(s1.iter().copied())
             .is_disjoint(&std::collections::HashSet::from_iter(s3.iter().copied()))
     );
     assert!(
-        std::collections::HashSet::<u32>::from_iter(s2.iter().copied())
+        std::collections::HashSet::<ShardId>::from_iter(s2.iter().copied())
             .is_disjoint(&std::collections::HashSet::from_iter(s3.iter().copied()))
     );
 
@@ -529,17 +537,18 @@ async fn multi_node_ownership_stable_over_time() {
     assert!(c1.wait_converged(Duration::from_secs(10)).await);
     assert!(c2.wait_converged(Duration::from_secs(10)).await);
 
-    let initial_s1: HashSet<u32> = c1.owned_shards().await.into_iter().collect();
-    let initial_s2: HashSet<u32> = c2.owned_shards().await.into_iter().collect();
+    let initial_s1: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    let initial_s2: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
 
     // Verify initial state
     assert!(initial_s1.is_disjoint(&initial_s2), "no overlap initially");
-    let all: HashSet<u32> = initial_s1
+    let all: HashSet<ShardId> = initial_s1
         .iter()
         .copied()
         .chain(initial_s2.iter().copied())
         .collect();
-    let expected: HashSet<u32> = (0..num_shards).collect();
+    let shard_map = c1.get_shard_map().await.expect("get shard map");
+    let expected: HashSet<ShardId> = shard_map.shards().iter().map(|s| s.id).collect();
     assert_eq!(all, expected, "all shards covered initially");
 
     // Sample ownership multiple times over 3x TTL with NO membership changes
@@ -547,8 +556,8 @@ async fn multi_node_ownership_stable_over_time() {
     for i in 0..3 {
         tokio::time::sleep(Duration::from_secs(lease_ttl_secs as u64)).await;
 
-        let s1: HashSet<u32> = c1.owned_shards().await.into_iter().collect();
-        let s2: HashSet<u32> = c2.owned_shards().await.into_iter().collect();
+        let s1: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+        let s2: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
 
         assert_eq!(
             s1, initial_s1,
@@ -614,21 +623,16 @@ async fn shard_owner_map_matches_actual_ownership() {
     );
 
     // Verify owner map is consistent with actual ownership
-    let s1: HashSet<u32> = c1.owned_shards().await.into_iter().collect();
-    let s2: HashSet<u32> = c2.owned_shards().await.into_iter().collect();
+    let s1: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    let s2: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
 
-    for shard_id in 0..num_shards {
-        let addr = owner_map
-            .shard_to_addr
-            .get(&shard_id)
-            .expect("shard should have addr");
-
-        if s1.contains(&shard_id) {
+    for (shard_id, addr) in &owner_map.shard_to_addr {
+        if s1.contains(shard_id) {
             assert_eq!(
                 addr, "http://127.0.0.1:50061",
                 "shard {shard_id} owned by c1 should map to c1's addr"
             );
-        } else if s2.contains(&shard_id) {
+        } else if s2.contains(shard_id) {
             assert_eq!(
                 addr, "http://127.0.0.1:50062",
                 "shard {shard_id} owned by c2 should map to c2's addr"

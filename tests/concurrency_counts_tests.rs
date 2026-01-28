@@ -5,7 +5,7 @@
 
 use silo::concurrency::ConcurrencyCounts;
 
-#[test]
+#[silo::test]
 fn try_reserve_success() {
     let counts = ConcurrencyCounts::new();
 
@@ -18,7 +18,7 @@ fn try_reserve_success() {
     assert_eq!(counts.holder_count("tenant1", "queue1"), 2);
 }
 
-#[test]
+#[silo::test]
 fn try_reserve_at_capacity() {
     let counts = ConcurrencyCounts::new();
 
@@ -30,7 +30,7 @@ fn try_reserve_at_capacity() {
     assert_eq!(counts.holder_count("tenant1", "queue1"), 1);
 }
 
-#[test]
+#[silo::test]
 fn try_reserve_idempotent() {
     let counts = ConcurrencyCounts::new();
 
@@ -42,7 +42,7 @@ fn try_reserve_idempotent() {
     assert_eq!(counts.holder_count("tenant1", "queue1"), 1);
 }
 
-#[test]
+#[silo::test]
 fn try_reserve_different_queues() {
     let counts = ConcurrencyCounts::new();
 
@@ -54,7 +54,7 @@ fn try_reserve_different_queues() {
     assert_eq!(counts.holder_count("tenant1", "queue2"), 1);
 }
 
-#[test]
+#[silo::test]
 fn try_reserve_different_tenants() {
     let counts = ConcurrencyCounts::new();
 
@@ -66,7 +66,7 @@ fn try_reserve_different_tenants() {
     assert_eq!(counts.holder_count("tenant2", "queue1"), 1);
 }
 
-#[test]
+#[silo::test]
 fn release_reservation() {
     let counts = ConcurrencyCounts::new();
 
@@ -82,7 +82,7 @@ fn release_reservation() {
     assert_eq!(counts.holder_count("tenant1", "queue1"), 1);
 }
 
-#[test]
+#[silo::test]
 fn release_reservation_nonexistent() {
     let counts = ConcurrencyCounts::new();
 
@@ -91,7 +91,7 @@ fn release_reservation_nonexistent() {
     assert_eq!(counts.holder_count("tenant1", "queue1"), 0);
 }
 
-#[test]
+#[silo::test]
 fn atomic_release_and_reserve() {
     let counts = ConcurrencyCounts::new();
 
@@ -108,7 +108,7 @@ fn atomic_release_and_reserve() {
     assert!(!counts.try_reserve("tenant1", "queue1", "task3", 1, "job3"));
 }
 
-#[test]
+#[silo::test]
 fn atomic_release() {
     let counts = ConcurrencyCounts::new();
 
@@ -123,7 +123,7 @@ fn atomic_release() {
     assert!(counts.try_reserve("tenant1", "queue1", "task2", 1, "job2"));
 }
 
-#[test]
+#[silo::test]
 fn atomic_release_nonexistent() {
     let counts = ConcurrencyCounts::new();
 
@@ -132,7 +132,7 @@ fn atomic_release_nonexistent() {
     assert_eq!(counts.holder_count("tenant1", "queue1"), 0);
 }
 
-#[test]
+#[silo::test]
 fn rollback_release_and_reserve() {
     let counts = ConcurrencyCounts::new();
 
@@ -151,7 +151,7 @@ fn rollback_release_and_reserve() {
     assert!(!counts.try_reserve("tenant1", "queue1", "task3", 1, "job3"));
 }
 
-#[test]
+#[silo::test]
 fn rollback_release() {
     let counts = ConcurrencyCounts::new();
 
@@ -170,7 +170,7 @@ fn rollback_release() {
     assert!(!counts.try_reserve("tenant1", "queue1", "task2", 1, "job2"));
 }
 
-#[test]
+#[silo::test]
 fn toctou_prevention_scenario() {
     // This test demonstrates the fix for the TOCTOU race.
     // The key insight is that try_reserve atomically checks AND reserves.
@@ -191,7 +191,7 @@ fn toctou_prevention_scenario() {
     assert_eq!(counts.holder_count("tenant1", "queue1"), 1);
 }
 
-#[test]
+#[silo::test]
 fn rollback_after_failed_db_write_scenario() {
     // Simulates the rollback flow when a DB write fails after try_reserve
     let counts = ConcurrencyCounts::new();
@@ -209,7 +209,7 @@ fn rollback_after_failed_db_write_scenario() {
     assert_eq!(counts.holder_count("tenant1", "queue1"), 1);
 }
 
-#[test]
+#[silo::test]
 fn concurrent_reserve_limit_enforcement() {
     // Tests that try_reserve correctly enforces limits with various max_concurrency values
     let counts = ConcurrencyCounts::new();
@@ -225,7 +225,7 @@ fn concurrent_reserve_limit_enforcement() {
     assert_eq!(counts.holder_count("t", "q"), 3);
 }
 
-#[test]
+#[silo::test]
 fn release_and_reserve_maintains_count() {
     // Verifies that atomic_release_and_reserve doesn't change the count
     let counts = ConcurrencyCounts::new();
@@ -243,7 +243,7 @@ fn release_and_reserve_maintains_count() {
     assert!(!counts.try_reserve("t", "q", "task4", 2, "job4"));
 }
 
-#[test]
+#[silo::test]
 fn multiple_rollbacks_in_sequence() {
     // Tests the rollback flow for multiple release-and-grant operations
     let counts = ConcurrencyCounts::new();
@@ -283,7 +283,7 @@ fn multiple_rollbacks_in_sequence() {
 /// Without proper rollback, we'd leak slot(s) in memory:
 /// - If we only rollback release_and_reserve: task2's slot leaks (count shows 2, should be 1)
 /// - If we only rollback task2's grant: task1 is released but shouldn't be
-#[test]
+#[silo::test]
 fn retry_scheduling_with_immediate_grant_rollback() {
     let counts = ConcurrencyCounts::new();
 
@@ -322,7 +322,7 @@ fn retry_scheduling_with_immediate_grant_rollback() {
 
 /// Test that WITHOUT proper rollback of retry immediate grants, we leak slots.
 /// This demonstrates why the rollback is necessary.
-#[test]
+#[silo::test]
 fn retry_immediate_grant_leak_without_rollback() {
     let counts = ConcurrencyCounts::new();
 

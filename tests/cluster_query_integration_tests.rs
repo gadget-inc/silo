@@ -57,12 +57,12 @@ async fn get_client(addr: &str) -> SiloClient<Channel> {
 /// Enqueue a job via gRPC to a specific shard
 async fn enqueue_job(
     client: &mut SiloClient<Channel>,
-    shard: u32,
+    shard: &str,
     job_id: &str,
     tenant: Option<&str>,
 ) {
     let request = EnqueueRequest {
-        shard,
+        shard: shard.to_string(),
         id: job_id.to_string(),
         priority: 5,
         start_at_ms: 0,
@@ -87,8 +87,8 @@ async fn enqueue_job(
 struct ClusterClients {
     client1: SiloClient<Channel>,
     client2: SiloClient<Channel>,
-    node1_shards: Vec<u32>,
-    node2_shards: Vec<u32>,
+    node1_shards: Vec<String>,
+    node2_shards: Vec<String>,
 }
 
 impl ClusterClients {
@@ -107,9 +107,9 @@ impl ClusterClients {
 
         for (shard_id, addr) in &owner_map.shard_to_addr {
             if addr.contains(&addr1.replace("127.0.0.1:", "")) || addr == addr1 {
-                node1_shards.push(*shard_id);
+                node1_shards.push(shard_id.to_string());
             } else {
-                node2_shards.push(*shard_id);
+                node2_shards.push(shard_id.to_string());
             }
         }
 
@@ -125,8 +125,8 @@ impl ClusterClients {
     }
 
     /// Get the client for the node that owns the given shard
-    fn client_for_shard(&mut self, shard: u32) -> &mut SiloClient<Channel> {
-        if self.node1_shards.contains(&shard) {
+    fn client_for_shard(&mut self, shard: &str) -> &mut SiloClient<Channel> {
+        if self.node1_shards.contains(&shard.to_string()) {
             &mut self.client1
         } else {
             &mut self.client2
@@ -134,19 +134,19 @@ impl ClusterClients {
     }
 
     /// Get a shard owned by node 1
-    fn shard_on_node1(&self) -> u32 {
-        *self
-            .node1_shards
+    fn shard_on_node1(&self) -> String {
+        self.node1_shards
             .first()
             .expect("node1 should own at least one shard")
+            .clone()
     }
 
     /// Get a shard owned by node 2
-    fn shard_on_node2(&self) -> u32 {
-        *self
-            .node2_shards
+    fn shard_on_node2(&self) -> String {
+        self.node2_shards
             .first()
             .expect("node2 should own at least one shard")
+            .clone()
     }
 }
 
@@ -232,16 +232,15 @@ async fn cluster_two_nodes_basic_query() {
     let shard2 = clients.shard_on_node2();
 
     // Enqueue jobs to shards owned by the correct nodes
-    enqueue_job(clients.client_for_shard(shard1), shard1, "job-001", None).await;
-    enqueue_job(clients.client_for_shard(shard1), shard1, "job-002", None).await;
-    enqueue_job(clients.client_for_shard(shard2), shard2, "job-003", None).await;
-    enqueue_job(clients.client_for_shard(shard2), shard2, "job-004", None).await;
+    enqueue_job(clients.client_for_shard(&shard1), &shard1, "job-001", None).await;
+    enqueue_job(clients.client_for_shard(&shard1), &shard1, "job-002", None).await;
+    enqueue_job(clients.client_for_shard(&shard2), &shard2, "job-003", None).await;
+    enqueue_job(clients.client_for_shard(&shard2), &shard2, "job-004", None).await;
 
     // Create cluster query engine on node 1
-    let query_engine =
-        ClusterQueryEngine::new(factory1.clone(), Some(coordinator1.clone()), NUM_SHARDS)
-            .await
-            .expect("failed to create query engine");
+    let query_engine = ClusterQueryEngine::new(factory1.clone(), Some(coordinator1.clone()))
+        .await
+        .expect("failed to create query engine");
 
     // Test basic count query
     let df = query_engine
@@ -346,18 +345,23 @@ async fn cluster_two_nodes_status_filter_query() {
     // Set up cluster clients with shard routing
     let mut clients = ClusterClients::new(&addr1, &addr2, &coordinator1).await;
 
-    // Enqueue some jobs, routing to the correct node for each shard
+    // Enqueue some jobs, alternating between available shards
+    let all_shards: Vec<String> = clients
+        .node1_shards
+        .iter()
+        .chain(clients.node2_shards.iter())
+        .cloned()
+        .collect();
     for i in 0..5u32 {
-        let shard = i % NUM_SHARDS;
+        let shard = &all_shards[i as usize % all_shards.len()];
         let client = clients.client_for_shard(shard);
         enqueue_job(client, shard, &format!("job-{:03}", i), None).await;
     }
 
     // Create cluster query engine
-    let query_engine =
-        ClusterQueryEngine::new(factory1.clone(), Some(coordinator1.clone()), NUM_SHARDS)
-            .await
-            .expect("failed to create query engine");
+    let query_engine = ClusterQueryEngine::new(factory1.clone(), Some(coordinator1.clone()))
+        .await
+        .expect("failed to create query engine");
 
     // Test status filter - this is what the webui uses
     let df = query_engine
@@ -465,17 +469,22 @@ async fn cluster_two_nodes_count_across_shards() {
     let mut clients = ClusterClients::new(&addr1, &addr2, &coordinator1).await;
 
     // Enqueue jobs to different shards, routing to the correct node
+    let all_shards: Vec<String> = clients
+        .node1_shards
+        .iter()
+        .chain(clients.node2_shards.iter())
+        .cloned()
+        .collect();
     for i in 0..20u32 {
-        let shard = i % NUM_SHARDS;
+        let shard = &all_shards[i as usize % all_shards.len()];
         let client = clients.client_for_shard(shard);
         enqueue_job(client, shard, &format!("job-{:03}", i), None).await;
     }
 
     // Create cluster query engine
-    let query_engine =
-        ClusterQueryEngine::new(factory1.clone(), Some(coordinator1.clone()), NUM_SHARDS)
-            .await
-            .expect("failed to create query engine");
+    let query_engine = ClusterQueryEngine::new(factory1.clone(), Some(coordinator1.clone()))
+        .await
+        .expect("failed to create query engine");
 
     // Test COUNT aggregation across shards
     let df = query_engine
@@ -578,10 +587,9 @@ async fn cluster_two_nodes_queues_table() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Create cluster query engine
-    let query_engine =
-        ClusterQueryEngine::new(factory1.clone(), Some(coordinator1.clone()), NUM_SHARDS)
-            .await
-            .expect("failed to create query engine");
+    let query_engine = ClusterQueryEngine::new(factory1.clone(), Some(coordinator1.clone()))
+        .await
+        .expect("failed to create query engine");
 
     // Test queues table query - used by queues page
     let df = query_engine
@@ -681,17 +689,22 @@ async fn cluster_two_nodes_projection_remote_shards() {
     let mut clients = ClusterClients::new(&addr1, &addr2, &coordinator1).await;
 
     // Enqueue jobs to different shards, ensuring some go to each node
+    let all_shards: Vec<String> = clients
+        .node1_shards
+        .iter()
+        .chain(clients.node2_shards.iter())
+        .cloned()
+        .collect();
     for i in 0..10u32 {
-        let shard = i % NUM_SHARDS;
+        let shard = &all_shards[i as usize % all_shards.len()];
         let client = clients.client_for_shard(shard);
         enqueue_job(client, shard, &format!("proj-job-{:03}", i), None).await;
     }
 
     // Create cluster query engine on node 1
-    let query_engine =
-        ClusterQueryEngine::new(factory1.clone(), Some(coordinator1.clone()), NUM_SHARDS)
-            .await
-            .expect("failed to create query engine");
+    let query_engine = ClusterQueryEngine::new(factory1.clone(), Some(coordinator1.clone()))
+        .await
+        .expect("failed to create query engine");
 
     // Test projection with specific columns (not SELECT *)
     // This is the pattern used by the webui and catches schema mismatches
@@ -721,8 +734,8 @@ async fn cluster_two_nodes_projection_remote_shards() {
             .column_by_name("shard_id")
             .expect("shard_id column missing")
             .as_any()
-            .downcast_ref::<UInt32Array>()
-            .expect("shard_id should be UInt32");
+            .downcast_ref::<StringArray>()
+            .expect("shard_id should be String (UUID)");
         let id_col = batch
             .column_by_name("id")
             .expect("id column missing")
@@ -745,8 +758,8 @@ async fn cluster_two_nodes_projection_remote_shards() {
         // Verify actual data values make sense
         for i in 0..batch.num_rows() {
             assert!(
-                shard_col.value(i) < NUM_SHARDS,
-                "shard_id should be < NUM_SHARDS"
+                !shard_col.value(i).is_empty(),
+                "shard_id should be a non-empty UUID string"
             );
             assert!(
                 id_col.value(i).starts_with("proj-job-"),

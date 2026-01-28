@@ -7,8 +7,8 @@
 
 use crate::helpers::{
     AttemptStatus, EnqueueRequest, GetJobRequest, HashMap, InvariantTracker, JobStatus,
-    LeaseTasksRequest, SerializedBytes, ReportOutcomeRequest, get_seed, report_outcome_request, serialized_bytes,
-    run_scenario_impl, setup_server, turmoil_connector,
+    LeaseTasksRequest, ReportOutcomeRequest, SerializedBytes, TEST_SHARD_ID, get_seed,
+    report_outcome_request, run_scenario_impl, serialized_bytes, setup_server, turmoil_connector,
 };
 use silo::pb::silo_client::SiloClient;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -45,13 +45,15 @@ pub fn run() {
                 tracing::trace!(job_id = %job_id, "enqueue");
                 client
                     .enqueue(tonic::Request::new(EnqueueRequest {
-                        shard: 0,
+                        shard: TEST_SHARD_ID.to_string(),
                         id: job_id.clone(),
                         priority: i as u32,
                         start_at_ms: 0,
                         retry_policy: None,
                         payload: Some(SerializedBytes {
-                            encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"job": i})).unwrap())),
+                            encoding: Some(serialized_bytes::Encoding::Msgpack(
+                                rmp_serde::to_vec(&serde_json::json!({"job": i})).unwrap(),
+                            )),
                         }),
                         limits: vec![],
                         tenant: None,
@@ -80,7 +82,7 @@ pub fn run() {
             for _ in 0..10 {
                 let lease = client
                     .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                        shard: Some(0),
+                        shard: Some(TEST_SHARD_ID.to_string()),
                         worker_id: "w1".into(),
                         max_tasks: 2,
                         task_group: "default".to_string(),
@@ -98,11 +100,15 @@ pub fn run() {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     client
                         .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                            shard: 0,
+                            shard: TEST_SHARD_ID.to_string(),
                             task_id: task.id.clone(),
-                            outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
-                                encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!("ok")).unwrap())),
-                            })),
+                            outcome: Some(report_outcome_request::Outcome::Success(
+                                SerializedBytes {
+                                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                                        rmp_serde::to_vec(&serde_json::json!("ok")).unwrap(),
+                                    )),
+                                },
+                            )),
                         }))
                         .await?;
 
@@ -133,7 +139,7 @@ pub fn run() {
             for _ in 0..10 {
                 let lease = client
                     .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                        shard: Some(0),
+                        shard: Some(TEST_SHARD_ID.to_string()),
                         worker_id: "w2".into(),
                         max_tasks: 2,
                         task_group: "default".to_string(),
@@ -151,11 +157,15 @@ pub fn run() {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     client
                         .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                            shard: 0,
+                            shard: TEST_SHARD_ID.to_string(),
                             task_id: task.id.clone(),
-                            outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
-                                encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!("ok")).unwrap())),
-                            })),
+                            outcome: Some(report_outcome_request::Outcome::Success(
+                                SerializedBytes {
+                                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                                        rmp_serde::to_vec(&serde_json::json!("ok")).unwrap(),
+                                    )),
+                                },
+                            )),
                         }))
                         .await?;
 
@@ -212,7 +222,7 @@ pub fn run() {
             for job_id in &enqueued {
                 let job_resp = client
                     .get_job(tonic::Request::new(GetJobRequest {
-                        shard: 0,
+                        shard: TEST_SHARD_ID.to_string(),
                         id: job_id.clone(),
                         tenant: None,
                         include_attempts: true,
@@ -276,10 +286,7 @@ pub fn run() {
                 );
             }
 
-            tracing::trace!(
-                succeeded = succeeded,
-                "verifier_done"
-            );
+            tracing::trace!(succeeded = succeeded, "verifier_done");
 
             Ok(())
         });

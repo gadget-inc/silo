@@ -4,8 +4,12 @@
 import type { RpcTransport } from "@protobuf-ts/runtime-rpc";
 import type { ServiceInfo } from "@protobuf-ts/runtime-rpc";
 import { Silo } from "./silo";
+import type { CpuProfileResponse } from "./silo";
+import type { CpuProfileRequest } from "./silo";
 import type { ResetShardsResponse } from "./silo";
 import type { ResetShardsRequest } from "./silo";
+import type { GetShardCountersResponse } from "./silo";
+import type { GetShardCountersRequest } from "./silo";
 import type { ArrowIpcMessage } from "./silo";
 import type { QueryArrowRequest } from "./silo";
 import type { ServerStreamingCall } from "@protobuf-ts/runtime-rpc";
@@ -150,6 +154,13 @@ export interface ISiloClient {
      */
     queryArrow(input: QueryArrowRequest, options?: RpcOptions): ServerStreamingCall<QueryArrowRequest, ArrowIpcMessage>;
     /**
+     * Get job counters for a shard.
+     * Returns total jobs and completed jobs without scanning all job data.
+     *
+     * @generated from protobuf rpc: GetShardCounters
+     */
+    getShardCounters(input: GetShardCountersRequest, options?: RpcOptions): UnaryCall<GetShardCountersRequest, GetShardCountersResponse>;
+    /**
      * Reset all shards owned by this server.
      * WARNING: Destructive operation. Only available in dev mode.
      * Clears all jobs, tasks, queues, and other data.
@@ -157,6 +168,14 @@ export interface ISiloClient {
      * @generated from protobuf rpc: ResetShards
      */
     resetShards(input: ResetShardsRequest, options?: RpcOptions): UnaryCall<ResetShardsRequest, ResetShardsResponse>;
+    /**
+     * Capture a CPU profile from this node.
+     * Returns pprof protobuf data that can be analyzed with pprof or go tool pprof.
+     * The profile captures CPU usage for the specified duration.
+     *
+     * @generated from protobuf rpc: CpuProfile
+     */
+    cpuProfile(input: CpuProfileRequest, options?: RpcOptions): UnaryCall<CpuProfileRequest, CpuProfileResponse>;
 }
 /**
  * The Silo job queue service.
@@ -317,6 +336,16 @@ export class SiloClient implements ISiloClient, ServiceInfo {
         return stackIntercept<QueryArrowRequest, ArrowIpcMessage>("serverStreaming", this._transport, method, opt, input);
     }
     /**
+     * Get job counters for a shard.
+     * Returns total jobs and completed jobs without scanning all job data.
+     *
+     * @generated from protobuf rpc: GetShardCounters
+     */
+    getShardCounters(input: GetShardCountersRequest, options?: RpcOptions): UnaryCall<GetShardCountersRequest, GetShardCountersResponse> {
+        const method = this.methods[14], opt = this._transport.mergeOptions(options);
+        return stackIntercept<GetShardCountersRequest, GetShardCountersResponse>("unary", this._transport, method, opt, input);
+    }
+    /**
      * Reset all shards owned by this server.
      * WARNING: Destructive operation. Only available in dev mode.
      * Clears all jobs, tasks, queues, and other data.
@@ -324,7 +353,18 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: ResetShards
      */
     resetShards(input: ResetShardsRequest, options?: RpcOptions): UnaryCall<ResetShardsRequest, ResetShardsResponse> {
-        const method = this.methods[14], opt = this._transport.mergeOptions(options);
+        const method = this.methods[15], opt = this._transport.mergeOptions(options);
         return stackIntercept<ResetShardsRequest, ResetShardsResponse>("unary", this._transport, method, opt, input);
+    }
+    /**
+     * Capture a CPU profile from this node.
+     * Returns pprof protobuf data that can be analyzed with pprof or go tool pprof.
+     * The profile captures CPU usage for the specified duration.
+     *
+     * @generated from protobuf rpc: CpuProfile
+     */
+    cpuProfile(input: CpuProfileRequest, options?: RpcOptions): UnaryCall<CpuProfileRequest, CpuProfileResponse> {
+        const method = this.methods[16], opt = this._transport.mergeOptions(options);
+        return stackIntercept<CpuProfileRequest, CpuProfileResponse>("unary", this._transport, method, opt, input);
     }
 }

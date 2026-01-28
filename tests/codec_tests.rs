@@ -10,7 +10,7 @@ use silo::job::{JobStatus, JobStatusKind};
 use silo::job_attempt::{AttemptStatus, JobAttempt};
 use silo::task::{ConcurrencyAction, HolderRecord, LeaseRecord, Task};
 
-#[test]
+#[silo::test]
 fn test_task_roundtrip() {
     let task = Task::RunAttempt {
         id: "task-1".to_string(),
@@ -43,7 +43,7 @@ fn test_task_roundtrip() {
     }
 }
 
-#[test]
+#[silo::test]
 fn test_version_mismatch() {
     let task = Task::RunAttempt {
         id: "task-1".to_string(),
@@ -65,13 +65,13 @@ fn test_version_mismatch() {
     ));
 }
 
-#[test]
+#[silo::test]
 fn test_empty_data() {
     let result = decode_task(&[]);
     assert!(matches!(result, Err(CodecError::TooShort)));
 }
 
-#[test]
+#[silo::test]
 fn test_lease_roundtrip() {
     let lease = LeaseRecord {
         worker_id: "worker-1".to_string(),
@@ -93,7 +93,7 @@ fn test_lease_roundtrip() {
     assert_eq!(archived.expiry_ms, 12345);
 }
 
-#[test]
+#[silo::test]
 fn test_job_attempt_roundtrip() {
     let attempt = JobAttempt {
         job_id: "job-1".to_string(),
@@ -111,7 +111,7 @@ fn test_job_attempt_roundtrip() {
     assert_eq!(archived.attempt_number, 1);
 }
 
-#[test]
+#[silo::test]
 fn test_job_status_roundtrip() {
     let status = JobStatus::running(5000);
     let encoded = encode_job_status(&status).unwrap();
@@ -126,7 +126,7 @@ fn test_job_status_roundtrip() {
     assert_eq!(deserialized.changed_at_ms, 5000i64);
 }
 
-#[test]
+#[silo::test]
 fn test_holder_roundtrip() {
     let holder = HolderRecord {
         granted_at_ms: 9999,
@@ -137,7 +137,7 @@ fn test_holder_roundtrip() {
     assert_eq!(decoded.archived().granted_at_ms, 9999);
 }
 
-#[test]
+#[silo::test]
 fn test_concurrency_action_roundtrip() {
     let action = ConcurrencyAction::EnqueueTask {
         start_time_ms: 1000,

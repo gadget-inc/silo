@@ -15,6 +15,7 @@ use tokio::sync::{Mutex, Notify, watch};
 use tracing::debug;
 
 use crate::factory::ShardFactory;
+use crate::shard_range::{ShardId, ShardMap};
 
 pub mod etcd;
 #[cfg(feature = "k8s")]
@@ -45,15 +46,45 @@ pub fn get_hostname() -> Option<String> {
     hostname::get().ok().and_then(|h| h.into_string().ok())
 }
 
-/// Mapping of shard IDs to their owning node's gRPC address
+/// Mapping of shard IDs to their owning node's gRPC address.
+///
+/// This struct combines the static shard map (which defines shard identities and ranges)
+/// with dynamic ownership information (which nodes own which shards).
 #[derive(Debug, Clone)]
 pub struct ShardOwnerMap {
-    /// Total number of shards in the cluster
-    pub num_shards: u32,
+    /// The shard map defining all shards and their ranges
+    pub shard_map: ShardMap,
     /// Maps shard_id -> grpc_addr of the owning node
-    pub shard_to_addr: HashMap<u32, String>,
+    pub shard_to_addr: HashMap<ShardId, String>,
     /// Maps shard_id -> node_id of the owning node
-    pub shard_to_node: HashMap<u32, String>,
+    pub shard_to_node: HashMap<ShardId, String>,
+}
+
+impl ShardOwnerMap {
+    /// Get the total number of shards in the cluster.
+    pub fn num_shards(&self) -> usize {
+        self.shard_map.len()
+    }
+
+    /// Get all shard IDs.
+    pub fn shard_ids(&self) -> Vec<ShardId> {
+        self.shard_map.shard_ids()
+    }
+
+    /// Find the shard that owns a given tenant ID.
+    pub fn shard_for_tenant(&self, tenant_id: &str) -> Option<ShardId> {
+        self.shard_map.shard_for_tenant(tenant_id).map(|s| s.id)
+    }
+
+    /// Get the gRPC address for a shard owner.
+    pub fn get_addr(&self, shard_id: &ShardId) -> Option<&String> {
+        self.shard_to_addr.get(shard_id)
+    }
+
+    /// Get the node ID for a shard owner.
+    pub fn get_node(&self, shard_id: &ShardId) -> Option<&String> {
+        self.shard_to_node.get(shard_id)
+    }
 }
 
 /// Error type for coordination operations
@@ -164,13 +195,13 @@ impl<T> Default for ShardGuardState<T> {
 
 /// Common context for a shard guard that's shared across backends.
 pub struct ShardGuardContext {
-    pub shard_id: u32,
+    pub shard_id: ShardId,
     pub notify: Notify,
     pub shutdown: watch::Receiver<bool>,
 }
 
 impl ShardGuardContext {
-    pub fn new(shard_id: u32, shutdown: watch::Receiver<bool>) -> Self {
+    pub fn new(shard_id: ShardId, shutdown: watch::Receiver<bool>) -> Self {
         Self {
             shard_id,
             notify: Notify::new(),
@@ -200,8 +231,10 @@ impl ShardGuardContext {
 pub struct CoordinatorBase {
     pub node_id: String,
     pub grpc_addr: String,
-    pub num_shards: u32,
-    pub owned: Arc<Mutex<HashSet<u32>>>,
+    /// The shard map defining all shards and their ranges.
+    /// This is loaded from the coordination backend or created during cluster init.
+    pub shard_map: Arc<Mutex<ShardMap>>,
+    pub owned: Arc<Mutex<HashSet<ShardId>>>,
     pub shutdown_tx: watch::Sender<bool>,
     pub shutdown_rx: watch::Receiver<bool>,
     pub factory: Arc<ShardFactory>,
@@ -214,7 +247,7 @@ impl CoordinatorBase {
     pub fn new(
         node_id: impl Into<String>,
         grpc_addr: impl Into<String>,
-        num_shards: u32,
+        shard_map: ShardMap,
         factory: Arc<ShardFactory>,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -225,7 +258,7 @@ impl CoordinatorBase {
         Self {
             node_id: node_id.into(),
             grpc_addr: grpc_addr.into(),
-            num_shards,
+            shard_map: Arc::new(Mutex::new(shard_map)),
             owned: Arc::new(Mutex::new(HashSet::new())),
             shutdown_tx,
             shutdown_rx,
@@ -234,16 +267,31 @@ impl CoordinatorBase {
         }
     }
 
+    /// Get the current shard map.
+    pub async fn get_shard_map(&self) -> ShardMap {
+        self.shard_map.lock().await.clone()
+    }
+
+    /// Get the number of shards.
+    pub async fn num_shards(&self) -> usize {
+        self.shard_map.lock().await.len()
+    }
+
+    /// Get all shard IDs from the shard map.
+    pub async fn shard_ids(&self) -> Vec<ShardId> {
+        self.shard_map.lock().await.shard_ids()
+    }
+
     /// Get owned shards sorted (shared by both backends).
-    pub async fn owned_shards(&self) -> Vec<u32> {
+    pub async fn owned_shards(&self) -> Vec<ShardId> {
         let guard = self.owned.lock().await;
-        let mut v: Vec<u32> = guard.iter().copied().collect();
-        v.sort_unstable();
+        let mut v: Vec<ShardId> = guard.iter().copied().collect();
+        v.sort_by_key(|id| id.to_string());
         v
     }
 
     /// Compute shard owner map from members (shared by both backends).
-    pub fn compute_shard_owner_map(&self, members: &[MemberInfo]) -> ShardOwnerMap {
+    pub async fn compute_shard_owner_map(&self, members: &[MemberInfo]) -> ShardOwnerMap {
         let member_ids: Vec<String> = members.iter().map(|m| m.node_id.clone()).collect();
 
         let addr_map: HashMap<String, String> = members
@@ -251,20 +299,21 @@ impl CoordinatorBase {
             .map(|m| (m.node_id.clone(), m.grpc_addr.clone()))
             .collect();
 
+        let shard_map = self.shard_map.lock().await.clone();
         let mut shard_to_addr = HashMap::new();
         let mut shard_to_node = HashMap::new();
 
-        for shard_id in 0..self.num_shards {
-            if let Some(owner_node) = select_owner_for_shard(shard_id, &member_ids)
+        for shard_info in shard_map.shards() {
+            if let Some(owner_node) = select_owner_for_shard(&shard_info.id, &member_ids)
                 && let Some(addr) = addr_map.get(&owner_node)
             {
-                shard_to_addr.insert(shard_id, addr.clone());
-                shard_to_node.insert(shard_id, owner_node);
+                shard_to_addr.insert(shard_info.id, addr.clone());
+                shard_to_node.insert(shard_info.id, owner_node);
             }
         }
 
         ShardOwnerMap {
-            num_shards: self.num_shards,
+            shard_map,
             shard_to_addr,
             shard_to_node,
         }
@@ -292,8 +341,9 @@ impl CoordinatorBase {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
-            let desired: HashSet<u32> =
-                compute_desired_shards_for_node(self.num_shards, &self.node_id, &member_ids);
+            let shard_ids = self.shard_ids().await;
+            let desired: HashSet<ShardId> =
+                compute_desired_shards_for_node(&shard_ids, &self.node_id, &member_ids);
             let guard = self.owned.lock().await;
             if *guard == desired {
                 return true;
@@ -304,14 +354,15 @@ impl CoordinatorBase {
 
         // Log diff on timeout
         if let Ok(member_ids) = get_member_ids().await {
-            let desired: HashSet<u32> =
-                compute_desired_shards_for_node(self.num_shards, &self.node_id, &member_ids);
-            let owned_now: HashSet<u32> = {
+            let shard_ids = self.shard_ids().await;
+            let desired: HashSet<ShardId> =
+                compute_desired_shards_for_node(&shard_ids, &self.node_id, &member_ids);
+            let owned_now: HashSet<ShardId> = {
                 let g = self.owned.lock().await;
                 g.clone()
             };
-            let missing: Vec<u32> = desired.difference(&owned_now).copied().collect();
-            let extra: Vec<u32> = owned_now.difference(&desired).copied().collect();
+            let missing: Vec<ShardId> = desired.difference(&owned_now).copied().collect();
+            let extra: Vec<ShardId> = owned_now.difference(&desired).copied().collect();
             debug!(node_id = %self.node_id, missing = ?missing, extra = ?extra, "wait_converged: timed out");
         }
         false
@@ -330,7 +381,7 @@ impl CoordinatorBase {
 #[async_trait]
 pub trait Coordinator: Send + Sync {
     /// Get the list of shard IDs currently owned by this node.
-    async fn owned_shards(&self) -> Vec<u32>;
+    async fn owned_shards(&self) -> Vec<ShardId>;
 
     /// Gracefully shutdown the coordinator, releasing all owned shards.
     async fn shutdown(&self) -> Result<(), CoordinationError>;
@@ -343,11 +394,14 @@ pub trait Coordinator: Send + Sync {
     /// Get all member information from the cluster.
     async fn get_members(&self) -> Result<Vec<MemberInfo>, CoordinationError>;
 
+    /// Get the current shard map defining all shards and their ranges.
+    async fn get_shard_map(&self) -> Result<ShardMap, CoordinationError>;
+
     /// Compute a mapping of shard IDs to their owning node's address.
     async fn get_shard_owner_map(&self) -> Result<ShardOwnerMap, CoordinationError>;
 
     /// Get the number of shards in the cluster.
-    fn num_shards(&self) -> u32;
+    async fn num_shards(&self) -> usize;
 
     /// Get this node's ID.
     fn node_id(&self) -> &str;
@@ -360,11 +414,14 @@ pub trait Coordinator: Send + Sync {
 ///
 /// The coordinator will manage shard ownership and automatically open/close
 /// shards in the factory as ownership changes.
+///
+/// The `initial_shard_count` is only used when bootstrapping a new cluster.
+/// For existing clusters, the shard map is loaded from the coordination backend.
 pub async fn create_coordinator(
     config: &crate::settings::CoordinationConfig,
     node_id: impl Into<String>,
     grpc_addr: impl Into<String>,
-    num_shards: u32,
+    initial_shard_count: u32,
     factory: Arc<ShardFactory>,
 ) -> Result<(Arc<dyn Coordinator>, Option<tokio::task::JoinHandle<()>>), CoordinationError> {
     let node_id = node_id.into();
@@ -372,7 +429,8 @@ pub async fn create_coordinator(
 
     match &config.backend {
         crate::settings::CoordinationBackend::None => {
-            let coord = NoneCoordinator::new(node_id, grpc_addr, num_shards, factory).await;
+            let coord =
+                NoneCoordinator::new(node_id, grpc_addr, initial_shard_count, factory).await;
             Ok((Arc::new(coord), None))
         }
         crate::settings::CoordinationBackend::Etcd => {
@@ -381,7 +439,7 @@ pub async fn create_coordinator(
                 &config.cluster_prefix,
                 node_id,
                 grpc_addr,
-                num_shards,
+                initial_shard_count,
                 config.lease_ttl_secs,
                 factory,
             )
@@ -395,7 +453,7 @@ pub async fn create_coordinator(
                 &config.cluster_prefix,
                 node_id,
                 grpc_addr,
-                num_shards,
+                initial_shard_count,
                 config.lease_ttl_secs,
                 factory,
             )
@@ -410,14 +468,18 @@ pub async fn create_coordinator(
 // Helper functions for rendezvous hashing (shared across backends)
 
 /// Deterministically select the owner node for a shard using rendezvous hashing.
-pub fn select_owner_for_shard(shard_id: u32, member_ids: &[String]) -> Option<String> {
+///
+/// Uses the shard's UUID as input to the hash function, ensuring consistent
+/// distribution regardless of when shards were created.
+pub fn select_owner_for_shard(shard_id: &ShardId, member_ids: &[String]) -> Option<String> {
     if member_ids.is_empty() {
         return None;
     }
     let mut best: Option<(u64, &String)> = None;
     for m in member_ids {
         let member_hash = fnv1a64(m.as_bytes());
-        let shard_hash = (shard_id as u64).wrapping_mul(0x9e3779b97f4a7c15);
+        // Use the UUID bytes for consistent hashing
+        let shard_hash = fnv1a64(shard_id.as_uuid().as_bytes());
         let score = mix64(member_hash ^ shard_hash);
         if let Some((cur, _)) = best {
             if score > cur {
@@ -432,16 +494,16 @@ pub fn select_owner_for_shard(shard_id: u32, member_ids: &[String]) -> Option<St
 
 /// Compute the desired set of shard ids for a node given current membership.
 pub fn compute_desired_shards_for_node(
-    num_shards: u32,
+    shard_ids: &[ShardId],
     node_id: &str,
     member_ids: &[String],
-) -> HashSet<u32> {
-    let mut desired: HashSet<u32> = HashSet::new();
-    for s in 0..num_shards {
-        if let Some(owner) = select_owner_for_shard(s, member_ids)
+) -> HashSet<ShardId> {
+    let mut desired: HashSet<ShardId> = HashSet::new();
+    for shard_id in shard_ids {
+        if let Some(owner) = select_owner_for_shard(shard_id, member_ids)
             && owner == node_id
         {
-            desired.insert(s);
+            desired.insert(*shard_id);
         }
     }
     desired
@@ -466,6 +528,8 @@ fn mix64(mut x: u64) -> u64 {
 
 /// Helpers to build key paths used for coordination (shared naming convention).
 pub mod keys {
+    use crate::shard_range::ShardId;
+
     pub fn members_prefix(cluster_prefix: &str) -> String {
         format!("{}/coord/members/", cluster_prefix)
     }
@@ -475,7 +539,12 @@ pub mod keys {
     pub fn shards_prefix(cluster_prefix: &str) -> String {
         format!("{}/coord/shards/", cluster_prefix)
     }
-    pub fn shard_owner_key(cluster_prefix: &str, shard_id: u32) -> String {
+    /// Key for the shard map that defines all shards and their ranges.
+    pub fn shard_map_key(cluster_prefix: &str) -> String {
+        format!("{}/coord/shard_map", cluster_prefix)
+    }
+    /// Key for shard ownership lock (uses UUID).
+    pub fn shard_owner_key(cluster_prefix: &str, shard_id: &ShardId) -> String {
         format!("{}{}/owner", shards_prefix(cluster_prefix), shard_id)
     }
 
@@ -483,7 +552,8 @@ pub mod keys {
     pub fn k8s_member_lease_name(cluster_prefix: &str, node_id: &str) -> String {
         format!("{}-member-{}", cluster_prefix, node_id)
     }
-    pub fn k8s_shard_lease_name(cluster_prefix: &str, shard_id: u32) -> String {
+    /// K8S lease name for shard ownership (uses UUID, which is DNS-compatible).
+    pub fn k8s_shard_lease_name(cluster_prefix: &str, shard_id: &ShardId) -> String {
         format!("{}-shard-{}", cluster_prefix, shard_id)
     }
 }

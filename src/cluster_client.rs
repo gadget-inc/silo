@@ -28,6 +28,7 @@ use crate::pb::{
     CancelJobRequest, ColumnInfo, GetJobRequest, GetJobResponse, GetShardCountersRequest,
     JobStatus, QueryRequest, SerializedBytes, serialized_bytes,
 };
+use crate::shard_range::ShardId;
 
 /// Configuration for gRPC client connections.
 ///
@@ -196,7 +197,7 @@ pub async fn create_silo_client(
 #[derive(Debug, thiserror::Error)]
 pub enum ClusterClientError {
     #[error("Shard {0} not found in cluster")]
-    ShardNotFound(u32),
+    ShardNotFound(ShardId),
     #[error("Job not found")]
     JobNotFound,
     #[error("Failed to connect to node at {0}: {1}")]
@@ -219,7 +220,7 @@ pub struct QueryResult {
     /// Number of rows returned
     pub row_count: i32,
     /// Which shard this result came from
-    pub shard_id: u32,
+    pub shard_id: ShardId,
 }
 
 /// Client for querying shards across a distributed Silo cluster
@@ -303,27 +304,25 @@ impl ClusterClient {
     /// Query a specific shard, routing to the appropriate node
     pub async fn query_shard(
         &self,
-        shard_id: u32,
+        shard_id: &ShardId,
         sql: &str,
     ) -> Result<QueryResult, ClusterClientError> {
-        let shard_name = shard_id.to_string();
-
         // Check if shard is local first
-        if let Some(shard) = self.factory.get(&shard_name) {
-            debug!(shard_id = shard_id, "querying local shard");
+        if let Some(shard) = self.factory.get(shard_id) {
+            debug!(shard_id = %shard_id, "querying local shard");
             return self.query_local_shard(shard_id, &shard, sql).await;
         }
 
         // Shard is not local, need to query remote node
         let addr = self.get_shard_addr(shard_id).await?;
-        debug!(shard_id = shard_id, addr = %addr, "querying remote shard");
+        debug!(shard_id = %shard_id, addr = %addr, "querying remote shard");
         self.query_remote_shard(shard_id, &addr, sql).await
     }
 
     /// Query a local shard directly
     async fn query_local_shard(
         &self,
-        shard_id: u32,
+        shard_id: &ShardId,
         shard: &Arc<crate::job_store_shard::JobStoreShard>,
         sql: &str,
     ) -> Result<QueryResult, ClusterClientError> {
@@ -370,21 +369,21 @@ impl ClusterClient {
             columns,
             rows,
             row_count,
-            shard_id,
+            shard_id: *shard_id,
         })
     }
 
     /// Query a remote shard via gRPC
     async fn query_remote_shard(
         &self,
-        shard_id: u32,
+        shard_id: &ShardId,
         addr: &str,
         sql: &str,
     ) -> Result<QueryResult, ClusterClientError> {
         let mut client = self.get_client(addr).await?;
 
         let request = QueryRequest {
-            shard: shard_id,
+            shard: shard_id.to_string(),
             sql: sql.to_string(),
             tenant: None,
         };
@@ -407,7 +406,7 @@ impl ClusterClient {
             columns: resp.columns,
             rows: resp.rows,
             row_count: resp.row_count,
-            shard_id,
+            shard_id: *shard_id,
         })
     }
 
@@ -421,7 +420,7 @@ impl ClusterClient {
         // Query all shards in parallel
         let futures: Vec<_> = shard_ids
             .into_iter()
-            .map(|shard_id| async move { (shard_id, self.query_shard(shard_id, sql).await) })
+            .map(|shard_id| async move { (shard_id, self.query_shard(&shard_id, sql).await) })
             .collect();
 
         let results: Vec<_> = join_all(futures)
@@ -430,7 +429,7 @@ impl ClusterClient {
             .filter_map(|(shard_id, result)| match result {
                 Ok(r) => Some(r),
                 Err(e) => {
-                    warn!(shard_id = shard_id, error = %e, "failed to query shard");
+                    warn!(shard_id = %shard_id, error = %e, "failed to query shard");
                     None
                 }
             })
@@ -442,13 +441,11 @@ impl ClusterClient {
     /// Get counters for a specific shard, routing to the appropriate node
     pub async fn get_shard_counters(
         &self,
-        shard_id: u32,
+        shard_id: &ShardId,
     ) -> Result<ShardCounters, ClusterClientError> {
-        let shard_name = shard_id.to_string();
-
         // Check if shard is local first
-        if let Some(shard) = self.factory.get(&shard_name) {
-            debug!(shard_id = shard_id, "getting counters from local shard");
+        if let Some(shard) = self.factory.get(shard_id) {
+            debug!(shard_id = %shard_id, "getting counters from local shard");
             return shard
                 .get_counters()
                 .await
@@ -457,24 +454,26 @@ impl ClusterClient {
 
         // Shard is not local, need to query remote node
         let addr = self.get_shard_addr(shard_id).await?;
-        debug!(shard_id = shard_id, addr = %addr, "getting counters from remote shard");
+        debug!(shard_id = %shard_id, addr = %addr, "getting counters from remote shard");
         self.get_remote_shard_counters(shard_id, &addr).await
     }
 
     /// Get counters from a remote shard via gRPC
     async fn get_remote_shard_counters(
         &self,
-        shard_id: u32,
+        shard_id: &ShardId,
         addr: &str,
     ) -> Result<ShardCounters, ClusterClientError> {
         let mut client = self.get_client(addr).await?;
 
-        let request = GetShardCountersRequest { shard: shard_id };
+        let request = GetShardCountersRequest {
+            shard: shard_id.to_string(),
+        };
         let response = client
             .get_shard_counters(request)
             .await
             .map_err(|e| {
-                warn!(shard_id = shard_id, addr = %addr, error = %e, "remote shard counters failed");
+                warn!(shard_id = %shard_id, addr = %addr, error = %e, "remote shard counters failed");
                 ClusterClientError::QueryFailed(e.to_string())
             })?
             .into_inner();
@@ -488,22 +487,22 @@ impl ClusterClient {
     /// Get counters from all shards in the cluster
     pub async fn get_all_shard_counters(
         &self,
-    ) -> Result<HashMap<u32, ShardCounters>, ClusterClientError> {
+    ) -> Result<HashMap<ShardId, ShardCounters>, ClusterClientError> {
         let shard_ids = self.get_all_shard_ids().await?;
 
         // Query all shards in parallel
         let futures: Vec<_> = shard_ids
             .into_iter()
-            .map(|shard_id| async move { (shard_id, self.get_shard_counters(shard_id).await) })
+            .map(|shard_id| async move { (shard_id, self.get_shard_counters(&shard_id).await) })
             .collect();
 
-        let results: HashMap<u32, ShardCounters> = join_all(futures)
+        let results: HashMap<ShardId, ShardCounters> = join_all(futures)
             .await
             .into_iter()
             .filter_map(|(shard_id, result)| match result {
                 Ok(counters) => Some((shard_id, counters)),
                 Err(e) => {
-                    warn!(shard_id = shard_id, error = %e, "failed to get counters for shard");
+                    warn!(shard_id = %shard_id, error = %e, "failed to get counters for shard");
                     None
                 }
             })
@@ -513,21 +512,16 @@ impl ClusterClient {
     }
 
     /// Get all shard IDs in the cluster
-    async fn get_all_shard_ids(&self) -> Result<Vec<u32>, ClusterClientError> {
+    async fn get_all_shard_ids(&self) -> Result<Vec<ShardId>, ClusterClientError> {
         if let Some(coordinator) = &self.coordinator {
             let owner_map = coordinator
                 .get_shard_owner_map()
                 .await
                 .map_err(|e| ClusterClientError::QueryFailed(e.to_string()))?;
-            Ok((0..owner_map.num_shards).collect())
+            Ok(owner_map.shard_ids())
         } else {
             // No coordinator, just return local shard IDs
-            let local_shards: Vec<u32> = self
-                .factory
-                .instances()
-                .keys()
-                .filter_map(|s| s.parse().ok())
-                .collect();
+            let local_shards: Vec<ShardId> = self.factory.instances().keys().copied().collect();
             Ok(local_shards)
         }
     }
@@ -545,12 +539,12 @@ impl ClusterClient {
     }
 
     /// Check if this node owns a specific shard
-    pub fn owns_shard(&self, shard_id: u32) -> bool {
-        self.factory.get(&shard_id.to_string()).is_some()
+    pub fn owns_shard(&self, shard_id: &ShardId) -> bool {
+        self.factory.owns_shard(shard_id)
     }
 
     /// Get the address for a remote shard
-    async fn get_shard_addr(&self, shard_id: u32) -> Result<String, ClusterClientError> {
+    async fn get_shard_addr(&self, shard_id: &ShardId) -> Result<String, ClusterClientError> {
         let Some(coordinator) = &self.coordinator else {
             return Err(ClusterClientError::NoCoordinator);
         };
@@ -561,26 +555,23 @@ impl ClusterClient {
             .map_err(|e| ClusterClientError::QueryFailed(e.to_string()))?;
 
         owner_map
-            .shard_to_addr
-            .get(&shard_id)
+            .get_addr(shard_id)
             .cloned()
-            .ok_or(ClusterClientError::ShardNotFound(shard_id))
+            .ok_or(ClusterClientError::ShardNotFound(*shard_id))
     }
 
     /// Get a job from any shard (local or remote)
     pub async fn get_job(
         &self,
-        shard_id: u32,
+        shard_id: &ShardId,
         tenant: &str,
         job_id: &str,
         include_attempts: bool,
     ) -> Result<GetJobResponse, ClusterClientError> {
-        let shard_name = shard_id.to_string();
-
         // Check if shard is local first
-        if let Some(shard) = self.factory.get(&shard_name) {
+        if let Some(shard) = self.factory.get(shard_id) {
             debug!(
-                shard_id = shard_id,
+                shard_id = %shard_id,
                 job_id = job_id,
                 "getting job from local shard"
             );
@@ -655,11 +646,11 @@ impl ClusterClient {
 
         // Shard is not local, need to call remote node
         let addr = self.get_shard_addr(shard_id).await?;
-        debug!(shard_id = shard_id, addr = %addr, job_id = job_id, "getting job from remote shard");
+        debug!(shard_id = %shard_id, addr = %addr, job_id = job_id, "getting job from remote shard");
 
         let mut client = self.get_client(&addr).await?;
         let request = GetJobRequest {
-            shard: shard_id,
+            shard: shard_id.to_string(),
             id: job_id.to_string(),
             tenant: Some(tenant.to_string()),
             include_attempts,
@@ -684,16 +675,14 @@ impl ClusterClient {
     /// Cancel a job on any shard (local or remote)
     pub async fn cancel_job(
         &self,
-        shard_id: u32,
+        shard_id: &ShardId,
         tenant: &str,
         job_id: &str,
     ) -> Result<(), ClusterClientError> {
-        let shard_name = shard_id.to_string();
-
         // Check if shard is local first
-        if let Some(shard) = self.factory.get(&shard_name) {
+        if let Some(shard) = self.factory.get(shard_id) {
             debug!(
-                shard_id = shard_id,
+                shard_id = %shard_id,
                 job_id = job_id,
                 "cancelling job on local shard"
             );
@@ -706,11 +695,11 @@ impl ClusterClient {
 
         // Shard is not local, need to call remote node
         let addr = self.get_shard_addr(shard_id).await?;
-        debug!(shard_id = shard_id, addr = %addr, job_id = job_id, "cancelling job on remote shard");
+        debug!(shard_id = %shard_id, addr = %addr, job_id = job_id, "cancelling job on remote shard");
 
         let mut client = self.get_client(&addr).await?;
         let request = CancelJobRequest {
-            shard: shard_id,
+            shard: shard_id.to_string(),
             id: job_id.to_string(),
             tenant: Some(tenant.to_string()),
         };

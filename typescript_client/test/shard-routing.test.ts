@@ -1,153 +1,53 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
-import { SiloGRPCClient, fnv1a32, defaultTenantToShard } from "../src/client";
+import { SiloGRPCClient, shardForTenant, type ShardInfoWithRange } from "../src/client";
 import { RpcError } from "@protobuf-ts/runtime-rpc";
 
 describe("Shard Routing", () => {
-  describe("fnv1a32 hash function", () => {
-    it("produces deterministic results", () => {
-      const hash1 = fnv1a32("tenant-1");
-      const hash2 = fnv1a32("tenant-1");
-      expect(hash1).toBe(hash2);
-    });
-
-    it("distributes tenants evenly across shards", () => {
-      const numShards = 16;
-      const numTenants = 10000;
-      const counts = Array.from({ length: numShards }, () => 0);
-
-      for (let i = 0; i < numTenants; i++) {
-        const tenant = `tenant-${i}`;
-        const shard = defaultTenantToShard(tenant, numShards);
-        counts[shard]++;
-      }
-
-      // Expected count per shard: 10000 / 16 = 625
-      // Allow 30% variance
-      const expectedPerShard = numTenants / numShards;
-      const minExpected = expectedPerShard * 0.7;
-      const maxExpected = expectedPerShard * 1.3;
-
-      for (let i = 0; i < numShards; i++) {
-        expect(counts[i]).toBeGreaterThan(minExpected);
-        expect(counts[i]).toBeLessThan(maxExpected);
-      }
-    });
-
-    it("is sensitive to small changes in input", () => {
-      const hash1 = fnv1a32("tenant-1");
-      const hash2 = fnv1a32("tenant-2");
-      const hash3 = fnv1a32("tenant-3");
-
-      expect(hash1).not.toBe(hash2);
-      expect(hash2).not.toBe(hash3);
-      expect(hash1).not.toBe(hash3);
-    });
-  });
-
-  describe("defaultTenantToShard", () => {
-    it("handles various shard counts", () => {
-      const tenant = "test-tenant";
-
-      for (const numShards of [1, 2, 4, 8, 16, 32, 64, 128, 256]) {
-        const shard = defaultTenantToShard(tenant, numShards);
-        expect(shard).toBeGreaterThanOrEqual(0);
-        expect(shard).toBeLessThan(numShards);
-      }
-    });
-
-    it("is stable - same hash modulo different shard counts", () => {
-      const tenant = "stable-tenant";
-      const hash = fnv1a32(tenant);
-
-      expect(defaultTenantToShard(tenant, 16)).toBe(hash % 16);
-      expect(defaultTenantToShard(tenant, 32)).toBe(hash % 32);
-      expect(defaultTenantToShard(tenant, 64)).toBe(hash % 64);
-    });
-
-    it("handles UUIDs as tenant IDs", () => {
-      const numShards = 16;
-      const uuids = [
-        "550e8400-e29b-41d4-a716-446655440000",
-        "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
-        "6ba7b811-9dad-11d1-80b4-00c04fd430c8",
-        "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  describe("shardForTenant range-based lookup", () => {
+    it("finds correct shard for tenant in range", () => {
+      const shards: ShardInfoWithRange[] = [
+        { shardId: "shard-1", serverAddr: "server-a:50051", rangeStart: "", rangeEnd: "m" },
+        { shardId: "shard-2", serverAddr: "server-b:50051", rangeStart: "m", rangeEnd: "" },
       ];
 
-      const shards = new Set<number>();
-      for (const uuid of uuids) {
-        const shard = defaultTenantToShard(uuid, numShards);
-        expect(shard).toBeGreaterThanOrEqual(0);
-        expect(shard).toBeLessThan(numShards);
-        shards.add(shard);
-      }
-
-      // UUIDs should distribute across shards
-      expect(shards.size).toBeGreaterThan(1);
+      // "apple" comes before "m"
+      expect(shardForTenant("apple", shards)?.shardId).toBe("shard-1");
+      // "zebra" comes after "m"
+      expect(shardForTenant("zebra", shards)?.shardId).toBe("shard-2");
     });
 
-    it("handles special characters in tenant IDs", () => {
-      const numShards = 8;
-      const tenants = [
-        "tenant:with:colons",
-        "tenant/with/slashes",
-        "tenant.with.dots",
-        "tenant-with-dashes",
-        "tenant_with_underscores",
-        "tenant@with@ats",
+    it("handles empty rangeStart (no lower bound)", () => {
+      const shards: ShardInfoWithRange[] = [
+        { shardId: "shard-1", serverAddr: "server-a:50051", rangeStart: "", rangeEnd: "" },
       ];
 
-      for (const tenant of tenants) {
-        const shard = defaultTenantToShard(tenant, numShards);
-        expect(shard).toBeGreaterThanOrEqual(0);
-        expect(shard).toBeLessThan(numShards);
-      }
-    });
-  });
-
-  describe("client shard resolution", () => {
-    let client: SiloGRPCClient;
-
-    afterEach(() => {
-      client?.close();
+      expect(shardForTenant("any-tenant", shards)?.shardId).toBe("shard-1");
     });
 
-    it("computes shard from tenant using default hash", () => {
-      client = new SiloGRPCClient({
-        servers: "localhost:50051",
-        useTls: false,
-        shardRouting: {
-          numShards: 16,
-          topologyRefreshIntervalMs: 0,
-        },
-      });
+    it("handles empty rangeEnd (no upper bound)", () => {
+      const shards: ShardInfoWithRange[] = [
+        { shardId: "shard-1", serverAddr: "server-a:50051", rangeStart: "a", rangeEnd: "" },
+      ];
 
-      const shard = client.getShardForTenant("my-tenant");
-      const expectedShard = defaultTenantToShard("my-tenant", 16);
-      expect(shard).toBe(expectedShard);
+      expect(shardForTenant("zebra", shards)?.shardId).toBe("shard-1");
     });
 
-    it("uses custom tenantToShard function when provided", () => {
-      const customFn = vi.fn((tenant: string, numShards: number) => {
-        return tenant.length % numShards;
-      });
+    it("returns undefined for empty shards array", () => {
+      expect(shardForTenant("tenant", [])).toBeUndefined();
+    });
 
-      client = new SiloGRPCClient({
-        servers: "localhost:50051",
-        useTls: false,
-        shardRouting: {
-          numShards: 10,
-          tenantToShard: customFn,
-          topologyRefreshIntervalMs: 0,
-        },
-      });
+    it("handles multiple shard ranges", () => {
+      const shards: ShardInfoWithRange[] = [
+        { shardId: "shard-1", serverAddr: "server-a:50051", rangeStart: "", rangeEnd: "4" },
+        { shardId: "shard-2", serverAddr: "server-b:50051", rangeStart: "4", rangeEnd: "8" },
+        { shardId: "shard-3", serverAddr: "server-a:50051", rangeStart: "8", rangeEnd: "c" },
+        { shardId: "shard-4", serverAddr: "server-b:50051", rangeStart: "c", rangeEnd: "" },
+      ];
 
-      // "short" has length 5
-      expect(client.getShardForTenant("short")).toBe(5);
-      expect(customFn).toHaveBeenCalledWith("short", 10);
-
-      // "verylongtenant" has length 14, 14 % 10 = 4
-      expect(client.getShardForTenant("verylongtenant")).toBe(4);
-      expect(customFn).toHaveBeenCalledWith("verylongtenant", 10);
+      expect(shardForTenant("1", shards)?.shardId).toBe("shard-1");
+      expect(shardForTenant("5", shards)?.shardId).toBe("shard-2");
+      expect(shardForTenant("9", shards)?.shardId).toBe("shard-3");
+      expect(shardForTenant("d", shards)?.shardId).toBe("shard-4");
     });
   });
 
@@ -159,7 +59,6 @@ describe("Shard Routing", () => {
         servers: "localhost:50051",
         useTls: false,
         shardRouting: {
-          numShards: 8,
           topologyRefreshIntervalMs: 0,
         },
       });
@@ -174,10 +73,10 @@ describe("Shard Routing", () => {
         response: Promise.resolve({
           numShards: 4,
           shardOwners: [
-            { shardId: 0, grpcAddr: "server-a:50051", nodeId: "node-a" },
-            { shardId: 1, grpcAddr: "server-b:50051", nodeId: "node-b" },
-            { shardId: 2, grpcAddr: "server-a:50051", nodeId: "node-a" },
-            { shardId: 3, grpcAddr: "server-b:50051", nodeId: "node-b" },
+            { shardId: "00000000-0000-0000-0000-000000000001", grpcAddr: "server-a:50051", nodeId: "node-a", rangeStart: "", rangeEnd: "4" },
+            { shardId: "00000000-0000-0000-0000-000000000002", grpcAddr: "server-b:50051", nodeId: "node-b", rangeStart: "4", rangeEnd: "8" },
+            { shardId: "00000000-0000-0000-0000-000000000003", grpcAddr: "server-a:50051", nodeId: "node-a", rangeStart: "8", rangeEnd: "c" },
+            { shardId: "00000000-0000-0000-0000-000000000004", grpcAddr: "server-b:50051", nodeId: "node-b", rangeStart: "c", rangeEnd: "" },
           ],
           thisNodeId: "node-a",
           thisGrpcAddr: "server-a:50051",
@@ -191,11 +90,11 @@ describe("Shard Routing", () => {
       await client.refreshTopology();
 
       const topology = client.getTopology();
-      expect(topology.numShards).toBe(4);
-      expect(topology.shardToServer.get(0)).toBe("server-a:50051");
-      expect(topology.shardToServer.get(1)).toBe("server-b:50051");
-      expect(topology.shardToServer.get(2)).toBe("server-a:50051");
-      expect(topology.shardToServer.get(3)).toBe("server-b:50051");
+      expect(topology.shards.length).toBe(4);
+      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000001")).toBe("server-a:50051");
+      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000002")).toBe("server-b:50051");
+      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000003")).toBe("server-a:50051");
+      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000004")).toBe("server-b:50051");
     });
 
     it("creates connections to discovered servers", async () => {
@@ -203,8 +102,8 @@ describe("Shard Routing", () => {
         response: Promise.resolve({
           numShards: 2,
           shardOwners: [
-            { shardId: 0, grpcAddr: "server-x:50051", nodeId: "node-x" },
-            { shardId: 1, grpcAddr: "server-y:50051", nodeId: "node-y" },
+            { shardId: "00000000-0000-0000-0000-000000000001", grpcAddr: "server-x:50051", nodeId: "node-x", rangeStart: "", rangeEnd: "m" },
+            { shardId: "00000000-0000-0000-0000-000000000002", grpcAddr: "server-y:50051", nodeId: "node-y", rangeStart: "m", rangeEnd: "" },
           ],
           thisNodeId: "node-x",
           thisGrpcAddr: "server-x:50051",
@@ -227,7 +126,6 @@ describe("Shard Routing", () => {
         servers: ["failing-server:50051", "working-server:50051"],
         useTls: false,
         shardRouting: {
-          numShards: 1,
           topologyRefreshIntervalMs: 0,
         },
       });
@@ -246,7 +144,7 @@ describe("Shard Routing", () => {
         response: Promise.resolve({
           numShards: 1,
           shardOwners: [
-            { shardId: 0, grpcAddr: "working-server:50051", nodeId: "node-1" },
+            { shardId: "00000000-0000-0000-0000-000000000001", grpcAddr: "working-server:50051", nodeId: "node-1", rangeStart: "", rangeEnd: "" },
           ],
           thisNodeId: "node-1",
           thisGrpcAddr: "working-server:50051",
@@ -256,8 +154,8 @@ describe("Shard Routing", () => {
       await client.refreshTopology();
 
       const topology = client.getTopology();
-      expect(topology.numShards).toBe(1);
-      expect(topology.shardToServer.get(0)).toBe("working-server:50051");
+      expect(topology.shards.length).toBe(1);
+      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000001")).toBe("working-server:50051");
     });
 
     it("throws if all servers fail during topology refresh after exhausting retries", async () => {
@@ -283,7 +181,6 @@ describe("Shard Routing", () => {
         servers: "localhost:50051",
         useTls: false,
         shardRouting: {
-          numShards: 1,
           topologyRefreshIntervalMs: 0,
         },
       });
@@ -328,7 +225,6 @@ describe("Shard Routing", () => {
         servers: "localhost:50051",
         useTls: false,
         shardRouting: {
-          numShards: 1,
           topologyRefreshIntervalMs: 0,
         },
         grpcClientOptions: {
@@ -349,17 +245,26 @@ describe("Shard Routing", () => {
   describe("Wrong Shard Retry", () => {
     let client: SiloGRPCClient;
 
+    // Helper to set up mock topology so shard resolution works
+    const setupMockTopology = (c: SiloGRPCClient) => {
+      (c as any)._shards = [
+        { shardId: "00000000-0000-0000-0000-000000000001", serverAddr: "localhost:50051", rangeStart: "", rangeEnd: "" }
+      ];
+      (c as any)._shardToServer.set("00000000-0000-0000-0000-000000000001", "localhost:50051");
+    };
+
     beforeEach(() => {
       client = new SiloGRPCClient({
         servers: "localhost:50051",
         useTls: false,
         shardRouting: {
-          numShards: 16,
           maxWrongShardRetries: 3,
           wrongShardRetryDelayMs: 1, // Fast retries for tests
           topologyRefreshIntervalMs: 0,
         },
       });
+      // Set up mock topology so shard resolution works
+      setupMockTopology(client);
     });
 
     afterEach(() => {

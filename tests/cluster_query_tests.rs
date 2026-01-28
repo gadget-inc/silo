@@ -13,12 +13,13 @@ use silo::cluster_query::ClusterQueryEngine;
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::settings::{Backend, DatabaseTemplate};
+use silo::shard_range::ShardMap;
 use test_helpers::now_ms;
 
 /// Helper to create a multi-shard factory with temp directories
 async fn create_multi_shard_factory(
     num_shards: usize,
-) -> (Vec<tempfile::TempDir>, Arc<ShardFactory>) {
+) -> (Vec<tempfile::TempDir>, Arc<ShardFactory>, ShardMap) {
     let mut temps = Vec::new();
     let base_dir = tempfile::tempdir().unwrap();
     let base_path = base_dir.path().to_string_lossy().to_string();
@@ -34,12 +35,26 @@ async fn create_multi_shard_factory(
     let rate_limiter = MockGubernatorClient::new_arc();
     let factory = Arc::new(ShardFactory::new(template, rate_limiter, None));
 
-    // Open all shards
-    for i in 0..num_shards {
-        factory.open(i).await.expect("open shard");
+    // Create a ShardMap and open all shards
+    let shard_map =
+        ShardMap::create_initial(num_shards as u32).expect("failed to create shard map");
+    for shard_info in shard_map.shards() {
+        factory.open(&shard_info.id).await.expect("open shard");
     }
 
-    (temps, factory)
+    (temps, factory, shard_map)
+}
+
+/// Helper to get a shard by index from the shard map
+fn get_shard(
+    factory: &ShardFactory,
+    shard_map: &ShardMap,
+    index: usize,
+) -> Arc<silo::job_store_shard::JobStoreShard> {
+    let shard_id = shard_map.shards()[index].id;
+    factory
+        .get(&shard_id)
+        .expect(&format!("shard {} not found", index))
 }
 
 // Helper to extract string column values from batches
@@ -95,11 +110,12 @@ async fn query_collect(engine: &ClusterQueryEngine, query: &str) -> Vec<RecordBa
 
 #[silo::test]
 async fn cluster_query_single_shard_basic() {
-    let (_temps, factory) = create_multi_shard_factory(1).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(1).await;
     let now = now_ms();
 
     // Enqueue jobs to the single shard
-    let shard = factory.get("0").unwrap();
+    let shard_id = shard_map.shards()[0].id;
+    let shard = factory.get(&shard_id).unwrap();
     for id in ["a1", "a2", "b1"] {
         shard
             .enqueue(
@@ -118,7 +134,7 @@ async fn cluster_query_single_shard_basic() {
     }
 
     // Create cluster query engine (no coordinator = local only)
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 1)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -134,10 +150,10 @@ async fn cluster_query_single_shard_basic() {
 
 #[silo::test]
 async fn cluster_query_single_shard_count() {
-    let (_temps, factory) = create_multi_shard_factory(1).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(1).await;
     let now = now_ms();
 
-    let shard = factory.get("0").unwrap();
+    let shard = get_shard(&factory, &shard_map, 0);
     for i in 0..5 {
         shard
             .enqueue(
@@ -155,7 +171,7 @@ async fn cluster_query_single_shard_count() {
             .expect("enqueue");
     }
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 1)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -175,16 +191,16 @@ async fn cluster_query_single_shard_count() {
 
 #[silo::test]
 async fn cluster_query_multi_shard_combines_results() {
-    let (_temps, factory) = create_multi_shard_factory(3).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(3).await;
     let now = now_ms();
 
     // Enqueue jobs to different shards
-    for shard_id in 0..3 {
-        let shard = factory.get(&shard_id.to_string()).unwrap();
+    for (shard_idx, shard_info) in shard_map.shards().iter().enumerate() {
+        let shard = factory.get(&shard_info.id).unwrap();
         shard
             .enqueue(
                 "-",
-                Some(format!("shard{}_job", shard_id)),
+                Some(format!("shard{}_job", shard_idx)),
                 10,
                 now,
                 None,
@@ -197,7 +213,7 @@ async fn cluster_query_multi_shard_combines_results() {
             .expect("enqueue");
     }
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 3)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -217,16 +233,23 @@ async fn cluster_query_multi_shard_combines_results() {
 
 #[silo::test]
 async fn cluster_query_shard_id_column() {
-    let (_temps, factory) = create_multi_shard_factory(3).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(3).await;
     let now = now_ms();
 
+    // Collect expected shard IDs
+    let expected_shard_ids: std::collections::HashSet<String> = shard_map
+        .shards()
+        .iter()
+        .map(|s| s.id.to_string())
+        .collect();
+
     // Enqueue jobs to different shards
-    for shard_id in 0..3 {
-        let shard = factory.get(&shard_id.to_string()).unwrap();
+    for (shard_idx, shard_info) in shard_map.shards().iter().enumerate() {
+        let shard = factory.get(&shard_info.id).unwrap();
         shard
             .enqueue(
                 "-",
-                Some(format!("shard{}_job", shard_id)),
+                Some(format!("shard{}_job", shard_idx)),
                 10,
                 now,
                 None,
@@ -239,7 +262,7 @@ async fn cluster_query_shard_id_column() {
             .expect("enqueue");
     }
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 3)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -250,34 +273,34 @@ async fn cluster_query_shard_id_column() {
     )
     .await;
 
-    // Extract shard_ids
-    let mut shard_ids: Vec<u32> = Vec::new();
-    for batch in &batches {
-        let col = batch.column(0);
-        let arr = col
-            .as_any()
-            .downcast_ref::<datafusion::arrow::array::UInt32Array>()
-            .expect("u32 column");
-        for i in 0..arr.len() {
-            shard_ids.push(arr.value(i));
-        }
-    }
+    // Extract shard_ids (now strings/UUIDs)
+    let shard_ids = extract_string_column(&batches, 0);
 
-    // Should have shard_ids 0, 1, 2
+    // Should have all 3 shard_ids from our shard_map
     assert_eq!(shard_ids.len(), 3);
-    assert!(shard_ids.contains(&0));
-    assert!(shard_ids.contains(&1));
-    assert!(shard_ids.contains(&2));
+    for shard_id in &shard_ids {
+        assert!(
+            expected_shard_ids.contains(shard_id),
+            "shard_id {} should be in expected set {:?}",
+            shard_id,
+            expected_shard_ids
+        );
+    }
 }
 
 #[silo::test]
 async fn cluster_query_group_by_shard_id() {
-    let (_temps, factory) = create_multi_shard_factory(3).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(3).await;
     let now = now_ms();
+
+    // Get actual shard IDs for verification
+    let shard0_id = shard_map.shards()[0].id.to_string();
+    let shard1_id = shard_map.shards()[1].id.to_string();
+    let shard2_id = shard_map.shards()[2].id.to_string();
 
     // Enqueue different numbers of jobs to each shard
     // Shard 0: 2 jobs, Shard 1: 3 jobs, Shard 2: 1 job
-    let shard0 = factory.get("0").unwrap();
+    let shard0 = get_shard(&factory, &shard_map, 0);
     for i in 0..2 {
         shard0
             .enqueue(
@@ -295,7 +318,7 @@ async fn cluster_query_group_by_shard_id() {
             .expect("enqueue");
     }
 
-    let shard1 = factory.get("1").unwrap();
+    let shard1 = get_shard(&factory, &shard_map, 1);
     for i in 0..3 {
         shard1
             .enqueue(
@@ -313,7 +336,7 @@ async fn cluster_query_group_by_shard_id() {
             .expect("enqueue");
     }
 
-    let shard2 = factory.get("2").unwrap();
+    let shard2 = get_shard(&factory, &shard_map, 2);
     shard2
         .enqueue(
             "-",
@@ -329,7 +352,7 @@ async fn cluster_query_group_by_shard_id() {
         .await
         .expect("enqueue");
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 3)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -340,42 +363,42 @@ async fn cluster_query_group_by_shard_id() {
     )
     .await;
 
-    // Extract results
-    let mut results: Vec<(u32, i64)> = Vec::new();
+    // Extract results - shard_id is now a string (UUID)
+    let mut results: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     for batch in &batches {
         let shard_col = batch
             .column(0)
             .as_any()
-            .downcast_ref::<datafusion::arrow::array::UInt32Array>()
-            .expect("shard_id column");
+            .downcast_ref::<StringArray>()
+            .expect("shard_id string column");
         let count_col = batch
             .column(1)
             .as_any()
-            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .downcast_ref::<Int64Array>()
             .expect("count column");
 
         for i in 0..batch.num_rows() {
-            results.push((shard_col.value(i), count_col.value(i)));
+            results.insert(shard_col.value(i).to_string(), count_col.value(i));
         }
     }
 
     // Should have 3 groups with correct counts
     assert_eq!(results.len(), 3);
-    assert!(results.contains(&(0, 2))); // shard 0 has 2 jobs
-    assert!(results.contains(&(1, 3))); // shard 1 has 3 jobs
-    assert!(results.contains(&(2, 1))); // shard 2 has 1 job
+    assert_eq!(results.get(&shard0_id), Some(&2)); // shard 0 has 2 jobs
+    assert_eq!(results.get(&shard1_id), Some(&3)); // shard 1 has 3 jobs
+    assert_eq!(results.get(&shard2_id), Some(&1)); // shard 2 has 1 job
 }
 
 #[silo::test]
 async fn cluster_query_multi_shard_count_aggregates_correctly() {
-    let (_temps, factory) = create_multi_shard_factory(3).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(3).await;
     let now = now_ms();
 
     // Enqueue different numbers of jobs to each shard
     // Shard 0: 2 jobs, Shard 1: 3 jobs, Shard 2: 5 jobs = 10 total
-    for shard_id in 0..3 {
-        let shard = factory.get(&shard_id.to_string()).unwrap();
-        let job_count = match shard_id {
+    for (shard_idx, shard_info) in shard_map.shards().iter().enumerate() {
+        let shard = factory.get(&shard_info.id).unwrap();
+        let job_count = match shard_idx {
             0 => 2,
             1 => 3,
             2 => 5,
@@ -385,7 +408,7 @@ async fn cluster_query_multi_shard_count_aggregates_correctly() {
             shard
                 .enqueue(
                     "-",
-                    Some(format!("shard{}_job{}", shard_id, i)),
+                    Some(format!("shard{}_job{}", shard_idx, i)),
                     10,
                     now,
                     None,
@@ -399,7 +422,7 @@ async fn cluster_query_multi_shard_count_aggregates_correctly() {
         }
     }
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 3)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -416,11 +439,11 @@ async fn cluster_query_multi_shard_count_aggregates_correctly() {
 
 #[silo::test]
 async fn cluster_query_multi_shard_group_by() {
-    let (_temps, factory) = create_multi_shard_factory(2).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(2).await;
     let now = now_ms();
 
     // Shard 0: 2 high priority, 1 low priority
-    let shard0 = factory.get("0").unwrap();
+    let shard0 = get_shard(&factory, &shard_map, 0);
     for i in 0..2 {
         shard0
             .enqueue(
@@ -453,7 +476,7 @@ async fn cluster_query_multi_shard_group_by() {
         .expect("enqueue");
 
     // Shard 1: 1 high priority, 2 low priority
-    let shard1 = factory.get("1").unwrap();
+    let shard1 = get_shard(&factory, &shard_map, 1);
     shard1
         .enqueue(
             "-",
@@ -485,7 +508,7 @@ async fn cluster_query_multi_shard_group_by() {
             .expect("enqueue");
     }
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 2)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -503,11 +526,11 @@ async fn cluster_query_multi_shard_group_by() {
 
 #[silo::test]
 async fn cluster_query_multi_shard_filter_pushdown() {
-    let (_temps, factory) = create_multi_shard_factory(2).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(2).await;
     let now = now_ms();
 
     // Enqueue jobs with different statuses
-    let shard0 = factory.get("0").unwrap();
+    let shard0 = get_shard(&factory, &shard_map, 0);
     shard0
         .enqueue(
             "-",
@@ -523,7 +546,7 @@ async fn cluster_query_multi_shard_filter_pushdown() {
         .await
         .expect("enqueue");
 
-    let shard1 = factory.get("1").unwrap();
+    let shard1 = get_shard(&factory, &shard_map, 1);
     shard1
         .enqueue(
             "-",
@@ -545,7 +568,7 @@ async fn cluster_query_multi_shard_filter_pushdown() {
         .await
         .expect("dequeue");
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 2)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -564,11 +587,11 @@ async fn cluster_query_multi_shard_filter_pushdown() {
 
 #[silo::test]
 async fn cluster_query_multi_shard_empty_some_shards() {
-    let (_temps, factory) = create_multi_shard_factory(3).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(3).await;
     let now = now_ms();
 
     // Only put jobs in shard 1
-    let shard1 = factory.get("1").unwrap();
+    let shard1 = get_shard(&factory, &shard_map, 1);
     for i in 0..3 {
         shard1
             .enqueue(
@@ -586,7 +609,7 @@ async fn cluster_query_multi_shard_empty_some_shards() {
             .expect("enqueue");
     }
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 3)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -603,9 +626,9 @@ async fn cluster_query_multi_shard_empty_some_shards() {
 
 #[silo::test]
 async fn cluster_query_multi_shard_all_empty() {
-    let (_temps, factory) = create_multi_shard_factory(3).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(3).await;
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 3)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -622,17 +645,17 @@ async fn cluster_query_multi_shard_all_empty() {
 
 #[silo::test]
 async fn cluster_query_multi_shard_limit() {
-    let (_temps, factory) = create_multi_shard_factory(2).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(2).await;
     let now = now_ms();
 
     // Put 10 jobs in each shard
-    for shard_id in 0..2 {
-        let shard = factory.get(&shard_id.to_string()).unwrap();
+    for (shard_idx, shard_info) in shard_map.shards().iter().enumerate() {
+        let shard = factory.get(&shard_info.id).unwrap();
         for i in 0..10 {
             shard
                 .enqueue(
                     "-",
-                    Some(format!("s{}_job{}", shard_id, i)),
+                    Some(format!("s{}_job{}", shard_idx, i)),
                     10,
                     now,
                     None,
@@ -646,7 +669,7 @@ async fn cluster_query_multi_shard_limit() {
         }
     }
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 2)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -663,11 +686,11 @@ async fn cluster_query_multi_shard_limit() {
 
 #[silo::test]
 async fn cluster_query_queues_table_multi_shard() {
-    let (_temps, factory) = create_multi_shard_factory(2).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(2).await;
     let now = now_ms();
 
     // Create concurrency queues in both shards
-    let shard0 = factory.get("0").unwrap();
+    let shard0 = get_shard(&factory, &shard_map, 0);
     shard0
         .enqueue(
             "-",
@@ -690,7 +713,7 @@ async fn cluster_query_queues_table_multi_shard() {
         .await
         .expect("dequeue");
 
-    let shard1 = factory.get("1").unwrap();
+    let shard1 = get_shard(&factory, &shard_map, 1);
     shard1
         .enqueue(
             "-",
@@ -713,7 +736,7 @@ async fn cluster_query_queues_table_multi_shard() {
         .await
         .expect("dequeue");
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 2)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -736,9 +759,9 @@ async fn cluster_query_queues_table_multi_shard() {
 
 #[silo::test]
 async fn cluster_query_explain_shows_partitions() {
-    let (_temps, factory) = create_multi_shard_factory(3).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(3).await;
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 3)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -761,11 +784,11 @@ async fn cluster_query_explain_shows_partitions() {
 
 #[silo::test]
 async fn cluster_query_metadata_filter_multi_shard() {
-    let (_temps, factory) = create_multi_shard_factory(2).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(2).await;
     let now = now_ms();
 
     // Shard 0: job with env=prod
-    let shard0 = factory.get("0").unwrap();
+    let shard0 = get_shard(&factory, &shard_map, 0);
     shard0
         .enqueue(
             "-",
@@ -782,7 +805,7 @@ async fn cluster_query_metadata_filter_multi_shard() {
         .expect("enqueue");
 
     // Shard 1: job with env=staging
-    let shard1 = factory.get("1").unwrap();
+    let shard1 = get_shard(&factory, &shard_map, 1);
     shard1
         .enqueue(
             "-",
@@ -798,7 +821,7 @@ async fn cluster_query_metadata_filter_multi_shard() {
         .await
         .expect("enqueue");
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 2)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -819,9 +842,9 @@ async fn cluster_query_metadata_filter_multi_shard() {
 
 #[silo::test]
 async fn cluster_query_malformed_sql_syntax_error() {
-    let (_temps, factory) = create_multi_shard_factory(2).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(2).await;
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 2)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -839,9 +862,9 @@ async fn cluster_query_malformed_sql_syntax_error() {
 
 #[silo::test]
 async fn cluster_query_invalid_column_name() {
-    let (_temps, factory) = create_multi_shard_factory(2).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(2).await;
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 2)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -852,9 +875,9 @@ async fn cluster_query_invalid_column_name() {
 
 #[silo::test]
 async fn cluster_query_invalid_table_name() {
-    let (_temps, factory) = create_multi_shard_factory(2).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(2).await;
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 2)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -865,9 +888,9 @@ async fn cluster_query_invalid_table_name() {
 
 #[silo::test]
 async fn cluster_query_type_mismatch_in_filter() {
-    let (_temps, factory) = create_multi_shard_factory(2).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(2).await;
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 2)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -891,9 +914,9 @@ async fn cluster_query_type_mismatch_in_filter() {
 
 #[silo::test]
 async fn cluster_query_empty_sql() {
-    let (_temps, factory) = create_multi_shard_factory(1).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(1).await;
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 1)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -903,9 +926,9 @@ async fn cluster_query_empty_sql() {
 
 #[silo::test]
 async fn cluster_query_sql_with_only_whitespace() {
-    let (_temps, factory) = create_multi_shard_factory(1).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(1).await;
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 1)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -915,10 +938,10 @@ async fn cluster_query_sql_with_only_whitespace() {
 
 #[silo::test]
 async fn cluster_query_division_by_zero() {
-    let (_temps, factory) = create_multi_shard_factory(1).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(1).await;
     let now = now_ms();
 
-    let shard = factory.get("0").unwrap();
+    let shard = get_shard(&factory, &shard_map, 0);
     shard
         .enqueue(
             "-",
@@ -934,7 +957,7 @@ async fn cluster_query_division_by_zero() {
         .await
         .expect("enqueue");
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 1)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -967,10 +990,10 @@ async fn cluster_query_division_by_zero() {
 #[silo::test]
 async fn cluster_query_handles_missing_shard_gracefully() {
     // Create a factory with only shard 0, but tell engine there are 2 shards
-    let (_temps, factory) = create_multi_shard_factory(1).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(1).await;
     let now = now_ms();
 
-    let shard = factory.get("0").unwrap();
+    let shard = get_shard(&factory, &shard_map, 0);
     shard
         .enqueue(
             "-",
@@ -988,7 +1011,7 @@ async fn cluster_query_handles_missing_shard_gracefully() {
 
     // Engine expects 2 shards but only 1 exists locally and no coordinator
     // This tests the case where build_shard_configs skips unavailable shards
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 2)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -1007,11 +1030,11 @@ async fn cluster_query_handles_missing_shard_gracefully() {
 #[silo::test]
 async fn cluster_query_count_with_missing_shards() {
     // Create factory with 2 shards but tell engine there are 4
-    let (_temps, factory) = create_multi_shard_factory(2).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(2).await;
     let now = now_ms();
 
     // Add jobs to both available shards
-    let shard0 = factory.get("0").unwrap();
+    let shard0 = get_shard(&factory, &shard_map, 0);
     shard0
         .enqueue(
             "-",
@@ -1027,7 +1050,7 @@ async fn cluster_query_count_with_missing_shards() {
         .await
         .expect("enqueue");
 
-    let shard1 = factory.get("1").unwrap();
+    let shard1 = get_shard(&factory, &shard_map, 1);
     shard1
         .enqueue(
             "-",
@@ -1044,7 +1067,7 @@ async fn cluster_query_count_with_missing_shards() {
         .expect("enqueue");
 
     // Engine expects 4 shards but only 2 exist
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 4)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -1062,11 +1085,15 @@ async fn cluster_query_count_with_missing_shards() {
 
 #[silo::test]
 async fn cluster_query_group_by_shard_id_with_missing_shards() {
-    // Create factory with 2 shards but tell engine there are 4
-    let (_temps, factory) = create_multi_shard_factory(2).await;
+    // Create factory with 2 shards - query should only show those 2
+    let (_temps, factory, shard_map) = create_multi_shard_factory(2).await;
     let now = now_ms();
 
-    let shard0 = factory.get("0").unwrap();
+    // Get actual shard IDs
+    let shard0_id = shard_map.shards()[0].id.to_string();
+    let shard1_id = shard_map.shards()[1].id.to_string();
+
+    let shard0 = get_shard(&factory, &shard_map, 0);
     shard0
         .enqueue(
             "-",
@@ -1082,7 +1109,7 @@ async fn cluster_query_group_by_shard_id_with_missing_shards() {
         .await
         .expect("enqueue");
 
-    let shard1 = factory.get("1").unwrap();
+    let shard1 = get_shard(&factory, &shard_map, 1);
     shard1
         .enqueue(
             "-",
@@ -1098,7 +1125,7 @@ async fn cluster_query_group_by_shard_id_with_missing_shards() {
         .await
         .expect("enqueue");
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 4)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -1109,28 +1136,29 @@ async fn cluster_query_group_by_shard_id_with_missing_shards() {
     )
     .await;
 
-    let mut results: Vec<(u32, i64)> = Vec::new();
+    // Extract results - shard_id is now a string (UUID)
+    let mut results: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     for batch in &batches {
         let shard_col = batch
             .column(0)
             .as_any()
-            .downcast_ref::<datafusion::arrow::array::UInt32Array>()
-            .expect("shard_id column");
+            .downcast_ref::<StringArray>()
+            .expect("shard_id string column");
         let count_col = batch
             .column(1)
             .as_any()
-            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .downcast_ref::<Int64Array>()
             .expect("count column");
 
         for i in 0..batch.num_rows() {
-            results.push((shard_col.value(i), count_col.value(i)));
+            results.insert(shard_col.value(i).to_string(), count_col.value(i));
         }
     }
 
-    // Should only have results for shards 0 and 1, not 2 and 3
+    // Should only have results for the 2 shards we created
     assert_eq!(results.len(), 2);
-    assert!(results.contains(&(0, 1)));
-    assert!(results.contains(&(1, 1)));
+    assert_eq!(results.get(&shard0_id), Some(&1));
+    assert_eq!(results.get(&shard1_id), Some(&1));
 }
 
 // =============================================================================
@@ -1139,11 +1167,11 @@ async fn cluster_query_group_by_shard_id_with_missing_shards() {
 
 #[silo::test]
 async fn cluster_query_tenant_isolation_multi_shard() {
-    let (_temps, factory) = create_multi_shard_factory(2).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(2).await;
     let now = now_ms();
 
     // Shard 0: tenant A job
-    let shard0 = factory.get("0").unwrap();
+    let shard0 = get_shard(&factory, &shard_map, 0);
     shard0
         .enqueue(
             "tenant_a",
@@ -1160,7 +1188,7 @@ async fn cluster_query_tenant_isolation_multi_shard() {
         .expect("enqueue");
 
     // Shard 1: tenant B job
-    let shard1 = factory.get("1").unwrap();
+    let shard1 = get_shard(&factory, &shard_map, 1);
     shard1
         .enqueue(
             "tenant_b",
@@ -1176,7 +1204,7 @@ async fn cluster_query_tenant_isolation_multi_shard() {
         .await
         .expect("enqueue");
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 2)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -1198,11 +1226,11 @@ async fn cluster_query_tenant_isolation_multi_shard() {
 /// Test that queries WITHOUT a tenant filter return jobs from ALL tenants
 #[silo::test]
 async fn cluster_query_no_tenant_filter_returns_all_tenants() {
-    let (_temps, factory) = create_multi_shard_factory(2).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(2).await;
     let now = now_ms();
 
     // Shard 0: tenant A jobs
-    let shard0 = factory.get("0").unwrap();
+    let shard0 = get_shard(&factory, &shard_map, 0);
     shard0
         .enqueue(
             "tenant_a",
@@ -1233,7 +1261,7 @@ async fn cluster_query_no_tenant_filter_returns_all_tenants() {
         .expect("enqueue");
 
     // Shard 1: tenant B jobs
-    let shard1 = factory.get("1").unwrap();
+    let shard1 = get_shard(&factory, &shard_map, 1);
     shard1
         .enqueue(
             "tenant_b",
@@ -1265,7 +1293,7 @@ async fn cluster_query_no_tenant_filter_returns_all_tenants() {
         .await
         .expect("enqueue");
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 2)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -1284,11 +1312,11 @@ async fn cluster_query_no_tenant_filter_returns_all_tenants() {
 /// Test that COUNT(*) without tenant filter counts ALL jobs across ALL tenants
 #[silo::test]
 async fn cluster_query_count_no_tenant_filter() {
-    let (_temps, factory) = create_multi_shard_factory(2).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(2).await;
     let now = now_ms();
 
     // Shard 0: 2 jobs in tenant A
-    let shard0 = factory.get("0").unwrap();
+    let shard0 = get_shard(&factory, &shard_map, 0);
     for i in 0..2 {
         shard0
             .enqueue(
@@ -1307,7 +1335,7 @@ async fn cluster_query_count_no_tenant_filter() {
     }
 
     // Shard 1: 3 jobs in tenant B
-    let shard1 = factory.get("1").unwrap();
+    let shard1 = get_shard(&factory, &shard_map, 1);
     for i in 0..3 {
         shard1
             .enqueue(
@@ -1325,7 +1353,7 @@ async fn cluster_query_count_no_tenant_filter() {
             .expect("enqueue");
     }
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 2)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -1339,10 +1367,10 @@ async fn cluster_query_count_no_tenant_filter() {
 /// Test that querying by ID without tenant filter finds the job in any tenant
 #[silo::test]
 async fn cluster_query_by_id_no_tenant_filter() {
-    let (_temps, factory) = create_multi_shard_factory(1).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(1).await;
     let now = now_ms();
 
-    let shard = factory.get("0").unwrap();
+    let shard = get_shard(&factory, &shard_map, 0);
 
     // Create jobs with same ID pattern but different tenants
     shard
@@ -1375,7 +1403,7 @@ async fn cluster_query_by_id_no_tenant_filter() {
         .await
         .expect("enqueue");
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 1)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -1397,11 +1425,11 @@ async fn cluster_query_by_id_no_tenant_filter() {
 /// Test that status filter without tenant returns jobs from all tenants
 #[silo::test]
 async fn cluster_query_by_status_no_tenant_filter() {
-    let (_temps, factory) = create_multi_shard_factory(2).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(2).await;
     let now = now_ms();
 
     // Create scheduled jobs in different tenants
-    let shard0 = factory.get("0").unwrap();
+    let shard0 = get_shard(&factory, &shard_map, 0);
     shard0
         .enqueue(
             "alpha",
@@ -1417,7 +1445,7 @@ async fn cluster_query_by_status_no_tenant_filter() {
         .await
         .expect("enqueue");
 
-    let shard1 = factory.get("1").unwrap();
+    let shard1 = get_shard(&factory, &shard_map, 1);
     shard1
         .enqueue(
             "beta",
@@ -1433,7 +1461,7 @@ async fn cluster_query_by_status_no_tenant_filter() {
         .await
         .expect("enqueue");
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 2)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 
@@ -1458,11 +1486,11 @@ async fn cluster_query_by_status_no_tenant_filter() {
 /// Test the webui-style query (what the index page uses) without tenant filter
 #[silo::test]
 async fn cluster_query_webui_style_no_tenant_filter() {
-    let (_temps, factory) = create_multi_shard_factory(2).await;
+    let (_temps, factory, shard_map) = create_multi_shard_factory(2).await;
     let now = now_ms();
 
     // Create jobs across multiple tenants
-    let shard0 = factory.get("0").unwrap();
+    let shard0 = get_shard(&factory, &shard_map, 0);
     shard0
         .enqueue(
             "customer_1",
@@ -1478,7 +1506,7 @@ async fn cluster_query_webui_style_no_tenant_filter() {
         .await
         .expect("enqueue");
 
-    let shard1 = factory.get("1").unwrap();
+    let shard1 = get_shard(&factory, &shard_map, 1);
     shard1
         .enqueue(
             "customer_2",
@@ -1494,7 +1522,7 @@ async fn cluster_query_webui_style_no_tenant_filter() {
         .await
         .expect("enqueue");
 
-    let engine = ClusterQueryEngine::new(factory.clone(), None, 2)
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
         .expect("create engine");
 

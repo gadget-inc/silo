@@ -199,8 +199,8 @@ struct ConfigTemplate {
 
 #[derive(serde::Deserialize)]
 pub struct JobParams {
-    /// Optional shard ID - used to make lookup more efficient if provided
-    shard: Option<u32>,
+    /// Optional shard ID (UUID string) - used to make lookup more efficient if provided
+    shard: Option<String>,
     /// Optional tenant - used to make lookup more efficient if provided
     tenant: Option<String>,
     /// Job ID to look up (required)
@@ -314,7 +314,7 @@ async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
                 for batch in batches {
                     let shard_col = batch.column_by_name("shard_id").and_then(|c| {
                         c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::UInt32Array>()
+                            .downcast_ref::<datafusion::arrow::array::StringArray>()
                     });
                     let tenant_col = batch.column_by_name("tenant").and_then(|c| {
                         c.as_any()
@@ -380,7 +380,7 @@ async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
 
     // Get total shard count from coordinator if available
     let shard_count = if let Some(coordinator) = &state.coordinator {
-        coordinator.num_shards() as usize
+        coordinator.num_shards().await
     } else {
         state.factory.instances().len()
     };
@@ -401,7 +401,7 @@ async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
 
 /// Job data fetched from the cluster query engine
 struct JobQueryResult {
-    shard_id: u32,
+    shard_id: String,
     priority: u8,
     enqueue_time_ms: i64,
     payload: String,
@@ -417,8 +417,8 @@ async fn job_handler(
     // Build SQL query with optional shard/tenant filters for performance
     // If shard and tenant are provided, the query engine can route directly to that shard
     let mut where_clauses = vec![format!("id = '{}'", params.id.replace('\'', "''"))];
-    if let Some(shard) = params.shard {
-        where_clauses.push(format!("shard_id = {}", shard));
+    if let Some(ref shard) = params.shard {
+        where_clauses.push(format!("shard_id = '{}'", shard.replace('\'', "''")));
     }
     if let Some(ref tenant) = params.tenant {
         where_clauses.push(format!("tenant = '{}'", tenant.replace('\'', "''")));
@@ -441,10 +441,10 @@ async fn job_handler(
                         .column_by_name("shard_id")
                         .and_then(|c| {
                             c.as_any()
-                                .downcast_ref::<datafusion::arrow::array::UInt32Array>()
+                                .downcast_ref::<datafusion::arrow::array::StringArray>()
                         })
-                        .map(|a| a.value(0))
-                        .unwrap_or(0);
+                        .map(|a| a.value(0).to_string())
+                        .unwrap_or_default();
 
                     let priority = batch
                         .column_by_name("priority")
@@ -625,14 +625,22 @@ async fn cancel_job_handler(
 ) -> impl IntoResponse {
     // If both shard and tenant are provided, we can cancel directly without querying
     // Otherwise, query the job's shard and tenant from the cluster query engine
-    let (shard_id, tenant) =
-        if let (Some(shard), Some(tenant)) = (params.shard, params.tenant.clone()) {
-            (shard, tenant)
+    let (shard_id, tenant): (crate::shard_range::ShardId, String) =
+        if let (Some(shard_str), Some(tenant)) = (params.shard.clone(), params.tenant.clone()) {
+            match crate::shard_range::ShardId::parse(&shard_str) {
+                Ok(shard_id) => (shard_id, tenant),
+                Err(_) => {
+                    return Html(format!(
+                        r#"<span class="text-red-400">Invalid shard ID: {}</span>"#,
+                        shard_str
+                    ));
+                }
+            }
         } else {
             // Build query with optional filters for efficiency
             let mut where_clauses = vec![format!("id = '{}'", params.id.replace('\'', "''"))];
-            if let Some(shard) = params.shard {
-                where_clauses.push(format!("shard_id = {}", shard));
+            if let Some(ref shard) = params.shard {
+                where_clauses.push(format!("shard_id = '{}'", shard.replace('\'', "''")));
             }
             if let Some(ref tenant) = params.tenant {
                 where_clauses.push(format!("tenant = '{}'", tenant.replace('\'', "''")));
@@ -642,40 +650,43 @@ async fn cancel_job_handler(
                 where_clauses.join(" AND ")
             );
 
-            let job_info: Option<(u32, String)> = match state.query_engine.sql(&sql).await {
-                Ok(df) => match df.collect().await {
-                    Ok(batches) => {
-                        let mut result = None;
-                        for batch in batches {
-                            if batch.num_rows() == 0 {
-                                continue;
-                            }
-                            let shard_id = batch
-                                .column_by_name("shard_id")
-                                .and_then(|c| {
-                                    c.as_any()
-                                        .downcast_ref::<datafusion::arrow::array::UInt32Array>()
-                                })
-                                .map(|a| a.value(0));
-                            let tenant = batch
-                                .column_by_name("tenant")
-                                .and_then(|c| {
-                                    c.as_any()
-                                        .downcast_ref::<datafusion::arrow::array::StringArray>()
-                                })
-                                .map(|a| a.value(0).to_string());
+            let job_info: Option<(crate::shard_range::ShardId, String)> =
+                match state.query_engine.sql(&sql).await {
+                    Ok(df) => match df.collect().await {
+                        Ok(batches) => {
+                            let mut result = None;
+                            for batch in batches {
+                                if batch.num_rows() == 0 {
+                                    continue;
+                                }
+                                let shard_id = batch
+                                    .column_by_name("shard_id")
+                                    .and_then(|c| {
+                                        c.as_any()
+                                            .downcast_ref::<datafusion::arrow::array::StringArray>()
+                                    })
+                                    .and_then(|a| {
+                                        crate::shard_range::ShardId::parse(a.value(0)).ok()
+                                    });
+                                let tenant = batch
+                                    .column_by_name("tenant")
+                                    .and_then(|c| {
+                                        c.as_any()
+                                            .downcast_ref::<datafusion::arrow::array::StringArray>()
+                                    })
+                                    .map(|a| a.value(0).to_string());
 
-                            if let (Some(s), Some(t)) = (shard_id, tenant) {
-                                result = Some((s, t));
-                                break;
+                                if let (Some(s), Some(t)) = (shard_id, tenant) {
+                                    result = Some((s, t));
+                                    break;
+                                }
                             }
+                            result
                         }
-                        result
-                    }
+                        Err(_) => None,
+                    },
                     Err(_) => None,
-                },
-                Err(_) => None,
-            };
+                };
 
             let Some((shard_id, tenant)) = job_info else {
                 return Html(r#"<span class="text-red-400">Job not found</span>"#.to_string());
@@ -685,7 +696,7 @@ async fn cancel_job_handler(
 
     match state
         .cluster_client
-        .cancel_job(shard_id, &tenant, &params.id)
+        .cancel_job(&shard_id, &tenant, &params.id)
         .await
     {
         Ok(()) => Html(
@@ -798,7 +809,7 @@ async fn queue_handler(
                 for batch in batches {
                     let shard_col = batch.column_by_name("shard_id").and_then(|c| {
                         c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::UInt32Array>()
+                            .downcast_ref::<datafusion::arrow::array::StringArray>()
                     });
                     let tenant_col = batch.column_by_name("tenant").and_then(|c| {
                         c.as_any()
@@ -942,12 +953,12 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
         _ => a.node_id.cmp(&b.node_id),
     });
 
-    // Get total number of shards
-    let num_shards = state
-        .coordinator
-        .as_ref()
-        .map(|c| c.num_shards())
-        .unwrap_or_else(|| state.factory.instances().len() as u32);
+    // Get shard IDs from owner map or factory
+    let shard_ids: Vec<crate::shard_range::ShardId> = if let Some(ref map) = owner_map {
+        map.shard_ids()
+    } else {
+        state.factory.instances().keys().copied().collect()
+    };
 
     // Get job counts from counters for all shards (local and remote)
     // This uses the GetShardCounters RPC for remote shards
@@ -957,18 +968,18 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
         Err(e) => {
             warn!(error = %e, "failed to get counters from all shards");
             error = Some(format!("Failed to get shard counters: {}", e));
-            HashMap::new()
+            std::collections::HashMap::new()
         }
     };
 
     // Build shard rows from the counters map, filling in 0 for missing shards
-    for shard_id in 0..num_shards {
+    for shard_id in shard_ids {
         let job_count = shard_counters
             .get(&shard_id)
             .map(|c| c.total_jobs as usize)
             .unwrap_or(0);
         let owner = if let Some(ref map) = owner_map {
-            if state.cluster_client.owns_shard(shard_id) {
+            if state.cluster_client.owns_shard(&shard_id) {
                 "local".to_string()
             } else {
                 map.shard_to_node
@@ -1326,14 +1337,8 @@ pub async fn run_webui(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cluster_client = Arc::new(ClusterClient::new(factory.clone(), coordinator.clone()));
 
-    // Get num_shards from coordinator or default to local shards
-    let num_shards = coordinator
-        .as_ref()
-        .map(|c| c.num_shards())
-        .unwrap_or_else(|| factory.instances().len() as u32);
-
     let query_engine = Arc::new(
-        ClusterQueryEngine::new(factory.clone(), coordinator.clone(), num_shards)
+        ClusterQueryEngine::new(factory.clone(), coordinator.clone())
             .await
             .expect("Failed to create cluster query engine"),
     );

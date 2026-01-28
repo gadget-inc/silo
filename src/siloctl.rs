@@ -139,14 +139,14 @@ pub async fn cluster_info<W: Write>(opts: &GlobalOptions, out: &mut W) -> anyhow
 pub async fn job_get<W: Write>(
     opts: &GlobalOptions,
     out: &mut W,
-    shard: u32,
+    shard: &str,
     id: &str,
     include_attempts: bool,
 ) -> anyhow::Result<()> {
     let mut client = connect(&opts.address).await?;
     let response = client
         .get_job(GetJobRequest {
-            shard,
+            shard: shard.to_string(),
             id: id.to_string(),
             tenant: opts.tenant.clone(),
             include_attempts,
@@ -260,13 +260,13 @@ pub async fn job_get<W: Write>(
 pub async fn job_cancel<W: Write>(
     opts: &GlobalOptions,
     out: &mut W,
-    shard: u32,
+    shard: &str,
     id: &str,
 ) -> anyhow::Result<()> {
     let mut client = connect(&opts.address).await?;
     client
         .cancel_job(CancelJobRequest {
-            shard,
+            shard: shard.to_string(),
             id: id.to_string(),
             tenant: opts.tenant.clone(),
         })
@@ -285,13 +285,13 @@ pub async fn job_cancel<W: Write>(
 pub async fn job_restart<W: Write>(
     opts: &GlobalOptions,
     out: &mut W,
-    shard: u32,
+    shard: &str,
     id: &str,
 ) -> anyhow::Result<()> {
     let mut client = connect(&opts.address).await?;
     client
         .restart_job(RestartJobRequest {
-            shard,
+            shard: shard.to_string(),
             id: id.to_string(),
             tenant: opts.tenant.clone(),
         })
@@ -310,13 +310,13 @@ pub async fn job_restart<W: Write>(
 pub async fn job_expedite<W: Write>(
     opts: &GlobalOptions,
     out: &mut W,
-    shard: u32,
+    shard: &str,
     id: &str,
 ) -> anyhow::Result<()> {
     let mut client = connect(&opts.address).await?;
     client
         .expedite_job(ExpediteJobRequest {
-            shard,
+            shard: shard.to_string(),
             id: id.to_string(),
             tenant: opts.tenant.clone(),
         })
@@ -335,13 +335,13 @@ pub async fn job_expedite<W: Write>(
 pub async fn job_delete<W: Write>(
     opts: &GlobalOptions,
     out: &mut W,
-    shard: u32,
+    shard: &str,
     id: &str,
 ) -> anyhow::Result<()> {
     let mut client = connect(&opts.address).await?;
     client
         .delete_job(DeleteJobRequest {
-            shard,
+            shard: shard.to_string(),
             id: id.to_string(),
             tenant: opts.tenant.clone(),
         })
@@ -360,13 +360,13 @@ pub async fn job_delete<W: Write>(
 pub async fn query<W: Write>(
     opts: &GlobalOptions,
     out: &mut W,
-    shard: u32,
+    shard: &str,
     sql: &str,
 ) -> anyhow::Result<()> {
     let mut client = connect(&opts.address).await?;
     let response = client
         .query(QueryRequest {
-            shard,
+            shard: shard.to_string(),
             sql: sql.to_string(),
             tenant: opts.tenant.clone(),
         })

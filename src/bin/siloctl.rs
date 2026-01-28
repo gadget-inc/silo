@@ -15,7 +15,12 @@ use silo::siloctl::{self, GlobalOptions};
 #[command(version)]
 struct Args {
     /// Silo server address (e.g., http://localhost:50051)
-    #[arg(long, short = 'a', default_value = "http://localhost:50051", global = true)]
+    #[arg(
+        long,
+        short = 'a',
+        default_value = "http://localhost:50051",
+        global = true
+    )]
     address: String,
 
     /// Tenant ID for multi-tenant clusters
@@ -54,8 +59,8 @@ enum Command {
     },
     /// Execute SQL query against a shard
     Query {
-        /// Shard ID to query
-        shard: u32,
+        /// Shard ID (UUID) to query
+        shard: String,
         /// SQL query string
         sql: String,
     },
@@ -83,8 +88,8 @@ enum ClusterAction {
 enum JobAction {
     /// Get job details
     Get {
-        /// Shard ID where the job is stored
-        shard: u32,
+        /// Shard ID (UUID) where the job is stored
+        shard: String,
         /// Job ID
         id: String,
         /// Include attempt history
@@ -93,29 +98,29 @@ enum JobAction {
     },
     /// Cancel a job
     Cancel {
-        /// Shard ID where the job is stored
-        shard: u32,
+        /// Shard ID (UUID) where the job is stored
+        shard: String,
         /// Job ID
         id: String,
     },
     /// Restart a cancelled or failed job
     Restart {
-        /// Shard ID where the job is stored
-        shard: u32,
+        /// Shard ID (UUID) where the job is stored
+        shard: String,
         /// Job ID
         id: String,
     },
     /// Expedite a scheduled job to run immediately
     Expedite {
-        /// Shard ID where the job is stored
-        shard: u32,
+        /// Shard ID (UUID) where the job is stored
+        shard: String,
         /// Job ID
         id: String,
     },
     /// Delete a job permanently
     Delete {
-        /// Shard ID where the job is stored
-        shard: u32,
+        /// Shard ID (UUID) where the job is stored
+        shard: String,
         /// Job ID
         id: String,
     },
@@ -130,23 +135,25 @@ async fn run(args: Args) -> anyhow::Result<()> {
             ClusterAction::Info => siloctl::cluster_info(&opts, &mut stdout).await,
         },
         Command::Job { action } => match action {
-            JobAction::Get { shard, id, attempts } => {
-                siloctl::job_get(&opts, &mut stdout, *shard, id, *attempts).await
-            }
+            JobAction::Get {
+                shard,
+                id,
+                attempts,
+            } => siloctl::job_get(&opts, &mut stdout, shard, id, *attempts).await,
             JobAction::Cancel { shard, id } => {
-                siloctl::job_cancel(&opts, &mut stdout, *shard, id).await
+                siloctl::job_cancel(&opts, &mut stdout, shard, id).await
             }
             JobAction::Restart { shard, id } => {
-                siloctl::job_restart(&opts, &mut stdout, *shard, id).await
+                siloctl::job_restart(&opts, &mut stdout, shard, id).await
             }
             JobAction::Expedite { shard, id } => {
-                siloctl::job_expedite(&opts, &mut stdout, *shard, id).await
+                siloctl::job_expedite(&opts, &mut stdout, shard, id).await
             }
             JobAction::Delete { shard, id } => {
-                siloctl::job_delete(&opts, &mut stdout, *shard, id).await
+                siloctl::job_delete(&opts, &mut stdout, shard, id).await
             }
         },
-        Command::Query { shard, sql } => siloctl::query(&opts, &mut stdout, *shard, sql).await,
+        Command::Query { shard, sql } => siloctl::query(&opts, &mut stdout, shard, sql).await,
         Command::Profile {
             duration,
             frequency,

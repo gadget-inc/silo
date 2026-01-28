@@ -18,15 +18,15 @@
 //! - queueLimitEnforced: Never more than 1 holder for the limit
 
 use crate::helpers::{
-    ConcurrencyLimit, EnqueueRequest, HashMap, LeaseTasksRequest, Limit, SerializedBytes,
-    ReportOutcomeRequest, RetryPolicy, check_holder_limits, get_seed, limit, serialized_bytes,
-    report_outcome_request, run_scenario_impl, setup_server, turmoil_connector,
+    ConcurrencyLimit, EnqueueRequest, HashMap, LeaseTasksRequest, Limit, ReportOutcomeRequest,
+    RetryPolicy, SerializedBytes, TEST_SHARD_ID, check_holder_limits, get_seed, limit,
+    report_outcome_request, run_scenario_impl, serialized_bytes, setup_server, turmoil_connector,
     verify_server_invariants,
 };
 use silo::pb::silo_client::SiloClient;
 use std::collections::HashMap as StdHashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tonic::transport::Endpoint;
 
@@ -64,7 +64,7 @@ pub fn run() {
             tracing::trace!(job_id = "job-A", "enqueue_with_retry");
             client
                 .enqueue(tonic::Request::new(EnqueueRequest {
-                    shard: 0,
+                    shard: TEST_SHARD_ID.to_string(),
                     id: "job-A".into(),
                     priority: 10,
                     start_at_ms: 0,
@@ -76,7 +76,9 @@ pub fn run() {
                         backoff_factor: 1.0,       // No exponential backoff
                     }),
                     payload: Some(SerializedBytes {
-                        encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"job": "A"})).unwrap())),
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(
+                            rmp_serde::to_vec(&serde_json::json!({"job": "A"})).unwrap(),
+                        )),
                     }),
                     limits: vec![Limit {
                         limit: Some(limit::Limit::Concurrency(ConcurrencyLimit {
@@ -96,13 +98,15 @@ pub fn run() {
             tracing::trace!(job_id = "job-B", "enqueue");
             client
                 .enqueue(tonic::Request::new(EnqueueRequest {
-                    shard: 0,
+                    shard: TEST_SHARD_ID.to_string(),
                     id: "job-B".into(),
                     priority: 10, // Same priority as A
                     start_at_ms: 0,
                     retry_policy: None, // No retry
                     payload: Some(SerializedBytes {
-                        encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"job": "B"})).unwrap())),
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(
+                            rmp_serde::to_vec(&serde_json::json!({"job": "B"})).unwrap(),
+                        )),
                     }),
                     limits: vec![Limit {
                         limit: Some(limit::Limit::Concurrency(ConcurrencyLimit {
@@ -123,8 +127,12 @@ pub fn run() {
             let fail_time = producer_fail_time.load(Ordering::SeqCst);
             if fail_time > 0 {
                 // Job A has failed, check that it doesn't hold the ticket
-                if let Ok(state) = verify_server_invariants(&mut client, 0).await {
-                    let holder_count = state.holder_counts_by_queue.get(LIMIT_KEY).copied().unwrap_or(0);
+                if let Ok(state) = verify_server_invariants(&mut client, TEST_SHARD_ID).await {
+                    let holder_count = state
+                        .holder_counts_by_queue
+                        .get(LIMIT_KEY)
+                        .copied()
+                        .unwrap_or(0);
                     tracing::trace!(
                         holder_count = holder_count,
                         limit_key = LIMIT_KEY,
@@ -162,7 +170,7 @@ pub fn run() {
             for _round in 0..50 {
                 let lease = client
                     .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                        shard: Some(0),
+                        shard: Some(TEST_SHARD_ID.to_string()),
                         worker_id: "worker-1".into(),
                         max_tasks: 1,
                         task_group: "default".to_string(),
@@ -192,7 +200,7 @@ pub fn run() {
                             // Report failure
                             client
                                 .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                                    shard: 0,
+                                    shard: TEST_SHARD_ID.to_string(),
                                     task_id: task.id.clone(),
                                     outcome: Some(report_outcome_request::Outcome::Failure(
                                         silo::pb::Failure {
@@ -231,12 +239,14 @@ pub fn run() {
 
                             client
                                 .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                                    shard: 0,
+                                    shard: TEST_SHARD_ID.to_string(),
                                     task_id: task.id.clone(),
                                     outcome: Some(report_outcome_request::Outcome::Success(
                                         SerializedBytes {
-                                            encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!("done"))
-                                                .unwrap())),
+                                            encoding: Some(serialized_bytes::Encoding::Msgpack(
+                                                rmp_serde::to_vec(&serde_json::json!("done"))
+                                                    .unwrap(),
+                                            )),
                                         },
                                     )),
                                 }))
@@ -285,7 +295,7 @@ pub fn run() {
             for _round in 0..30 {
                 let lease = client
                     .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                        shard: Some(0),
+                        shard: Some(TEST_SHARD_ID.to_string()),
                         worker_id: "worker-2".into(),
                         max_tasks: 1,
                         task_group: "default".to_string(),
@@ -299,22 +309,20 @@ pub fn run() {
                             .map(|d| d.as_millis() as u64)
                             .unwrap_or(0);
 
-                        tracing::trace!(
-                            job_id = "job-B",
-                            sim_time_ms = sim_time,
-                            "job_b_leased"
-                        );
+                        tracing::trace!(job_id = "job-B", sim_time_ms = sim_time, "job_b_leased");
 
                         // Brief processing
                         tokio::time::sleep(Duration::from_millis(50)).await;
 
                         client
                             .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                                shard: 0,
+                                shard: TEST_SHARD_ID.to_string(),
                                 task_id: task.id.clone(),
                                 outcome: Some(report_outcome_request::Outcome::Success(
                                     SerializedBytes {
-                                        encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!("done")).unwrap())),
+                                        encoding: Some(serialized_bytes::Encoding::Msgpack(
+                                            rmp_serde::to_vec(&serde_json::json!("done")).unwrap(),
+                                        )),
                                     },
                                 )),
                             }))
@@ -329,7 +337,9 @@ pub fn run() {
                         let a_fail_time = worker2_a_fail_time.load(Ordering::SeqCst);
                         let a_second_start = worker2_a_second_start.load(Ordering::SeqCst);
 
-                        if a_fail_time > 0 && (a_second_start == 0 || complete_time < a_second_start) {
+                        if a_fail_time > 0
+                            && (a_second_start == 0 || complete_time < a_second_start)
+                        {
                             // B completed while A was in backoff - ticket was released!
                             worker2_verified.store(true, Ordering::SeqCst);
                             tracing::trace!(
@@ -376,7 +386,7 @@ pub fn run() {
             let mut client = SiloClient::new(ch);
 
             // Verify server state
-            if let Ok(state) = verify_server_invariants(&mut client, 0).await {
+            if let Ok(state) = verify_server_invariants(&mut client, TEST_SHARD_ID).await {
                 assert!(
                     state.violations.is_empty(),
                     "Server invariant violations: {:?}",
@@ -417,14 +427,8 @@ pub fn run() {
             );
 
             // Verify both jobs completed
-            assert!(
-                a_complete_time > 0,
-                "Job A should have completed"
-            );
-            assert!(
-                b_complete_time > 0,
-                "Job B should have completed"
-            );
+            assert!(a_complete_time > 0, "Job A should have completed");
+            assert!(b_complete_time > 0, "Job B should have completed");
 
             // Key invariant: B completed during A's backoff period
             // (after A failed, before A's second attempt started)

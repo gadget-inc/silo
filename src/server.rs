@@ -233,15 +233,24 @@ impl SiloService {
         }
     }
 
+    /// Parse a shard ID string into a ShardId.
+    #[allow(clippy::result_large_err)] // Status is required by tonic's API
+    fn parse_shard_id(shard_str: &str) -> Result<crate::shard_range::ShardId, Status> {
+        crate::shard_range::ShardId::parse(shard_str)
+            .map_err(|_| Status::invalid_argument(format!("invalid shard ID: {}", shard_str)))
+    }
+
     /// Get shard with async lookup of owner for redirect metadata.
     /// If the shard is not found locally, returns NOT_FOUND with metadata
     /// indicating which server owns the shard (if known).
     ///
     /// If this node is the computed owner but hasn't finished acquiring the shard,
     /// returns UNAVAILABLE to signal the client should retry after a delay.
-    async fn shard_with_redirect(&self, shard_id: u32) -> Result<Arc<JobStoreShard>, Status> {
-        let name = shard_id.to_string();
-        if let Some(shard) = self.factory.get(&name) {
+    async fn shard_with_redirect(
+        &self,
+        shard_id: &crate::shard_range::ShardId,
+    ) -> Result<Arc<JobStoreShard>, Status> {
+        if let Some(shard) = self.factory.get(shard_id) {
             return Ok(shard);
         }
 
@@ -251,7 +260,7 @@ impl SiloService {
         // Look up the owner if we have a coordinator
         let Some(coord) = &self.coordinator else {
             // Single-node mode - shard simply doesn't exist
-            tracing::debug!(shard_id, "shard not found (single-node mode)");
+            tracing::debug!(shard_id = %shard_id, "shard not found (single-node mode)");
             return Err(status);
         };
 
@@ -273,12 +282,12 @@ impl SiloService {
         let owned_shards = coord.owned_shards().await;
         let members = coord.get_members().await.ok();
 
-        if let Some(computed_owner_node) = owner_map.shard_to_node.get(&shard_id)
+        if let Some(computed_owner_node) = owner_map.shard_to_node.get(shard_id)
             && computed_owner_node == this_node_id
         {
             // We're computed to own this shard but don't have it locally
             tracing::warn!(
-                shard_id,
+                shard_id = %shard_id,
                 node_id = %this_node_id,
                 owned_shards = ?owned_shards,
                 members = ?members.as_ref().map(|m| m.iter().map(|mi| &mi.node_id).collect::<Vec<_>>()),
@@ -291,30 +300,30 @@ impl SiloService {
 
         // Log details about the routing mismatch to help diagnose production issues
         tracing::warn!(
-            shard_id,
+            shard_id = %shard_id,
             this_node_id = %this_node_id,
             owned_shards = ?owned_shards,
-            computed_owner = ?owner_map.shard_to_node.get(&shard_id),
-            computed_addr = ?owner_map.shard_to_addr.get(&shard_id),
+            computed_owner = ?owner_map.shard_to_node.get(shard_id),
+            computed_addr = ?owner_map.shard_to_addr.get(shard_id),
             members = ?members.as_ref().map(|m| m.iter().map(|mi| (&mi.node_id, &mi.grpc_addr)).collect::<Vec<_>>()),
             "shard not found: routing mismatch - another node sent us a request for a shard we don't own"
         );
 
         // Add redirect metadata - point to the actual computed owner
         let metadata = status.metadata_mut();
-        if let Some(addr) = owner_map.shard_to_addr.get(&shard_id) {
+        if let Some(addr) = owner_map.shard_to_addr.get(shard_id) {
             if let Ok(val) = addr.parse() {
                 metadata.insert(SHARD_OWNER_ADDR_METADATA_KEY, val);
             }
         } else {
             tracing::warn!(
-                shard_id,
-                num_shards = owner_map.num_shards,
+                shard_id = %shard_id,
+                num_shards = owner_map.num_shards(),
                 "shard ID not found in owner map"
             );
         }
 
-        if let Some(node) = owner_map.shard_to_node.get(&shard_id)
+        if let Some(node) = owner_map.shard_to_node.get(shard_id)
             && let Ok(val) = node.parse()
         {
             metadata.insert(SHARD_OWNER_NODE_METADATA_KEY, val);
@@ -340,6 +349,61 @@ impl SiloService {
             (false, None) => Ok("-".to_string()),
         }
     }
+
+    /// Validate that the tenant_id falls within the shard's tenant range.
+    ///
+    /// This prevents clients from accidentally sending requests to the wrong shard,
+    /// which could happen if topology information is stale or the client has a bug.
+    /// Returns an error if the tenant_id is outside the shard's range.
+    async fn validate_tenant_in_shard_range(
+        &self,
+        shard_id: &crate::shard_range::ShardId,
+        tenant_id: &str,
+    ) -> Result<(), Status> {
+        // Skip validation when tenancy is disabled (default tenant "-")
+        // The synthetic tenant doesn't represent real routing requirements
+        if !self.cfg.tenancy.enabled {
+            return Ok(());
+        }
+
+        // Look up the shard's range from the coordinator's shard map
+        let Some(coord) = &self.coordinator else {
+            // Single-node mode - no range validation needed
+            // (all shards implicitly cover the full range)
+            return Ok(());
+        };
+
+        let shard_map = coord.get_shard_map().await.map_err(|e| {
+            tracing::error!(error = %e, "failed to get shard map for tenant validation");
+            Status::internal("failed to validate tenant routing")
+        })?;
+
+        // Find the shard in the map
+        let Some(shard_info) = shard_map.shards().iter().find(|s| &s.id == shard_id) else {
+            // Shard not in map - this shouldn't happen if shard_with_redirect succeeded
+            tracing::warn!(
+                shard_id = %shard_id,
+                "shard not found in shard map during tenant validation"
+            );
+            return Ok(()); // Allow the request to proceed
+        };
+
+        // Validate tenant_id is within the shard's range
+        if !shard_info.range.contains(tenant_id) {
+            tracing::warn!(
+                shard_id = %shard_id,
+                tenant_id = %tenant_id,
+                shard_range = %shard_info.range,
+                "tenant_id is outside shard's range - client may have stale topology"
+            );
+            return Err(Status::failed_precondition(format!(
+                "tenant '{}' is not within shard {} range {}; refresh topology and retry",
+                tenant_id, shard_id, shard_info.range
+            )));
+        }
+
+        Ok(())
+    }
 }
 
 #[tonic::async_trait]
@@ -359,19 +423,17 @@ impl Silo for SiloService {
                 .unwrap_or(&self.cfg.server.grpc_addr)
                 .clone();
 
-            let local_shards: Vec<u32> = self
-                .factory
-                .instances()
-                .keys()
-                .filter_map(|s| s.parse().ok())
-                .collect();
+            let local_shards: Vec<crate::shard_range::ShardId> =
+                self.factory.instances().keys().copied().collect();
 
             let shard_owners: Vec<ShardOwner> = local_shards
                 .into_iter()
                 .map(|shard_id| ShardOwner {
-                    shard_id,
+                    shard_id: shard_id.to_string(),
                     grpc_addr: grpc_addr.clone(),
                     node_id: "local".to_string(),
+                    range_start: String::new(),
+                    range_end: String::new(),
                 })
                 .collect();
 
@@ -388,24 +450,33 @@ impl Silo for SiloService {
             .await
             .map_err(|e| Status::internal(format!("failed to get shard owner map: {}", e)))?;
 
-        let shard_owners: Vec<ShardOwner> = (0..owner_map.num_shards)
-            .filter_map(|shard_id| {
-                let grpc_addr = owner_map.shard_to_addr.get(&shard_id)?.clone();
-                let node_id = owner_map
-                    .shard_to_node
-                    .get(&shard_id)
+        let shard_owners: Vec<ShardOwner> = owner_map
+            .shard_map
+            .shards()
+            .iter()
+            .map(|shard_info| {
+                let grpc_addr = owner_map
+                    .shard_to_addr
+                    .get(&shard_info.id)
                     .cloned()
                     .unwrap_or_default();
-                Some(ShardOwner {
-                    shard_id,
+                let node_id = owner_map
+                    .shard_to_node
+                    .get(&shard_info.id)
+                    .cloned()
+                    .unwrap_or_default();
+                ShardOwner {
+                    shard_id: shard_info.id.to_string(),
                     grpc_addr,
                     node_id,
-                })
+                    range_start: shard_info.range.start.clone(),
+                    range_end: shard_info.range.end.clone(),
+                }
             })
             .collect();
 
         Ok(Response::new(GetClusterInfoResponse {
-            num_shards: owner_map.num_shards,
+            num_shards: owner_map.num_shards() as u32,
             shard_owners,
             this_node_id: coord.node_id().to_string(),
             this_grpc_addr: coord.grpc_addr().to_string(),
@@ -417,8 +488,11 @@ impl Silo for SiloService {
         req: Request<EnqueueRequest>,
     ) -> Result<Response<EnqueueResponse>, Status> {
         let r = req.into_inner();
-        let shard = self.shard_with_redirect(r.shard).await?;
+        let shard_id = Self::parse_shard_id(&r.shard)?;
+        let shard = self.shard_with_redirect(&shard_id).await?;
         let tenant = self.validate_tenant(r.tenant.as_deref())?;
+        self.validate_tenant_in_shard_range(&shard_id, &tenant)
+            .await?;
         let payload_bytes = r
             .payload
             .as_ref()
@@ -506,8 +580,11 @@ impl Silo for SiloService {
         req: Request<GetJobRequest>,
     ) -> Result<Response<GetJobResponse>, Status> {
         let r = req.into_inner();
-        let shard = self.shard_with_redirect(r.shard).await?;
+        let shard_id = Self::parse_shard_id(&r.shard)?;
+        let shard = self.shard_with_redirect(&shard_id).await?;
         let tenant = self.validate_tenant(r.tenant.as_deref())?;
+        self.validate_tenant_in_shard_range(&shard_id, &tenant)
+            .await?;
         let Some(view) = shard.get_job(&tenant, &r.id).await.map_err(map_err)? else {
             return Err(Status::not_found("job not found"));
         };
@@ -576,8 +653,11 @@ impl Silo for SiloService {
         req: Request<GetJobResultRequest>,
     ) -> Result<Response<GetJobResultResponse>, Status> {
         let r = req.into_inner();
-        let shard = self.shard_with_redirect(r.shard).await?;
+        let shard_id = Self::parse_shard_id(&r.shard)?;
+        let shard = self.shard_with_redirect(&shard_id).await?;
         let tenant = self.validate_tenant(r.tenant.as_deref())?;
+        self.validate_tenant_in_shard_range(&shard_id, &tenant)
+            .await?;
 
         // First check if job exists
         let Some(_job_view) = shard.get_job(&tenant, &r.id).await.map_err(map_err)? else {
@@ -673,8 +753,11 @@ impl Silo for SiloService {
         req: Request<DeleteJobRequest>,
     ) -> Result<Response<DeleteJobResponse>, Status> {
         let r = req.into_inner();
-        let shard = self.shard_with_redirect(r.shard).await?;
+        let shard_id = Self::parse_shard_id(&r.shard)?;
+        let shard = self.shard_with_redirect(&shard_id).await?;
         let tenant = self.validate_tenant(r.tenant.as_deref())?;
+        self.validate_tenant_in_shard_range(&shard_id, &tenant)
+            .await?;
         shard.delete_job(&tenant, &r.id).await.map_err(map_err)?;
         Ok(Response::new(DeleteJobResponse {}))
     }
@@ -684,8 +767,11 @@ impl Silo for SiloService {
         req: Request<CancelJobRequest>,
     ) -> Result<Response<CancelJobResponse>, Status> {
         let r = req.into_inner();
-        let shard = self.shard_with_redirect(r.shard).await?;
+        let shard_id = Self::parse_shard_id(&r.shard)?;
+        let shard = self.shard_with_redirect(&shard_id).await?;
         let tenant = self.validate_tenant(r.tenant.as_deref())?;
+        self.validate_tenant_in_shard_range(&shard_id, &tenant)
+            .await?;
         shard.cancel_job(&tenant, &r.id).await.map_err(map_err)?;
         Ok(Response::new(CancelJobResponse {}))
     }
@@ -695,8 +781,11 @@ impl Silo for SiloService {
         req: Request<RestartJobRequest>,
     ) -> Result<Response<RestartJobResponse>, Status> {
         let r = req.into_inner();
-        let shard = self.shard_with_redirect(r.shard).await?;
+        let shard_id = Self::parse_shard_id(&r.shard)?;
+        let shard = self.shard_with_redirect(&shard_id).await?;
         let tenant = self.validate_tenant(r.tenant.as_deref())?;
+        self.validate_tenant_in_shard_range(&shard_id, &tenant)
+            .await?;
         shard.restart_job(&tenant, &r.id).await.map_err(map_err)?;
         Ok(Response::new(RestartJobResponse {}))
     }
@@ -706,8 +795,11 @@ impl Silo for SiloService {
         req: Request<ExpediteJobRequest>,
     ) -> Result<Response<ExpediteJobResponse>, Status> {
         let r = req.into_inner();
-        let shard = self.shard_with_redirect(r.shard).await?;
+        let shard_id = Self::parse_shard_id(&r.shard)?;
+        let shard = self.shard_with_redirect(&shard_id).await?;
         let tenant = self.validate_tenant(r.tenant.as_deref())?;
+        self.validate_tenant_in_shard_range(&shard_id, &tenant)
+            .await?;
         shard.expedite_job(&tenant, &r.id).await.map_err(map_err)?;
         Ok(Response::new(ExpediteJobResponse {}))
     }
@@ -728,22 +820,24 @@ impl Silo for SiloService {
         // Determine which shards to poll:
         // - If shard filter is specified, only poll that shard
         // - Otherwise, poll all local shards (default behavior for workers)
-        let shards_to_poll: Vec<(u32, Arc<JobStoreShard>)> = if let Some(shard_filter) = r.shard {
-            // Filter to specific shard
-            let shard = self.shard_with_redirect(shard_filter).await?;
-            vec![(shard_filter, shard)]
-        } else {
-            // Poll all local shards - this is the typical worker behavior
-            // Shuffle for fair distribution across shards
-            let mut shards: Vec<_> = self
-                .factory
-                .instances()
-                .iter()
-                .filter_map(|(name, shard)| name.parse::<u32>().ok().map(|id| (id, shard.clone())))
-                .collect();
-            shards.shuffle(&mut rand::rng());
-            shards
-        };
+        let shards_to_poll: Vec<(crate::shard_range::ShardId, Arc<JobStoreShard>)> =
+            if let Some(shard_filter) = r.shard {
+                // Filter to specific shard
+                let shard_id = Self::parse_shard_id(&shard_filter)?;
+                let shard = self.shard_with_redirect(&shard_id).await?;
+                vec![(shard_id, shard)]
+            } else {
+                // Poll all local shards - this is the typical worker behavior
+                // Shuffle for fair distribution across shards
+                let mut shards: Vec<_> = self
+                    .factory
+                    .instances()
+                    .iter()
+                    .map(|(id, shard)| (*id, shard.clone()))
+                    .collect();
+                shards.shuffle(&mut rand::rng());
+                shards
+            };
 
         let mut all_tasks = Vec::new();
         let mut all_refresh_tasks = Vec::new();
@@ -813,7 +907,7 @@ impl Silo for SiloService {
                         )),
                     }),
                     priority: job.priority() as u32,
-                    shard: shard_id,
+                    shard: shard_id.to_string(),
                     task_group,
                     tenant_id,
                     is_last_attempt,
@@ -836,7 +930,7 @@ impl Silo for SiloService {
                     last_refreshed_at_ms: rt.last_refreshed_at_ms,
                     metadata: rt.metadata.into_iter().collect(),
                     lease_ms: DEFAULT_LEASE_MS,
-                    shard: shard_id,
+                    shard: shard_id.to_string(),
                     task_group: rt.task_group,
                     tenant_id,
                 });
@@ -864,7 +958,8 @@ impl Silo for SiloService {
     ) -> Result<Response<ReportOutcomeResponse>, Status> {
         let r = req.into_inner();
         let shard_str = r.shard.to_string();
-        let shard = self.shard_with_redirect(r.shard).await?;
+        let shard_id = Self::parse_shard_id(&r.shard)?;
+        let shard = self.shard_with_redirect(&shard_id).await?;
         let (outcome, status_str) = match r
             .outcome
             .ok_or_else(|| Status::invalid_argument("missing outcome"))?
@@ -914,7 +1009,8 @@ impl Silo for SiloService {
         req: Request<ReportRefreshOutcomeRequest>,
     ) -> Result<Response<ReportRefreshOutcomeResponse>, Status> {
         let r = req.into_inner();
-        let shard = self.shard_with_redirect(r.shard).await?;
+        let shard_id = Self::parse_shard_id(&r.shard)?;
+        let shard = self.shard_with_redirect(&shard_id).await?;
         // Tenant is extracted from the lease on the server side, not from the request
         let outcome = r
             .outcome
@@ -942,7 +1038,8 @@ impl Silo for SiloService {
         req: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let r = req.into_inner();
-        let shard = self.shard_with_redirect(r.shard).await?;
+        let shard_id = Self::parse_shard_id(&r.shard)?;
+        let shard = self.shard_with_redirect(&shard_id).await?;
         // Tenant is extracted from the lease on the server side, not from the request
         let result = shard
             .heartbeat_task(&r.worker_id, &r.task_id)
@@ -956,7 +1053,8 @@ impl Silo for SiloService {
 
     async fn query(&self, req: Request<QueryRequest>) -> Result<Response<QueryResponse>, Status> {
         let r = req.into_inner();
-        let shard = self.shard_with_redirect(r.shard).await?;
+        let shard_id = Self::parse_shard_id(&r.shard)?;
+        let shard = self.shard_with_redirect(&shard_id).await?;
 
         // Get the cached query engine for this shard
         let query_engine = shard.query_engine();
@@ -1019,7 +1117,8 @@ impl Silo for SiloService {
         req: Request<QueryArrowRequest>,
     ) -> Result<Response<Self::QueryArrowStream>, Status> {
         let r = req.into_inner();
-        let shard = self.shard_with_redirect(r.shard).await?;
+        let shard_id = Self::parse_shard_id(&r.shard)?;
+        let shard = self.shard_with_redirect(&shard_id).await?;
 
         // Get the cached query engine for this shard
         let query_engine = shard.query_engine();
@@ -1075,26 +1174,22 @@ impl Silo for SiloService {
             ));
         }
 
-        // Get all local shard numbers
-        let shard_numbers: Vec<usize> = self
-            .factory
-            .instances()
-            .keys()
-            .filter_map(|s| s.parse().ok())
-            .collect();
+        // Get all local shard IDs
+        let shard_ids: Vec<crate::shard_range::ShardId> =
+            self.factory.instances().keys().copied().collect();
 
         let mut reset_count = 0u32;
-        for shard_number in shard_numbers {
-            match self.factory.reset(shard_number).await {
+        for shard_id in shard_ids {
+            match self.factory.reset(&shard_id).await {
                 Ok(_) => {
                     reset_count += 1;
-                    tracing::debug!(shard = shard_number, "reset shard successfully");
+                    tracing::debug!(shard = %shard_id, "reset shard successfully");
                 }
                 Err(e) => {
-                    tracing::error!(shard = shard_number, error = %e, "failed to reset shard");
+                    tracing::error!(shard = %shard_id, error = %e, "failed to reset shard");
                     return Err(Status::internal(format!(
                         "Failed to reset shard {}: {}",
-                        shard_number, e
+                        shard_id, e
                     )));
                 }
             }
@@ -1111,7 +1206,8 @@ impl Silo for SiloService {
         req: Request<GetShardCountersRequest>,
     ) -> Result<Response<GetShardCountersResponse>, Status> {
         let r = req.into_inner();
-        let shard = self.shard_with_redirect(r.shard).await?;
+        let shard_id = Self::parse_shard_id(&r.shard)?;
+        let shard = self.shard_with_redirect(&shard_id).await?;
 
         let counters = shard.get_counters().await.map_err(map_err)?;
 
@@ -1247,13 +1343,13 @@ where
                     }
 
                     // Use default tenant "-" for system-level reaping
-                    for (name, shard) in instances.iter() {
+                    for (shard_id, shard) in instances.iter() {
                         let _ = shard.reap_expired_leases("-").await;
 
                         // Collect SlateDB storage metrics for this shard
                         if let Some(ref m) = reaper_metrics {
                             let stats = shard.slatedb_stats();
-                            m.update_slatedb_stats(name, &stats);
+                            m.update_slatedb_stats(&shard_id.to_string(), &stats);
                         }
                     }
                 }

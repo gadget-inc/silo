@@ -16,6 +16,7 @@ use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::server::run_server_with_incoming;
 use silo::settings::{AppConfig, Backend, GubernatorSettings, LoggingConfig, WebUiConfig};
+use silo::shard_range::ShardId;
 use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tower::Service;
@@ -30,6 +31,10 @@ pub use silo::pb::{
 };
 pub use std::collections::HashMap;
 pub use turmoil;
+
+/// The test shard ID used by DST scenarios.
+/// This is a fixed UUID that matches what setup_server() creates.
+pub const TEST_SHARD_ID: &str = "00000000-0000-0000-0000-000000000000";
 
 /// Get the DST seed from environment, or use a default.
 pub fn get_seed() -> u64 {
@@ -216,7 +221,12 @@ pub async fn setup_server(port: u16) -> turmoil::Result<()> {
 
     let rate_limiter = MockGubernatorClient::new_arc();
     let factory = ShardFactory::new(cfg.database.clone(), rate_limiter, None);
-    let _ = factory.open(0).await.map_err(|e| e.to_string())?;
+    // For DST tests, use a fixed shard ID (zero UUID) for simplicity
+    let test_shard_id = ShardId::parse("00000000-0000-0000-0000-000000000000").unwrap();
+    let _ = factory
+        .open(&test_shard_id)
+        .await
+        .map_err(|e| e.to_string())?;
     let factory = Arc::new(factory);
 
     let addr = (IpAddr::from(Ipv4Addr::UNSPECIFIED), port);
@@ -1077,7 +1087,7 @@ impl ServerInvariantResult {
 /// - Job state distribution is consistent
 pub async fn verify_server_invariants(
     client: &mut silo::pb::silo_client::SiloClient<tonic::transport::Channel>,
-    shard: u32,
+    shard: &str,
 ) -> Result<ServerInvariantResult, String> {
     let mut result = ServerInvariantResult::default();
 
@@ -1085,7 +1095,7 @@ pub async fn verify_server_invariants(
     let job_status_query = "SELECT status_kind, COUNT(*) as cnt FROM jobs GROUP BY status_kind";
     match client
         .query(tonic::Request::new(QueryRequest {
-            shard,
+            shard: shard.to_string(),
             sql: job_status_query.to_string(),
             tenant: None,
         }))
@@ -1120,7 +1130,7 @@ pub async fn verify_server_invariants(
     let holder_query = "SELECT queue_name, COUNT(*) as cnt FROM queues WHERE entry_type = 'holder' GROUP BY queue_name";
     match client
         .query(tonic::Request::new(QueryRequest {
-            shard,
+            shard: shard.to_string(),
             sql: holder_query.to_string(),
             tenant: None,
         }))
@@ -1152,7 +1162,7 @@ pub async fn verify_server_invariants(
     let requester_query = "SELECT queue_name, COUNT(*) as cnt FROM queues WHERE entry_type = 'requester' GROUP BY queue_name";
     match client
         .query(tonic::Request::new(QueryRequest {
-            shard,
+            shard: shard.to_string(),
             sql: requester_query.to_string(),
             tenant: None,
         }))
@@ -1191,7 +1201,7 @@ pub async fn verify_server_invariants(
     "#;
     match client
         .query(tonic::Request::new(QueryRequest {
-            shard,
+            shard: shard.to_string(),
             sql: terminal_with_holders_query.to_string(),
             tenant: None,
         }))

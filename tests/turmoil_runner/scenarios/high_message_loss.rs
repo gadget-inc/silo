@@ -9,11 +9,11 @@
 
 use crate::helpers::{
     ClientConfig, EnqueueRequest, HashMap, InvariantTracker, LeaseTasksRequest,
-    ReportOutcomeRequest, RetryPolicy, SerializedBytes, create_turmoil_client, get_seed,
-    report_outcome_request, run_scenario_impl, serialized_bytes, setup_server,
+    ReportOutcomeRequest, RetryPolicy, SerializedBytes, TEST_SHARD_ID, create_turmoil_client,
+    get_seed, report_outcome_request, run_scenario_impl, serialized_bytes, setup_server,
 };
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 pub fn run() {
@@ -56,7 +56,7 @@ pub fn run() {
 
                 match client
                     .enqueue(tonic::Request::new(EnqueueRequest {
-                        shard: 0,
+                        shard: TEST_SHARD_ID.to_string(),
                         id: job_id.clone(),
                         priority: i as u32,
                         start_at_ms: 0,
@@ -117,7 +117,7 @@ pub fn run() {
                 }
                 match client
                     .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                        shard: Some(0),
+                        shard: Some(TEST_SHARD_ID.to_string()),
                         worker_id: "resilient".into(),
                         max_tasks: 5,
                         task_group: "default".to_string(),
@@ -131,7 +131,7 @@ pub fn run() {
                             tracing::trace!(job_id = %task.job_id, "lease");
                             match client
                                 .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                                    shard: 0,
+                                    shard: TEST_SHARD_ID.to_string(),
                                     task_id: task.id.clone(),
                                     outcome: Some(report_outcome_request::Outcome::Success(
                                         SerializedBytes {

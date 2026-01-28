@@ -14,7 +14,7 @@ async fn grpc_get_job_includes_status() -> anyhow::Result<()> {
 
         // Enqueue a job
         let enq = EnqueueRequest {
-            shard: 0,
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
             id: "status_test_job".to_string(),
             priority: 10,
             start_at_ms: 0,
@@ -34,7 +34,7 @@ async fn grpc_get_job_includes_status() -> anyhow::Result<()> {
         // Get job - should be Scheduled initially
         let job = client
             .get_job(GetJobRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "status_test_job".to_string(),
                 tenant: None,
                 include_attempts: false,
@@ -52,7 +52,7 @@ async fn grpc_get_job_includes_status() -> anyhow::Result<()> {
         // Lease the task to start running
         let lease_resp = client
             .lease_tasks(LeaseTasksRequest {
-                shard: Some(0),
+                shard: Some(crate::grpc_integration_helpers::TEST_SHARD_ID.to_string()),
                 worker_id: "w1".to_string(),
                 max_tasks: 1,
                 task_group: "default".to_string(),
@@ -66,7 +66,7 @@ async fn grpc_get_job_includes_status() -> anyhow::Result<()> {
         // Get job - should be Running now
         let job = client
             .get_job(GetJobRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "status_test_job".to_string(),
                 tenant: None,
                 include_attempts: false,
@@ -79,7 +79,7 @@ async fn grpc_get_job_includes_status() -> anyhow::Result<()> {
         // Report success
         let _ = client
             .report_outcome(ReportOutcomeRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 task_id: task.id.clone(),
                 outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
                     encoding: Some(serialized_bytes::Encoding::Msgpack(
@@ -92,7 +92,7 @@ async fn grpc_get_job_includes_status() -> anyhow::Result<()> {
         // Get job - should be Succeeded now
         let job = client
             .get_job(GetJobRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "status_test_job".to_string(),
                 tenant: None,
                 include_attempts: false,
@@ -121,7 +121,7 @@ async fn grpc_get_job_result_not_found() -> anyhow::Result<()> {
         // Try to get result for non-existent job
         let result = client
             .get_job_result(GetJobResultRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "nonexistent_job".to_string(),
                 tenant: None,
             })
@@ -149,7 +149,7 @@ async fn grpc_get_job_result_not_terminal() -> anyhow::Result<()> {
 
         // Enqueue a job
         let enq = EnqueueRequest {
-            shard: 0,
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
             id: "scheduled_job".to_string(),
             priority: 10,
             start_at_ms: 0,
@@ -169,7 +169,7 @@ async fn grpc_get_job_result_not_terminal() -> anyhow::Result<()> {
         // Try to get result for scheduled job - should fail with FAILED_PRECONDITION
         let result = client
             .get_job_result(GetJobResultRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "scheduled_job".to_string(),
                 tenant: None,
             })
@@ -183,7 +183,7 @@ async fn grpc_get_job_result_not_terminal() -> anyhow::Result<()> {
         // Lease the task to make it running
         let lease_resp = client
             .lease_tasks(LeaseTasksRequest {
-                shard: Some(0),
+                shard: Some(crate::grpc_integration_helpers::TEST_SHARD_ID.to_string()),
                 worker_id: "w1".to_string(),
                 max_tasks: 1,
                 task_group: "default".to_string(),
@@ -195,7 +195,7 @@ async fn grpc_get_job_result_not_terminal() -> anyhow::Result<()> {
         // Try to get result for running job - should also fail with FAILED_PRECONDITION
         let result = client
             .get_job_result(GetJobResultRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "scheduled_job".to_string(),
                 tenant: None,
             })
@@ -223,7 +223,7 @@ async fn grpc_get_job_result_success() -> anyhow::Result<()> {
 
         // Enqueue a job
         let enq = EnqueueRequest {
-            shard: 0,
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
             id: "success_job".to_string(),
             priority: 10,
             start_at_ms: 0,
@@ -243,7 +243,7 @@ async fn grpc_get_job_result_success() -> anyhow::Result<()> {
         // Lease and complete the task
         let lease_resp = client
             .lease_tasks(LeaseTasksRequest {
-                shard: Some(0),
+                shard: Some(crate::grpc_integration_helpers::TEST_SHARD_ID.to_string()),
                 worker_id: "w1".to_string(),
                 max_tasks: 1,
                 task_group: "default".to_string(),
@@ -256,7 +256,7 @@ async fn grpc_get_job_result_success() -> anyhow::Result<()> {
 
         let _ = client
             .report_outcome(ReportOutcomeRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 task_id: task.id.clone(),
                 outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
                     encoding: Some(serialized_bytes::Encoding::Msgpack(result_data.clone())),
@@ -267,7 +267,7 @@ async fn grpc_get_job_result_success() -> anyhow::Result<()> {
         // Get job result - should return success data
         let result = client
             .get_job_result(GetJobResultRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "success_job".to_string(),
                 tenant: None,
             })
@@ -307,7 +307,7 @@ async fn grpc_get_job_result_failure() -> anyhow::Result<()> {
 
         // Enqueue a job with no retries
         let enq = EnqueueRequest {
-            shard: 0,
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
             id: "failed_job".to_string(),
             priority: 10,
             start_at_ms: 0,
@@ -333,7 +333,7 @@ async fn grpc_get_job_result_failure() -> anyhow::Result<()> {
         // Lease and fail the task
         let lease_resp = client
             .lease_tasks(LeaseTasksRequest {
-                shard: Some(0),
+                shard: Some(crate::grpc_integration_helpers::TEST_SHARD_ID.to_string()),
                 worker_id: "w1".to_string(),
                 max_tasks: 1,
                 task_group: "default".to_string(),
@@ -347,7 +347,7 @@ async fn grpc_get_job_result_failure() -> anyhow::Result<()> {
 
         let _ = client
             .report_outcome(ReportOutcomeRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 task_id: task.id.clone(),
                 outcome: Some(report_outcome_request::Outcome::Failure(Failure {
                     code: error_code.clone(),
@@ -361,7 +361,7 @@ async fn grpc_get_job_result_failure() -> anyhow::Result<()> {
         // Get job result - should return failure info
         let result = client
             .get_job_result(GetJobResultRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "failed_job".to_string(),
                 tenant: None,
             })
@@ -405,7 +405,7 @@ async fn grpc_get_job_result_cancelled() -> anyhow::Result<()> {
 
         // Enqueue a job
         let enq = EnqueueRequest {
-            shard: 0,
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
             id: "cancelled_job".to_string(),
             priority: 10,
             start_at_ms: 0,
@@ -425,7 +425,7 @@ async fn grpc_get_job_result_cancelled() -> anyhow::Result<()> {
         // Cancel the job while it's scheduled (before running)
         let _ = client
             .cancel_job(CancelJobRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "cancelled_job".to_string(),
                 tenant: None,
             })
@@ -434,7 +434,7 @@ async fn grpc_get_job_result_cancelled() -> anyhow::Result<()> {
         // Get job result - should return cancelled info
         let result = client
             .get_job_result(GetJobResultRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "cancelled_job".to_string(),
                 tenant: None,
             })
@@ -470,7 +470,7 @@ async fn grpc_get_job_result_cancelled_while_running() -> anyhow::Result<()> {
 
         // Enqueue a job
         let enq = EnqueueRequest {
-            shard: 0,
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
             id: "cancel_running_job".to_string(),
             priority: 10,
             start_at_ms: 0,
@@ -490,7 +490,7 @@ async fn grpc_get_job_result_cancelled_while_running() -> anyhow::Result<()> {
         // Lease the task to start running
         let lease_resp = client
             .lease_tasks(LeaseTasksRequest {
-                shard: Some(0),
+                shard: Some(crate::grpc_integration_helpers::TEST_SHARD_ID.to_string()),
                 worker_id: "w1".to_string(),
                 max_tasks: 1,
                 task_group: "default".to_string(),
@@ -503,7 +503,7 @@ async fn grpc_get_job_result_cancelled_while_running() -> anyhow::Result<()> {
         // Cancel the job while it's running
         let _ = client
             .cancel_job(CancelJobRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "cancel_running_job".to_string(),
                 tenant: None,
             })
@@ -512,7 +512,7 @@ async fn grpc_get_job_result_cancelled_while_running() -> anyhow::Result<()> {
         // Worker reports Cancelled outcome after seeing cancellation in heartbeat
         let _ = client
             .report_outcome(ReportOutcomeRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 task_id: task.id.clone(),
                 outcome: Some(report_outcome_request::Outcome::Cancelled(Cancelled {})),
             })
@@ -521,7 +521,7 @@ async fn grpc_get_job_result_cancelled_while_running() -> anyhow::Result<()> {
         // Get job result - should return cancelled info
         let result = client
             .get_job_result(GetJobResultRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "cancel_running_job".to_string(),
                 tenant: None,
             })
@@ -557,7 +557,7 @@ async fn grpc_server_get_job_result_for_non_terminal_job() -> anyhow::Result<()>
         // Enqueue a job
         let _ = client
             .enqueue(EnqueueRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "non-terminal-job".to_string(),
                 priority: 5,
                 start_at_ms: 0,
@@ -577,7 +577,7 @@ async fn grpc_server_get_job_result_for_non_terminal_job() -> anyhow::Result<()>
         // Get result for scheduled (non-terminal) job - should fail
         let res = client
             .get_job_result(GetJobResultRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "non-terminal-job".to_string(),
                 tenant: None,
             })
@@ -618,7 +618,7 @@ async fn grpc_get_job_next_attempt_starts_after() -> anyhow::Result<()> {
 
         // Test 1: Enqueue with start_at_ms=0 should have next_attempt_starts_after_ms close to now
         let enq = EnqueueRequest {
-            shard: 0,
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
             id: "next_attempt_test_1".to_string(),
             priority: 10,
             start_at_ms: 0,
@@ -637,7 +637,7 @@ async fn grpc_get_job_next_attempt_starts_after() -> anyhow::Result<()> {
 
         let job = client
             .get_job(GetJobRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "next_attempt_test_1".to_string(),
                 tenant: None,
                 include_attempts: false,
@@ -660,7 +660,7 @@ async fn grpc_get_job_next_attempt_starts_after() -> anyhow::Result<()> {
         // Test 2: Enqueue with future start_at_ms
         let future_ms = now_ms + 60000; // 1 minute in future
         let enq_future = EnqueueRequest {
-            shard: 0,
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
             id: "next_attempt_test_future".to_string(),
             priority: 10,
             start_at_ms: future_ms,
@@ -679,7 +679,7 @@ async fn grpc_get_job_next_attempt_starts_after() -> anyhow::Result<()> {
 
         let job_future = client
             .get_job(GetJobRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "next_attempt_test_future".to_string(),
                 tenant: None,
                 include_attempts: false,
@@ -697,7 +697,7 @@ async fn grpc_get_job_next_attempt_starts_after() -> anyhow::Result<()> {
         // Test 3: Running job should NOT have next_attempt_starts_after_ms
         let lease_resp = client
             .lease_tasks(LeaseTasksRequest {
-                shard: Some(0),
+                shard: Some(crate::grpc_integration_helpers::TEST_SHARD_ID.to_string()),
                 worker_id: "w1".to_string(),
                 max_tasks: 1,
                 task_group: "default".to_string(),
@@ -710,7 +710,7 @@ async fn grpc_get_job_next_attempt_starts_after() -> anyhow::Result<()> {
 
         let running_job = client
             .get_job(GetJobRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "next_attempt_test_1".to_string(),
                 tenant: None,
                 include_attempts: false,
@@ -727,7 +727,7 @@ async fn grpc_get_job_next_attempt_starts_after() -> anyhow::Result<()> {
         // Test 4: Complete the job - terminal jobs should NOT have next_attempt_starts_after_ms
         let _ = client
             .report_outcome(ReportOutcomeRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 task_id: task.id.clone(),
                 outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
                     encoding: Some(serialized_bytes::Encoding::Msgpack(
@@ -739,7 +739,7 @@ async fn grpc_get_job_next_attempt_starts_after() -> anyhow::Result<()> {
 
         let succeeded_job = client
             .get_job(GetJobRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "next_attempt_test_1".to_string(),
                 tenant: None,
                 include_attempts: false,
@@ -776,7 +776,7 @@ async fn grpc_get_job_next_attempt_after_retry() -> anyhow::Result<()> {
 
         // Enqueue a job with retry policy
         let enq = EnqueueRequest {
-            shard: 0,
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
             id: "retry_next_attempt_test".to_string(),
             priority: 10,
             start_at_ms: 0,
@@ -802,7 +802,7 @@ async fn grpc_get_job_next_attempt_after_retry() -> anyhow::Result<()> {
         // Lease and fail the task to trigger retry
         let lease_resp = client
             .lease_tasks(LeaseTasksRequest {
-                shard: Some(0),
+                shard: Some(crate::grpc_integration_helpers::TEST_SHARD_ID.to_string()),
                 worker_id: "w1".to_string(),
                 max_tasks: 1,
                 task_group: "default".to_string(),
@@ -814,7 +814,7 @@ async fn grpc_get_job_next_attempt_after_retry() -> anyhow::Result<()> {
 
         let _ = client
             .report_outcome(ReportOutcomeRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 task_id: task.id.clone(),
                 outcome: Some(report_outcome_request::Outcome::Failure(Failure {
                     code: "TEST_FAILURE".to_string(),
@@ -828,7 +828,7 @@ async fn grpc_get_job_next_attempt_after_retry() -> anyhow::Result<()> {
         // After failure with retry, job should be Scheduled with next_attempt_starts_after_ms in the future
         let retrying_job = client
             .get_job(GetJobRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "retry_next_attempt_test".to_string(),
                 tenant: None,
                 include_attempts: false,
@@ -869,7 +869,7 @@ async fn grpc_get_job_next_attempt_cancelled() -> anyhow::Result<()> {
 
         // Enqueue a job
         let enq = EnqueueRequest {
-            shard: 0,
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
             id: "cancel_next_attempt_test".to_string(),
             priority: 10,
             start_at_ms: 0,
@@ -889,7 +889,7 @@ async fn grpc_get_job_next_attempt_cancelled() -> anyhow::Result<()> {
         // Verify scheduled job has next_attempt_starts_after_ms
         let job = client
             .get_job(GetJobRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "cancel_next_attempt_test".to_string(),
                 tenant: None,
                 include_attempts: false,
@@ -902,7 +902,7 @@ async fn grpc_get_job_next_attempt_cancelled() -> anyhow::Result<()> {
         // Cancel the job
         let _ = client
             .cancel_job(CancelJobRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "cancel_next_attempt_test".to_string(),
                 tenant: None,
             })
@@ -911,7 +911,7 @@ async fn grpc_get_job_next_attempt_cancelled() -> anyhow::Result<()> {
         // Cancelled job should NOT have next_attempt_starts_after_ms
         let cancelled_job = client
             .get_job(GetJobRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "cancel_next_attempt_test".to_string(),
                 tenant: None,
                 include_attempts: false,

@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -80,7 +80,11 @@ async fn main() -> anyhow::Result<()> {
     let factory1 = Arc::new(ShardFactory::new(
         DatabaseTemplate {
             backend: Backend::Fs,
-            path: tmpdir.path().join("node-a-%shard%").to_string_lossy().to_string(),
+            path: tmpdir
+                .path()
+                .join("node-a-%shard%")
+                .to_string_lossy()
+                .to_string(),
             wal: None,
             apply_wal_on_close: true,
         },
@@ -90,7 +94,11 @@ async fn main() -> anyhow::Result<()> {
     let factory2 = Arc::new(ShardFactory::new(
         DatabaseTemplate {
             backend: Backend::Fs,
-            path: tmpdir.path().join("node-b-%shard%").to_string_lossy().to_string(),
+            path: tmpdir
+                .path()
+                .join("node-b-%shard%")
+                .to_string_lossy()
+                .to_string(),
             wal: None,
             apply_wal_on_close: true,
         },
@@ -98,17 +106,40 @@ async fn main() -> anyhow::Result<()> {
         None,
     ));
 
-    let (c1, h1) = EtcdCoordinator::start(&cfg.coordination.etcd_endpoints, &prefix, "node-a", "http://127.0.0.1:50051", num_shards, 10, factory1).await?;
-    let (c2, h2) = EtcdCoordinator::start(&cfg.coordination.etcd_endpoints, &prefix, "node-b", "http://127.0.0.1:50052", num_shards, 10, factory2).await?;
+    let (c1, h1) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "node-a",
+        "http://127.0.0.1:50051",
+        num_shards,
+        10,
+        factory1,
+    )
+    .await?;
+    let (c2, h2) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "node-b",
+        "http://127.0.0.1:50052",
+        num_shards,
+        10,
+        factory2,
+    )
+    .await?;
 
-    let mut shards: Vec<Arc<JobStoreShard>> = Vec::new();
-    for s in 0..num_shards as usize {
+    // Get the shard map from coordinator to get actual shard IDs
+    let shard_map = c1.get_shard_map().await?;
+    let shard_ids: Vec<silo::shard_range::ShardId> = shard_map.shard_ids();
+
+    let mut shards: std::collections::HashMap<silo::shard_range::ShardId, Arc<JobStoreShard>> =
+        std::collections::HashMap::new();
+    for shard_id in &shard_ids {
         let cfg = DatabaseConfig {
-            name: s.to_string(),
+            name: shard_id.to_string(),
             backend: Backend::Fs,
             path: tmpdir
                 .path()
-                .join(format!("{}", s))
+                .join(shard_id.to_string())
                 .to_string_lossy()
                 .to_string(),
             flush_interval_ms: Some(10), // Fast flushes for simulation
@@ -116,7 +147,7 @@ async fn main() -> anyhow::Result<()> {
             apply_wal_on_close: true,
         };
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None).await?;
-        shards.push(shard);
+        shards.insert(*shard_id, shard);
     }
 
     let seen_attempt_ids: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -129,12 +160,14 @@ async fn main() -> anyhow::Result<()> {
     ];
 
     let shards_for_enq = Arc::new(shards);
+    let shard_ids_for_enq = Arc::new(shard_ids.clone());
     let c1_owned = c1.clone();
     let c2_owned = c2.clone();
     let enq_running = Arc::new(AtomicBool::new(true));
     let queues_enq = queues.clone();
     let enq_handle = {
         let shards = Arc::clone(&shards_for_enq);
+        let _shard_ids = Arc::clone(&shard_ids_for_enq);
         let enq_running = enq_running.clone();
         tokio::spawn(async move {
             let mut i: u64 = 0;
@@ -144,14 +177,18 @@ async fn main() -> anyhow::Result<()> {
                 }
                 let owned1 = c1_owned.owned_shards().await;
                 let owned2 = c2_owned.owned_shards().await;
-                let candidates: Vec<u32> = owned1.into_iter().chain(owned2.into_iter()).collect();
+                let candidates: Vec<silo::shard_range::ShardId> =
+                    owned1.into_iter().chain(owned2.into_iter()).collect();
                 if candidates.is_empty() {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     continue;
                 }
                 let (q_name, q_limit) = &queues_enq[(i as usize) % queues_enq.len()];
-                let shard_id = candidates[(i as usize) % candidates.len()] as usize;
-                let shard = &shards[shard_id];
+                let shard_id = candidates[(i as usize) % candidates.len()];
+                let Some(shard) = shards.get(&shard_id) else {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                };
                 let payload = serde_json::json!({"i": i, "queue": q_name});
                 let payload_bytes = rmp_serde::to_vec(&payload).unwrap();
                 let _ = shard
@@ -180,13 +217,16 @@ async fn main() -> anyhow::Result<()> {
 
     let workers_running = Arc::new(AtomicBool::new(true));
     let mut worker_handles = Vec::new();
-    for s in 0..num_shards as usize {
-        let shard = shards_for_enq[s].clone();
+    for (idx, shard_id) in shard_ids.iter().enumerate() {
+        let shard = shards_for_enq
+            .get(shard_id)
+            .expect("shard must exist")
+            .clone();
         let workers_running = workers_running.clone();
         let seen = Arc::clone(&seen_attempt_ids);
         let processed = Arc::clone(&processed_total);
         let handle = tokio::spawn(async move {
-            let wid = format!("w-{}", s);
+            let wid = format!("w-{}", idx);
             loop {
                 if !workers_running.load(Ordering::SeqCst) {
                     break;
@@ -227,7 +267,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             while checker_running.load(Ordering::SeqCst) {
                 let mut holders_total = 0usize;
-                for shard in shards_for_check.iter() {
+                for shard in shards_for_check.values() {
                     holders_total += count_with_prefix(shard.db(), "holders/").await;
                 }
                 assert!(
@@ -238,7 +278,7 @@ async fn main() -> anyhow::Result<()> {
                 );
 
                 let mut requests_total = 0usize;
-                for shard in shards_for_check.iter() {
+                for shard in shards_for_check.values() {
                     requests_total += count_with_prefix(shard.db(), "requests/").await;
                 }
                 assert!(
@@ -256,14 +296,27 @@ async fn main() -> anyhow::Result<()> {
     let factory3 = Arc::new(ShardFactory::new(
         DatabaseTemplate {
             backend: Backend::Fs,
-            path: tmpdir.path().join("node-c-%shard%").to_string_lossy().to_string(),
+            path: tmpdir
+                .path()
+                .join("node-c-%shard%")
+                .to_string_lossy()
+                .to_string(),
             wal: None,
             apply_wal_on_close: true,
         },
         rate_limiter.clone(),
         None,
     ));
-    let (c3, h3) = EtcdCoordinator::start(&cfg.coordination.etcd_endpoints, &prefix, "node-c", "http://127.0.0.1:50053", num_shards, 10, factory3).await?;
+    let (c3, h3) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "node-c",
+        "http://127.0.0.1:50053",
+        num_shards,
+        10,
+        factory3,
+    )
+    .await?;
 
     // Run for desired duration
     tokio::time::sleep(Duration::from_secs(args.duration_secs)).await;
@@ -279,7 +332,7 @@ async fn main() -> anyhow::Result<()> {
     checker_running.store(false, Ordering::SeqCst);
     let _ = check_handle.await;
 
-    for shard in shards_for_enq.iter() {
+    for shard in shards_for_enq.values() {
         assert_eq!(
             count_with_prefix(shard.db(), "holders/").await,
             0,

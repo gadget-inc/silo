@@ -2,8 +2,8 @@
 
 use crate::helpers::{
     AttemptStatus, EnqueueRequest, GetJobRequest, HashMap, JobStatus, LeaseTasksRequest,
-    SerializedBytes, ReportOutcomeRequest, get_seed, report_outcome_request, run_scenario_impl, serialized_bytes,
-    setup_server, turmoil_connector, verify_server_invariants,
+    ReportOutcomeRequest, SerializedBytes, TEST_SHARD_ID, get_seed, report_outcome_request,
+    run_scenario_impl, serialized_bytes, setup_server, turmoil_connector, verify_server_invariants,
 };
 use silo::pb::silo_client::SiloClient;
 use std::time::Duration;
@@ -24,20 +24,22 @@ pub fn run() {
             let mut client = SiloClient::new(ch);
 
             // Verify initial server state (no jobs)
-            let initial_state = verify_server_invariants(&mut client, 0).await;
+            let initial_state = verify_server_invariants(&mut client, TEST_SHARD_ID).await;
             tracing::trace!(result = ?initial_state, "initial_server_state");
 
             // Enqueue
             tracing::trace!(job_id = "test-job", "enqueue");
             client
                 .enqueue(tonic::Request::new(EnqueueRequest {
-                    shard: 0,
+                    shard: TEST_SHARD_ID.to_string(),
                     id: "test-job".into(),
                     priority: 1,
                     start_at_ms: 0,
                     retry_policy: None,
                     payload: Some(SerializedBytes {
-                        encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"test": true})).unwrap())),
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(
+                            rmp_serde::to_vec(&serde_json::json!({"test": true})).unwrap(),
+                        )),
                     }),
                     limits: vec![],
                     tenant: None,
@@ -48,19 +50,23 @@ pub fn run() {
             tracing::trace!(job_id = "test-job", "enqueue_done");
 
             // Verify server state after enqueue (should have no running jobs, no terminal)
-            if let Ok(state) = verify_server_invariants(&mut client, 0).await {
+            if let Ok(state) = verify_server_invariants(&mut client, TEST_SHARD_ID).await {
                 tracing::trace!(
                     running = state.running_job_count,
                     terminal = state.terminal_job_count,
                     "server_state_after_enqueue"
                 );
-                assert!(state.violations.is_empty(), "Server invariant violations after enqueue: {:?}", state.violations);
+                assert!(
+                    state.violations.is_empty(),
+                    "Server invariant violations after enqueue: {:?}",
+                    state.violations
+                );
             }
 
             // Lease
             let lease = client
                 .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                    shard: Some(0),
+                    shard: Some(TEST_SHARD_ID.to_string()),
                     worker_id: "worker-1".into(),
                     max_tasks: 1,
                     task_group: "default".to_string(),
@@ -81,7 +87,7 @@ pub fn run() {
                 // INVARIANT: Lease implies job is Running with one running attempt
                 let job_resp = client
                     .get_job(tonic::Request::new(GetJobRequest {
-                        shard: 0,
+                        shard: TEST_SHARD_ID.to_string(),
                         id: task.job_id.clone(),
                         tenant: None,
                         include_attempts: true,
@@ -106,10 +112,12 @@ pub fn run() {
                 // Complete
                 client
                     .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                        shard: 0,
+                        shard: TEST_SHARD_ID.to_string(),
                         task_id: task.id.clone(),
                         outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
-                            encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"result": "ok"})).unwrap())),
+                            encoding: Some(serialized_bytes::Encoding::Msgpack(
+                                rmp_serde::to_vec(&serde_json::json!({"result": "ok"})).unwrap(),
+                            )),
                         })),
                     }))
                     .await?;
@@ -118,7 +126,7 @@ pub fn run() {
                 // INVARIANT: Completed job is terminal with no running attempts
                 let job_resp = client
                     .get_job(tonic::Request::new(GetJobRequest {
-                        shard: 0,
+                        shard: TEST_SHARD_ID.to_string(),
                         id: task.job_id.clone(),
                         tenant: None,
                         include_attempts: true,
@@ -151,16 +159,26 @@ pub fn run() {
                 );
 
                 // Verify server state after completion
-                if let Ok(state) = verify_server_invariants(&mut client, 0).await {
+                if let Ok(state) = verify_server_invariants(&mut client, TEST_SHARD_ID).await {
                     tracing::trace!(
                         running = state.running_job_count,
                         terminal = state.terminal_job_count,
                         holders = ?state.holder_counts_by_queue,
                         "server_state_after_complete"
                     );
-                    assert!(state.violations.is_empty(), "Server invariant violations after complete: {:?}", state.violations);
-                    assert_eq!(state.running_job_count, 0, "No jobs should be running after completion");
-                    assert_eq!(state.terminal_job_count, 1, "One job should be terminal after completion");
+                    assert!(
+                        state.violations.is_empty(),
+                        "Server invariant violations after complete: {:?}",
+                        state.violations
+                    );
+                    assert_eq!(
+                        state.running_job_count, 0,
+                        "No jobs should be running after completion"
+                    );
+                    assert_eq!(
+                        state.terminal_job_count, 1,
+                        "One job should be terminal after completion"
+                    );
                 }
             }
 

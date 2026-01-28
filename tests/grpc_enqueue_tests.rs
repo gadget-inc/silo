@@ -17,7 +17,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
         let mut md = std::collections::HashMap::new();
         md.insert("env".to_string(), "test".to_string());
         let enq = EnqueueRequest {
-            shard: 0,
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
             id: "".to_string(),
             priority: 10,
             start_at_ms: 0,
@@ -36,7 +36,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
         // Lease a task
         let lease_resp = client
             .lease_tasks(LeaseTasksRequest {
-                shard: Some(0),
+                shard: Some(crate::grpc_integration_helpers::TEST_SHARD_ID.to_string()),
                 worker_id: "w1".to_string(),
                 max_tasks: 1,
                 task_group: "default".to_string(),
@@ -57,7 +57,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
         // Report success
         let _ = client
             .report_outcome(ReportOutcomeRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 task_id: task.id.clone(),
                 outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
                     encoding: Some(serialized_bytes::Encoding::Msgpack(
@@ -71,7 +71,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
         // First try get_job to ensure job exists pre-delete
         let _ = client
             .get_job(GetJobRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: job_id.clone(),
                 tenant: None,
                 include_attempts: false,
@@ -80,7 +80,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
         // Verify metadata via get_job
         let got = client
             .get_job(GetJobRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: job_id.clone(),
                 tenant: None,
                 include_attempts: false,
@@ -91,7 +91,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
         // Now delete it
         let _ = client
             .delete_job(DeleteJobRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: job_id.clone(),
                 tenant: None,
             })
@@ -135,7 +135,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
                 md.insert(format!("k{}", i), "v".to_string());
             }
             let req = EnqueueRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "".to_string(),
                 priority: 1,
                 start_at_ms: 0,
@@ -159,7 +159,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
             let long_key = "x".repeat(64);
             md.insert(long_key, "v".to_string());
             let req = EnqueueRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "".to_string(),
                 priority: 1,
                 start_at_ms: 0,
@@ -186,7 +186,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
                 String::from_utf8(long_val).unwrap_or_default(),
             );
             let req = EnqueueRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "".to_string(),
                 priority: 1,
                 start_at_ms: 0,
@@ -222,7 +222,7 @@ async fn grpc_server_enqueue_with_rate_limit() -> anyhow::Result<()> {
         // Enqueue a job with a rate limit
         let enq_resp = client
             .enqueue(EnqueueRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "rate-limited-job".to_string(),
                 priority: 5,
                 start_at_ms: 0,
@@ -261,7 +261,7 @@ async fn grpc_server_enqueue_with_rate_limit() -> anyhow::Result<()> {
         // Verify job was created with rate limit via get_job
         let job_resp = client
             .get_job(GetJobRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "rate-limited-job".to_string(),
                 tenant: None,
                 include_attempts: false,
@@ -302,7 +302,7 @@ async fn grpc_enqueue_requires_tenant_when_tenancy_enabled() -> anyhow::Result<(
 
         // Test 1: Enqueue without tenant (None)
         let req = EnqueueRequest {
-            shard: 0,
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
             id: "".to_string(),
             priority: 1,
             start_at_ms: 0,
@@ -332,7 +332,7 @@ async fn grpc_enqueue_requires_tenant_when_tenancy_enabled() -> anyhow::Result<(
 
         // Test 2: Enqueue with empty tenant string
         let req = EnqueueRequest {
-            shard: 0,
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
             id: "".to_string(),
             priority: 1,
             start_at_ms: 0,
@@ -362,7 +362,7 @@ async fn grpc_enqueue_requires_tenant_when_tenancy_enabled() -> anyhow::Result<(
 
         // Test 3: Enqueue WITH a valid tenant should succeed
         let req = EnqueueRequest {
-            shard: 0,
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
             id: "".to_string(),
             priority: 1,
             start_at_ms: 0,

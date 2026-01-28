@@ -39,7 +39,13 @@ pub async fn setup_test_server(
     Ok((client, shutdown_tx, server, addr))
 }
 
+use silo::shard_range::ShardId;
+
+/// Predictable shard ID for testing - the zero UUID
+pub const TEST_SHARD_ID: &str = "00000000-0000-0000-0000-000000000000";
+
 /// Helper to create a shard factory with temp storage
+/// Uses a predictable shard ID (TEST_SHARD_ID) for simplicity in tests
 pub async fn create_test_factory() -> anyhow::Result<(Arc<ShardFactory>, tempfile::TempDir)> {
     let tmp = tempfile::tempdir()?;
     let template = DatabaseTemplate {
@@ -50,7 +56,9 @@ pub async fn create_test_factory() -> anyhow::Result<(Arc<ShardFactory>, tempfil
     };
     let rate_limiter = MockGubernatorClient::new_arc();
     let factory = ShardFactory::new(template, rate_limiter, None);
-    let _ = factory.open(0).await?;
+    // Use a predictable shard ID for testing
+    let shard_id = ShardId::parse(TEST_SHARD_ID).expect("valid test shard ID");
+    let _ = factory.open(&shard_id).await?;
     Ok((Arc::new(factory), tmp))
 }
 

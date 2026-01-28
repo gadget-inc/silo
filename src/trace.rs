@@ -114,3 +114,13 @@ where
     init(LogFormat::Text).unwrap();
     f().await
 }
+
+/// Run a sync test body with a per-test tracing subscriber.
+/// This is the synchronous equivalent of `with_test_tracing`.
+pub fn with_test_tracing_sync<F, T>(_test_name: &str, f: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    init(LogFormat::Text).unwrap();
+    f()
+}

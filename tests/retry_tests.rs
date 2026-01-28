@@ -1,6 +1,6 @@
 use silo::retry::{RetryPolicy, next_retry_time_ms};
 
-#[test]
+#[silo::test]
 fn next_retry_no_retries_returns_none() {
     let policy = RetryPolicy {
         retry_count: 0,
@@ -12,7 +12,7 @@ fn next_retry_no_retries_returns_none() {
     assert_eq!(next_retry_time_ms(1_000_000, 1, &policy), None);
 }
 
-#[test]
+#[silo::test]
 fn next_retry_basic_exponential() {
     let policy = RetryPolicy {
         retry_count: 5,
@@ -29,7 +29,7 @@ fn next_retry_basic_exponential() {
     assert_eq!(next_retry_time_ms(1_000_000, 2, &policy), Some(1_004_000));
 }
 
-#[test]
+#[silo::test]
 fn next_retry_caps_at_max_interval() {
     let policy = RetryPolicy {
         retry_count: 10,
@@ -42,7 +42,7 @@ fn next_retry_caps_at_max_interval() {
     assert_eq!(next_retry_time_ms(100, 1, &policy), Some(2_100));
 }
 
-#[test]
+#[silo::test]
 fn next_retry_randomized_is_deterministic_for_given_inputs() {
     let policy = RetryPolicy {
         retry_count: 5,

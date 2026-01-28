@@ -5,6 +5,7 @@ use silo::settings::{
     AppConfig, Backend, DatabaseConfig, DatabaseTemplate, GubernatorSettings, LoggingConfig,
     WalConfig, WebUiConfig, expand_env_vars_for_test,
 };
+use silo::shard_range::ShardMap;
 use silo::storage::resolve_object_store;
 
 #[silo::test]
@@ -29,7 +30,9 @@ async fn open_fs_db_from_config() {
 
     let rate_limiter = MockGubernatorClient::new_arc();
     let factory = ShardFactory::new(cfg.database.clone(), rate_limiter, None);
-    let shard = factory.open(0).await.expect("open shard");
+    let shard_map = ShardMap::create_initial(1).expect("create shard map");
+    let shard_id = shard_map.shards()[0].id;
+    let shard = factory.open(&shard_id).await.expect("open shard");
 
     shard.db().put(b"k", b"v").await.expect("put");
     shard.db().flush().await.expect("flush");
@@ -296,17 +299,20 @@ async fn factory_close_all_flushes_all_shards_wal() {
     let rate_limiter = MockGubernatorClient::new_arc();
     let factory = ShardFactory::new(template, rate_limiter, None);
 
-    // Open multiple shards
-    let shard0 = factory.open(0).await.expect("open shard 0");
-    let shard1 = factory.open(1).await.expect("open shard 1");
+    // Create ShardMap and open multiple shards
+    let shard_map = ShardMap::create_initial(2).expect("create shard map");
+    let shard0_id = shard_map.shards()[0].id;
+    let shard1_id = shard_map.shards()[1].id;
+    let shard0 = factory.open(&shard0_id).await.expect("open shard 0");
+    let shard1 = factory.open(&shard1_id).await.expect("open shard 1");
 
     // Write to both
     shard0.db().put(b"key0", b"value0").await.expect("put 0");
     shard1.db().put(b"key1", b"value1").await.expect("put 1");
 
-    // Both WAL directories should exist
-    let wal_path_0 = wal_dir.path().join("0");
-    let wal_path_1 = wal_dir.path().join("1");
+    // Both WAL directories should exist (using UUID paths now)
+    let wal_path_0 = wal_dir.path().join(shard0_id.to_string());
+    let wal_path_1 = wal_dir.path().join(shard1_id.to_string());
     assert!(wal_path_0.exists(), "shard 0 WAL should exist");
     assert!(wal_path_1.exists(), "shard 1 WAL should exist");
 
@@ -356,13 +362,13 @@ async fn wal_config_is_local_storage_detection() {
 // Environment Variable Expansion Tests
 // =============================================================================
 
-#[test]
+#[silo::test]
 fn expand_env_vars_no_vars() {
     let input = "hello world";
     assert_eq!(expand_env_vars_for_test(input), "hello world");
 }
 
-#[test]
+#[silo::test]
 fn expand_env_vars_simple_var() {
     // SAFETY: Test runs single-threaded and uses a unique env var name
     unsafe { std::env::set_var("TEST_SILO_VAR", "test_value") };
@@ -371,7 +377,7 @@ fn expand_env_vars_simple_var() {
     unsafe { std::env::remove_var("TEST_SILO_VAR") };
 }
 
-#[test]
+#[silo::test]
 fn expand_env_vars_missing_var() {
     // SAFETY: Test runs single-threaded and uses a unique env var name
     unsafe { std::env::remove_var("TEST_SILO_MISSING") };
@@ -379,7 +385,7 @@ fn expand_env_vars_missing_var() {
     assert_eq!(expand_env_vars_for_test(input), "prefix--suffix");
 }
 
-#[test]
+#[silo::test]
 fn expand_env_vars_default_value_used() {
     // SAFETY: Test runs single-threaded and uses a unique env var name
     unsafe { std::env::remove_var("TEST_SILO_DEFAULT") };
@@ -387,7 +393,7 @@ fn expand_env_vars_default_value_used() {
     assert_eq!(expand_env_vars_for_test(input), "prefix-fallback-suffix");
 }
 
-#[test]
+#[silo::test]
 fn expand_env_vars_default_value_not_used() {
     // SAFETY: Test runs single-threaded and uses a unique env var name
     unsafe { std::env::set_var("TEST_SILO_DEFAULT2", "actual_value") };
@@ -399,7 +405,7 @@ fn expand_env_vars_default_value_not_used() {
     unsafe { std::env::remove_var("TEST_SILO_DEFAULT2") };
 }
 
-#[test]
+#[silo::test]
 fn expand_env_vars_multiple_vars() {
     // SAFETY: Test runs single-threaded and uses unique env var names
     unsafe {
@@ -414,20 +420,20 @@ fn expand_env_vars_multiple_vars() {
     }
 }
 
-#[test]
+#[silo::test]
 fn expand_env_vars_unclosed_brace() {
     let input = "prefix-${UNCLOSED-suffix";
     // Malformed syntax is kept as-is
     assert_eq!(expand_env_vars_for_test(input), "prefix-${UNCLOSED-suffix");
 }
 
-#[test]
+#[silo::test]
 fn expand_env_vars_dollar_without_brace() {
     let input = "cost is $50";
     assert_eq!(expand_env_vars_for_test(input), "cost is $50");
 }
 
-#[test]
+#[silo::test]
 fn expand_env_vars_real_k8s_example() {
     // SAFETY: Test runs single-threaded and uses a unique env var name
     unsafe { std::env::set_var("POD_IP", "10.0.0.5") };
@@ -440,7 +446,7 @@ fn expand_env_vars_real_k8s_example() {
 // Storage Tests
 // =============================================================================
 
-#[test]
+#[silo::test]
 fn resolve_object_store_fs_creates_directory() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("new_subdir");
@@ -455,7 +461,7 @@ fn resolve_object_store_fs_creates_directory() {
     assert!(path.exists());
 }
 
-#[test]
+#[silo::test]
 fn resolve_object_store_fs_canonicalizes_path() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().to_string_lossy().to_string();
@@ -467,7 +473,7 @@ fn resolve_object_store_fs_canonicalizes_path() {
     assert!(!result.canonical_path.contains(".."));
 }
 
-#[test]
+#[silo::test]
 fn resolve_object_store_memory_returns_same_path() {
     let result = resolve_object_store(&Backend::Memory, "my-test-path").unwrap();
 

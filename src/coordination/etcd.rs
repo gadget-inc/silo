@@ -14,6 +14,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 use crate::factory::ShardFactory;
+use crate::shard_range::{ShardId, ShardMap};
 
 // Re-export ShardPhase for backwards compatibility (tests reference it from here)
 pub use super::ShardPhase;
@@ -32,7 +33,7 @@ pub struct EtcdCoordinator {
     cluster_prefix: String,
     membership_lease_id: i64,
     liveness_lease_id: i64,
-    shard_guards: Arc<Mutex<HashMap<u32, Arc<EtcdShardGuard>>>>,
+    shard_guards: Arc<Mutex<HashMap<ShardId, Arc<EtcdShardGuard>>>>,
 }
 
 impl EtcdCoordinator {
@@ -40,12 +41,16 @@ impl EtcdCoordinator {
     ///
     /// The coordinator will manage shard ownership and automatically open/close
     /// shards in the factory as ownership changes.
+    ///
+    /// If the cluster doesn't have a shard map yet, one will be created with
+    /// `initial_shard_count` shards. If the cluster already has a shard map,
+    /// the existing one is used and `initial_shard_count` is ignored.
     pub async fn start(
         endpoints: &[String],
         cluster_prefix: &str,
         node_id: impl Into<String>,
         grpc_addr: impl Into<String>,
-        num_shards: u32,
+        initial_shard_count: u32,
         ttl_secs: i64,
         factory: Arc<ShardFactory>,
     ) -> Result<(Self, tokio::task::JoinHandle<()>), CoordinationError> {
@@ -64,6 +69,11 @@ impl EtcdCoordinator {
         let node_id = node_id.into();
         let grpc_addr = grpc_addr.into();
 
+        // Load or create the shard map
+        let shard_map =
+            Self::load_or_create_shard_map(&mut client, &cluster_prefix, initial_shard_count)
+                .await?;
+
         // Create membership and liveness leases
         let membership_lease = client
             .lease_grant(ttl_secs, None)
@@ -79,7 +89,7 @@ impl EtcdCoordinator {
         let base = Arc::new(CoordinatorBase::new(
             node_id.clone(),
             grpc_addr.clone(),
-            num_shards,
+            shard_map,
             factory,
         ));
 
@@ -275,6 +285,90 @@ impl EtcdCoordinator {
         Ok((me, handle))
     }
 
+    /// Load an existing shard map from etcd, or create a new one if none exists.
+    async fn load_or_create_shard_map(
+        client: &mut Client,
+        cluster_prefix: &str,
+        initial_shard_count: u32,
+    ) -> Result<ShardMap, CoordinationError> {
+        let shard_map_key = keys::shard_map_key(cluster_prefix);
+
+        // Try to read existing shard map
+        let resp = client
+            .kv_client()
+            .get(shard_map_key.clone(), None)
+            .await
+            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+
+        if let Some(kv) = resp.kvs().first() {
+            // Existing shard map found - parse and use it
+            let value = String::from_utf8_lossy(kv.value());
+            let shard_map: ShardMap = serde_json::from_str(&value).map_err(|e| {
+                CoordinationError::BackendError(format!("invalid shard map JSON: {}", e))
+            })?;
+            info!(
+                num_shards = shard_map.len(),
+                version = shard_map.version,
+                "loaded existing shard map from etcd"
+            );
+            return Ok(shard_map);
+        }
+
+        // No existing shard map - create a new one
+        let shard_map = ShardMap::create_initial(initial_shard_count)
+            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+
+        let shard_map_json = serde_json::to_string(&shard_map)
+            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+
+        // Try to create it (may fail if another node created it first)
+        // Use a transaction to ensure we only create if it doesn't exist
+        let txn = etcd_client::Txn::new()
+            .when([etcd_client::Compare::version(
+                shard_map_key.clone(),
+                etcd_client::CompareOp::Equal,
+                0,
+            )])
+            .and_then([etcd_client::TxnOp::put(
+                shard_map_key.clone(),
+                shard_map_json.clone(),
+                None,
+            )])
+            .or_else([etcd_client::TxnOp::get(shard_map_key.clone(), None)]);
+
+        let txn_resp = client
+            .kv_client()
+            .txn(txn)
+            .await
+            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+
+        if txn_resp.succeeded() {
+            info!(
+                num_shards = initial_shard_count,
+                "created new shard map in etcd"
+            );
+            Ok(shard_map)
+        } else {
+            // Another node created it first - read and use theirs
+            if let Some(etcd_client::TxnOpResponse::Get(get_resp)) = txn_resp.op_responses().first()
+                && let Some(kv) = get_resp.kvs().first()
+            {
+                let value = String::from_utf8_lossy(kv.value());
+                let existing_map: ShardMap = serde_json::from_str(&value).map_err(|e| {
+                    CoordinationError::BackendError(format!("invalid shard map JSON: {}", e))
+                })?;
+                info!(
+                    num_shards = existing_map.len(),
+                    "using shard map created by another node"
+                );
+                return Ok(existing_map);
+            }
+            Err(CoordinationError::BackendError(
+                "failed to load shard map after create race".to_string(),
+            ))
+        }
+    }
+
     async fn reconcile_shards(
         &self,
         _lock: &mut etcd_client::LockClient,
@@ -294,10 +388,10 @@ impl EtcdCoordinator {
             return Ok(());
         }
 
-        let desired =
-            compute_desired_shards_for_node(self.base.num_shards, &self.base.node_id, &members);
+        let shard_ids = self.base.shard_ids().await;
+        let desired = compute_desired_shards_for_node(&shard_ids, &self.base.node_id, &members);
 
-        let current_locks: Vec<u32> = {
+        let current_locks: Vec<ShardId> = {
             let g = self.shard_guards.lock().await;
             let mut v = Vec::new();
             for (sid, guard) in g.iter() {
@@ -311,7 +405,7 @@ impl EtcdCoordinator {
 
         // Release undesired shards
         {
-            let to_release: Vec<u32> = {
+            let to_release: Vec<ShardId> = {
                 let guards = self.shard_guards.lock().await;
                 let mut v = Vec::new();
                 for (sid, guard) in guards.iter() {
@@ -328,7 +422,7 @@ impl EtcdCoordinator {
 
         // Acquire desired shards
         {
-            let snapshot: Vec<u32> = desired.iter().copied().collect();
+            let snapshot: Vec<ShardId> = desired.iter().copied().collect();
             for shard_id in snapshot {
                 self.ensure_shard_guard(shard_id)
                     .await
@@ -340,7 +434,7 @@ impl EtcdCoordinator {
         Ok(())
     }
 
-    async fn ensure_shard_guard(&self, shard_id: u32) -> Arc<EtcdShardGuard> {
+    async fn ensure_shard_guard(&self, shard_id: ShardId) -> Arc<EtcdShardGuard> {
         {
             let guards = self.shard_guards.lock().await;
             if let Some(g) = guards.get(&shard_id) {
@@ -390,7 +484,7 @@ impl EtcdCoordinator {
 
 #[async_trait]
 impl Coordinator for EtcdCoordinator {
-    async fn owned_shards(&self) -> Vec<u32> {
+    async fn owned_shards(&self) -> Vec<ShardId> {
         self.base.owned_shards().await
     }
 
@@ -454,13 +548,17 @@ impl Coordinator for EtcdCoordinator {
         Ok(members)
     }
 
-    async fn get_shard_owner_map(&self) -> Result<ShardOwnerMap, CoordinationError> {
-        let members = self.get_members().await?;
-        Ok(self.base.compute_shard_owner_map(&members))
+    async fn get_shard_map(&self) -> Result<ShardMap, CoordinationError> {
+        Ok(self.base.get_shard_map().await)
     }
 
-    fn num_shards(&self) -> u32 {
-        self.base.num_shards
+    async fn get_shard_owner_map(&self) -> Result<ShardOwnerMap, CoordinationError> {
+        let members = self.get_members().await?;
+        Ok(self.base.compute_shard_owner_map(&members).await)
+    }
+
+    async fn num_shards(&self) -> usize {
+        self.base.num_shards().await
     }
 
     fn node_id(&self) -> &str {
@@ -480,7 +578,7 @@ pub struct ShardState {
 
 /// Per-shard lock guard for etcd backend.
 pub struct EtcdShardGuard {
-    pub shard_id: u32,
+    pub shard_id: ShardId,
     pub client: Client,
     pub cluster_prefix: String,
     pub liveness_lease_id: i64,
@@ -491,7 +589,7 @@ pub struct EtcdShardGuard {
 
 impl EtcdShardGuard {
     pub fn new(
-        shard_id: u32,
+        shard_id: ShardId,
         client: Client,
         cluster_prefix: String,
         liveness_lease_id: i64,
@@ -513,13 +611,13 @@ impl EtcdShardGuard {
     }
 
     fn owner_key(&self) -> String {
-        keys::shard_owner_key(&self.cluster_prefix, self.shard_id)
+        keys::shard_owner_key(&self.cluster_prefix, &self.shard_id)
     }
 
     pub async fn set_desired(&self, desired: bool) {
         let mut st = self.state.lock().await;
         if matches!(st.phase, ShardPhase::ShutDown | ShardPhase::ShuttingDown) {
-            debug!(shard_id = self.shard_id, desired = desired, phase = %st.phase, "shard: can't change desired state after shut down");
+            debug!(shard_id = %self.shard_id, desired = desired, phase = %st.phase, "shard: can't change desired state after shut down");
             return;
         }
 
@@ -527,14 +625,14 @@ impl EtcdShardGuard {
             let prev_desired = st.desired;
             let prev_phase = st.phase;
             st.desired = desired;
-            debug!(shard_id = self.shard_id, prev_desired = prev_desired, desired = desired, phase = %prev_phase, "shard: set_desired");
+            debug!(shard_id = %self.shard_id, prev_desired = prev_desired, desired = desired, phase = %prev_phase, "shard: set_desired");
             self.notify.notify_one();
         }
     }
 
     pub async fn run(
         self: Arc<Self>,
-        owned_arc: Arc<Mutex<HashSet<u32>>>,
+        owned_arc: Arc<Mutex<HashSet<ShardId>>>,
         factory: Arc<ShardFactory>,
     ) {
         use tracing::{Instrument, info_span};
@@ -552,14 +650,14 @@ impl EtcdShardGuard {
                     (ShardPhase::ShuttingDown, _, _) => {}
                     (ShardPhase::Idle, true, false) => {
                         debug!(
-                            shard_id = self.shard_id,
+                            shard_id = %self.shard_id,
                             "shard: transition Idle -> Acquiring"
                         );
                         st.phase = ShardPhase::Acquiring;
                     }
                     (ShardPhase::Held, false, true) => {
                         debug!(
-                            shard_id = self.shard_id,
+                            shard_id = %self.shard_id,
                             "shard: transition Held -> Releasing"
                         );
                         st.phase = ShardPhase::Releasing;
@@ -574,12 +672,15 @@ impl EtcdShardGuard {
                 ShardPhase::Acquiring => {
                     let name = self.owner_key();
                     let span =
-                        info_span!("shard.acquire", shard_id = self.shard_id, lock_key = %name);
+                        info_span!("shard.acquire", shard_id = %self.shard_id, lock_key = %name);
                     async {
                         let mut lock_cli = self.client.lock_client();
                         let mut attempt: u32 = 0;
 
-                        let initial_jitter_ms = ((self.shard_id as u64).wrapping_mul(13)) % 80;
+                        // Use first 8 bytes of UUID for jitter seed
+                        let uuid_bytes = self.shard_id.as_uuid().as_bytes();
+                        let jitter_seed = u64::from_le_bytes(uuid_bytes[0..8].try_into().unwrap());
+                        let initial_jitter_ms = jitter_seed % 80;
                         tokio::time::sleep(Duration::from_millis(initial_jitter_ms)).await;
 
                         loop {
@@ -592,7 +693,7 @@ impl EtcdShardGuard {
                                     if !st.desired && st.phase == ShardPhase::Acquiring {
                                         st.phase = ShardPhase::Idle;
                                     }
-                                    info!(shard_id = self.shard_id, desired = st.desired, phase = %st.phase, "shard: acquire abort");
+                                    info!(shard_id = %self.shard_id, desired = st.desired, phase = %st.phase, "shard: acquire abort");
                                     break;
                                 }
                             }
@@ -609,7 +710,7 @@ impl EtcdShardGuard {
                                     let key = resp.key().to_vec();
                                     // Open the shard BEFORE marking as Held - if open fails,
                                     // we should release the lock and not claim ownership
-                                    match factory.open(self.shard_id as usize).await {
+                                    match factory.open(&self.shard_id).await {
                                         Ok(_) => {
                                             {
                                                 let mut st = self.state.lock().await;
@@ -620,12 +721,12 @@ impl EtcdShardGuard {
                                                 let mut owned = owned_arc.lock().await;
                                                 owned.insert(self.shard_id);
                                             }
-                                            info!(shard_id = self.shard_id, attempts = attempt, "shard: acquired and opened");
+                                            info!(shard_id = %self.shard_id, attempts = attempt, "shard: acquired and opened");
                                             break;
                                         }
                                         Err(e) => {
                                             // Failed to open - release the lock and retry
-                                            tracing::error!(shard_id = self.shard_id, error = %e, "failed to open shard, releasing lock");
+                                            tracing::error!(shard_id = %self.shard_id, error = %e, "failed to open shard, releasing lock");
                                             let mut lock_cli = self.client.lock_client();
                                             let _ = lock_cli.unlock(key).await;
                                             // Exponential backoff before retry
@@ -638,13 +739,13 @@ impl EtcdShardGuard {
                                 }
                                 Ok(Err(_)) | Err(_) => {
                                     attempt = attempt.wrapping_add(1);
-                                    let jitter_ms = ((self.shard_id as u64)
+                                    let jitter_ms = (jitter_seed
                                         .wrapping_mul(31)
                                         .wrapping_add(attempt as u64 * 17))
                                         % 150;
                                     tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
                                     if attempt % 8 == 0 {
-                                        debug!(shard_id = self.shard_id, attempt = attempt, "shard: acquire retry");
+                                        debug!(shard_id = %self.shard_id, attempt = attempt, "shard: acquire retry");
                                     }
                                 }
                             }
@@ -656,9 +757,9 @@ impl EtcdShardGuard {
                 ShardPhase::Releasing => {
                     let name = self.owner_key();
                     let span =
-                        info_span!("shard.release", shard_id = self.shard_id, lock_key = %name);
+                        info_span!("shard.release", shard_id = %self.shard_id, lock_key = %name);
                     async {
-                        debug!(shard_id = self.shard_id, "shard: release start (delay)");
+                        debug!(shard_id = %self.shard_id, "shard: release start (delay)");
                         tokio::time::sleep(Duration::from_millis(100)).await;
 
                         let mut cancelled = false;
@@ -669,7 +770,7 @@ impl EtcdShardGuard {
                             } else if st.desired {
                                 st.phase = ShardPhase::Held;
                                 cancelled = true;
-                                debug!(shard_id = self.shard_id, "shard: release cancelled");
+                                debug!(shard_id = %self.shard_id, "shard: release cancelled");
                             }
                             st.held_key.clone()
                         };
@@ -678,8 +779,8 @@ impl EtcdShardGuard {
                         }
                         if let Some(key) = key_opt {
                             // Close the shard before releasing the lock
-                            if let Err(e) = factory.close(self.shard_id as usize).await {
-                                tracing::error!(shard_id = self.shard_id, error = %e, "failed to close shard before releasing lock");
+                            if let Err(e) = factory.close(&self.shard_id).await {
+                                tracing::error!(shard_id = %self.shard_id, error = %e, "failed to close shard before releasing lock");
                             }
                             let mut lock_cli = self.client.lock_client();
                             let _ = lock_cli.unlock(key).await;
@@ -692,11 +793,11 @@ impl EtcdShardGuard {
                                 let mut owned = owned_arc.lock().await;
                                 owned.remove(&self.shard_id);
                             }
-                            debug!(shard_id = self.shard_id, "shard: release done");
+                            debug!(shard_id = %self.shard_id, "shard: release done");
                         } else {
                             let mut st = self.state.lock().await;
                             st.phase = ShardPhase::Idle;
-                            debug!(shard_id = self.shard_id, "shard: release noop");
+                            debug!(shard_id = %self.shard_id, "shard: release noop");
                         }
                     }
                     .instrument(span)
@@ -706,8 +807,8 @@ impl EtcdShardGuard {
                     let key_opt = { self.state.lock().await.held_key.clone() };
                     if let Some(key) = key_opt {
                         // Close the shard before releasing the lock
-                        if let Err(e) = factory.close(self.shard_id as usize).await {
-                            tracing::error!(shard_id = self.shard_id, error = %e, "failed to close shard during shutdown");
+                        if let Err(e) = factory.close(&self.shard_id).await {
+                            tracing::error!(shard_id = %self.shard_id, error = %e, "failed to close shard during shutdown");
                         }
                         let mut lock_cli = self.client.lock_client();
                         let _ = lock_cli.unlock(key).await;

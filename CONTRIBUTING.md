@@ -177,7 +177,7 @@ fn scenario_your_test_name() {
 2. **Add the test function**:
 
 ```rust
-#[test]
+#[silo::test]
 fn your_test_name() {
     if is_subprocess() || is_fuzz_mode() {
         scenario_your_test_name();

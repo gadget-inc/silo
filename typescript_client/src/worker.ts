@@ -65,8 +65,8 @@ export type TaskHandler<Payload = unknown, Metadata extends Record<string, strin
 export interface RefreshTaskContext {
   /** The refresh task being executed */
   task: RefreshTask;
-  /** The shard the task is from (for reference) */
-  shard: number;
+  /** The shard ID (UUID) the task is from (for reference) */
+  shard: string;
   /** The worker ID processing this task */
   workerId: string;
   /** Signal that is aborted when the worker is stopping */
@@ -567,7 +567,7 @@ export class SiloWorker<Payload = unknown, Metadata extends Record<string, strin
    */
   private async _executeRefreshTask(
     task: RefreshTask,
-    shard: number
+    shard: string
   ): Promise<void> {
     const context: RefreshTaskContext = {
       task,
@@ -627,7 +627,7 @@ export class SiloWorker<Payload = unknown, Metadata extends Record<string, strin
   /**
    * Send a heartbeat for a task (for refresh tasks that don't need TaskExecution).
    */
-  private async _sendHeartbeat(taskId: string, shard: number): Promise<void> {
+  private async _sendHeartbeat(taskId: string, shard: string): Promise<void> {
     await this._client.heartbeat(this._workerId, taskId, shard);
   }
 

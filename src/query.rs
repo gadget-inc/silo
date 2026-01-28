@@ -338,7 +338,7 @@ impl JobsScanner {
     /// Get the base schema for the jobs table
     pub fn base_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new("shard_id", DataType::UInt32, false),
+            Field::new("shard_id", DataType::Utf8, false),
             Field::new("tenant", DataType::Utf8, false),
             Field::new("id", DataType::Utf8, false),
             Field::new("priority", DataType::UInt8, false),
@@ -584,15 +584,15 @@ impl Scan for JobsScanner {
                     continue;
                 }
 
-                // Get shard_id from shard name
-                let shard_id: u32 = shard.name().parse().unwrap_or(0);
+                // Get shard_id from shard name (now a UUID string)
+                let shard_id = shard.name().to_string();
 
                 let mut cols: Vec<ArrayRef> = Vec::with_capacity(proj_for_stream.fields().len());
                 for f in proj_for_stream.fields() {
                     match f.name().as_str() {
                         "shard_id" => {
-                            let vals: Vec<u32> = vec![shard_id; existing_pairs.len()];
-                            cols.push(Arc::new(UInt32Array::from(vals)));
+                            let vals: Vec<&str> = vec![&shard_id; existing_pairs.len()];
+                            cols.push(Arc::new(StringArray::from(vals)));
                         }
                         "tenant" => {
                             let vals: Vec<String> =
@@ -818,7 +818,7 @@ impl QueuesScanner {
     /// Get the base schema for the queues table
     pub fn base_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new("shard_id", DataType::UInt32, false),
+            Field::new("shard_id", DataType::Utf8, false),
             Field::new("tenant", DataType::Utf8, false),
             Field::new("queue_name", DataType::Utf8, false),
             Field::new("entry_type", DataType::Utf8, false), // "holder" or "requester"
@@ -995,15 +995,15 @@ impl Scan for QueuesScanner {
                     continue;
                 }
 
-                // Get shard_id from shard name
-                let shard_id: u32 = shard.name().parse().unwrap_or(0);
+                // Get shard_id from shard name (now a UUID string)
+                let shard_id = shard.name().to_string();
 
                 let mut cols: Vec<ArrayRef> = Vec::with_capacity(proj_for_stream.fields().len());
                 for f in proj_for_stream.fields() {
                     match f.name().as_str() {
                         "shard_id" => {
-                            let vals: Vec<u32> = vec![shard_id; batch_entries.len()];
-                            cols.push(Arc::new(UInt32Array::from(vals)));
+                            let vals: Vec<&str> = vec![&shard_id; batch_entries.len()];
+                            cols.push(Arc::new(StringArray::from(vals)));
                         }
                         "tenant" => {
                             let vals: Vec<&str> =

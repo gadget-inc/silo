@@ -23,15 +23,15 @@
 //! - queueLimitEnforced: Never more than 1 holder for the limit
 
 use crate::helpers::{
-    ConcurrencyLimit, EnqueueRequest, HashMap, LeaseTasksRequest, Limit, SerializedBytes,
-    ReportOutcomeRequest, check_holder_limits, get_seed, limit, report_outcome_request,
+    ConcurrencyLimit, EnqueueRequest, HashMap, LeaseTasksRequest, Limit, ReportOutcomeRequest,
+    SerializedBytes, TEST_SHARD_ID, check_holder_limits, get_seed, limit, report_outcome_request,
     run_scenario_impl, serialized_bytes, setup_server, turmoil_connector, verify_server_invariants,
 };
 use silo::pb::silo_client::SiloClient;
 use silo::pb::{CancelJobRequest, HeartbeatRequest};
 use std::collections::HashMap as StdHashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tonic::transport::Endpoint;
 
@@ -67,13 +67,15 @@ pub fn run() {
             tracing::trace!(job_id = "job-A", "enqueue");
             client
                 .enqueue(tonic::Request::new(EnqueueRequest {
-                    shard: 0,
+                    shard: TEST_SHARD_ID.to_string(),
                     id: "job-A".into(),
                     priority: 10,
                     start_at_ms: 0,
                     retry_policy: None,
                     payload: Some(SerializedBytes {
-                        encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"job": "A"})).unwrap())),
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(
+                            rmp_serde::to_vec(&serde_json::json!({"job": "A"})).unwrap(),
+                        )),
                     }),
                     limits: vec![Limit {
                         limit: Some(limit::Limit::Concurrency(ConcurrencyLimit {
@@ -93,13 +95,15 @@ pub fn run() {
             tracing::trace!(job_id = "job-B", "enqueue");
             client
                 .enqueue(tonic::Request::new(EnqueueRequest {
-                    shard: 0,
+                    shard: TEST_SHARD_ID.to_string(),
                     id: "job-B".into(),
                     priority: 10,
                     start_at_ms: 0,
                     retry_policy: None,
                     payload: Some(SerializedBytes {
-                        encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"job": "B"})).unwrap())),
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(
+                            rmp_serde::to_vec(&serde_json::json!({"job": "B"})).unwrap(),
+                        )),
                     }),
                     limits: vec![Limit {
                         limit: Some(limit::Limit::Concurrency(ConcurrencyLimit {
@@ -119,13 +123,15 @@ pub fn run() {
             tracing::trace!(job_id = "job-C", "enqueue");
             client
                 .enqueue(tonic::Request::new(EnqueueRequest {
-                    shard: 0,
+                    shard: TEST_SHARD_ID.to_string(),
                     id: "job-C".into(),
                     priority: 10,
                     start_at_ms: 0,
                     retry_policy: None,
                     payload: Some(SerializedBytes {
-                        encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"job": "C"})).unwrap())),
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(
+                            rmp_serde::to_vec(&serde_json::json!({"job": "C"})).unwrap(),
+                        )),
                     }),
                     limits: vec![Limit {
                         limit: Some(limit::Limit::Concurrency(ConcurrencyLimit {
@@ -163,7 +169,7 @@ pub fn run() {
                 tracing::trace!(job_id = "job-B", "cancelling_while_waiting");
                 match client
                     .cancel_job(tonic::Request::new(CancelJobRequest {
-                        shard: 0,
+                        shard: TEST_SHARD_ID.to_string(),
                         id: "job-B".into(),
                         tenant: None,
                     }))
@@ -185,7 +191,7 @@ pub fn run() {
             tracing::trace!(job_id = "job-A", "cancelling_while_running");
             match client
                 .cancel_job(tonic::Request::new(CancelJobRequest {
-                    shard: 0,
+                    shard: TEST_SHARD_ID.to_string(),
                     id: "job-A".into(),
                     tenant: None,
                 }))
@@ -234,7 +240,7 @@ pub fn run() {
                 if let Some((ref job_id, ref task_id)) = current_task {
                     let heartbeat = client
                         .heartbeat(tonic::Request::new(HeartbeatRequest {
-                            shard: 0,
+                            shard: TEST_SHARD_ID.to_string(),
                             worker_id: "worker-1".into(),
                             task_id: task_id.clone(),
                         }))
@@ -258,7 +264,7 @@ pub fn run() {
                                 // Report cancelled outcome
                                 match client
                                     .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                                        shard: 0,
+                                        shard: TEST_SHARD_ID.to_string(),
                                         task_id: task_id.clone(),
                                         outcome: Some(report_outcome_request::Outcome::Cancelled(
                                             silo::pb::Cancelled {},
@@ -299,12 +305,13 @@ pub fn run() {
 
                         match client
                             .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                                shard: 0,
+                                shard: TEST_SHARD_ID.to_string(),
                                 task_id: task_id.clone(),
                                 outcome: Some(report_outcome_request::Outcome::Success(
                                     SerializedBytes {
-                                        encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!("done"))
-                                            .unwrap())),
+                                        encoding: Some(serialized_bytes::Encoding::Msgpack(
+                                            rmp_serde::to_vec(&serde_json::json!("done")).unwrap(),
+                                        )),
                                     },
                                 )),
                             }))
@@ -343,7 +350,7 @@ pub fn run() {
                 if current_task.is_none() {
                     let lease = client
                         .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                            shard: Some(0),
+                            shard: Some(TEST_SHARD_ID.to_string()),
                             worker_id: "worker-1".into(),
                             max_tasks: 1,
                             task_group: "default".to_string(),
@@ -410,7 +417,7 @@ pub fn run() {
             let mut client = SiloClient::new(ch);
 
             // Verify server state
-            if let Ok(state) = verify_server_invariants(&mut client, 0).await {
+            if let Ok(state) = verify_server_invariants(&mut client, TEST_SHARD_ID).await {
                 assert!(
                     state.violations.is_empty(),
                     "Server invariant violations: {:?}",
@@ -456,10 +463,7 @@ pub fn run() {
             );
 
             // Verify job C completed (it should have gotten the ticket after A was cancelled)
-            assert!(
-                c_complete > 0,
-                "Job C should have completed"
-            );
+            assert!(c_complete > 0, "Job C should have completed");
 
             // Job C should have been leased after A was cancelled
             if a_cancelled > 0 && c_leased > 0 {
@@ -484,7 +488,7 @@ pub fn run() {
                     b_leased,
                     b_complete
                 );
-                // Note: The exact behavior depends on timing - B might not have been 
+                // Note: The exact behavior depends on timing - B might not have been
                 // leased at all, or if it was leased it would be cancelled
             }
 

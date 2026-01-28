@@ -466,7 +466,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
 
   describe("shard context", () => {
     it("provides correct shard in task context", async () => {
-      let receivedShard: number | undefined;
+      let receivedShard: string | undefined;
 
       const handler: TaskHandler = async (ctx) => {
         receivedShard = ctx.task.shard;
@@ -486,9 +486,10 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       // Wait until task is processed
       await waitFor(() => receivedShard !== undefined);
 
-      // Should have received a valid shard ID
+      // Should have received a valid shard ID (UUID string)
       expect(receivedShard).toBeDefined();
-      expect(receivedShard).toBeGreaterThanOrEqual(0);
+      expect(typeof receivedShard).toBe("string");
+      expect(receivedShard!.length).toBeGreaterThan(0);
     });
   });
 
@@ -726,7 +727,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         queueKey: string;
         currentMax: number;
         metadata: Record<string, string>;
-        shard: number;
+        shard: string;
         workerId: string;
       } | null = null;
 
@@ -792,7 +793,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       expect(receivedContext!.queueKey).toBe(queueKey);
       expect(receivedContext!.currentMax).toBe(10);
       expect(receivedContext!.metadata).toEqual(testMetadata);
-      expect(receivedContext!.shard).toBeGreaterThanOrEqual(0);
+      expect(typeof receivedContext!.shard).toBe("string");
+      expect(receivedContext!.shard.length).toBeGreaterThan(0);
       expect(receivedContext!.workerId).toBeTruthy();
     });
 

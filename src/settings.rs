@@ -210,9 +210,12 @@ pub struct CoordinationConfig {
     #[serde(default = "default_lease_ttl_secs")]
     pub lease_ttl_secs: i64,
 
-    /// Number of shards in the cluster (default: 8)
-    #[serde(default = "default_num_shards")]
-    pub num_shards: u32,
+    /// Initial number of shards to create when bootstrapping a new cluster.
+    /// This is only used during cluster initialization - once the cluster is
+    /// created, the shard count is stored in the coordination backend and
+    /// this config value is ignored. Default: 8.
+    #[serde(default = "default_initial_shard_count")]
+    pub initial_shard_count: u32,
 
     /// The gRPC address that other nodes should use to connect to this node.
     /// If not set, falls back to server.grpc_addr.
@@ -242,7 +245,7 @@ impl Default for CoordinationConfig {
             backend: CoordinationBackend::default(),
             cluster_prefix: default_cluster_prefix(),
             lease_ttl_secs: default_lease_ttl_secs(),
-            num_shards: default_num_shards(),
+            initial_shard_count: default_initial_shard_count(),
             advertised_grpc_addr: None,
             etcd_endpoints: default_etcd_endpoints(),
             k8s_namespace: default_k8s_namespace(),
@@ -250,7 +253,7 @@ impl Default for CoordinationConfig {
     }
 }
 
-fn default_num_shards() -> u32 {
+fn default_initial_shard_count() -> u32 {
     8
 }
 

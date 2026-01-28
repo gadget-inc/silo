@@ -5,8 +5,7 @@ export {
   JobNotFoundError,
   JobNotTerminalError,
   TaskNotFoundError,
-  fnv1a32,
-  defaultTenantToShard,
+  shardForTenant,
   GubernatorAlgorithm,
   GubernatorBehavior,
   type SiloGRPCClientOptions,
@@ -35,8 +34,8 @@ export {
   type RateLimitRetryPolicyConfig,
   type FloatingConcurrencyLimitConfig,
   type ShardRoutingConfig,
-  type TenantToShardFn,
   type ShardOwner,
+  type ShardInfoWithRange,
 } from "./client";
 export {
   SiloWorker,

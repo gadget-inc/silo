@@ -25,9 +25,9 @@
 //! - No job loss across shard boundaries
 
 use crate::helpers::{
-    EnqueueRequest, GetJobRequest, HashMap, JobStatus, LeaseTasksRequest, SerializedBytes,
-    ReportOutcomeRequest, get_seed, report_outcome_request, run_scenario_impl, serialized_bytes, setup_server,
-    turmoil_connector, verify_server_invariants,
+    EnqueueRequest, GetJobRequest, HashMap, JobStatus, LeaseTasksRequest, ReportOutcomeRequest,
+    SerializedBytes, TEST_SHARD_ID, get_seed, report_outcome_request, run_scenario_impl,
+    serialized_bytes, setup_server, turmoil_connector, verify_server_invariants,
 };
 use silo::pb::silo_client::SiloClient;
 use std::collections::HashMap as StdHashMap;
@@ -38,7 +38,7 @@ use tonic::transport::Endpoint;
 
 // We test with a single shard since turmoil setup_server only creates shard 0
 // The test still validates shard-aware routing logic
-const TEST_SHARD: u32 = 0;
+const TEST_SHARD: &str = "0";
 const JOBS_PER_BATCH: usize = 5;
 
 pub fn run() {
@@ -83,17 +83,19 @@ pub fn run() {
 
                     match client
                         .enqueue(tonic::Request::new(EnqueueRequest {
-                            shard: TEST_SHARD,
+                            shard: TEST_SHARD.to_string(),
                             id: job_id.clone(),
                             priority: 10,
                             start_at_ms: 0,
                             retry_policy: None,
                             payload: Some(SerializedBytes {
-                                encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({
-                                    "group": group,
-                                    "index": i
-                                }))
-                                .unwrap())),
+                                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                                    rmp_serde::to_vec(&serde_json::json!({
+                                        "group": group,
+                                        "index": i
+                                    }))
+                                    .unwrap(),
+                                )),
                             }),
                             limits: vec![],
                             tenant: None,
@@ -143,7 +145,7 @@ pub fn run() {
                 // Lease from the shard
                 let lease = client
                     .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                        shard: Some(TEST_SHARD),
+                        shard: Some(TEST_SHARD.to_string()),
                         worker_id: "worker-1".into(),
                         max_tasks: 3,
                         task_group: "default".to_string(),
@@ -153,12 +155,7 @@ pub fn run() {
 
                 for task in lease.tasks {
                     // Extract group from job_id
-                    let group = task
-                        .job_id
-                        .split('-')
-                        .take(2)
-                        .collect::<Vec<_>>()
-                        .join("-");
+                    let group = task.job_id.split('-').take(2).collect::<Vec<_>>().join("-");
 
                     tracing::trace!(
                         job_id = %task.job_id,
@@ -173,11 +170,15 @@ pub fn run() {
                     // Complete
                     match client
                         .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                            shard: TEST_SHARD,
+                            shard: TEST_SHARD.to_string(),
                             task_id: task.id.clone(),
-                            outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
-                                encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!("done")).unwrap())),
-                            })),
+                            outcome: Some(report_outcome_request::Outcome::Success(
+                                SerializedBytes {
+                                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                                        rmp_serde::to_vec(&serde_json::json!("done")).unwrap(),
+                                    )),
+                                },
+                            )),
                         }))
                         .await
                     {
@@ -222,7 +223,7 @@ pub fn run() {
             for _round in 0..40 {
                 let lease = client
                     .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                        shard: Some(TEST_SHARD),
+                        shard: Some(TEST_SHARD.to_string()),
                         worker_id: "worker-2".into(),
                         max_tasks: 2,
                         task_group: "default".to_string(),
@@ -250,7 +251,7 @@ pub fn run() {
 
                     match client
                         .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                            shard: TEST_SHARD,
+                            shard: TEST_SHARD.to_string(),
                             task_id: task.id.clone(),
                             outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
                                 encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!("done")).unwrap())),
@@ -298,7 +299,7 @@ pub fn run() {
             let mut client = SiloClient::new(ch);
 
             // Verify server state
-            if let Ok(state) = verify_server_invariants(&mut client, 0).await {
+            if let Ok(state) = verify_server_invariants(&mut client, TEST_SHARD_ID).await {
                 assert!(
                     state.violations.is_empty(),
                     "Server invariant violations: {:?}",
@@ -321,7 +322,7 @@ pub fn run() {
                 for job_id in job_ids {
                     if let Ok(resp) = client
                         .get_job(tonic::Request::new(GetJobRequest {
-                            shard: TEST_SHARD,
+                            shard: TEST_SHARD.to_string(),
                             id: job_id.clone(),
                             tenant: None,
                             include_attempts: false,
