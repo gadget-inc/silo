@@ -4,8 +4,8 @@
 //! and simulates concurrent workers polling and executing tasks. It reports the
 //! rate of task execution in real-time.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
@@ -13,8 +13,8 @@ use rand::Rng;
 use silo::pb::report_outcome_request::Outcome;
 use silo::pb::silo_client::SiloClient;
 use silo::pb::{
-    serialized_bytes, ConcurrencyLimit, EnqueueRequest, GetClusterInfoRequest, LeaseTasksRequest,
-    Limit, ReportOutcomeRequest, SerializedBytes,
+    ConcurrencyLimit, EnqueueRequest, GetClusterInfoRequest, LeaseTasksRequest, Limit,
+    ReportOutcomeRequest, SerializedBytes, serialized_bytes,
 };
 use silo::settings::LogFormat;
 use silo::trace;
@@ -130,7 +130,7 @@ async fn discover_cluster(address: &str) -> anyhow::Result<ClusterInfo> {
 
 #[derive(Debug, Clone)]
 struct ShardOwnerInfo {
-    shard_id: u32,
+    shard_id: String,
     grpc_addr: String,
     #[allow(dead_code)]
     node_id: String,
@@ -146,12 +146,13 @@ struct ClusterInfo {
 
 impl ClusterInfo {
     /// Get a random shard ID
-    fn random_shard(&self) -> u32 {
-        rand::rng().random_range(0..self.num_shards)
+    fn random_shard(&self) -> &str {
+        let idx = rand::rng().random_range(0..self.shard_owners.len());
+        &self.shard_owners[idx].shard_id
     }
 
     /// Get the address of the server owning a specific shard
-    fn address_for_shard(&self, shard_id: u32) -> Option<&str> {
+    fn address_for_shard(&self, shard_id: &str) -> Option<&str> {
         self.shard_owners
             .iter()
             .find(|owner| owner.shard_id == shard_id)
@@ -323,7 +324,7 @@ async fn worker_loop(
         };
 
         let request = LeaseTasksRequest {
-            shard: Some(shard),
+            shard: Some(shard.to_string()),
             worker_id: worker_id.clone(),
             max_tasks,
             task_group: "default".to_string(),
@@ -343,9 +344,9 @@ async fn worker_loop(
 
                 for task in tasks {
                     // Report success immediately (simulating instant task execution)
-                    let task_shard = task.shard;
+                    let task_shard = task.shard.clone();
                     let task_addr = cluster_info
-                        .address_for_shard(task_shard)
+                        .address_for_shard(&task_shard)
                         .map(|a| a.to_string())
                         .unwrap_or_else(|| addr.clone());
 
@@ -459,7 +460,7 @@ async fn enqueuer_loop(
         });
 
         let request = EnqueueRequest {
-            shard,
+            shard: shard.to_string(),
             id: String::new(), // Let server generate ID
             priority: (job_counter % 100) as u32,
             start_at_ms: now_ms(),

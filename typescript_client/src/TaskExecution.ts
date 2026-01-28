@@ -30,8 +30,8 @@ export interface Task<Payload = unknown, Metadata extends Record<string, string>
   payload: Payload;
   /** Job priority (for informational purposes) */
   priority: number;
-  /** Shard this task came from (needed for reporting outcome) */
-  shard: number;
+  /** Shard ID (UUID) this task came from (needed for reporting outcome) */
+  shard: string;
   /** Task group this task belongs to */
   taskGroup: string;
   /** Tenant ID if multi-tenancy is enabled */

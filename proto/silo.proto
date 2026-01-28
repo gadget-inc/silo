@@ -89,7 +89,7 @@ message Limit {
 
 // Request to enqueue a new job for processing.
 message EnqueueRequest {
-  uint32 shard = 1;                      // Shard ID where the job should be stored.
+  string shard = 1;                      // Shard ID (UUID) where the job should be stored.
   string id = 2;                         // Optional job ID. If empty, a random UUID is generated.
   uint32 priority = 3;                   // Priority from 0-99. Lower is higher priority (0 = highest).
   int64 start_at_ms = 4;                 // Unix timestamp (ms) for future scheduling. 0 = run immediately.
@@ -117,7 +117,7 @@ enum JobStatus {
 
 // Request to retrieve details about a specific job.
 message GetJobRequest {
-  uint32 shard = 1;          // Shard ID where the job is stored.
+  string shard = 1;          // Shard ID (UUID) where the job is stored.
   string id = 2;             // The job's unique ID.
   optional string tenant = 3; // Tenant ID if multi-tenancy is enabled.
   bool include_attempts = 4; // If true, include all attempts in the response. Defaults to false.
@@ -163,7 +163,7 @@ message GetJobResponse {
 // Request to get the result of a completed job.
 // Only succeeds if the job has reached a terminal state (succeeded, failed, or cancelled).
 message GetJobResultRequest {
-  uint32 shard = 1;          // Shard ID where the job is stored.
+  string shard = 1;          // Shard ID (UUID) where the job is stored.
   string id = 2;             // The job's unique ID.
   optional string tenant = 3; // Tenant ID if multi-tenancy is enabled.
 }
@@ -195,7 +195,7 @@ message JobCancelled {
 
 // Request to permanently delete a job and all its data.
 message DeleteJobRequest {
-  uint32 shard = 1;          // Shard ID where the job is stored.
+  string shard = 1;          // Shard ID (UUID) where the job is stored.
   string id = 2;             // The job's unique ID.
   optional string tenant = 3; // Tenant ID if multi-tenancy is enabled.
 }
@@ -205,7 +205,7 @@ message DeleteJobResponse {}
 
 // Request to cancel a job. Running jobs will be notified via heartbeat response.
 message CancelJobRequest {
-  uint32 shard = 1;          // Shard ID where the job is stored.
+  string shard = 1;          // Shard ID (UUID) where the job is stored.
   string id = 2;             // The job's unique ID.
   optional string tenant = 3; // Tenant ID if multi-tenancy is enabled.
 }
@@ -215,20 +215,20 @@ message CancelJobResponse {}
 
 // Restart a cancelled or failed job, allowing it to be processed again.
 // The job will get a fresh set of retries according to its retry policy.
-message RestartJobRequest { uint32 shard = 1; string id = 2; optional string tenant = 3; }
+message RestartJobRequest { string shard = 1; string id = 2; optional string tenant = 3; }
 message RestartJobResponse {}
 
 // Expedite a future-scheduled job to run immediately.
 // This is useful for dragging forward a job that was scheduled for the future,
 // or for skipping retry backoff delays on a mid-retry job.
-message ExpediteJobRequest { uint32 shard = 1; string id = 2; optional string tenant = 3; }
+message ExpediteJobRequest { string shard = 1; string id = 2; optional string tenant = 3; }
 message ExpediteJobResponse {}
 
 // Lease tasks for processing from this server.
 // By default, leases from all shards this server owns (fair distribution).
 // If shard is specified, filters to only that shard.
 message LeaseTasksRequest { 
-  optional uint32 shard = 1;  // optional filter - if set, only lease from this shard
+  optional string shard = 1;  // optional filter - if set, only lease from this shard (UUID)
   string worker_id = 2; 
   uint32 max_tasks = 3;
   string task_group = 4;      // Required. Task group to poll tasks from.
@@ -242,7 +242,7 @@ message Task {
   int64 lease_ms = 4;         // How long the lease lasts. Heartbeat before this expires.
   SerializedBytes payload = 5;   // The job's payload for the worker to process.
   uint32 priority = 6;        // Job priority (for informational purposes).
-  uint32 shard = 7;           // Shard this task came from (needed for reporting outcome).
+  string shard = 7;           // Shard ID (UUID) this task came from (needed for reporting outcome).
   string task_group = 8;      // Task group this task belongs to.
   optional string tenant_id = 9;       // Tenant ID if multi-tenancy is enabled.
   bool is_last_attempt = 10;           // True if this is the final attempt (no more retries after this).
@@ -258,7 +258,7 @@ message RefreshFloatingLimitTask {
   int64 last_refreshed_at_ms = 4;      // Unix timestamp (ms) of last refresh.
   map<string, string> metadata = 5;    // Metadata from the limit definition.
   int64 lease_ms = 6;                  // How long the lease lasts. Heartbeat before this expires.
-  uint32 shard = 7;                    // Shard this task came from (needed for reporting outcome).
+  string shard = 7;                    // Shard ID (UUID) this task came from (needed for reporting outcome).
   string task_group = 8;               // Task group this refresh task belongs to.
   optional string tenant_id = 9;       // Tenant ID if multi-tenancy is enabled.
 }
@@ -272,7 +272,7 @@ message LeaseTasksResponse {
 // Request to report the outcome of a completed task.
 // Note: tenant is determined from the task lease, not from the request.
 message ReportOutcomeRequest {
-  uint32 shard = 1;          // Shard the task came from.
+  string shard = 1;          // Shard ID (UUID) the task came from.
   string task_id = 2;        // The task's unique ID.
   oneof outcome {
     SerializedBytes success = 3;   // Job succeeded. Contains result data from executing the job.
@@ -296,7 +296,7 @@ message ReportOutcomeResponse {}
 // Request to report the outcome of a floating limit refresh task.
 // Note: tenant is determined from the task lease, not from the request.
 message ReportRefreshOutcomeRequest {
-  uint32 shard = 1;          // Shard the task came from.
+  string shard = 1;          // Shard ID (UUID) the task came from.
   string task_id = 2;        // The task's unique ID.
   oneof outcome {
     RefreshSuccess success = 4; // Refresh succeeded with new max concurrency.
@@ -322,7 +322,7 @@ message ReportRefreshOutcomeResponse {}
 // Workers must heartbeat before lease_ms expires to keep the task.
 // Note: tenant is determined from the task lease, not from the request.
 message HeartbeatRequest {
-  uint32 shard = 1;          // Shard the task came from.
+  string shard = 1;          // Shard ID (UUID) the task came from.
   string worker_id = 2;      // Worker ID that holds the lease.
   string task_id = 3;        // The task's unique ID.
 }
@@ -336,7 +336,7 @@ message HeartbeatResponse {
 // Request to execute an arbitrary SQL query against shard data.
 // Useful for ad-hoc inspection and debugging.
 message QueryRequest {
-  uint32 shard = 1;          // Shard to query.
+  string shard = 1;          // Shard ID (UUID) to query.
   string sql = 2;            // SQL query string.
   optional string tenant = 3; // Tenant ID to scope results, if multi-tenancy is enabled.
 }
@@ -357,7 +357,7 @@ message QueryResponse {
 // Request to execute SQL query with Arrow IPC streaming response.
 // More efficient than QueryResponse for large result sets.
 message QueryArrowRequest {
-  uint32 shard = 1;          // Shard to query.
+  string shard = 1;          // Shard ID (UUID) to query.
   string sql = 2;            // SQL query string.
   optional string tenant = 3; // Tenant ID to scope results, if multi-tenancy is enabled.
 }
@@ -372,9 +372,11 @@ message GetClusterInfoRequest {}
 
 // Information about which node owns a specific shard.
 message ShardOwner {
-  uint32 shard_id = 1;  // The shard ID.
+  string shard_id = 1;  // The shard ID (UUID).
   string grpc_addr = 2; // gRPC address of the node owning this shard.
   string node_id = 3;   // Unique identifier of the owning node.
+  string range_start = 4; // Inclusive start of the tenant_id range owned by this shard.
+  string range_end = 5;   // Exclusive end of the tenant_id range owned by this shard.
 }
 
 // Cluster topology information.
@@ -388,7 +390,7 @@ message GetClusterInfoResponse {
 // Request to get job counters for a shard.
 // Used for efficient job count queries without scanning all jobs.
 message GetShardCountersRequest {
-  uint32 shard = 1; // Shard ID to get counters for.
+  string shard = 1; // Shard ID (UUID) to get counters for.
 }
 
 // Response with shard job counters.

@@ -32,6 +32,7 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use k8s_openapi::api::coordination::v1::Lease;
+use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
 use kube::{
     Client,
@@ -47,6 +48,7 @@ use tokio_stream::StreamExt;
 use tracing::{debug, info, warn};
 
 use crate::factory::ShardFactory;
+use crate::shard_range::{ShardId, ShardMap};
 
 use super::{
     CoordinationError, Coordinator, CoordinatorBase, MemberInfo, ShardOwnerMap, ShardPhase,
@@ -67,7 +69,7 @@ pub struct K8sCoordinator {
     namespace: String,
     cluster_prefix: String,
     lease_duration_secs: i32,
-    shard_guards: Arc<Mutex<HashMap<u32, Arc<K8sShardGuard>>>>,
+    shard_guards: Arc<Mutex<HashMap<ShardId, Arc<K8sShardGuard>>>>,
     /// Cache of active members, updated by the watcher
     members_cache: Arc<Mutex<Vec<MemberInfo>>>,
     /// Notifier for membership changes (from watcher)
@@ -84,7 +86,7 @@ impl K8sCoordinator {
         cluster_prefix: &str,
         node_id: impl Into<String>,
         grpc_addr: impl Into<String>,
-        num_shards: u32,
+        initial_shard_count: u32,
         lease_duration_secs: i64,
         factory: Arc<ShardFactory>,
     ) -> Result<(Self, tokio::task::JoinHandle<()>), CoordinationError> {
@@ -97,10 +99,19 @@ impl K8sCoordinator {
         let node_id = node_id.into();
         let grpc_addr = grpc_addr.into();
 
+        // Load or create the shard map in a ConfigMap
+        let shard_map = Self::load_or_create_shard_map(
+            &client,
+            &namespace,
+            &cluster_prefix,
+            initial_shard_count,
+        )
+        .await?;
+
         let base = Arc::new(CoordinatorBase::new(
             node_id.clone(),
             grpc_addr.clone(),
-            num_shards,
+            shard_map,
             factory,
         ));
 
@@ -186,6 +197,118 @@ impl K8sCoordinator {
         });
 
         Ok((me, handle))
+    }
+
+    /// Load the shard map from a ConfigMap, or create a new one if it doesn't exist.
+    ///
+    /// The shard map is stored in a ConfigMap with the key "shard_map.json".
+    /// This function handles the initial cluster bootstrapping where the first
+    /// node to start creates the shard map.
+    async fn load_or_create_shard_map(
+        client: &Client,
+        namespace: &str,
+        cluster_prefix: &str,
+        initial_shard_count: u32,
+    ) -> Result<ShardMap, CoordinationError> {
+        let configmaps: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
+        let configmap_name = format!("{}-shard-map", cluster_prefix);
+
+        // Try to get the existing ConfigMap
+        match configmaps.get(&configmap_name).await {
+            Ok(cm) => {
+                // ConfigMap exists, parse the shard map
+                let data = cm
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("shard_map.json"))
+                    .ok_or_else(|| {
+                        CoordinationError::BackendError(
+                            "shard map ConfigMap exists but has no data".into(),
+                        )
+                    })?;
+
+                let shard_map: ShardMap = serde_json::from_str(data).map_err(|e| {
+                    CoordinationError::BackendError(format!("failed to parse shard map: {}", e))
+                })?;
+
+                info!(
+                    num_shards = shard_map.len(),
+                    version = shard_map.version,
+                    "loaded existing shard map from ConfigMap"
+                );
+                Ok(shard_map)
+            }
+            Err(kube::Error::Api(e)) if e.code == 404 => {
+                // ConfigMap doesn't exist, create initial shard map
+                let shard_map = ShardMap::create_initial(initial_shard_count).map_err(|e| {
+                    CoordinationError::BackendError(format!(
+                        "failed to create initial shard map: {}",
+                        e
+                    ))
+                })?;
+
+                let shard_map_json = serde_json::to_string(&shard_map)
+                    .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+
+                let cm = serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": configmap_name,
+                        "labels": {
+                            "silo.dev/type": "shard-map",
+                            "silo.dev/cluster": cluster_prefix
+                        }
+                    },
+                    "data": {
+                        "shard_map.json": shard_map_json
+                    }
+                });
+
+                // Use create with optimistic concurrency - if another node creates
+                // it first, we'll get a conflict and retry
+                match configmaps
+                    .create(&PostParams::default(), &serde_json::from_value(cm).unwrap())
+                    .await
+                {
+                    Ok(_) => {
+                        info!(
+                            num_shards = shard_map.len(),
+                            "created new shard map ConfigMap"
+                        );
+                        Ok(shard_map)
+                    }
+                    Err(kube::Error::Api(e)) if e.code == 409 => {
+                        // Another node created it first - load it
+                        debug!("shard map ConfigMap already created by another node, loading");
+                        let cm = configmaps
+                            .get(&configmap_name)
+                            .await
+                            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+
+                        let data = cm
+                            .data
+                            .as_ref()
+                            .and_then(|d| d.get("shard_map.json"))
+                            .ok_or_else(|| {
+                                CoordinationError::BackendError(
+                                    "shard map ConfigMap exists but has no data".into(),
+                                )
+                            })?;
+
+                        let shard_map: ShardMap = serde_json::from_str(data).map_err(|e| {
+                            CoordinationError::BackendError(format!(
+                                "failed to parse shard map: {}",
+                                e
+                            ))
+                        })?;
+                        Ok(shard_map)
+                    }
+                    Err(e) => Err(CoordinationError::BackendError(e.to_string())),
+                }
+            }
+            Err(e) => Err(CoordinationError::BackendError(e.to_string())),
+        }
     }
 
     /// Run the membership watcher - watches for lease changes and updates the members cache
@@ -474,13 +597,13 @@ impl K8sCoordinator {
             return Ok(());
         }
 
-        let desired =
-            compute_desired_shards_for_node(self.base.num_shards, &self.base.node_id, &members);
+        let shard_ids = self.base.shard_ids().await;
+        let desired = compute_desired_shards_for_node(&shard_ids, &self.base.node_id, &members);
         debug!(node_id = %self.base.node_id, members = ?members, desired = ?desired, "reconcile: begin");
 
         // Release undesired shards
         {
-            let to_release: Vec<u32> = {
+            let to_release: Vec<ShardId> = {
                 let guards = self.shard_guards.lock().await;
                 let mut v = Vec::new();
                 for (sid, guard) in guards.iter() {
@@ -497,7 +620,7 @@ impl K8sCoordinator {
 
         // Acquire desired shards
         {
-            let snapshot: Vec<u32> = desired.iter().copied().collect();
+            let snapshot: Vec<ShardId> = desired.iter().copied().collect();
             for shard_id in snapshot {
                 self.ensure_shard_guard(shard_id)
                     .await
@@ -509,7 +632,7 @@ impl K8sCoordinator {
         Ok(())
     }
 
-    async fn ensure_shard_guard(&self, shard_id: u32) -> Arc<K8sShardGuard> {
+    async fn ensure_shard_guard(&self, shard_id: ShardId) -> Arc<K8sShardGuard> {
         {
             let guards = self.shard_guards.lock().await;
             if let Some(g) = guards.get(&shard_id) {
@@ -520,7 +643,7 @@ impl K8sCoordinator {
         if let Some(g) = guards.get(&shard_id) {
             return g.clone();
         }
-        debug!(shard_id, "creating new shard guard");
+        debug!(shard_id = %shard_id, "creating new shard guard");
         let guard = K8sShardGuard::new(
             shard_id,
             self.client.clone(),
@@ -546,8 +669,12 @@ impl K8sCoordinator {
 
 #[async_trait]
 impl Coordinator for K8sCoordinator {
-    async fn owned_shards(&self) -> Vec<u32> {
+    async fn owned_shards(&self) -> Vec<ShardId> {
         self.base.owned_shards().await
+    }
+
+    async fn get_shard_map(&self) -> Result<ShardMap, CoordinationError> {
+        Ok(self.base.get_shard_map().await)
     }
 
     async fn shutdown(&self) -> Result<(), CoordinationError> {
@@ -595,11 +722,9 @@ impl Coordinator for K8sCoordinator {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
-            let desired: HashSet<u32> = compute_desired_shards_for_node(
-                self.base.num_shards,
-                &self.base.node_id,
-                &member_ids,
-            );
+            let shard_ids = self.base.shard_ids().await;
+            let desired: HashSet<ShardId> =
+                compute_desired_shards_for_node(&shard_ids, &self.base.node_id, &member_ids);
             let guard = self.base.owned.lock().await;
             if *guard == desired {
                 return true;
@@ -618,11 +743,11 @@ impl Coordinator for K8sCoordinator {
 
     async fn get_shard_owner_map(&self) -> Result<ShardOwnerMap, CoordinationError> {
         let members = self.get_members().await?;
-        Ok(self.base.compute_shard_owner_map(&members))
+        Ok(self.base.compute_shard_owner_map(&members).await)
     }
 
-    fn num_shards(&self) -> u32 {
-        self.base.num_shards
+    async fn num_shards(&self) -> usize {
+        self.base.num_shards().await
     }
 
     fn node_id(&self) -> &str {
@@ -651,7 +776,7 @@ pub struct ShardState {
 /// - All lease modifications use optimistic concurrency (resourceVersion checks)
 /// - Release clears holderIdentity instead of deleting to avoid races
 pub struct K8sShardGuard {
-    pub shard_id: u32,
+    pub shard_id: ShardId,
     pub client: Client,
     pub namespace: String,
     pub cluster_prefix: String,
@@ -664,7 +789,7 @@ pub struct K8sShardGuard {
 
 impl K8sShardGuard {
     pub fn new(
-        shard_id: u32,
+        shard_id: ShardId,
         client: Client,
         namespace: String,
         cluster_prefix: String,
@@ -691,7 +816,7 @@ impl K8sShardGuard {
     }
 
     fn lease_name(&self) -> String {
-        keys::k8s_shard_lease_name(&self.cluster_prefix, self.shard_id)
+        keys::k8s_shard_lease_name(&self.cluster_prefix, &self.shard_id)
     }
 
     pub async fn is_held(&self) -> bool {
@@ -703,13 +828,13 @@ impl K8sShardGuard {
         let mut st = self.state.lock().await;
         if matches!(st.phase, ShardPhase::ShutDown | ShardPhase::ShuttingDown) {
             debug!(
-                shard_id = self.shard_id,
+                shard_id = %self.shard_id,
                 desired, "set_desired: guard is shutting down, ignoring"
             );
             return;
         }
         if st.desired != desired {
-            debug!(shard_id = self.shard_id, desired, phase = ?st.phase, "set_desired: changing desired state");
+            debug!(shard_id = %self.shard_id, desired, phase = ?st.phase, "set_desired: changing desired state");
             st.desired = desired;
             self.notify.notify_one();
         }
@@ -717,7 +842,7 @@ impl K8sShardGuard {
 
     pub async fn run(
         self: Arc<Self>,
-        owned_arc: Arc<Mutex<HashSet<u32>>>,
+        owned_arc: Arc<Mutex<HashSet<ShardId>>>,
         factory: Arc<ShardFactory>,
     ) {
         let leases: Api<Lease> = Api::namespaced(self.client.clone(), &self.namespace);
@@ -749,7 +874,8 @@ impl K8sShardGuard {
                 ShardPhase::ShutDown => break,
                 ShardPhase::Acquiring => {
                     let mut attempt: u32 = 0;
-                    let initial_jitter_ms = ((self.shard_id as u64).wrapping_mul(13)) % 80;
+                    let initial_jitter_ms =
+                        (self.shard_id.as_uuid().as_u64_pair().0.wrapping_mul(13)) % 80;
                     tokio::time::sleep(Duration::from_millis(initial_jitter_ms)).await;
 
                     loop {
@@ -768,7 +894,7 @@ impl K8sShardGuard {
                             Ok((rv, uid)) => {
                                 // Open the shard BEFORE marking as Held - if open fails,
                                 // we should release the lease and not claim ownership
-                                match factory.open(self.shard_id as usize).await {
+                                match factory.open(&self.shard_id).await {
                                     Ok(_) => {
                                         {
                                             let mut st = self.state.lock().await;
@@ -780,7 +906,7 @@ impl K8sShardGuard {
                                             let mut owned = owned_arc.lock().await;
                                             owned.insert(self.shard_id);
                                         }
-                                        info!(shard_id = self.shard_id, rv = %rv, attempts = attempt, "k8s shard: acquired and opened");
+                                        info!(shard_id = %self.shard_id, rv = %rv, attempts = attempt, "k8s shard: acquired and opened");
 
                                         // Start renewal loop
                                         self.clone()
@@ -795,7 +921,7 @@ impl K8sShardGuard {
                                     }
                                     Err(e) => {
                                         // Failed to open - release the lease and retry
-                                        tracing::error!(shard_id = self.shard_id, error = %e, "failed to open shard, releasing lease");
+                                        tracing::error!(shard_id = %self.shard_id, error = %e, "failed to open shard, releasing lease");
                                         let _ = self.release_lease_cas(&leases, &lease_name).await;
                                         // Exponential backoff before retry
                                         let backoff_ms = 200 * (1 << attempt.min(5));
@@ -806,9 +932,13 @@ impl K8sShardGuard {
                                 }
                             }
                             Err(e) => {
-                                debug!(shard_id = self.shard_id, attempt, error = %e, "failed to acquire shard lease, retrying");
+                                debug!(shard_id = %self.shard_id, attempt, error = %e, "failed to acquire shard lease, retrying");
                                 attempt = attempt.wrapping_add(1);
-                                let jitter_ms = ((self.shard_id as u64)
+                                let jitter_ms = (self
+                                    .shard_id
+                                    .as_uuid()
+                                    .as_u64_pair()
+                                    .0
                                     .wrapping_mul(31)
                                     .wrapping_add(attempt as u64 * 17))
                                     % 150;
@@ -834,8 +964,8 @@ impl K8sShardGuard {
 
                     if !cancelled {
                         // Close the shard before releasing the lease
-                        if let Err(e) = factory.close(self.shard_id as usize).await {
-                            tracing::error!(shard_id = self.shard_id, error = %e, "failed to close shard before releasing lease");
+                        if let Err(e) = factory.close(&self.shard_id).await {
+                            tracing::error!(shard_id = %self.shard_id, error = %e, "failed to close shard before releasing lease");
                         }
 
                         // Release the lease by clearing holderIdentity with CAS
@@ -848,13 +978,13 @@ impl K8sShardGuard {
                             match self.release_lease_cas(&leases, &lease_name).await {
                                 Ok(_) => {
                                     debug!(
-                                        shard_id = self.shard_id,
+                                        shard_id = %self.shard_id,
                                         "k8s shard: released with CAS"
                                     );
                                 }
                                 Err(e) => {
                                     // This is okay - we may have already lost the lease
-                                    debug!(shard_id = self.shard_id, error = %e, "k8s shard: release CAS failed (may have lost lease)");
+                                    debug!(shard_id = %self.shard_id, error = %e, "k8s shard: release CAS failed (may have lost lease)");
                                 }
                             }
                         }
@@ -867,13 +997,13 @@ impl K8sShardGuard {
                         }
                         let mut owned = owned_arc.lock().await;
                         owned.remove(&self.shard_id);
-                        debug!(shard_id = self.shard_id, "k8s shard: released");
+                        debug!(shard_id = %self.shard_id, "k8s shard: released");
                     }
                 }
                 ShardPhase::ShuttingDown => {
                     // Close the shard before releasing the lease
-                    if let Err(e) = factory.close(self.shard_id as usize).await {
-                        tracing::error!(shard_id = self.shard_id, error = %e, "failed to close shard during shutdown");
+                    if let Err(e) = factory.close(&self.shard_id).await {
+                        tracing::error!(shard_id = %self.shard_id, error = %e, "failed to close shard during shutdown");
                     }
 
                     // Release our lease if we hold it
@@ -917,7 +1047,7 @@ impl K8sShardGuard {
     ) -> Result<(String, Option<String>), CoordinationError> {
         let now = Utc::now();
         debug!(
-            shard_id = self.shard_id,
+            shard_id = %self.shard_id,
             lease_name, "try_acquire_lease_cas: checking lease"
         );
 
@@ -991,7 +1121,7 @@ impl K8sShardGuard {
                                 )
                             })?;
                             debug!(
-                                shard_id = self.shard_id,
+                                shard_id = %self.shard_id,
                                 old_rv = %rv,
                                 new_rv = %new_rv,
                                 "try_acquire_lease_cas: CAS succeeded"
@@ -1001,7 +1131,7 @@ impl K8sShardGuard {
                         Err(kube::Error::Api(e)) if e.code == 409 => {
                             // Conflict - someone else modified the lease
                             debug!(
-                                shard_id = self.shard_id,
+                                shard_id = %self.shard_id,
                                 "try_acquire_lease_cas: CAS conflict, someone else acquired"
                             );
                             return Err(CoordinationError::BackendError(
@@ -1016,7 +1146,7 @@ impl K8sShardGuard {
 
                 // Lease is held by someone else and not expired
                 debug!(
-                    shard_id = self.shard_id,
+                    shard_id = %self.shard_id,
                     holder = ?holder,
                     is_expired,
                     "try_acquire_lease_cas: lease held by another node"
@@ -1028,7 +1158,7 @@ impl K8sShardGuard {
             Err(kube::Error::Api(e)) if e.code == 404 => {
                 // Lease doesn't exist, create it
                 debug!(
-                    shard_id = self.shard_id,
+                    shard_id = %self.shard_id,
                     lease_name, "try_acquire_lease_cas: lease not found, creating"
                 );
                 let lease_spec = Lease {
@@ -1059,7 +1189,7 @@ impl K8sShardGuard {
                             CoordinationError::BackendError("no resource_version".into())
                         })?;
                         debug!(
-                            shard_id = self.shard_id,
+                            shard_id = %self.shard_id,
                             lease_name,
                             rv = %rv,
                             "try_acquire_lease_cas: created successfully"
@@ -1069,7 +1199,7 @@ impl K8sShardGuard {
                     Err(kube::Error::Api(e)) if e.code == 409 => {
                         // Already exists - race with another node
                         debug!(
-                            shard_id = self.shard_id,
+                            shard_id = %self.shard_id,
                             "try_acquire_lease_cas: create conflict, lease already exists"
                         );
                         Err(CoordinationError::BackendError(
@@ -1078,7 +1208,7 @@ impl K8sShardGuard {
                     }
                     Err(e) => {
                         debug!(
-                            shard_id = self.shard_id,
+                            shard_id = %self.shard_id,
                             lease_name,
                             error = %e,
                             "try_acquire_lease_cas: create failed"
@@ -1089,7 +1219,7 @@ impl K8sShardGuard {
             }
             Err(e) => {
                 debug!(
-                    shard_id = self.shard_id,
+                    shard_id = %self.shard_id,
                     error = %e,
                     "try_acquire_lease_cas: unexpected error getting lease"
                 );
@@ -1161,7 +1291,7 @@ impl K8sShardGuard {
             .ok_or_else(|| CoordinationError::BackendError("no resource_version".into()))?;
 
         debug!(
-            shard_id = self.shard_id,
+            shard_id = %self.shard_id,
             old_rv = %current_rv,
             new_rv = %new_rv,
             "release_lease_cas: cleared holder"
@@ -1171,7 +1301,7 @@ impl K8sShardGuard {
 
     async fn run_renewal_loop(
         self: Arc<Self>,
-        owned_arc: Arc<Mutex<HashSet<u32>>>,
+        owned_arc: Arc<Mutex<HashSet<ShardId>>>,
         factory: Arc<ShardFactory>,
         leases: &Api<Lease>,
         lease_name: &str,
@@ -1201,7 +1331,7 @@ impl K8sShardGuard {
 
             if expected_rv.is_none() {
                 warn!(
-                    shard_id = self.shard_id,
+                    shard_id = %self.shard_id,
                     "renewal loop: no resourceVersion, exiting"
                 );
                 break;
@@ -1215,10 +1345,10 @@ impl K8sShardGuard {
                     st.resource_version = Some(new_rv);
                 }
                 Err(e) => {
-                    warn!(shard_id = self.shard_id, error = %e, "failed to renew shard lease (lost ownership)");
+                    warn!(shard_id = %self.shard_id, error = %e, "failed to renew shard lease (lost ownership)");
                     // We lost the lease - close the shard and update state
-                    if let Err(close_err) = factory.close(self.shard_id as usize).await {
-                        tracing::error!(shard_id = self.shard_id, error = %close_err, "failed to close shard after losing lease");
+                    if let Err(close_err) = factory.close(&self.shard_id).await {
+                        tracing::error!(shard_id = %self.shard_id, error = %close_err, "failed to close shard after losing lease");
                     }
                     {
                         let mut st = self.state.lock().await;

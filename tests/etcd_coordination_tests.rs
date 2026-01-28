@@ -5,6 +5,7 @@ use silo::coordination::etcd::{EtcdConnection, EtcdShardGuard, ShardPhase};
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::settings::{Backend, DatabaseTemplate};
+use silo::shard_range::ShardId;
 
 fn unique_prefix() -> String {
     let nanos = SystemTime::now()
@@ -31,10 +32,10 @@ fn make_test_factory(prefix: &str) -> Arc<ShardFactory> {
 async fn make_guard(
     coord: &EtcdConnection,
     cluster_prefix: &str,
-    shard_id: u32,
+    shard_id: ShardId,
 ) -> (
     std::sync::Arc<EtcdShardGuard>,
-    std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<u32>>>,
+    std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<ShardId>>>,
     tokio::sync::watch::Sender<bool>,
     tokio::task::JoinHandle<()>,
 ) {
@@ -82,7 +83,7 @@ async fn shard_guard_acquire_and_release() {
         .await
         .expect("connect etcd");
 
-    let shard_id = 7u32;
+    let shard_id = ShardId::new();
     let (guard, owned, _tx, handle) = make_guard(&coord, &prefix, shard_id).await;
 
     guard.set_desired(true).await;
@@ -120,7 +121,7 @@ async fn shard_guard_contention_and_handoff() {
         .await
         .expect("connect etcd #2");
 
-    let shard_id = 3u32;
+    let shard_id = ShardId::new();
     let (g1, owned1, _tx1, h1) = make_guard(&coord1, &prefix, shard_id).await;
     let (g2, owned2, _tx2, h2) = make_guard(&coord2, &prefix, shard_id).await;
 
@@ -186,7 +187,7 @@ async fn shard_guard_idempotent_set_desired_true() {
         .await
         .expect("connect etcd");
 
-    let shard_id = 11u32;
+    let shard_id = ShardId::new();
     let (guard, owned, _tx, handle) = make_guard(&coord, &prefix, shard_id).await;
     guard.set_desired(true).await;
 
@@ -230,7 +231,7 @@ async fn shard_guard_quick_flip_reacquires() {
         .await
         .expect("connect etcd");
 
-    let shard_id = 19u32;
+    let shard_id = ShardId::new();
     let (guard, owned, _tx, handle) = make_guard(&coord, &prefix, shard_id).await;
     guard.set_desired(true).await;
     let acquired = wait_until(Duration::from_secs(3), || async {
@@ -273,7 +274,7 @@ async fn shard_guard_acquire_aborts_when_desired_changes() {
         .await
         .expect("connect etcd #2");
 
-    let shard_id = 23u32;
+    let shard_id = ShardId::new();
     // First guard holds the lock to block second guard's acquisition
     let (g1, _o1, _tx1, h1) = make_guard(&coord, &prefix, shard_id).await;
     g1.set_desired(true).await;
@@ -320,7 +321,7 @@ async fn shard_guard_acquire_abort_sets_idle() {
         .await
         .expect("connect etcd #2");
 
-    let shard_id = 21u32;
+    let shard_id = ShardId::new();
     // Block the lock with g1 so g2 enters Acquiring
     let (g1, _o1, _tx1, h1) = make_guard(&coord1, &prefix, shard_id).await;
     g1.set_desired(true).await;
@@ -361,7 +362,7 @@ async fn shard_guard_release_cancelled_on_desired_true() {
         .await
         .expect("connect etcd");
 
-    let shard_id = 17u32;
+    let shard_id = ShardId::new();
     let (g, owned, _tx, h) = make_guard(&coord, &prefix, shard_id).await;
     g.set_desired(true).await;
     let acquired = wait_until(Duration::from_secs(3), || async {
@@ -407,7 +408,7 @@ async fn shard_guard_shutdown_in_idle() {
         .await
         .expect("connect etcd");
 
-    let shard_id = 29u32;
+    let shard_id = ShardId::new();
     let (guard, owned, tx, handle) = make_guard(&coord, &prefix, shard_id).await;
     // Ensure Idle
     {
@@ -436,7 +437,7 @@ async fn shard_guard_shutdown_while_acquiring() {
         .await
         .expect("connect etcd #2");
 
-    let shard_id = 31u32;
+    let shard_id = ShardId::new();
     // g1 holds the lock so g2 is acquiring
     let (g1, _o1, _tx1, h1) = make_guard(&coord1, &prefix, shard_id).await;
     g1.set_desired(true).await;
@@ -484,7 +485,7 @@ async fn shard_guard_shutdown_while_held() {
         .await
         .expect("connect etcd");
 
-    let shard_id = 37u32;
+    let shard_id = ShardId::new();
     let (g, owned, tx, h) = make_guard(&coord, &prefix, shard_id).await;
     g.set_desired(true).await;
     assert!(
@@ -514,7 +515,7 @@ async fn shard_guard_shutdown_while_releasing() {
         .await
         .expect("connect etcd");
 
-    let shard_id = 41u32;
+    let shard_id = ShardId::new();
     let (g, owned, tx, h) = make_guard(&coord, &prefix, shard_id).await;
     g.set_desired(true).await;
     assert!(

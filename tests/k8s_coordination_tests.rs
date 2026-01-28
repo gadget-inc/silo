@@ -22,6 +22,7 @@ use silo::coordination::{Coordinator, K8sCoordinator};
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::settings::{Backend, DatabaseTemplate};
+use silo::shard_range::ShardId;
 use tokio::sync::Mutex;
 
 // Atomic counter for truly unique prefixes even within the same nanosecond
@@ -122,8 +123,14 @@ async fn k8s_single_node_owns_all_shards() {
 
     // Single node should own all shards
     let owned = coord.owned_shards().await;
-    let expected: HashSet<u32> = (0..num_shards).collect();
-    let owned_set: HashSet<u32> = owned.iter().copied().collect();
+    let expected: HashSet<ShardId> = coord
+        .get_shard_map()
+        .await
+        .unwrap()
+        .shard_ids()
+        .into_iter()
+        .collect();
+    let owned_set: HashSet<ShardId> = owned.into_iter().collect();
     assert_eq!(owned_set, expected, "single node should own all shards");
 
     // Cleanup
@@ -172,10 +179,16 @@ async fn k8s_multiple_nodes_partition_shards() {
     );
 
     // Check that all shards are covered
-    let s1: HashSet<u32> = c1.owned_shards().await.into_iter().collect();
-    let s2: HashSet<u32> = c2.owned_shards().await.into_iter().collect();
-    let all: HashSet<u32> = s1.union(&s2).copied().collect();
-    let expected: HashSet<u32> = (0..num_shards).collect();
+    let s1: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    let s2: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
+    let all: HashSet<ShardId> = s1.union(&s2).copied().collect();
+    let expected: HashSet<ShardId> = c1
+        .get_shard_map()
+        .await
+        .unwrap()
+        .shard_ids()
+        .into_iter()
+        .collect();
     assert_eq!(all, expected, "all shards should be owned");
 
     // Check that shards are disjoint
@@ -205,8 +218,14 @@ async fn k8s_rebalances_on_membership_change() {
     );
 
     assert!(c1.wait_converged(Duration::from_secs(10)).await);
-    let initial_owned: HashSet<u32> = c1.owned_shards().await.into_iter().collect();
-    let expected: HashSet<u32> = (0..num_shards).collect();
+    let initial_owned: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    let expected: HashSet<ShardId> = c1
+        .get_shard_map()
+        .await
+        .unwrap()
+        .shard_ids()
+        .into_iter()
+        .collect();
     assert_eq!(
         initial_owned, expected,
         "single node should own all initially"
@@ -230,8 +249,8 @@ async fn k8s_rebalances_on_membership_change() {
     assert!(c2.wait_converged(Duration::from_secs(15)).await);
 
     // Check redistribution
-    let s1: HashSet<u32> = c1.owned_shards().await.into_iter().collect();
-    let s2: HashSet<u32> = c2.owned_shards().await.into_iter().collect();
+    let s1: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    let s2: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
 
     // Node 1 should have fewer shards now
     assert!(
@@ -241,7 +260,7 @@ async fn k8s_rebalances_on_membership_change() {
     assert!(!s2.is_empty(), "c2 should own some shards");
     assert!(s1.is_disjoint(&s2), "ownership should be disjoint");
 
-    let all: HashSet<u32> = s1.union(&s2).copied().collect();
+    let all: HashSet<ShardId> = s1.union(&s2).copied().collect();
     assert_eq!(all, expected, "all shards should still be covered");
 
     // Cleanup
@@ -293,18 +312,24 @@ async fn k8s_three_nodes_even_distribution() {
     assert!(c2.wait_converged(Duration::from_secs(30)).await);
     assert!(c3.wait_converged(Duration::from_secs(30)).await);
 
-    let s1: HashSet<u32> = c1.owned_shards().await.into_iter().collect();
-    let s2: HashSet<u32> = c2.owned_shards().await.into_iter().collect();
-    let s3: HashSet<u32> = c3.owned_shards().await.into_iter().collect();
+    let s1: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    let s2: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
+    let s3: HashSet<ShardId> = c3.owned_shards().await.into_iter().collect();
 
     // All shards covered
-    let all: HashSet<u32> = s1
+    let all: HashSet<ShardId> = s1
         .iter()
         .chain(s2.iter())
         .chain(s3.iter())
         .copied()
         .collect();
-    let expected: HashSet<u32> = (0..num_shards).collect();
+    let expected: HashSet<ShardId> = c1
+        .get_shard_map()
+        .await
+        .unwrap()
+        .shard_ids()
+        .into_iter()
+        .collect();
     assert_eq!(all, expected, "all shards should be owned exactly once");
 
     // Disjoint ownership
@@ -389,12 +414,18 @@ async fn k8s_removing_node_rebalances() {
         "c2 should reconverge after node removal"
     );
 
-    let s1: HashSet<u32> = c1.owned_shards().await.into_iter().collect();
-    let s2: HashSet<u32> = c2.owned_shards().await.into_iter().collect();
+    let s1: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    let s2: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
 
     // All shards still covered
-    let all: HashSet<u32> = s1.union(&s2).copied().collect();
-    let expected: HashSet<u32> = (0..num_shards).collect();
+    let all: HashSet<ShardId> = s1.union(&s2).copied().collect();
+    let expected: HashSet<ShardId> = c1
+        .get_shard_map()
+        .await
+        .unwrap()
+        .shard_ids()
+        .into_iter()
+        .collect();
     assert_eq!(
         all, expected,
         "all shards should be covered after node removal"
@@ -484,17 +515,23 @@ async fn k8s_rapid_membership_churn_converges() {
     );
 
     // Validate ownership
-    let s1: HashSet<u32> = c1.owned_shards().await.into_iter().collect();
-    let s2: HashSet<u32> = c2b.owned_shards().await.into_iter().collect();
-    let s3: HashSet<u32> = c3.owned_shards().await.into_iter().collect();
+    let s1: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    let s2: HashSet<ShardId> = c2b.owned_shards().await.into_iter().collect();
+    let s3: HashSet<ShardId> = c3.owned_shards().await.into_iter().collect();
 
-    let all: HashSet<u32> = s1
+    let all: HashSet<ShardId> = s1
         .iter()
         .chain(s2.iter())
         .chain(s3.iter())
         .copied()
         .collect();
-    let expected: HashSet<u32> = (0..num_shards).collect();
+    let expected: HashSet<ShardId> = c1
+        .get_shard_map()
+        .await
+        .unwrap()
+        .shard_ids()
+        .into_iter()
+        .collect();
     assert_eq!(all, expected, "all shards covered after churn");
     assert!(s1.is_disjoint(&s2), "s1 and s2 disjoint");
     assert!(s1.is_disjoint(&s3), "s1 and s3 disjoint");
@@ -606,11 +643,15 @@ async fn k8s_get_shard_owner_map_accurate() {
     // Get shard owner map
     let map = c1.get_shard_owner_map().await.expect("get_shard_owner_map");
 
-    assert_eq!(map.num_shards, num_shards, "num_shards should match");
+    assert_eq!(
+        map.num_shards(),
+        num_shards as usize,
+        "num_shards should match"
+    );
 
     // All shards should have owners
-    let shards_with_owners: HashSet<u32> = map.shard_to_addr.keys().copied().collect();
-    let expected: HashSet<u32> = (0..num_shards).collect();
+    let shards_with_owners: HashSet<ShardId> = map.shard_to_addr.keys().copied().collect();
+    let expected: HashSet<ShardId> = map.shard_ids().into_iter().collect();
     assert_eq!(
         shards_with_owners, expected,
         "all shards should have owners in map"
@@ -648,7 +689,7 @@ async fn k8s_coordinator_metadata() {
         num_shards
     );
 
-    assert_eq!(coord.num_shards(), num_shards);
+    assert_eq!(coord.num_shards().await, num_shards as usize);
     assert_eq!(coord.node_id(), "meta-test-node");
     assert_eq!(coord.grpc_addr(), "http://192.168.1.1:9999");
 
@@ -666,11 +707,11 @@ async fn make_k8s_guard(
     namespace: &str,
     cluster_prefix: &str,
     node_id: &str,
-    shard_id: u32,
+    shard_id: ShardId,
 ) -> Result<
     (
         Arc<K8sShardGuard>,
-        Arc<Mutex<HashSet<u32>>>,
+        Arc<Mutex<HashSet<ShardId>>>,
         tokio::sync::watch::Sender<bool>,
         tokio::task::JoinHandle<()>,
     ),
@@ -708,7 +749,7 @@ async fn make_k8s_guard(
 async fn k8s_shard_guard_acquire_and_release() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
-    let shard_id = 7u32;
+    let shard_id = ShardId::new();
 
     let (guard, owned, _tx, handle) =
         match make_k8s_guard(&namespace, &prefix, "guard-node-1", shard_id).await {
@@ -746,7 +787,7 @@ async fn k8s_shard_guard_acquire_and_release() {
 async fn k8s_shard_guard_contention() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
-    let shard_id = 3u32;
+    let shard_id = ShardId::new();
 
     let (g1, owned1, _tx1, h1) =
         match make_k8s_guard(&namespace, &prefix, "contend-node-1", shard_id).await {
@@ -794,7 +835,7 @@ async fn k8s_shard_guard_contention() {
 async fn k8s_shard_guard_handoff() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
-    let shard_id = 5u32;
+    let shard_id = ShardId::new();
 
     let (g1, owned1, _tx1, h1) =
         match make_k8s_guard(&namespace, &prefix, "handoff-node-1", shard_id).await {
@@ -846,7 +887,7 @@ async fn k8s_shard_guard_handoff() {
 async fn k8s_shard_guard_idempotent_set_desired() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
-    let shard_id = 11u32;
+    let shard_id = ShardId::new();
 
     let (guard, owned, _tx, handle) =
         match make_k8s_guard(&namespace, &prefix, "idemp-node", shard_id).await {
@@ -886,7 +927,7 @@ async fn k8s_shard_guard_idempotent_set_desired() {
 async fn k8s_shard_guard_quick_flip_reacquires() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
-    let shard_id = 19u32;
+    let shard_id = ShardId::new();
 
     let (guard, owned, _tx, handle) =
         match make_k8s_guard(&namespace, &prefix, "flip-node", shard_id).await {
@@ -925,7 +966,7 @@ async fn k8s_shard_guard_quick_flip_reacquires() {
 async fn k8s_shard_guard_acquire_aborts_on_desired_change() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
-    let shard_id = 23u32;
+    let shard_id = ShardId::new();
 
     // g1 holds the lock to block g2's acquisition
     let (g1, _o1, _tx1, h1) =
@@ -973,7 +1014,7 @@ async fn k8s_shard_guard_acquire_aborts_on_desired_change() {
 async fn k8s_shard_guard_shutdown_while_idle() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
-    let shard_id = 29u32;
+    let shard_id = ShardId::new();
 
     let (guard, owned, tx, handle) =
         match make_k8s_guard(&namespace, &prefix, "shutdown-idle", shard_id).await {
@@ -1001,7 +1042,7 @@ async fn k8s_shard_guard_shutdown_while_idle() {
 async fn k8s_shard_guard_shutdown_while_held() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
-    let shard_id = 37u32;
+    let shard_id = ShardId::new();
 
     let (guard, owned, tx, handle) =
         match make_k8s_guard(&namespace, &prefix, "shutdown-held", shard_id).await {
@@ -1082,9 +1123,9 @@ async fn k8s_no_split_brain_during_transitions() {
     let check_deadline = Instant::now() + Duration::from_secs(20);
 
     while Instant::now() < check_deadline {
-        let s1: HashSet<u32> = c1.owned_shards().await.into_iter().collect();
-        let s2: HashSet<u32> = c2.owned_shards().await.into_iter().collect();
-        let s3: HashSet<u32> = c3.owned_shards().await.into_iter().collect();
+        let s1: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+        let s2: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
+        let s3: HashSet<ShardId> = c3.owned_shards().await.into_iter().collect();
 
         // Check for overlaps
         let s1_s2_overlap: HashSet<_> = s1.intersection(&s2).collect();
@@ -1155,7 +1196,7 @@ async fn k8s_prompt_acquisition_after_node_departure() {
     assert!(c2.wait_converged(Duration::from_secs(15)).await);
 
     // Record what c2 owned
-    let c2_shards: HashSet<u32> = c2.owned_shards().await.into_iter().collect();
+    let c2_shards: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
     assert!(!c2_shards.is_empty(), "c2 should own some shards");
 
     // Shutdown c2
@@ -1179,8 +1220,14 @@ async fn k8s_prompt_acquisition_after_node_departure() {
         convergence_time
     );
 
-    let c1_final: HashSet<u32> = c1.owned_shards().await.into_iter().collect();
-    let expected: HashSet<u32> = (0..num_shards).collect();
+    let c1_final: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    let expected: HashSet<ShardId> = c1
+        .get_shard_map()
+        .await
+        .unwrap()
+        .shard_ids()
+        .into_iter()
+        .collect();
     assert_eq!(
         c1_final, expected,
         "c1 should own all shards after c2 leaves"
@@ -1237,11 +1284,17 @@ async fn k8s_multiple_add_remove_cycles() {
         );
 
         // Verify partition
-        let s1: HashSet<u32> = c1.owned_shards().await.into_iter().collect();
-        let s2: HashSet<u32> = c2.owned_shards().await.into_iter().collect();
+        let s1: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+        let s2: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
         assert!(s1.is_disjoint(&s2), "disjoint at iter {}", i);
-        let all: HashSet<u32> = s1.union(&s2).copied().collect();
-        let expected: HashSet<u32> = (0..num_shards).collect();
+        let all: HashSet<ShardId> = s1.union(&s2).copied().collect();
+        let expected: HashSet<ShardId> = c1
+            .get_shard_map()
+            .await
+            .unwrap()
+            .shard_ids()
+            .into_iter()
+            .collect();
         assert_eq!(all, expected, "all covered at iter {}", i);
 
         // Remove node
@@ -1256,7 +1309,7 @@ async fn k8s_multiple_add_remove_cycles() {
             "c1 converge after remove iter {}",
             i
         );
-        let s1_after: HashSet<u32> = c1.owned_shards().await.into_iter().collect();
+        let s1_after: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
         assert_eq!(s1_after, expected, "c1 owns all after remove iter {}", i);
     }
 
@@ -1326,20 +1379,26 @@ async fn k8s_four_node_cluster() {
     assert!(c3.wait_converged(timeout).await, "c3 converge");
     assert!(c4.wait_converged(timeout).await, "c4 converge");
 
-    let s1: HashSet<u32> = c1.owned_shards().await.into_iter().collect();
-    let s2: HashSet<u32> = c2.owned_shards().await.into_iter().collect();
-    let s3: HashSet<u32> = c3.owned_shards().await.into_iter().collect();
-    let s4: HashSet<u32> = c4.owned_shards().await.into_iter().collect();
+    let s1: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    let s2: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
+    let s3: HashSet<ShardId> = c3.owned_shards().await.into_iter().collect();
+    let s4: HashSet<ShardId> = c4.owned_shards().await.into_iter().collect();
 
     // All covered
-    let all: HashSet<u32> = s1
+    let all: HashSet<ShardId> = s1
         .iter()
         .chain(s2.iter())
         .chain(s3.iter())
         .chain(s4.iter())
         .copied()
         .collect();
-    let expected: HashSet<u32> = (0..num_shards).collect();
+    let expected: HashSet<ShardId> = c1
+        .get_shard_map()
+        .await
+        .unwrap()
+        .shard_ids()
+        .into_iter()
+        .collect();
     assert_eq!(all, expected, "all shards covered");
 
     // All disjoint
@@ -1375,7 +1434,7 @@ async fn k8s_four_node_cluster() {
 async fn k8s_shard_guard_shutdown_while_acquiring() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
-    let shard_id = 43u32;
+    let shard_id = ShardId::new();
 
     // g1 holds the lock so g2 will be stuck acquiring
     let (g1, _o1, _tx1, h1) =
@@ -1429,7 +1488,7 @@ async fn k8s_shard_guard_shutdown_while_acquiring() {
 async fn k8s_shard_guard_shutdown_while_releasing() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
-    let shard_id = 47u32;
+    let shard_id = ShardId::new();
 
     let (guard, owned, tx, handle) =
         match make_k8s_guard(&namespace, &prefix, "rel-shutdown", shard_id).await {
@@ -1476,7 +1535,7 @@ async fn k8s_shard_guard_shutdown_while_releasing() {
 async fn k8s_shard_guard_three_way_contention() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
-    let shard_id = 51u32;
+    let shard_id = ShardId::new();
 
     let (g1, o1, _tx1, h1) =
         match make_k8s_guard(&namespace, &prefix, "three-way-1", shard_id).await {
@@ -1537,7 +1596,7 @@ async fn k8s_shard_guard_three_way_contention() {
 async fn k8s_shard_guard_rapid_desired_toggling() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
-    let shard_id = 53u32;
+    let shard_id = ShardId::new();
 
     let (guard, owned, _tx, handle) =
         match make_k8s_guard(&namespace, &prefix, "rapid-toggle", shard_id).await {
@@ -1592,8 +1651,14 @@ async fn k8s_node_restart_same_id() {
         "c1 initial converge"
     );
 
-    let initial_owned: HashSet<u32> = c1.owned_shards().await.into_iter().collect();
-    let expected: HashSet<u32> = (0..num_shards).collect();
+    let initial_owned: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    let expected: HashSet<ShardId> = c1
+        .get_shard_map()
+        .await
+        .unwrap()
+        .shard_ids()
+        .into_iter()
+        .collect();
     assert_eq!(initial_owned, expected, "single node should own all");
 
     // Shutdown first instance
@@ -1621,7 +1686,7 @@ async fn k8s_node_restart_same_id() {
         c2.wait_converged(Duration::from_secs(20)).await,
         "restarted node should converge"
     );
-    let restarted_owned: HashSet<u32> = c2.owned_shards().await.into_iter().collect();
+    let restarted_owned: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
     assert_eq!(
         restarted_owned, expected,
         "restarted node should own all shards"
@@ -1708,17 +1773,23 @@ async fn k8s_simultaneous_node_additions() {
     assert!(c3.wait_converged(timeout).await, "c3 should converge");
 
     // All shards should be covered with no overlaps
-    let s1: HashSet<u32> = c1.owned_shards().await.into_iter().collect();
-    let s2: HashSet<u32> = c2.owned_shards().await.into_iter().collect();
-    let s3: HashSet<u32> = c3.owned_shards().await.into_iter().collect();
+    let s1: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    let s2: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
+    let s3: HashSet<ShardId> = c3.owned_shards().await.into_iter().collect();
 
-    let all: HashSet<u32> = s1
+    let all: HashSet<ShardId> = s1
         .iter()
         .chain(s2.iter())
         .chain(s3.iter())
         .copied()
         .collect();
-    let expected: HashSet<u32> = (0..num_shards).collect();
+    let expected: HashSet<ShardId> = c1
+        .get_shard_map()
+        .await
+        .unwrap()
+        .shard_ids()
+        .into_iter()
+        .collect();
     assert_eq!(
         all, expected,
         "all shards covered after simultaneous additions"
@@ -1793,8 +1864,14 @@ async fn k8s_concurrent_shutdown_multiple_nodes() {
         "c1 should converge after concurrent shutdowns"
     );
 
-    let s1: HashSet<u32> = c1.owned_shards().await.into_iter().collect();
-    let expected: HashSet<u32> = (0..num_shards).collect();
+    let s1: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    let expected: HashSet<ShardId> = c1
+        .get_shard_map()
+        .await
+        .unwrap()
+        .shard_ids()
+        .into_iter()
+        .collect();
     assert_eq!(
         s1, expected,
         "c1 should own all shards after concurrent peer shutdowns"
@@ -1841,8 +1918,14 @@ async fn k8s_short_lease_ttl() {
     tokio::time::sleep(Duration::from_secs(8)).await; // Longer than TTL
 
     let owned = c1.owned_shards().await;
-    let expected: HashSet<u32> = (0..num_shards).collect();
-    let owned_set: HashSet<u32> = owned.into_iter().collect();
+    let expected: HashSet<ShardId> = c1
+        .get_shard_map()
+        .await
+        .unwrap()
+        .shard_ids()
+        .into_iter()
+        .collect();
+    let owned_set: HashSet<ShardId> = owned.into_iter().collect();
     assert_eq!(
         owned_set, expected,
         "should still own all shards after TTL period (renewals working)"
@@ -1858,7 +1941,7 @@ async fn k8s_short_lease_ttl() {
 async fn k8s_shard_guard_handoff_chain() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
-    let shard_id = 59u32;
+    let shard_id = ShardId::new();
 
     let (g1, o1, _tx1, h1) = match make_k8s_guard(&namespace, &prefix, "chain-1", shard_id).await {
         Ok(g) => g,
@@ -1967,15 +2050,15 @@ async fn k8s_ownership_stability_during_steady_state() {
     assert!(c2.wait_converged(Duration::from_secs(20)).await);
 
     // Record initial ownership
-    let s1_initial: HashSet<u32> = c1.owned_shards().await.into_iter().collect();
-    let s2_initial: HashSet<u32> = c2.owned_shards().await.into_iter().collect();
+    let s1_initial: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    let s2_initial: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
 
     // Wait for a while with no changes
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Check ownership hasn't changed
-    let s1_after: HashSet<u32> = c1.owned_shards().await.into_iter().collect();
-    let s2_after: HashSet<u32> = c2.owned_shards().await.into_iter().collect();
+    let s1_after: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    let s2_after: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
 
     assert_eq!(s1_initial, s1_after, "c1 ownership should remain stable");
     assert_eq!(s2_initial, s2_after, "c2 ownership should remain stable");
@@ -1992,7 +2075,7 @@ async fn k8s_ownership_stability_during_steady_state() {
 async fn k8s_shard_guard_release_while_idle() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
-    let shard_id = 61u32;
+    let shard_id = ShardId::new();
 
     let (guard, owned, _tx, handle) =
         match make_k8s_guard(&namespace, &prefix, "release-idle", shard_id).await {
@@ -2099,7 +2182,7 @@ async fn k8s_graceful_shutdown_releases_shards_promptly() {
     assert!(c2.wait_converged(Duration::from_secs(20)).await);
 
     // Record what c2 owns
-    let c2_initial: HashSet<u32> = c2.owned_shards().await.into_iter().collect();
+    let c2_initial: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
     assert!(!c2_initial.is_empty(), "c2 should own some shards");
 
     // Graceful shutdown of c2 (releases shards and deletes membership lease)
@@ -2113,8 +2196,14 @@ async fn k8s_graceful_shutdown_releases_shards_promptly() {
     );
 
     // c1 should now own all shards
-    let c1_final: HashSet<u32> = c1.owned_shards().await.into_iter().collect();
-    let expected: HashSet<u32> = (0..num_shards).collect();
+    let c1_final: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    let expected: HashSet<ShardId> = c1
+        .get_shard_map()
+        .await
+        .unwrap()
+        .shard_ids()
+        .into_iter()
+        .collect();
     assert_eq!(
         c1_final, expected,
         "c1 should own all shards after c2 graceful shutdown"

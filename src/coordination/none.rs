@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::factory::ShardFactory;
+use crate::shard_range::{ShardId, ShardMap};
 
 use super::{CoordinationError, Coordinator, MemberInfo, ShardOwnerMap, get_hostname};
 
@@ -19,7 +20,7 @@ use super::{CoordinationError, Coordinator, MemberInfo, ShardOwnerMap, get_hostn
 pub struct NoneCoordinator {
     node_id: String,
     grpc_addr: String,
-    num_shards: u32,
+    shard_map: ShardMap,
     startup_time_ms: Option<i64>,
     hostname: Option<String>,
 }
@@ -27,17 +28,22 @@ pub struct NoneCoordinator {
 impl NoneCoordinator {
     /// Create a new single-node coordinator.
     ///
-    /// Opens all shards immediately since this node owns everything.
+    /// Creates a shard map with the given number of shards and opens all shards
+    /// immediately since this node owns everything.
     pub async fn new(
         node_id: impl Into<String>,
         grpc_addr: impl Into<String>,
-        num_shards: u32,
+        initial_shard_count: u32,
         factory: Arc<ShardFactory>,
     ) -> Self {
+        // Create the shard map for single-node mode
+        let shard_map = ShardMap::create_initial(initial_shard_count)
+            .expect("failed to create initial shard map");
+
         // In single-node mode, we own all shards immediately - open them all
-        for shard_id in 0..num_shards {
-            if let Err(e) = factory.open(shard_id as usize).await {
-                tracing::error!(shard_id, error = %e, "failed to open shard");
+        for shard_info in shard_map.shards() {
+            if let Err(e) = factory.open(&shard_info.id).await {
+                tracing::error!(shard_id = %shard_info.id, error = %e, "failed to open shard");
             }
         }
 
@@ -49,7 +55,7 @@ impl NoneCoordinator {
         Self {
             node_id: node_id.into(),
             grpc_addr: grpc_addr.into(),
-            num_shards,
+            shard_map,
             startup_time_ms,
             hostname: get_hostname(),
         }
@@ -58,9 +64,9 @@ impl NoneCoordinator {
 
 #[async_trait]
 impl Coordinator for NoneCoordinator {
-    async fn owned_shards(&self) -> Vec<u32> {
+    async fn owned_shards(&self) -> Vec<ShardId> {
         // Single node owns all shards
-        (0..self.num_shards).collect()
+        self.shard_map.shard_ids()
     }
 
     async fn shutdown(&self) -> Result<(), CoordinationError> {
@@ -83,25 +89,29 @@ impl Coordinator for NoneCoordinator {
         }])
     }
 
+    async fn get_shard_map(&self) -> Result<ShardMap, CoordinationError> {
+        Ok(self.shard_map.clone())
+    }
+
     async fn get_shard_owner_map(&self) -> Result<ShardOwnerMap, CoordinationError> {
         // All shards owned by this node
         let mut shard_to_addr = HashMap::new();
         let mut shard_to_node = HashMap::new();
 
-        for shard_id in 0..self.num_shards {
-            shard_to_addr.insert(shard_id, self.grpc_addr.clone());
-            shard_to_node.insert(shard_id, self.node_id.clone());
+        for shard_info in self.shard_map.shards() {
+            shard_to_addr.insert(shard_info.id, self.grpc_addr.clone());
+            shard_to_node.insert(shard_info.id, self.node_id.clone());
         }
 
         Ok(ShardOwnerMap {
-            num_shards: self.num_shards,
+            shard_map: self.shard_map.clone(),
             shard_to_addr,
             shard_to_node,
         })
     }
 
-    fn num_shards(&self) -> u32 {
-        self.num_shards
+    async fn num_shards(&self) -> usize {
+        self.shard_map.len()
     }
 
     fn node_id(&self) -> &str {

@@ -43,7 +43,7 @@ Silo works by separating the compute and storage tiers. Storage is provided by o
 
 The clustering approach is modelled after something similar to Google Cloud Bigtable, where individual compute node members all hold leases over some subset of the overall shards. Unlike Bigtable, there's no central coordiantor managing which bits are assigned to which nodes -- we just manage an internal consistent hash ring that assigns the entire shard space to all the nodes, shifting around as few as possible when cluster membership changes.
 
-### Shard coordination plan (using consistent hashing + etcd control plane)
+### Shard coordination plan
 
 Goals:
 

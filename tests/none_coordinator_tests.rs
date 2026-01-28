@@ -31,7 +31,9 @@ async fn none_coordinator_owns_all_shards() {
 
     let owned = coord.owned_shards().await;
     assert_eq!(owned.len(), 16);
-    assert_eq!(owned, (0..16).collect::<Vec<_>>());
+    // Just verify we have 16 unique ShardIds
+    let unique_ids: std::collections::HashSet<_> = owned.iter().collect();
+    assert_eq!(unique_ids.len(), 16);
 }
 
 #[silo::test]
@@ -73,16 +75,17 @@ async fn none_coordinator_shard_map() {
     .await;
 
     let map = coord.get_shard_owner_map().await.unwrap();
-    assert_eq!(map.num_shards, 4);
+    assert_eq!(map.num_shards(), 4);
     assert_eq!(map.shard_to_addr.len(), 4);
 
-    for shard_id in 0..4 {
+    // Verify all shards have the correct address and node mappings
+    for shard_info in map.shard_map.shards() {
         assert_eq!(
-            map.shard_to_addr.get(&shard_id),
+            map.shard_to_addr.get(&shard_info.id),
             Some(&"http://localhost:50051".to_string())
         );
         assert_eq!(
-            map.shard_to_node.get(&shard_id),
+            map.shard_to_node.get(&shard_info.id),
             Some(&"test-node".to_string())
         );
     }

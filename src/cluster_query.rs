@@ -42,6 +42,7 @@ use crate::job_store_shard::JobStoreShard;
 use crate::pb::QueryArrowRequest;
 use crate::pb::silo_client::SiloClient;
 use crate::query::{JobsScanner, QueuesScanner, ScannerRef, explain_dataframe};
+use crate::shard_range::ShardId;
 
 /// Cluster-wide SQL query engine using DataFusion.
 ///
@@ -61,8 +62,8 @@ impl std::fmt::Debug for ClusterQueryEngine {
 /// Configuration for a shard - either local or remote
 #[derive(Clone)]
 enum ShardConfig {
-    Local(Arc<JobStoreShard>),
-    Remote { shard_id: u32, addr: String },
+    Local(ShardId, Arc<JobStoreShard>),
+    Remote { shard_id: ShardId, addr: String },
 }
 
 impl ClusterQueryEngine {
@@ -70,12 +71,10 @@ impl ClusterQueryEngine {
     ///
     /// # Arguments
     /// * `factory` - The shard factory for accessing local shards
-    /// * `coordinator` - Optional coordinator for discovering remote shards
-    /// * `num_shards` - Total number of shards in the cluster
+    /// * `coordinator` - Optional coordinator for discovering shards
     pub async fn new(
         factory: Arc<ShardFactory>,
         coordinator: Option<Arc<dyn Coordinator>>,
-        num_shards: u32,
     ) -> DfResult<Self> {
         let ctx = SessionContext::new();
 
@@ -85,7 +84,6 @@ impl ClusterQueryEngine {
             jobs_schema,
             factory.clone(),
             coordinator.clone(),
-            num_shards,
             TableKind::Jobs,
         ));
         ctx.register_table("jobs", jobs_provider)?;
@@ -96,7 +94,6 @@ impl ClusterQueryEngine {
             queues_schema,
             factory,
             coordinator,
-            num_shards,
             TableKind::Queues,
         ));
         ctx.register_table("queues", queues_provider)?;
@@ -109,27 +106,30 @@ impl ClusterQueryEngine {
     async fn build_shard_configs(
         factory: &ShardFactory,
         coordinator: Option<&Arc<dyn Coordinator>>,
-        num_shards: u32,
     ) -> Vec<ShardConfig> {
-        let mut configs = Vec::with_capacity(num_shards as usize);
-
-        // Get remote shard addresses if we have a coordinator
-        let remote_addrs: HashMap<u32, String> = if let Some(coord) = coordinator {
-            match coord.get_shard_owner_map().await {
-                Ok(map) => map.shard_to_addr,
-                Err(e) => {
-                    warn!(error = %e, "failed to get shard owner map, assuming all shards are local");
-                    HashMap::new()
+        // Get shard ownership info from coordinator
+        let (shard_ids, remote_addrs): (Vec<ShardId>, HashMap<ShardId, String>) =
+            if let Some(coord) = coordinator {
+                match coord.get_shard_owner_map().await {
+                    Ok(map) => (map.shard_ids(), map.shard_to_addr),
+                    Err(e) => {
+                        warn!(error = %e, "failed to get shard owner map, using only local shards");
+                        // Fall back to local shards only
+                        let local_ids: Vec<ShardId> = factory.instances().keys().copied().collect();
+                        (local_ids, HashMap::new())
+                    }
                 }
-            }
-        } else {
-            HashMap::new()
-        };
+            } else {
+                // No coordinator - use local shards only
+                let local_ids: Vec<ShardId> = factory.instances().keys().copied().collect();
+                (local_ids, HashMap::new())
+            };
 
-        for shard_id in 0..num_shards {
-            let shard_name = shard_id.to_string();
-            if let Some(local_shard) = factory.get(&shard_name) {
-                configs.push(ShardConfig::Local(local_shard));
+        let mut configs = Vec::with_capacity(shard_ids.len());
+
+        for shard_id in shard_ids {
+            if let Some(local_shard) = factory.get(&shard_id) {
+                configs.push(ShardConfig::Local(shard_id, local_shard));
             } else if let Some(addr) = remote_addrs.get(&shard_id) {
                 configs.push(ShardConfig::Remote {
                     shard_id,
@@ -139,7 +139,7 @@ impl ClusterQueryEngine {
                 // Shard not found locally and no remote address known
                 // This might happen during cluster startup - we'll skip it
                 debug!(
-                    shard_id,
+                    shard_id = %shard_id,
                     "shard not available locally or remotely, skipping"
                 );
             }
@@ -182,8 +182,6 @@ struct ClusterTableProvider {
     factory: Arc<ShardFactory>,
     /// Optional coordinator for discovering remote shards
     coordinator: Option<Arc<dyn Coordinator>>,
-    /// Total number of shards in the cluster
-    num_shards: u32,
     table_kind: TableKind,
 }
 
@@ -191,7 +189,6 @@ impl std::fmt::Debug for ClusterTableProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClusterTableProvider")
             .field("table_kind", &self.table_kind)
-            .field("num_shards", &self.num_shards)
             .finish()
     }
 }
@@ -199,7 +196,9 @@ impl std::fmt::Debug for ClusterTableProvider {
 impl std::fmt::Debug for ShardConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ShardConfig::Local(shard) => write!(f, "Local({})", shard.name()),
+            ShardConfig::Local(shard_id, shard) => {
+                write!(f, "Local({}, {})", shard_id, shard.name())
+            }
             ShardConfig::Remote { shard_id, addr } => {
                 write!(f, "Remote(shard={}, addr={})", shard_id, addr)
             }
@@ -212,14 +211,12 @@ impl ClusterTableProvider {
         schema: SchemaRef,
         factory: Arc<ShardFactory>,
         coordinator: Option<Arc<dyn Coordinator>>,
-        num_shards: u32,
         table_kind: TableKind,
     ) -> Self {
         Self {
             schema,
             factory,
             coordinator,
-            num_shards,
             table_kind,
         }
     }
@@ -247,12 +244,8 @@ impl TableProvider for ClusterTableProvider {
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         // Build shard configs dynamically to pick up current cluster state
-        let shard_configs = ClusterQueryEngine::build_shard_configs(
-            &self.factory,
-            self.coordinator.as_ref(),
-            self.num_shards,
-        )
-        .await;
+        let shard_configs =
+            ClusterQueryEngine::build_shard_configs(&self.factory, self.coordinator.as_ref()).await;
 
         // Handle projection
         let (output_schema, projection_indices) = match projection {
@@ -387,7 +380,7 @@ impl ExecutionPlan for ClusterExecutionPlan {
 
         tokio::spawn(async move {
             match shard_config {
-                ShardConfig::Local(shard) => {
+                ShardConfig::Local(_shard_id, shard) => {
                     // Create the appropriate scanner for this table type
                     let scanner: ScannerRef = match table_kind {
                         TableKind::Jobs => Arc::new(JobsScanner::new(Arc::clone(&shard))),
@@ -413,7 +406,7 @@ impl ExecutionPlan for ClusterExecutionPlan {
                 }
                 ShardConfig::Remote { shard_id, addr } => {
                     // Query remote shard via gRPC with Arrow IPC (returns full schema)
-                    match query_remote_shard_batches(shard_id, &addr, table_kind, &filters, limit)
+                    match query_remote_shard_batches(&shard_id, &addr, table_kind, &filters, limit)
                         .await
                     {
                         Ok(batches) => {
@@ -482,7 +475,7 @@ impl DisplayAs for ClusterExecutionPlan {
 /// - UNAVAILABLE: The target node is acquiring the shard, retry with backoff
 /// - NOT_FOUND with redirect: The shard moved, retry to the new address
 async fn query_remote_shard_batches(
-    shard_id: u32,
+    shard_id: &ShardId,
     addr: &str,
     table_kind: TableKind,
     filters: &[Expr],
@@ -514,7 +507,7 @@ async fn query_remote_shard_batches(
             } else {
                 format!("http://{}", current_addr)
             };
-        debug!(shard_id, addr = %full_addr, sql = %sql, attempt, "querying remote shard");
+        debug!(shard_id = %shard_id, addr = %full_addr, sql = %sql, attempt, "querying remote shard");
 
         // Connect to remote node
         let channel = match Channel::from_shared(full_addr.clone()) {
@@ -544,7 +537,7 @@ async fn query_remote_shard_batches(
                     MAX_BACKOFF_MS,
                 );
                 warn!(
-                    shard_id,
+                    shard_id = %shard_id,
                     addr = %full_addr,
                     attempt,
                     backoff_ms = backoff,
@@ -560,7 +553,7 @@ async fn query_remote_shard_batches(
 
         // Make streaming query
         let request = QueryArrowRequest {
-            shard: shard_id,
+            shard: shard_id.to_string(),
             sql: sql.clone(),
             tenant: None,
         };
@@ -573,7 +566,7 @@ async fn query_remote_shard_batches(
                     tonic::Code::Unavailable => {
                         // Target node is acquiring the shard - retry with backoff
                         debug!(
-                            shard_id,
+                            shard_id = %shard_id,
                             addr = %full_addr,
                             attempt,
                             "shard unavailable (acquisition in progress), will retry"
@@ -589,7 +582,7 @@ async fn query_remote_shard_batches(
                             if let Ok(new_addr_str) = new_addr.to_str() {
                                 // Redirect to new owner
                                 debug!(
-                                    shard_id,
+                                    shard_id = %shard_id,
                                     old_addr = %full_addr,
                                     new_addr = %new_addr_str,
                                     attempt,

@@ -17,10 +17,10 @@
 //! 5. System progress: Jobs complete without deadlock
 
 use crate::helpers::{
-    AttemptStatus, ConcurrencyLimit, EnqueueRequest, GetJobRequest, InvariantTracker,
-    HashMap, JobStatus, LeaseTasksRequest, Limit, SerializedBytes, serialized_bytes,
-    ReportOutcomeRequest, Task,
-    get_seed, limit, report_outcome_request, run_scenario_impl, setup_server, turmoil_connector,
+    AttemptStatus, ConcurrencyLimit, EnqueueRequest, GetJobRequest, HashMap, InvariantTracker,
+    JobStatus, LeaseTasksRequest, Limit, ReportOutcomeRequest, SerializedBytes, TEST_SHARD_ID,
+    Task, get_seed, limit, report_outcome_request, run_scenario_impl, serialized_bytes,
+    setup_server, turmoil_connector,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -93,7 +93,9 @@ pub fn run() {
 
         // Register all limit keys with their max concurrency values
         for config in LIMIT_CONFIGS {
-            tracker.concurrency.register_limit(config.key, config.max_concurrency);
+            tracker
+                .concurrency
+                .register_limit(config.key, config.max_concurrency);
         }
 
         sim.host("server", || async move { setup_server(9905).await });
@@ -147,17 +149,19 @@ pub fn run() {
 
                 match client
                     .enqueue(tonic::Request::new(EnqueueRequest {
-                        shard: 0,
+                        shard: TEST_SHARD_ID.to_string(),
                         id: job_id.clone(),
                         priority,
                         start_at_ms: 0,
                         retry_policy: None,
                         payload: Some(SerializedBytes {
-                            encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({
-                                "limit_key": config.key,
-                                "job_num": job_num
-                            }))
-                            .unwrap())),
+                            encoding: Some(serialized_bytes::Encoding::Msgpack(
+                                rmp_serde::to_vec(&serde_json::json!({
+                                    "limit_key": config.key,
+                                    "job_num": job_num
+                                }))
+                                .unwrap(),
+                            )),
                         }),
                         limits: vec![Limit {
                             limit: Some(limit::Limit::Concurrency(ConcurrencyLimit {
@@ -231,17 +235,19 @@ pub fn run() {
 
                 match client
                     .enqueue(tonic::Request::new(EnqueueRequest {
-                        shard: 0,
+                        shard: TEST_SHARD_ID.to_string(),
                         id: job_id.clone(),
                         priority,
                         start_at_ms: 0,
                         retry_policy: None,
                         payload: Some(SerializedBytes {
-                            encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({
-                                "limit_key": config.key,
-                                "job_num": job_num
-                            }))
-                            .unwrap())),
+                            encoding: Some(serialized_bytes::Encoding::Msgpack(
+                                rmp_serde::to_vec(&serde_json::json!({
+                                    "limit_key": config.key,
+                                    "job_num": job_num
+                                }))
+                                .unwrap(),
+                            )),
                         }),
                         limits: vec![Limit {
                             limit: Some(limit::Limit::Concurrency(ConcurrencyLimit {
@@ -303,7 +309,7 @@ pub fn run() {
 
                     let lease_result = client
                         .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                            shard: Some(0),
+                            shard: Some(TEST_SHARD_ID.to_string()),
                             worker_id: worker_id.clone(),
                             max_tasks,
                             task_group: "default".to_string(),
@@ -391,7 +397,7 @@ pub fn run() {
 
                             match client
                                 .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                                    shard: 0,
+                                    shard: TEST_SHARD_ID.to_string(),
                                     task_id: task.id.clone(),
                                     outcome: Some(outcome),
                                 }))
@@ -459,7 +465,7 @@ pub fn run() {
 
                     match client
                         .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                            shard: 0,
+                            shard: TEST_SHARD_ID.to_string(),
                             task_id: task.id.clone(),
                             outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
                                 encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!("done")).unwrap())),
@@ -547,7 +553,7 @@ pub fn run() {
             for job_id in &job_ids {
                 match client
                     .get_job(tonic::Request::new(GetJobRequest {
-                        shard: 0,
+                        shard: TEST_SHARD_ID.to_string(),
                         id: job_id.clone(),
                         tenant: None,
                         include_attempts: true,

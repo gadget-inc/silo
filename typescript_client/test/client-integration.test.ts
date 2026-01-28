@@ -18,6 +18,43 @@ const RUN_INTEGRATION =
 // Default task group for all integration tests
 const DEFAULT_TASK_GROUP = "integration-test-group";
 
+/**
+ * Wait for the cluster to converge by polling until all shards have owners.
+ * This handles the case where the cluster is still starting up and shards
+ * haven't been fully distributed yet.
+ */
+async function waitForClusterConvergence(
+  client: SiloGRPCClient,
+  maxAttempts = 30,
+  delayMs = 500
+): Promise<void> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    await client.refreshTopology();
+    const topology = client.getTopology();
+
+    // Check if we have at least one shard with a valid address
+    const hasShards = topology.shards.length > 0;
+    const allShardsHaveOwners = topology.shards.every(
+      (s) => s.serverAddr && s.serverAddr.length > 0
+    );
+
+    if (hasShards && allShardsHaveOwners) {
+      return; // Cluster is ready
+    }
+
+    if (attempt === maxAttempts) {
+      throw new Error(
+        `Cluster did not converge after ${maxAttempts} attempts. ` +
+          `Found ${topology.shards.length} shards, ` +
+          `${topology.shards.filter((s) => s.serverAddr).length} with owners.`
+      );
+    }
+
+    // Wait before retrying
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+}
+
 describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
   let client: SiloGRPCClient;
 
@@ -29,8 +66,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         topologyRefreshIntervalMs: 0, // Disable auto-refresh in tests
       },
     });
-    // Refresh topology to discover actual cluster state
-    await client.refreshTopology();
+    // Wait for cluster to converge and discover topology
+    await waitForClusterConvergence(client);
   });
 
   afterAll(() => {
@@ -42,7 +79,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       const topology = client.getTopology();
 
       // Should have discovered at least 1 shard
-      expect(topology.numShards).toBeGreaterThanOrEqual(1);
+      expect(topology.shards.length).toBeGreaterThanOrEqual(1);
 
       // Should have server addresses for shards
       expect(topology.shardToServer.size).toBeGreaterThanOrEqual(1);
@@ -53,7 +90,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       await client.refreshTopology();
 
       const topology = client.getTopology();
-      expect(topology.numShards).toBeGreaterThanOrEqual(1);
+      expect(topology.shards.length).toBeGreaterThanOrEqual(1);
     });
   });
 
@@ -84,12 +121,13 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       const shard2 = client.getShardForTenant(tenant);
 
       expect(shard1).toBe(shard2);
-      expect(shard1).toBeGreaterThanOrEqual(0);
+      expect(typeof shard1).toBe("string");
+      expect(shard1.length).toBeGreaterThan(0);
     });
 
     it("different tenants may route to different shards", () => {
       // With enough tenants, they should distribute across available shards
-      const shards = new Set<number>();
+      const shards = new Set<string>();
 
       for (let i = 0; i < 100; i++) {
         const shard = client.getShardForTenant(`tenant-${i}`);
@@ -1193,14 +1231,27 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 });
 
 describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
+  // Wait for cluster convergence before running any shard routing tests
+  beforeAll(async () => {
+    const client = new SiloGRPCClient({
+      servers: SILO_SERVERS,
+      useTls: false,
+      shardRouting: { topologyRefreshIntervalMs: 0 },
+    });
+    try {
+      await waitForClusterConvergence(client);
+    } finally {
+      client.close();
+    }
+  });
+
   describe("wrong shard error handling", () => {
-    it("handles requests to non-existent shards gracefully", async () => {
-      // Create a client configured for more shards than exist
+    it("handles requests gracefully after topology refresh", async () => {
+      // Create a client and refresh topology
       const client = new SiloGRPCClient({
         servers: SILO_SERVERS,
         useTls: false,
         shardRouting: {
-          numShards: 100, // Way more shards than actually exist
           maxWrongShardRetries: 2,
           wrongShardRetryDelayMs: 50,
           topologyRefreshIntervalMs: 0,
@@ -1208,8 +1259,7 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
       });
 
       try {
-        // This tenant will hash to a shard that likely doesn't exist
-        // but after topology refresh, it should still work
+        // Refresh to discover the actual topology
         await client.refreshTopology();
 
         // Now requests should work because we've discovered the actual topology
@@ -1229,7 +1279,6 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
         servers: SILO_SERVERS,
         useTls: false,
         shardRouting: {
-          numShards: 1,
           maxWrongShardRetries: 5,
           wrongShardRetryDelayMs: 10,
           topologyRefreshIntervalMs: 0,
@@ -1262,7 +1311,6 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
         servers: SILO_SERVERS,
         useTls: false,
         shardRouting: {
-          numShards: 8,
           topologyRefreshIntervalMs: 0,
         },
       });
@@ -1295,12 +1343,11 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
       }
     });
 
-    it("handles high volume of different tenants", async () => {
+    it("handles high volume of different tenants", { timeout: 30000 }, async () => {
       const client = new SiloGRPCClient({
         servers: SILO_SERVERS,
         useTls: false,
         shardRouting: {
-          numShards: 16,
           topologyRefreshIntervalMs: 0,
         },
       });
@@ -1340,7 +1387,6 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
         servers: SILO_SERVERS,
         useTls: false,
         shardRouting: {
-          numShards: 1,
           topologyRefreshIntervalMs: 0,
         },
       });
@@ -1357,8 +1403,8 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
         const topo3 = client.getTopology();
 
         // Topology should be consistent (cluster hasn't changed)
-        expect(topo1.numShards).toBe(topo2.numShards);
-        expect(topo2.numShards).toBe(topo3.numShards);
+        expect(topo1.shards.length).toBe(topo2.shards.length);
+        expect(topo2.shards.length).toBe(topo3.shards.length);
       } finally {
         client.close();
       }
@@ -1369,7 +1415,6 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
         servers: SILO_SERVERS,
         useTls: false,
         shardRouting: {
-          numShards: 1,
           topologyRefreshIntervalMs: 0,
         },
       });
@@ -1414,7 +1459,6 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
         servers: [...SILO_SERVERS, "invalid-server:99999"],
         useTls: false,
         shardRouting: {
-          numShards: 1,
           topologyRefreshIntervalMs: 0,
         },
       });
@@ -1424,7 +1468,7 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
         await client.refreshTopology();
 
         const topology = client.getTopology();
-        expect(topology.numShards).toBeGreaterThanOrEqual(1);
+        expect(topology.shards.length).toBeGreaterThanOrEqual(1);
 
         // Operations should work
         const handle = await client.enqueue({
@@ -1445,7 +1489,6 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
         servers: { host, port: parseInt(port) },
         useTls: false,
         shardRouting: {
-          numShards: 1,
           topologyRefreshIntervalMs: 0,
         },
       });

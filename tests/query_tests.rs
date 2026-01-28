@@ -1294,7 +1294,7 @@ async fn queues_table_exists() {
 
     // Should have the expected columns
     if !batches.is_empty() {
-        assert_eq!(batches[0].num_columns(), 7); // tenant, queue_name, entry_type, task_id, job_id, priority, timestamp_ms
+        assert_eq!(batches[0].num_columns(), 8); // shard_id, tenant, queue_name, entry_type, task_id, job_id, priority, timestamp_ms
     }
 }
 

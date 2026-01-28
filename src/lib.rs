@@ -15,6 +15,7 @@ pub mod metrics;
 pub mod query;
 pub mod retry;
 pub mod settings;
+pub mod shard_range;
 pub mod storage;
 pub mod task;
 pub mod task_broker;

@@ -2,8 +2,9 @@
 
 use crate::helpers::{
     AttemptStatus, EnqueueRequest, GetJobRequest, HashMap, JobStatus, LeaseTasksRequest,
-    SerializedBytes, ReportOutcomeRequest, get_seed, report_outcome_request, run_scenario_impl, serialized_bytes,
-    setup_server, turmoil, turmoil_connector, verify_server_invariants,
+    ReportOutcomeRequest, SerializedBytes, TEST_SHARD_ID, get_seed, report_outcome_request,
+    run_scenario_impl, serialized_bytes, setup_server, turmoil, turmoil_connector,
+    verify_server_invariants,
 };
 use silo::pb::silo_client::SiloClient;
 use std::time::Duration;
@@ -26,22 +27,28 @@ pub fn run() {
             let mut client = SiloClient::new(ch);
 
             // Verify initial server state
-            if let Ok(state) = verify_server_invariants(&mut client, 0).await {
+            if let Ok(state) = verify_server_invariants(&mut client, TEST_SHARD_ID).await {
                 tracing::trace!(result = ?state, "initial_server_state");
-                assert!(state.violations.is_empty(), "Initial server invariant violations: {:?}", state.violations);
+                assert!(
+                    state.violations.is_empty(),
+                    "Initial server invariant violations: {:?}",
+                    state.violations
+                );
             }
 
             // Enqueue before partition
             tracing::trace!(job_id = "partition-test", "enqueue");
             client
                 .enqueue(tonic::Request::new(EnqueueRequest {
-                    shard: 0,
+                    shard: TEST_SHARD_ID.to_string(),
                     id: "partition-test".into(),
                     priority: 1,
                     start_at_ms: 0,
                     retry_policy: None,
                     payload: Some(SerializedBytes {
-                        encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"test": "partition"})).unwrap())),
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(
+                            rmp_serde::to_vec(&serde_json::json!({"test": "partition"})).unwrap(),
+                        )),
                     }),
                     limits: vec![],
                     tenant: None,
@@ -51,13 +58,17 @@ pub fn run() {
                 .await?;
 
             // Verify server state after enqueue (before partition)
-            if let Ok(state) = verify_server_invariants(&mut client, 0).await {
+            if let Ok(state) = verify_server_invariants(&mut client, TEST_SHARD_ID).await {
                 tracing::trace!(
                     running = state.running_job_count,
                     terminal = state.terminal_job_count,
                     "server_state_before_partition"
                 );
-                assert!(state.violations.is_empty(), "Server invariant violations before partition: {:?}", state.violations);
+                assert!(
+                    state.violations.is_empty(),
+                    "Server invariant violations before partition: {:?}",
+                    state.violations
+                );
             }
 
             // Partition
@@ -80,7 +91,7 @@ pub fn run() {
 
             let lease = client
                 .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                    shard: Some(0),
+                    shard: Some(TEST_SHARD_ID.to_string()),
                     worker_id: "worker-1".into(),
                     max_tasks: 1,
                     task_group: "default".to_string(),
@@ -96,7 +107,7 @@ pub fn run() {
                 // INVARIANT: Lease implies job is Running with one running attempt
                 let job_resp = client
                     .get_job(tonic::Request::new(GetJobRequest {
-                        shard: 0,
+                        shard: TEST_SHARD_ID.to_string(),
                         id: task.job_id.clone(),
                         tenant: None,
                         include_attempts: true,
@@ -120,11 +131,13 @@ pub fn run() {
 
                 client
                     .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                        shard: 0,
+                        shard: TEST_SHARD_ID.to_string(),
                         task_id: task.id.clone(),
                         outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
-                            encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"result": "recovered"}))
-                                .unwrap())),
+                            encoding: Some(serialized_bytes::Encoding::Msgpack(
+                                rmp_serde::to_vec(&serde_json::json!({"result": "recovered"}))
+                                    .unwrap(),
+                            )),
                         })),
                     }))
                     .await?;
@@ -133,7 +146,7 @@ pub fn run() {
                 // INVARIANT: Completed job is terminal with no running attempts
                 let job_resp = client
                     .get_job(tonic::Request::new(GetJobRequest {
-                        shard: 0,
+                        shard: TEST_SHARD_ID.to_string(),
                         id: task.job_id.clone(),
                         tenant: None,
                         include_attempts: true,
@@ -166,16 +179,26 @@ pub fn run() {
                 );
 
                 // Verify server state after completion (post-partition recovery)
-                if let Ok(state) = verify_server_invariants(&mut client, 0).await {
+                if let Ok(state) = verify_server_invariants(&mut client, TEST_SHARD_ID).await {
                     tracing::trace!(
                         running = state.running_job_count,
                         terminal = state.terminal_job_count,
                         holders = ?state.holder_counts_by_queue,
                         "server_state_after_complete"
                     );
-                    assert!(state.violations.is_empty(), "Server invariant violations after complete: {:?}", state.violations);
-                    assert_eq!(state.running_job_count, 0, "No jobs should be running after completion");
-                    assert_eq!(state.terminal_job_count, 1, "One job should be terminal after completion");
+                    assert!(
+                        state.violations.is_empty(),
+                        "Server invariant violations after complete: {:?}",
+                        state.violations
+                    );
+                    assert_eq!(
+                        state.running_job_count, 0,
+                        "No jobs should be running after completion"
+                    );
+                    assert_eq!(
+                        state.terminal_job_count, 1,
+                        "One job should be terminal after completion"
+                    );
                 }
             }
 

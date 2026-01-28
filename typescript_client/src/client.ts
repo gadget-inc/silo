@@ -87,50 +87,70 @@ export class TaskNotFoundError extends Error {
 }
 
 /**
- * FNV-1a hash constants for 32-bit hash.
- * Using 32-bit for simplicity and JS number safety.
+ * Represents a shard with its range and server address.
+ * Shards own lexicographical ranges of tenant_ids.
  */
-const FNV_OFFSET_32 = 0x811c9dc5;
-const FNV_PRIME_32 = 0x01000193;
-
-/**
- * Compute FNV-1a 32-bit hash of a string.
- * This is a fast, simple hash function suitable for shard distribution.
- * @param str The string to hash
- * @returns A 32-bit unsigned integer hash
- */
-export function fnv1a32(str: string): number {
-  let hash = FNV_OFFSET_32;
-  for (let i = 0; i < str.length; i++) {
-    hash ^= str.charCodeAt(i);
-    // Multiply by prime, keeping 32-bit result using unsigned right shift
-    hash = Math.imul(hash, FNV_PRIME_32) >>> 0;
-  }
-  return hash >>> 0;
+export interface ShardInfoWithRange {
+  /** Unique shard identifier (UUID string) */
+  shardId: string;
+  /** Server address owning this shard */
+  serverAddr: string;
+  /** Inclusive start of the tenant_id range (empty string means no lower bound) */
+  rangeStart: string;
+  /** Exclusive end of the tenant_id range (empty string means no upper bound) */
+  rangeEnd: string;
 }
 
 /**
- * Default function to map a tenant ID to a shard ID.
- * Uses FNV-1a hash for fast, well-distributed results.
+ * Find the shard that owns a given tenant ID using range-based lookup.
+ * Shards should be sorted by rangeStart for efficient binary search.
  * @param tenantId The tenant identifier
- * @param numShards Total number of shards in the system
- * @returns The shard ID (0 to numShards-1)
+ * @param shards Array of shards sorted by rangeStart
+ * @returns The shard info, or undefined if no shard found
  */
-export function defaultTenantToShard(
+export function shardForTenant(
   tenantId: string,
-  numShards: number
-): number {
-  if (numShards <= 0) {
-    throw new Error("numShards must be positive");
+  shards: ShardInfoWithRange[]
+): ShardInfoWithRange | undefined {
+  if (shards.length === 0) {
+    return undefined;
   }
-  const hash = fnv1a32(tenantId);
-  return hash % numShards;
+
+  // Binary search to find the shard whose range contains the tenant
+  // We're looking for the last shard where rangeStart <= tenantId
+  let left = 0;
+  let right = shards.length - 1;
+  let result: ShardInfoWithRange | undefined = undefined;
+
+  while (left <= right) {
+    const mid = Math.floor((left + right) / 2);
+    const shard = shards[mid];
+
+    // Check if tenantId >= rangeStart (empty rangeStart means -infinity)
+    const afterStart = shard.rangeStart === "" || tenantId >= shard.rangeStart;
+
+    if (afterStart) {
+      // This shard's rangeStart is <= tenantId, could be a candidate
+      result = shard;
+      left = mid + 1; // Look for a shard with a later rangeStart
+    } else {
+      right = mid - 1; // rangeStart > tenantId, look earlier
+    }
+  }
+
+  // Verify the tenant is within the range (before rangeEnd)
+  if (result) {
+    const beforeEnd = result.rangeEnd === "" || tenantId < result.rangeEnd;
+    if (!beforeEnd) {
+      // The tenant is >= rangeEnd, so it's not in this shard's range
+      // This shouldn't happen if shards cover the full keyspace
+      return undefined;
+    }
+  }
+
+  return result;
 }
 
-/**
- * Function type for mapping tenant IDs to shard IDs.
- */
-export type TenantToShardFn = (tenantId: string, numShards: number) => number;
 
 /** gRPC metadata key for shard owner address on redirect */
 const SHARD_OWNER_ADDR_METADATA_KEY = "x-silo-shard-owner-addr";
@@ -139,18 +159,6 @@ const SHARD_OWNER_ADDR_METADATA_KEY = "x-silo-shard-owner-addr";
  * Configuration for shard routing in a multi-shard cluster.
  */
 export interface ShardRoutingConfig {
-  /**
-   * Total number of shards in the cluster.
-   * This is discovered automatically from the server but can be provided as a hint.
-   */
-  numShards?: number;
-
-  /**
-   * Custom function to map tenant IDs to shard IDs.
-   * If not provided, uses FNV-1a hash (see {@link defaultTenantToShard}).
-   */
-  tenantToShard?: TenantToShardFn;
-
   /**
    * Maximum number of retries when receiving a "wrong shard" error.
    * This can happen during cluster rebalancing.
@@ -530,10 +538,10 @@ export interface LeaseTasksOptions {
    */
   taskGroup: string;
   /**
-   * Optional shard filter. If specified, only leases from this shard.
+   * Optional shard ID (UUID) filter. If specified, only leases from this shard.
    * If not specified (the default), the server leases from all its shards.
    */
-  shard?: number;
+  shard?: string;
 }
 
 /** Outcome for reporting task success */
@@ -563,8 +571,8 @@ export type TaskOutcome<Result, > = SuccessOutcome<Result> | FailureOutcome | Ca
 export interface ReportOutcomeOptions<Result = unknown> {
   /** The task ID to report outcome for */
   taskId: string;
-  /** The shard the task came from (from Task.shard) */
-  shard: number;
+  /** The shard ID (UUID) the task came from (from Task.shard) */
+  shard: string;
   /** The outcome of the task */
   outcome: TaskOutcome<Result>;
 }
@@ -589,8 +597,8 @@ export interface RefreshTask {
   metadata: Record<string, string>;
   /** How long to heartbeat in ms */
   leaseMs: bigint;
-  /** Which shard this task came from (for reporting outcomes) */
-  shard: number;
+  /** Which shard ID (UUID) this task came from (for reporting outcomes) */
+  shard: string;
   /** Task group this task belongs to */
   taskGroup: string;
 }
@@ -617,8 +625,8 @@ export type RefreshOutcome = RefreshSuccessOutcome | RefreshFailureOutcome;
 export interface ReportRefreshOutcomeOptions {
   /** The refresh task ID to report outcome for */
   taskId: string;
-  /** The shard the task came from (from RefreshTask.shard) */
-  shard: number;
+  /** The shard ID (UUID) the task came from (from RefreshTask.shard) */
+  shard: string;
   /** The outcome of the refresh */
   outcome: RefreshOutcome;
 }
@@ -777,19 +785,16 @@ export class SiloGRPCClient {
   private readonly _grpcClientOptions: ClientOptions;
 
   /** @internal */
-  private readonly _tenantToShard: TenantToShardFn;
-
-  /** @internal */
   private readonly _maxWrongShardRetries: number;
 
   /** @internal */
   private readonly _wrongShardRetryDelayMs: number;
 
-  /** @internal Shard ID → server address */
-  private _shardToServer: Map<number, string> = new Map();
+  /** @internal Shard ID (string UUID) → server address */
+  private _shardToServer: Map<string, string> = new Map();
 
-  /** @internal */
-  private _numShards: number = 0;
+  /** @internal Array of shards sorted by rangeStart for efficient lookup */
+  private _shards: ShardInfoWithRange[] = [];
 
   /** @internal */
   private _topologyRefreshInterval: ReturnType<typeof setInterval> | null =
@@ -866,16 +871,12 @@ export class SiloGRPCClient {
         : () => options.rpcOptions as RpcOptions | undefined;
 
     // Shard routing configuration
-    this._tenantToShard =
-      options.shardRouting?.tenantToShard ?? defaultTenantToShard;
+    
     this._maxWrongShardRetries =
       options.shardRouting?.maxWrongShardRetries ?? 5;
     this._wrongShardRetryDelayMs =
       options.shardRouting?.wrongShardRetryDelayMs ?? 100;
-
-    if (options.shardRouting?.numShards) {
-      this._numShards = options.shardRouting.numShards;
-    }
+      
 
     // Parse initial servers
     this._initialServers = this._parseServers(options.servers);
@@ -939,24 +940,30 @@ export class SiloGRPCClient {
   }
 
   /**
-   * Compute the shard ID from tenant.
+   * Resolve the shard ID (string UUID) from tenant using range-based lookup.
    * @internal
    */
-  private _resolveShard(tenant: string | undefined): number {
+  private _resolveShard(tenant: string | undefined): string {
     const tenantId = tenant ?? DEFAULT_TENANT;
-    if (this._numShards <= 0) {
+    if (this._shards.length === 0) {
       throw new Error(
         "Cluster topology not discovered yet. Call refreshTopology() first."
       );
     }
-    return this._tenantToShard(tenantId, this._numShards);
+    const shardInfo = shardForTenant(tenantId, this._shards);
+    if (!shardInfo) {
+      throw new Error(
+        `No shard found for tenant "${tenantId}". This indicates a topology error.`
+      );
+    }
+    return shardInfo.shardId;
   }
 
   /**
    * Get the client for a specific shard.
    * @internal
    */
-  private _getClientForShard(shardId: number): SiloClient {
+  private _getClientForShard(shardId: string): SiloClient {
     const serverAddr = this._shardToServer.get(shardId);
     if (serverAddr) {
       const conn = this._connections.get(serverAddr);
@@ -1003,7 +1010,7 @@ export class SiloGRPCClient {
    */
   private _getClientForTenant(tenant: string | undefined): {
     client: SiloClient;
-    shard: number;
+    shard: string;
   } {
     const shardId = this._resolveShard(tenant);
     return {
@@ -1018,7 +1025,7 @@ export class SiloGRPCClient {
    */
   private async _withWrongShardRetry<T>(
     tenant: string | undefined,
-    operation: (client: SiloClient, shard: number) => Promise<T>
+    operation: (client: SiloClient, shard: string) => Promise<T>
   ): Promise<T> {
     let lastError: unknown;
     let delay = this._wrongShardRetryDelayMs;
@@ -1060,7 +1067,7 @@ export class SiloGRPCClient {
 
   /**
    * Refresh the cluster topology by calling GetClusterInfo.
-   * This updates the shard → server mapping.
+   * This updates the shard → server mapping and range info.
    */
   public async refreshTopology(): Promise<void> {
     // Try each known server until one responds
@@ -1075,15 +1082,30 @@ export class SiloGRPCClient {
         const call = conn.client.getClusterInfo({}, this._rpcOptions());
         const response = await call.response;
 
-        this._numShards = response.numShards;
-
-        // Update shard → server mapping
+        // Update shard → server mapping and build shards array
+        // Skip shards without a valid address (cluster may not have fully converged)
         this._shardToServer.clear();
+        const shards: ShardInfoWithRange[] = [];
         for (const owner of response.shardOwners) {
+          // Skip shards that don't have an owner yet (empty grpcAddr)
+          // This can happen during cluster startup before all shards are acquired
+          if (!owner.grpcAddr) {
+            continue;
+          }
           this._shardToServer.set(owner.shardId, owner.grpcAddr);
+          shards.push({
+            shardId: owner.shardId,
+            serverAddr: owner.grpcAddr,
+            rangeStart: owner.rangeStart,
+            rangeEnd: owner.rangeEnd,
+          });
           // Ensure we have a connection to this server
           this._getOrCreateConnection(owner.grpcAddr);
         }
+
+        // Sort shards by rangeStart for efficient binary search lookup
+        shards.sort((a, b) => a.rangeStart.localeCompare(b.rangeStart));
+        this._shards = shards;
 
         return; // Success
       } catch {
@@ -1608,7 +1630,7 @@ export class SiloGRPCClient {
   public async heartbeat(
     workerId: string,
     taskId: string,
-    shard: number
+    shard: string
   ): Promise<HeartbeatResult> {
     try {
       const client = this._getClientForShard(shard);
@@ -1655,26 +1677,26 @@ export class SiloGRPCClient {
   }
 
   /**
-   * Compute the shard ID for a given tenant.
+   * Compute the shard ID for a given tenant using range-based lookup.
    * Useful for debugging or when you need to know which shard a tenant maps to.
    * @param tenant The tenant ID
-   * @returns The shard ID
+   * @returns The shard ID (UUID string) or undefined if no shard found
    */
-  public getShardForTenant(tenant: string): number {
+  public getShardForTenant(tenant: string): string {
     return this._resolveShard(tenant);
   }
 
   /**
    * Get the current cluster topology.
-   * @returns Map of shard ID to server address
+   * @returns Information about shards including their ranges
    */
   public getTopology(): {
-    numShards: number;
-    shardToServer: Map<number, string>;
+    shardToServer: Map<string, string>;
+    shards: ShardInfoWithRange[];
   } {
     return {
-      numShards: this._numShards,
       shardToServer: new Map(this._shardToServer),
+      shards: [...this._shards],
     };
   }
 

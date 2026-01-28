@@ -7,105 +7,12 @@ import {
   TaskNotFoundError,
   encodeBytes,
   decodeBytes,
-  fnv1a32,
-  defaultTenantToShard,
   type EnqueueJobOptions,
   type SiloGRPCClientOptions,
   type AwaitJobOptions,
   type JobResult,
 } from "../src/client";
 import { JobHandle } from "../src/JobHandle";
-
-describe("fnv1a32", () => {
-  it("returns consistent hash for same input", () => {
-    const hash1 = fnv1a32("tenant-123");
-    const hash2 = fnv1a32("tenant-123");
-    expect(hash1).toBe(hash2);
-  });
-
-  it("returns different hashes for different inputs", () => {
-    const hash1 = fnv1a32("tenant-123");
-    const hash2 = fnv1a32("tenant-456");
-    expect(hash1).not.toBe(hash2);
-  });
-
-  it("returns a 32-bit unsigned integer", () => {
-    const hash = fnv1a32("test-string");
-    expect(hash).toBeGreaterThanOrEqual(0);
-    expect(hash).toBeLessThanOrEqual(0xffffffff);
-  });
-
-  it("handles empty string", () => {
-    const hash = fnv1a32("");
-    expect(hash).toBe(0x811c9dc5); // FNV offset basis
-  });
-
-  it("handles unicode characters", () => {
-    const hash = fnv1a32("テスト");
-    expect(hash).toBeGreaterThanOrEqual(0);
-    expect(hash).toBeLessThanOrEqual(0xffffffff);
-  });
-
-  it("produces well-distributed hashes", () => {
-    // Test that hashes distribute somewhat evenly
-    const buckets = new Map<number, number>();
-    const numBuckets = 16;
-    for (let i = 0; i < 1000; i++) {
-      const hash = fnv1a32(`tenant-${i}`);
-      const bucket = hash % numBuckets;
-      buckets.set(bucket, (buckets.get(bucket) ?? 0) + 1);
-    }
-    // Each bucket should have roughly 1000/16 = 62.5 entries
-    // Allow significant variance but ensure all buckets are used
-    for (let i = 0; i < numBuckets; i++) {
-      expect(buckets.get(i)).toBeGreaterThan(20);
-      expect(buckets.get(i)).toBeLessThan(150);
-    }
-  });
-});
-
-describe("defaultTenantToShard", () => {
-  it("returns a shard ID between 0 and numShards-1", () => {
-    const shardId = defaultTenantToShard("tenant-123", 16);
-    expect(shardId).toBeGreaterThanOrEqual(0);
-    expect(shardId).toBeLessThan(16);
-  });
-
-  it("returns consistent shard for same tenant", () => {
-    const shard1 = defaultTenantToShard("tenant-abc", 10);
-    const shard2 = defaultTenantToShard("tenant-abc", 10);
-    expect(shard1).toBe(shard2);
-  });
-
-  it("returns different shards for different tenants (usually)", () => {
-    // Test multiple tenants - not all will be different but most should be
-    const shards = new Set<number>();
-    for (let i = 0; i < 100; i++) {
-      shards.add(defaultTenantToShard(`tenant-${i}`, 10));
-    }
-    // With 100 tenants and 10 shards, we should see most shards used
-    expect(shards.size).toBeGreaterThanOrEqual(8);
-  });
-
-  it("throws for zero numShards", () => {
-    expect(() => defaultTenantToShard("tenant", 0)).toThrow(
-      "numShards must be positive"
-    );
-  });
-
-  it("throws for negative numShards", () => {
-    expect(() => defaultTenantToShard("tenant", -1)).toThrow(
-      "numShards must be positive"
-    );
-  });
-
-  it("handles single shard", () => {
-    // With only one shard, all tenants should map to shard 0
-    expect(defaultTenantToShard("tenant-a", 1)).toBe(0);
-    expect(defaultTenantToShard("tenant-b", 1)).toBe(0);
-    expect(defaultTenantToShard("anything", 1)).toBe(0);
-  });
-});
 
 describe("encodeBytes", () => {
   it("encodes a string as msgpack bytes", () => {
@@ -195,7 +102,6 @@ describe("SiloGRPCClient", () => {
   const defaultOptions = {
     useTls: false,
     shardRouting: {
-      numShards: 16,
       topologyRefreshIntervalMs: 0, // Disable auto-refresh in tests
     },
   };
@@ -362,57 +268,19 @@ describe("SiloGRPCClient", () => {
   });
 
   describe("shard routing", () => {
-    describe("getShardForTenant", () => {
-      it("returns the computed shard for a tenant", () => {
-        const client = createClient({
-          servers: "localhost:50051",
-          useTls: false,
-          shardRouting: {
-            numShards: 16,
-            topologyRefreshIntervalMs: 0,
-          },
-        });
-
-        const shard = client.getShardForTenant("tenant-123");
-        expect(shard).toBeGreaterThanOrEqual(0);
-        expect(shard).toBeLessThan(16);
-
-        // Should be consistent
-        expect(client.getShardForTenant("tenant-123")).toBe(shard);
-      });
-
-      it("uses custom tenantToShard function", () => {
-        const customFn = vi.fn((_tenant: string, _numShards: number) => 7);
-        const client = createClient({
-          servers: "localhost:50051",
-          useTls: false,
-          shardRouting: {
-            numShards: 16,
-            tenantToShard: customFn,
-            topologyRefreshIntervalMs: 0,
-          },
-        });
-
-        const shard = client.getShardForTenant("any-tenant");
-        expect(shard).toBe(7);
-        expect(customFn).toHaveBeenCalledWith("any-tenant", 16);
-      });
-    });
-
     describe("getTopology", () => {
       it("returns the current topology", () => {
         const client = createClient({
           servers: "localhost:50051",
           useTls: false,
           shardRouting: {
-            numShards: 16,
             topologyRefreshIntervalMs: 0,
           },
         });
 
         const topology = client.getTopology();
-        expect(topology.numShards).toBe(16);
         expect(topology.shardToServer).toBeInstanceOf(Map);
+        expect(topology.shards).toBeInstanceOf(Array);
       });
     });
 

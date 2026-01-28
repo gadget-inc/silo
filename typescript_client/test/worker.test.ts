@@ -32,7 +32,7 @@ function tasksResult(tasks: Task[]): LeaseTasksResult {
   return { tasks, refreshTasks: [] };
 }
 
-function createTask(id: string, jobId: string, shard: number = 0): Task {
+function createTask(id: string, jobId: string, shard: string = "00000000-0000-0000-0000-000000000001"): Task {
   return {
     id,
     jobId,
@@ -238,9 +238,8 @@ describe("SiloWorker", () => {
 
       expect(reportOutcome).toHaveBeenCalledWith({
         taskId: "task-1",
-        tenant: undefined,
         outcome: { type: "success", result: { processed: true } },
-        shard: 0,
+        shard: "00000000-0000-0000-0000-000000000001",
       });
     });
 
@@ -273,13 +272,12 @@ describe("SiloWorker", () => {
 
       expect(reportOutcome).toHaveBeenCalledWith({
         taskId: "task-2",
-        tenant: undefined,
         outcome: {
           type: "failure",
           code: "VALIDATION_ERROR",
           data: { field: "email" },
         },
-        shard: 0,
+        shard: "00000000-0000-0000-0000-000000000001",
       });
     });
 
@@ -311,7 +309,6 @@ describe("SiloWorker", () => {
 
       expect(reportOutcome).toHaveBeenCalledWith({
         taskId: "task-3",
-        tenant: undefined,
         outcome: {
           type: "failure",
           code: "HANDLER_ERROR",
@@ -319,7 +316,7 @@ describe("SiloWorker", () => {
             message: "Something went wrong",
           }),
         },
-        shard: 0,
+        shard: "00000000-0000-0000-0000-000000000001",
       });
     });
 
@@ -450,7 +447,7 @@ describe("SiloWorker", () => {
 
       // Should have sent multiple heartbeats
       // heartbeat(workerId, taskId, shard)
-      expect(heartbeat).toHaveBeenCalledWith("test-worker", "task-hb", 0);
+      expect(heartbeat).toHaveBeenCalledWith("test-worker", "task-hb", "00000000-0000-0000-0000-000000000001");
       expect(heartbeat.mock.calls.length).toBeGreaterThanOrEqual(2);
     });
 

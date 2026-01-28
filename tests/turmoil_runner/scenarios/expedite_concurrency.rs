@@ -22,8 +22,8 @@
 
 use crate::helpers::{
     ConcurrencyLimit, EnqueueRequest, GetJobRequest, HashMap, JobStatus, LeaseTasksRequest, Limit,
-    SerializedBytes, ReportOutcomeRequest, check_holder_limits, get_seed, limit, serialized_bytes,
-    report_outcome_request, run_scenario_impl, setup_server, turmoil_connector,
+    ReportOutcomeRequest, SerializedBytes, TEST_SHARD_ID, check_holder_limits, get_seed, limit,
+    report_outcome_request, run_scenario_impl, serialized_bytes, setup_server, turmoil_connector,
     verify_server_invariants,
 };
 use silo::pb::silo_client::SiloClient;
@@ -64,13 +64,15 @@ pub fn run() {
             tracing::trace!(job_id = "job-A", priority = 10, "enqueue");
             client
                 .enqueue(tonic::Request::new(EnqueueRequest {
-                    shard: 0,
+                    shard: TEST_SHARD_ID.to_string(),
                     id: "job-A".into(),
                     priority: 10, // Highest priority
                     start_at_ms: 0,
                     retry_policy: None,
                     payload: Some(SerializedBytes {
-                        encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"job": "A"})).unwrap())),
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(
+                            rmp_serde::to_vec(&serde_json::json!({"job": "A"})).unwrap(),
+                        )),
                     }),
                     limits: vec![Limit {
                         limit: Some(limit::Limit::Concurrency(ConcurrencyLimit {
@@ -90,13 +92,15 @@ pub fn run() {
             tracing::trace!(job_id = "job-B", priority = 20, "enqueue");
             client
                 .enqueue(tonic::Request::new(EnqueueRequest {
-                    shard: 0,
+                    shard: TEST_SHARD_ID.to_string(),
                     id: "job-B".into(),
                     priority: 20,
                     start_at_ms: 0,
                     retry_policy: None,
                     payload: Some(SerializedBytes {
-                        encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"job": "B"})).unwrap())),
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(
+                            rmp_serde::to_vec(&serde_json::json!({"job": "B"})).unwrap(),
+                        )),
                     }),
                     limits: vec![Limit {
                         limit: Some(limit::Limit::Concurrency(ConcurrencyLimit {
@@ -116,13 +120,15 @@ pub fn run() {
             tracing::trace!(job_id = "job-C", priority = 30, "enqueue");
             client
                 .enqueue(tonic::Request::new(EnqueueRequest {
-                    shard: 0,
+                    shard: TEST_SHARD_ID.to_string(),
                     id: "job-C".into(),
                     priority: 30, // Lowest priority
                     start_at_ms: 0,
                     retry_policy: None,
                     payload: Some(SerializedBytes {
-                        encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"job": "C"})).unwrap())),
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(
+                            rmp_serde::to_vec(&serde_json::json!({"job": "C"})).unwrap(),
+                        )),
                     }),
                     limits: vec![Limit {
                         limit: Some(limit::Limit::Concurrency(ConcurrencyLimit {
@@ -142,13 +148,15 @@ pub fn run() {
             tracing::trace!(job_id = "job-D", priority = 40, "enqueue");
             client
                 .enqueue(tonic::Request::new(EnqueueRequest {
-                    shard: 0,
+                    shard: TEST_SHARD_ID.to_string(),
                     id: "job-D".into(),
                     priority: 40,
                     start_at_ms: 0,
                     retry_policy: None,
                     payload: Some(SerializedBytes {
-                        encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!({"job": "D"})).unwrap())),
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(
+                            rmp_serde::to_vec(&serde_json::json!({"job": "D"})).unwrap(),
+                        )),
                     }),
                     limits: vec![Limit {
                         limit: Some(limit::Limit::Concurrency(ConcurrencyLimit {
@@ -183,7 +191,7 @@ pub fn run() {
             tracing::trace!(job_id = "job-D", "cancelling");
             let _ = client
                 .cancel_job(tonic::Request::new(CancelJobRequest {
-                    shard: 0,
+                    shard: TEST_SHARD_ID.to_string(),
                     id: "job-D".into(),
                     tenant: None,
                 }))
@@ -193,7 +201,7 @@ pub fn run() {
             tracing::trace!(job_id = "job-D", "expediting_cancelled_job");
             match client
                 .expedite_job(tonic::Request::new(ExpediteJobRequest {
-                    shard: 0,
+                    shard: TEST_SHARD_ID.to_string(),
                     id: "job-D".into(),
                     tenant: None,
                 }))
@@ -215,7 +223,7 @@ pub fn run() {
             // Verify job C is still Scheduled before expedite
             let job_c_before = client
                 .get_job(tonic::Request::new(GetJobRequest {
-                    shard: 0,
+                    shard: TEST_SHARD_ID.to_string(),
                     id: "job-C".into(),
                     tenant: None,
                     include_attempts: false,
@@ -237,7 +245,7 @@ pub fn run() {
                 tracing::trace!(job_id = "job-C", "expediting");
                 match client
                     .expedite_job(tonic::Request::new(ExpediteJobRequest {
-                        shard: 0,
+                        shard: TEST_SHARD_ID.to_string(),
                         id: "job-C".into(),
                         tenant: None,
                     }))
@@ -263,7 +271,7 @@ pub fn run() {
             // Verify job C is still Scheduled after expedite (expeditePreservesStatus)
             let job_c_after = client
                 .get_job(tonic::Request::new(GetJobRequest {
-                    shard: 0,
+                    shard: TEST_SHARD_ID.to_string(),
                     id: "job-C".into(),
                     tenant: None,
                     include_attempts: false,
@@ -308,7 +316,7 @@ pub fn run() {
             for _round in 0..60 {
                 let lease = client
                     .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                        shard: Some(0),
+                        shard: Some(TEST_SHARD_ID.to_string()),
                         worker_id: "worker-1".into(),
                         max_tasks: 1,
                         task_group: "default".to_string(),
@@ -340,11 +348,15 @@ pub fn run() {
                     // Complete the task
                     match client
                         .report_outcome(tonic::Request::new(ReportOutcomeRequest {
-                            shard: 0,
+                            shard: TEST_SHARD_ID.to_string(),
                             task_id: task.id.clone(),
-                            outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
-                                encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!("done")).unwrap())),
-                            })),
+                            outcome: Some(report_outcome_request::Outcome::Success(
+                                SerializedBytes {
+                                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                                        rmp_serde::to_vec(&serde_json::json!("done")).unwrap(),
+                                    )),
+                                },
+                            )),
                         }))
                         .await
                     {
@@ -407,7 +419,7 @@ pub fn run() {
             let mut client = SiloClient::new(ch);
 
             // Verify server state
-            if let Ok(state) = verify_server_invariants(&mut client, 0).await {
+            if let Ok(state) = verify_server_invariants(&mut client, TEST_SHARD_ID).await {
                 assert!(
                     state.violations.is_empty(),
                     "Server invariant violations: {:?}",

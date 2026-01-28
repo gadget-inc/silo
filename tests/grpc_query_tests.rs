@@ -18,7 +18,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
             md.insert("env".to_string(), "test".to_string());
             md.insert("batch".to_string(), "batch1".to_string());
             let enq = EnqueueRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: format!("job{}", i),
                 priority: (10 + i) as u32,
                 start_at_ms: 0,
@@ -37,7 +37,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
         // Test 1: Basic SELECT query
         let query_resp = client
             .query(QueryRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: "SELECT * FROM jobs".to_string(),
                 tenant: None,
             })
@@ -65,7 +65,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
         // Test 2: Query with WHERE clause
         let query_resp = client
             .query(QueryRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: "SELECT id FROM jobs WHERE priority >= 10".to_string(),
                 tenant: None,
             })
@@ -80,7 +80,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
         // Test 3: Aggregation query
         let query_resp = client
             .query(QueryRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
                 tenant: None,
             })
@@ -113,7 +113,7 @@ async fn grpc_server_query_errors() -> anyhow::Result<()> {
         // Test 1: SQL syntax error
         let res = client
             .query(QueryRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: "SELECT FROM WHERE".to_string(),
                 tenant: None,
             })
@@ -134,7 +134,7 @@ async fn grpc_server_query_errors() -> anyhow::Result<()> {
         // Test 2: Invalid column name
         let res = client
             .query(QueryRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: "SELECT nonexistent_column FROM jobs".to_string(),
                 tenant: None,
             })
@@ -147,10 +147,10 @@ async fn grpc_server_query_errors() -> anyhow::Result<()> {
             }
         }
 
-        // Test 3: Shard not found
+        // Test 3: Shard not found (use a valid UUID that doesn't exist)
         let res = client
             .query(QueryRequest {
-                shard: 999,
+                shard: "99999999-9999-9999-9999-999999999999".to_string(),
                 sql: "SELECT * FROM jobs".to_string(),
                 tenant: None,
             })
@@ -181,7 +181,7 @@ async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
         // Query on empty shard
         let query_resp = client
             .query(QueryRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: "SELECT * FROM jobs".to_string(),
                 tenant: None,
             })
@@ -195,7 +195,7 @@ async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
         // Add a job, then query with WHERE that matches nothing
         let payload_bytes = rmp_serde::to_vec(&serde_json::json!({ "test": "data" })).unwrap();
         let enq = EnqueueRequest {
-            shard: 0,
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
             id: "test_job".to_string(),
             priority: 10,
             start_at_ms: 0,
@@ -213,7 +213,7 @@ async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
         // Query that doesn't match
         let query_resp = client
             .query(QueryRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: "SELECT * FROM jobs WHERE id = 'nonexistent'".to_string(),
                 tenant: None,
             })
@@ -252,7 +252,7 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
         md.insert("region".to_string(), "us-west".to_string());
 
         let enq = EnqueueRequest {
-            shard: 0,
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
             id: "complex_job".to_string(),
             priority: 5,
             start_at_ms: 1234567890,
@@ -270,7 +270,7 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
         // Query with multiple columns to verify schema
         let query_resp = client
             .query(QueryRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: "SELECT id, priority, enqueue_time_ms, payload FROM jobs".to_string(),
                 tenant: None,
             })
@@ -333,7 +333,7 @@ async fn grpc_server_query_without_tenant() -> anyhow::Result<()> {
         let empty_payload = rmp_serde::to_vec(&serde_json::json!({})).unwrap();
         for i in 0..3 {
             let enq = EnqueueRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: format!("job{}", i),
                 priority: 10,
                 start_at_ms: 0,
@@ -352,7 +352,7 @@ async fn grpc_server_query_without_tenant() -> anyhow::Result<()> {
         // Query without specifying tenant - should work and return all jobs
         let query_resp = client
             .query(QueryRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: "SELECT id FROM jobs ORDER BY id".to_string(),
                 tenant: None, // No tenant required for query
             })
@@ -368,7 +368,7 @@ async fn grpc_server_query_without_tenant() -> anyhow::Result<()> {
         // Can also query with SQL tenant filter
         let query_resp = client
             .query(QueryRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: "SELECT id FROM jobs WHERE tenant = '-' ORDER BY id".to_string(),
                 tenant: None,
             })
@@ -402,7 +402,7 @@ async fn grpc_server_query_msgpack_data_types() -> anyhow::Result<()> {
             let payload_bytes =
                 rmp_serde::to_vec(&serde_json::json!({ "value": i * 100 })).unwrap();
             let enq = EnqueueRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: format!("type_test_{}", i),
                 priority: (i * 50) as u32,                   // 0, 50, 100
                 start_at_ms: 1000000000 + (i as i64 * 1000), // Different timestamps
@@ -424,7 +424,7 @@ async fn grpc_server_query_msgpack_data_types() -> anyhow::Result<()> {
         //          status_changed_at_ms (Int64), metadata (Map)
         let query_resp = client
             .query(QueryRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: r#"
                     SELECT 
                         id,
@@ -461,7 +461,10 @@ async fn grpc_server_query_msgpack_data_types() -> anyhow::Result<()> {
 
         // Row 0: priority=0, enqueue_time_ms=1000000000
         assert_eq!(rows[0]["id"], "type_test_0");
-        assert_eq!(rows[0]["shard_id"], 0); // UInt32
+        assert_eq!(
+            rows[0]["shard_id"],
+            crate::grpc_integration_helpers::TEST_SHARD_ID
+        ); // String (UUID)
         assert_eq!(rows[0]["priority"], 0); // UInt8
         assert_eq!(rows[0]["enqueue_time_ms"], 1000000000_i64); // Int64
         assert_eq!(rows[0]["is_high_priority"], false); // Boolean false
@@ -485,7 +488,7 @@ async fn grpc_server_query_msgpack_data_types() -> anyhow::Result<()> {
         // Test aggregation with different result types
         let agg_resp = client
             .query(QueryRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: r#"
                     SELECT 
                         COUNT(*) as count_val,
@@ -536,7 +539,7 @@ async fn grpc_server_query_arrow_without_tenant() -> anyhow::Result<()> {
         let empty_payload = rmp_serde::to_vec(&serde_json::json!({})).unwrap();
         for i in 0..2 {
             let enq = EnqueueRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: format!("arrow_job{}", i),
                 priority: 10,
                 start_at_ms: 0,
@@ -555,7 +558,7 @@ async fn grpc_server_query_arrow_without_tenant() -> anyhow::Result<()> {
         // Use QueryArrow without tenant parameter
         let response = client
             .query_arrow(QueryArrowRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: "SELECT id FROM jobs ORDER BY id".to_string(),
                 tenant: None, // No tenant required
             })

@@ -90,7 +90,7 @@ async fn siloctl_job_get() -> anyhow::Result<()> {
         // Enqueue a job via gRPC
         let _ = client
             .enqueue(EnqueueRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "siloctl-test-job".to_string(),
                 priority: 50,
                 start_at_ms: 0,
@@ -112,7 +112,14 @@ async fn siloctl_job_get() -> anyhow::Result<()> {
         // Test job get command
         let opts = opts_for_addr(&addr);
         let mut output = Vec::new();
-        siloctl::job_get(&opts, &mut output, 0, "siloctl-test-job", false).await?;
+        siloctl::job_get(
+            &opts,
+            &mut output,
+            crate::grpc_integration_helpers::TEST_SHARD_ID,
+            "siloctl-test-job",
+            false,
+        )
+        .await?;
         let stdout = String::from_utf8(output)?;
 
         assert!(
@@ -139,7 +146,14 @@ async fn siloctl_job_get() -> anyhow::Result<()> {
         // Test JSON output
         let opts_json = opts_for_addr_json(&addr);
         let mut json_output = Vec::new();
-        siloctl::job_get(&opts_json, &mut json_output, 0, "siloctl-test-job", false).await?;
+        siloctl::job_get(
+            &opts_json,
+            &mut json_output,
+            crate::grpc_integration_helpers::TEST_SHARD_ID,
+            "siloctl-test-job",
+            false,
+        )
+        .await?;
         let json_stdout = String::from_utf8(json_output)?;
 
         let parsed: serde_json::Value = serde_json::from_str(&json_stdout)
@@ -166,7 +180,14 @@ async fn siloctl_job_get_not_found() -> anyhow::Result<()> {
         // Test job get for non-existent job
         let opts = opts_for_addr(&addr);
         let mut output = Vec::new();
-        let result = siloctl::job_get(&opts, &mut output, 0, "nonexistent-job", false).await;
+        let result = siloctl::job_get(
+            &opts,
+            &mut output,
+            crate::grpc_integration_helpers::TEST_SHARD_ID,
+            "nonexistent-job",
+            false,
+        )
+        .await;
 
         assert!(result.is_err(), "should fail for nonexistent job");
         let err = result.unwrap_err();
@@ -201,7 +222,7 @@ async fn siloctl_job_cancel() -> anyhow::Result<()> {
 
         let _ = client
             .enqueue(EnqueueRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "cancel-test-job".to_string(),
                 priority: 50,
                 start_at_ms: future_ms,
@@ -221,7 +242,13 @@ async fn siloctl_job_cancel() -> anyhow::Result<()> {
         // Cancel via siloctl
         let opts = opts_for_addr(&addr);
         let mut output = Vec::new();
-        siloctl::job_cancel(&opts, &mut output, 0, "cancel-test-job").await?;
+        siloctl::job_cancel(
+            &opts,
+            &mut output,
+            crate::grpc_integration_helpers::TEST_SHARD_ID,
+            "cancel-test-job",
+        )
+        .await?;
         let stdout = String::from_utf8(output)?;
 
         assert!(
@@ -233,7 +260,7 @@ async fn siloctl_job_cancel() -> anyhow::Result<()> {
         // Verify job is cancelled via gRPC
         let job = client
             .get_job(GetJobRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "cancel-test-job".to_string(),
                 tenant: None,
                 include_attempts: false,
@@ -266,7 +293,7 @@ async fn siloctl_job_restart() -> anyhow::Result<()> {
 
         let _ = client
             .enqueue(EnqueueRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "restart-test-job".to_string(),
                 priority: 50,
                 start_at_ms: future_ms,
@@ -285,7 +312,7 @@ async fn siloctl_job_restart() -> anyhow::Result<()> {
 
         let _ = client
             .cancel_job(CancelJobRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "restart-test-job".to_string(),
                 tenant: None,
             })
@@ -294,7 +321,13 @@ async fn siloctl_job_restart() -> anyhow::Result<()> {
         // Restart via siloctl
         let opts = opts_for_addr(&addr);
         let mut output = Vec::new();
-        siloctl::job_restart(&opts, &mut output, 0, "restart-test-job").await?;
+        siloctl::job_restart(
+            &opts,
+            &mut output,
+            crate::grpc_integration_helpers::TEST_SHARD_ID,
+            "restart-test-job",
+        )
+        .await?;
         let stdout = String::from_utf8(output)?;
 
         assert!(
@@ -306,7 +339,7 @@ async fn siloctl_job_restart() -> anyhow::Result<()> {
         // Verify job is scheduled again via gRPC
         let job = client
             .get_job(GetJobRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "restart-test-job".to_string(),
                 tenant: None,
                 include_attempts: false,
@@ -339,7 +372,7 @@ async fn siloctl_job_expedite() -> anyhow::Result<()> {
 
         let _ = client
             .enqueue(EnqueueRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "expedite-test-job".to_string(),
                 priority: 50,
                 start_at_ms: future_ms,
@@ -359,7 +392,7 @@ async fn siloctl_job_expedite() -> anyhow::Result<()> {
         // Verify job is scheduled in the future before expediting
         let job_before = client
             .get_job(GetJobRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "expedite-test-job".to_string(),
                 tenant: None,
                 include_attempts: false,
@@ -376,7 +409,13 @@ async fn siloctl_job_expedite() -> anyhow::Result<()> {
         // Expedite via siloctl - main test is that this succeeds without error
         let opts = opts_for_addr(&addr);
         let mut output = Vec::new();
-        siloctl::job_expedite(&opts, &mut output, 0, "expedite-test-job").await?;
+        siloctl::job_expedite(
+            &opts,
+            &mut output,
+            crate::grpc_integration_helpers::TEST_SHARD_ID,
+            "expedite-test-job",
+        )
+        .await?;
         let stdout = String::from_utf8(output)?;
 
         assert!(
@@ -388,7 +427,7 @@ async fn siloctl_job_expedite() -> anyhow::Result<()> {
         // Verify job still exists and is still scheduled (not cancelled/failed)
         let job_after = client
             .get_job(GetJobRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "expedite-test-job".to_string(),
                 tenant: None,
                 include_attempts: false,
@@ -426,7 +465,7 @@ async fn siloctl_job_delete() -> anyhow::Result<()> {
 
         let _ = client
             .enqueue(EnqueueRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "delete-test-job".to_string(),
                 priority: 50,
                 start_at_ms: future_ms,
@@ -446,7 +485,7 @@ async fn siloctl_job_delete() -> anyhow::Result<()> {
         // Cancel the job first (required before delete for non-terminal jobs)
         let _ = client
             .cancel_job(CancelJobRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "delete-test-job".to_string(),
                 tenant: None,
             })
@@ -455,7 +494,13 @@ async fn siloctl_job_delete() -> anyhow::Result<()> {
         // Delete via siloctl
         let opts = opts_for_addr(&addr);
         let mut output = Vec::new();
-        siloctl::job_delete(&opts, &mut output, 0, "delete-test-job").await?;
+        siloctl::job_delete(
+            &opts,
+            &mut output,
+            crate::grpc_integration_helpers::TEST_SHARD_ID,
+            "delete-test-job",
+        )
+        .await?;
         let stdout = String::from_utf8(output)?;
 
         assert!(
@@ -467,7 +512,7 @@ async fn siloctl_job_delete() -> anyhow::Result<()> {
         // Verify job is gone via gRPC
         let result = client
             .get_job(GetJobRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "delete-test-job".to_string(),
                 tenant: None,
                 include_attempts: false,
@@ -500,7 +545,7 @@ async fn siloctl_query() -> anyhow::Result<()> {
         for i in 0..3 {
             let _ = client
                 .enqueue(EnqueueRequest {
-                    shard: 0,
+                    shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                     id: format!("query-test-job-{}", i),
                     priority: 50,
                     start_at_ms: future_ms,
@@ -521,7 +566,13 @@ async fn siloctl_query() -> anyhow::Result<()> {
         // Query via siloctl
         let opts = opts_for_addr(&addr);
         let mut output = Vec::new();
-        siloctl::query(&opts, &mut output, 0, "SELECT id FROM jobs LIMIT 10").await?;
+        siloctl::query(
+            &opts,
+            &mut output,
+            crate::grpc_integration_helpers::TEST_SHARD_ID,
+            "SELECT id FROM jobs LIMIT 10",
+        )
+        .await?;
         let stdout = String::from_utf8(output)?;
 
         assert!(
@@ -541,7 +592,7 @@ async fn siloctl_query() -> anyhow::Result<()> {
         siloctl::query(
             &opts_json,
             &mut json_output,
-            0,
+            crate::grpc_integration_helpers::TEST_SHARD_ID,
             "SELECT id FROM jobs LIMIT 10",
         )
         .await?;
@@ -574,7 +625,7 @@ async fn siloctl_job_get_with_attempts() -> anyhow::Result<()> {
         // Enqueue a job
         let _ = client
             .enqueue(EnqueueRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: "attempts-test-job".to_string(),
                 priority: 50,
                 start_at_ms: 0,
@@ -594,7 +645,7 @@ async fn siloctl_job_get_with_attempts() -> anyhow::Result<()> {
         // Lease and complete the task
         let lease_resp = client
             .lease_tasks(LeaseTasksRequest {
-                shard: Some(0),
+                shard: Some(crate::grpc_integration_helpers::TEST_SHARD_ID.to_string()),
                 worker_id: "test-worker".to_string(),
                 max_tasks: 1,
                 task_group: "default".to_string(),
@@ -606,7 +657,7 @@ async fn siloctl_job_get_with_attempts() -> anyhow::Result<()> {
 
         let _ = client
             .report_outcome(ReportOutcomeRequest {
-                shard: 0,
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 task_id: task.id.clone(),
                 outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
                     encoding: Some(serialized_bytes::Encoding::Msgpack(
@@ -619,7 +670,14 @@ async fn siloctl_job_get_with_attempts() -> anyhow::Result<()> {
         // Get job with attempts via siloctl
         let opts = opts_for_addr(&addr);
         let mut output = Vec::new();
-        siloctl::job_get(&opts, &mut output, 0, "attempts-test-job", true).await?;
+        siloctl::job_get(
+            &opts,
+            &mut output,
+            crate::grpc_integration_helpers::TEST_SHARD_ID,
+            "attempts-test-job",
+            true,
+        )
+        .await?;
         let stdout = String::from_utf8(output)?;
 
         assert!(
@@ -636,7 +694,14 @@ async fn siloctl_job_get_with_attempts() -> anyhow::Result<()> {
         // Test JSON output with attempts
         let opts_json = opts_for_addr_json(&addr);
         let mut json_output = Vec::new();
-        siloctl::job_get(&opts_json, &mut json_output, 0, "attempts-test-job", true).await?;
+        siloctl::job_get(
+            &opts_json,
+            &mut json_output,
+            crate::grpc_integration_helpers::TEST_SHARD_ID,
+            "attempts-test-job",
+            true,
+        )
+        .await?;
         let json_stdout = String::from_utf8(json_output)?;
 
         let parsed: serde_json::Value = serde_json::from_str(&json_stdout)
