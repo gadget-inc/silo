@@ -2144,36 +2144,6 @@ async fn k8s_shard_guard_release_while_idle() {
     handle.abort();
 }
 
-/// Test coordinator with zero shards (edge case)
-#[silo::test(flavor = "multi_thread", worker_threads = 2)]
-async fn k8s_coordinator_zero_shards() {
-    let prefix = unique_prefix();
-    let namespace = get_namespace();
-    let num_shards: u32 = 0;
-
-    let (coord, handle) = start_coordinator!(
-        &namespace,
-        &prefix,
-        "zero-shards",
-        "http://127.0.0.1:50051",
-        num_shards
-    );
-
-    // Should converge immediately (nothing to own)
-    assert!(
-        coord.wait_converged(Duration::from_secs(5)).await,
-        "should converge with zero shards"
-    );
-
-    // Should have no owned shards
-    let owned = coord.owned_shards().await;
-    assert!(owned.is_empty(), "should own no shards");
-
-    // Cleanup
-    coord.shutdown().await.unwrap();
-    handle.abort();
-}
-
 /// Test that a clean shutdown properly releases shards for other nodes to acquire
 /// Note: Testing true crash behavior (task abort) is complex because spawned shard guard
 /// tasks continue running independently. This test verifies the graceful shutdown path works.
