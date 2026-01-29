@@ -30,6 +30,7 @@ rkyv = { version = "0.7", features = ["validation"] }
 bytecheck = "0.6"
 bytes = "1"
 crossbeam-skiplist = "0.1"
+dashmap = "6"
 tonic = { version = "0.12", features = ["transport"] }
 tonic-health = "0.12"
 tonic-reflection = "0.12"
