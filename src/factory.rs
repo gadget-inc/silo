@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{OnceCell, RwLock};
 
 use crate::gubernator::RateLimitClient;
 use crate::job_store_shard::JobStoreShard;
@@ -12,12 +12,40 @@ use crate::shard_range::{ShardId, ShardRange};
 use crate::storage::resolve_object_store;
 use thiserror::Error;
 
+/// A shard entry that supports atomic initialization.
+/// Uses OnceCell to ensure only one caller opens each database even under concurrent access.
+struct ShardEntry {
+    cell: OnceCell<Arc<JobStoreShard>>,
+}
+
+impl ShardEntry {
+    fn new() -> Self {
+        Self {
+            cell: OnceCell::new(),
+        }
+    }
+
+    fn get(&self) -> Option<Arc<JobStoreShard>> {
+        self.cell.get().cloned()
+    }
+
+    async fn get_or_try_init<F, Fut>(&self, f: F) -> Result<Arc<JobStoreShard>, JobStoreShardError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Arc<JobStoreShard>, JobStoreShardError>>,
+    {
+        self.cell.get_or_try_init(f).await.map(|s| Arc::clone(s))
+    }
+}
+
 /// Factory for opening and holding `Shard` instances by ShardId.
 ///
 /// Uses interior mutability (RwLock) so it can be shared across tasks
 /// and shards can be opened/closed dynamically as ownership changes.
+/// Per-shard OnceCell ensures that concurrent opens for the same shard
+/// are serialized while opens for different shards proceed in parallel.
 pub struct ShardFactory {
-    instances: RwLock<HashMap<ShardId, Arc<JobStoreShard>>>,
+    instances: RwLock<HashMap<ShardId, Arc<ShardEntry>>>,
     template: DatabaseTemplate,
     rate_limiter: Arc<dyn RateLimitClient>,
     metrics: Option<Metrics>,
@@ -65,7 +93,7 @@ impl ShardFactory {
         self.instances
             .try_read()
             .ok()
-            .and_then(|guard| guard.get(shard_id).map(Arc::clone))
+            .and_then(|guard| guard.get(shard_id).and_then(|entry| entry.get()))
     }
 
     /// Open a shard using the shared database template.
@@ -73,66 +101,85 @@ impl ShardFactory {
     /// The shard's UUID is used to construct the storage path. The `range` parameter
     /// specifies the tenant keyspace this shard is responsible for - this is immutable
     /// after opening.
+    ///
+    /// Uses per-shard OnceCell to ensure atomic initialization: if two callers try to
+    /// open the same shard concurrently, only one will actually open the database and
+    /// the other will wait and receive the same instance.
     pub async fn open(
         &self,
         shard_id: &ShardId,
         range: &ShardRange,
     ) -> Result<Arc<JobStoreShard>, JobStoreShardError> {
         let shard_id = *shard_id;
-        let name = shard_id.to_string();
 
-        // Check if already open
-        {
-            let instances = self.instances.read().await;
-            if let Some(shard) = instances.get(&shard_id) {
-                return Ok(Arc::clone(shard));
+        // Get or create the entry for this shard. The entry contains a OnceCell
+        // that ensures only one caller actually opens the database.
+        let entry = {
+            // Fast path: check if entry exists
+            {
+                let instances = self.instances.read().await;
+                if let Some(entry) = instances.get(&shard_id) {
+                    entry.clone()
+                } else {
+                    drop(instances);
+                    // Slow path: create entry if needed
+                    let mut instances = self.instances.write().await;
+                    instances
+                        .entry(shard_id)
+                        .or_insert_with(|| Arc::new(ShardEntry::new()))
+                        .clone()
+                }
             }
-        }
-
-        let path = self
-            .template
-            .path
-            .replace("%shard%", &name)
-            .replace("{shard}", &name);
-        // Resolve WAL config with shard placeholder substitution if present
-        let wal = self.template.wal.as_ref().map(|wal_template| WalConfig {
-            backend: wal_template.backend.clone(),
-            path: wal_template
-                .path
-                .replace("%shard%", &name)
-                .replace("{shard}", &name),
-        });
-        let cfg = DatabaseConfig {
-            name: name.clone(),
-            backend: self.template.backend.clone(),
-            path,
-            flush_interval_ms: None, // Use SlateDB's default in production
-            wal,
-            apply_wal_on_close: self.template.apply_wal_on_close,
         };
-        let shard_arc = JobStoreShard::open(
-            &cfg,
-            Arc::clone(&self.rate_limiter),
-            self.metrics.clone(),
-            range.clone(),
-        )
-        .await?;
 
-        let mut instances = self.instances.write().await;
-        instances.insert(shard_id, Arc::clone(&shard_arc));
-        tracing::info!(shard_id = %shard_id, range = %range, "opened shard");
-        Ok(shard_arc)
+        // OnceCell::get_or_try_init ensures only one caller opens the database,
+        // even if multiple callers reach this point concurrently.
+        let name = shard_id.to_string();
+        let range = range.clone();
+        let template = &self.template;
+        let rate_limiter = Arc::clone(&self.rate_limiter);
+        let metrics = self.metrics.clone();
+
+        entry
+            .get_or_try_init(|| async {
+                let path = template
+                    .path
+                    .replace("%shard%", &name)
+                    .replace("{shard}", &name);
+                let wal = template.wal.as_ref().map(|wal_template| WalConfig {
+                    backend: wal_template.backend.clone(),
+                    path: wal_template
+                        .path
+                        .replace("%shard%", &name)
+                        .replace("{shard}", &name),
+                });
+                let cfg = DatabaseConfig {
+                    name: name.clone(),
+                    backend: template.backend.clone(),
+                    path,
+                    flush_interval_ms: None,
+                    wal,
+                    apply_wal_on_close: template.apply_wal_on_close,
+                };
+                let shard_arc =
+                    JobStoreShard::open(&cfg, rate_limiter, metrics, range.clone()).await?;
+                tracing::info!(shard_id = %shard_id, range = %range, "opened shard");
+                Ok(shard_arc)
+            })
+            .await
     }
 
     /// Close a specific shard and remove it from the factory.
     pub async fn close(&self, shard_id: &ShardId) -> Result<(), JobStoreShardError> {
-        let shard = {
+        let entry = {
             let mut instances = self.instances.write().await;
             instances.remove(shard_id)
         };
-        if let Some(shard) = shard {
-            shard.close().await?;
-            tracing::info!(shard_id = %shard_id, "closed shard");
+        if let Some(entry) = entry {
+            if let Some(shard) = entry.get() {
+                shard.close().await?;
+                tracing::info!(shard_id = %shard_id, "closed shard");
+            }
         }
         Ok(())
     }
@@ -147,13 +194,15 @@ impl ShardFactory {
         let name = shard_id.to_string();
 
         // 1. Close and remove the shard if it exists
-        let shard = {
+        let entry = {
             let mut instances = self.instances.write().await;
             instances.remove(shard_id)
         };
-        if let Some(shard) = shard {
-            shard.close().await?;
-            tracing::info!(shard_id = %shard_id, "closed shard for reset");
+        if let Some(entry) = entry {
+            if let Some(shard) = entry.get() {
+                shard.close().await?;
+                tracing::info!(shard_id = %shard_id, "closed shard for reset");
+            }
         }
 
         // 2. Delete the data directory
@@ -194,19 +243,25 @@ impl ShardFactory {
     }
 
     /// Check if this factory owns a shard by its ID.
+    /// Returns true only if the shard entry exists AND the shard has been initialized.
     pub fn owns_shard(&self, shard_id: &ShardId) -> bool {
         self.instances
             .try_read()
             .ok()
-            .map(|guard| guard.contains_key(shard_id))
-            .unwrap_or(false)
+            .and_then(|guard| guard.get(shard_id).and_then(|entry| entry.get()))
+            .is_some()
     }
 
     /// Get a snapshot of all currently open instances.
     pub fn instances(&self) -> HashMap<ShardId, Arc<JobStoreShard>> {
         self.instances
             .try_read()
-            .map(|guard| guard.clone())
+            .map(|guard| {
+                guard
+                    .iter()
+                    .filter_map(|(id, entry)| entry.get().map(|shard| (*id, shard)))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -214,7 +269,10 @@ impl ShardFactory {
     pub async fn close_all(&self) -> Result<(), CloseAllError> {
         let mut errors: Vec<(ShardId, JobStoreShardError)> = Vec::new();
         let instances = self.instances.read().await;
-        for (shard_id, shard) in instances.iter() {
+        for (shard_id, entry) in instances.iter() {
+            let Some(shard) = entry.get() else {
+                continue;
+            };
             if let Err(e) = shard.close().await {
                 errors.push((*shard_id, e));
             }
@@ -253,7 +311,7 @@ impl ShardFactory {
             let instances = self.instances.read().await;
             instances
                 .get(parent_id)
-                .cloned()
+                .and_then(|entry| entry.get())
                 .ok_or_else(|| ShardFactoryError::ShardNotOpen(*parent_id))?
         };
 

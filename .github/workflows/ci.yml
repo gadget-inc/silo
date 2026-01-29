@@ -34,7 +34,7 @@ jobs:
           sleep 2
       - name: Run cargo test
         shell: bash
-        run: cargo test
+        run: cargo test -- --skip k8s_
 
   benchmark:
     name: Run benchmarks
@@ -67,7 +67,7 @@ jobs:
       - name: Run K8S coordination tests
         shell: bash
         # Run K8S tests single-threaded to prevent interference between tests
-        run: cargo test --features k8s k8s_ -- --test-threads=1
+        run: cargo test k8s_ -- --test-threads=1
 
   alloy:
     name: Alloy model verification
