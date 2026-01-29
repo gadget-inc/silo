@@ -11,7 +11,8 @@ use std::path::Path;
 use crate::pb::silo_client::SiloClient;
 use crate::pb::{
     CancelJobRequest, CpuProfileRequest, DeleteJobRequest, ExpediteJobRequest,
-    GetClusterInfoRequest, GetJobRequest, QueryRequest, RestartJobRequest,
+    GetClusterInfoRequest, GetJobRequest, GetSplitStatusRequest, QueryRequest, RequestSplitRequest,
+    RestartJobRequest,
 };
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -542,4 +543,230 @@ pub async fn profile<W: Write>(
     }
 
     Ok(())
+}
+
+/// Request a shard split operation
+pub async fn shard_split<W: Write>(
+    opts: &GlobalOptions,
+    out: &mut W,
+    shard: &str,
+    split_point: Option<String>,
+    auto: bool,
+    wait: bool,
+) -> anyhow::Result<()> {
+    let mut client = connect(&opts.address).await?;
+
+    // If auto is set and no split point provided, we need to get the shard's range
+    // and compute the midpoint. For now, we require either --at or --auto.
+    let split_point = if let Some(point) = split_point {
+        point
+    } else if auto {
+        // Get cluster info to find the shard's range
+        let cluster_info = client
+            .get_cluster_info(GetClusterInfoRequest {})
+            .await?
+            .into_inner();
+
+        // Find the shard in the cluster info
+        let shard_info = cluster_info
+            .shard_owners
+            .iter()
+            .find(|s| s.shard_id == shard)
+            .ok_or_else(|| anyhow::anyhow!("Shard '{}' not found in cluster", shard))?;
+
+        // Compute midpoint of the range
+        let start = if shard_info.range_start.is_empty() {
+            "0".to_string()
+        } else {
+            shard_info.range_start.clone()
+        };
+        let end = if shard_info.range_end.is_empty() {
+            "zzzzzzzz".to_string()
+        } else {
+            shard_info.range_end.clone()
+        };
+
+        compute_midpoint(&start, &end).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cannot compute midpoint for range [{}, {})",
+                shard_info.range_start,
+                shard_info.range_end
+            )
+        })?
+    } else {
+        return Err(anyhow::anyhow!(
+            "Either --at <split-point> or --auto must be specified"
+        ));
+    };
+
+    if !opts.json {
+        writeln!(
+            out,
+            "Requesting split of shard {} at '{}'...",
+            shard, split_point
+        )?;
+        out.flush()?;
+    }
+
+    let response = client
+        .request_split(RequestSplitRequest {
+            shard_id: shard.to_string(),
+            split_point: split_point.clone(),
+        })
+        .await?
+        .into_inner();
+
+    if opts.json {
+        let json_output = serde_json::json!({
+            "status": "split_requested",
+            "parent_shard_id": shard,
+            "split_point": split_point,
+            "left_child_id": response.left_child_id,
+            "right_child_id": response.right_child_id,
+            "phase": response.phase,
+        });
+        writeln!(out, "{}", serde_json::to_string_pretty(&json_output)?)?;
+    } else {
+        writeln!(out, "Split requested successfully")?;
+        writeln!(out, "  Parent shard:    {}", shard)?;
+        writeln!(out, "  Split point:     {}", split_point)?;
+        writeln!(out, "  Left child:      {}", response.left_child_id)?;
+        writeln!(out, "  Right child:     {}", response.right_child_id)?;
+        writeln!(out, "  Initial phase:   {}", response.phase)?;
+    }
+
+    // If --wait is specified, poll until split is complete
+    if wait {
+        if !opts.json {
+            writeln!(out)?;
+            writeln!(out, "Waiting for split to complete...")?;
+        }
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+            let status = client
+                .get_split_status(GetSplitStatusRequest {
+                    shard_id: shard.to_string(),
+                })
+                .await?
+                .into_inner();
+
+            if !status.in_progress {
+                if !opts.json {
+                    writeln!(out, "Split completed!")?;
+                }
+                break;
+            }
+
+            if !opts.json {
+                write!(out, "  Phase: {}...\r", status.phase)?;
+                out.flush()?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Get the status of a shard split operation
+pub async fn shard_split_status<W: Write>(
+    opts: &GlobalOptions,
+    out: &mut W,
+    shard: &str,
+) -> anyhow::Result<()> {
+    let mut client = connect(&opts.address).await?;
+
+    let response = client
+        .get_split_status(GetSplitStatusRequest {
+            shard_id: shard.to_string(),
+        })
+        .await?
+        .into_inner();
+
+    if opts.json {
+        let json_output = serde_json::json!({
+            "shard_id": shard,
+            "in_progress": response.in_progress,
+            "phase": response.phase,
+            "left_child_id": response.left_child_id,
+            "right_child_id": response.right_child_id,
+            "split_point": response.split_point,
+            "initiator_node_id": response.initiator_node_id,
+            "requested_at_ms": response.requested_at_ms,
+        });
+        writeln!(out, "{}", serde_json::to_string_pretty(&json_output)?)?;
+    } else if response.in_progress {
+        writeln!(out, "Split Status for Shard {}", shard)?;
+        writeln!(out, "=========================")?;
+        writeln!(out, "In Progress:      Yes")?;
+        writeln!(out, "Phase:            {}", response.phase)?;
+        writeln!(out, "Split Point:      {}", response.split_point)?;
+        writeln!(out, "Left Child:       {}", response.left_child_id)?;
+        writeln!(out, "Right Child:      {}", response.right_child_id)?;
+        writeln!(out, "Initiator:        {}", response.initiator_node_id)?;
+        writeln!(
+            out,
+            "Requested At:     {}",
+            format_timestamp_ms(response.requested_at_ms)
+        )?;
+    } else {
+        writeln!(out, "No split in progress for shard {}", shard)?;
+    }
+
+    Ok(())
+}
+
+/// Compute the lexicographic midpoint of two strings
+fn compute_midpoint(start: &str, end: &str) -> Option<String> {
+    if start >= end {
+        return None;
+    }
+
+    let start_bytes = start.as_bytes();
+    let end_bytes = end.as_bytes();
+
+    // Find the first differing position
+    let min_len = start_bytes.len().min(end_bytes.len());
+    let mut diff_pos = 0;
+    while diff_pos < min_len && start_bytes[diff_pos] == end_bytes[diff_pos] {
+        diff_pos += 1;
+    }
+
+    if diff_pos == min_len {
+        // One is a prefix of the other
+        if start_bytes.len() < end_bytes.len() {
+            // Start is shorter, add a middle character
+            let mut mid = start.to_string();
+            mid.push('M');
+            if mid.as_str() > start && mid.as_str() < end {
+                return Some(mid);
+            }
+        }
+        return None;
+    }
+
+    // Compute midpoint at the differing position
+    let start_char = start_bytes[diff_pos];
+    let end_char = end_bytes[diff_pos];
+
+    if end_char <= start_char + 1 {
+        // Too close, extend with a high character
+        let mut mid = String::from_utf8_lossy(&start_bytes[..=diff_pos]).to_string();
+        mid.push('~');
+        if mid.as_str() > start && mid.as_str() < end {
+            return Some(mid);
+        }
+        return None;
+    }
+
+    let mid_char = start_char + (end_char - start_char) / 2;
+    let mut result = String::from_utf8_lossy(&start_bytes[..diff_pos]).to_string();
+    result.push(mid_char as char);
+
+    if result.as_str() > start && result.as_str() < end {
+        Some(result)
+    } else {
+        None
+    }
 }

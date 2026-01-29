@@ -12,6 +12,7 @@ use std::time::Duration;
 use core::future::Future;
 use hyper::Uri;
 use hyper_util::rt::TokioIo;
+use silo::coordination::NoneCoordinator;
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::server::run_server_with_incoming;
@@ -280,11 +281,22 @@ pub async fn setup_server(port: u16) -> turmoil::Result<()> {
         }
     };
 
+    // Create a NoneCoordinator for single-node DST test mode
+    let coordinator = Arc::new(
+        NoneCoordinator::new(
+            "dst-test-node",
+            format!("http://0.0.0.0:{}", port),
+            1,
+            factory.clone(),
+        )
+        .await,
+    );
+
     let (_tx, rx) = tokio::sync::broadcast::channel::<()>(1);
     run_server_with_incoming(
         incoming,
         factory,
-        None,
+        coordinator,
         silo::settings::AppConfig::load(None).unwrap(),
         None,
         rx,

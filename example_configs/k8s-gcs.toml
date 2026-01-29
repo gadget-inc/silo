@@ -36,10 +36,11 @@ addr = "0.0.0.0:50052"
 # Use GCS backend for Google Cloud Storage
 # Credentials are read from GOOGLE_APPLICATION_CREDENTIALS or workload identity
 backend = "gcs"
-path = "gs://my-bucket/silo/data-%shard%"
+# NOTE: %shard% must be at a path boundary (after /) for split/clone to work correctly
+path = "gs://my-bucket/silo/%shard%"
 
 # Optional: Use local filesystem for WAL for lower write latency
 # If omitted, WAL uses the same backend as the main store
 [database.wal]
 backend = "fs"
-path = "/var/lib/silo/wal-%shard%"
+path = "/var/lib/silo/wal/%shard%"

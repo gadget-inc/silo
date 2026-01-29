@@ -213,7 +213,7 @@ fn map_err(e: JobStoreShardError) -> Status {
 #[derive(Clone)]
 pub struct SiloService {
     factory: Arc<ShardFactory>,
-    coordinator: Option<Arc<dyn Coordinator>>,
+    coordinator: Arc<dyn Coordinator>,
     cfg: AppConfig,
     metrics: Option<Metrics>,
 }
@@ -221,7 +221,7 @@ pub struct SiloService {
 impl SiloService {
     pub fn new(
         factory: Arc<ShardFactory>,
-        coordinator: Option<Arc<dyn Coordinator>>,
+        coordinator: Arc<dyn Coordinator>,
         cfg: AppConfig,
         metrics: Option<Metrics>,
     ) -> Self {
@@ -256,9 +256,7 @@ impl SiloService {
     ) -> Result<Arc<JobStoreShard>, Status> {
         if let Some(shard) = self.factory.get(shard_id) {
             // [SILO-ROUTE-PAUSED-1] Check if this shard is paused for split
-            if let Some(coord) = &self.coordinator
-                && coord.is_shard_paused(*shard_id).await
-            {
+            if self.coordinator.is_shard_paused(*shard_id).await {
                 tracing::debug!(
                     shard_id = %shard_id,
                     "shard is paused for split, returning UNAVAILABLE"
@@ -272,13 +270,7 @@ impl SiloService {
 
         // Shard not found locally - determine if we should redirect or signal unavailable
         let mut status = Status::not_found("shard not found");
-
-        // Look up the owner if we have a coordinator
-        let Some(coord) = &self.coordinator else {
-            // Single-node mode - shard simply doesn't exist
-            tracing::debug!(shard_id = %shard_id, "shard not found (single-node mode)");
-            return Err(status);
-        };
+        let coord = &self.coordinator;
 
         // Get the owner map to find where this shard lives
         let owner_map = match coord.get_shard_owner_map().await {
@@ -383,13 +375,7 @@ impl SiloService {
         }
 
         // Look up the shard's range from the coordinator's shard map
-        let Some(coord) = &self.coordinator else {
-            // Single-node mode - no range validation needed
-            // (all shards implicitly cover the full range)
-            return Ok(());
-        };
-
-        let shard_map = coord.get_shard_map().await.map_err(|e| {
+        let shard_map = self.coordinator.get_shard_map().await.map_err(|e| {
             tracing::error!(error = %e, "failed to get shard map for tenant validation");
             Status::internal("failed to validate tenant routing")
         })?;
@@ -428,38 +414,7 @@ impl Silo for SiloService {
         &self,
         _req: Request<GetClusterInfoRequest>,
     ) -> Result<Response<GetClusterInfoResponse>, Status> {
-        let Some(coord) = &self.coordinator else {
-            // Single-node mode - report just ourselves
-            // Use advertised_grpc_addr if set, otherwise fall back to the bind address
-            let grpc_addr = self
-                .cfg
-                .coordination
-                .advertised_grpc_addr
-                .as_ref()
-                .unwrap_or(&self.cfg.server.grpc_addr)
-                .clone();
-
-            let local_shards: Vec<crate::shard_range::ShardId> =
-                self.factory.instances().keys().copied().collect();
-
-            let shard_owners: Vec<ShardOwner> = local_shards
-                .into_iter()
-                .map(|shard_id| ShardOwner {
-                    shard_id: shard_id.to_string(),
-                    grpc_addr: grpc_addr.clone(),
-                    node_id: "local".to_string(),
-                    range_start: String::new(),
-                    range_end: String::new(),
-                })
-                .collect();
-
-            return Ok(Response::new(GetClusterInfoResponse {
-                num_shards: shard_owners.len() as u32,
-                shard_owners,
-                this_node_id: "local".to_string(),
-                this_grpc_addr: grpc_addr,
-            }));
-        };
+        let coord = &self.coordinator;
 
         let owner_map = coord
             .get_shard_owner_map()
@@ -1318,13 +1273,7 @@ impl Silo for SiloService {
             return Err(Status::invalid_argument("split_point is required"));
         }
 
-        let coord = self.coordinator.as_ref().ok_or_else(|| {
-            Status::failed_precondition(
-                "shard splitting requires distributed coordination (not available in single-node mode)",
-            )
-        })?;
-
-        let orchestrator = ShardSplitter::new(coord.as_ref());
+        let orchestrator = ShardSplitter::new(self.coordinator.as_ref());
 
         let split = orchestrator
             .request_split(shard_id, r.split_point)
@@ -1345,6 +1294,20 @@ impl Silo for SiloService {
                 other => Status::internal(format!("split request failed: {}", other)),
             })?;
 
+        // Spawn a background task to execute the split through all phases.
+        // The request returns immediately with phase=SplitRequested, and the split
+        // progresses asynchronously. Clients can poll GetSplitStatus to track progress.
+        let coordinator = Arc::clone(&self.coordinator);
+        tokio::spawn(async move {
+            let orchestrator = ShardSplitter::new(coordinator.as_ref());
+            if let Err(e) = orchestrator
+                .execute_split(shard_id, || coordinator.get_shard_owner_map())
+                .await
+            {
+                tracing::error!(shard_id = %shard_id, error = %e, "split execution failed");
+            }
+        });
+
         Ok(Response::new(RequestSplitResponse {
             left_child_id: split.left_child_id.to_string(),
             right_child_id: split.right_child_id.to_string(),
@@ -1361,15 +1324,8 @@ impl Silo for SiloService {
         // Parse the shard ID
         let shard_id = Self::parse_shard_id(&r.shard_id)?;
 
-        // We need a coordinator to check split status
-        let coord = self.coordinator.as_ref().ok_or_else(|| {
-            Status::failed_precondition(
-                "shard splitting requires distributed coordination (not available in single-node mode)",
-            )
-        })?;
-
         // Create orchestrator
-        let orchestrator = ShardSplitter::new(coord.as_ref());
+        let orchestrator = ShardSplitter::new(self.coordinator.as_ref());
 
         let split_opt = orchestrator
             .get_split_status(shard_id)
@@ -1403,7 +1359,7 @@ impl Silo for SiloService {
 pub async fn run_server(
     listener: TcpListener,
     factory: Arc<ShardFactory>,
-    coordinator: Option<Arc<dyn Coordinator>>,
+    coordinator: Arc<dyn Coordinator>,
     cfg: crate::settings::AppConfig,
     metrics: Option<Metrics>,
     shutdown: broadcast::Receiver<()>,
@@ -1417,7 +1373,7 @@ pub async fn run_server(
 pub async fn run_server_with_incoming<S, IO>(
     incoming: S,
     factory: Arc<ShardFactory>,
-    coordinator: Option<Arc<dyn Coordinator>>,
+    coordinator: Arc<dyn Coordinator>,
     cfg: crate::settings::AppConfig,
     metrics: Option<Metrics>,
     mut shutdown: broadcast::Receiver<()>,

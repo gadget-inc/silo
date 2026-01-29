@@ -1935,3 +1935,129 @@ async fn etcd_crash_recovery_late_phase_resumes_split() {
     c2.shutdown().await.unwrap();
     h2.abort();
 }
+
+/// Test that the gRPC RequestSplit endpoint actually executes the split to completion.
+/// This test verifies the fix for the bug where request_split only stored the split
+/// record but didn't call execute_split to drive it through all phases.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn etcd_grpc_request_split_executes_to_completion() {
+    use silo::pb::silo_client::SiloClient;
+    use silo::server::run_server;
+    use silo::settings::AppConfig;
+    use std::net::SocketAddr;
+    use tokio::net::TcpListener;
+
+    let prefix = unique_prefix();
+    let num_shards: u32 = 1;
+
+    // Start etcd coordinator
+    let (coord, handle) = start_etcd_coordinator!(
+        &prefix,
+        "grpc-split-1",
+        "http://127.0.0.1:50099",
+        num_shards
+    );
+    let coord = Arc::new(coord);
+
+    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+
+    // Get the shard to split
+    let owned = coord.owned_shards().await;
+    let shard_id = owned[0];
+
+    // Start a gRPC server using the etcd coordinator
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().expect("get addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
+    let factory = coord.base().factory.clone();
+    let cfg = AppConfig::load(None).unwrap();
+
+    let server_coord = coord.clone();
+    let server = tokio::spawn(async move {
+        run_server(listener, factory, server_coord, cfg, None, shutdown_rx).await
+    });
+
+    // Give the server a moment to start
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Create gRPC client
+    let endpoint = format!("http://{}", addr);
+    let channel = tonic::transport::Endpoint::new(endpoint)
+        .expect("endpoint")
+        .connect()
+        .await
+        .expect("connect");
+    let mut client = SiloClient::new(channel);
+
+    // Make gRPC request to split the shard
+    let response = client
+        .request_split(silo::pb::RequestSplitRequest {
+            shard_id: shard_id.to_string(),
+            split_point: "m".to_string(),
+        })
+        .await
+        .expect("request_split gRPC call should succeed");
+
+    let split_response = response.into_inner();
+    assert_eq!(
+        split_response.phase, "SplitRequested",
+        "initial phase should be SplitRequested"
+    );
+
+    // Wait for the split to complete (background task should execute it)
+    let start = Instant::now();
+    let timeout = Duration::from_secs(30);
+    loop {
+        if start.elapsed() > timeout {
+            panic!("Split did not complete within timeout");
+        }
+
+        let status = client
+            .get_split_status(silo::pb::GetSplitStatusRequest {
+                shard_id: shard_id.to_string(),
+            })
+            .await
+            .expect("get_split_status")
+            .into_inner();
+
+        if !status.in_progress {
+            // Split completed - record was cleaned up
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Verify the shard map was updated
+    let shard_map = coord.get_shard_map().await.expect("get_shard_map");
+    assert_eq!(shard_map.len(), 2, "should have 2 shards after split");
+
+    // Parent should be removed
+    assert!(
+        shard_map.get_shard(&shard_id).is_none(),
+        "parent shard should be removed from shard map"
+    );
+
+    // Children should exist
+    let left_child_id = silo::shard_range::ShardId::parse(&split_response.left_child_id)
+        .expect("parse left child id");
+    let right_child_id = silo::shard_range::ShardId::parse(&split_response.right_child_id)
+        .expect("parse right child id");
+    assert!(
+        shard_map.get_shard(&left_child_id).is_some(),
+        "left child should exist"
+    );
+    assert!(
+        shard_map.get_shard(&right_child_id).is_some(),
+        "right child should exist"
+    );
+
+    // Cleanup
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+    coord.shutdown().await.unwrap();
+    handle.abort();
+}

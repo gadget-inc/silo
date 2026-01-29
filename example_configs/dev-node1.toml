@@ -24,4 +24,5 @@ addr = "127.0.0.1:8081"
 [database]
 backend = "fs"
 # use the same data path as the other node to simulate prod-like usage of object storage and compute/storage separation
-path = "./tmp/silo-data/shard-%shard%"
+# NOTE: %shard% must be at a directory boundary (after /) for split/clone to work correctly
+path = "./tmp/silo-data/%shard%"

@@ -206,7 +206,7 @@ async fn cluster_two_nodes_basic_query() {
     let server1 = tokio::spawn(run_server(
         listener1,
         factory1.clone(),
-        Some(coordinator1.clone()),
+        coordinator1.clone(),
         cfg.clone(),
         None, // metrics
         shutdown_rx1,
@@ -215,7 +215,7 @@ async fn cluster_two_nodes_basic_query() {
     let server2 = tokio::spawn(run_server(
         listener2,
         factory2.clone(),
-        Some(coordinator2.clone()),
+        coordinator2.clone(),
         cfg.clone(),
         None, // metrics
         shutdown_rx2,
@@ -325,7 +325,7 @@ async fn cluster_two_nodes_status_filter_query() {
     let server1 = tokio::spawn(run_server(
         listener1,
         factory1.clone(),
-        Some(coordinator1.clone()),
+        coordinator1.clone(),
         cfg.clone(),
         None, // metrics
         shutdown_rx1,
@@ -334,7 +334,7 @@ async fn cluster_two_nodes_status_filter_query() {
     let server2 = tokio::spawn(run_server(
         listener2,
         factory2.clone(),
-        Some(coordinator2.clone()),
+        coordinator2.clone(),
         cfg.clone(),
         None, // metrics
         shutdown_rx2,
@@ -448,7 +448,7 @@ async fn cluster_two_nodes_count_across_shards() {
     let server1 = tokio::spawn(run_server(
         listener1,
         factory1.clone(),
-        Some(coordinator1.clone()),
+        coordinator1.clone(),
         cfg.clone(),
         None, // metrics
         shutdown_rx1,
@@ -457,7 +457,7 @@ async fn cluster_two_nodes_count_across_shards() {
     let server2 = tokio::spawn(run_server(
         listener2,
         factory2.clone(),
-        Some(coordinator2.clone()),
+        coordinator2.clone(),
         cfg.clone(),
         None, // metrics
         shutdown_rx2,
@@ -569,7 +569,7 @@ async fn cluster_two_nodes_queues_table() {
     let server1 = tokio::spawn(run_server(
         listener1,
         factory1.clone(),
-        Some(coordinator1.clone()),
+        coordinator1.clone(),
         cfg.clone(),
         None, // metrics
         shutdown_rx1,
@@ -578,7 +578,7 @@ async fn cluster_two_nodes_queues_table() {
     let server2 = tokio::spawn(run_server(
         listener2,
         factory2.clone(),
-        Some(coordinator2.clone()),
+        coordinator2.clone(),
         cfg.clone(),
         None, // metrics
         shutdown_rx2,
@@ -666,7 +666,7 @@ async fn cluster_two_nodes_projection_remote_shards() {
     let server1 = tokio::spawn(run_server(
         listener1,
         factory1.clone(),
-        Some(coordinator1.clone()),
+        coordinator1.clone(),
         cfg.clone(),
         None, // metrics
         shutdown_rx1,
@@ -675,7 +675,7 @@ async fn cluster_two_nodes_projection_remote_shards() {
     let server2 = tokio::spawn(run_server(
         listener2,
         factory2.clone(),
-        Some(coordinator2.clone()),
+        coordinator2.clone(),
         cfg.clone(),
         None, // metrics
         shutdown_rx2,

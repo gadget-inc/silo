@@ -26,7 +26,8 @@ use crate::job_store_shard::ShardCounters;
 use crate::pb::silo_client::SiloClient;
 use crate::pb::{
     CancelJobRequest, ColumnInfo, GetJobRequest, GetJobResponse, GetShardCountersRequest,
-    JobStatus, QueryRequest, SerializedBytes, serialized_bytes,
+    JobStatus, QueryRequest, RequestSplitRequest, RequestSplitResponse, SerializedBytes,
+    serialized_bytes,
 };
 use crate::shard_range::ShardId;
 
@@ -702,5 +703,43 @@ impl ClusterClient {
         }
 
         Ok(())
+    }
+
+    /// Request a shard split operation
+    ///
+    /// Routes the request to the node that owns the shard. The split will be
+    /// executed asynchronously by the owning node.
+    pub async fn request_split(
+        &self,
+        shard_id: &ShardId,
+        split_point: &str,
+    ) -> Result<RequestSplitResponse, ClusterClientError> {
+        // Always route to the shard owner for split operations
+        let addr = if self.factory.owns_shard(shard_id) {
+            // Local shard - need to get our own address from coordinator
+            if let Some(coordinator) = &self.coordinator {
+                coordinator.grpc_addr().to_string()
+            } else {
+                return Err(ClusterClientError::NoCoordinator);
+            }
+        } else {
+            self.get_shard_addr(shard_id).await?
+        };
+
+        debug!(shard_id = %shard_id, addr = %addr, split_point = %split_point, "requesting shard split");
+
+        let mut client = self.get_client(&addr).await?;
+        let request = RequestSplitRequest {
+            shard_id: shard_id.to_string(),
+            split_point: split_point.to_string(),
+        };
+
+        match client.request_split(request).await {
+            Ok(resp) => Ok(resp.into_inner()),
+            Err(e) => {
+                self.invalidate_connection(&addr);
+                Err(ClusterClientError::RpcFailed(e.to_string()))
+            }
+        }
     }
 }

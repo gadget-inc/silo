@@ -10,9 +10,9 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use askama::Template;
 use axum::{
-    Router,
-    extract::{Query, State},
-    response::{Html, IntoResponse},
+    Form, Router,
+    extract::{Path, Query, State},
+    response::{Html, IntoResponse, Redirect},
     routing::{get, post},
 };
 use datafusion::arrow::array::Array;
@@ -21,14 +21,14 @@ use tracing::warn;
 
 use crate::cluster_client::ClusterClient;
 use crate::cluster_query::ClusterQueryEngine;
-use crate::coordination::Coordinator;
+use crate::coordination::{Coordinator, SplitCleanupStatus};
 use crate::factory::ShardFactory;
 use crate::settings::AppConfig;
 
 #[derive(Clone)]
 pub struct AppState {
     pub factory: Arc<ShardFactory>,
-    pub coordinator: Option<Arc<dyn Coordinator>>,
+    pub coordinator: Arc<dyn Coordinator>,
     pub cluster_client: Arc<ClusterClient>,
     pub query_engine: Arc<ClusterQueryEngine>,
     pub config: AppConfig,
@@ -81,6 +81,23 @@ pub struct ShardRow {
     pub name: String,
     pub owner: String,
     pub job_count: usize,
+    /// If this shard has a split in progress, the current phase
+    pub split_phase: Option<String>,
+    /// Cleanup status if not CompactionDone
+    pub cleanup_status: Option<String>,
+    /// Parent shard ID if this shard was created from a split
+    pub parent_shard_id: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct ActiveSplitRow {
+    pub parent_shard_id: String,
+    pub phase: String,
+    pub left_child_id: String,
+    pub right_child_id: String,
+    pub split_point: String,
+    pub initiator_node_id: String,
+    pub requested_at: String,
 }
 
 #[derive(Clone)]
@@ -144,6 +161,8 @@ struct ClusterTemplate {
     total_shards: usize,
     owned_shards: usize,
     total_jobs: usize,
+    active_splits: Vec<ActiveSplitRow>,
+    shards_needing_cleanup: usize,
     error: Option<String>,
 }
 
@@ -197,6 +216,22 @@ struct ConfigTemplate {
     config_toml: String,
 }
 
+#[derive(Template)]
+#[template(path = "shard.html")]
+struct ShardTemplate {
+    nav_active: &'static str,
+    shard_id: String,
+    range_start: String,
+    range_end: String,
+    owner: String,
+    job_count: usize,
+    cleanup_status: Option<String>,
+    parent_shard_id: Option<String>,
+    split_phase: Option<String>,
+    split_message: Option<String>,
+    split_error: Option<String>,
+}
+
 #[derive(serde::Deserialize)]
 pub struct JobParams {
     /// Optional shard ID (UUID string) - used to make lookup more efficient if provided
@@ -217,6 +252,28 @@ pub struct QueueParams {
 pub struct SqlQueryParams {
     #[serde(default)]
     q: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct ShardParams {
+    /// Shard ID (UUID)
+    id: String,
+    /// Optional message to display (e.g., after a successful split request)
+    #[serde(default)]
+    message: Option<String>,
+    /// Optional error message to display
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct SplitFormParams {
+    /// Split point (tenant ID)
+    #[serde(default)]
+    split_point: String,
+    /// Auto-compute midpoint
+    #[serde(default)]
+    auto: bool,
 }
 
 fn format_uptime(startup_time_ms: Option<i64>) -> String {
@@ -378,12 +435,8 @@ async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
 
     // Already sorted by ORDER BY clause
 
-    // Get total shard count from coordinator if available
-    let shard_count = if let Some(coordinator) = &state.coordinator {
-        coordinator.num_shards().await
-    } else {
-        state.factory.instances().len()
-    };
+    // Get total shard count from coordinator
+    let shard_count = state.coordinator.num_shards().await;
 
     let template = IndexTemplate {
         nav_active: "index",
@@ -911,40 +964,51 @@ async fn queue_handler(
 async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
     let mut shards: Vec<ShardRow> = Vec::new();
     let mut members: Vec<MemberRow> = Vec::new();
+    let mut active_splits: Vec<ActiveSplitRow> = Vec::new();
 
-    // Get shard owner map and members if coordinator is available
-    let (owner_map, this_node_id) = if let Some(coordinator) = &state.coordinator {
-        let map = coordinator.get_shard_owner_map().await.ok();
-        let node_id = coordinator.node_id().to_string();
+    let coordinator = &state.coordinator;
+    let owner_map = coordinator.get_shard_owner_map().await.ok();
+    let this_node_id = coordinator.node_id().to_string();
+    let shard_map = coordinator.get_shard_map().await.ok();
 
-        // Fetch cluster members
-        if let Ok(member_infos) = coordinator.get_members().await {
-            for member_info in member_infos {
-                // Count shards owned by this member
-                let shard_count = if let Some(ref m) = map {
-                    m.shard_to_node
-                        .values()
-                        .filter(|&n| n == &member_info.node_id)
-                        .count()
-                } else {
-                    0
-                };
+    // Fetch cluster members
+    if let Ok(member_infos) = coordinator.get_members().await {
+        for member_info in member_infos {
+            // Count shards owned by this member
+            let shard_count = if let Some(m) = &owner_map {
+                m.shard_to_node
+                    .values()
+                    .filter(|&n| n == &member_info.node_id)
+                    .count()
+            } else {
+                0
+            };
 
-                members.push(MemberRow {
-                    is_self: member_info.node_id == node_id,
-                    node_id: member_info.node_id,
-                    grpc_addr: member_info.grpc_addr,
-                    shard_count,
-                    uptime: format_uptime(member_info.startup_time_ms),
-                    hostname: member_info.hostname,
-                });
-            }
+            members.push(MemberRow {
+                is_self: member_info.node_id == this_node_id,
+                node_id: member_info.node_id,
+                grpc_addr: member_info.grpc_addr,
+                shard_count,
+                uptime: format_uptime(member_info.startup_time_ms),
+                hostname: member_info.hostname,
+            });
         }
+    }
 
-        (map, Some(node_id))
-    } else {
-        (None, None)
-    };
+    // Fetch active splits
+    if let Ok(splits) = coordinator.list_all_splits().await {
+        for split in splits {
+            active_splits.push(ActiveSplitRow {
+                parent_shard_id: split.parent_shard_id.to_string(),
+                phase: split.phase.to_string(),
+                left_child_id: split.left_child_id.to_string(),
+                right_child_id: split.right_child_id.to_string(),
+                split_point: split.split_point.clone(),
+                initiator_node_id: split.initiator_node_id.clone(),
+                requested_at: format_timestamp(split.requested_at_ms),
+            });
+        }
+    }
 
     // Sort members: self first, then by node_id
     members.sort_by(|a, b| match (a.is_self, b.is_self) {
@@ -972,6 +1036,12 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
         }
     };
 
+    // Build a lookup map for active splits by parent shard
+    let active_split_map: HashMap<String, &ActiveSplitRow> = active_splits
+        .iter()
+        .map(|s| (s.parent_shard_id.clone(), s))
+        .collect();
+
     // Build shard rows from the counters map, filling in 0 for missing shards
     for shard_id in shard_ids {
         let job_count = shard_counters
@@ -991,14 +1061,39 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
             "local".to_string()
         };
 
+        // Check if this shard has a split in progress
+        let split_phase = active_split_map
+            .get(&shard_id.to_string())
+            .map(|s| s.phase.clone());
+
+        // Get cleanup status and parent info from shard map
+        let (cleanup_status, parent_shard_id) = if let Some(ref map) = shard_map {
+            if let Some(shard_info) = map.get_shard(&shard_id) {
+                let cleanup = if shard_info.cleanup_status != SplitCleanupStatus::CompactionDone {
+                    Some(shard_info.cleanup_status.to_string())
+                } else {
+                    None
+                };
+                let parent = shard_info.parent_shard_id.map(|p| p.to_string());
+                (cleanup, parent)
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
         shards.push(ShardRow {
             name: shard_id.to_string(),
             owner,
             job_count,
+            split_phase,
+            cleanup_status,
+            parent_shard_id,
         });
     }
 
-    // If no coordinator, add a single "self" member for standalone mode
+    // If members list is empty (e.g., get_members failed), add self as fallback
     if members.is_empty() {
         // Use advertised_grpc_addr if set, otherwise fall back to the bind address
         let grpc_addr = state
@@ -1010,7 +1105,7 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
             .clone();
 
         members.push(MemberRow {
-            node_id: this_node_id.unwrap_or_else(|| "standalone".to_string()),
+            node_id: this_node_id.clone(),
             grpc_addr,
             is_self: true,
             shard_count: shards.len(),
@@ -1035,6 +1130,7 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
         .map(|m| m.shard_count)
         .unwrap_or(0);
     let total_jobs: usize = shards.iter().map(|s| s.job_count).sum();
+    let shards_needing_cleanup = shards.iter().filter(|s| s.cleanup_status.is_some()).count();
 
     let template = ClusterTemplate {
         nav_active: "cluster",
@@ -1043,6 +1139,8 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
         total_shards,
         owned_shards,
         total_jobs,
+        active_splits,
+        shards_needing_cleanup,
         error,
     };
 
@@ -1299,6 +1397,176 @@ async fn config_handler(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
+async fn shard_handler(
+    State(state): State<AppState>,
+    Query(params): Query<ShardParams>,
+) -> impl IntoResponse {
+    let shard_id = match crate::shard_range::ShardId::parse(&params.id) {
+        Ok(id) => id,
+        Err(_) => {
+            return Html(
+                ErrorTemplate {
+                    nav_active: "cluster",
+                    title: "Invalid Shard ID".to_string(),
+                    code: 400,
+                    message: format!("'{}' is not a valid shard UUID", params.id),
+                }
+                .render()
+                .unwrap_or_default(),
+            );
+        }
+    };
+
+    // Get shard info from coordinator
+    let coordinator = &state.coordinator;
+    let shard_map = coordinator.get_shard_map().await.ok();
+    let owner_map = coordinator.get_shard_owner_map().await.ok();
+
+    let shard_info = shard_map
+        .as_ref()
+        .and_then(|m| m.get_shard(&shard_id).cloned());
+
+    let owner = if let Some(ref map) = owner_map {
+        if state.cluster_client.owns_shard(&shard_id) {
+            "local".to_string()
+        } else {
+            map.shard_to_node
+                .get(&shard_id)
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string())
+        }
+    } else {
+        "local".to_string()
+    };
+
+    // Get job count
+    let job_count = state
+        .cluster_client
+        .get_all_shard_counters()
+        .await
+        .ok()
+        .and_then(|counters| counters.get(&shard_id).map(|c| c.total_jobs as usize))
+        .unwrap_or(0);
+
+    // Check for active split
+    let split_phase = coordinator
+        .load_split(&shard_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|s| s.phase.to_string());
+
+    let Some(info) = shard_info else {
+        return Html(
+            ErrorTemplate {
+                nav_active: "cluster",
+                title: "Shard Not Found".to_string(),
+                code: 404,
+                message: format!("Shard '{}' not found in cluster", params.id),
+            }
+            .render()
+            .unwrap_or_default(),
+        );
+    };
+
+    let cleanup_status = if info.cleanup_status != SplitCleanupStatus::CompactionDone {
+        Some(info.cleanup_status.to_string())
+    } else {
+        None
+    };
+
+    let template = ShardTemplate {
+        nav_active: "cluster",
+        shard_id: params.id,
+        range_start: if info.range.start.is_empty() {
+            "-∞".to_string()
+        } else {
+            info.range.start.clone()
+        },
+        range_end: if info.range.end.is_empty() {
+            "+∞".to_string()
+        } else {
+            info.range.end.clone()
+        },
+        owner,
+        job_count,
+        cleanup_status,
+        parent_shard_id: info.parent_shard_id.map(|p| p.to_string()),
+        split_phase,
+        split_message: params.message,
+        split_error: params.error,
+    };
+
+    Html(
+        template
+            .render()
+            .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
+}
+
+async fn shard_split_handler(
+    State(state): State<AppState>,
+    Path(shard_id): Path<String>,
+    Form(params): Form<SplitFormParams>,
+) -> impl IntoResponse {
+    let parsed_shard_id = match crate::shard_range::ShardId::parse(&shard_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return Redirect::to(&format!(
+                "/shard?id={}&error={}",
+                shard_id,
+                urlencoding::encode("Invalid shard ID")
+            ));
+        }
+    };
+
+    // Determine split point
+    let split_point = if params.auto || params.split_point.is_empty() {
+        // Auto-compute midpoint from shard range
+        if let Ok(shard_map) = state.coordinator.get_shard_map().await {
+            if let Some(info) = shard_map.get_shard(&parsed_shard_id) {
+                info.range.midpoint()
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        Some(params.split_point.clone())
+    };
+
+    let Some(split_point) = split_point else {
+        return Redirect::to(&format!(
+            "/shard?id={}&error={}",
+            shard_id,
+            urlencoding::encode("Could not compute split point. Please specify one manually.")
+        ));
+    };
+
+    // Request the split via gRPC
+    let result = state
+        .cluster_client
+        .request_split(&parsed_shard_id, &split_point)
+        .await;
+
+    match result {
+        Ok(response) => Redirect::to(&format!(
+            "/shard?id={}&message={}",
+            shard_id,
+            urlencoding::encode(&format!(
+                "Split requested successfully. Left child: {}, Right child: {}",
+                response.left_child_id, response.right_child_id
+            ))
+        )),
+        Err(e) => Redirect::to(&format!(
+            "/shard?id={}&error={}",
+            shard_id,
+            urlencoding::encode(&format!("Split failed: {}", e))
+        )),
+    }
+}
+
 async fn not_found_handler() -> impl IntoResponse {
     Html(
         ErrorTemplate {
@@ -1320,6 +1588,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/queues", get(queues_handler))
         .route("/queue", get(queue_handler))
         .route("/cluster", get(cluster_handler))
+        .route("/shard", get(shard_handler))
+        .route("/shard/{id}/split", post(shard_split_handler))
         .route("/sql", get(sql_handler))
         .route("/sql/execute", get(sql_execute_handler))
         .route("/config", get(config_handler))
@@ -1331,14 +1601,17 @@ pub fn create_router(state: AppState) -> Router {
 pub async fn run_webui(
     addr: SocketAddr,
     factory: Arc<ShardFactory>,
-    coordinator: Option<Arc<dyn Coordinator>>,
+    coordinator: Arc<dyn Coordinator>,
     cfg: AppConfig,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let cluster_client = Arc::new(ClusterClient::new(factory.clone(), coordinator.clone()));
+    let cluster_client = Arc::new(ClusterClient::new(
+        factory.clone(),
+        Some(coordinator.clone()),
+    ));
 
     let query_engine = Arc::new(
-        ClusterQueryEngine::new(factory.clone(), coordinator.clone())
+        ClusterQueryEngine::new(factory.clone(), Some(coordinator.clone()))
             .await
             .expect("Failed to create cluster query engine"),
     );

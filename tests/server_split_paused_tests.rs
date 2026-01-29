@@ -180,7 +180,7 @@ async fn create_test_service(paused: bool) -> (SiloService, Arc<MockPausedCoordi
         .expect("open shard");
 
     let cfg = silo::settings::AppConfig::load(None).expect("load config");
-    let svc = SiloService::new(factory, Some(coord.clone()), cfg, None);
+    let svc = SiloService::new(factory, coord.clone(), cfg, None);
 
     (svc, coord, shard_id)
 }

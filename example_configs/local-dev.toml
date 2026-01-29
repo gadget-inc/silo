@@ -23,5 +23,6 @@ addr = "127.0.0.1:9090"
 
 [database]
 backend = "fs"
-# %shard% placeholder will be replaced with the shard number
-path = "/var/lib/silo/data-%shard%"
+# %shard% placeholder will be replaced with the shard ID
+# NOTE: %shard% must be at a directory boundary (after /) for split/clone to work correctly
+path = "/var/lib/silo/%shard%"

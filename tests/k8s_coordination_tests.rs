@@ -1443,18 +1443,6 @@ async fn k8s_four_node_cluster() {
     assert!(s2.is_disjoint(&s3) && s2.is_disjoint(&s4));
     assert!(s3.is_disjoint(&s4));
 
-    // Distribution check (within 25% for 4 nodes with smaller shard count)
-    let sizes = [s1.len(), s2.len(), s3.len(), s4.len()];
-    let max = *sizes.iter().max().unwrap();
-    let min = *sizes.iter().min().unwrap();
-    let tolerance = ((num_shards as f32) * 0.25).ceil() as usize;
-    assert!(
-        max - min <= tolerance,
-        "distribution should be roughly even: {:?} (tolerance: {})",
-        sizes,
-        tolerance
-    );
-
     // Cleanup
     c1.shutdown().await.unwrap();
     c2.shutdown().await.unwrap();

@@ -1,0 +1,138 @@
+{% extends "base.html" %}
+
+{% block title %}Shard {{ shard_id }} - Silo{% endblock %}
+
+{% block content %}
+<div class="space-y-4">
+    <div class="flex items-center justify-between">
+        <div class="flex items-center gap-4">
+            <a href="/cluster" class="text-zinc-400 hover:text-emerald-400">&larr; Back to Cluster</a>
+            <h1 class="text-xl font-bold text-zinc-100">Shard Details</h1>
+        </div>
+    </div>
+    
+    {% if let Some(msg) = split_message %}
+    <div class="bg-emerald-900/30 border border-emerald-700 p-4">
+        <div class="text-emerald-400 text-sm font-medium">Success</div>
+        <pre class="text-emerald-300 text-xs mt-2 whitespace-pre-wrap">{{ msg }}</pre>
+    </div>
+    {% endif %}
+    
+    {% if let Some(err) = split_error %}
+    <div class="bg-red-900/30 border border-red-700 p-4">
+        <div class="text-red-400 text-sm font-medium">Error</div>
+        <pre class="text-red-300 text-xs mt-2 whitespace-pre-wrap">{{ err }}</pre>
+    </div>
+    {% endif %}
+    
+    <!-- Shard Info -->
+    <div class="bg-zinc-800 border border-zinc-700 overflow-hidden">
+        <div class="bg-zinc-850 border-b border-zinc-700 px-4 py-2">
+            <h2 class="text-sm font-semibold text-zinc-300">Shard Information</h2>
+        </div>
+        <div class="p-4">
+            <dl class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                    <dt class="text-xs text-zinc-500 uppercase tracking-wider">Shard ID</dt>
+                    <dd class="text-sm text-zinc-200 font-mono mt-1">{{ shard_id }}</dd>
+                </div>
+                <div>
+                    <dt class="text-xs text-zinc-500 uppercase tracking-wider">Owner</dt>
+                    <dd class="text-sm text-zinc-200 mt-1">{{ owner }}</dd>
+                </div>
+                <div>
+                    <dt class="text-xs text-zinc-500 uppercase tracking-wider">Range Start</dt>
+                    <dd class="text-sm text-zinc-200 font-mono mt-1">{{ range_start }}</dd>
+                </div>
+                <div>
+                    <dt class="text-xs text-zinc-500 uppercase tracking-wider">Range End</dt>
+                    <dd class="text-sm text-zinc-200 font-mono mt-1">{{ range_end }}</dd>
+                </div>
+                <div>
+                    <dt class="text-xs text-zinc-500 uppercase tracking-wider">Job Count</dt>
+                    <dd class="text-sm text-zinc-200 mt-1">{{ job_count }}</dd>
+                </div>
+                <div>
+                    <dt class="text-xs text-zinc-500 uppercase tracking-wider">Status</dt>
+                    <dd class="text-sm mt-1">
+                        {% if let Some(phase) = split_phase %}
+                        <span class="px-2 py-0.5 text-xs font-medium border bg-amber-900/50 border-amber-600 text-amber-300">Splitting: {{ phase }}</span>
+                        {% else if let Some(cleanup) = cleanup_status %}
+                        <span class="px-2 py-0.5 text-xs font-medium border bg-blue-900/50 border-blue-700 text-blue-400">{{ cleanup }}</span>
+                        {% else %}
+                        <span class="px-2 py-0.5 text-xs font-medium border bg-green-900/50 border-green-700 text-green-400">Active</span>
+                        {% endif %}
+                    </dd>
+                </div>
+                {% if let Some(parent) = parent_shard_id %}
+                <div>
+                    <dt class="text-xs text-zinc-500 uppercase tracking-wider">Parent Shard</dt>
+                    <dd class="text-sm text-zinc-200 font-mono mt-1">
+                        <a href="/shard?id={{ parent }}" class="text-emerald-400 hover:underline">{{ parent }}</a>
+                    </dd>
+                </div>
+                {% endif %}
+            </dl>
+        </div>
+    </div>
+    
+    <!-- Split Shard Form -->
+    {% if split_phase.is_none() %}
+    <div class="bg-zinc-800 border border-zinc-700 overflow-hidden">
+        <div class="bg-zinc-850 border-b border-zinc-700 px-4 py-2">
+            <h2 class="text-sm font-semibold text-zinc-300">Split Shard</h2>
+        </div>
+        <div class="p-4">
+            <p class="text-zinc-400 text-sm mb-4">
+                Split this shard into two child shards at a specified tenant ID. The left child will
+                own tenant IDs less than the split point, and the right child will own tenant IDs
+                greater than or equal to the split point.
+            </p>
+            <form action="/shard/{{ shard_id }}/split" method="POST" class="space-y-4">
+                <div>
+                    <label for="split_point" class="block text-xs text-zinc-500 uppercase tracking-wider mb-1">
+                        Split Point (Tenant ID)
+                    </label>
+                    <div class="flex gap-2">
+                        <input 
+                            type="text" 
+                            name="split_point" 
+                            id="split_point"
+                            placeholder="Enter tenant ID or leave empty for auto"
+                            class="flex-1 bg-zinc-900 border border-zinc-700 text-zinc-200 text-sm px-3 py-2 font-mono focus:outline-none focus:border-emerald-500"
+                        />
+                        <label class="flex items-center gap-2 text-sm text-zinc-400">
+                            <input type="checkbox" name="auto" value="true" class="bg-zinc-900 border border-zinc-700" />
+                            Auto (midpoint)
+                        </label>
+                    </div>
+                    <p class="text-zinc-500 text-xs mt-1">
+                        Current range: [{{ range_start }}, {{ range_end }})
+                    </p>
+                </div>
+                <div class="flex gap-2">
+                    <button 
+                        type="submit"
+                        class="px-4 py-2 bg-amber-700 hover:bg-amber-600 text-amber-100 text-sm font-medium"
+                    >
+                        Split Shard
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+    {% else %}
+    <div class="bg-amber-900/20 border border-amber-700 overflow-hidden">
+        <div class="bg-amber-900/30 border-b border-amber-700 px-4 py-2">
+            <h2 class="text-sm font-semibold text-amber-300">Split In Progress</h2>
+        </div>
+        <div class="p-4">
+            <p class="text-amber-200 text-sm">
+                A split operation is currently in progress for this shard. Please wait for it to complete
+                before requesting another split.
+            </p>
+        </div>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}

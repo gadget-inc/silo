@@ -57,6 +57,38 @@ impl NoneCoordinator {
 
         Self { base }
     }
+
+    /// Create a single-node coordinator using shards that are already open in the factory.
+    ///
+    /// This is useful for tests where shards are pre-opened with predictable IDs.
+    /// The shard map is built from the factory's existing instances.
+    pub async fn from_factory(
+        node_id: impl Into<String>,
+        grpc_addr: impl Into<String>,
+        factory: Arc<ShardFactory>,
+    ) -> Self {
+        use crate::shard_range::ShardInfo;
+
+        // Build shard map from factory's existing shards
+        let instances = factory.instances();
+        let shard_infos: Vec<ShardInfo> = instances
+            .iter()
+            .map(|(id, shard)| ShardInfo::new(*id, shard.get_range()))
+            .collect();
+        let shard_map = ShardMap::from_shards(shard_infos);
+
+        let base = CoordinatorBase::new(node_id, grpc_addr, shard_map, Arc::clone(&factory));
+
+        // Mark all existing shards as owned
+        {
+            let mut owned = base.owned.lock().await;
+            for shard_id in instances.keys() {
+                owned.insert(*shard_id);
+            }
+        }
+
+        Self { base }
+    }
 }
 
 #[async_trait]
