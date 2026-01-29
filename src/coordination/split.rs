@@ -423,32 +423,70 @@ impl<'a> ShardSplitter<'a> {
                     );
                 }
                 SplitPhase::SplitUpdatingMap => {
+                    // Pre-add BOTH children to owned set BEFORE updating the shard map.
+                    // This prevents a race condition where the shard map watch fires and
+                    // shard guards try to acquire children before we've opened them.
+                    // We'll remove any children we don't actually own after computing ownership.
+                    let both_children = [split.left_child_id, split.right_child_id];
+                    {
+                        let mut owned = self.ctx.owned.lock().await;
+                        for child_id in &both_children {
+                            owned.insert(*child_id);
+                        }
+                    }
+
                     // Update the shard map atomically
                     self.coordinator.update_shard_map_for_split(&split).await?;
 
                     // Reload the shard map to update local cache
                     self.coordinator.reload_shard_map().await?;
 
-                    // Update local ownership state: remove parent, add children if we own them
+                    // Now compute which children we actually own based on the updated shard map
                     let owner_map = get_shard_owner_map().await?;
-                    let children_to_open: Vec<ShardId> = {
+                    let children_we_own: Vec<ShardId> = both_children
+                        .into_iter()
+                        .filter(|child_id| {
+                            owner_map
+                                .shard_to_node
+                                .get(child_id)
+                                .map(|owner| *owner == self.ctx.node_id)
+                                .unwrap_or(false)
+                        })
+                        .collect();
+
+                    // Close the parent shard before opening children.
+                    // The parent is no longer valid after being split - its data now lives
+                    // in the two child shards. Closing it releases database resources and
+                    // ensures no stale references remain.
+                    self.ctx
+                        .factory
+                        .close(&parent_shard_id)
+                        .await
+                        .map_err(|e| {
+                            CoordinationError::BackendError(format!(
+                                "failed to close parent shard {}: {}",
+                                parent_shard_id, e
+                            ))
+                        })?;
+                    info!(
+                        parent_shard_id = %parent_shard_id,
+                        "closed parent shard after split"
+                    );
+
+                    // Update ownership: remove parent and children we don't own
+                    {
                         let mut owned = self.ctx.owned.lock().await;
                         owned.remove(&parent_shard_id);
-
-                        let mut to_open = Vec::new();
-                        for child_id in [split.left_child_id, split.right_child_id] {
-                            if let Some(owner_node_id) = owner_map.shard_to_node.get(&child_id)
-                                && *owner_node_id == self.ctx.node_id
-                            {
-                                owned.insert(child_id);
-                                to_open.push(child_id);
+                        // Remove children we don't own (they were pre-added to prevent race)
+                        for child_id in &both_children {
+                            if !children_we_own.contains(child_id) {
+                                owned.remove(child_id);
                             }
                         }
-                        to_open
-                    };
+                    }
 
-                    // Open the child shards we now own
-                    for child_id in children_to_open {
+                    // Open the child shards we own
+                    for child_id in children_we_own {
                         // Look up the child's range from the reloaded shard map
                         let range = {
                             let map = self.ctx.shard_map.lock().await;
