@@ -75,11 +75,11 @@ where
     false
 }
 
-/// Start a K8S coordinator, skipping the test if K8S is not available
+/// Start a K8S coordinator, failing the test if K8S is not available
 macro_rules! start_coordinator {
     ($namespace:expr, $prefix:expr, $node_id:expr, $grpc_addr:expr, $num_shards:expr) => {{
         let factory = make_test_factory($node_id);
-        match K8sCoordinator::start(
+        K8sCoordinator::start(
             $namespace,
             $prefix,
             $node_id,
@@ -89,13 +89,7 @@ macro_rules! start_coordinator {
             factory,
         )
         .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("Skipping K8S test - could not connect to cluster: {}", e);
-                return;
-            }
-        }
+        .expect("Failed to connect to K8s cluster - ensure cluster is accessible")
     }};
 }
 
@@ -2980,7 +2974,8 @@ async fn k8s_sequential_splits_work_correctly() {
 async fn k8s_split_in_multi_node_cluster() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
-    let num_shards: u32 = 2;
+    // Use 8 shards to ensure even distribution across 2 nodes via rendezvous hashing
+    let num_shards: u32 = 8;
 
     let (c1, h1) = start_coordinator!(
         &namespace,
@@ -3041,8 +3036,9 @@ async fn k8s_split_in_multi_node_cluster() {
         .expect("execute_split");
 
     // Verify c1 sees the updated shard map immediately (it performed the split)
+    // After splitting one shard: 8 original - 1 split + 2 children = 9 shards
     let map1 = c1.get_shard_map().await.unwrap();
-    assert_eq!(map1.len(), 3, "c1 should see 3 shards");
+    assert_eq!(map1.len(), 9, "c1 should see 9 shards");
     assert!(map1.get_shard(&split.left_child_id).is_some());
     assert!(map1.get_shard(&split.right_child_id).is_some());
 
