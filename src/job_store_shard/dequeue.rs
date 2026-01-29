@@ -9,7 +9,7 @@ use crate::job::{JobStatus, JobView};
 use crate::job_attempt::{AttemptStatus, JobAttempt};
 use crate::job_store_shard::helpers::now_epoch_ms;
 use crate::job_store_shard::{DequeueResult, JobStoreShard, JobStoreShardError};
-use crate::keys::{attempt_key, job_info_key, leased_task_key};
+use crate::keys::{attempt_key, decode_tenant, job_info_key, leased_task_key};
 use crate::task::{DEFAULT_LEASE_MS, LeaseRecord, LeasedRefreshTask, LeasedTask, Task};
 use crate::task_broker::BrokerTask;
 
@@ -71,8 +71,30 @@ impl JobStoreShard {
             let mut ack_keys: Vec<String> = Vec::with_capacity(claimed.len());
             let mut processed_internal = false;
 
+            // Get the shard range for split-aware filtering
+            let shard_range = self.get_range();
+
             for entry in &claimed {
                 let task = &entry.task;
+
+                // [SILO-SPLIT-AWARE-1] Check if task's tenant is within shard range
+                // Tasks for tenants outside the range are defunct (from before a split)
+                let task_tenant = task.tenant();
+                let decoded_tenant = decode_tenant(task_tenant);
+
+                if !shard_range.contains(&decoded_tenant) {
+                    // Task is for a tenant outside our range - delete and skip
+                    batch.delete(entry.key.as_bytes());
+                    ack_keys.push(entry.key.clone());
+                    tracing::debug!(
+                        key = %entry.key,
+                        tenant = %decoded_tenant,
+                        range = %shard_range,
+                        "dequeue: skipping defunct task (tenant outside shard range)"
+                    );
+                    continue;
+                }
+
                 // Internal tasks are processed inside the store and not leased
                 match task {
                     Task::RequestTicket {

@@ -20,7 +20,11 @@ pub enum StorageError {
 /// Result of resolving an object store, includes the canonical path used
 pub struct ResolvedStore {
     pub store: Arc<dyn ObjectStore>,
+    /// Path to use with DbBuilder - empty for LocalFileSystem since the root is already set
     pub canonical_path: String,
+    /// Actual filesystem root path - used for WAL cleanup and other operations
+    /// that need to know the real location on disk. Same as canonical_path for non-Fs backends.
+    pub root_path: String,
 }
 
 pub fn resolve_object_store(backend: &Backend, path: &str) -> Result<ResolvedStore, StorageError> {
@@ -42,14 +46,18 @@ pub fn resolve_object_store(backend: &Backend, path: &str) -> Result<ResolvedSto
             // Use slatedb's re-exported object_store to ensure trait compatibility
             let fs = slatedb::object_store::local::LocalFileSystem::new_with_prefix(&canonical_str)
                 .map_err(|e| StorageError::InvalidUrl(format!("{}", e)))?;
+            // For LocalFileSystem, the path is the root, so DbBuilder should use empty path
+            // to refer to data at that location (not the full path which would create subdirs)
             Ok(ResolvedStore {
                 store: Arc::new(fs),
-                canonical_path: canonical_str,
+                canonical_path: String::new(),
+                root_path: canonical_str,
             })
         }
         Backend::Memory => Ok(ResolvedStore {
             store: Arc::new(slatedb::object_store::memory::InMemory::new()),
             canonical_path: path.to_string(),
+            root_path: path.to_string(),
         }),
         Backend::S3 | Backend::Gcs | Backend::Url => {
             // Interpret path as a URL understood by SlateDB's resolver, e.g. s3://bucket/prefix or gs://bucket/prefix
@@ -76,7 +84,8 @@ pub fn resolve_object_store(backend: &Backend, path: &str) -> Result<ResolvedSto
 
             Ok(ResolvedStore {
                 store,
-                canonical_path,
+                canonical_path: canonical_path.clone(),
+                root_path: canonical_path,
             })
         }
     }

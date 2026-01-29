@@ -1,6 +1,6 @@
 //! Integration tests for Gubernator rate limiting.
 //!
-//! These tests require a real Gubernator server running at localhost:9991.
+//! These tests require a real Gubernator server running at localhost:9992.
 //! Run with: `process-compose up` to start the required services.
 
 mod test_helpers;
@@ -14,10 +14,11 @@ use silo::job::{
 use silo::job_attempt::AttemptOutcome;
 use silo::job_store_shard::JobStoreShard;
 use silo::settings::{Backend, DatabaseConfig};
+use silo::shard_range::ShardRange;
 
 use test_helpers::*;
 
-const GUBERNATOR_ADDRESS: &str = "http://localhost:9991";
+const GUBERNATOR_ADDRESS: &str = "http://localhost:9992";
 
 /// Create a real Gubernator client connected to the local server
 async fn create_gubernator_client() -> Arc<GubernatorClient> {
@@ -49,7 +50,7 @@ async fn open_shard_with_gubernator()
         wal: None,
         apply_wal_on_close: true,
     };
-    let shard = JobStoreShard::open(&cfg, gubernator.clone(), None)
+    let shard = JobStoreShard::open(&cfg, gubernator.clone(), None, ShardRange::full())
         .await
         .expect("open shard");
     (tmp, shard, gubernator)

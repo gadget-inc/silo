@@ -39,7 +39,10 @@ async fn create_multi_shard_factory(
     let shard_map =
         ShardMap::create_initial(num_shards as u32).expect("failed to create shard map");
     for shard_info in shard_map.shards() {
-        factory.open(&shard_info.id).await.expect("open shard");
+        factory
+            .open(&shard_info.id, &shard_info.range)
+            .await
+            .expect("open shard");
     }
 
     (temps, factory, shard_map)
@@ -626,7 +629,7 @@ async fn cluster_query_multi_shard_empty_some_shards() {
 
 #[silo::test]
 async fn cluster_query_multi_shard_all_empty() {
-    let (_temps, factory, shard_map) = create_multi_shard_factory(3).await;
+    let (_temps, factory, _shard_map) = create_multi_shard_factory(3).await;
 
     let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
@@ -759,7 +762,7 @@ async fn cluster_query_queues_table_multi_shard() {
 
 #[silo::test]
 async fn cluster_query_explain_shows_partitions() {
-    let (_temps, factory, shard_map) = create_multi_shard_factory(3).await;
+    let (_temps, factory, _shard_map) = create_multi_shard_factory(3).await;
 
     let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
@@ -842,7 +845,7 @@ async fn cluster_query_metadata_filter_multi_shard() {
 
 #[silo::test]
 async fn cluster_query_malformed_sql_syntax_error() {
-    let (_temps, factory, shard_map) = create_multi_shard_factory(2).await;
+    let (_temps, factory, _shard_map) = create_multi_shard_factory(2).await;
 
     let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
@@ -862,7 +865,7 @@ async fn cluster_query_malformed_sql_syntax_error() {
 
 #[silo::test]
 async fn cluster_query_invalid_column_name() {
-    let (_temps, factory, shard_map) = create_multi_shard_factory(2).await;
+    let (_temps, factory, _shard_map) = create_multi_shard_factory(2).await;
 
     let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
@@ -875,7 +878,7 @@ async fn cluster_query_invalid_column_name() {
 
 #[silo::test]
 async fn cluster_query_invalid_table_name() {
-    let (_temps, factory, shard_map) = create_multi_shard_factory(2).await;
+    let (_temps, factory, _shard_map) = create_multi_shard_factory(2).await;
 
     let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
@@ -888,7 +891,7 @@ async fn cluster_query_invalid_table_name() {
 
 #[silo::test]
 async fn cluster_query_type_mismatch_in_filter() {
-    let (_temps, factory, shard_map) = create_multi_shard_factory(2).await;
+    let (_temps, factory, _shard_map) = create_multi_shard_factory(2).await;
 
     let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
@@ -914,7 +917,7 @@ async fn cluster_query_type_mismatch_in_filter() {
 
 #[silo::test]
 async fn cluster_query_empty_sql() {
-    let (_temps, factory, shard_map) = create_multi_shard_factory(1).await;
+    let (_temps, factory, _shard_map) = create_multi_shard_factory(1).await;
 
     let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
@@ -926,7 +929,7 @@ async fn cluster_query_empty_sql() {
 
 #[silo::test]
 async fn cluster_query_sql_with_only_whitespace() {
-    let (_temps, factory, shard_map) = create_multi_shard_factory(1).await;
+    let (_temps, factory, _shard_map) = create_multi_shard_factory(1).await;
 
     let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await

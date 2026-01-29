@@ -375,7 +375,7 @@ fun shardParent[s: Shard, t: Time]: set Shard {
 }
 
 /** Get the cleanup status of a shard at time t */
-fun shardCleanupStatus[s: Shard, t: Time]: set CleanupStatus {
+fun shardSplitCleanupStatus[s: Shard, t: Time]: set CleanupStatus {
     (shardMapEntryAt[s, t]).sme_cleanupStatus
 }
 
@@ -1036,27 +1036,27 @@ pred workerCacheInit[w: Worker, tenant: TenantId, s: Shard, t: Time, tnext: Time
 }
 
 /** Check if a shard has cleanup pending */
-pred cleanupPendingFor[s: Shard, t: Time] {
-    shardCleanupStatus[s, t] = CleanupPending
+pred splitCleanupPendingFor[s: Shard, t: Time] {
+    shardSplitCleanupStatus[s, t] = CleanupPending
 }
 
 /** Check if a shard's cleanup is running */
-pred cleanupRunningFor[s: Shard, t: Time] {
-    shardCleanupStatus[s, t] = CleanupRunning
+pred splitCleanupRunningFor[s: Shard, t: Time] {
+    shardSplitCleanupStatus[s, t] = CleanupRunning
 }
 
 /** Check if a shard's cleanup is done */
-pred cleanupDoneFor[s: Shard, t: Time] {
-    shardCleanupStatus[s, t] = CleanupDone
+pred splitCleanupDoneFor[s: Shard, t: Time] {
+    shardSplitCleanupStatus[s, t] = CleanupDone
 }
 
 /** Check if a shard's compaction is done */
-pred compactionDoneFor[s: Shard, t: Time] {
-    shardCleanupStatus[s, t] = CompactionDone
+pred splitCompactionDoneFor[s: Shard, t: Time] {
+    shardSplitCleanupStatus[s, t] = CompactionDone
 }
 
 /**
- * [SILO-CLEANUP-START-1] Start cleanup process for a shard.
+ * [SILO-SPLIT-CLEANUP-START-1] Start cleanup process for a shard.
  * 
  * After a split, the child shards contain defunct data (keys outside their range).
  * This starts the background process to delete that data.
@@ -1069,12 +1069,12 @@ pred compactionDoneFor[s: Shard, t: Time] {
  * Postconditions:
  * - Cleanup status transitions to CleanupRunning
  */
-pred cleanupStart[n: Node, s: Shard, t: Time, tnext: Time] {
+pred splitCleanupStart[n: Node, s: Shard, t: Time, tnext: Time] {
     -- Pre: Shard exists
     shardExists[s, t]
     
     -- Pre: Cleanup pending
-    cleanupPendingFor[s, t]
+    splitCleanupPendingFor[s, t]
     
     -- Pre: Node holds lease
     holdsLease[n, s, t]
@@ -1093,11 +1093,11 @@ pred cleanupStart[n: Node, s: Shard, t: Time, tnext: Time] {
     }
     
     -- Frame: Other shards unchanged
-    all s2: Shard | s2 != s implies shardCleanupStatus[s2, tnext] = shardCleanupStatus[s2, t]
+    all s2: Shard | s2 != s implies shardSplitCleanupStatus[s2, tnext] = shardSplitCleanupStatus[s2, t]
 }
 
 /**
- * [SILO-CLEANUP-1] Complete cleanup of defunct data.
+ * [SILO-SPLIT-CLEANUP-1] Complete cleanup of defunct data.
  * 
  * The background process has finished deleting keys that are outside
  * this shard's tenant_id range.
@@ -1110,12 +1110,12 @@ pred cleanupStart[n: Node, s: Shard, t: Time, tnext: Time] {
  * Postconditions:
  * - Cleanup status transitions to CleanupDone
  */
-pred cleanupComplete[n: Node, s: Shard, t: Time, tnext: Time] {
+pred splitCleanupComplete[n: Node, s: Shard, t: Time, tnext: Time] {
     -- Pre: Shard exists
     shardExists[s, t]
     
     -- Pre: Cleanup is running
-    cleanupRunningFor[s, t]
+    splitCleanupRunningFor[s, t]
     
     -- Pre: Node holds lease
     holdsLease[n, s, t]
@@ -1134,11 +1134,11 @@ pred cleanupComplete[n: Node, s: Shard, t: Time, tnext: Time] {
     }
     
     -- Frame: Other shards unchanged
-    all s2: Shard | s2 != s implies shardCleanupStatus[s2, tnext] = shardCleanupStatus[s2, t]
+    all s2: Shard | s2 != s implies shardSplitCleanupStatus[s2, tnext] = shardSplitCleanupStatus[s2, t]
 }
 
 /**
- * [SILO-COMPACT-1] Run full compaction on a cleaned shard.
+ * [SILO-SPLIT-COMPACT-1] Run full compaction on a cleaned shard.
  * 
  * After cleanup, we run a full compaction using SlateDB's Admin API
  * to reclaim storage space from deleted keys.
@@ -1156,7 +1156,7 @@ pred compactShard[n: Node, s: Shard, t: Time, tnext: Time] {
     shardExists[s, t]
     
     -- Pre: Cleanup is done
-    cleanupDoneFor[s, t]
+    splitCleanupDoneFor[s, t]
     
     -- Pre: Node holds lease
     holdsLease[n, s, t]
@@ -1175,11 +1175,11 @@ pred compactShard[n: Node, s: Shard, t: Time, tnext: Time] {
     }
     
     -- Frame: Other shards unchanged
-    all s2: Shard | s2 != s implies shardCleanupStatus[s2, tnext] = shardCleanupStatus[s2, t]
+    all s2: Shard | s2 != s implies shardSplitCleanupStatus[s2, tnext] = shardSplitCleanupStatus[s2, t]
 }
 
 /**
- * [SILO-CLEANUP-RESTART-1] Restart cleanup on a new node.
+ * [SILO-SPLIT-CLEANUP-RESTART-1] Restart cleanup on a new node.
  * 
  * If a node takes over a shard mid-cleanup (e.g., after node failure),
  * it must restart the cleanup process from the beginning.
@@ -1197,14 +1197,14 @@ pred cleanupRestart[n: Node, s: Shard, t: Time, tnext: Time] {
     shardExists[s, t]
     
     -- Pre: Cleanup was running
-    cleanupRunningFor[s, t]
+    splitCleanupRunningFor[s, t]
     
     -- Pre: Node just acquired lease (wasn't holder at t)
     not holdsLease[n, s, t]
     holdsLease[n, s, tnext]
     
     -- Post: Cleanup status still running (restarts from beginning)
-    shardCleanupStatus[s, tnext] = CleanupRunning
+    shardSplitCleanupStatus[s, tnext] = CleanupRunning
 }
 
 fact wellFormed {
@@ -1358,7 +1358,7 @@ pred shardMapFrameExcept[shards: set Shard, t: Time, tnext: Time] {
         shardExists[s, t] implies {
             shardRangeStart[s, tnext] = shardRangeStart[s, t]
             shardRangeEnd[s, tnext] = shardRangeEnd[s, t]
-            shardCleanupStatus[s, tnext] = shardCleanupStatus[s, t]
+            shardSplitCleanupStatus[s, tnext] = shardSplitCleanupStatus[s, t]
             shardParent[s, tnext] = shardParent[s, t]
         }
     }
@@ -1371,7 +1371,7 @@ pred shardMapFrame[t: Time, tnext: Time] {
         shardExists[s, t] implies {
             shardRangeStart[s, tnext] = shardRangeStart[s, t]
             shardRangeEnd[s, tnext] = shardRangeEnd[s, t]
-            shardCleanupStatus[s, tnext] = shardCleanupStatus[s, t]
+            shardSplitCleanupStatus[s, tnext] = shardSplitCleanupStatus[s, t]
             shardParent[s, tnext] = shardParent[s, t]
         }
     }
@@ -1454,8 +1454,8 @@ pred step[t: Time, tnext: Time] {
     or (some n: Node, s: Shard | splitResumeStep[n, s, t, tnext])  -- Resume after crash
     
     -- Cleanup and compaction
-    or (some n: Node, s: Shard | cleanupStartStep[n, s, t, tnext])
-    or (some n: Node, s: Shard | cleanupCompleteStep[n, s, t, tnext])
+    or (some n: Node, s: Shard | splitCleanupStartStep[n, s, t, tnext])
+    or (some n: Node, s: Shard | splitCleanupCompleteStep[n, s, t, tnext])
     or (some n: Node, s: Shard | compactShardStep[n, s, t, tnext])
     
     -- Worker transitions
@@ -1577,7 +1577,7 @@ pred shardCreateInitialStep[s: Shard, t: Time, tnext: Time] {
     shardRangeStart[s, tnext] = TenantMin
     shardRangeEnd[s, tnext] = TenantMax
     no shardParent[s, tnext]
-    shardCleanupStatus[s, tnext] = CompactionDone  -- Initial shard doesn't need cleanup
+    shardSplitCleanupStatus[s, tnext] = CompactionDone  -- Initial shard doesn't need cleanup
     
     -- Frame conditions
     membershipFrame[t, tnext]
@@ -1739,14 +1739,14 @@ pred splitUpdateMapStep[n: Node, s: Shard, t: Time, tnext: Time] {
             shardRangeStart[leftChild, tnext] = shardRangeStart[s, t]
             shardRangeEnd[leftChild, tnext] = splitPt
             shardParent[leftChild, tnext] = s
-            shardCleanupStatus[leftChild, tnext] = CleanupPending
+            shardSplitCleanupStatus[leftChild, tnext] = CleanupPending
             
             -- Right child: [split_point, parent_end)
             shardExists[rightChild, tnext]
             shardRangeStart[rightChild, tnext] = splitPt
             shardRangeEnd[rightChild, tnext] = shardRangeEnd[s, t]
             shardParent[rightChild, tnext] = s
-            shardCleanupStatus[rightChild, tnext] = CleanupPending
+            shardSplitCleanupStatus[rightChild, tnext] = CleanupPending
             
             -- Split phase advances
             splitInProgressFor[s, tnext]
@@ -1763,7 +1763,7 @@ pred splitUpdateMapStep[n: Node, s: Shard, t: Time, tnext: Time] {
                 shardExists[s2, t] implies {
                     shardRangeStart[s2, tnext] = shardRangeStart[s2, t]
                     shardRangeEnd[s2, tnext] = shardRangeEnd[s2, t]
-                    shardCleanupStatus[s2, tnext] = shardCleanupStatus[s2, t]
+                    shardSplitCleanupStatus[s2, tnext] = shardSplitCleanupStatus[s2, t]
                 }
             }
         }
@@ -1871,15 +1871,15 @@ pred splitResumeStep[n: Node, s: Shard, t: Time, tnext: Time] {
  */
 
 /** Cleanup start with full frame conditions */
-pred cleanupStartStep[n: Node, s: Shard, t: Time, tnext: Time] {
+pred splitCleanupStartStep[n: Node, s: Shard, t: Time, tnext: Time] {
     -- Preconditions
     shardExists[s, t]
-    cleanupPendingFor[s, t]
+    splitCleanupPendingFor[s, t]
     holdsLease[n, s, t]
     
     -- Postconditions
     shardExists[s, tnext]
-    shardCleanupStatus[s, tnext] = CleanupRunning
+    shardSplitCleanupStatus[s, tnext] = CleanupRunning
     -- Preserve other shard properties
     shardRangeStart[s, tnext] = shardRangeStart[s, t]
     shardRangeEnd[s, tnext] = shardRangeEnd[s, t]
@@ -1894,15 +1894,15 @@ pred cleanupStartStep[n: Node, s: Shard, t: Time, tnext: Time] {
 }
 
 /** Cleanup complete with full frame conditions */
-pred cleanupCompleteStep[n: Node, s: Shard, t: Time, tnext: Time] {
+pred splitCleanupCompleteStep[n: Node, s: Shard, t: Time, tnext: Time] {
     -- Preconditions
     shardExists[s, t]
-    cleanupRunningFor[s, t]
+    splitCleanupRunningFor[s, t]
     holdsLease[n, s, t]
     
     -- Postconditions
     shardExists[s, tnext]
-    shardCleanupStatus[s, tnext] = CleanupDone
+    shardSplitCleanupStatus[s, tnext] = CleanupDone
     -- Preserve other shard properties
     shardRangeStart[s, tnext] = shardRangeStart[s, t]
     shardRangeEnd[s, tnext] = shardRangeEnd[s, t]
@@ -1920,12 +1920,12 @@ pred cleanupCompleteStep[n: Node, s: Shard, t: Time, tnext: Time] {
 pred compactShardStep[n: Node, s: Shard, t: Time, tnext: Time] {
     -- Preconditions
     shardExists[s, t]
-    cleanupDoneFor[s, t]
+    splitCleanupDoneFor[s, t]
     holdsLease[n, s, t]
     
     -- Postconditions
     shardExists[s, tnext]
-    shardCleanupStatus[s, tnext] = CompactionDone
+    shardSplitCleanupStatus[s, tnext] = CompactionDone
     -- Preserve other shard properties
     shardRangeStart[s, tnext] = shardRangeStart[s, t]
     shardRangeEnd[s, tnext] = shardRangeEnd[s, t]
@@ -2067,10 +2067,10 @@ assert leaseRequiresMembership {
 }
 
 /**
- * [SILO-COORD-INV-7] Cleanup status is consistent.
+ * Cleanup status is consistent.
  * 
  * The cleanup status follows a progression: Pending -> Running -> Done -> CompactionDone.
- * This verifies the CleanupStatus values are valid (always true, but good to check).
+ * This verifies the CleanupStatus values are valid
  */
 assert cleanupStatusIsValid {
     all sme: ShardMapEntry | 
@@ -2106,12 +2106,12 @@ assert splitParentExists {
 assert cleanupStatusMonotonic {
     all s: Shard, t1, t2: Time | 
         lt[t1, t2] and shardExists[s, t1] and shardExists[s, t2] implies {
-            (shardCleanupStatus[s, t1] = CleanupRunning implies 
-                shardCleanupStatus[s, t2] in (CleanupRunning + CleanupDone + CompactionDone))
-            (shardCleanupStatus[s, t1] = CleanupDone implies 
-                shardCleanupStatus[s, t2] in (CleanupDone + CompactionDone))
-            (shardCleanupStatus[s, t1] = CompactionDone implies 
-                shardCleanupStatus[s, t2] = CompactionDone)
+            (shardSplitCleanupStatus[s, t1] = CleanupRunning implies 
+                shardSplitCleanupStatus[s, t2] in (CleanupRunning + CleanupDone + CompactionDone))
+            (shardSplitCleanupStatus[s, t1] = CleanupDone implies 
+                shardSplitCleanupStatus[s, t2] in (CleanupDone + CompactionDone))
+            (shardSplitCleanupStatus[s, t1] = CompactionDone implies 
+                shardSplitCleanupStatus[s, t2] = CompactionDone)
         }
 }
 
@@ -2354,8 +2354,8 @@ pred exampleShardSplit {
         some tChildren: Time | {
             shardExists[left, tChildren]
             shardExists[right, tChildren]
-            cleanupPendingFor[left, tChildren]
-            cleanupPendingFor[right, tChildren]
+            splitCleanupPendingFor[left, tChildren]
+            splitCleanupPendingFor[right, tChildren]
             -- Children are contiguous
             shardRangeEnd[left, tChildren] = shardRangeStart[right, tChildren]
         }

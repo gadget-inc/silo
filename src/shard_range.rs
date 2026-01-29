@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
 
+use crate::coordination::{SplitCleanupStatus, SplitPhase};
+
 /// A unique identifier for a shard.
 ///
 /// Shards have immutable identities that persist across restarts and
@@ -126,6 +128,130 @@ impl ShardRange {
     pub fn is_full(&self) -> bool {
         self.start.is_empty() && self.end.is_empty()
     }
+
+    /// [SILO-COORD-INV-2] Split this range at the given point into two contiguous ranges.
+    ///
+    /// Returns `(left, right)` where:
+    /// - `left` = [self.start, split_point)
+    /// - `right` = [split_point, self.end)
+    ///
+    /// # Errors
+    /// Returns an error if the split point is not strictly within the range.
+    pub fn split(&self, split_point: &str) -> Result<(ShardRange, ShardRange), ShardMapError> {
+        // [SILO-RANGE-1] Validate that split_point is within this range
+        if !self.contains(split_point) {
+            return Err(ShardMapError::InvalidSplitPoint(format!(
+                "split point '{}' is not within range {}",
+                split_point, self
+            )));
+        }
+
+        // split_point must be strictly after start (can't split at the start)
+        if !self.start.is_empty() && split_point <= self.start.as_str() {
+            return Err(ShardMapError::InvalidSplitPoint(format!(
+                "split point '{}' must be strictly after range start '{}'",
+                split_point, self.start
+            )));
+        }
+
+        // split_point must be strictly before end (can't split at the end)
+        if !self.end.is_empty() && split_point >= self.end.as_str() {
+            return Err(ShardMapError::InvalidSplitPoint(format!(
+                "split point '{}' must be strictly before range end '{}'",
+                split_point, self.end
+            )));
+        }
+
+        let left = ShardRange {
+            start: self.start.clone(),
+            end: split_point.to_string(),
+        };
+        let right = ShardRange {
+            start: split_point.to_string(),
+            end: self.end.clone(),
+        };
+
+        // [SILO-COORD-INV-3] Verify children are contiguous
+        debug_assert_eq!(left.end, right.start);
+
+        Ok((left, right))
+    }
+
+    /// Compute the lexicographic midpoint of this range for auto-split.
+    ///
+    /// Returns None if the range cannot be split (e.g., single character range).
+    pub fn midpoint(&self) -> Option<String> {
+        // For unbounded ranges, we need to pick reasonable bounds
+        let effective_start = if self.start.is_empty() {
+            "0".to_string()
+        } else {
+            self.start.clone()
+        };
+
+        let effective_end = if self.end.is_empty() {
+            // Use a reasonably high value (all 'z's)
+            "zzzzzzzz".to_string()
+        } else {
+            self.end.clone()
+        };
+
+        // Simple midpoint: take first char of start, compute midpoint with first char of end
+        // This is a simplified approach; a production system might use more sophisticated logic
+        if effective_start >= effective_end {
+            return None;
+        }
+
+        // Binary search through the string space
+        let start_bytes = effective_start.as_bytes();
+        let end_bytes = effective_end.as_bytes();
+
+        // Find the first differing position
+        let min_len = start_bytes.len().min(end_bytes.len());
+        let mut diff_pos = 0;
+        while diff_pos < min_len && start_bytes[diff_pos] == end_bytes[diff_pos] {
+            diff_pos += 1;
+        }
+
+        if diff_pos == min_len {
+            // One is a prefix of the other
+            if start_bytes.len() < end_bytes.len() {
+                // Start is shorter, we can split by extending start
+                let mut mid = effective_start.clone();
+                // Add a character that's midway through ASCII printable range
+                mid.push('M');
+                if mid.as_str() > effective_start.as_str() && mid.as_str() < effective_end.as_str()
+                {
+                    return Some(mid);
+                }
+            }
+            return None;
+        }
+
+        // Compute midpoint at the differing position
+        let start_char = start_bytes[diff_pos];
+        let end_char = end_bytes[diff_pos];
+
+        if end_char <= start_char + 1 {
+            // Too close to split at this level, extend
+            let mut mid = String::from_utf8_lossy(&start_bytes[..=diff_pos]).to_string();
+            mid.push('~'); // High ASCII value
+            if mid.as_str() > effective_start.as_str() && mid.as_str() < effective_end.as_str() {
+                return Some(mid);
+            }
+            return None;
+        }
+
+        let mid_char = start_char + (end_char - start_char) / 2;
+        let mut result = String::from_utf8_lossy(&start_bytes[..diff_pos]).to_string();
+        result.push(mid_char as char);
+
+        // Validate the result
+        if result.as_str() > effective_start.as_str() && result.as_str() < effective_end.as_str() {
+            Some(result)
+        } else {
+            None
+        }
+    }
 }
 
 impl fmt::Display for ShardRange {
@@ -155,6 +281,9 @@ pub struct ShardInfo {
     pub created_at_ms: i64,
     /// If this shard was created by splitting another shard, the parent's ID.
     pub parent_shard_id: Option<ShardId>,
+    /// Cleanup status for post-split data cleanup.
+    #[serde(default)]
+    pub cleanup_status: SplitCleanupStatus,
 }
 
 impl ShardInfo {
@@ -168,6 +297,7 @@ impl ShardInfo {
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0),
             parent_shard_id: None,
+            cleanup_status: SplitCleanupStatus::CompactionDone,
         }
     }
 
@@ -178,10 +308,12 @@ impl ShardInfo {
             range,
             created_at_ms,
             parent_shard_id: None,
+            cleanup_status: SplitCleanupStatus::CompactionDone,
         }
     }
 
     /// Create a new shard info that was split from a parent.
+    /// The new shard has CleanupPending status since it needs to clean defunct data.
     pub fn from_split(id: ShardId, range: ShardRange, parent_id: ShardId) -> Self {
         Self {
             id,
@@ -191,12 +323,72 @@ impl ShardInfo {
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0),
             parent_shard_id: Some(parent_id),
+            cleanup_status: SplitCleanupStatus::CleanupPending,
         }
     }
 
     /// Check if this shard's range contains the given tenant ID.
     pub fn contains(&self, tenant_id: &str) -> bool {
         self.range.contains(tenant_id)
+    }
+}
+
+/// Tracks an in-progress shard split operation.
+///
+/// The split creates two child shards from one parent, dividing the keyspace
+/// at a specified split point. This struct persists in the coordination backend
+/// to enable crash recovery.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitInProgress {
+    /// The parent shard being split
+    pub parent_shard_id: ShardId,
+    /// The tenant ID where the keyspace is split.
+    /// Left child: [parent_start, split_point)
+    /// Right child: [split_point, parent_end)
+    pub split_point: String,
+    /// The left child shard (tenant IDs < split_point)
+    pub left_child_id: ShardId,
+    /// The right child shard (tenant IDs >= split_point)
+    pub right_child_id: ShardId,
+    /// Current phase of the split operation
+    pub phase: SplitPhase,
+    /// Timestamp when the split was requested (milliseconds since epoch)
+    pub requested_at_ms: i64,
+    /// Node ID that initiated the split (for crash recovery)
+    pub initiator_node_id: String,
+}
+
+impl SplitInProgress {
+    /// Create a new split operation in the SplitRequested phase.
+    pub fn new(parent_shard_id: ShardId, split_point: String, initiator_node_id: String) -> Self {
+        Self {
+            parent_shard_id,
+            split_point,
+            left_child_id: ShardId::new(),
+            right_child_id: ShardId::new(),
+            phase: SplitPhase::SplitRequested,
+            requested_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+            initiator_node_id,
+        }
+    }
+
+    /// Advance to the next phase.
+    pub fn advance_phase(&mut self) {
+        self.phase = match self.phase {
+            SplitPhase::SplitRequested => SplitPhase::SplitPausing,
+            SplitPhase::SplitPausing => SplitPhase::SplitCloning,
+            SplitPhase::SplitCloning => SplitPhase::SplitUpdatingMap,
+            SplitPhase::SplitUpdatingMap => SplitPhase::SplitComplete,
+            SplitPhase::SplitComplete => SplitPhase::SplitComplete, // Terminal
+        };
+    }
+
+    /// Check if the split is complete.
+    pub fn is_complete(&self) -> bool {
+        self.phase == SplitPhase::SplitComplete
     }
 }
 
@@ -404,6 +596,86 @@ impl ShardMap {
         map.sort_shards();
         map
     }
+
+    /// [SILO-SPLIT-MAP-1] Atomically split a shard into two children.
+    ///
+    /// This removes the parent shard and replaces it with two child shards
+    /// whose ranges are [parent_start, split_point) and [split_point, parent_end).
+    ///
+    /// The children are created with:
+    /// - CleanupPending status (they need to clean defunct data)
+    /// - parent_shard_id set to the parent's ID
+    ///
+    /// # Returns
+    /// Returns `(left_child_info, right_child_info)` on success.
+    ///
+    /// # Errors
+    /// - `ShardNotFound` if the parent shard doesn't exist
+    /// - `InvalidSplitPoint` if the split point is not valid for the parent's range
+    pub fn split_shard(
+        &mut self,
+        parent_id: &ShardId,
+        split_point: &str,
+        left_child_id: ShardId,
+        right_child_id: ShardId,
+    ) -> Result<(ShardInfo, ShardInfo), ShardMapError> {
+        // Find the parent shard
+        let parent_idx = self
+            .shards
+            .iter()
+            .position(|s| &s.id == parent_id)
+            .ok_or(ShardMapError::ShardNotFound(*parent_id))?;
+
+        let parent = &self.shards[parent_idx];
+
+        // [SILO-COORD-INV-2] Compute child ranges
+        let (left_range, right_range) = parent.range.split(split_point)?;
+
+        // Create child shards with CleanupPending status
+        let left_child = ShardInfo::from_split(left_child_id, left_range, *parent_id);
+        let right_child = ShardInfo::from_split(right_child_id, right_range, *parent_id);
+
+        // Remove parent and add children
+        self.shards.remove(parent_idx);
+        self.shards.push(left_child.clone());
+        self.shards.push(right_child.clone());
+
+        // Re-sort and bump version
+        self.sort_shards();
+        self.version += 1;
+
+        // Validate the resulting map
+        self.validate()?;
+
+        Ok((left_child, right_child))
+    }
+
+    /// Update the cleanup status for a shard.
+    ///
+    /// Used during post-split cleanup to track progress.
+    pub fn update_cleanup_status(
+        &mut self,
+        shard_id: &ShardId,
+        status: SplitCleanupStatus,
+    ) -> Result<(), ShardMapError> {
+        let shard = self
+            .shards
+            .iter_mut()
+            .find(|s| &s.id == shard_id)
+            .ok_or(ShardMapError::ShardNotFound(*shard_id))?;
+
+        shard.cleanup_status = status;
+        self.version += 1;
+        Ok(())
+    }
+
+    /// Get all shards that need cleanup (CleanupPending or CleanupRunning).
+    pub fn shards_needing_cleanup(&self) -> Vec<&ShardInfo> {
+        self.shards
+            .iter()
+            .filter(|s| s.cleanup_status.needs_work())
+            .collect()
+    }
 }
 
 impl Default for ShardMap {
@@ -432,6 +704,12 @@ pub enum ShardMapError {
 
     #[error("shard not found: {0}")]
     ShardNotFound(ShardId),
+
+    #[error("invalid split point: {0}")]
+    InvalidSplitPoint(String),
+
+    #[error("split already in progress for shard: {0}")]
+    SplitAlreadyInProgress(ShardId),
 }
 
 /// Compute evenly-spaced range boundaries for the given shard count.

@@ -29,13 +29,15 @@ processes:
   gubernator:
     command: gubernator
     environment:
-      - GUBER_GRPC_ADDRESS=127.0.0.1:9991
-      - GUBER_HTTP_ADDRESS=127.0.0.1:9981
-      - GUBER_MEMBERLIST_KNOWN_NODES=127.0.0.1:7946
+      - GUBER_GRPC_ADDRESS=127.0.0.1:9992
+      - GUBER_HTTP_ADDRESS=127.0.0.1:9982
+      - GUBER_MEMBERLIST_ADDRESS=127.0.0.1:7947
+      - GUBER_MEMBERLIST_BIND_ADDRESS=127.0.0.1:7947
+      - GUBER_MEMBERLIST_KNOWN_NODES=127.0.0.1:7947
     readiness_probe:
       http_get:
         host: 127.0.0.1
-        port: 9981
+        port: 9982
         path: /v1/HealthCheck
       initial_delay_seconds: 1
       period_seconds: 2

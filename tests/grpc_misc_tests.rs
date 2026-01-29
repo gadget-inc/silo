@@ -7,7 +7,7 @@ use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::pb::*;
 use silo::settings::{AppConfig, Backend, DatabaseTemplate};
-use silo::shard_range::ShardMap;
+use silo::shard_range::{ShardMap, ShardRange};
 use tonic_health::pb::HealthCheckRequest;
 use tonic_health::pb::health_client::HealthClient;
 
@@ -75,7 +75,7 @@ async fn grpc_server_lease_tasks_multi_shard() -> anyhow::Result<()> {
         // Create ShardMap and open 3 shards
         let shard_map = ShardMap::create_initial(3).expect("create shard map");
         for shard_info in shard_map.shards() {
-            let _ = factory.open(&shard_info.id).await?;
+            let _ = factory.open(&shard_info.id, &ShardRange::full()).await?;
         }
         let factory = Arc::new(factory);
 

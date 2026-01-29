@@ -5,7 +5,7 @@ use silo::coordination::etcd::{EtcdConnection, EtcdShardGuard, ShardPhase};
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::settings::{Backend, DatabaseTemplate};
-use silo::shard_range::ShardId;
+use silo::shard_range::{ShardId, ShardMap};
 
 fn unique_prefix() -> String {
     let nanos = SystemTime::now()
@@ -53,8 +53,15 @@ async fn make_guard(
     let runner = guard.clone();
     let owned_arc = owned.clone();
     let factory = make_test_factory(cluster_prefix);
+    // Create a shard map containing the specific shard_id being tested
+    let mut shard_map = ShardMap::new();
+    shard_map.add_shard(silo::shard_range::ShardInfo::new(
+        shard_id,
+        silo::shard_range::ShardRange::full(),
+    ));
+    let shard_map = Arc::new(tokio::sync::Mutex::new(shard_map));
     let handle = tokio::spawn(async move {
-        runner.run(owned_arc, factory).await;
+        runner.run(owned_arc, factory, shard_map).await;
     });
     (guard, owned, tx, handle)
 }

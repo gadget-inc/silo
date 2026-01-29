@@ -6,6 +6,7 @@ use silo::gubernator::MockGubernatorClient;
 use silo::pb::silo_client::SiloClient;
 use silo::server::run_server;
 use silo::settings::{AppConfig, Backend, DatabaseTemplate};
+use silo::shard_range::ShardRange;
 use tokio::net::TcpListener;
 
 /// Helper to set up a test gRPC server with a factory and return the client and shutdown channel.
@@ -58,7 +59,7 @@ pub async fn create_test_factory() -> anyhow::Result<(Arc<ShardFactory>, tempfil
     let factory = ShardFactory::new(template, rate_limiter, None);
     // Use a predictable shard ID for testing
     let shard_id = ShardId::parse(TEST_SHARD_ID).expect("valid test shard ID");
-    let _ = factory.open(&shard_id).await?;
+    let _ = factory.open(&shard_id, &ShardRange::full()).await?;
     Ok((Arc::new(factory), tmp))
 }
 

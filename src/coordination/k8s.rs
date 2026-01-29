@@ -48,11 +48,11 @@ use tokio_stream::StreamExt;
 use tracing::{debug, info, warn};
 
 use crate::factory::ShardFactory;
-use crate::shard_range::{ShardId, ShardMap};
+use crate::shard_range::{ShardId, ShardMap, SplitInProgress};
 
 use super::{
     CoordinationError, Coordinator, CoordinatorBase, MemberInfo, ShardOwnerMap, ShardPhase,
-    compute_desired_shards_for_node, get_hostname, keys,
+    SplitCleanupStatus, SplitStorageBackend, compute_desired_shards_for_node, get_hostname, keys,
 };
 
 /// Format a chrono DateTime for K8S MicroTime (RFC3339 with microseconds and Z suffix)
@@ -656,7 +656,8 @@ impl K8sCoordinator {
         let runner = guard.clone();
         let owned_arc = self.base.owned.clone();
         let factory = self.base.factory.clone();
-        tokio::spawn(async move { runner.run(owned_arc, factory).await });
+        let shard_map = self.base.shard_map.clone();
+        tokio::spawn(async move { runner.run(owned_arc, factory, shard_map).await });
         guards.insert(shard_id, guard.clone());
         guard
     }
@@ -665,16 +666,302 @@ impl K8sCoordinator {
         let cache = self.members_cache.lock().await;
         Ok(cache.iter().map(|m| m.node_id.clone()).collect())
     }
+
+    /// Reload the shard map from ConfigMap into local cache.
+    async fn reload_shard_map(&self) -> Result<(), CoordinationError> {
+        let configmaps: Api<ConfigMap> = Api::namespaced(self.client.clone(), &self.namespace);
+        let configmap_name = format!("{}-shard-map", self.cluster_prefix);
+
+        let cm = configmaps.get(&configmap_name).await.map_err(|e| {
+            CoordinationError::BackendError(format!("failed to read shard map: {}", e))
+        })?;
+
+        let data = cm
+            .data
+            .as_ref()
+            .and_then(|d| d.get("shard_map.json"))
+            .ok_or_else(|| {
+                CoordinationError::BackendError("shard map ConfigMap has no data".into())
+            })?;
+
+        let shard_map: ShardMap = serde_json::from_str(data)
+            .map_err(|e| CoordinationError::BackendError(format!("invalid shard map: {}", e)))?;
+
+        *self.base.shard_map.lock().await = shard_map;
+        Ok(())
+    }
+
+    /// Update the shard map ConfigMap after a split.
+    async fn update_shard_map_for_split(
+        &self,
+        split: &SplitInProgress,
+    ) -> Result<(), CoordinationError> {
+        let configmaps: Api<ConfigMap> = Api::namespaced(self.client.clone(), &self.namespace);
+        let configmap_name = format!("{}-shard-map", self.cluster_prefix);
+
+        // Read current shard map
+        let existing = configmaps.get(&configmap_name).await.map_err(|e| {
+            CoordinationError::BackendError(format!("failed to read shard map: {}", e))
+        })?;
+
+        let current_rv = existing.metadata.resource_version.as_ref().ok_or_else(|| {
+            CoordinationError::BackendError("no resourceVersion on shard map".into())
+        })?;
+
+        let data = existing
+            .data
+            .as_ref()
+            .and_then(|d| d.get("shard_map.json"))
+            .ok_or_else(|| {
+                CoordinationError::BackendError("shard map ConfigMap has no data".into())
+            })?;
+
+        let mut shard_map: ShardMap = serde_json::from_str(data)
+            .map_err(|e| CoordinationError::BackendError(format!("invalid shard map: {}", e)))?;
+
+        // Apply the split to the shard map
+        shard_map.split_shard(
+            &split.parent_shard_id,
+            &split.split_point,
+            split.left_child_id,
+            split.right_child_id,
+        )?;
+
+        let new_map_json = serde_json::to_string(&shard_map)
+            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+
+        // Use replace with resourceVersion for CAS
+        let updated_cm = ConfigMap {
+            metadata: kube::api::ObjectMeta {
+                name: Some(configmap_name.clone()),
+                namespace: Some(self.namespace.clone()),
+                resource_version: Some(current_rv.clone()),
+                uid: existing.metadata.uid.clone(),
+                labels: existing.metadata.labels.clone(),
+                ..Default::default()
+            },
+            data: Some([("shard_map.json".to_string(), new_map_json)].into()),
+            ..Default::default()
+        };
+
+        match configmaps
+            .replace(&configmap_name, &PostParams::default(), &updated_cm)
+            .await
+        {
+            Ok(_) => {
+                // Update local shard map
+                *self.base.shard_map.lock().await = shard_map;
+
+                info!(
+                    parent_shard_id = %split.parent_shard_id,
+                    left_child_id = %split.left_child_id,
+                    right_child_id = %split.right_child_id,
+                    split_point = %split.split_point,
+                    "shard map updated for split (k8s)"
+                );
+
+                Ok(())
+            }
+            Err(kube::Error::Api(e)) if e.code == 409 => Err(CoordinationError::BackendError(
+                "shard map was modified concurrently".to_string(),
+            )),
+            Err(e) => Err(CoordinationError::BackendError(e.to_string())),
+        }
+    }
+}
+
+#[async_trait]
+impl SplitStorageBackend for K8sCoordinator {
+    async fn load_split(
+        &self,
+        parent_shard_id: &ShardId,
+    ) -> Result<Option<SplitInProgress>, CoordinationError> {
+        let configmaps: Api<ConfigMap> = Api::namespaced(self.client.clone(), &self.namespace);
+        let configmap_name = keys::k8s_split_configmap_name(&self.cluster_prefix, parent_shard_id);
+
+        match configmaps.get(&configmap_name).await {
+            Ok(cm) => {
+                let data = cm
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("split.json"))
+                    .ok_or_else(|| {
+                        CoordinationError::BackendError(
+                            "split ConfigMap exists but has no data".into(),
+                        )
+                    })?;
+
+                let split: SplitInProgress = serde_json::from_str(data).map_err(|e| {
+                    CoordinationError::BackendError(format!("invalid split JSON: {}", e))
+                })?;
+
+                Ok(Some(split))
+            }
+            Err(kube::Error::Api(e)) if e.code == 404 => Ok(None),
+            Err(e) => Err(CoordinationError::BackendError(e.to_string())),
+        }
+    }
+
+    async fn store_split(&self, split: &SplitInProgress) -> Result<(), CoordinationError> {
+        let configmaps: Api<ConfigMap> = Api::namespaced(self.client.clone(), &self.namespace);
+        let configmap_name =
+            keys::k8s_split_configmap_name(&self.cluster_prefix, &split.parent_shard_id);
+
+        let split_json = serde_json::to_string(split)
+            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+
+        let cm = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": configmap_name,
+                "labels": {
+                    "silo.dev/type": "split",
+                    "silo.dev/cluster": self.cluster_prefix,
+                    "silo.dev/parent-shard": split.parent_shard_id.to_string()
+                }
+            },
+            "data": {
+                "split.json": split_json
+            }
+        });
+
+        configmaps
+            .patch(
+                &configmap_name,
+                &PatchParams::apply("silo-coordinator").force(),
+                &Patch::Apply(&cm),
+            )
+            .await
+            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn delete_split(&self, parent_shard_id: &ShardId) -> Result<(), CoordinationError> {
+        let configmaps: Api<ConfigMap> = Api::namespaced(self.client.clone(), &self.namespace);
+        let configmap_name = keys::k8s_split_configmap_name(&self.cluster_prefix, parent_shard_id);
+
+        match configmaps
+            .delete(&configmap_name, &Default::default())
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(e)) if e.code == 404 => Ok(()), // Already deleted
+            Err(e) => Err(CoordinationError::BackendError(e.to_string())),
+        }
+    }
+
+    async fn update_shard_map_for_split(
+        &self,
+        split: &SplitInProgress,
+    ) -> Result<(), CoordinationError> {
+        // Delegate to the inherent method
+        K8sCoordinator::update_shard_map_for_split(self, split).await
+    }
+
+    async fn reload_shard_map(&self) -> Result<(), CoordinationError> {
+        // Delegate to the inherent method
+        K8sCoordinator::reload_shard_map(self).await
+    }
+
+    async fn update_cleanup_status_in_shard_map(
+        &self,
+        shard_id: ShardId,
+        status: SplitCleanupStatus,
+    ) -> Result<(), CoordinationError> {
+        let configmaps: Api<ConfigMap> = Api::namespaced(self.client.clone(), &self.namespace);
+        let configmap_name = format!("{}-shard-map", self.cluster_prefix);
+
+        // Read current shard map
+        let existing = configmaps.get(&configmap_name).await.map_err(|e| {
+            CoordinationError::BackendError(format!("failed to read shard map: {}", e))
+        })?;
+
+        let current_rv = existing.metadata.resource_version.as_ref().ok_or_else(|| {
+            CoordinationError::BackendError("no resourceVersion on shard map".into())
+        })?;
+
+        let data = existing
+            .data
+            .as_ref()
+            .and_then(|d| d.get("shard_map.json"))
+            .ok_or_else(|| {
+                CoordinationError::BackendError("shard map ConfigMap has no data".into())
+            })?;
+
+        let mut shard_map: ShardMap = serde_json::from_str(data)
+            .map_err(|e| CoordinationError::BackendError(format!("invalid shard map: {}", e)))?;
+
+        // Update cleanup status
+        shard_map.update_cleanup_status(&shard_id, status)?;
+
+        let new_map_json = serde_json::to_string(&shard_map)
+            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+
+        // Use replace with resourceVersion for CAS
+        let updated_cm = ConfigMap {
+            metadata: kube::api::ObjectMeta {
+                name: Some(configmap_name.clone()),
+                namespace: Some(self.namespace.clone()),
+                resource_version: Some(current_rv.clone()),
+                uid: existing.metadata.uid.clone(),
+                labels: existing.metadata.labels.clone(),
+                ..Default::default()
+            },
+            data: Some([("shard_map.json".to_string(), new_map_json)].into()),
+            ..Default::default()
+        };
+
+        match configmaps
+            .replace(&configmap_name, &PostParams::default(), &updated_cm)
+            .await
+        {
+            Ok(_) => {
+                // Update local shard map
+                *self.base.shard_map.lock().await = shard_map;
+
+                debug!(shard_id = %shard_id, status = %status, "cleanup status updated (k8s)");
+                Ok(())
+            }
+            Err(kube::Error::Api(e)) if e.code == 409 => Err(CoordinationError::BackendError(
+                "shard map was modified concurrently".to_string(),
+            )),
+            Err(e) => Err(CoordinationError::BackendError(e.to_string())),
+        }
+    }
+
+    async fn list_all_splits(&self) -> Result<Vec<SplitInProgress>, CoordinationError> {
+        let configmaps: Api<ConfigMap> = Api::namespaced(self.client.clone(), &self.namespace);
+        let lp = ListParams::default().labels(&format!(
+            "silo.dev/type=split,silo.dev/cluster={}",
+            self.cluster_prefix
+        ));
+
+        let cm_list = configmaps
+            .list(&lp)
+            .await
+            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+
+        let mut splits = Vec::new();
+        for cm in cm_list {
+            let data = match cm.data.as_ref().and_then(|d| d.get("split.json")) {
+                Some(d) => d,
+                None => continue,
+            };
+
+            if let Ok(split) = serde_json::from_str::<SplitInProgress>(data) {
+                splits.push(split);
+            }
+        }
+        Ok(splits)
+    }
 }
 
 #[async_trait]
 impl Coordinator for K8sCoordinator {
-    async fn owned_shards(&self) -> Vec<ShardId> {
-        self.base.owned_shards().await
-    }
-
-    async fn get_shard_map(&self) -> Result<ShardMap, CoordinationError> {
-        Ok(self.base.get_shard_map().await)
+    fn base(&self) -> &CoordinatorBase {
+        &self.base
     }
 
     async fn shutdown(&self) -> Result<(), CoordinationError> {
@@ -744,18 +1031,6 @@ impl Coordinator for K8sCoordinator {
     async fn get_shard_owner_map(&self) -> Result<ShardOwnerMap, CoordinationError> {
         let members = self.get_members().await?;
         Ok(self.base.compute_shard_owner_map(&members).await)
-    }
-
-    async fn num_shards(&self) -> usize {
-        self.base.num_shards().await
-    }
-
-    fn node_id(&self) -> &str {
-        &self.base.node_id
-    }
-
-    fn grpc_addr(&self) -> &str {
-        &self.base.grpc_addr
     }
 }
 
@@ -844,6 +1119,7 @@ impl K8sShardGuard {
         self: Arc<Self>,
         owned_arc: Arc<Mutex<HashSet<ShardId>>>,
         factory: Arc<ShardFactory>,
+        shard_map: Arc<Mutex<ShardMap>>,
     ) {
         let leases: Api<Lease> = Api::namespaced(self.client.clone(), &self.namespace);
         let lease_name = self.lease_name();
@@ -892,9 +1168,22 @@ impl K8sShardGuard {
                         // Try to acquire the lease with CAS semantics
                         match self.try_acquire_lease_cas(&leases, &lease_name).await {
                             Ok((rv, uid)) => {
+                                // Look up the shard's range from the shard map
+                                let range = {
+                                    let map = shard_map.lock().await;
+                                    match map.get_shard(&self.shard_id) {
+                                        Some(info) => info.range.clone(),
+                                        None => {
+                                            tracing::error!(shard_id = %self.shard_id, "shard not found in shard map");
+                                            let _ =
+                                                self.release_lease_cas(&leases, &lease_name).await;
+                                            continue;
+                                        }
+                                    }
+                                };
                                 // Open the shard BEFORE marking as Held - if open fails,
                                 // we should release the lease and not claim ownership
-                                match factory.open(&self.shard_id).await {
+                                match factory.open(&self.shard_id, &range).await {
                                     Ok(_) => {
                                         {
                                             let mut st = self.state.lock().await;

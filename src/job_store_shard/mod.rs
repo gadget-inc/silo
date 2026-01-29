@@ -1,18 +1,6 @@
 //! Job store shard - a single shard of the distributed job storage system.
-//!
-//! This module contains the core `JobStoreShard` type and its implementation,
-//! split across multiple submodules for organization:
-//!
-//! - `helpers`: Utility functions for encoding, timestamps, etc.
-//! - `enqueue`: Job enqueue logic
-//! - `dequeue`: Task dequeue and processing
-//! - `lease`: Lease management, heartbeat, and reaping
-//! - `cancel`: Job cancellation
-//! - `floating`: Floating concurrency limit operations
-//! - `rate_limit`: Rate limit checking via Gubernator
-//! - `scan`: Scanning and query operations
-
 mod cancel;
+mod cleanup;
 mod counters;
 mod dequeue;
 mod enqueue;
@@ -23,6 +11,8 @@ mod lease;
 mod rate_limit;
 mod restart;
 mod scan;
+
+pub use cleanup::{CleanupProgress, CleanupResult, extract_tenant_from_key};
 
 pub use counters::ShardCounters;
 pub use expedite::JobNotExpediteableError;
@@ -43,6 +33,7 @@ use crate::keys::{attempt_key, job_info_key, job_status_key};
 use crate::metrics::Metrics;
 use crate::query::ShardQueryEngine;
 use crate::settings::DatabaseConfig;
+use crate::shard_range::ShardRange;
 use crate::storage::resolve_object_store;
 use crate::task::{LeasedRefreshTask, LeasedTask};
 use crate::task_broker::TaskBroker;
@@ -120,11 +111,16 @@ impl From<CodecError> for JobStoreShardError {
 }
 
 impl JobStoreShard {
-    /// Open a shard with a rate limit client and optional metrics
+    /// Open a shard with a rate limit client, range, and optional metrics.
+    ///
+    /// The `range` parameter specifies the tenant keyspace this shard is responsible for.
+    /// This is immutable after opening - when shards split, new child shards are created
+    /// with new identities and ranges.
     pub async fn open(
         cfg: &DatabaseConfig,
         rate_limiter: Arc<dyn RateLimitClient>,
         metrics: Option<Metrics>,
+        range: ShardRange,
     ) -> Result<Arc<Self>, JobStoreShardError> {
         let resolved = resolve_object_store(&cfg.backend, &cfg.path)?;
 
@@ -140,9 +136,10 @@ impl JobStoreShard {
             db_builder = db_builder.with_wal_object_store(wal_resolved.store);
 
             // Only set up WAL cleanup for local (Fs) storage backends
+            // Use root_path which has the actual filesystem path (canonical_path is empty for Fs)
             if wal_cfg.is_local_storage() {
                 Some(WalCloseConfig {
-                    path: wal_resolved.canonical_path,
+                    path: wal_resolved.root_path,
                     flush_on_close: cfg.apply_wal_on_close,
                 })
             } else {
@@ -169,6 +166,7 @@ impl JobStoreShard {
             Arc::clone(&concurrency),
             cfg.name.clone(),
             metrics.clone(),
+            range,
         );
         broker.start();
 
@@ -287,6 +285,14 @@ impl JobStoreShard {
     /// Use this to collect storage-level statistics for observability.
     pub fn slatedb_stats(&self) -> std::sync::Arc<slatedb::stats::StatRegistry> {
         self.db.metrics()
+    }
+
+    /// Get the shard's tenant range.
+    ///
+    /// The range is immutable after the shard is opened. When shards split,
+    /// new child shards are created with new identities and ranges.
+    pub fn get_range(&self) -> ShardRange {
+        self.broker.get_range()
     }
 
     /// Fetch a job by id as a zero-copy archived view.

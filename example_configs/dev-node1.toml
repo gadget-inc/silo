@@ -15,7 +15,7 @@ etcd_endpoints = ["http://127.0.0.1:2379"]
 enabled = true
 
 [gubernator]
-address = "http://localhost:9991"
+address = "http://localhost:9992"
 
 [webui]
 enabled = true

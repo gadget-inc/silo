@@ -1,6 +1,7 @@
 use silo::gubernator::NullGubernatorClient;
 use silo::job_store_shard::JobStoreShard;
 use silo::settings::{Backend, DatabaseConfig};
+use silo::shard_range::ShardRange;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -16,7 +17,7 @@ async fn open_temp_shard(
         wal: None,
         apply_wal_on_close: true,
     };
-    let shard = JobStoreShard::open(&cfg, NullGubernatorClient::new(), None)
+    let shard = JobStoreShard::open(&cfg, NullGubernatorClient::new(), None, ShardRange::full())
         .await
         .expect("open shard");
     (tmp, shard)

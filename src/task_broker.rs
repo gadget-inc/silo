@@ -7,12 +7,14 @@ use std::sync::{
 use std::time::Duration;
 
 use crossbeam_skiplist::SkipMap;
-use slatedb::Db;
+use slatedb::{Db, WriteBatch};
 use tokio::sync::Notify;
 
 use crate::codec::decode_task;
 use crate::concurrency::ConcurrencyManager;
+use crate::keys::decode_tenant;
 use crate::metrics::Metrics;
+use crate::shard_range::ShardRange;
 use crate::task::Task;
 use tracing::debug;
 
@@ -51,6 +53,8 @@ pub struct TaskBroker {
     shard_name: String,
     // Optional metrics for recording broker stats
     metrics: Option<Metrics>,
+    /// The shard's tenant range for filtering defunct tasks.
+    range: ShardRange,
 }
 
 impl TaskBroker {
@@ -59,6 +63,7 @@ impl TaskBroker {
         concurrency: Arc<ConcurrencyManager>,
         shard_name: String,
         metrics: Option<Metrics>,
+        range: ShardRange,
     ) -> Arc<Self> {
         Arc::new(Self {
             db,
@@ -72,7 +77,13 @@ impl TaskBroker {
             scan_batch: 1024,
             shard_name,
             metrics,
+            range,
         })
+    }
+
+    /// Get the shard's tenant range.
+    pub fn get_range(&self) -> ShardRange {
+        self.range.clone()
     }
 
     pub fn buffer_len(&self) -> usize {
@@ -93,6 +104,9 @@ impl TaskBroker {
         let Ok(mut iter) = self.db.scan::<Vec<u8>, _>(start..=end).await else {
             return 0;
         };
+
+        // Collect keys to delete for defunct tasks (outside shard range)
+        let mut defunct_keys: Vec<Vec<u8>> = Vec::new();
 
         let mut inserted = 0;
         while inserted < self.scan_batch && self.buffer.len() < self.target_buffer {
@@ -134,6 +148,23 @@ impl TaskBroker {
                 Ok(t) => t,
                 Err(_) => continue, // Skip malformed tasks
             };
+
+            // [SILO-SPLIT-AWARE-1] Check if task's tenant is within shard range
+            let task_tenant = task.tenant();
+            let decoded_tenant = decode_tenant(task_tenant);
+
+            if !self.range.contains(&decoded_tenant) {
+                // Task is for a tenant outside our range - mark for deletion
+                defunct_keys.push(kv.key.to_vec());
+                debug!(
+                    key = %key_str,
+                    tenant = %decoded_tenant,
+                    range = %self.range,
+                    "skipping defunct task (tenant outside shard range)"
+                );
+                continue;
+            }
+
             let entry = BrokerTask {
                 key: key_str.to_string(),
                 task,
@@ -148,6 +179,22 @@ impl TaskBroker {
                 if inserted % 16 == 0 {
                     tokio::task::yield_now().await;
                 }
+            }
+        }
+
+        // Delete defunct tasks from the database
+        if !defunct_keys.is_empty() {
+            let mut batch = WriteBatch::new();
+            for key in &defunct_keys {
+                batch.delete(key);
+            }
+            if let Err(e) = self.db.write(batch).await {
+                debug!(error = %e, count = defunct_keys.len(), "failed to delete defunct tasks");
+            } else {
+                debug!(
+                    count = defunct_keys.len(),
+                    "deleted defunct tasks outside shard range"
+                );
             }
         }
 

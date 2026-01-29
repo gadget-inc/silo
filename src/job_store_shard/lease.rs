@@ -12,7 +12,9 @@ use crate::job::{FloatingLimitState, JobStatus, JobView};
 use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt};
 use crate::job_store_shard::helpers::now_epoch_ms;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
-use crate::keys::{attempt_key, floating_limit_state_key, job_info_key, leased_task_key};
+use crate::keys::{
+    attempt_key, decode_tenant, floating_limit_state_key, job_info_key, leased_task_key,
+};
 use crate::task::{DEFAULT_LEASE_MS, HeartbeatResult, LeaseRecord};
 use tracing::{debug, info_span};
 
@@ -303,6 +305,7 @@ impl JobStoreShard {
 
     /// Scan all held leases and mark any expired ones as failed with a WORKER_CRASHED error code, or as Cancelled if the job was cancelled.
     /// For RefreshFloatingLimit tasks, resets the floating limit state so it can be retried on next periodic refresh.
+    /// [SILO-SPLIT-AWARE-1] Skips and deletes leases for tenants outside the shard's range.
     /// Returns the number of expired leases reaped.
     pub async fn reap_expired_leases(&self, tenant: &str) -> Result<usize, JobStoreShardError> {
         // Scan leases under lease/
@@ -314,6 +317,12 @@ impl JobStoreShard {
         let now_ms = now_epoch_ms();
         let mut reaped: usize = 0;
 
+        // Get the shard range for split-aware filtering
+        let shard_range = self.get_range();
+
+        // Collect defunct lease keys to delete
+        let mut defunct_keys: Vec<Vec<u8>> = Vec::new();
+
         while let Some(kv) = iter.next().await? {
             let key_str = String::from_utf8_lossy(&kv.key);
             if !key_str.starts_with("lease/") {
@@ -324,6 +333,22 @@ impl JobStoreShard {
                 Ok(l) => l,
                 Err(_) => continue,
             };
+
+            // [SILO-SPLIT-AWARE-1] Check if lease's tenant is within shard range
+            let lease_tenant = decoded.tenant();
+            let decoded_tenant = decode_tenant(lease_tenant);
+
+            if !shard_range.contains(&decoded_tenant) {
+                // Lease is for a tenant outside our range - mark for deletion
+                debug!(
+                    key = %key_str,
+                    tenant = %decoded_tenant,
+                    range = %shard_range,
+                    "deleting defunct lease (tenant outside shard range)"
+                );
+                defunct_keys.push(kv.key.to_vec());
+                continue;
+            }
 
             // [SILO-REAP-1] Pre: Lease exists (we found it)
             // [SILO-REAP-2] Pre: Check if lease has expired
@@ -375,6 +400,22 @@ impl JobStoreShard {
             // [SILO-REAP-REL] Release lease and update job/attempt status via report_attempt_outcome
             let _ = self.report_attempt_outcome(task_id, outcome).await;
             reaped += 1;
+        }
+
+        // Delete defunct leases from the database
+        if !defunct_keys.is_empty() {
+            let mut batch = WriteBatch::new();
+            for key in &defunct_keys {
+                batch.delete(key);
+            }
+            if let Err(e) = self.db.write(batch).await {
+                debug!(error = %e, count = defunct_keys.len(), "failed to delete defunct leases");
+            } else {
+                debug!(
+                    count = defunct_keys.len(),
+                    "deleted defunct leases outside shard range"
+                );
+            }
         }
 
         Ok(reaped)

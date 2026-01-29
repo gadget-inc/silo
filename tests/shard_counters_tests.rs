@@ -657,9 +657,14 @@ async fn counters_survive_close_and_reopen() {
             apply_wal_on_close: true,
         };
 
-        let shard2 = silo::job_store_shard::JobStoreShard::open(&cfg, rate_limiter, None)
-            .await
-            .expect("reopen shard");
+        let shard2 = silo::job_store_shard::JobStoreShard::open(
+            &cfg,
+            rate_limiter,
+            None,
+            silo::shard_range::ShardRange::full(),
+        )
+        .await
+        .expect("reopen shard");
 
         // Verify counters persist
         let counters = shard2.get_counters().await.expect("get_counters");

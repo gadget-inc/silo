@@ -56,3 +56,8 @@
 - [ ] rust best practices review
 - [ ] benchmarks in CI, codspeed or similar regression tracker
 - [ ] make sure failure data is also stored using msgpack
+- [ ] shard splitting
+  - [ ] wire up re-cleanup on re-aquire
+  - [ ] add tests for actually processing jobs before cleanup has happened
+  - [ ] validate all sigils present
+  - [ ] add split DST scenarios
