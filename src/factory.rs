@@ -1,7 +1,9 @@
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{OnceCell, RwLock};
+use thiserror::Error;
+use tokio::sync::OnceCell;
 
 use crate::gubernator::RateLimitClient;
 use crate::job_store_shard::JobStoreShard;
@@ -10,7 +12,6 @@ use crate::metrics::Metrics;
 use crate::settings::{DatabaseConfig, DatabaseTemplate, WalConfig};
 use crate::shard_range::{ShardId, ShardRange};
 use crate::storage::resolve_object_store;
-use thiserror::Error;
 
 /// A shard entry that supports atomic initialization.
 /// Uses OnceCell to ensure only one caller opens each database even under concurrent access.
@@ -40,12 +41,12 @@ impl ShardEntry {
 
 /// Factory for opening and holding `Shard` instances by ShardId.
 ///
-/// Uses interior mutability (RwLock) so it can be shared across tasks
+/// Uses interior mutability (DashMap) so it can be shared across tasks
 /// and shards can be opened/closed dynamically as ownership changes.
 /// Per-shard OnceCell ensures that concurrent opens for the same shard
 /// are serialized while opens for different shards proceed in parallel.
 pub struct ShardFactory {
-    instances: RwLock<HashMap<ShardId, Arc<ShardEntry>>>,
+    instances: DashMap<ShardId, Arc<ShardEntry>>,
     template: DatabaseTemplate,
     rate_limiter: Arc<dyn RateLimitClient>,
     metrics: Option<Metrics>,
@@ -58,7 +59,7 @@ impl ShardFactory {
         metrics: Option<Metrics>,
     ) -> Self {
         Self {
-            instances: RwLock::new(HashMap::new()),
+            instances: DashMap::new(),
             template,
             rate_limiter,
             metrics,
@@ -75,7 +76,7 @@ impl ShardFactory {
         use crate::settings::Backend;
 
         Self {
-            instances: RwLock::new(HashMap::new()),
+            instances: DashMap::new(),
             template: DatabaseTemplate {
                 backend: Backend::Memory,
                 path: "/noop/%shard%".to_string(),
@@ -89,11 +90,7 @@ impl ShardFactory {
 
     /// Get a shard by its ID.
     pub fn get(&self, shard_id: &ShardId) -> Option<Arc<JobStoreShard>> {
-        // Use try_read to avoid blocking; if locked, return None
-        self.instances
-            .try_read()
-            .ok()
-            .and_then(|guard| guard.get(shard_id).and_then(|entry| entry.get()))
+        self.instances.get(shard_id).and_then(|entry| entry.get())
     }
 
     /// Open a shard using the shared database template.
@@ -114,23 +111,11 @@ impl ShardFactory {
 
         // Get or create the entry for this shard. The entry contains a OnceCell
         // that ensures only one caller actually opens the database.
-        let entry = {
-            // Fast path: check if entry exists
-            {
-                let instances = self.instances.read().await;
-                if let Some(entry) = instances.get(&shard_id) {
-                    entry.clone()
-                } else {
-                    drop(instances);
-                    // Slow path: create entry if needed
-                    let mut instances = self.instances.write().await;
-                    instances
-                        .entry(shard_id)
-                        .or_insert_with(|| Arc::new(ShardEntry::new()))
-                        .clone()
-                }
-            }
-        };
+        let entry = self
+            .instances
+            .entry(shard_id)
+            .or_insert_with(|| Arc::new(ShardEntry::new()))
+            .clone();
 
         // OnceCell::get_or_try_init ensures only one caller opens the database,
         // even if multiple callers reach this point concurrently.
@@ -171,11 +156,7 @@ impl ShardFactory {
 
     /// Close a specific shard and remove it from the factory.
     pub async fn close(&self, shard_id: &ShardId) -> Result<(), JobStoreShardError> {
-        let entry = {
-            let mut instances = self.instances.write().await;
-            instances.remove(shard_id)
-        };
-        if let Some(entry) = entry {
+        if let Some((_, entry)) = self.instances.remove(shard_id) {
             if let Some(shard) = entry.get() {
                 shard.close().await?;
                 tracing::info!(shard_id = %shard_id, "closed shard");
@@ -194,11 +175,7 @@ impl ShardFactory {
         let name = shard_id.to_string();
 
         // 1. Close and remove the shard if it exists
-        let entry = {
-            let mut instances = self.instances.write().await;
-            instances.remove(shard_id)
-        };
-        if let Some(entry) = entry {
+        if let Some((_, entry)) = self.instances.remove(shard_id) {
             if let Some(shard) = entry.get() {
                 shard.close().await?;
                 tracing::info!(shard_id = %shard_id, "closed shard for reset");
@@ -246,35 +223,29 @@ impl ShardFactory {
     /// Returns true only if the shard entry exists AND the shard has been initialized.
     pub fn owns_shard(&self, shard_id: &ShardId) -> bool {
         self.instances
-            .try_read()
-            .ok()
-            .and_then(|guard| guard.get(shard_id).and_then(|entry| entry.get()))
+            .get(shard_id)
+            .and_then(|entry| entry.get())
             .is_some()
     }
 
     /// Get a snapshot of all currently open instances.
     pub fn instances(&self) -> HashMap<ShardId, Arc<JobStoreShard>> {
         self.instances
-            .try_read()
-            .map(|guard| {
-                guard
-                    .iter()
-                    .filter_map(|(id, entry)| entry.get().map(|shard| (*id, shard)))
-                    .collect()
-            })
-            .unwrap_or_default()
+            .iter()
+            .filter_map(|entry| entry.value().get().map(|shard| (*entry.key(), shard)))
+            .collect()
     }
 
     /// Close all shards gracefully. Returns all errors if any shards fail to close.
     pub async fn close_all(&self) -> Result<(), CloseAllError> {
         let mut errors: Vec<(ShardId, JobStoreShardError)> = Vec::new();
-        let instances = self.instances.read().await;
-        for (shard_id, entry) in instances.iter() {
-            let Some(shard) = entry.get() else {
+        for entry in self.instances.iter() {
+            let shard_id = *entry.key();
+            let Some(shard) = entry.value().get() else {
                 continue;
             };
             if let Err(e) = shard.close().await {
-                errors.push((*shard_id, e));
+                errors.push((shard_id, e));
             }
         }
         if errors.is_empty() {
@@ -307,13 +278,11 @@ impl ShardFactory {
         let child_name = child_id.to_string();
 
         // Get the parent shard (must be open)
-        let parent_shard = {
-            let instances = self.instances.read().await;
-            instances
-                .get(parent_id)
-                .and_then(|entry| entry.get())
-                .ok_or_else(|| ShardFactoryError::ShardNotOpen(*parent_id))?
-        };
+        let parent_shard = self
+            .instances
+            .get(parent_id)
+            .and_then(|entry| entry.get())
+            .ok_or_else(|| ShardFactoryError::ShardNotOpen(*parent_id))?;
 
         // Ensure all data is flushed to object storage before creating checkpoint
         // This is required for SlateDB cloning to work correctly

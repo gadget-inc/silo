@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use dashmap::DashMap;
 use futures::future::join_all;
-use tokio::sync::RwLock;
 use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, trace, warn};
 
@@ -230,7 +230,7 @@ pub struct ClusterClient {
     /// Coordinator for getting shard ownership information
     coordinator: Option<Arc<dyn Coordinator>>,
     /// Cache of gRPC client connections to peer nodes
-    connections: RwLock<HashMap<String, SiloClient<Channel>>>,
+    connections: DashMap<String, SiloClient<Channel>>,
     /// Client configuration for timeouts and connection behavior
     config: ClientConfig,
 }
@@ -250,7 +250,7 @@ impl ClusterClient {
         Self {
             factory,
             coordinator,
-            connections: RwLock::new(HashMap::new()),
+            connections: DashMap::new(),
             config,
         }
     }
@@ -264,39 +264,30 @@ impl ClusterClient {
             format!("http://{}", addr)
         };
 
-        // Check cache first (fast path with read lock)
-        {
-            let cache = self.connections.read().await;
-            if let Some(client) = cache.get(&full_addr) {
-                return Ok(client.clone());
-            }
+        // Check cache first
+        if let Some(client) = self.connections.get(&full_addr) {
+            return Ok(client.clone());
         }
 
         // Create new connection with configured timeouts
         debug!(addr = %full_addr, "connecting to remote node");
         let client = create_silo_client(&full_addr, &self.config).await?;
 
-        // Cache the connection (double-check after acquiring write lock to avoid race)
-        let mut cache = self.connections.write().await;
-        if let Some(existing) = cache.get(&full_addr) {
-            // Another task created the connection while we were connecting
-            return Ok(existing.clone());
-        }
-        cache.insert(full_addr, client.clone());
+        // Cache the connection - if another task raced us, use their connection
+        self.connections.insert(full_addr.clone(), client.clone());
 
         Ok(client)
     }
 
     /// Invalidate a cached connection (call after RPC failures to force reconnect)
-    pub async fn invalidate_connection(&self, addr: &str) {
+    pub fn invalidate_connection(&self, addr: &str) {
         let full_addr = if addr.starts_with("http://") || addr.starts_with("https://") {
             addr.to_string()
         } else {
             format!("http://{}", addr)
         };
 
-        let mut cache = self.connections.write().await;
-        if cache.remove(&full_addr).is_some() {
+        if self.connections.remove(&full_addr).is_some() {
             debug!(addr = %full_addr, "invalidated cached connection");
         }
     }
@@ -392,7 +383,7 @@ impl ClusterClient {
             Ok(resp) => resp,
             Err(e) => {
                 // Invalidate connection on failure to force reconnect on next attempt
-                self.invalidate_connection(addr).await;
+                self.invalidate_connection(addr);
                 return Err(ClusterClientError::QueryFailed(format!(
                     "gRPC error: {}",
                     e
@@ -660,7 +651,7 @@ impl ClusterClient {
             Ok(resp) => resp,
             Err(e) => {
                 // Invalidate connection on failure to force reconnect on next attempt
-                self.invalidate_connection(&addr).await;
+                self.invalidate_connection(&addr);
                 if e.code() == tonic::Code::NotFound {
                     return Err(ClusterClientError::JobNotFound);
                 } else {
@@ -706,7 +697,7 @@ impl ClusterClient {
 
         if let Err(e) = client.cancel_job(request).await {
             // Invalidate connection on failure to force reconnect on next attempt
-            self.invalidate_connection(&addr).await;
+            self.invalidate_connection(&addr);
             return Err(ClusterClientError::RpcFailed(e.to_string()));
         }
 
