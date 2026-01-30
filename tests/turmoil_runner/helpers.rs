@@ -18,6 +18,8 @@ use silo::gubernator::MockGubernatorClient;
 use silo::server::run_server_with_incoming;
 use silo::settings::{AppConfig, Backend, GubernatorSettings, LoggingConfig, WebUiConfig};
 use silo::shard_range::{ShardId, ShardRange};
+#[cfg(feature = "dst")]
+use silo::turmoil_object_store::clear_shared_storage;
 use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tower::Service;
@@ -320,6 +322,10 @@ where
     println!("DST_SEED:{}", seed);
     println!("---DST_BEGIN---");
 
+    // Clear shared storage from previous runs to ensure test isolation
+    #[cfg(feature = "dst")]
+    clear_shared_storage();
+
     let _guard = init_deterministic_sim(seed);
 
     tracing::info!(scenario = name, seed = seed, "starting DST scenario");
@@ -355,27 +361,129 @@ where
 // Test Entry Point Helpers
 // ============================================================================
 
-/// Helper to run a scenario in a subprocess and verify success
+/// Maximum time allowed for a subprocess to complete (in seconds).
+///
+/// The k8s_shard_splits test uses filesystem-based SlateDB which runs at about
+/// 4-10x slower than simulated time. With 24 simulated seconds needed to complete,
+/// the test may take up to 240 seconds in worst case. We use 180 seconds as the
+/// timeout to allow for reasonable completion while catching truly hung tests.
+const SUBPROCESS_TIMEOUT_SECS: u64 = 180;
+
+/// Helper to run a scenario in a subprocess and verify success.
+/// Enforces a timeout to catch scenarios that hang or run too long.
+///
+/// Uses temp files for output to avoid pipe buffer deadlocks.
 pub fn run_in_subprocess(scenario: &str, seed: u64) -> std::process::Output {
-    use std::process::Command;
+    use std::fs::File;
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
 
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
 
-    Command::new(&cargo)
-        .args([
-            "test",
-            "--test",
-            "turmoil_runner",
-            scenario,
-            "--",
-            "--nocapture",
-            "--exact",
-        ])
-        .env("DST_SEED", seed.to_string())
-        .env("RUST_BACKTRACE", "0")
-        .env("DST_SUBPROCESS", "1") // Marker that we're in subprocess
-        .output()
-        .expect("Failed to run test subprocess")
+    // Use temp files for output to avoid pipe buffer deadlocks
+    let stdout_file = tempfile::NamedTempFile::new().expect("create stdout temp file");
+    let stderr_file = tempfile::NamedTempFile::new().expect("create stderr temp file");
+
+    let stdout_fd = stdout_file.reopen().expect("reopen stdout temp file");
+    let stderr_fd = stderr_file.reopen().expect("reopen stderr temp file");
+
+    let mut cmd = Command::new(&cargo);
+    cmd.args([
+        "test",
+        "--features",
+        "dst",
+        "--test",
+        "turmoil_runner",
+        scenario,
+        "--",
+        "--nocapture",
+        "--exact",
+    ])
+    .env("DST_SEED", seed.to_string())
+    .env("RUST_BACKTRACE", "0")
+    .env("DST_SUBPROCESS", "1") // Marker that we're in subprocess
+    .stdout(Stdio::from(stdout_fd))
+    .stderr(Stdio::from(stderr_fd));
+
+    // Create a new process group so we can kill all descendants on timeout
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    let mut child = cmd.spawn().expect("Failed to spawn test subprocess");
+
+    let start = Instant::now();
+    let timeout = Duration::from_secs(SUBPROCESS_TIMEOUT_SECS);
+
+    // Poll for completion with timeout
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Process completed - read output from temp files
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                File::open(stdout_file.path())
+                    .and_then(|mut f| f.read_to_end(&mut stdout))
+                    .ok();
+                File::open(stderr_file.path())
+                    .and_then(|mut f| f.read_to_end(&mut stderr))
+                    .ok();
+                return std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                };
+            }
+            Ok(None) => {
+                // Still running - check timeout
+                if start.elapsed() > timeout {
+                    // Kill the entire process group (cargo + child test binary)
+                    // Using negative PID kills the process group
+                    #[cfg(unix)]
+                    {
+                        // Use kill command to send SIGKILL to the process group
+                        let pgid = child.id();
+                        Command::new("kill")
+                            .args(["-9", &format!("-{}", pgid)])
+                            .output()
+                            .ok();
+                    }
+                    // Also kill the direct child (for non-unix platforms)
+                    child.kill().ok();
+                    child.wait().ok(); // Reap the zombie
+
+                    // Read output from temp files
+                    let mut stdout = Vec::new();
+                    let mut stderr = Vec::new();
+                    File::open(stdout_file.path())
+                        .and_then(|mut f| f.read_to_end(&mut stdout))
+                        .ok();
+                    File::open(stderr_file.path())
+                        .and_then(|mut f| f.read_to_end(&mut stderr))
+                        .ok();
+
+                    panic!(
+                        "Subprocess '{}' timed out after {}s.\n\
+                         This likely indicates a hang or infinite loop in the scenario.\n\
+                         stdout:\n{}\n\
+                         stderr:\n{}",
+                        scenario,
+                        SUBPROCESS_TIMEOUT_SECS,
+                        String::from_utf8_lossy(&stdout),
+                        String::from_utf8_lossy(&stderr)
+                    );
+                }
+                // Sleep briefly before polling again
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => {
+                panic!("Error waiting for subprocess: {}", e);
+            }
+        }
+    }
 }
 
 /// Check if we're running as a subprocess (direct scenario execution)
@@ -526,11 +634,15 @@ pub fn verify_determinism(scenario: &str, seed: u64) {
 ///
 /// This tracker receives events from server-side instrumentation via DST events,
 /// ensuring accurate tracking without race conditions from client-side tracking.
+///
+/// Note: The actual system uses `tenant|queue` as the composite key - each tenant
+/// has its own separate limit for each queue name. This tracker mirrors that behavior.
 #[derive(Debug, Default)]
 pub struct GlobalConcurrencyTracker {
-    /// Maps limit_key -> set of (task_id, job_id) pairs currently holding the limit
+    /// Maps tenant|queue -> set of (task_id, job_id) pairs currently holding the limit
     holders: Mutex<HashMap<String, HashSet<(String, String)>>>,
-    /// Maps limit_key -> max_concurrency for that key
+    /// Maps queue_name -> max_concurrency for that queue
+    /// (limits are per-queue, applied separately to each tenant)
     limits: Mutex<HashMap<String, u32>>,
 }
 
@@ -541,28 +653,32 @@ impl GlobalConcurrencyTracker {
         Self::default()
     }
 
-    /// Register a limit key and its max concurrency value
-    pub fn register_limit(&self, key: &str, max_concurrency: u32) {
+    /// Register a queue limit and its max concurrency value.
+    /// The limit applies separately to each tenant.
+    pub fn register_limit(&self, queue: &str, max_concurrency: u32) {
         let mut limits = self.limits.lock().unwrap();
-        limits.entry(key.to_string()).or_insert(max_concurrency);
+        limits.entry(queue.to_string()).or_insert(max_concurrency);
     }
 
     /// Record that a task has acquired a concurrency slot.
-    /// Panics if this would violate the concurrency limit.
-    pub fn acquire(&self, limit_key: &str, task_id: &str, job_id: &str) {
+    /// Panics if this would violate the concurrency limit for that tenant+queue.
+    pub fn acquire(&self, tenant: &str, queue: &str, task_id: &str, job_id: &str) {
         let mut holders = self.holders.lock().unwrap();
         let limits = self.limits.lock().unwrap();
 
-        let entry = holders.entry(limit_key.to_string()).or_default();
-        let max = limits.get(limit_key).copied().unwrap_or(u32::MAX);
+        // Use tenant|queue as composite key, matching the actual ConcurrencyManager
+        let composite_key = format!("{}|{}", tenant, queue);
+        let entry = holders.entry(composite_key.clone()).or_default();
+        // Look up max by queue name only (limits are registered by queue name)
+        let max = limits.get(queue).copied().unwrap_or(u32::MAX);
 
         // Check invariant BEFORE adding
         if entry.len() >= max as usize {
             panic!(
-                "INVARIANT VIOLATION (queueLimitEnforced): Attempting to acquire slot for limit '{}' \
+                "INVARIANT VIOLATION (queueLimitEnforced): Attempting to acquire slot for limit '{}' (tenant='{}', queue='{}') \
                  but already at max_concurrency {}. Current holders: {:?}. \
                  New task_id={}, job_id={}",
-                limit_key, max, entry, task_id, job_id
+                composite_key, tenant, queue, max, entry, task_id, job_id
             );
         }
 
@@ -570,12 +686,13 @@ impl GlobalConcurrencyTracker {
         if !inserted {
             panic!(
                 "INVARIANT VIOLATION (noDoubleLease): Task {} already holds limit '{}'",
-                task_id, limit_key
+                task_id, composite_key
             );
         }
 
         tracing::trace!(
-            limit_key = limit_key,
+            tenant = tenant,
+            queue = queue,
             task_id = task_id,
             job_id = job_id,
             current_count = entry.len(),
@@ -585,10 +702,11 @@ impl GlobalConcurrencyTracker {
     }
 
     /// Record that a task has released a concurrency slot.
-    pub fn release(&self, limit_key: &str, task_id: &str) {
+    pub fn release(&self, tenant: &str, queue: &str, task_id: &str) {
         let mut holders = self.holders.lock().unwrap();
+        let composite_key = format!("{}|{}", tenant, queue);
 
-        if let Some(entry) = holders.get_mut(limit_key) {
+        if let Some(entry) = holders.get_mut(&composite_key) {
             // Find and remove any entry matching this task_id (job_id may vary)
             let to_remove: Option<(String, String)> =
                 entry.iter().find(|(tid, _)| tid == task_id).cloned();
@@ -596,14 +714,16 @@ impl GlobalConcurrencyTracker {
             if let Some(key) = to_remove {
                 entry.remove(&key);
                 tracing::trace!(
-                    limit_key = limit_key,
+                    tenant = tenant,
+                    queue = queue,
                     task_id = task_id,
                     remaining_count = entry.len(),
                     "concurrency_released"
                 );
             } else {
                 tracing::trace!(
-                    limit_key = limit_key,
+                    tenant = tenant,
+                    queue = queue,
                     task_id = task_id,
                     "release called for task not in holders set (may have been released already)"
                 );
@@ -611,10 +731,23 @@ impl GlobalConcurrencyTracker {
         }
     }
 
-    /// Get the current holder count for a limit key
-    pub fn holder_count(&self, limit_key: &str) -> usize {
+    /// Get the current holder count for a tenant+queue combination
+    pub fn holder_count(&self, tenant: &str, queue: &str) -> usize {
         let holders = self.holders.lock().unwrap();
-        holders.get(limit_key).map(|s| s.len()).unwrap_or(0)
+        let composite_key = format!("{}|{}", tenant, queue);
+        holders.get(&composite_key).map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Get the total holder count for a queue across all tenants.
+    /// Useful for logging/debugging when tenants are not tracked individually.
+    pub fn total_holder_count_for_queue(&self, queue: &str) -> usize {
+        let holders = self.holders.lock().unwrap();
+        let suffix = format!("|{}", queue);
+        holders
+            .iter()
+            .filter(|(key, _)| key.ends_with(&suffix))
+            .map(|(_, set)| set.len())
+            .sum()
     }
 
     /// Verify that a job doesn't have duplicate active leases (oneLeasePerJob invariant)
@@ -1185,19 +1318,19 @@ impl InvariantTracker {
                     self.jobs.task_released(job_id, task_id);
                 }
                 DstEvent::ConcurrencyTicketGranted {
-                    tenant: _,
+                    ref tenant,
                     ref job_id,
                     ref queue,
                     ref task_id,
                 } => {
-                    self.concurrency.acquire(queue, task_id, job_id);
+                    self.concurrency.acquire(tenant, queue, task_id, job_id);
                 }
                 DstEvent::ConcurrencyTicketReleased {
-                    tenant: _,
+                    ref tenant,
                     ref queue,
                     ref task_id,
                 } => {
-                    self.concurrency.release(queue, task_id);
+                    self.concurrency.release(tenant, queue, task_id);
                 }
                 DstEvent::ShardAcquired {
                     ref node_id,

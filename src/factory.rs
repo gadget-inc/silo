@@ -235,6 +235,30 @@ impl ShardFactory {
                 let db_path = resolved.canonical_path.clone();
                 Ok((resolved, db_path))
             }
+            #[cfg(feature = "dst")]
+            Backend::TurmoilFs => {
+                // TurmoilFs backend: same as Fs but uses turmoil's simulated filesystem
+                let placeholder_pos = template_path
+                    .find("%shard%")
+                    .or_else(|| template_path.find("{shard}"));
+
+                let root_path = match placeholder_pos {
+                    Some(pos) => {
+                        let root = &template_path[..pos];
+                        let root_trimmed = root.trim_end_matches('/');
+                        if root_trimmed.is_empty() {
+                            "/"
+                        } else {
+                            root_trimmed
+                        }
+                    }
+                    None => template_path, // No placeholder, use as-is
+                };
+
+                let resolved = resolve_object_store(backend, root_path)?;
+                // For TurmoilFs, db_path is the shard name (relative to root)
+                Ok((resolved, shard_name.to_string()))
+            }
         }
     }
 

@@ -39,7 +39,9 @@ use crate::codec::{
     decode_concurrency_action, encode_concurrency_action, encode_holder, encode_task,
 };
 use crate::job::{ConcurrencyLimit, JobView};
-use crate::keys::{concurrency_holder_key, concurrency_request_key, job_cancelled_key, task_key};
+use crate::keys::{
+    concurrency_holder_key, concurrency_request_key, decode_tenant, job_cancelled_key, task_key,
+};
 use crate::task::{ConcurrencyAction, HolderRecord, Task};
 
 /// Information needed to rollback a release_and_grant operation if DB write fails.
@@ -94,7 +96,17 @@ impl ConcurrencyCounts {
         }
     }
 
-    pub async fn hydrate(&self, db: &Db) -> Result<(), slatedb::Error> {
+    /// Hydrate concurrency holder state from durable storage.
+    ///
+    /// The `range` parameter filters holders to only load those for tenants within
+    /// the shard's range. This is critical after shard splits - both child shards
+    /// clone the same holder records, and without filtering, both would think they
+    /// own the same concurrency tickets, leading to limit violations.
+    pub async fn hydrate(
+        &self,
+        db: &Db,
+        range: &crate::shard_range::ShardRange,
+    ) -> Result<(), slatedb::Error> {
         // Scan holders under holders/<tenant>/<queue>/<task-id>
         let start: Vec<u8> = b"holders/".to_vec();
         let mut end: Vec<u8> = b"holders/".to_vec();
@@ -121,6 +133,20 @@ impl ConcurrencyCounts {
                     Some(x) => x,
                     None => continue,
                 };
+
+                // Filter by shard range - only hydrate holders for tenants in this shard
+                let decoded_tenant = decode_tenant(tenant);
+                if !range.contains(&decoded_tenant) {
+                    tracing::debug!(
+                        tenant = %decoded_tenant,
+                        queue = %queue,
+                        task = %task,
+                        range = %range,
+                        "skipping holder outside shard range during hydration"
+                    );
+                    continue;
+                }
+
                 let key = format!("{}|{}", tenant, queue);
                 let mut h = self.holders.lock().unwrap();
                 let set = h.entry(key).or_default();

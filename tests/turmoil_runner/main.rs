@@ -151,3 +151,13 @@ fn k8s_coordination() {
         verify_determinism("k8s_coordination", get_seed());
     }
 }
+
+#[test]
+#[cfg(feature = "k8s")]
+fn k8s_shard_splits() {
+    if is_subprocess() || is_fuzz_mode() {
+        scenarios::k8s_shard_splits::run();
+    } else {
+        verify_determinism("k8s_shard_splits", get_seed());
+    }
+}

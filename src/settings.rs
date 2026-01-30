@@ -315,6 +315,10 @@ pub enum Backend {
     Gcs,
     Memory,
     Url,
+    /// Turmoil simulated filesystem for deterministic simulation testing.
+    /// Only available when the `dst` feature is enabled.
+    #[cfg(feature = "dst")]
+    TurmoilFs,
 }
 
 /// Expand environment variables in a string.

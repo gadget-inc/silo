@@ -49,6 +49,7 @@ kube = { version = "0.98", features = [
 ], optional = true }
 k8s-openapi = { version = "0.24", features = ["v1_31"], optional = true }
 chrono = { version = "0.4", optional = true }
+turmoil = { version = "0.7", features = ["unstable-fs"], optional = true }
 tracing-opentelemetry = "0.27"
 opentelemetry = { version = "0.26" }
 opentelemetry_sdk = { version = "0.26", features = ["rt-tokio"] }
@@ -79,11 +80,10 @@ urlencoding = "2"
 
 [features]
 default = ["k8s"]
-dst = []
+dst = ["turmoil"]
 k8s = ["kube", "k8s-openapi", "chrono"]
 
 [dev-dependencies]
-turmoil = "0.7"
 mad-turmoil = "0.2"
 rand = "0.9"
 fastrand = "2"                                                      # For deterministic simulation - seed must be set explicitly
@@ -114,3 +114,4 @@ harness = false
 [[test]]
 name = "turmoil_runner"
 path = "tests/turmoil_runner/main.rs"
+required-features = ["dst"]

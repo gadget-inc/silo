@@ -179,7 +179,7 @@ function runScenarioWithSeed(scenario, seed) {
 
     const proc = spawn(
       "cargo",
-      ["test", "--test", "turmoil_runner", scenario, "--", "--exact", "--nocapture"],
+      ["test", "--features", "dst", "--test", "turmoil_runner", scenario, "--", "--exact", "--nocapture"],
       {
         env: { ...process.env, DST_SEED: String(seed), DST_FUZZ: "1" },
         stdio: ["ignore", "pipe", "pipe"],
@@ -259,7 +259,7 @@ async function main() {
     console.log(`Running scenario '${scenario}' with seed: ${SPECIFIC_SEED}\n`);
     const result = spawnSync(
       "cargo",
-      ["test", "--test", "turmoil_runner", scenario, "--", "--exact", "--nocapture"],
+      ["test", "--features", "dst", "--test", "turmoil_runner", scenario, "--", "--exact", "--nocapture"],
       {
         env: { ...process.env, DST_SEED: String(SPECIFIC_SEED), DST_FUZZ: "1" },
         stdio: "inherit",
@@ -289,7 +289,7 @@ async function main() {
 
   // Build test binary first
   console.log("Building test binary...");
-  const buildResult = spawnSync("cargo", ["test", "--test", "turmoil_runner", "--no-run"], {
+  const buildResult = spawnSync("cargo", ["test", "--features", "dst", "--test", "turmoil_runner", "--no-run"], {
     stdio: "inherit",
   });
   if (buildResult.status !== 0) {
