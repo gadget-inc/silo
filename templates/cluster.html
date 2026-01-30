@@ -16,7 +16,7 @@
     {% endif %}
     
     <!-- Stats -->
-    <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+    <div class="grid grid-cols-2 md:grid-cols-5 gap-3">
         <div class="bg-zinc-800 border border-zinc-700 p-4">
             <div class="text-xs text-zinc-500 uppercase tracking-wider">Total Shards</div>
             <div class="text-2xl font-bold text-zinc-100 mt-1">{{ total_shards }}</div>
@@ -33,7 +33,52 @@
             <div class="text-xs text-zinc-500 uppercase tracking-wider">Total Jobs</div>
             <div class="text-2xl font-bold text-zinc-100 mt-1">{{ total_jobs }}</div>
         </div>
+        <div class="bg-zinc-800 border border-zinc-700 p-4">
+            <div class="text-xs text-zinc-500 uppercase tracking-wider">Active Splits</div>
+            <div class="text-2xl font-bold {% if active_splits.is_empty() %}text-zinc-100{% else %}text-amber-400{% endif %} mt-1">{{ active_splits.len() }}</div>
+        </div>
     </div>
+    
+    {% if !active_splits.is_empty() %}
+    <!-- Active Split Operations -->
+    <div class="bg-amber-900/20 border border-amber-700 overflow-hidden">
+        <div class="bg-amber-900/30 border-b border-amber-700 px-4 py-2">
+            <h2 class="text-sm font-semibold text-amber-300">Active Split Operations</h2>
+        </div>
+        <div class="p-4">
+            <div class="overflow-x-auto">
+                <table class="min-w-full divide-y divide-amber-700/50">
+                    <thead class="bg-amber-900/20">
+                        <tr>
+                            <th class="px-3 py-2 text-left text-xs font-medium text-amber-400 uppercase tracking-wider">Parent Shard</th>
+                            <th class="px-3 py-2 text-left text-xs font-medium text-amber-400 uppercase tracking-wider">Phase</th>
+                            <th class="px-3 py-2 text-left text-xs font-medium text-amber-400 uppercase tracking-wider">Split Point</th>
+                            <th class="px-3 py-2 text-left text-xs font-medium text-amber-400 uppercase tracking-wider">Left Child</th>
+                            <th class="px-3 py-2 text-left text-xs font-medium text-amber-400 uppercase tracking-wider">Right Child</th>
+                            <th class="px-3 py-2 text-left text-xs font-medium text-amber-400 uppercase tracking-wider">Initiator</th>
+                            <th class="px-3 py-2 text-left text-xs font-medium text-amber-400 uppercase tracking-wider">Requested At</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-amber-700/30">
+                        {% for split in active_splits %}
+                        <tr class="hover:bg-amber-900/10">
+                            <td class="px-3 py-2 text-sm text-amber-200 whitespace-nowrap font-mono">{{ split.parent_shard_id }}</td>
+                            <td class="px-3 py-2 text-sm whitespace-nowrap">
+                                <span class="px-2 py-0.5 text-xs font-medium border bg-amber-900/50 border-amber-600 text-amber-300">{{ split.phase }}</span>
+                            </td>
+                            <td class="px-3 py-2 text-sm text-amber-200 whitespace-nowrap font-mono">{{ split.split_point }}</td>
+                            <td class="px-3 py-2 text-sm text-amber-200 whitespace-nowrap font-mono">{{ split.left_child_id }}</td>
+                            <td class="px-3 py-2 text-sm text-amber-200 whitespace-nowrap font-mono">{{ split.right_child_id }}</td>
+                            <td class="px-3 py-2 text-sm text-amber-200 whitespace-nowrap">{{ split.initiator_node_id }}</td>
+                            <td class="px-3 py-2 text-sm text-amber-200 whitespace-nowrap">{{ split.requested_at }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    {% endif %}
     
     <!-- Shard Distribution -->
     <div class="bg-zinc-800 border border-zinc-700 overflow-hidden">
@@ -43,10 +88,10 @@
         <div class="p-4">
             <div class="flex flex-wrap gap-2 justify-center py-4">
                 {% for shard in shards %}
-                <div class="w-16 h-16 bg-emerald-900/30 border border-emerald-700 flex flex-col items-center justify-center text-xs">
-                    <span class="text-emerald-400 font-bold">{{ shard.name }}</span>
+                <a href="/shard?id={{ shard.name }}" class="w-16 h-16 {% if shard.split_phase.is_some() %}bg-amber-900/30 border-amber-700{% else if shard.cleanup_status.is_some() %}bg-blue-900/30 border-blue-700{% else %}bg-emerald-900/30 border-emerald-700{% endif %} border flex flex-col items-center justify-center text-xs hover:opacity-80">
+                    <span class="{% if shard.split_phase.is_some() %}text-amber-400{% else if shard.cleanup_status.is_some() %}text-blue-400{% else %}text-emerald-400{% endif %} font-bold w-full truncate text-center">{{ shard.name }}</span>
                     <span class="text-zinc-500">{{ shard.job_count }} jobs</span>
-                </div>
+                </a>
                 {% endfor %}
             </div>
         </div>
@@ -54,8 +99,11 @@
     
     <!-- Shard Details -->
     <div class="bg-zinc-800 border border-zinc-700 overflow-hidden">
-        <div class="bg-zinc-850 border-b border-zinc-700 px-4 py-2">
+        <div class="bg-zinc-850 border-b border-zinc-700 px-4 py-2 flex items-center justify-between">
             <h2 class="text-sm font-semibold text-zinc-300">Shard Details</h2>
+            {% if shards_needing_cleanup > 0 %}
+            <span class="px-2 py-0.5 text-xs font-medium border bg-blue-900/50 border-blue-700 text-blue-400">{{ shards_needing_cleanup }} shard(s) cleaning up</span>
+            {% endif %}
         </div>
         <div class="p-4">
             {% if shards.is_empty() %}
@@ -74,11 +122,22 @@
                     <tbody class="divide-y divide-zinc-700">
                         {% for shard in shards %}
                         <tr class="border-b border-zinc-700 hover:bg-zinc-750">
-                            <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">{{ shard.name }}</td>
+                            <td class="px-3 py-2 text-sm whitespace-nowrap">
+                                <a href="/shard?id={{ shard.name }}" class="text-emerald-400 hover:underline">{{ shard.name }}</a>
+                                {% if let Some(parent) = shard.parent_shard_id %}
+                                <span class="text-xs text-zinc-500 ml-1">(from {{ parent }})</span>
+                                {% endif %}
+                            </td>
                             <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">{{ shard.owner }}</td>
                             <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">{{ shard.job_count }}</td>
-                            <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">
+                            <td class="px-3 py-2 text-sm whitespace-nowrap">
+                                {% if let Some(phase) = shard.split_phase %}
+                                <span class="px-2 py-0.5 text-xs font-medium border bg-amber-900/50 border-amber-600 text-amber-300">Splitting: {{ phase }}</span>
+                                {% else if let Some(cleanup) = shard.cleanup_status %}
+                                <span class="px-2 py-0.5 text-xs font-medium border bg-blue-900/50 border-blue-700 text-blue-400">{{ cleanup }}</span>
+                                {% else %}
                                 <span class="px-2 py-0.5 text-xs font-medium border bg-green-900/50 border-green-700 text-green-400">Active</span>
+                                {% endif %}
                             </td>
                         </tr>
                         {% endfor %}

@@ -170,6 +170,8 @@ async fn setup_node_server(
     .await
     .map_err(|e| e.to_string())?;
 
+    let coordinator = Arc::new(coordinator);
+
     // Wait for initial convergence
     let converged = coordinator.wait_converged(Duration::from_secs(30)).await;
     if converged {
@@ -257,14 +259,15 @@ async fn setup_node_server(
     let (shutdown_tx, rx) = tokio::sync::broadcast::channel::<()>(1);
 
     // Spawn the server in the background
+    let coordinator_for_server = Arc::clone(&coordinator) as Arc<dyn Coordinator>;
     tokio::spawn(async move {
-        if let Err(e) = run_server_with_incoming(incoming, factory, None, cfg, None, rx).await {
+        if let Err(e) = run_server_with_incoming(incoming, factory, coordinator_for_server, cfg, None, rx).await {
             tracing::trace!(error = %e, "server error");
         }
     });
 
     Ok(NodeServerHandle {
-        coordinator: Arc::new(coordinator),
+        coordinator,
         _shutdown_tx: shutdown_tx,
     })
 }

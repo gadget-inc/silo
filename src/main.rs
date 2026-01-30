@@ -106,34 +106,26 @@ async fn main() -> anyhow::Result<()> {
     )
     .await;
 
-    let (coordinator, _coord_handle): (
-        Option<Arc<dyn Coordinator>>,
-        Option<tokio::task::JoinHandle<()>>,
-    ) = match coord_result {
-        Ok((coord, handle)) => {
-            match cfg.coordination.backend {
-                CoordinationBackend::None => {
-                    tracing::info!("coordination: none (single-node mode)");
+    let (coordinator, _coord_handle): (Arc<dyn Coordinator>, Option<tokio::task::JoinHandle<()>>) =
+        match coord_result {
+            Ok((coord, handle)) => {
+                match cfg.coordination.backend {
+                    CoordinationBackend::None => {
+                        tracing::info!("coordination: none (single-node mode)");
+                    }
+                    CoordinationBackend::Etcd => {
+                        tracing::info!(endpoints = ?cfg.coordination.etcd_endpoints, "coordination: connected to etcd");
+                    }
+                    CoordinationBackend::K8s => {
+                        tracing::info!(namespace = ?cfg.coordination.k8s_namespace, "coordination: connected to kubernetes");
+                    }
                 }
-                CoordinationBackend::Etcd => {
-                    tracing::info!(endpoints = ?cfg.coordination.etcd_endpoints, "coordination: connected to etcd");
-                }
-                CoordinationBackend::K8s => {
-                    tracing::info!(namespace = ?cfg.coordination.k8s_namespace, "coordination: connected to kubernetes");
-                }
+                (coord, handle)
             }
-            (Some(coord), handle)
-        }
-        Err(e) => {
-            // In single-node mode, coordination errors are warnings not failures
-            if cfg.coordination.backend == CoordinationBackend::None {
-                tracing::warn!(error = %e, "coordination: failed but continuing in single-node mode");
-                (None, None)
-            } else {
+            Err(e) => {
                 return Err(anyhow::anyhow!("coordination: {}", e));
             }
-        }
-    };
+        };
 
     // Start gRPC server and scheduled reaper together
     let addr: SocketAddr = cfg.server.grpc_addr.parse()?;

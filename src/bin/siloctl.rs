@@ -57,6 +57,11 @@ enum Command {
         #[command(subcommand)]
         action: JobAction,
     },
+    /// Shard operations
+    Shard {
+        #[command(subcommand)]
+        action: ShardAction,
+    },
     /// Execute SQL query against a shard
     Query {
         /// Shard ID (UUID) to query
@@ -82,6 +87,29 @@ enum Command {
 enum ClusterAction {
     /// Show cluster topology and shard ownership
     Info,
+}
+
+#[derive(Subcommand, Debug)]
+enum ShardAction {
+    /// Split a shard into two at a specified tenant ID
+    Split {
+        /// Shard ID (UUID) to split
+        shard: String,
+        /// Tenant ID at which to split the keyspace
+        #[arg(long)]
+        at: Option<String>,
+        /// Automatically compute the midpoint of the shard's range
+        #[arg(long, conflicts_with = "at")]
+        auto: bool,
+        /// Wait for split to complete
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Check the status of a split operation
+    SplitStatus {
+        /// Parent shard ID (UUID) to check
+        shard: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -151,6 +179,17 @@ async fn run(args: Args) -> anyhow::Result<()> {
             }
             JobAction::Delete { shard, id } => {
                 siloctl::job_delete(&opts, &mut stdout, shard, id).await
+            }
+        },
+        Command::Shard { action } => match action {
+            ShardAction::Split {
+                shard,
+                at,
+                auto,
+                wait,
+            } => siloctl::shard_split(&opts, &mut stdout, shard, at.clone(), *auto, *wait).await,
+            ShardAction::SplitStatus { shard } => {
+                siloctl::shard_split_status(&opts, &mut stdout, shard).await
             }
         },
         Command::Query { shard, sql } => siloctl::query(&opts, &mut stdout, shard, sql).await,

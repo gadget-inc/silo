@@ -341,6 +341,22 @@ impl ShardFactory {
             ))
         })?;
 
+        // Validate that the placeholder is at a path boundary (preceded by / or at start of path).
+        // This ensures that when we split the template into root + relative paths for cloning,
+        // the relative path will be the shard ID as a subdirectory, not concatenated with a prefix.
+        // e.g., "/data/%shard%" is valid (root="/data", relative="<uuid>")
+        //       "/data/shard-%shard%" is INVALID - would create path mismatch during clone
+        if pos > 0 {
+            let char_before = self.template.path.chars().nth(pos - 1);
+            if char_before != Some('/') {
+                return Err(ShardFactoryError::CloneError(format!(
+                    "shard placeholder in database template path must be preceded by '/' for cloning to work correctly. \
+                     Got: '{}'. Change to something like '/data/%shard%' where the shard ID is a directory name.",
+                    self.template.path
+                )));
+            }
+        }
+
         // Extract the root path (everything before the placeholder)
         let root = &self.template.path[..pos];
         // Trim trailing slashes but keep at least one character

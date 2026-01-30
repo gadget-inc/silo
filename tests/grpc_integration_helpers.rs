@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use silo::coordination::NoneCoordinator;
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::pb::silo_client::SiloClient;
@@ -24,10 +25,16 @@ pub async fn setup_test_server(
     let addr = listener.local_addr()?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
 
+    // Create a NoneCoordinator for single-node test mode, using factory's existing shards
+    let coordinator = Arc::new(
+        NoneCoordinator::from_factory("test-node", format!("http://{}", addr), factory.clone())
+            .await,
+    );
+
     let server = tokio::spawn(run_server(
         listener,
         factory.clone(),
-        None,
+        coordinator,
         config,
         None, // metrics
         shutdown_rx,

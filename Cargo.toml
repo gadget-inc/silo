@@ -75,6 +75,7 @@ datafusion-sql = "50"
 hostname = "0.4"
 pprof = { version = "0.15", features = ["prost-codec", "frame-pointer"] }
 flate2 = "1"
+urlencoding = "2"
 
 [features]
 default = ["k8s"]

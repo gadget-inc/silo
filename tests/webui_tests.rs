@@ -7,10 +7,11 @@ use axum::{
 use http_body_util::BodyExt;
 use silo::cluster_client::ClusterClient;
 use silo::cluster_query::ClusterQueryEngine;
+use silo::coordination::{Coordinator, NoneCoordinator};
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::settings::{AppConfig, Backend, DatabaseTemplate};
-use silo::shard_range::{ShardMap, ShardRange};
+use silo::shard_range::ShardMap;
 use silo::webui::{AppState, create_router};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -20,7 +21,7 @@ async fn setup_test_state() -> (tempfile::TempDir, AppState, ShardMap) {
     let tmp = tempfile::tempdir().unwrap();
 
     let rate_limiter = MockGubernatorClient::new_arc();
-    let factory = ShardFactory::new(
+    let factory = Arc::new(ShardFactory::new(
         DatabaseTemplate {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
@@ -29,20 +30,21 @@ async fn setup_test_state() -> (tempfile::TempDir, AppState, ShardMap) {
         },
         rate_limiter,
         None,
-    );
+    ));
 
-    // Create a single-shard ShardMap and open that shard
-    let shard_map = ShardMap::create_initial(1).expect("failed to create shard map");
-    let shard_id = shard_map.shards()[0].id;
-    factory
-        .open(&shard_id, &ShardRange::full())
-        .await
-        .expect("open shard");
+    // Use NoneCoordinator which creates a single-shard map and opens all shards
+    let coordinator: Arc<dyn Coordinator> =
+        Arc::new(NoneCoordinator::new("test-node", "127.0.0.1:50051", 1, factory.clone()).await);
 
-    let factory = Arc::new(factory);
-    let cluster_client = Arc::new(ClusterClient::new(factory.clone(), None));
+    // Get the shard map from the coordinator
+    let shard_map = coordinator.get_shard_map().await.expect("get shard map");
+
+    let cluster_client = Arc::new(ClusterClient::new(
+        factory.clone(),
+        Some(coordinator.clone()),
+    ));
     let query_engine = Arc::new(
-        ClusterQueryEngine::new(factory.clone(), None)
+        ClusterQueryEngine::new(factory.clone(), Some(coordinator.clone()))
             .await
             .expect("create query engine"),
     );
@@ -51,7 +53,7 @@ async fn setup_test_state() -> (tempfile::TempDir, AppState, ShardMap) {
 
     let state = AppState {
         factory,
-        coordinator: None,
+        coordinator,
         cluster_client,
         query_engine,
         config,
@@ -382,7 +384,7 @@ async fn setup_multi_shard_state(num_shards: usize) -> (tempfile::TempDir, AppSt
     let rate_limiter = MockGubernatorClient::new_arc();
     // Use {shard} placeholder so each shard gets its own subdirectory
     let path_with_shard = format!("{}/{{shard}}", tmp.path().to_string_lossy());
-    let factory = ShardFactory::new(
+    let factory = Arc::new(ShardFactory::new(
         DatabaseTemplate {
             backend: Backend::Fs,
             path: path_with_shard,
@@ -391,22 +393,28 @@ async fn setup_multi_shard_state(num_shards: usize) -> (tempfile::TempDir, AppSt
         },
         rate_limiter,
         None,
+    ));
+
+    // Use NoneCoordinator which creates a shard map and opens all shards
+    let coordinator: Arc<dyn Coordinator> = Arc::new(
+        NoneCoordinator::new(
+            "test-node",
+            "127.0.0.1:50051",
+            num_shards as u32,
+            factory.clone(),
+        )
+        .await,
     );
 
-    // Create a ShardMap and open all shards
-    let shard_map =
-        ShardMap::create_initial(num_shards as u32).expect("failed to create shard map");
-    for shard_info in shard_map.shards() {
-        factory
-            .open(&shard_info.id, &ShardRange::full())
-            .await
-            .expect(&format!("open shard {}", shard_info.id));
-    }
+    // Get the shard map from the coordinator
+    let shard_map = coordinator.get_shard_map().await.expect("get shard map");
 
-    let factory = Arc::new(factory);
-    let cluster_client = Arc::new(ClusterClient::new(factory.clone(), None));
+    let cluster_client = Arc::new(ClusterClient::new(
+        factory.clone(),
+        Some(coordinator.clone()),
+    ));
     let query_engine = Arc::new(
-        ClusterQueryEngine::new(factory.clone(), None)
+        ClusterQueryEngine::new(factory.clone(), Some(coordinator.clone()))
             .await
             .expect("create query engine"),
     );
@@ -415,7 +423,7 @@ async fn setup_multi_shard_state(num_shards: usize) -> (tempfile::TempDir, AppSt
 
     let state = AppState {
         factory,
-        coordinator: None,
+        coordinator,
         cluster_client,
         query_engine,
         config,
@@ -855,5 +863,154 @@ async fn test_sql_page_shows_query_in_url() {
     assert!(
         body.contains("SELECT * FROM jobs"),
         "body should contain the query from URL"
+    );
+}
+
+#[silo::test]
+async fn test_shard_detail_page_renders() {
+    let (_tmp, state, shard_map) = setup_test_state().await;
+    let shard_id = shard_map.shards()[0].id;
+
+    let (status, body) = make_request(state, "GET", &format!("/shard?id={}", shard_id)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("Shard Details"),
+        "body should contain 'Shard Details'"
+    );
+    assert!(
+        body.contains(&shard_id.to_string()),
+        "body should contain shard ID"
+    );
+    assert!(
+        body.contains("Split Shard"),
+        "body should contain split form"
+    );
+    assert!(body.contains("Active"), "body should show Active status");
+}
+
+#[silo::test]
+async fn test_shard_detail_page_invalid_id() {
+    let (_tmp, state, _shard_map) = setup_test_state().await;
+
+    let (status, body) = make_request(state, "GET", "/shard?id=not-a-valid-uuid").await;
+
+    assert_eq!(status, StatusCode::OK); // Error page renders with 200
+    assert!(
+        body.contains("Invalid Shard ID") || body.contains("not a valid"),
+        "body should show error for invalid shard ID"
+    );
+}
+
+#[silo::test]
+async fn test_shard_detail_page_not_found() {
+    let (_tmp, state, _shard_map) = setup_test_state().await;
+
+    // Use a valid UUID that doesn't exist in the cluster
+    let nonexistent_id = "00000000-0000-0000-0000-000000000000";
+    let (status, body) = make_request(state, "GET", &format!("/shard?id={}", nonexistent_id)).await;
+
+    assert_eq!(status, StatusCode::OK); // Error page renders with 200
+    assert!(
+        body.contains("Not Found") || body.contains("not found"),
+        "body should show not found error"
+    );
+}
+
+#[silo::test]
+async fn test_cluster_page_shows_shard_links() {
+    let (_tmp, state, shard_map) = setup_test_state().await;
+    let shard_id = shard_map.shards()[0].id;
+
+    let (status, body) = make_request(state, "GET", "/cluster").await;
+
+    assert_eq!(status, StatusCode::OK);
+    // Check that shard IDs are linked to detail pages
+    assert!(
+        body.contains(&format!("/shard?id={}", shard_id)),
+        "cluster page should have links to shard detail pages"
+    );
+}
+
+#[silo::test]
+async fn test_cluster_page_shows_active_splits_section() {
+    // Without a coordinator, there won't be any active splits, but the page should still render
+    let (_tmp, state, _shard_map) = setup_test_state().await;
+
+    let (status, body) = make_request(state, "GET", "/cluster").await;
+
+    assert_eq!(status, StatusCode::OK);
+    // The active splits stat should show 0 when no coordinator
+    assert!(
+        body.contains("Active Splits"),
+        "cluster page should have Active Splits stat"
+    );
+}
+
+#[silo::test]
+async fn test_cluster_page_shows_cleanup_count() {
+    // Without a coordinator, shards needing cleanup should be 0
+    let (_tmp, state, _shard_map) = setup_test_state().await;
+
+    let (status, body) = make_request(state, "GET", "/cluster").await;
+
+    assert_eq!(status, StatusCode::OK);
+    // Shard Details section should exist
+    assert!(
+        body.contains("Shard Details"),
+        "cluster page should have Shard Details section"
+    );
+}
+
+#[silo::test]
+async fn test_shard_detail_shows_job_count() {
+    let (_tmp, state, shard_map) = setup_test_state().await;
+    let shard_id = shard_map.shards()[0].id;
+    let shard = state.factory.get(&shard_id).expect("shard 0");
+
+    // Enqueue some jobs
+    for i in 0..5 {
+        let _job_id = shard
+            .enqueue(
+                "-",
+                Some(format!("shard-detail-job-{}", i)),
+                50,
+                test_helpers::now_ms() + 10000,
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({})),
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+    }
+
+    let (status, body) = make_request(state, "GET", &format!("/shard?id={}", shard_id)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("Job Count"),
+        "body should show Job Count label"
+    );
+    // Should show 5 jobs
+    assert!(body.contains(">5<"), "body should show 5 jobs");
+}
+
+#[silo::test]
+async fn test_shard_detail_shows_range() {
+    let (_tmp, state, shard_map) = setup_test_state().await;
+    let shard_id = shard_map.shards()[0].id;
+
+    let (status, body) = make_request(state, "GET", &format!("/shard?id={}", shard_id)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    // Single shard should have full range
+    assert!(body.contains("Range Start"), "body should show Range Start");
+    assert!(body.contains("Range End"), "body should show Range End");
+    // Unbounded ranges shown as infinity symbols
+    assert!(
+        body.contains("-∞") || body.contains("+∞"),
+        "body should show unbounded range indicators"
     );
 }

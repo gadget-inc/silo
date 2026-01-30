@@ -71,6 +71,12 @@ processes:
     availability:
       restart: always
       backoff_seconds: 1
+    log_location: ./tmp/silo-1.log
+    log_configuration:
+      rotation:
+        max_size_mb: 5
+        max_age_days: 3
+        max_backups: 1
 
   # Silo instance 2 - watchexec restarts cargo run on source changes
   silo-2:
@@ -96,3 +102,9 @@ processes:
     availability:
       restart: always
       backoff_seconds: 1
+    log_location: ./tmp/silo-2.log
+    log_configuration:
+      rotation:
+        max_size_mb: 5
+        max_age_days: 3
+        max_backups: 1
