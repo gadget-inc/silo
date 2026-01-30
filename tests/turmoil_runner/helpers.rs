@@ -639,6 +639,149 @@ impl GlobalConcurrencyTracker {
     }
 }
 
+/// Tracks shard ownership for split-brain detection.
+///
+/// Verifies the invariant:
+/// - noSplitBrain: A shard is owned by at most one node at any time
+///
+/// This tracker receives ShardAcquired/ShardReleased events from server-side
+/// instrumentation, allowing continuous verification without polling.
+#[derive(Debug, Default)]
+pub struct ShardOwnershipTracker {
+    /// Maps shard_id -> current owner node_id (if any)
+    current_owners: Mutex<HashMap<String, String>>,
+    /// Records any split-brain violations detected: (shard_id, node1, node2, timestamp)
+    violations: Mutex<Vec<(String, String, String, u64)>>,
+    /// Monotonic counter for ordering events
+    event_counter: std::sync::atomic::AtomicU64,
+}
+
+impl ShardOwnershipTracker {
+    /// Create a new tracker.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that a node acquired ownership of a shard.
+    /// If another node already owns this shard, records a split-brain violation.
+    pub fn shard_acquired(&self, node_id: &str, shard_id: &str) {
+        let timestamp = self
+            .event_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        let mut owners = self.current_owners.lock().unwrap();
+
+        if let Some(existing_owner) = owners.get(shard_id) {
+            if existing_owner != node_id {
+                // SPLIT-BRAIN DETECTED!
+                tracing::error!(
+                    shard_id = %shard_id,
+                    existing_owner = %existing_owner,
+                    new_owner = %node_id,
+                    timestamp = timestamp,
+                    "SPLIT-BRAIN DETECTED: shard acquired by new node while still owned by another"
+                );
+                let mut violations = self.violations.lock().unwrap();
+                violations.push((
+                    shard_id.to_string(),
+                    existing_owner.clone(),
+                    node_id.to_string(),
+                    timestamp,
+                ));
+            }
+            // Even if same node, update is fine (idempotent)
+        }
+
+        owners.insert(shard_id.to_string(), node_id.to_string());
+        tracing::trace!(
+            shard_id = %shard_id,
+            node_id = %node_id,
+            timestamp = timestamp,
+            "shard_ownership_acquired"
+        );
+    }
+
+    /// Record that a node released ownership of a shard.
+    pub fn shard_released(&self, node_id: &str, shard_id: &str) {
+        let timestamp = self
+            .event_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        let mut owners = self.current_owners.lock().unwrap();
+
+        if let Some(existing_owner) = owners.get(shard_id) {
+            if existing_owner == node_id {
+                owners.remove(shard_id);
+                tracing::trace!(
+                    shard_id = %shard_id,
+                    node_id = %node_id,
+                    timestamp = timestamp,
+                    "shard_ownership_released"
+                );
+            } else {
+                // Node releasing a shard it doesn't own - this might indicate a race
+                // but isn't necessarily a split-brain (the release might be stale)
+                tracing::warn!(
+                    shard_id = %shard_id,
+                    releasing_node = %node_id,
+                    actual_owner = %existing_owner,
+                    timestamp = timestamp,
+                    "shard_release_by_non_owner"
+                );
+            }
+        } else {
+            // Releasing an unowned shard - might happen during cleanup
+            tracing::trace!(
+                shard_id = %shard_id,
+                node_id = %node_id,
+                timestamp = timestamp,
+                "shard_release_of_unowned"
+            );
+        }
+    }
+
+    /// Verify no split-brain occurred. Panics if any violations were detected.
+    pub fn verify_no_split_brain(&self) {
+        let violations = self.violations.lock().unwrap();
+        if !violations.is_empty() {
+            let details: Vec<String> = violations
+                .iter()
+                .map(|(shard, n1, n2, ts)| {
+                    format!(
+                        "shard {} owned by both {} and {} at event {}",
+                        shard, n1, n2, ts
+                    )
+                })
+                .collect();
+            panic!(
+                "INVARIANT VIOLATION (noSplitBrain): {} split-brain events detected:\n  {}",
+                violations.len(),
+                details.join("\n  ")
+            );
+        }
+    }
+
+    /// Check if any split-brain violations have been detected (non-panicking).
+    pub fn has_violations(&self) -> bool {
+        let violations = self.violations.lock().unwrap();
+        !violations.is_empty()
+    }
+
+    /// Get the current owner of a shard (for debugging).
+    #[allow(dead_code)]
+    pub fn get_owner(&self, shard_id: &str) -> Option<String> {
+        let owners = self.current_owners.lock().unwrap();
+        owners.get(shard_id).cloned()
+    }
+
+    /// Get the count of currently owned shards (for debugging).
+    #[allow(dead_code)]
+    pub fn owned_shard_count(&self) -> usize {
+        let owners = self.current_owners.lock().unwrap();
+        owners.len()
+    }
+}
+
 /// Tracks job state for invariant verification.
 /// Verifies invariants like:
 /// - noLeasesForTerminal: Terminal jobs have no active leases
@@ -955,6 +1098,7 @@ impl JobStateTracker {
 pub struct InvariantTracker {
     pub concurrency: GlobalConcurrencyTracker,
     pub jobs: JobStateTracker,
+    pub shards: ShardOwnershipTracker,
 }
 
 impl InvariantTracker {
@@ -968,6 +1112,7 @@ impl InvariantTracker {
     pub fn verify_all(&self) {
         self.concurrency.verify_no_duplicate_job_leases();
         self.jobs.verify_no_terminal_leases();
+        self.shards.verify_no_split_brain();
     }
 
     /// Process all pending DST events from the server-side instrumentation.
@@ -1040,6 +1185,18 @@ impl InvariantTracker {
                     ref task_id,
                 } => {
                     self.concurrency.release(queue, task_id);
+                }
+                DstEvent::ShardAcquired {
+                    ref node_id,
+                    ref shard_id,
+                } => {
+                    self.shards.shard_acquired(node_id, shard_id);
+                }
+                DstEvent::ShardReleased {
+                    ref node_id,
+                    ref shard_id,
+                } => {
+                    self.shards.shard_released(node_id, shard_id);
                 }
             }
         }

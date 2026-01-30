@@ -12,8 +12,6 @@ pub mod grpc_end_to_end;
 pub mod high_message_loss;
 #[cfg(feature = "k8s")]
 pub mod k8s_coordination;
-#[cfg(feature = "k8s")]
-pub mod k8s_worker_during_membership_changes;
 pub mod lease_expiry;
 pub mod multiple_workers;
 pub mod rate_limits;

@@ -49,6 +49,12 @@ pub enum DstEvent {
         queue: String,
         task_id: String,
     },
+
+    /// A node acquired ownership of a shard.
+    ShardAcquired { node_id: String, shard_id: String },
+
+    /// A node released ownership of a shard.
+    ShardReleased { node_id: String, shard_id: String },
 }
 
 #[cfg(feature = "dst")]
