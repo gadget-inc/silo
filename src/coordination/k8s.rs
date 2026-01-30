@@ -41,6 +41,7 @@ use tokio::sync::{Mutex, Notify, watch};
 use tokio_stream::StreamExt;
 use tracing::{debug, info, warn};
 
+use crate::dst_events::{self, DstEvent};
 use crate::factory::ShardFactory;
 use crate::shard_range::{ShardId, ShardMap, SplitInProgress};
 
@@ -1234,6 +1235,10 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                                             let mut owned = owned_arc.lock().await;
                                             owned.insert(self.shard_id);
                                         }
+                                        dst_events::emit(DstEvent::ShardAcquired {
+                                            node_id: self.node_id.clone(),
+                                            shard_id: self.shard_id.to_string(),
+                                        });
                                         info!(shard_id = %self.shard_id, rv = %rv, attempts = attempt, "k8s shard: acquired and opened");
 
                                         // Start renewal loop
@@ -1328,6 +1333,10 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                         }
                         let mut owned = owned_arc.lock().await;
                         owned.remove(&self.shard_id);
+                        dst_events::emit(DstEvent::ShardReleased {
+                            node_id: self.node_id.clone(),
+                            shard_id: self.shard_id.to_string(),
+                        });
                         debug!(shard_id = %self.shard_id, "k8s shard: released");
                     }
                 }
@@ -1355,6 +1364,10 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                     }
                     let mut owned = owned_arc.lock().await;
                     owned.remove(&self.shard_id);
+                    dst_events::emit(DstEvent::ShardReleased {
+                        node_id: self.node_id.clone(),
+                        shard_id: self.shard_id.to_string(),
+                    });
                     break;
                 }
                 ShardPhase::Idle | ShardPhase::Held => {
@@ -1640,6 +1653,10 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                     }
                     let mut owned = owned_arc.lock().await;
                     owned.remove(&self.shard_id);
+                    dst_events::emit(DstEvent::ShardReleased {
+                        node_id: self.node_id.clone(),
+                        shard_id: self.shard_id.to_string(),
+                    });
                     self.notify.notify_one();
                     break;
                 }

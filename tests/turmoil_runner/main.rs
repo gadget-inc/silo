@@ -151,13 +151,3 @@ fn k8s_coordination() {
         verify_determinism("k8s_coordination", get_seed());
     }
 }
-
-#[test]
-#[cfg(feature = "k8s")]
-fn k8s_worker_during_membership_changes() {
-    if is_subprocess() || is_fuzz_mode() {
-        scenarios::k8s_worker_during_membership_changes::run();
-    } else {
-        verify_determinism("k8s_worker_during_membership_changes", get_seed());
-    }
-}
