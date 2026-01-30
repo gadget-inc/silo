@@ -153,25 +153,35 @@ pub fn run() {
             Ok(())
         });
 
-        // Worker 1: Processes job A, fails it first time, then succeeds on retry
-        let worker1_fail_time = Arc::clone(&job_a_first_fail_time);
-        let worker1_second_start = Arc::clone(&job_a_second_attempt_start);
-        let worker1_complete = Arc::clone(&job_a_complete_time);
-        sim.client("worker1", async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        // Shared state for tracking job A attempts across workers
+        // This lets any worker handle any job correctly
+        let job_a_attempts_seen = Arc::new(AtomicU64::new(0));
+
+        // Helper to create a worker that can process any job
+        // - Job A first attempt: fail (triggers retry backoff)
+        // - Job A retry attempt: succeed
+        // - Job B: succeed
+        // This makes the test insensitive to which worker gets which job
+        let make_worker = |worker_id: &'static str,
+                           delay_ms: u64,
+                           a_attempts: Arc<AtomicU64>,
+                           a_fail_time: Arc<AtomicU64>,
+                           a_second_start: Arc<AtomicU64>,
+                           a_complete: Arc<AtomicU64>,
+                           b_complete: Arc<AtomicU64>,
+                           ticket_verified: Arc<AtomicBool>| async move {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 
             let ch = Endpoint::new("http://server:9920")?
                 .connect_with_connector(turmoil_connector())
                 .await?;
             let mut client = SiloClient::new(ch);
 
-            let mut job_a_attempt = 0u32;
-
             for _round in 0..50 {
                 let lease = client
                     .lease_tasks(tonic::Request::new(LeaseTasksRequest {
                         shard: Some(TEST_SHARD_ID.to_string()),
-                        worker_id: "worker-1".into(),
+                        worker_id: worker_id.into(),
                         max_tasks: 1,
                         task_group: "default".to_string(),
                     }))
@@ -179,25 +189,26 @@ pub fn run() {
                     .into_inner();
 
                 for task in lease.tasks {
-                    if task.job_id == "job-A" {
-                        job_a_attempt += 1;
-                        let sim_time = turmoil::sim_elapsed()
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
+                    let sim_time = turmoil::sim_elapsed()
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
 
-                        if job_a_attempt == 1 {
+                    if task.job_id == "job-A" {
+                        // Atomically increment and get the attempt number
+                        let attempt = a_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+
+                        if attempt == 1 {
                             // First attempt: fail to trigger retry
                             tracing::trace!(
                                 job_id = "job-A",
-                                attempt = job_a_attempt,
+                                attempt = attempt,
+                                worker = worker_id,
                                 sim_time_ms = sim_time,
                                 "job_a_first_attempt_failing"
                             );
 
-                            // Brief processing
                             tokio::time::sleep(Duration::from_millis(50)).await;
 
-                            // Report failure
                             client
                                 .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                                     shard: TEST_SHARD_ID.to_string(),
@@ -214,25 +225,27 @@ pub fn run() {
                             let fail_time = turmoil::sim_elapsed()
                                 .map(|d| d.as_millis() as u64)
                                 .unwrap_or(0);
-                            worker1_fail_time.store(fail_time, Ordering::SeqCst);
+                            a_fail_time.store(fail_time, Ordering::SeqCst);
 
                             tracing::trace!(
                                 job_id = "job-A",
+                                worker = worker_id,
                                 fail_time_ms = fail_time,
                                 "job_a_failed_entering_backoff"
                             );
                         } else {
-                            // Second attempt: succeed
+                            // Retry attempt: succeed
                             let start_time = turmoil::sim_elapsed()
                                 .map(|d| d.as_millis() as u64)
                                 .unwrap_or(0);
-                            worker1_second_start.store(start_time, Ordering::SeqCst);
+                            a_second_start.store(start_time, Ordering::SeqCst);
 
                             tracing::trace!(
                                 job_id = "job-A",
-                                attempt = job_a_attempt,
+                                attempt = attempt,
+                                worker = worker_id,
                                 sim_time_ms = start_time,
-                                "job_a_second_attempt_starting"
+                                "job_a_retry_attempt_starting"
                             );
 
                             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -255,63 +268,23 @@ pub fn run() {
                             let complete_time = turmoil::sim_elapsed()
                                 .map(|d| d.as_millis() as u64)
                                 .unwrap_or(0);
-                            worker1_complete.store(complete_time, Ordering::SeqCst);
+                            a_complete.store(complete_time, Ordering::SeqCst);
 
                             tracing::trace!(
                                 job_id = "job-A",
+                                worker = worker_id,
                                 complete_time_ms = complete_time,
                                 "job_a_completed"
                             );
                         }
-                    }
-                }
+                    } else if task.job_id == "job-B" {
+                        tracing::trace!(
+                            job_id = "job-B",
+                            worker = worker_id,
+                            sim_time_ms = sim_time,
+                            "job_b_leased"
+                        );
 
-                // If job A is done, stop
-                if worker1_complete.load(Ordering::SeqCst) > 0 {
-                    break;
-                }
-
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-
-            tracing::trace!("worker1_done");
-            Ok(())
-        });
-
-        // Worker 2: Processes job B (should be able to run during A's backoff)
-        let worker2_complete = Arc::clone(&job_b_complete_time);
-        let worker2_verified = Arc::clone(&verified_ticket_released);
-        let worker2_a_fail_time = Arc::clone(&job_a_first_fail_time);
-        let worker2_a_second_start = Arc::clone(&job_a_second_attempt_start);
-        sim.client("worker2", async move {
-            // Start after job A has had time to fail
-            tokio::time::sleep(Duration::from_millis(400)).await;
-
-            let ch = Endpoint::new("http://server:9920")?
-                .connect_with_connector(turmoil_connector())
-                .await?;
-            let mut client = SiloClient::new(ch);
-
-            for _round in 0..30 {
-                let lease = client
-                    .lease_tasks(tonic::Request::new(LeaseTasksRequest {
-                        shard: Some(TEST_SHARD_ID.to_string()),
-                        worker_id: "worker-2".into(),
-                        max_tasks: 1,
-                        task_group: "default".to_string(),
-                    }))
-                    .await?
-                    .into_inner();
-
-                for task in lease.tasks {
-                    if task.job_id == "job-B" {
-                        let sim_time = turmoil::sim_elapsed()
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
-
-                        tracing::trace!(job_id = "job-B", sim_time_ms = sim_time, "job_b_leased");
-
-                        // Brief processing
                         tokio::time::sleep(Duration::from_millis(50)).await;
 
                         client
@@ -331,44 +304,74 @@ pub fn run() {
                         let complete_time = turmoil::sim_elapsed()
                             .map(|d| d.as_millis() as u64)
                             .unwrap_or(0);
-                        worker2_complete.store(complete_time, Ordering::SeqCst);
+                        b_complete.store(complete_time, Ordering::SeqCst);
 
-                        // Verify this happened during A's backoff window
-                        let a_fail_time = worker2_a_fail_time.load(Ordering::SeqCst);
-                        let a_second_start = worker2_a_second_start.load(Ordering::SeqCst);
+                        // Check if B completed during A's backoff window
+                        let fail_time = a_fail_time.load(Ordering::SeqCst);
+                        let second_start = a_second_start.load(Ordering::SeqCst);
 
-                        if a_fail_time > 0
-                            && (a_second_start == 0 || complete_time < a_second_start)
-                        {
-                            // B completed while A was in backoff - ticket was released!
-                            worker2_verified.store(true, Ordering::SeqCst);
+                        if fail_time > 0 && (second_start == 0 || complete_time < second_start) {
+                            ticket_verified.store(true, Ordering::SeqCst);
                             tracing::trace!(
                                 job_id = "job-B",
+                                worker = worker_id,
                                 complete_time_ms = complete_time,
-                                a_fail_time_ms = a_fail_time,
-                                a_second_start_ms = a_second_start,
+                                a_fail_time_ms = fail_time,
+                                a_second_start_ms = second_start,
                                 "job_b_completed_during_a_backoff"
                             );
                         }
 
                         tracing::trace!(
                             job_id = "job-B",
+                            worker = worker_id,
                             complete_time_ms = complete_time,
                             "job_b_completed"
                         );
                     }
                 }
 
-                if worker2_complete.load(Ordering::SeqCst) > 0 {
+                // Stop if both jobs are done
+                if a_complete.load(Ordering::SeqCst) > 0 && b_complete.load(Ordering::SeqCst) > 0 {
                     break;
                 }
 
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
 
-            tracing::trace!("worker2_done");
-            Ok(())
-        });
+            tracing::trace!(worker = worker_id, "worker_done");
+            Ok::<_, Box<dyn std::error::Error>>(())
+        };
+
+        // Worker 1: starts early
+        sim.client(
+            "worker1",
+            make_worker(
+                "worker-1",
+                100,
+                Arc::clone(&job_a_attempts_seen),
+                Arc::clone(&job_a_first_fail_time),
+                Arc::clone(&job_a_second_attempt_start),
+                Arc::clone(&job_a_complete_time),
+                Arc::clone(&job_b_complete_time),
+                Arc::clone(&verified_ticket_released),
+            ),
+        );
+
+        // Worker 2: starts slightly later to create contention
+        sim.client(
+            "worker2",
+            make_worker(
+                "worker-2",
+                150,
+                Arc::clone(&job_a_attempts_seen),
+                Arc::clone(&job_a_first_fail_time),
+                Arc::clone(&job_a_second_attempt_start),
+                Arc::clone(&job_a_complete_time),
+                Arc::clone(&job_b_complete_time),
+                Arc::clone(&verified_ticket_released),
+            ),
+        );
 
         // Verifier: Check invariants after completion
         let verify_a_fail = Arc::clone(&job_a_first_fail_time);
