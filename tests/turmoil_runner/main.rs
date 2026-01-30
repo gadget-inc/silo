@@ -20,6 +20,8 @@
 //! 3. Add a `#[silo::test] fn your_name()` in this file that calls the scenario
 
 mod helpers;
+#[cfg(feature = "k8s")]
+mod mock_k8s;
 mod scenarios;
 
 use helpers::{get_seed, is_fuzz_mode, is_subprocess, verify_determinism};
@@ -141,10 +143,21 @@ fn floating_concurrency() {
 }
 
 #[test]
-fn coordinator_shard_migration() {
+#[cfg(feature = "k8s")]
+fn k8s_coordination() {
     if is_subprocess() || is_fuzz_mode() {
-        scenarios::coordinator_shard_migration::run();
+        scenarios::k8s_coordination::run();
     } else {
-        verify_determinism("coordinator_shard_migration", get_seed());
+        verify_determinism("k8s_coordination", get_seed());
+    }
+}
+
+#[test]
+#[cfg(feature = "k8s")]
+fn k8s_worker_during_membership_changes() {
+    if is_subprocess() || is_fuzz_mode() {
+        scenarios::k8s_worker_during_membership_changes::run();
+    } else {
+        verify_determinism("k8s_worker_during_membership_changes", get_seed());
     }
 }

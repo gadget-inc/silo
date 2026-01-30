@@ -10,29 +10,37 @@ import { spawn, spawnSync } from "node:child_process";
 import { parseArgs } from "node:util";
 import { randomInt } from "node:crypto";
 import { cpus } from "node:os";
-import { mkdirSync, unlinkSync, rmSync, createWriteStream } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, unlinkSync, rmSync, createWriteStream, readdirSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // Directory for storing test output logs
 const LOGS_DIR = "dst-logs";
 
-// All available DST scenarios - must match test function names in main.rs
-const SCENARIOS = [
-  "chaos",
-  "concurrency_limits",
-  "fault_injection_partition",
-  "grpc_end_to_end",
-  "high_message_loss",
-  "lease_expiry",
-  "multiple_workers",
-];
+// Auto-discover scenarios from the filesystem
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const SCENARIOS_DIR = join(__dirname, "..", "tests", "turmoil_runner", "scenarios");
+
+/**
+ * Discover all DST scenarios by scanning the scenarios directory.
+ * Scenario names are derived from filenames (e.g., chaos.rs -> chaos).
+ * Excludes mod.rs as it's the module declaration file.
+ */
+function discoverScenarios() {
+  const files = readdirSync(SCENARIOS_DIR);
+  return files
+    .filter((f) => f.endsWith(".rs") && f !== "mod.rs")
+    .map((f) => f.replace(/\.rs$/, ""))
+    .sort();
+}
+
+const SCENARIOS = discoverScenarios();
 
 // Determine default parallelism: all cores in CI, 3 otherwise
 const isCI = process.env.CI === "true" || process.env.CI === "1";
 const defaultParallelism = isCI ? cpus().length : 3;
 
-// Parse command line arguments
-const { values: args, positionals } = parseArgs({
+const { values: args } = parseArgs({
   options: {
     help: {
       type: "boolean",

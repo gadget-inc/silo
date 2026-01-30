@@ -20,6 +20,8 @@ use crate::shard_range::{ShardId, ShardMap, ShardMapError};
 pub mod etcd;
 #[cfg(feature = "k8s")]
 pub mod k8s;
+#[cfg(feature = "k8s")]
+pub mod k8s_backend;
 pub mod none;
 pub mod split;
 
@@ -30,6 +32,8 @@ pub use split::{ShardSplitter, SplitCleanupStatus, SplitPhase, SplitStorageBacke
 pub use etcd::EtcdCoordinator;
 #[cfg(feature = "k8s")]
 pub use k8s::K8sCoordinator;
+#[cfg(feature = "k8s")]
+pub use k8s_backend::{K8sBackend, KubeBackend, LeaseWatchEvent, LeaseWatchStream};
 pub use none::NoneCoordinator;
 
 /// Information about a cluster member
