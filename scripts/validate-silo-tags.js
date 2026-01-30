@@ -9,7 +9,7 @@
 const fs = require("fs");
 const path = require("path");
 
-const ALLOY_SPEC = "specs/job_shard.als";
+const ALLOY_SPECS_DIR = "specs";
 const RUST_SRC_DIR = "src";
 
 // Regex to match SILO-* tags like [SILO-ENQ-1], [SILO-DEQ-CXL-REL], etc.
@@ -73,12 +73,12 @@ function main() {
         projectRoot = parent;
     }
 
-    const alloySpecPath = path.join(projectRoot, ALLOY_SPEC);
+    const alloySpecsDir = path.join(projectRoot, ALLOY_SPECS_DIR);
     const rustSrcDir = path.join(projectRoot, RUST_SRC_DIR);
 
     // Check that files/dirs exist
-    if (!fs.existsSync(alloySpecPath)) {
-        console.error(`Error: Alloy spec not found at ${alloySpecPath}`);
+    if (!fs.existsSync(alloySpecsDir)) {
+        console.error(`Error: Alloy specs directory not found at ${alloySpecsDir}`);
         process.exit(1);
     }
     if (!fs.existsSync(rustSrcDir)) {
@@ -86,9 +86,14 @@ function main() {
         process.exit(1);
     }
 
-    // Extract tags from Alloy spec
-    const alloyContent = fs.readFileSync(alloySpecPath, "utf-8");
-    const alloyTags = extractTags(alloyContent);
+    // Extract tags from all Alloy spec files
+    const alloyFiles = findFiles(alloySpecsDir, ".als");
+    if (alloyFiles.length === 0) {
+        console.error(`Error: No .als files found in ${alloySpecsDir}`);
+        process.exit(1);
+    }
+    const { tags: alloyTags, locations: alloyLocations } =
+        extractTagsFromFiles(alloyFiles);
 
     // Extract tags from Rust implementation (excluding tests)
     const rustFiles = findFiles(rustSrcDir, ".rs");
@@ -108,7 +113,7 @@ function main() {
     console.log("SILO Tag Validation Report");
     console.log("==========================\n");
 
-    console.log(`Alloy spec: ${ALLOY_SPEC}`);
+    console.log(`Alloy specs: ${ALLOY_SPECS_DIR}/ (${alloyFiles.length} files)`);
     console.log(`Rust source: ${RUST_SRC_DIR}/\n`);
 
     console.log(`Tags found in both: ${inBoth.length}`);
@@ -121,14 +126,16 @@ function main() {
         hasErrors = true;
         console.log("❌ Tags in Alloy model but MISSING from Rust implementation:");
         for (const tag of onlyInAlloy) {
-            console.log(`   ${tag}`);
+            const files = alloyLocations.get(tag) || [];
+            const fileList = files.map((f) => path.relative(projectRoot, f));
+            console.log(`   ${tag} (in: ${fileList.join(", ")})`);
         }
         console.log();
     }
 
     if (onlyInRust.length > 0) {
         hasErrors = true;
-        console.log("❌ Tags in Rust implementation but MISSING from Alloy model:");
+        console.log("❌ Tags in Rust implementation but MISSING from Alloy specs:");
         for (const tag of onlyInRust) {
             const files = rustLocations.get(tag) || [];
             const fileList = files.map((f) => path.relative(projectRoot, f));

@@ -25,15 +25,18 @@ pub mod k8s_backend;
 pub mod none;
 pub mod split;
 
-// Re-export the split orchestrator types and split enums
+// Re-export the split splitter types and split enums
 pub use split::{ShardSplitter, SplitCleanupStatus, SplitPhase, SplitStorageBackend};
 
 // Re-export the backends
 pub use etcd::EtcdCoordinator;
 #[cfg(feature = "k8s")]
-pub use k8s::K8sCoordinator;
+pub use k8s::{K8sCoordinator, K8sCoordinatorConfig};
 #[cfg(feature = "k8s")]
-pub use k8s_backend::{K8sBackend, KubeBackend, LeaseWatchEvent, LeaseWatchStream};
+pub use k8s_backend::{
+    ConfigMapWatchEvent, ConfigMapWatchStream, K8sBackend, KubeBackend, LeaseWatchEvent,
+    LeaseWatchStream,
+};
 pub use none::NoneCoordinator;
 
 /// Information about a cluster member
@@ -342,12 +345,15 @@ impl CoordinatorBase {
     ///
     /// The `get_member_ids` closure is called to fetch the current member list,
     /// allowing backends to use their own membership fetching mechanism.
+    ///
+    /// Uses `tokio::time::Instant` for the timeout to ensure compatibility with
+    /// turmoil's simulated time in deterministic simulation tests.
     pub async fn wait_converged<F, Fut>(&self, timeout: Duration, get_member_ids: F) -> bool
     where
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = Result<Vec<String>, CoordinationError>>,
     {
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         while start.elapsed() < timeout {
             let member_ids = match get_member_ids().await {
                 Ok(m) => m,
@@ -497,16 +503,15 @@ pub async fn create_coordinator(
         }
         #[cfg(feature = "k8s")]
         crate::settings::CoordinationBackend::K8s => {
-            let (coord, handle) = K8sCoordinator::start(
-                &config.k8s_namespace,
-                &config.cluster_prefix,
+            let k8s_config = K8sCoordinatorConfig {
+                namespace: config.k8s_namespace.clone(),
+                cluster_prefix: config.cluster_prefix.clone(),
                 node_id,
                 grpc_addr,
                 initial_shard_count,
-                config.lease_ttl_secs,
-                factory,
-            )
-            .await?;
+                lease_duration_secs: config.lease_ttl_secs,
+            };
+            let (coord, handle) = K8sCoordinator::start(k8s_config, factory).await?;
             Ok((Arc::new(coord), Some(handle)))
         }
         #[cfg(not(feature = "k8s"))]

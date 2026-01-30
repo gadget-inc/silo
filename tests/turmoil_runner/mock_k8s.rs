@@ -18,7 +18,10 @@ use chrono::Utc;
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
-use silo::coordination::{CoordinationError, K8sBackend, LeaseWatchEvent, LeaseWatchStream};
+use silo::coordination::{
+    ConfigMapWatchEvent, ConfigMapWatchStream, CoordinationError, K8sBackend, LeaseWatchEvent,
+    LeaseWatchStream,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,12 +43,18 @@ pub struct MockK8sState {
     configmaps: Mutex<HashMap<String, HashMap<String, StoredConfigMap>>>,
     /// Monotonically increasing resource version counter
     resource_version: AtomicU64,
-    /// Broadcast channel for watch events
+    /// Broadcast channel for Lease watch events
     watch_tx: broadcast::Sender<WatchEvent>,
+    /// Broadcast channel for ConfigMap watch events
+    configmap_watch_tx: broadcast::Sender<ConfigMapWatchBroadcastEvent>,
     /// Simulated operation latency (for testing with delays)
     pub operation_latency: Mutex<Option<Duration>>,
     /// Simulated failure rate (0.0 - 1.0, probability of operation failing)
     pub failure_rate: Mutex<f64>,
+    /// Simulated delay between write acknowledgment and watch event delivery.
+    /// In real Kubernetes, there's latency between when the API server persists a write
+    /// and when watchers receive the notification. This simulates that behavior.
+    pub watch_event_delay: Mutex<Option<Duration>>,
 }
 
 /// A ConfigMap stored in the mock server with metadata
@@ -68,6 +77,7 @@ pub struct StoredLease {
 }
 
 /// Watch event sent to watchers
+/// Watch event for Lease changes
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct WatchEvent {
@@ -75,6 +85,16 @@ pub struct WatchEvent {
     pub namespace: String,
     pub name: String,
     pub object: Lease,
+}
+
+/// Watch event for ConfigMap changes
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ConfigMapWatchBroadcastEvent {
+    pub event_type: WatchEventType,
+    pub namespace: String,
+    pub name: String,
+    pub object: ConfigMap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,13 +107,16 @@ pub enum WatchEventType {
 impl MockK8sState {
     pub fn new() -> Arc<Self> {
         let (watch_tx, _) = broadcast::channel(1024);
+        let (configmap_watch_tx, _) = broadcast::channel(1024);
         Arc::new(Self {
             leases: Mutex::new(HashMap::new()),
             configmaps: Mutex::new(HashMap::new()),
             resource_version: AtomicU64::new(1),
             watch_tx,
+            configmap_watch_tx,
             operation_latency: Mutex::new(None),
             failure_rate: Mutex::new(0.0),
+            watch_event_delay: Mutex::new(Some(Duration::from_millis(50))),
         })
     }
 
@@ -122,6 +145,41 @@ impl MockK8sState {
     async fn apply_latency(&self) {
         if let Some(latency) = *self.operation_latency.lock().await {
             tokio::time::sleep(latency).await;
+        }
+    }
+
+    /// Get the configured watch event delay
+    async fn get_watch_delay(&self) -> Option<Duration> {
+        *self.watch_event_delay.lock().await
+    }
+
+    /// Emit a lease watch event, possibly with delay
+    fn emit_lease_watch_event(&self, event: WatchEvent, delay: Option<Duration>) {
+        let tx = self.watch_tx.clone();
+        if let Some(delay) = delay {
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let _ = tx.send(event);
+            });
+        } else {
+            let _ = self.watch_tx.send(event);
+        }
+    }
+
+    /// Emit a ConfigMap watch event, possibly with delay
+    fn emit_configmap_watch_event(
+        &self,
+        event: ConfigMapWatchBroadcastEvent,
+        delay: Option<Duration>,
+    ) {
+        let tx = self.configmap_watch_tx.clone();
+        if let Some(delay) = delay {
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let _ = tx.send(event);
+            });
+        } else {
+            let _ = self.configmap_watch_tx.send(event);
         }
     }
 
@@ -160,11 +218,18 @@ impl MockK8sState {
             return Ok(Vec::new());
         };
 
-        Ok(ns_leases
+        let mut results: Vec<_> = ns_leases
             .values()
             .filter(|stored| match_labels(&stored.lease, label_selector))
             .cloned()
-            .collect())
+            .collect();
+        // Sort by name for deterministic ordering in DST
+        results.sort_by(|a, b| {
+            let a_name = a.lease.metadata.name.as_deref().unwrap_or("");
+            let b_name = b.lease.metadata.name.as_deref().unwrap_or("");
+            a_name.cmp(b_name)
+        });
+        Ok(results)
     }
 
     /// Find the current holder of a shard lease (for client routing).
@@ -225,6 +290,30 @@ impl MockK8sState {
             }))
     }
 
+    /// Get the full shard map from the cluster's ConfigMap.
+    /// Subject to failure injection like other K8s operations.
+    #[allow(dead_code)]
+    pub async fn get_shard_map(
+        &self,
+        namespace: &str,
+        cluster_prefix: &str,
+    ) -> Result<Option<silo::shard_range::ShardMap>, CoordinationError> {
+        self.apply_latency().await;
+        if self.should_fail().await {
+            return Err(CoordinationError::BackendError(
+                "simulated network failure".into(),
+            ));
+        }
+
+        let configmap_name = format!("{}-shard-map", cluster_prefix);
+        let configmaps = self.configmaps.lock().await;
+        Ok(configmaps
+            .get(namespace)
+            .and_then(|ns| ns.get(&configmap_name))
+            .and_then(|cm| cm.data.get("shard_map.json"))
+            .and_then(|json| serde_json::from_str::<silo::shard_range::ShardMap>(json).ok()))
+    }
+
     /// Create a new lease (returns error if already exists)
     pub async fn create_lease(
         &self,
@@ -271,12 +360,17 @@ impl MockK8sState {
         };
         ns_leases.insert(name.clone(), stored.clone());
 
-        let _ = self.watch_tx.send(WatchEvent {
-            event_type: WatchEventType::Added,
-            namespace: namespace.to_string(),
-            name: name.clone(),
-            object: lease,
-        });
+        // Get delay before dropping the lock
+        let delay = self.get_watch_delay().await;
+        self.emit_lease_watch_event(
+            WatchEvent {
+                event_type: WatchEventType::Added,
+                namespace: namespace.to_string(),
+                name: name.clone(),
+                object: lease,
+            },
+            delay,
+        );
 
         trace!(namespace, name = %name, "mock: created lease");
         Ok(stored)
@@ -327,12 +421,17 @@ impl MockK8sState {
         };
         ns_leases.insert(name.to_string(), stored.clone());
 
-        let _ = self.watch_tx.send(WatchEvent {
-            event_type: WatchEventType::Modified,
-            namespace: namespace.to_string(),
-            name: name.to_string(),
-            object: lease,
-        });
+        // Get delay before dropping the lock
+        let delay = self.get_watch_delay().await;
+        self.emit_lease_watch_event(
+            WatchEvent {
+                event_type: WatchEventType::Modified,
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                object: lease,
+            },
+            delay,
+        );
 
         trace!(namespace, name, "mock: replaced lease");
         Ok(stored)
@@ -405,12 +504,17 @@ impl MockK8sState {
 
         ns_leases.insert(name.to_string(), stored.clone());
 
-        let _ = self.watch_tx.send(WatchEvent {
-            event_type,
-            namespace: namespace.to_string(),
-            name: name.to_string(),
-            object: stored.lease.clone(),
-        });
+        // Get delay before dropping the lock
+        let delay = self.get_watch_delay().await;
+        self.emit_lease_watch_event(
+            WatchEvent {
+                event_type,
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                object: stored.lease.clone(),
+            },
+            delay,
+        );
 
         trace!(namespace, name, event = ?event_type, "mock: applied lease");
         Ok(stored)
@@ -429,12 +533,17 @@ impl MockK8sState {
         let ns_leases = leases.entry(namespace.to_string()).or_default();
 
         if let Some(stored) = ns_leases.remove(name) {
-            let _ = self.watch_tx.send(WatchEvent {
-                event_type: WatchEventType::Deleted,
-                namespace: namespace.to_string(),
-                name: name.to_string(),
-                object: stored.lease,
-            });
+            // Get delay before dropping the lock
+            let delay = self.get_watch_delay().await;
+            self.emit_lease_watch_event(
+                WatchEvent {
+                    event_type: WatchEventType::Deleted,
+                    namespace: namespace.to_string(),
+                    name: name.to_string(),
+                    object: stored.lease,
+                },
+                delay,
+            );
             trace!(namespace, name, "mock: deleted lease");
             Ok(())
         } else {
@@ -443,9 +552,14 @@ impl MockK8sState {
         }
     }
 
-    /// Subscribe to watch events
+    /// Subscribe to Lease watch events
     pub fn subscribe_watch(&self) -> broadcast::Receiver<WatchEvent> {
         self.watch_tx.subscribe()
+    }
+
+    /// Subscribe to ConfigMap watch events
+    pub fn subscribe_configmap_watch(&self) -> broadcast::Receiver<ConfigMapWatchBroadcastEvent> {
+        self.configmap_watch_tx.subscribe()
     }
 
     /// Set failure rate for testing (0.0 - 1.0)
@@ -495,11 +609,14 @@ impl MockK8sState {
             return Ok(Vec::new());
         };
 
-        Ok(ns_configmaps
+        let mut results: Vec<_> = ns_configmaps
             .values()
             .filter(|stored| match_configmap_labels(stored, label_selector))
             .cloned()
-            .collect())
+            .collect();
+        // Sort by name for deterministic ordering in DST
+        results.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(results)
     }
 
     /// Create a new ConfigMap (returns error if already exists)
@@ -539,6 +656,19 @@ impl MockK8sState {
             uid,
         };
         ns_configmaps.insert(name.to_string(), stored.clone());
+
+        // Emit watch event with delay
+        let configmap = stored_configmap_to_configmap_internal(&stored);
+        let delay = self.get_watch_delay().await;
+        self.emit_configmap_watch_event(
+            ConfigMapWatchBroadcastEvent {
+                event_type: WatchEventType::Added,
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                object: configmap,
+            },
+            delay,
+        );
 
         trace!(namespace, name, "mock: created configmap");
         Ok(stored)
@@ -586,6 +716,19 @@ impl MockK8sState {
         };
         ns_configmaps.insert(name.to_string(), stored.clone());
 
+        // Emit watch event with delay
+        let configmap = stored_configmap_to_configmap_internal(&stored);
+        let delay = self.get_watch_delay().await;
+        self.emit_configmap_watch_event(
+            ConfigMapWatchBroadcastEvent {
+                event_type: WatchEventType::Modified,
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                object: configmap,
+            },
+            delay,
+        );
+
         trace!(namespace, name, "mock: replaced configmap");
         Ok(stored)
     }
@@ -610,6 +753,7 @@ impl MockK8sState {
 
         let new_rv = self.next_resource_version();
 
+        let is_update = ns_configmaps.contains_key(name);
         let stored = if let Some(existing) = ns_configmaps.get(name) {
             // Update existing - merge data and labels
             let mut merged_data = existing.data.clone();
@@ -640,6 +784,24 @@ impl MockK8sState {
 
         ns_configmaps.insert(name.to_string(), stored.clone());
 
+        // Emit watch event with delay
+        let configmap = stored_configmap_to_configmap_internal(&stored);
+        let event_type = if is_update {
+            WatchEventType::Modified
+        } else {
+            WatchEventType::Added
+        };
+        let delay = self.get_watch_delay().await;
+        self.emit_configmap_watch_event(
+            ConfigMapWatchBroadcastEvent {
+                event_type,
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                object: configmap,
+            },
+            delay,
+        );
+
         trace!(namespace, name, "mock: applied configmap");
         Ok(stored)
     }
@@ -660,7 +822,19 @@ impl MockK8sState {
         let mut configmaps = self.configmaps.lock().await;
         let ns_configmaps = configmaps.entry(namespace.to_string()).or_default();
 
-        if ns_configmaps.remove(name).is_some() {
+        if let Some(stored) = ns_configmaps.remove(name) {
+            // Emit watch event with delay
+            let configmap = stored_configmap_to_configmap_internal(&stored);
+            let delay = self.get_watch_delay().await;
+            self.emit_configmap_watch_event(
+                ConfigMapWatchBroadcastEvent {
+                    event_type: WatchEventType::Deleted,
+                    namespace: namespace.to_string(),
+                    name: name.to_string(),
+                    object: configmap,
+                },
+                delay,
+            );
             trace!(namespace, name, "mock: deleted configmap");
         }
         // Not found is ok for delete (idempotent)
@@ -731,15 +905,11 @@ fn match_configmap_labels(configmap: &StoredConfigMap, selector: Option<&str>) -
 #[derive(Clone)]
 pub struct MockK8sBackend {
     pub state: Arc<MockK8sState>,
-    pub namespace: String,
 }
 
 impl MockK8sBackend {
-    pub fn new(state: Arc<MockK8sState>, namespace: impl Into<String>) -> Self {
-        Self {
-            state,
-            namespace: namespace.into(),
-        }
+    pub fn new(state: Arc<MockK8sState>, _namespace: impl Into<String>) -> Self {
+        Self { state }
     }
 }
 
@@ -960,27 +1130,84 @@ impl K8sBackend for MockK8sBackend {
             .await?;
         Ok(stored_configmap_to_configmap(stored))
     }
+
+    fn watch_configmap(&self, namespace: &str, name: &str) -> ConfigMapWatchStream {
+        let mut watch_rx = self.state.subscribe_configmap_watch();
+        let namespace = namespace.to_string();
+        let name = name.to_string();
+
+        Box::pin(async_stream::stream! {
+            // Send InitDone immediately since the mock doesn't have real initial sync
+            yield Ok(ConfigMapWatchEvent::InitDone);
+
+            loop {
+                match watch_rx.recv().await {
+                    Ok(event) => {
+                        // Filter by namespace and name
+                        if event.namespace != namespace || event.name != name {
+                            continue;
+                        }
+
+                        // Convert to ConfigMapWatchEvent
+                        let watch_event = match event.event_type {
+                            WatchEventType::Added | WatchEventType::Modified => {
+                                ConfigMapWatchEvent::Applied(event.object)
+                            }
+                            WatchEventType::Deleted => ConfigMapWatchEvent::Deleted(event.object),
+                        };
+
+                        yield Ok(watch_event);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        trace!("configmap watch lagged by {} events", n);
+                        // Continue watching after lag
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Channel closed, end stream
+                        break;
+                    }
+                }
+            }
+        })
+    }
 }
 
-/// Convert a StoredConfigMap to a k8s ConfigMap
+/// Convert a StoredConfigMap to a k8s ConfigMap (takes ownership)
 fn stored_configmap_to_configmap(stored: StoredConfigMap) -> ConfigMap {
+    stored_configmap_to_configmap_internal(&stored)
+}
+
+/// Convert a StoredConfigMap reference to a k8s ConfigMap
+fn stored_configmap_to_configmap_internal(stored: &StoredConfigMap) -> ConfigMap {
     ConfigMap {
         metadata: kube::api::ObjectMeta {
-            name: Some(stored.name),
-            namespace: Some(stored.namespace),
-            resource_version: Some(stored.resource_version),
-            uid: Some(stored.uid),
+            name: Some(stored.name.clone()),
+            namespace: Some(stored.namespace.clone()),
+            resource_version: Some(stored.resource_version.clone()),
+            uid: Some(stored.uid.clone()),
             labels: if stored.labels.is_empty() {
                 None
             } else {
-                Some(stored.labels.into_iter().collect())
+                Some(
+                    stored
+                        .labels
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                )
             },
             ..Default::default()
         },
         data: if stored.data.is_empty() {
             None
         } else {
-            Some(stored.data.into_iter().collect())
+            Some(
+                stored
+                    .data
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            )
         },
         ..Default::default()
     }
@@ -1226,6 +1453,8 @@ mod tests {
     #[silo::test]
     async fn mock_k8s_watch_events_emitted() {
         let state = MockK8sState::new();
+        // Disable watch event delay so events are sent synchronously
+        *state.watch_event_delay.lock().await = None;
         let mut rx = state.subscribe_watch();
 
         let lease = make_test_lease("test-lease", Some("node-1"));

@@ -66,8 +66,9 @@ jobs:
         run: kubectl cluster-info
       - name: Run K8S coordination tests
         shell: bash
-        # Run K8S tests single-threaded to prevent interference between tests
-        run: cargo test k8s_ -- --test-threads=1
+        # Run only the k8s_coordination_tests binary which requires a real k8s cluster
+        # Other tests with k8s_ in the name (like mock_k8s_* and turmoil DST tests) use mocks
+        run: cargo test --test k8s_coordination_tests -- --test-threads=1
 
   alloy-changes:
     name: Detect Alloy changes

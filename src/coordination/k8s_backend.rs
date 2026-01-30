@@ -30,6 +30,23 @@ pub enum LeaseWatchEvent {
 pub type LeaseWatchStream =
     Pin<Box<dyn Stream<Item = Result<LeaseWatchEvent, CoordinationError>> + Send>>;
 
+/// Watch event types for ConfigMap changes
+#[derive(Debug, Clone)]
+pub enum ConfigMapWatchEvent {
+    /// A ConfigMap was added or modified
+    Applied(ConfigMap),
+    /// A ConfigMap was deleted
+    Deleted(ConfigMap),
+    /// Initial sync started
+    Init,
+    /// Initial sync completed
+    InitDone,
+}
+
+/// A boxed stream of ConfigMap watch events
+pub type ConfigMapWatchStream =
+    Pin<Box<dyn Stream<Item = Result<ConfigMapWatchEvent, CoordinationError>> + Send>>;
+
 /// Trait abstracting Kubernetes API operations.
 ///
 /// This allows the K8sCoordinator to work with either:
@@ -138,6 +155,10 @@ pub trait K8sBackend: Send + Sync + Clone + 'static {
         name: &str,
         configmap_json: serde_json::Value,
     ) -> Result<ConfigMap, CoordinationError>;
+
+    /// Watch a specific ConfigMap by name.
+    /// Returns a stream of watch events for changes to the named ConfigMap.
+    fn watch_configmap(&self, namespace: &str, name: &str) -> ConfigMapWatchStream;
 }
 
 // ============================================================================
@@ -367,6 +388,28 @@ impl K8sBackend for KubeBackend {
             )
             .await
             .map_err(|e| CoordinationError::BackendError(e.to_string()))
+    }
+
+    fn watch_configmap(&self, namespace: &str, name: &str) -> ConfigMapWatchStream {
+        use futures::StreamExt;
+        use kube::runtime::watcher::{Config as WatcherConfig, Event, watcher};
+
+        let configmaps: kube::Api<ConfigMap> =
+            kube::Api::namespaced(self.client.clone(), namespace);
+        // Use field selector to watch only the specific ConfigMap by name
+        let watcher_config = WatcherConfig::default().fields(&format!("metadata.name={}", name));
+        let watch_stream = watcher(configmaps, watcher_config);
+
+        Box::pin(watch_stream.map(|result| {
+            result
+                .map(|ev| match ev {
+                    Event::Apply(cm) | Event::InitApply(cm) => ConfigMapWatchEvent::Applied(cm),
+                    Event::Delete(cm) => ConfigMapWatchEvent::Deleted(cm),
+                    Event::Init => ConfigMapWatchEvent::Init,
+                    Event::InitDone => ConfigMapWatchEvent::InitDone,
+                })
+                .map_err(|e| CoordinationError::BackendError(e.to_string()))
+        }))
     }
 }
 

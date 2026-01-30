@@ -1,6 +1,6 @@
 //! Tests for split-aware processing of tasks and leases.
 //!
-//! [SILO-SPLIT-AWARE-1] After a shard split, child shards contain tasks and leases
+//! After a shard split, child shards contain tasks and leases
 //! from the parent shard that may belong to tenants outside their new range.
 //! These tests verify that:
 //! - Cleanup correctly removes keys outside the shard's range

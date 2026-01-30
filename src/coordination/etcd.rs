@@ -1,9 +1,3 @@
-//! etcd-based coordination backend.
-//!
-//! This backend uses etcd leases and the Lock API for distributed shard ownership.
-//! It's the most battle-tested option for production deployments.
-
-use anyhow::Context;
 use async_trait::async_trait;
 use etcd_client::{Client, ConnectOptions, GetOptions, LockOptions, PutOptions};
 use std::collections::{HashMap, HashSet};
@@ -41,12 +35,9 @@ pub struct EtcdCoordinator {
 impl EtcdCoordinator {
     /// Connect to etcd and start the coordinator.
     ///
-    /// The coordinator will manage shard ownership and automatically open/close
-    /// shards in the factory as ownership changes.
+    /// The coordinator will manage shard ownership and automatically open/close shards in the factory as ownership changes.
     ///
-    /// If the cluster doesn't have a shard map yet, one will be created with
-    /// `initial_shard_count` shards. If the cluster already has a shard map,
-    /// the existing one is used and `initial_shard_count` is ignored.
+    /// If the cluster doesn't have a shard map yet, one will be created with `initial_shard_count` shards. If the cluster already has a shard map,  the existing one is used and `initial_shard_count` is ignored.
     pub async fn start(
         endpoints: &[String],
         cluster_prefix: &str,
@@ -167,9 +158,6 @@ impl EtcdCoordinator {
                 }
             };
 
-            // Send initial keepalive requests - this is REQUIRED to keep the lease alive!
-            // etcd-client's keep_alive() only establishes the channel, you must call
-            // keeper.keep_alive() to actually send keepalive requests.
             if let Err(e) = memb_keeper.keep_alive().await {
                 error!(node_id = %nid, error = %e, "failed to send initial membership keepalive");
             }
@@ -418,9 +406,7 @@ impl EtcdCoordinator {
         let members = self.get_sorted_member_ids().await?;
         debug!(node_id = %self.base.node_id, members = ?members, "reconcile: begin");
 
-        // Safety check: if we don't see ourselves in the member list, our membership
-        // lease may have expired or there's a connectivity issue. Don't reconcile
-        // based on incomplete membership data - it would cause us to release all shards.
+        // Safety check: if we don't see ourselves in the member list, our membership lease may have expired or there's a connectivity issue. Don't reconcile based on incomplete membership data - it would cause us to release all shards.
         if members.is_empty() {
             warn!(node_id = %self.base.node_id, "reconcile: no members found, skipping reconcile");
             return Ok(());
@@ -500,7 +486,8 @@ impl EtcdCoordinator {
         let owned_arc = self.base.owned.clone();
         let factory = self.base.factory.clone();
         let shard_map = self.base.shard_map.clone();
-        tokio::spawn(async move { runner.run(owned_arc, factory, shard_map).await });
+        let coordinator: Arc<dyn Coordinator> = Arc::new(self.clone());
+        tokio::spawn(async move { runner.run(owned_arc, factory, shard_map, coordinator).await });
         guards.insert(shard_id, guard.clone());
         guard
     }
@@ -545,58 +532,9 @@ impl EtcdCoordinator {
         }
         Ok(())
     }
-}
 
-#[async_trait]
-impl SplitStorageBackend for EtcdCoordinator {
-    async fn load_split(
-        &self,
-        parent_shard_id: &ShardId,
-    ) -> Result<Option<SplitInProgress>, CoordinationError> {
-        let split_key = keys::split_key(&self.cluster_prefix, parent_shard_id);
-        let resp = self
-            .client
-            .kv_client()
-            .get(split_key, None)
-            .await
-            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
-
-        if let Some(kv) = resp.kvs().first() {
-            let value = String::from_utf8_lossy(kv.value());
-            let split: SplitInProgress = serde_json::from_str(&value).map_err(|e| {
-                CoordinationError::BackendError(format!("invalid split JSON: {}", e))
-            })?;
-            Ok(Some(split))
-        } else {
-            Ok(None)
-        }
-    }
-
-    async fn store_split(&self, split: &SplitInProgress) -> Result<(), CoordinationError> {
-        let split_key = keys::split_key(&self.cluster_prefix, &split.parent_shard_id);
-        let split_json = serde_json::to_string(split)
-            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
-
-        self.client
-            .kv_client()
-            .put(split_key, split_json, None)
-            .await
-            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
-
-        Ok(())
-    }
-
-    async fn delete_split(&self, parent_shard_id: &ShardId) -> Result<(), CoordinationError> {
-        let split_key = keys::split_key(&self.cluster_prefix, parent_shard_id);
-        self.client
-            .kv_client()
-            .delete(split_key, None)
-            .await
-            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
-        Ok(())
-    }
-
-    async fn update_shard_map_for_split(
+    /// Helper method for CAS-based shard map update (used by update_shard_map_for_split).
+    async fn try_update_shard_map_for_split(
         &self,
         split: &SplitInProgress,
     ) -> Result<(), CoordinationError> {
@@ -668,6 +606,91 @@ impl SplitStorageBackend for EtcdCoordinator {
         );
 
         Ok(())
+    }
+}
+
+#[async_trait]
+impl SplitStorageBackend for EtcdCoordinator {
+    async fn load_split(
+        &self,
+        parent_shard_id: &ShardId,
+    ) -> Result<Option<SplitInProgress>, CoordinationError> {
+        let split_key = keys::split_key(&self.cluster_prefix, parent_shard_id);
+        let resp = self
+            .client
+            .kv_client()
+            .get(split_key, None)
+            .await
+            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+
+        if let Some(kv) = resp.kvs().first() {
+            let value = String::from_utf8_lossy(kv.value());
+            let split: SplitInProgress = serde_json::from_str(&value).map_err(|e| {
+                CoordinationError::BackendError(format!("invalid split JSON: {}", e))
+            })?;
+            Ok(Some(split))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn store_split(&self, split: &SplitInProgress) -> Result<(), CoordinationError> {
+        let split_key = keys::split_key(&self.cluster_prefix, &split.parent_shard_id);
+        let split_json = serde_json::to_string(split)
+            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+
+        self.client
+            .kv_client()
+            .put(split_key, split_json, None)
+            .await
+            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn delete_split(&self, parent_shard_id: &ShardId) -> Result<(), CoordinationError> {
+        let split_key = keys::split_key(&self.cluster_prefix, parent_shard_id);
+        self.client
+            .kv_client()
+            .delete(split_key, None)
+            .await
+            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn update_shard_map_for_split(
+        &self,
+        split: &SplitInProgress,
+    ) -> Result<(), CoordinationError> {
+        // Retry with exponential backoff to handle concurrent modifications
+        // (e.g., cleanup tasks updating cleanup status while a split is in progress)
+        let max_retries = 10;
+        let mut delay = std::time::Duration::from_millis(10);
+
+        for attempt in 0..max_retries {
+            match self.try_update_shard_map_for_split(split).await {
+                Ok(()) => return Ok(()),
+                Err(CoordinationError::BackendError(msg))
+                    if msg.contains("modified concurrently") =>
+                {
+                    if attempt < max_retries - 1 {
+                        debug!(
+                            parent_shard_id = %split.parent_shard_id,
+                            attempt = attempt,
+                            "shard map update hit CAS conflict, retrying"
+                        );
+                        tokio::time::sleep(delay).await;
+                        delay = std::cmp::min(delay * 2, std::time::Duration::from_secs(1));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(CoordinationError::BackendError(format!(
+            "failed to update shard map for split after {} retries",
+            max_retries
+        )))
     }
 
     async fn reload_shard_map(&self) -> Result<(), CoordinationError> {
@@ -778,8 +801,7 @@ impl Coordinator for EtcdCoordinator {
         };
 
         // Shut down each guard sequentially for deterministic ordering
-        // We trigger shutdown on each guard individually rather than using
-        // signal_shutdown() which would notify all guards concurrently
+        // We trigger shutdown on each guard individually rather than using signal_shutdown() which would notify all guards concurrently
         for (_sid, guard) in guards_sorted {
             guard.trigger_shutdown().await;
             guard.notify.notify_one();
@@ -803,7 +825,6 @@ impl Coordinator for EtcdCoordinator {
     }
 
     async fn wait_converged(&self, timeout: Duration) -> bool {
-        // Use the shared base implementation with our member-fetching closure
         self.base
             .wait_converged(timeout, || async {
                 self.get_sorted_member_ids()
@@ -934,6 +955,7 @@ impl EtcdShardGuard {
         owned_arc: Arc<Mutex<HashSet<ShardId>>>,
         factory: Arc<ShardFactory>,
         shard_map: Arc<Mutex<ShardMap>>,
+        coordinator: Arc<dyn Coordinator>,
     ) {
         use tracing::{Instrument, info_span};
 
@@ -997,22 +1019,63 @@ impl EtcdShardGuard {
                                     break;
                                 }
                             }
+
+                            // Create a short-lived lease (3s TTL) for this specific lock attempt. If this attempt times out and we retry, the old lease will expire and clean up any orphan lock key, preventing it from blocking
+                            // subsequent attempts. We use 3s which is longer than our 500ms timeout to give etcd time to process the lock before it expires.
+                            let attempt_lease = match self.client.clone().lease_grant(3, None).await {
+                                Ok(resp) => resp.id(),
+                                Err(e) => {
+                                    warn!(shard_id = %self.shard_id, error = %e, "failed to create attempt lease, retrying");
+                                    tokio::time::sleep(Duration::from_millis(100)).await;
+                                    continue;
+                                }
+                            };
+
                             match tokio::time::timeout(
                                 Duration::from_millis(500),
                                 lock_cli.lock(
                                     name.as_bytes().to_vec(),
-                                    Some(LockOptions::new().with_lease(self.liveness_lease_id)),
+                                    Some(LockOptions::new().with_lease(attempt_lease)),
                                 ),
                             )
                             .await
                             {
                                 Ok(Ok(resp)) => {
                                     let key = resp.key().to_vec();
-                                    // Look up the shard's range from the shard map
-                                    let range = {
+
+                                    // Successfully acquired the lock with the short-lived lease.
+                                    // Start keeping this lease alive so the lock doesn't expire.
+                                    let mut client_clone = self.client.clone();
+                                    let shutdown_rx = self.shutdown.clone();
+                                    tokio::spawn(async move {
+                                        // Keep the attempt lease alive until shutdown
+                                        let ka_result = client_clone.lease_keep_alive(attempt_lease).await;
+                                        if let Ok((mut keeper, mut stream)) = ka_result {
+                                            loop {
+                                                if *shutdown_rx.borrow() {
+                                                    break;
+                                                }
+                                                if keeper.keep_alive().await.is_err() {
+                                                    break;
+                                                }
+                                                // Wait for response or timeout
+                                                tokio::select! {
+                                                    resp = stream.message() => {
+                                                        if resp.is_err() || resp.unwrap().is_none() {
+                                                            break;
+                                                        }
+                                                    }
+                                                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                                                }
+                                            }
+                                        }
+                                    });
+
+                                    // Look up the shard's range and cleanup status from the shard map
+                                    let (range, cleanup_status) = {
                                         let map = shard_map.lock().await;
                                         match map.get_shard(&self.shard_id) {
-                                            Some(info) => info.range.clone(),
+                                            Some(info) => (info.range.clone(), info.cleanup_status),
                                             None => {
                                                 tracing::error!(shard_id = %self.shard_id, "shard not found in shard map");
                                                 let mut lock_cli = self.client.lock_client();
@@ -1021,22 +1084,9 @@ impl EtcdShardGuard {
                                             }
                                         }
                                     };
-                                    // Open the shard BEFORE marking as Held - if open fails,
-                                    // we should release the lock and not claim ownership
-                                    match factory.open(&self.shard_id, &range).await {
-                                        Ok(_) => {
-                                            {
-                                                let mut st = self.state.lock().await;
-                                                st.held_key = Some(key);
-                                                st.phase = ShardPhase::Held;
-                                            }
-                                            {
-                                                let mut owned = owned_arc.lock().await;
-                                                owned.insert(self.shard_id);
-                                            }
-                                            info!(shard_id = %self.shard_id, attempts = attempt, "shard: acquired and opened");
-                                            break;
-                                        }
+                                    // Open the shard BEFORE marking as Held - if open fails, we should release the lock and not claim ownership.
+                                    let shard = match factory.open(&self.shard_id, &range).await {
+                                        Ok(shard) => shard,
                                         Err(e) => {
                                             // Failed to open - release the lock and retry
                                             tracing::error!(shard_id = %self.shard_id, error = %e, "failed to open shard, releasing lock");
@@ -1048,9 +1098,37 @@ impl EtcdShardGuard {
                                             attempt = attempt.wrapping_add(1);
                                             continue;
                                         }
+                                    };
+
+                                    // Dispatch cleanup asynchronously if needed
+                                    crate::coordination::split::maybe_spawn_cleanup(
+                                        self.shard_id,
+                                        &range,
+                                        cleanup_status,
+                                        &shard,
+                                        Arc::clone(&coordinator),
+                                    );
+
+                                    {
+                                        let mut st = self.state.lock().await;
+                                        st.held_key = Some(key);
+                                        st.phase = ShardPhase::Held;
                                     }
+                                    {
+                                        let mut owned = owned_arc.lock().await;
+                                        owned.insert(self.shard_id);
+                                    }
+                                    info!(shard_id = %self.shard_id, attempts = attempt, "shard: acquired and opened");
+                                    break;
                                 }
                                 Ok(Err(_)) | Err(_) => {
+                                    // Lock attempt failed or timed out. Revoke the attempt lease to
+                                    // immediately clean up any orphan key (best effort - if this fails,
+                                    // the lease will expire in 3s anyway).
+                                    if let Err(e) = self.client.clone().lease_revoke(attempt_lease).await {
+                                        debug!(shard_id = %self.shard_id, error = %e, "failed to revoke attempt lease (will expire in 3s)");
+                                    }
+
                                     attempt = attempt.wrapping_add(1);
                                     let jitter_ms = (jitter_seed
                                         .wrapping_mul(31)
@@ -1146,30 +1224,5 @@ impl EtcdShardGuard {
                 }
             }
         }
-    }
-}
-
-/// Legacy compatibility: Connect to etcd without starting a coordinator.
-/// Used for tests that need raw etcd access.
-pub struct EtcdConnection {
-    client: Client,
-}
-
-impl EtcdConnection {
-    pub async fn connect(cfg: &crate::settings::CoordinationConfig) -> anyhow::Result<Self> {
-        let endpoints = if cfg.etcd_endpoints.is_empty() {
-            vec!["http://127.0.0.1:2379".to_string()]
-        } else {
-            cfg.etcd_endpoints.clone()
-        };
-        let opts = ConnectOptions::default();
-        let client = Client::connect(endpoints, Some(opts))
-            .await
-            .context("failed to connect to etcd")?;
-        Ok(Self { client })
-    }
-
-    pub fn client(&self) -> Client {
-        self.client.clone()
     }
 }

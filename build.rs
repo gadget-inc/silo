@@ -1,4 +1,8 @@
 fn main() {
+    // Tell cargo to only rerun this build script if the proto files change
+    println!("cargo:rerun-if-changed=proto/silo.proto");
+    println!("cargo:rerun-if-changed=proto/gubernator.proto");
+
     let protoc = protoc_bin_vendored::protoc_bin_path().expect("protoc not found");
     // SAFETY: This is safe because the build script runs single-threaded before any
     // parallel compilation, so there's no concurrent access to environment variables.

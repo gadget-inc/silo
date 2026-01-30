@@ -6,10 +6,9 @@ use thiserror::Error;
 use tokio::sync::OnceCell;
 
 use crate::gubernator::RateLimitClient;
-use crate::job_store_shard::JobStoreShard;
-use crate::job_store_shard::JobStoreShardError;
+use crate::job_store_shard::{JobStoreShard, JobStoreShardError, OpenShardOptions};
 use crate::metrics::Metrics;
-use crate::settings::{DatabaseConfig, DatabaseTemplate, WalConfig};
+use crate::settings::DatabaseTemplate;
 use crate::shard_range::{ShardId, ShardRange};
 use crate::storage::resolve_object_store;
 
@@ -35,7 +34,7 @@ impl ShardEntry {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<Arc<JobStoreShard>, JobStoreShardError>>,
     {
-        self.cell.get_or_try_init(f).await.map(|s| Arc::clone(s))
+        self.cell.get_or_try_init(f).await.map(Arc::clone)
     }
 }
 
@@ -66,7 +65,7 @@ impl ShardFactory {
         }
     }
 
-    /// Create a no-op factory for testing orchestrator logic without real shards.
+    /// Create a no-op factory for testing splitter logic without real shards.
     ///
     /// This factory cannot actually open shards; it's only useful for tests that
     /// need a factory reference but don't call `open()` or `clone_shard()`.
@@ -102,6 +101,12 @@ impl ShardFactory {
     /// Uses per-shard OnceCell to ensure atomic initialization: if two callers try to
     /// open the same shard concurrently, only one will actually open the database and
     /// the other will wait and receive the same instance.
+    ///
+    /// **Note on path resolution:**
+    /// For `Backend::Fs`, we resolve the object store at the storage root level (not
+    /// the shard-specific path) and pass the shard name to DbBuilder. This is required
+    /// for cloned databases to work correctly - they store relative paths to parent SST
+    /// files that must resolve correctly from the storage root.
     pub async fn open(
         &self,
         shard_id: &ShardId,
@@ -127,40 +132,119 @@ impl ShardFactory {
 
         entry
             .get_or_try_init(|| async {
-                let path = template
-                    .path
-                    .replace("%shard%", &name)
-                    .replace("{shard}", &name);
-                let wal = template.wal.as_ref().map(|wal_template| WalConfig {
-                    backend: wal_template.backend.clone(),
-                    path: wal_template
+                // For Backend::Fs, we need to open at the storage root level so that
+                // cloned databases can correctly resolve their relative parent SST paths.
+                // Extract the root from the template and use shard name as the db path.
+                let (resolved, db_path) =
+                    Self::resolve_at_root(&template.backend, &template.path, &name)?;
+
+                // Configure separate WAL object store if specified
+                let (wal_store, wal_close_config) = if let Some(wal_template) = &template.wal {
+                    let wal_path = wal_template
                         .path
                         .replace("%shard%", &name)
-                        .replace("{shard}", &name),
-                });
-                let cfg = DatabaseConfig {
-                    name: name.clone(),
-                    backend: template.backend.clone(),
-                    path,
-                    flush_interval_ms: None,
-                    wal,
-                    apply_wal_on_close: template.apply_wal_on_close,
+                        .replace("{shard}", &name);
+                    let wal_resolved = resolve_object_store(&wal_template.backend, &wal_path)?;
+
+                    // Only set up WAL cleanup for local (Fs) storage backends
+                    let close_config = if wal_template.is_local_storage() {
+                        Some(crate::job_store_shard::WalCloseConfig {
+                            path: wal_resolved.root_path,
+                            flush_on_close: template.apply_wal_on_close,
+                        })
+                    } else {
+                        None
+                    };
+                    (Some(wal_resolved.store), close_config)
+                } else {
+                    (None, None)
                 };
-                let shard_arc =
-                    JobStoreShard::open(&cfg, rate_limiter, metrics, range.clone()).await?;
+
+                let shard_arc = JobStoreShard::open_with_resolved_store(
+                    name.clone(),
+                    &db_path,
+                    OpenShardOptions {
+                        store: resolved.store,
+                        wal_store,
+                        wal_close_config,
+                        flush_interval: None, // No custom flush interval from factory
+                        rate_limiter,
+                        metrics,
+                    },
+                    range.clone(),
+                )
+                .await?;
+
                 tracing::info!(shard_id = %shard_id, range = %range, "opened shard");
                 Ok(shard_arc)
             })
             .await
     }
 
+    /// Resolve the object store at the storage root level.
+    ///
+    /// For Backend::Fs, this extracts the root path before the placeholder and
+    /// returns the shard name as the db_path. For cloud backends, this works
+    /// the same as before since the object store is already at bucket level.
+    fn resolve_at_root(
+        backend: &crate::settings::Backend,
+        template_path: &str,
+        shard_name: &str,
+    ) -> Result<(crate::storage::ResolvedStore, String), JobStoreShardError> {
+        use crate::settings::Backend;
+
+        match backend {
+            Backend::Fs => {
+                // Extract root path from template (everything before the placeholder)
+                let placeholder_pos = template_path
+                    .find("%shard%")
+                    .or_else(|| template_path.find("{shard}"));
+
+                let root_path = match placeholder_pos {
+                    Some(pos) => {
+                        let root = &template_path[..pos];
+                        let root_trimmed = root.trim_end_matches('/');
+                        if root_trimmed.is_empty() {
+                            "/"
+                        } else {
+                            root_trimmed
+                        }
+                    }
+                    None => template_path, // No placeholder, use as-is
+                };
+
+                let resolved = resolve_object_store(backend, root_path)?;
+                // For Fs, db_path is the shard name (relative to root)
+                Ok((resolved, shard_name.to_string()))
+            }
+            Backend::Memory => {
+                // Memory backend: use full path with placeholder replaced
+                let full_path = template_path
+                    .replace("%shard%", shard_name)
+                    .replace("{shard}", shard_name);
+                let resolved = resolve_object_store(backend, &full_path)?;
+                let db_path = resolved.canonical_path.clone();
+                Ok((resolved, db_path))
+            }
+            Backend::S3 | Backend::Gcs | Backend::Url => {
+                // Cloud backends: resolve full URL, canonical_path is the db_path
+                let full_path = template_path
+                    .replace("%shard%", shard_name)
+                    .replace("{shard}", shard_name);
+                let resolved = resolve_object_store(backend, &full_path)?;
+                let db_path = resolved.canonical_path.clone();
+                Ok((resolved, db_path))
+            }
+        }
+    }
+
     /// Close a specific shard and remove it from the factory.
     pub async fn close(&self, shard_id: &ShardId) -> Result<(), JobStoreShardError> {
-        if let Some((_, entry)) = self.instances.remove(shard_id) {
-            if let Some(shard) = entry.get() {
-                shard.close().await?;
-                tracing::info!(shard_id = %shard_id, "closed shard");
-            }
+        if let Some((_, entry)) = self.instances.remove(shard_id)
+            && let Some(shard) = entry.get()
+        {
+            shard.close().await?;
+            tracing::info!(shard_id = %shard_id, "closed shard");
         }
         Ok(())
     }
@@ -175,11 +259,11 @@ impl ShardFactory {
         let name = shard_id.to_string();
 
         // 1. Close and remove the shard if it exists
-        if let Some((_, entry)) = self.instances.remove(shard_id) {
-            if let Some(shard) = entry.get() {
-                shard.close().await?;
-                tracing::info!(shard_id = %shard_id, "closed shard for reset");
-            }
+        if let Some((_, entry)) = self.instances.remove(shard_id)
+            && let Some(shard) = entry.get()
+        {
+            shard.close().await?;
+            tracing::info!(shard_id = %shard_id, "closed shard for reset");
         }
 
         // 2. Delete the data directory

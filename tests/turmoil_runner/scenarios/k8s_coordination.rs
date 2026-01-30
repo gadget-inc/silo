@@ -159,12 +159,14 @@ async fn setup_node_server(
     // mad-turmoil patches RNG to be deterministic, so we don't need seeded shard IDs
     let (coordinator, _handle) = K8sCoordinator::start_with_backend(
         backend,
-        NAMESPACE,
-        CLUSTER_PREFIX,
-        node_id.clone(),
-        format!("http://{}:{}", node_id, port),
-        NUM_SHARDS,
-        lease_duration_secs,
+        silo::coordination::K8sCoordinatorConfig {
+            namespace: NAMESPACE.to_string(),
+            cluster_prefix: CLUSTER_PREFIX.to_string(),
+            node_id: node_id.clone(),
+            grpc_addr: format!("http://{}:{}", node_id, port),
+            initial_shard_count: NUM_SHARDS,
+            lease_duration_secs,
+        },
         Arc::clone(&factory),
     )
     .await
@@ -261,7 +263,9 @@ async fn setup_node_server(
     // Spawn the server in the background
     let coordinator_for_server = Arc::clone(&coordinator) as Arc<dyn Coordinator>;
     tokio::spawn(async move {
-        if let Err(e) = run_server_with_incoming(incoming, factory, coordinator_for_server, cfg, None, rx).await {
+        if let Err(e) =
+            run_server_with_incoming(incoming, factory, coordinator_for_server, cfg, None, rx).await
+        {
             tracing::trace!(error = %e, "server error");
         }
     });

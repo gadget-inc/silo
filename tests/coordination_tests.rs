@@ -2,7 +2,10 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use silo::coordination::{Coordinator, EtcdCoordinator, etcd::EtcdConnection};
+mod etcd_test_helpers;
+
+use etcd_test_helpers::EtcdConnection;
+use silo::coordination::{Coordinator, EtcdCoordinator};
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::settings::{Backend, DatabaseTemplate};
@@ -426,7 +429,7 @@ async fn membership_persists_beyond_lease_ttl() {
     let lease_ttl_secs: i64 = 2; // Short TTL to speed up test
 
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
-    let coord = silo::coordination::etcd::EtcdConnection::connect(&cfg.coordination)
+    let coord = EtcdConnection::connect(&cfg.coordination)
         .await
         .expect("connect etcd");
 

@@ -149,7 +149,7 @@ impl TaskBroker {
                 Err(_) => continue, // Skip malformed tasks
             };
 
-            // [SILO-SPLIT-AWARE-1] Check if task's tenant is within shard range
+            // Check if task's tenant is within shard range
             let task_tenant = task.tenant();
             let decoded_tenant = decode_tenant(task_tenant);
 

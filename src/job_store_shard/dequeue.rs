@@ -77,7 +77,7 @@ impl JobStoreShard {
             for entry in &claimed {
                 let task = &entry.task;
 
-                // [SILO-SPLIT-AWARE-1] Check if task's tenant is within shard range
+                // Check if task's tenant is within shard range
                 // Tasks for tenants outside the range are defunct (from before a split)
                 let task_tenant = task.tenant();
                 let decoded_tenant = decode_tenant(task_tenant);

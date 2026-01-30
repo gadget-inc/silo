@@ -14,7 +14,7 @@ mod scan;
 
 pub use cleanup::{CleanupProgress, CleanupResult, extract_tenant_from_key};
 
-pub use counters::ShardCounters;
+pub use counters::{ShardCounters, counter_merge_operator};
 pub use expedite::JobNotExpediteableError;
 pub use restart::JobNotRestartableError;
 
@@ -45,6 +45,22 @@ pub struct WalCloseConfig {
     pub path: String,
     /// Whether to flush memtable to SST before closing
     pub flush_on_close: bool,
+}
+
+/// Options for opening a shard with a pre-resolved object store.
+pub struct OpenShardOptions {
+    /// Pre-resolved object store at the storage root level
+    pub store: Arc<dyn slatedb::object_store::ObjectStore>,
+    /// Optional separate object store for WAL
+    pub wal_store: Option<Arc<dyn slatedb::object_store::ObjectStore>>,
+    /// Optional WAL cleanup configuration for local storage
+    pub wal_close_config: Option<WalCloseConfig>,
+    /// Optional custom flush interval
+    pub flush_interval: Option<std::time::Duration>,
+    /// Rate limiter client for this shard
+    pub rate_limiter: Arc<dyn RateLimitClient>,
+    /// Optional metrics collector
+    pub metrics: Option<Metrics>,
 }
 
 /// Result of a dequeue operation - contains both job tasks and floating limit refresh tasks
@@ -124,35 +140,85 @@ impl JobStoreShard {
     ) -> Result<Arc<Self>, JobStoreShardError> {
         let resolved = resolve_object_store(&cfg.backend, &cfg.path)?;
 
-        // Use the canonical path for both object store AND DbBuilder to ensure consistency
-        let mut db_builder =
-            slatedb::DbBuilder::new(resolved.canonical_path.as_str(), resolved.store)
-                // Add merge operator for counter keys (total_jobs, completed_jobs)
-                .with_merge_operator(counters::counter_merge_operator());
-
         // Configure separate WAL object store if specified, and track for cleanup on close
-        let wal_close_config = if let Some(wal_cfg) = &cfg.wal {
+        let (wal_store, wal_close_config) = if let Some(wal_cfg) = &cfg.wal {
             let wal_resolved = resolve_object_store(&wal_cfg.backend, &wal_cfg.path)?;
-            db_builder = db_builder.with_wal_object_store(wal_resolved.store);
 
             // Only set up WAL cleanup for local (Fs) storage backends
-            // Use root_path which has the actual filesystem path (canonical_path is empty for Fs)
-            if wal_cfg.is_local_storage() {
+            let close_config = if wal_cfg.is_local_storage() {
                 Some(WalCloseConfig {
                     path: wal_resolved.root_path,
                     flush_on_close: cfg.apply_wal_on_close,
                 })
             } else {
                 None
-            }
+            };
+            (Some(wal_resolved.store), close_config)
         } else {
-            None
+            (None, None)
         };
 
+        // Convert flush interval to Duration if specified
+        let flush_interval = cfg.flush_interval_ms.map(std::time::Duration::from_millis);
+
+        Self::open_with_resolved_store(
+            cfg.name.clone(),
+            &resolved.canonical_path,
+            OpenShardOptions {
+                store: resolved.store,
+                wal_store,
+                wal_close_config,
+                flush_interval,
+                rate_limiter,
+                metrics,
+            },
+            range,
+        )
+        .await
+    }
+
+    /// Open a shard using a pre-resolved object store and relative path.
+    ///
+    /// This is the unified method for opening shards - it works for both normal shards
+    /// and cloned shards because it operates at the storage root level.
+    ///
+    /// **Why root-level opening is required:**
+    /// SlateDB clones store relative paths to parent SST files (e.g., `parent-uuid/compacted/file.sst`).
+    /// If we opened with a LocalFileSystem rooted at the child path, these would resolve incorrectly
+    /// as `child-uuid/parent-uuid/compacted/...` instead of `parent-uuid/compacted/...`.
+    ///
+    /// # Arguments
+    /// * `name` - The shard's name (typically its UUID)
+    /// * `db_path` - Path to the database relative to the object store root
+    /// * `options` - Storage and configuration options for the shard
+    /// * `range` - The tenant keyspace range for this shard
+    pub async fn open_with_resolved_store(
+        name: String,
+        db_path: &str,
+        options: OpenShardOptions,
+        range: ShardRange,
+    ) -> Result<Arc<Self>, JobStoreShardError> {
+        let OpenShardOptions {
+            store,
+            wal_store,
+            wal_close_config,
+            flush_interval,
+            rate_limiter,
+            metrics,
+        } = options;
+
+        let mut db_builder = slatedb::DbBuilder::new(db_path, store)
+            .with_merge_operator(counters::counter_merge_operator());
+
+        // Configure separate WAL object store if provided
+        if let Some(wal) = wal_store {
+            db_builder = db_builder.with_wal_object_store(wal);
+        }
+
         // Apply custom flush interval if specified
-        if let Some(flush_ms) = cfg.flush_interval_ms {
+        if let Some(interval) = flush_interval {
             let settings = slatedb::config::Settings {
-                flush_interval: Some(std::time::Duration::from_millis(flush_ms)),
+                flush_interval: Some(interval),
                 ..Default::default()
             };
             db_builder = db_builder.with_settings(settings);
@@ -164,14 +230,14 @@ impl JobStoreShard {
         let broker = TaskBroker::new(
             Arc::clone(&db),
             Arc::clone(&concurrency),
-            cfg.name.clone(),
+            name.clone(),
             metrics.clone(),
             range,
         );
         broker.start();
 
         let shard = Arc::new(Self {
-            name: cfg.name.clone(),
+            name,
             db,
             broker,
             concurrency,
