@@ -20,14 +20,12 @@ use futures::future::join_all;
 use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, trace, warn};
 
-use crate::coordination::{Coordinator, ShardOwnerMap};
+use crate::coordination::{Coordinator, ShardOwnerMap, SplitCleanupStatus};
 use crate::factory::ShardFactory;
-use crate::job_store_shard::ShardCounters;
 use crate::pb::silo_client::SiloClient;
 use crate::pb::{
-    CancelJobRequest, ColumnInfo, GetJobRequest, GetJobResponse, GetShardCountersRequest,
-    JobStatus, QueryRequest, RequestSplitRequest, RequestSplitResponse, SerializedBytes,
-    serialized_bytes,
+    CancelJobRequest, ColumnInfo, GetJobRequest, GetJobResponse, GetNodeInfoRequest, JobStatus,
+    QueryRequest, RequestSplitRequest, RequestSplitResponse, SerializedBytes, serialized_bytes,
 };
 use crate::shard_range::ShardId;
 
@@ -222,6 +220,64 @@ pub struct QueryResult {
     pub row_count: i32,
     /// Which shard this result came from
     pub shard_id: ShardId,
+}
+
+/// Information about a single shard from GetNodeInfo RPC
+#[derive(Debug, Clone)]
+pub struct ShardNodeInfo {
+    /// The shard ID
+    pub shard_id: ShardId,
+    /// Total number of jobs in the shard
+    pub total_jobs: i64,
+    /// Number of jobs in terminal states
+    pub completed_jobs: i64,
+    /// The cleanup status (post-split cleanup state)
+    pub cleanup_status: SplitCleanupStatus,
+    /// Timestamp (ms) when this shard was first created
+    pub created_at_ms: i64,
+    /// Timestamp (ms) when cleanup completed (0 if not applicable)
+    pub cleanup_completed_at_ms: i64,
+}
+
+/// Information about a node and its owned shards from GetNodeInfo RPC
+#[derive(Debug, Clone)]
+pub struct NodeInfo {
+    /// The node ID
+    pub node_id: String,
+    /// Information about each shard owned by this node
+    pub shards: Vec<ShardNodeInfo>,
+}
+
+/// Aggregated information from all nodes in the cluster
+#[derive(Debug, Clone)]
+pub struct ClusterNodeInfo {
+    /// Information from each reachable node
+    pub nodes: Vec<NodeInfo>,
+}
+
+impl ClusterNodeInfo {
+    /// Get the info for a specific shard, if available
+    pub fn get_shard_info(&self, shard_id: &ShardId) -> Option<&ShardNodeInfo> {
+        for node in &self.nodes {
+            for shard in &node.shards {
+                if &shard.shard_id == shard_id {
+                    return Some(shard);
+                }
+            }
+        }
+        None
+    }
+
+    /// Get all shard info as a map from shard_id to ShardNodeInfo
+    pub fn shard_info_map(&self) -> HashMap<ShardId, ShardNodeInfo> {
+        let mut map = HashMap::new();
+        for node in &self.nodes {
+            for shard in &node.shards {
+                map.insert(shard.shard_id, shard.clone());
+            }
+        }
+        map
+    }
 }
 
 /// Client for querying shards across a distributed Silo cluster
@@ -422,79 +478,6 @@ impl ClusterClient {
                 Ok(r) => Some(r),
                 Err(e) => {
                     warn!(shard_id = %shard_id, error = %e, "failed to query shard");
-                    None
-                }
-            })
-            .collect();
-
-        Ok(results)
-    }
-
-    /// Get counters for a specific shard, routing to the appropriate node
-    pub async fn get_shard_counters(
-        &self,
-        shard_id: &ShardId,
-    ) -> Result<ShardCounters, ClusterClientError> {
-        // Check if shard is local first
-        if let Some(shard) = self.factory.get(shard_id) {
-            debug!(shard_id = %shard_id, "getting counters from local shard");
-            return shard
-                .get_counters()
-                .await
-                .map_err(|e| ClusterClientError::QueryFailed(e.to_string()));
-        }
-
-        // Shard is not local, need to query remote node
-        let addr = self.get_shard_addr(shard_id).await?;
-        debug!(shard_id = %shard_id, addr = %addr, "getting counters from remote shard");
-        self.get_remote_shard_counters(shard_id, &addr).await
-    }
-
-    /// Get counters from a remote shard via gRPC
-    async fn get_remote_shard_counters(
-        &self,
-        shard_id: &ShardId,
-        addr: &str,
-    ) -> Result<ShardCounters, ClusterClientError> {
-        let mut client = self.get_client(addr).await?;
-
-        let request = GetShardCountersRequest {
-            shard: shard_id.to_string(),
-        };
-        let response = client
-            .get_shard_counters(request)
-            .await
-            .map_err(|e| {
-                warn!(shard_id = %shard_id, addr = %addr, error = %e, "remote shard counters failed");
-                ClusterClientError::QueryFailed(e.to_string())
-            })?
-            .into_inner();
-
-        Ok(ShardCounters {
-            total_jobs: response.total_jobs,
-            completed_jobs: response.completed_jobs,
-        })
-    }
-
-    /// Get counters from all shards in the cluster
-    pub async fn get_all_shard_counters(
-        &self,
-    ) -> Result<HashMap<ShardId, ShardCounters>, ClusterClientError> {
-        let shard_ids = self.get_all_shard_ids().await?;
-
-        // Query all shards in parallel
-        let futures: Vec<_> = shard_ids
-            .into_iter()
-            .map(|shard_id| async move { (shard_id, self.get_shard_counters(&shard_id).await) })
-            .collect();
-
-        let results: HashMap<ShardId, ShardCounters> = join_all(futures)
-            .await
-            .into_iter()
-            .filter_map(|(shard_id, result)| match result {
-                Ok(counters) => Some((shard_id, counters)),
-                Err(e) => {
-                    warn!(shard_id = %shard_id, error = %e, "failed to get counters for shard");
                     None
                 }
             })
@@ -741,5 +724,180 @@ impl ClusterClient {
                 Err(ClusterClientError::RpcFailed(e.to_string()))
             }
         }
+    }
+
+    /// Get node information from all cluster members.
+    ///
+    /// Calls GetNodeInfo RPC on all cluster members and aggregates the results.
+    /// This returns counters and cleanup status for all shards across the cluster.
+    /// For the local node, gets information directly from the factory instead of gRPC.
+    pub async fn get_all_node_info(&self) -> Result<ClusterNodeInfo, ClusterClientError> {
+        let Some(coordinator) = &self.coordinator else {
+            return Err(ClusterClientError::NoCoordinator);
+        };
+
+        // Get all members from the coordinator
+        let members = coordinator
+            .get_members()
+            .await
+            .map_err(|e| ClusterClientError::QueryFailed(e.to_string()))?;
+
+        // Identify the local node by comparing grpc addresses
+        let local_addr = coordinator.grpc_addr();
+
+        // Call GetNodeInfo on all members in parallel
+        // For the local node, get info directly from factory instead of gRPC
+        let futures: Vec<_> = members
+            .iter()
+            .map(|member| {
+                let addr = member.grpc_addr.clone();
+                let node_id = member.node_id.clone();
+                let is_local = addr == local_addr;
+                async move {
+                    let result = if is_local {
+                        self.get_local_node_info(&node_id).await
+                    } else {
+                        self.get_node_info(&addr).await
+                    };
+                    (addr, result)
+                }
+            })
+            .collect();
+
+        let results: Vec<NodeInfo> = join_all(futures)
+            .await
+            .into_iter()
+            .filter_map(|(addr, result)| match result {
+                Ok(info) => Some(info),
+                Err(e) => {
+                    warn!(addr = %addr, error = %e, "failed to get node info");
+                    None
+                }
+            })
+            .collect();
+
+        Ok(ClusterNodeInfo { nodes: results })
+    }
+
+    /// Get node information for the local node directly from the factory.
+    ///
+    /// This avoids making a gRPC call when we can access the shards directly.
+    async fn get_local_node_info(&self, node_id: &str) -> Result<NodeInfo, ClusterClientError> {
+        let Some(coordinator) = &self.coordinator else {
+            return Err(ClusterClientError::NoCoordinator);
+        };
+
+        let owned_shard_ids = coordinator.owned_shards().await;
+        let mut shards = Vec::with_capacity(owned_shard_ids.len());
+
+        for shard_id in owned_shard_ids {
+            if let Some(shard) = self.factory.get(&shard_id) {
+                // Get counters
+                let (total_jobs, completed_jobs) = match shard.get_counters().await {
+                    Ok(counters) => (counters.total_jobs, counters.completed_jobs),
+                    Err(e) => {
+                        warn!(shard_id = %shard_id, error = %e, "failed to get counters from local shard");
+                        (0, 0)
+                    }
+                };
+
+                // Get cleanup status
+                let cleanup_status = match shard.get_cleanup_status().await {
+                    Ok(status) => status,
+                    Err(e) => {
+                        warn!(shard_id = %shard_id, error = %e, "failed to get cleanup status from local shard");
+                        SplitCleanupStatus::CompactionDone
+                    }
+                };
+
+                // Get shard metadata timestamps
+                let created_at_ms = shard.get_created_at_ms().await.ok().flatten().unwrap_or(0);
+                let cleanup_completed_at_ms = shard
+                    .get_cleanup_completed_at_ms()
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+
+                shards.push(ShardNodeInfo {
+                    shard_id,
+                    total_jobs,
+                    completed_jobs,
+                    cleanup_status,
+                    created_at_ms,
+                    cleanup_completed_at_ms,
+                });
+            }
+        }
+
+        Ok(NodeInfo {
+            node_id: node_id.to_string(),
+            shards,
+        })
+    }
+
+    /// Get node information from a specific node via gRPC
+    async fn get_node_info(&self, addr: &str) -> Result<NodeInfo, ClusterClientError> {
+        let mut client = self.get_client(addr).await?;
+
+        let request = GetNodeInfoRequest {};
+        let response = match client.get_node_info(request).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                self.invalidate_connection(addr);
+                return Err(ClusterClientError::RpcFailed(format!(
+                    "GetNodeInfo failed: {}",
+                    e
+                )));
+            }
+        };
+
+        let resp = response.into_inner();
+
+        // Parse the response into our internal types
+        let shards: Vec<ShardNodeInfo> = resp
+            .owned_shards
+            .into_iter()
+            .filter_map(|shard_info| {
+                let shard_id = match ShardId::parse(&shard_info.shard_id) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        warn!(
+                            shard_id = %shard_info.shard_id,
+                            error = %e,
+                            "failed to parse shard ID from GetNodeInfo response"
+                        );
+                        return None;
+                    }
+                };
+
+                let cleanup_status = match shard_info.cleanup_status.parse::<SplitCleanupStatus>() {
+                    Ok(status) => status,
+                    Err(e) => {
+                        warn!(
+                            shard_id = %shard_id,
+                            status = %shard_info.cleanup_status,
+                            error = %e,
+                            "failed to parse cleanup status, defaulting to CompactionDone"
+                        );
+                        SplitCleanupStatus::CompactionDone
+                    }
+                };
+
+                Some(ShardNodeInfo {
+                    shard_id,
+                    total_jobs: shard_info.total_jobs,
+                    completed_jobs: shard_info.completed_jobs,
+                    cleanup_status,
+                    created_at_ms: shard_info.created_at_ms,
+                    cleanup_completed_at_ms: shard_info.cleanup_completed_at_ms,
+                })
+            })
+            .collect();
+
+        Ok(NodeInfo {
+            node_id: resp.node_id,
+            shards,
+        })
     }
 }

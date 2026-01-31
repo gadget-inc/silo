@@ -192,3 +192,30 @@ pub fn shard_total_jobs_counter_key() -> &'static str {
 pub fn shard_completed_jobs_counter_key() -> &'static str {
     "counters/completed_jobs"
 }
+
+/// Key for storing cleanup progress checkpoint (for resumption after crash).
+pub fn cleanup_progress_key() -> &'static str {
+    "_silo_cleanup/progress"
+}
+
+/// Key for storing cleanup completion marker.
+pub fn cleanup_complete_key() -> &'static str {
+    "_silo_cleanup/complete"
+}
+
+/// Key for storing the authoritative cleanup status for this shard.
+/// This is the source of truth for whether the shard needs cleanup work.
+pub fn cleanup_status_key() -> &'static str {
+    "_silo_cleanup/status"
+}
+
+/// Key for storing the timestamp (ms) when the shard was first created/initialized.
+pub fn shard_created_at_key() -> &'static str {
+    "_silo_meta/created_at_ms"
+}
+
+/// Key for storing the timestamp (ms) when cleanup completed for this shard.
+/// Only set after a split cleanup finishes.
+pub fn cleanup_completed_at_key() -> &'static str {
+    "_silo_cleanup/completed_at_ms"
+}

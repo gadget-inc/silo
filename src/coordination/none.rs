@@ -12,7 +12,7 @@ use crate::factory::ShardFactory;
 use crate::shard_range::{ShardId, ShardMap};
 
 use crate::coordination::{
-    CoordinationError, Coordinator, CoordinatorBase, MemberInfo, ShardOwnerMap, SplitCleanupStatus,
+    CoordinationError, Coordinator, CoordinatorBase, MemberInfo, ShardOwnerMap,
     SplitStorageBackend, get_hostname,
 };
 use crate::shard_range::SplitInProgress;
@@ -167,14 +167,6 @@ impl SplitStorageBackend for NoneCoordinator {
     async fn reload_shard_map(&self) -> Result<(), CoordinationError> {
         // Nothing to reload in single-node mode
         Ok(())
-    }
-
-    async fn update_cleanup_status_in_shard_map(
-        &self,
-        _shard_id: ShardId,
-        _status: SplitCleanupStatus,
-    ) -> Result<(), CoordinationError> {
-        Err(CoordinationError::NotSupported)
     }
 
     async fn list_all_splits(&self) -> Result<Vec<SplitInProgress>, CoordinationError> {

@@ -1024,17 +1024,18 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
         state.factory.instances().keys().copied().collect()
     };
 
-    // Get job counts from counters for all shards (local and remote)
-    // This uses the GetShardCounters RPC for remote shards
+    // Get node info from all cluster nodes (counters + cleanup status)
+    // This uses the GetNodeInfo RPC for all nodes
     let mut error: Option<String> = None;
-    let shard_counters = match state.cluster_client.get_all_shard_counters().await {
-        Ok(counters) => counters,
+    let cluster_info = match state.cluster_client.get_all_node_info().await {
+        Ok(info) => info,
         Err(e) => {
-            warn!(error = %e, "failed to get counters from all shards");
-            error = Some(format!("Failed to get shard counters: {}", e));
-            std::collections::HashMap::new()
+            warn!(error = %e, "failed to get node info from cluster");
+            error = Some(format!("Failed to get node info: {}", e));
+            crate::cluster_client::ClusterNodeInfo { nodes: vec![] }
         }
     };
+    let shard_info_map = cluster_info.shard_info_map();
 
     // Build a lookup map for active splits by parent shard
     let active_split_map: HashMap<String, &ActiveSplitRow> = active_splits
@@ -1042,12 +1043,10 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
         .map(|s| (s.parent_shard_id.clone(), s))
         .collect();
 
-    // Build shard rows from the counters map, filling in 0 for missing shards
+    // Build shard rows from the node info map, filling in 0 for missing shards
     for shard_id in shard_ids {
-        let job_count = shard_counters
-            .get(&shard_id)
-            .map(|c| c.total_jobs as usize)
-            .unwrap_or(0);
+        let shard_info = shard_info_map.get(&shard_id);
+        let job_count = shard_info.map(|c| c.total_jobs as usize).unwrap_or(0);
         let owner = if let Some(ref map) = owner_map {
             if state.cluster_client.owns_shard(&shard_id) {
                 "local".to_string()
@@ -1066,22 +1065,19 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
             .get(&shard_id.to_string())
             .map(|s| s.phase.clone());
 
-        // Get cleanup status and parent info from shard map
-        let (cleanup_status, parent_shard_id) = if let Some(ref map) = shard_map {
-            if let Some(shard_info) = map.get_shard(&shard_id) {
-                let cleanup = if shard_info.cleanup_status != SplitCleanupStatus::CompactionDone {
-                    Some(shard_info.cleanup_status.to_string())
-                } else {
-                    None
-                };
-                let parent = shard_info.parent_shard_id.map(|p| p.to_string());
-                (cleanup, parent)
+        // Get cleanup status from the cluster-wide node info
+        let cleanup_status = shard_info.and_then(|info| {
+            if info.cleanup_status != SplitCleanupStatus::CompactionDone {
+                Some(info.cleanup_status.to_string())
             } else {
-                (None, None)
+                None
             }
-        } else {
-            (None, None)
-        };
+        });
+
+        let parent_shard_id = shard_map
+            .as_ref()
+            .and_then(|map| map.get_shard(&shard_id))
+            .and_then(|info| info.parent_shard_id.map(|p| p.to_string()));
 
         shards.push(ShardRow {
             name: shard_id.to_string(),
@@ -1439,13 +1435,15 @@ async fn shard_handler(
         "local".to_string()
     };
 
-    // Get job count
-    let job_count = state
-        .cluster_client
-        .get_all_shard_counters()
-        .await
-        .ok()
-        .and_then(|counters| counters.get(&shard_id).map(|c| c.total_jobs as usize))
+    // Get node info (counters + cleanup status) from the cluster
+    let cluster_info = state.cluster_client.get_all_node_info().await.ok();
+    let shard_node_info = cluster_info
+        .as_ref()
+        .and_then(|info| info.get_shard_info(&shard_id).cloned());
+
+    let job_count = shard_node_info
+        .as_ref()
+        .map(|info| info.total_jobs as usize)
         .unwrap_or(0);
 
     // Check for active split
@@ -1469,11 +1467,13 @@ async fn shard_handler(
         );
     };
 
-    let cleanup_status = if info.cleanup_status != SplitCleanupStatus::CompactionDone {
-        Some(info.cleanup_status.to_string())
-    } else {
-        None
-    };
+    let cleanup_status = shard_node_info.as_ref().and_then(|node_info| {
+        if node_info.cleanup_status != SplitCleanupStatus::CompactionDone {
+            Some(node_info.cleanup_status.to_string())
+        } else {
+            None
+        }
+    });
 
     let template = ShardTemplate {
         nav_active: "cluster",

@@ -1180,22 +1180,6 @@ impl Silo for SiloService {
         }))
     }
 
-    async fn get_shard_counters(
-        &self,
-        req: Request<GetShardCountersRequest>,
-    ) -> Result<Response<GetShardCountersResponse>, Status> {
-        let r = req.into_inner();
-        let shard_id = Self::parse_shard_id(&r.shard)?;
-        let shard = self.shard_with_redirect(&shard_id).await?;
-
-        let counters = shard.get_counters().await.map_err(map_err)?;
-
-        Ok(Response::new(GetShardCountersResponse {
-            total_jobs: counters.total_jobs,
-            completed_jobs: counters.completed_jobs,
-        }))
-    }
-
     async fn cpu_profile(
         &self,
         req: Request<CpuProfileRequest>,
@@ -1351,6 +1335,73 @@ impl Silo for SiloService {
                 requested_at_ms: 0,
             })),
         }
+    }
+
+    async fn get_node_info(
+        &self,
+        _req: Request<GetNodeInfoRequest>,
+    ) -> Result<Response<GetNodeInfoResponse>, Status> {
+        let coord = &self.coordinator;
+        let factory = &self.factory;
+
+        // Get all owned shards and their info (counters + cleanup status)
+        let owned_shard_ids = coord.owned_shards().await;
+        let mut owned_shards = Vec::with_capacity(owned_shard_ids.len());
+
+        for shard_id in owned_shard_ids {
+            // Get the shard from the factory
+            if let Some(shard) = factory.get(&shard_id) {
+                // Get counters
+                let (total_jobs, completed_jobs) = match shard.get_counters().await {
+                    Ok(counters) => (counters.total_jobs, counters.completed_jobs),
+                    Err(e) => {
+                        tracing::warn!(
+                            shard_id = %shard_id,
+                            error = %e,
+                            "failed to get counters from shard"
+                        );
+                        (0, 0)
+                    }
+                };
+
+                // Get the cleanup status from the shard's database
+                let cleanup_status = match shard.get_cleanup_status().await {
+                    Ok(status) => status.to_string(),
+                    Err(e) => {
+                        tracing::warn!(
+                            shard_id = %shard_id,
+                            error = %e,
+                            "failed to get cleanup status from shard"
+                        );
+                        // Default to CompactionDone if we can't read the status
+                        "CompactionDone".to_string()
+                    }
+                };
+
+                // Get shard metadata timestamps
+                let created_at_ms = shard.get_created_at_ms().await.ok().flatten().unwrap_or(0);
+                let cleanup_completed_at_ms = shard
+                    .get_cleanup_completed_at_ms()
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+
+                owned_shards.push(OwnedShardInfo {
+                    shard_id: shard_id.to_string(),
+                    total_jobs,
+                    completed_jobs,
+                    cleanup_status,
+                    created_at_ms,
+                    cleanup_completed_at_ms,
+                });
+            }
+        }
+
+        Ok(Response::new(GetNodeInfoResponse {
+            node_id: coord.node_id().to_string(),
+            owned_shards,
+        }))
     }
 }
 

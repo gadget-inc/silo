@@ -552,14 +552,16 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         priority: 1,
       });
 
-      // Wait until the task is processed
-      await waitFor(() =>
-        processedBySpecificWorker.includes("task-for-specific-group")
-      );
+      // Wait until the job is completed (server has updated the status)
+      await waitFor(async () => {
+        const job = await client.getJob(handle.id, DEFAULT_TENANT);
+        return job.status === JobStatus.Succeeded;
+      });
 
+      // Verify the task was processed by our handler
       expect(processedBySpecificWorker).toContain("task-for-specific-group");
 
-      // Verify the job completed successfully
+      // Verify the job completed successfully (already waited for this above)
       const job = await client.getJob(handle.id, DEFAULT_TENANT);
       expect(job.status).toBe(JobStatus.Succeeded);
     });

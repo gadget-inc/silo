@@ -6,9 +6,7 @@ mod etcd_test_helpers;
 
 use etcd_test_helpers::EtcdConnection;
 use silo::coordination::etcd::{EtcdCoordinator, EtcdShardGuard, ShardPhase};
-use silo::coordination::{
-    CoordinationError, Coordinator, ShardSplitter, SplitCleanupStatus, SplitPhase,
-};
+use silo::coordination::{CoordinationError, Coordinator, ShardSplitter, SplitPhase};
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::settings::{Backend, DatabaseTemplate};
@@ -1296,47 +1294,6 @@ async fn etcd_request_split_fails_if_already_in_progress() {
     handle.abort();
 }
 
-/// Test that update_cleanup_status works correctly.
-#[silo::test(flavor = "multi_thread", worker_threads = 2)]
-async fn etcd_update_cleanup_status_works() {
-    let prefix = unique_prefix();
-    let num_shards: u32 = 1; // Use 1 shard for simplicity
-
-    let (coord, handle) = start_etcd_coordinator!(
-        &prefix,
-        "cleanup-status-1",
-        "http://127.0.0.1:50051",
-        num_shards
-    );
-    let coord: Arc<dyn Coordinator> = Arc::new(coord);
-
-    assert!(coord.wait_converged(Duration::from_secs(15)).await);
-
-    let owned = coord.owned_shards().await;
-    let shard_id = owned[0];
-
-    // Create splitter and update cleanup status
-    let splitter = ShardSplitter::new(coord.clone());
-
-    splitter
-        .update_cleanup_status(shard_id, SplitCleanupStatus::CleanupRunning)
-        .await
-        .expect("update_cleanup_status should succeed");
-
-    // Verify the status was updated in the shard map
-    let shard_map = coord.get_shard_map().await.unwrap();
-    let shard_info = shard_map.get_shard(&shard_id).unwrap();
-    assert_eq!(
-        shard_info.cleanup_status,
-        SplitCleanupStatus::CleanupRunning,
-        "cleanup status should be updated"
-    );
-
-    // Cleanup
-    coord.shutdown().await.unwrap();
-    handle.abort();
-}
-
 /// Test that is_shard_paused returns correct values based on split phase.
 #[silo::test(flavor = "multi_thread", worker_threads = 2)]
 async fn etcd_is_shard_paused_returns_correct_values() {
@@ -1513,58 +1470,6 @@ async fn etcd_execute_split_completes_full_cycle() {
     assert!(
         shard_map.get_shard(&split.right_child_id).is_some(),
         "right child should exist"
-    );
-
-    // Children should initially need cleanup work (cleanup runs asynchronously,
-    // so status may be CleanupPending, CleanupRunning, or CleanupDone depending on timing)
-    let left_info = shard_map.get_shard(&split.left_child_id).unwrap();
-    let right_info = shard_map.get_shard(&split.right_child_id).unwrap();
-    assert!(
-        left_info.cleanup_status.needs_work(),
-        "left child should need cleanup work, got {:?}",
-        left_info.cleanup_status
-    );
-    assert!(
-        right_info.cleanup_status.needs_work(),
-        "right child should need cleanup work, got {:?}",
-        right_info.cleanup_status
-    );
-
-    // Wait for cleanup to complete - use longer timeout since cleanup can be slow under load
-    // (CAS conflicts on shard map cause retries)
-    let cleanup_complete = wait_until(Duration::from_secs(60), || async {
-        let Ok(map) = coord.get_shard_map().await else {
-            return false;
-        };
-        let Some(left) = map.get_shard(&split.left_child_id) else {
-            return false;
-        };
-        let Some(right) = map.get_shard(&split.right_child_id) else {
-            return false;
-        };
-        left.cleanup_status == SplitCleanupStatus::CompactionDone
-            && right.cleanup_status == SplitCleanupStatus::CompactionDone
-    })
-    .await;
-
-    assert!(
-        cleanup_complete,
-        "cleanup should complete automatically via background task"
-    );
-
-    // Verify final cleanup status
-    let final_map = coord.get_shard_map().await.expect("get_shard_map");
-    let left_final = final_map.get_shard(&split.left_child_id).unwrap();
-    let right_final = final_map.get_shard(&split.right_child_id).unwrap();
-    assert_eq!(
-        left_final.cleanup_status,
-        SplitCleanupStatus::CompactionDone,
-        "left child should have CompactionDone status after cleanup"
-    );
-    assert_eq!(
-        right_final.cleanup_status,
-        SplitCleanupStatus::CompactionDone,
-        "right child should have CompactionDone status after cleanup"
     );
 
     coord.shutdown().await.unwrap();
@@ -2121,99 +2026,6 @@ async fn etcd_grpc_request_split_executes_to_completion() {
     // Cleanup
     let _ = shutdown_tx.send(());
     let _ = server.await;
-    coord.shutdown().await.unwrap();
-    handle.abort();
-}
-
-/// Test that cleanup is triggered automatically when child shards are opened during a split.
-///
-/// After a split completes, child shards initially have CleanupPending status.
-/// The coordinator runs a background cleanup task every 5 seconds that transitions
-/// them through CleanupRunning -> CleanupDone -> CompactionDone.
-#[silo::test(flavor = "multi_thread", worker_threads = 4)]
-async fn etcd_cleanup_triggered_on_shard_acquisition() {
-    let prefix = unique_prefix();
-    let num_shards: u32 = 1;
-
-    let (coord, handle) = start_etcd_coordinator!(
-        &prefix,
-        "cleanup-test-1",
-        "http://127.0.0.1:50051",
-        num_shards
-    );
-    let coord: Arc<dyn Coordinator> = Arc::new(coord);
-
-    assert!(coord.wait_converged(Duration::from_secs(15)).await);
-
-    let owned = coord.owned_shards().await;
-    let shard_id = owned[0];
-
-    // Create splitter and perform a split
-    let splitter = ShardSplitter::new(coord.clone());
-
-    let split = splitter
-        .request_split(shard_id, "m".to_string())
-        .await
-        .expect("request_split");
-
-    splitter
-        .execute_split(shard_id, || coord.get_shard_owner_map())
-        .await
-        .expect("execute_split");
-
-    // Immediately after split, children should need cleanup work
-    // (cleanup runs asynchronously, so status may be CleanupPending, CleanupRunning, or CleanupDone depending on timing)
-    let shard_map = coord.get_shard_map().await.expect("get_shard_map");
-    let left_info = shard_map.get_shard(&split.left_child_id).unwrap();
-    let right_info = shard_map.get_shard(&split.right_child_id).unwrap();
-    assert!(
-        left_info.cleanup_status.needs_work(),
-        "left child should need cleanup work initially, got {:?}",
-        left_info.cleanup_status
-    );
-    assert!(
-        right_info.cleanup_status.needs_work(),
-        "right child should need cleanup work initially, got {:?}",
-        right_info.cleanup_status
-    );
-
-    // Wait for background cleanup to complete - use longer timeout since cleanup can be slow
-    // under load (CAS conflicts on shard map cause retries)
-    let cleanup_complete = wait_until(Duration::from_secs(60), || async {
-        let Ok(map) = coord.get_shard_map().await else {
-            return false;
-        };
-        let Some(left) = map.get_shard(&split.left_child_id) else {
-            return false;
-        };
-        let Some(right) = map.get_shard(&split.right_child_id) else {
-            return false;
-        };
-        left.cleanup_status == SplitCleanupStatus::CompactionDone
-            && right.cleanup_status == SplitCleanupStatus::CompactionDone
-    })
-    .await;
-
-    assert!(
-        cleanup_complete,
-        "cleanup should complete automatically via background task"
-    );
-
-    // Verify final state
-    let final_map = coord.get_shard_map().await.expect("get_shard_map");
-    let left_final = final_map.get_shard(&split.left_child_id).unwrap();
-    let right_final = final_map.get_shard(&split.right_child_id).unwrap();
-    assert_eq!(
-        left_final.cleanup_status,
-        SplitCleanupStatus::CompactionDone,
-        "left child should have CompactionDone status after cleanup"
-    );
-    assert_eq!(
-        right_final.cleanup_status,
-        SplitCleanupStatus::CompactionDone,
-        "right child should have CompactionDone status after cleanup"
-    );
-
     coord.shutdown().await.unwrap();
     handle.abort();
 }
