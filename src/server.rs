@@ -1273,9 +1273,9 @@ impl Silo for SiloService {
             return Err(Status::invalid_argument("split_point is required"));
         }
 
-        let orchestrator = ShardSplitter::new(self.coordinator.as_ref());
+        let splitter = ShardSplitter::new(Arc::clone(&self.coordinator));
 
-        let split = orchestrator
+        let split = splitter
             .request_split(shard_id, r.split_point)
             .await
             .map_err(|e| match e {
@@ -1299,8 +1299,8 @@ impl Silo for SiloService {
         // progresses asynchronously. Clients can poll GetSplitStatus to track progress.
         let coordinator = Arc::clone(&self.coordinator);
         tokio::spawn(async move {
-            let orchestrator = ShardSplitter::new(coordinator.as_ref());
-            if let Err(e) = orchestrator
+            let splitter = ShardSplitter::new(Arc::clone(&coordinator));
+            if let Err(e) = splitter
                 .execute_split(shard_id, || coordinator.get_shard_owner_map())
                 .await
             {
@@ -1324,10 +1324,9 @@ impl Silo for SiloService {
         // Parse the shard ID
         let shard_id = Self::parse_shard_id(&r.shard_id)?;
 
-        // Create orchestrator
-        let orchestrator = ShardSplitter::new(self.coordinator.as_ref());
+        let splitter = ShardSplitter::new(Arc::clone(&self.coordinator));
 
-        let split_opt = orchestrator
+        let split_opt = splitter
             .get_split_status(shard_id)
             .await
             .map_err(|e| Status::internal(format!("failed to get split status: {}", e)))?;

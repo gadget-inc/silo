@@ -75,8 +75,10 @@
         ]);
 
         # Set the project root for the dev script
+        # Match RUSTFLAGS with rust.nix to avoid cache invalidation between nix build and local dev
         shellHook = ''
           export SILO_PROJECT_ROOT="$(pwd)"
+          export RUSTFLAGS="-C force-frame-pointers=yes"
         '';
       };
     };

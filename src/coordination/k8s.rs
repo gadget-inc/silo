@@ -1,34 +1,3 @@
-//! Kubernetes Lease-based coordination backend.
-//!
-//! This backend uses Kubernetes Lease objects for distributed shard ownership.
-//! It's designed for deployments where Silo runs inside a Kubernetes cluster.
-//!
-//! ## Key Design Decisions
-//!
-//! - **Reactive membership detection**: Uses K8s watches for immediate notification of
-//!   membership changes, with a 30-second safety reconciliation as a fallback.
-//!
-//! - **Optimistic concurrency (CAS)**: All lease operations use `replace` with
-//!   `resourceVersion` to ensure atomic updates. This prevents races where two nodes
-//!   could both think they acquired the same shard.
-//!
-//! - **Safe release**: Shard leases are released by clearing `holderIdentity` instead
-//!   of deleting the lease object. This avoids races where deleting could remove
-//!   another node's lease if they acquired it between our check and delete.
-//!
-//! - **Fencing via resourceVersion**: Each guard tracks its `resourceVersion` and
-//!   verifies ownership before every operation. If the version changes unexpectedly
-//!   or we're no longer the holder, we consider the lease lost.
-//!
-//! ## Known Limitations
-//!
-//! - **Clock skew sensitivity**: Lease expiry is checked using local time compared to
-//!   the lease's `renewTime`. Significant clock skew between nodes could cause
-//!   incorrect expiry detection. We recommend using NTP or similar time sync.
-//!
-//! - **API server dependency**: All coordination goes through the K8s API server.
-//!   If the API server is unavailable, coordination operations will fail.
-
 use async_trait::async_trait;
 use chrono::Utc;
 use k8s_openapi::api::coordination::v1::Lease;
@@ -45,7 +14,7 @@ use crate::dst_events::{self, DstEvent};
 use crate::factory::ShardFactory;
 use crate::shard_range::{ShardId, ShardMap, SplitInProgress};
 
-use super::k8s_backend::{K8sBackend, KubeBackend, LeaseWatchEvent};
+use super::k8s_backend::{ConfigMapWatchEvent, K8sBackend, KubeBackend, LeaseWatchEvent};
 use super::{
     CoordinationError, Coordinator, CoordinatorBase, MemberInfo, ShardOwnerMap, ShardPhase,
     SplitCleanupStatus, SplitStorageBackend, compute_desired_shards_for_node, get_hostname, keys,
@@ -54,6 +23,16 @@ use super::{
 /// Format a chrono DateTime for K8S MicroTime (RFC3339 with microseconds and Z suffix)
 fn format_microtime(dt: chrono::DateTime<Utc>) -> String {
     dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
+}
+
+/// Configuration for starting a K8sCoordinator
+pub struct K8sCoordinatorConfig {
+    pub namespace: String,
+    pub cluster_prefix: String,
+    pub node_id: String,
+    pub grpc_addr: String,
+    pub initial_shard_count: u32,
+    pub lease_duration_secs: i64,
 }
 
 /// Kubernetes Lease-based coordinator for distributed shard ownership.
@@ -74,6 +53,11 @@ pub struct K8sCoordinator<B: K8sBackend> {
     members_cache: Arc<Mutex<Vec<MemberInfo>>>,
     /// Notifier for membership changes (from watcher)
     membership_changed: Arc<Notify>,
+    /// Notifier for shard map changes (from watcher)
+    shard_map_changed: Arc<Notify>,
+    /// Per-shard notifiers for when a shard lease becomes available (holder released).
+    /// Guards waiting to acquire a shard can subscribe to these instead of blind retrying.
+    shard_available_notifiers: Arc<Mutex<HashMap<ShardId, Arc<Notify>>>>,
 }
 
 /// Convenience type alias for K8sCoordinator with the real Kubernetes backend.
@@ -81,51 +65,29 @@ pub type K8sCoordinatorDefault = K8sCoordinator<KubeBackend>;
 
 impl K8sCoordinator<KubeBackend> {
     /// Start the K8S coordinator using the default Kubernetes client.
-    ///
-    /// The coordinator will manage shard ownership and automatically open/close
-    /// shards in the factory as ownership changes.
     pub async fn start(
-        namespace: &str,
-        cluster_prefix: &str,
-        node_id: impl Into<String>,
-        grpc_addr: impl Into<String>,
-        initial_shard_count: u32,
-        lease_duration_secs: i64,
+        config: K8sCoordinatorConfig,
         factory: Arc<ShardFactory>,
     ) -> Result<(Self, tokio::task::JoinHandle<()>), CoordinationError> {
         let backend = KubeBackend::try_default().await?;
-        Self::start_with_backend(
-            backend,
+        Self::start_with_backend(backend, config, factory).await
+    }
+}
+
+impl<B: K8sBackend> K8sCoordinator<B> {
+    pub async fn start_with_backend(
+        backend: B,
+        config: K8sCoordinatorConfig,
+        factory: Arc<ShardFactory>,
+    ) -> Result<(Self, tokio::task::JoinHandle<()>), CoordinationError> {
+        let K8sCoordinatorConfig {
             namespace,
             cluster_prefix,
             node_id,
             grpc_addr,
             initial_shard_count,
             lease_duration_secs,
-            factory,
-        )
-        .await
-    }
-}
-
-impl<B: K8sBackend> K8sCoordinator<B> {
-    /// Start the K8S coordinator with a custom backend.
-    ///
-    /// This method allows using alternative backends for testing.
-    pub async fn start_with_backend(
-        backend: B,
-        namespace: &str,
-        cluster_prefix: &str,
-        node_id: impl Into<String>,
-        grpc_addr: impl Into<String>,
-        initial_shard_count: u32,
-        lease_duration_secs: i64,
-        factory: Arc<ShardFactory>,
-    ) -> Result<(Self, tokio::task::JoinHandle<()>), CoordinationError> {
-        let namespace = namespace.to_string();
-        let cluster_prefix = cluster_prefix.to_string();
-        let node_id = node_id.into();
-        let grpc_addr = grpc_addr.into();
+        } = config;
 
         // Load or create the shard map in a ConfigMap
         let shard_map = Self::load_or_create_shard_map(
@@ -183,6 +145,8 @@ impl<B: K8sBackend> K8sCoordinator<B> {
 
         let members_cache = Arc::new(Mutex::new(Vec::new()));
         let membership_changed = Arc::new(Notify::new());
+        let shard_map_changed = Arc::new(Notify::new());
+        let shard_available_notifiers = Arc::new(Mutex::new(HashMap::new()));
 
         let me = Self {
             base: base.clone(),
@@ -193,6 +157,8 @@ impl<B: K8sBackend> K8sCoordinator<B> {
             shard_guards: Arc::new(Mutex::new(HashMap::new())),
             members_cache,
             membership_changed,
+            shard_map_changed,
+            shard_available_notifiers,
         };
 
         // Do initial member list fetch before starting background tasks
@@ -203,10 +169,30 @@ impl<B: K8sBackend> K8sCoordinator<B> {
 
         let handle = tokio::spawn(async move {
             // Start the membership watcher task
-            let watcher_me = me_bg.clone();
-            let watcher_shutdown = me_bg.base.shutdown_rx.clone();
-            let watcher_handle = tokio::spawn(async move {
-                watcher_me.run_membership_watcher(watcher_shutdown).await;
+            let membership_watcher_me = me_bg.clone();
+            let membership_watcher_shutdown = me_bg.base.shutdown_rx.clone();
+            let membership_watcher_handle = tokio::spawn(async move {
+                membership_watcher_me
+                    .run_membership_watcher(membership_watcher_shutdown)
+                    .await;
+            });
+
+            // Start the shard map watcher task
+            let shard_map_watcher_me = me_bg.clone();
+            let shard_map_watcher_shutdown = me_bg.base.shutdown_rx.clone();
+            let shard_map_watcher_handle = tokio::spawn(async move {
+                shard_map_watcher_me
+                    .run_shard_map_watcher(shard_map_watcher_shutdown)
+                    .await;
+            });
+
+            // Start the shard lease watcher task - watches for when shard leases become available
+            let shard_lease_watcher_me = me_bg.clone();
+            let shard_lease_watcher_shutdown = me_bg.base.shutdown_rx.clone();
+            let shard_lease_watcher_handle = tokio::spawn(async move {
+                shard_lease_watcher_me
+                    .run_shard_lease_watcher(shard_lease_watcher_shutdown)
+                    .await;
             });
 
             // Run the main coordination loop
@@ -214,8 +200,10 @@ impl<B: K8sBackend> K8sCoordinator<B> {
                 .run_coordination_loop(me_bg.base.shutdown_rx.clone())
                 .await;
 
-            // Clean up watcher on shutdown
-            watcher_handle.abort();
+            // Clean up watchers on shutdown
+            membership_watcher_handle.abort();
+            shard_map_watcher_handle.abort();
+            shard_lease_watcher_handle.abort();
             debug!(node_id = %nid, "k8s coordinator background task exiting");
         });
 
@@ -224,9 +212,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
 
     /// Load the shard map from a ConfigMap, or create a new one if it doesn't exist.
     ///
-    /// The shard map is stored in a ConfigMap with the key "shard_map.json".
-    /// This function handles the initial cluster bootstrapping where the first
-    /// node to start creates the shard map.
+    /// The shard map is stored in a ConfigMap with the key "shard_map.json". This function handles the initial cluster bootstrapping where the first node to start creates the shard map.
     async fn load_or_create_shard_map(
         backend: &B,
         namespace: &str,
@@ -288,8 +274,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
                     ..Default::default()
                 };
 
-                // Use create with optimistic concurrency - if another node creates
-                // it first, we'll get a conflict and retry
+                // Use create with optimistic concurrency - if another node creates it first, we'll get a conflict and retry
                 match backend.create_configmap(namespace, &cm).await {
                     Ok(_) => {
                         info!(
@@ -400,18 +385,167 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         }
     }
 
+    /// Run the shard map watcher - watches for shard map ConfigMap changes and triggers reconciliation
+    async fn run_shard_map_watcher(&self, mut shutdown_rx: watch::Receiver<bool>) {
+        let configmap_name = format!("{}-shard-map", self.cluster_prefix);
+        let mut watch_stream = std::pin::pin!(
+            self.backend
+                .watch_configmap(&self.namespace, &configmap_name)
+        );
+
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        debug!(node_id = %self.base.node_id, "shard map watcher shutting down");
+                        break;
+                    }
+                }
+                event = watch_stream.next() => {
+                    match event {
+                        Some(Ok(ev)) => {
+                            match ev {
+                                ConfigMapWatchEvent::Applied(cm) => {
+                                    let cm_name = cm.metadata.name.as_deref().unwrap_or("unknown");
+                                    info!(node_id = %self.base.node_id, configmap = %cm_name, "shard map ConfigMap changed");
+                                    // Reload the shard map from the ConfigMap into local cache
+                                    if let Err(e) = self.reload_shard_map().await {
+                                        warn!(node_id = %self.base.node_id, error = %e, "failed to reload shard map");
+                                    }
+                                    self.shard_map_changed.notify_waiters();
+                                }
+                                ConfigMapWatchEvent::Deleted(cm) => {
+                                    let cm_name = cm.metadata.name.as_deref().unwrap_or("unknown");
+                                    warn!(node_id = %self.base.node_id, configmap = %cm_name, "shard map ConfigMap deleted");
+                                    // Don't notify on delete - this shouldn't happen normally
+                                }
+                                ConfigMapWatchEvent::Init => {
+                                    debug!(node_id = %self.base.node_id, "shard map watcher initialized");
+                                }
+                                ConfigMapWatchEvent::InitDone => {
+                                    debug!(node_id = %self.base.node_id, "shard map watcher init done");
+                                    // Notify on init done in case we missed events
+                                    self.shard_map_changed.notify_waiters();
+                                }
+                            }
+                        }
+                        Some(Err(e)) => {
+                            warn!(node_id = %self.base.node_id, error = %e, "shard map watcher error, will retry");
+                            // Watchers should automatically reconnect on errors
+                        }
+                        None => {
+                            debug!(node_id = %self.base.node_id, "shard map watcher stream ended");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Get or create a notifier for when a specific shard lease becomes available.
+    /// Guards waiting to acquire a shard can await on this notifier instead of blind retrying.
+    pub async fn get_shard_available_notifier(&self, shard_id: ShardId) -> Arc<Notify> {
+        let mut notifiers = self.shard_available_notifiers.lock().await;
+        notifiers
+            .entry(shard_id)
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone()
+    }
+
+    /// Run the shard lease watcher - watches for when shard leases become available.
+    /// When a lease is released (holderIdentity cleared) or deleted, notify any guards
+    /// waiting to acquire that shard.
+    async fn run_shard_lease_watcher(&self, mut shutdown_rx: watch::Receiver<bool>) {
+        let label_selector = format!(
+            "silo.dev/type=shard,silo.dev/cluster={}",
+            self.cluster_prefix
+        );
+        let mut watch_stream =
+            std::pin::pin!(self.backend.watch_leases(&self.namespace, &label_selector));
+
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        debug!(node_id = %self.base.node_id, "shard lease watcher shutting down");
+                        break;
+                    }
+                }
+                event = watch_stream.next() => {
+                    match event {
+                        Some(Ok(ev)) => {
+                            match ev {
+                                LeaseWatchEvent::Applied(lease) => {
+                                    // Check if the lease holder was cleared (released)
+                                    let holder = lease.spec.as_ref()
+                                        .and_then(|s| s.holder_identity.as_ref())
+                                        .map(|h| h.as_str());
+                                    let holder_is_empty = holder.map(|h| h.is_empty()).unwrap_or(true);
+
+                                    if holder_is_empty {
+                                        // Lease was released - notify any waiting guards
+                                        if let Some(shard_id_str) = lease.metadata.labels.as_ref()
+                                            .and_then(|l| l.get("silo.dev/shard"))
+                                            && let Ok(shard_id) = ShardId::parse(shard_id_str) {
+                                                debug!(
+                                                    node_id = %self.base.node_id,
+                                                    shard_id = %shard_id,
+                                                    "shard lease released, notifying waiters"
+                                                );
+                                                let notifiers = self.shard_available_notifiers.lock().await;
+                                                if let Some(notifier) = notifiers.get(&shard_id) {
+                                                    notifier.notify_waiters();
+                                                }
+                                            }
+                                    }
+                                }
+                                LeaseWatchEvent::Deleted(lease) => {
+                                    // Lease was deleted - also makes the shard available
+                                    if let Some(shard_id_str) = lease.metadata.labels.as_ref()
+                                        .and_then(|l| l.get("silo.dev/shard"))
+                                        && let Ok(shard_id) = ShardId::parse(shard_id_str) {
+                                            debug!(
+                                                node_id = %self.base.node_id,
+                                                shard_id = %shard_id,
+                                                "shard lease deleted, notifying waiters"
+                                            );
+                                            let notifiers = self.shard_available_notifiers.lock().await;
+                                            if let Some(notifier) = notifiers.get(&shard_id) {
+                                                notifier.notify_waiters();
+                                            }
+                                        }
+                                }
+                                LeaseWatchEvent::Init => {
+                                    debug!(node_id = %self.base.node_id, "shard lease watcher initialized");
+                                }
+                                LeaseWatchEvent::InitDone => {
+                                    debug!(node_id = %self.base.node_id, "shard lease watcher init done");
+                                }
+                            }
+                        }
+                        Some(Err(e)) => {
+                            warn!(node_id = %self.base.node_id, error = %e, "shard lease watcher error, will retry");
+                        }
+                        None => {
+                            debug!(node_id = %self.base.node_id, "shard lease watcher stream ended");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Main coordination loop - renews membership and reconciles shards.
     ///
-    /// Reconciliation is primarily reactive (triggered by the membership watcher),
-    /// but we also do periodic reconciliation as a safety net in case watches miss
-    /// events due to network issues.
+    /// Reconciliation is primarily reactive (triggered by the membership watcher), but we also do periodic reconciliation as a safety net in case watches miss events due to network issues.
     async fn run_coordination_loop(&self, mut shutdown_rx: watch::Receiver<bool>) {
         // Renew membership lease periodically (at 1/3 of lease duration)
         let renew_interval = Duration::from_secs((self.lease_duration_secs / 3).max(1) as u64);
         let mut renew_timer = tokio::time::interval(renew_interval);
 
-        // Periodic reconciliation as a safety net - much less frequent since we have watches
-        // This catches any missed watch events due to network issues
+        // Periodic reconciliation as a safety net to catch any missed watch events due to network issues
         let safety_reconcile_interval = Duration::from_secs(30);
         let mut safety_reconcile_timer = tokio::time::interval(safety_reconcile_interval);
 
@@ -436,6 +570,13 @@ impl<B: K8sBackend> K8sCoordinator<B> {
                     info!(node_id = %self.base.node_id, "membership changed, reconciling shards");
                     if let Err(e) = self.reconcile_shards().await {
                         warn!(node_id = %self.base.node_id, error = %e, "reconcile after membership change failed");
+                    }
+                }
+                // React to shard map changes from the watcher (for split handling)
+                _ = self.shard_map_changed.notified() => {
+                    info!(node_id = %self.base.node_id, "shard map changed, reconciling shards");
+                    if let Err(e) = self.reconcile_shards().await {
+                        warn!(node_id = %self.base.node_id, error = %e, "reconcile after shard map change failed");
                     }
                 }
                 // Periodic membership lease renewal
@@ -518,8 +659,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
 
     /// Renew the membership lease.
     ///
-    /// We verify that we're still the holder before updating, and use CAS to ensure
-    /// we don't accidentally renew someone else's lease if ours expired.
+    /// We verify that we're still the holder before updating, and use CAS to ensure we don't accidentally renew someone else's lease if ours expired.
     async fn renew_membership_lease(&self) -> Result<(), CoordinationError> {
         let member_lease_name =
             keys::k8s_member_lease_name(&self.cluster_prefix, &self.base.node_id);
@@ -592,9 +732,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
             cache.iter().map(|m| m.node_id.clone()).collect::<Vec<_>>()
         };
 
-        // Safety check: if we don't see ourselves in the member list, our membership
-        // lease may have expired or there's a connectivity issue. Don't reconcile
-        // based on incomplete membership data - it would cause us to release all shards.
+        // Safety check: if we don't see ourselves in the member list, our membership lease may have expired or there's a connectivity issue. Don't reconcile based on incomplete membership data - it would cause us to release all shards.
         if members.is_empty() {
             warn!(node_id = %self.base.node_id, "reconcile: no members found, skipping reconcile");
             return Ok(());
@@ -653,6 +791,8 @@ impl<B: K8sBackend> K8sCoordinator<B> {
             return g.clone();
         }
         debug!(shard_id = %shard_id, "creating new shard guard");
+        // Get the shard_available notifier for this shard (used for fast handoffs)
+        let shard_available = self.get_shard_available_notifier(shard_id).await;
         let guard = K8sShardGuard::new(
             shard_id,
             self.backend.clone(),
@@ -661,12 +801,14 @@ impl<B: K8sBackend> K8sCoordinator<B> {
             self.base.node_id.clone(),
             self.lease_duration_secs,
             self.base.shutdown_rx.clone(),
+            shard_available,
         );
         let runner = guard.clone();
         let owned_arc = self.base.owned.clone();
         let factory = self.base.factory.clone();
         let shard_map = self.base.shard_map.clone();
-        tokio::spawn(async move { runner.run(owned_arc, factory, shard_map).await });
+        let coordinator: Arc<dyn Coordinator> = Arc::new(self.clone());
+        tokio::spawn(async move { runner.run(owned_arc, factory, shard_map, coordinator).await });
         guards.insert(shard_id, guard.clone());
         guard
     }
@@ -703,8 +845,8 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         Ok(())
     }
 
-    /// Update the shard map ConfigMap after a split.
-    async fn update_shard_map_for_split(
+    /// Try to update the shard map ConfigMap after a split (single attempt).
+    async fn try_update_shard_map_for_split(
         &self,
         split: &SplitInProgress,
     ) -> Result<(), CoordinationError> {
@@ -780,6 +922,150 @@ impl<B: K8sBackend> K8sCoordinator<B> {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Update the shard map ConfigMap after a split with retry logic.
+    async fn update_shard_map_for_split(
+        &self,
+        split: &SplitInProgress,
+    ) -> Result<(), CoordinationError> {
+        // Retry with exponential backoff to handle concurrent modifications
+        // (e.g., cleanup tasks updating cleanup status while a split is in progress)
+        let max_retries = 10;
+        let mut delay = Duration::from_millis(10);
+
+        for attempt in 0..max_retries {
+            match self.try_update_shard_map_for_split(split).await {
+                Ok(()) => return Ok(()),
+                Err(CoordinationError::BackendError(msg))
+                    if msg.contains("CAS conflict: resourceVersion mismatch") =>
+                {
+                    if attempt < max_retries - 1 {
+                        debug!(
+                            parent_shard_id = %split.parent_shard_id,
+                            attempt = attempt,
+                            "shard map update hit CAS conflict, retrying"
+                        );
+                        tokio::time::sleep(delay).await;
+                        delay = std::cmp::min(delay * 2, Duration::from_secs(1));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(CoordinationError::BackendError(format!(
+            "failed to update shard map for split after {} retries",
+            max_retries
+        )))
+    }
+
+    /// Try to update cleanup status in the shard map (single attempt).
+    async fn try_update_cleanup_status_in_shard_map(
+        &self,
+        shard_id: ShardId,
+        status: SplitCleanupStatus,
+    ) -> Result<(), CoordinationError> {
+        let configmap_name = format!("{}-shard-map", self.cluster_prefix);
+
+        // Read current shard map
+        let existing = self
+            .backend
+            .get_configmap(&self.namespace, &configmap_name)
+            .await?
+            .ok_or_else(|| {
+                CoordinationError::BackendError("shard map ConfigMap not found".into())
+            })?;
+
+        let current_rv = existing.metadata.resource_version.as_ref().ok_or_else(|| {
+            CoordinationError::BackendError("no resourceVersion on shard map".into())
+        })?;
+
+        let data = existing
+            .data
+            .as_ref()
+            .and_then(|d| d.get("shard_map.json"))
+            .ok_or_else(|| {
+                CoordinationError::BackendError("shard map ConfigMap has no data".into())
+            })?;
+
+        let mut shard_map: ShardMap = serde_json::from_str(data)
+            .map_err(|e| CoordinationError::BackendError(format!("invalid shard map: {}", e)))?;
+
+        // Update cleanup status
+        shard_map.update_cleanup_status(&shard_id, status)?;
+
+        let new_map_json = serde_json::to_string(&shard_map)
+            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+
+        // Use replace with resourceVersion for CAS
+        let updated_cm = ConfigMap {
+            metadata: kube::api::ObjectMeta {
+                name: Some(configmap_name.clone()),
+                namespace: Some(self.namespace.clone()),
+                resource_version: Some(current_rv.clone()),
+                uid: existing.metadata.uid.clone(),
+                labels: existing.metadata.labels.clone(),
+                ..Default::default()
+            },
+            data: Some([("shard_map.json".to_string(), new_map_json)].into()),
+            ..Default::default()
+        };
+
+        match self
+            .backend
+            .replace_configmap(&self.namespace, &configmap_name, &updated_cm)
+            .await
+        {
+            Ok(_) => {
+                // Update local shard map
+                *self.base.shard_map.lock().await = shard_map;
+
+                debug!(shard_id = %shard_id, status = %status, "cleanup status updated (k8s)");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Update cleanup status in the shard map with retry logic.
+    async fn update_cleanup_status_in_shard_map(
+        &self,
+        shard_id: ShardId,
+        status: SplitCleanupStatus,
+    ) -> Result<(), CoordinationError> {
+        // Retry with exponential backoff to handle concurrent modifications
+        // (e.g., another cleanup task or split operation updating the shard map)
+        let max_retries = 10;
+        let mut delay = Duration::from_millis(10);
+
+        for attempt in 0..max_retries {
+            match self
+                .try_update_cleanup_status_in_shard_map(shard_id, status)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(CoordinationError::BackendError(msg))
+                    if msg.contains("CAS conflict: resourceVersion mismatch") =>
+                {
+                    if attempt < max_retries - 1 {
+                        debug!(
+                            shard_id = %shard_id,
+                            attempt = attempt,
+                            "cleanup status update hit CAS conflict, retrying"
+                        );
+                        tokio::time::sleep(delay).await;
+                        delay = std::cmp::min(delay * 2, Duration::from_secs(1));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(CoordinationError::BackendError(format!(
+            "failed to update cleanup status after {} retries",
+            max_retries
+        )))
     }
 }
 
@@ -858,12 +1144,10 @@ impl<B: K8sBackend> SplitStorageBackend for K8sCoordinator<B> {
         &self,
         split: &SplitInProgress,
     ) -> Result<(), CoordinationError> {
-        // Delegate to the inherent method
         K8sCoordinator::update_shard_map_for_split(self, split).await
     }
 
     async fn reload_shard_map(&self) -> Result<(), CoordinationError> {
-        // Delegate to the inherent method
         K8sCoordinator::reload_shard_map(self).await
     }
 
@@ -872,66 +1156,7 @@ impl<B: K8sBackend> SplitStorageBackend for K8sCoordinator<B> {
         shard_id: ShardId,
         status: SplitCleanupStatus,
     ) -> Result<(), CoordinationError> {
-        let configmap_name = format!("{}-shard-map", self.cluster_prefix);
-
-        // Read current shard map
-        let existing = self
-            .backend
-            .get_configmap(&self.namespace, &configmap_name)
-            .await?
-            .ok_or_else(|| {
-                CoordinationError::BackendError("shard map ConfigMap not found".into())
-            })?;
-
-        let current_rv = existing.metadata.resource_version.as_ref().ok_or_else(|| {
-            CoordinationError::BackendError("no resourceVersion on shard map".into())
-        })?;
-
-        let data = existing
-            .data
-            .as_ref()
-            .and_then(|d| d.get("shard_map.json"))
-            .ok_or_else(|| {
-                CoordinationError::BackendError("shard map ConfigMap has no data".into())
-            })?;
-
-        let mut shard_map: ShardMap = serde_json::from_str(data)
-            .map_err(|e| CoordinationError::BackendError(format!("invalid shard map: {}", e)))?;
-
-        // Update cleanup status
-        shard_map.update_cleanup_status(&shard_id, status)?;
-
-        let new_map_json = serde_json::to_string(&shard_map)
-            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
-
-        // Use replace with resourceVersion for CAS
-        let updated_cm = ConfigMap {
-            metadata: kube::api::ObjectMeta {
-                name: Some(configmap_name.clone()),
-                namespace: Some(self.namespace.clone()),
-                resource_version: Some(current_rv.clone()),
-                uid: existing.metadata.uid.clone(),
-                labels: existing.metadata.labels.clone(),
-                ..Default::default()
-            },
-            data: Some([("shard_map.json".to_string(), new_map_json)].into()),
-            ..Default::default()
-        };
-
-        match self
-            .backend
-            .replace_configmap(&self.namespace, &configmap_name, &updated_cm)
-            .await
-        {
-            Ok(_) => {
-                // Update local shard map
-                *self.base.shard_map.lock().await = shard_map;
-
-                debug!(shard_id = %shard_id, status = %status, "cleanup status updated (k8s)");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        K8sCoordinator::update_cleanup_status_in_shard_map(self, shard_id, status).await
     }
 
     async fn list_all_splits(&self) -> Result<Vec<SplitInProgress>, CoordinationError> {
@@ -967,7 +1192,7 @@ impl<B: K8sBackend> Coordinator for K8sCoordinator<B> {
     }
 
     async fn shutdown(&self) -> Result<(), CoordinationError> {
-        // Collect guards in sorted order for deterministic shutdown
+        // Collect guards in sorted order for deterministic shutdown trigger order
         let guards_sorted: Vec<(ShardId, Arc<K8sShardGuard<B>>)> = {
             let guards = self.shard_guards.lock().await;
             let mut shard_ids: Vec<ShardId> = guards.keys().copied().collect();
@@ -978,14 +1203,20 @@ impl<B: K8sBackend> Coordinator for K8sCoordinator<B> {
                 .collect()
         };
 
-        // Shut down each guard sequentially for deterministic ordering
-        // We trigger shutdown on each guard individually rather than using
-        // signal_shutdown() which would notify all guards concurrently
-        for (_sid, guard) in guards_sorted {
+        // Trigger shutdown on all guards first (in sorted order for determinism),
+        // then wait for all of them in parallel. This is much faster than sequential
+        // shutdown because shard close + lease release can happen concurrently.
+        for (_sid, guard) in &guards_sorted {
             guard.trigger_shutdown().await;
             guard.notify.notify_one();
-            guard.wait_shutdown(Duration::from_millis(5000)).await;
         }
+
+        // Wait for all guards to complete shutdown in parallel
+        let wait_futures: Vec<_> = guards_sorted
+            .iter()
+            .map(|(_sid, guard)| guard.wait_shutdown(Duration::from_millis(5000)))
+            .collect();
+        futures::future::join_all(wait_futures).await;
 
         // Signal shutdown to stop background tasks
         self.base.signal_shutdown();
@@ -1002,16 +1233,19 @@ impl<B: K8sBackend> Coordinator for K8sCoordinator<B> {
     }
 
     async fn wait_converged(&self, timeout: Duration) -> bool {
-        let start = std::time::Instant::now();
+        // Use tokio::time::Instant for compatibility with turmoil's simulated time in DST
+        let start = tokio::time::Instant::now();
         while start.elapsed() < timeout {
-            // Refresh the members cache to get current membership.
-            // This is important because the watcher runs asynchronously and might not
-            // have processed membership changes yet (e.g., after a node shutdown).
+            // Refresh the members cache to get current membership. This is important because the watcher runs asynchronously and might not have processed membership changes yet (e.g., after a node shutdown).
             if let Err(e) = self.refresh_members_cache().await {
                 debug!(node_id = %self.base.node_id, error = %e, "wait_converged: failed to refresh members cache");
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
+
+            // Notify the coordination loop to reconcile with the refreshed membership.
+            // This ensures reconciliation runs even if the watcher hasn't fired an event.
+            self.membership_changed.notify_one();
 
             let member_ids = match self.get_active_member_ids().await {
                 Ok(m) => m,
@@ -1027,18 +1261,53 @@ impl<B: K8sBackend> Coordinator for K8sCoordinator<B> {
             let shard_ids = self.base.shard_ids().await;
             let desired: HashSet<ShardId> =
                 compute_desired_shards_for_node(&shard_ids, &self.base.node_id, &member_ids);
-            let guard = self.base.owned.lock().await;
-            if *guard == desired {
-                return true;
+            let owned_now: HashSet<ShardId> = {
+                let guard = self.base.owned.lock().await;
+                if *guard == desired {
+                    return true;
+                }
+                guard.clone()
+            };
+
+            // Log the diff periodically for debugging (only at debug level to avoid spam)
+            let missing: Vec<ShardId> = desired.difference(&owned_now).copied().collect();
+            let extra: Vec<ShardId> = owned_now.difference(&desired).copied().collect();
+            if !missing.is_empty() || !extra.is_empty() {
+                debug!(
+                    node_id = %self.base.node_id,
+                    members = ?member_ids,
+                    missing = ?missing,
+                    extra = ?extra,
+                    "wait_converged: not yet converged"
+                );
             }
-            drop(guard);
+
             tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Log diff on timeout
+        if let Ok(member_ids) = self.get_active_member_ids().await {
+            let shard_ids = self.base.shard_ids().await;
+            let desired: HashSet<ShardId> =
+                compute_desired_shards_for_node(&shard_ids, &self.base.node_id, &member_ids);
+            let owned_now: HashSet<ShardId> = {
+                let g = self.base.owned.lock().await;
+                g.clone()
+            };
+            let missing: Vec<ShardId> = desired.difference(&owned_now).copied().collect();
+            let extra: Vec<ShardId> = owned_now.difference(&desired).copied().collect();
+            warn!(
+                node_id = %self.base.node_id,
+                members = ?member_ids,
+                missing = ?missing,
+                extra = ?extra,
+                "wait_converged: timed out"
+            );
         }
         false
     }
 
     async fn get_members(&self) -> Result<Vec<MemberInfo>, CoordinationError> {
-        // Return cached members for consistency
         let cache = self.members_cache.lock().await;
         Ok(cache.clone())
     }
@@ -1075,6 +1344,9 @@ pub struct K8sShardGuard<B: K8sBackend> {
     pub state: Mutex<ShardState>,
     pub notify: Notify,
     pub shutdown: watch::Receiver<bool>,
+    /// Notifier that fires when this shard's lease becomes available (released by another node).
+    /// Used to avoid blind retry with exponential backoff during shard handoffs.
+    pub shard_available: Arc<Notify>,
 }
 
 impl<B: K8sBackend> K8sShardGuard<B> {
@@ -1086,6 +1358,7 @@ impl<B: K8sBackend> K8sShardGuard<B> {
         node_id: String,
         lease_duration_secs: i32,
         shutdown: watch::Receiver<bool>,
+        shard_available: Arc<Notify>,
     ) -> Arc<Self> {
         Arc::new(Self {
             shard_id,
@@ -1102,6 +1375,7 @@ impl<B: K8sBackend> K8sShardGuard<B> {
             }),
             notify: Notify::new(),
             shutdown,
+            shard_available,
         })
     }
 
@@ -1162,6 +1436,7 @@ impl<B: K8sBackend> K8sShardGuard<B> {
         owned_arc: Arc<Mutex<HashSet<ShardId>>>,
         factory: Arc<ShardFactory>,
         shard_map: Arc<Mutex<ShardMap>>,
+        coordinator: Arc<dyn Coordinator>,
     ) {
         let lease_name = self.lease_name();
 
@@ -1209,11 +1484,11 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                         // Try to acquire the lease with CAS semantics
                         match self.try_acquire_lease_cas(&lease_name).await {
                             Ok((rv, uid)) => {
-                                // Look up the shard's range from the shard map
-                                let range = {
+                                // Look up the shard's range and cleanup status from the shard map
+                                let (range, cleanup_status) = {
                                     let map = shard_map.lock().await;
                                     match map.get_shard(&self.shard_id) {
-                                        Some(info) => info.range.clone(),
+                                        Some(info) => (info.range.clone(), info.cleanup_status),
                                         None => {
                                             tracing::error!(shard_id = %self.shard_id, "shard not found in shard map");
                                             let _ = self.release_lease_cas(&lease_name).await;
@@ -1222,35 +1497,9 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                                     }
                                 };
                                 // Open the shard BEFORE marking as Held - if open fails,
-                                // we should release the lease and not claim ownership
-                                match factory.open(&self.shard_id, &range).await {
-                                    Ok(_) => {
-                                        {
-                                            let mut st = self.state.lock().await;
-                                            st.resource_version = Some(rv.clone());
-                                            st.lease_uid = uid;
-                                            st.phase = ShardPhase::Held;
-                                        }
-                                        {
-                                            let mut owned = owned_arc.lock().await;
-                                            owned.insert(self.shard_id);
-                                        }
-                                        dst_events::emit(DstEvent::ShardAcquired {
-                                            node_id: self.node_id.clone(),
-                                            shard_id: self.shard_id.to_string(),
-                                        });
-                                        info!(shard_id = %self.shard_id, rv = %rv, attempts = attempt, "k8s shard: acquired and opened");
-
-                                        // Start renewal loop
-                                        self.clone()
-                                            .run_renewal_loop(
-                                                owned_arc.clone(),
-                                                factory.clone(),
-                                                &lease_name,
-                                            )
-                                            .await;
-                                        break;
-                                    }
+                                // we should release the lease and not claim ownership.
+                                let shard = match factory.open(&self.shard_id, &range).await {
+                                    Ok(shard) => shard,
                                     Err(e) => {
                                         // Failed to open - release the lease and retry
                                         tracing::error!(shard_id = %self.shard_id, error = %e, "failed to open shard, releasing lease");
@@ -1261,11 +1510,60 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                                         attempt = attempt.wrapping_add(1);
                                         continue;
                                     }
+                                };
+
+                                // Dispatch cleanup asynchronously if needed
+                                crate::coordination::split::maybe_spawn_cleanup(
+                                    self.shard_id,
+                                    &range,
+                                    cleanup_status,
+                                    &shard,
+                                    Arc::clone(&coordinator),
+                                );
+
+                                {
+                                    let mut st = self.state.lock().await;
+                                    st.resource_version = Some(rv.clone());
+                                    st.lease_uid = uid;
+                                    st.phase = ShardPhase::Held;
                                 }
+                                {
+                                    let mut owned = owned_arc.lock().await;
+                                    owned.insert(self.shard_id);
+                                }
+                                dst_events::emit(DstEvent::ShardAcquired {
+                                    node_id: self.node_id.clone(),
+                                    shard_id: self.shard_id.to_string(),
+                                });
+                                info!(shard_id = %self.shard_id, rv = %rv, attempts = attempt, "k8s shard: acquired and opened");
+
+                                // Start renewal loop
+                                self.clone()
+                                    .run_renewal_loop(
+                                        owned_arc.clone(),
+                                        factory.clone(),
+                                        &lease_name,
+                                    )
+                                    .await;
+                                break;
                             }
                             Err(e) => {
-                                debug!(shard_id = %self.shard_id, attempt, error = %e, "failed to acquire shard lease, retrying");
+                                debug!(shard_id = %self.shard_id, attempt, error = %e, "failed to acquire shard lease, waiting for release");
                                 attempt = attempt.wrapping_add(1);
+
+                                // Wait for the shard_available notification (from the lease watcher)
+                                // with a timeout. This is MUCH faster than exponential backoff because
+                                // we get notified immediately when the other node releases the lease.
+                                // The timeout is a safety net in case the watch misses an event.
+                                let wait_timeout = Duration::from_millis(500);
+                                let _ = tokio::time::timeout(
+                                    wait_timeout,
+                                    self.shard_available.notified(),
+                                )
+                                .await;
+
+                                // Small jitter after notification to avoid thundering herd
+                                // when multiple nodes are waiting for the same shard
                                 let jitter_ms = (self
                                     .shard_id
                                     .as_uuid()
@@ -1273,18 +1571,18 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                                     .0
                                     .wrapping_mul(31)
                                     .wrapping_add(attempt as u64 * 17))
-                                    % 150;
-                                tokio::time::sleep(Duration::from_millis(100 + jitter_ms)).await;
+                                    % 20;
+                                tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
                             }
                         }
                     }
                 }
                 ShardPhase::Releasing => {
-                    // Add deterministic jitter based on shard ID for DST determinism
+                    // Small jitter based on shard ID for DST determinism
                     // This ensures releases happen in a consistent order when multiple
                     // guards are released simultaneously
-                    let jitter_ms = (self.shard_id.as_uuid().as_u64_pair().0.wrapping_mul(17)) % 50;
-                    tokio::time::sleep(Duration::from_millis(100 + jitter_ms)).await;
+                    let jitter_ms = (self.shard_id.as_uuid().as_u64_pair().0.wrapping_mul(17)) % 20;
+                    tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
 
                     let cancelled = {
                         let mut st = self.state.lock().await;
@@ -1382,8 +1680,6 @@ impl<B: K8sBackend> K8sShardGuard<B> {
     }
 
     /// Try to acquire the lease using compare-and-swap semantics.
-    ///
-    /// Returns (resourceVersion, Option<uid>) on success.
     async fn try_acquire_lease_cas(
         &self,
         lease_name: &str,
@@ -1528,8 +1824,7 @@ impl<B: K8sBackend> K8sShardGuard<B> {
     }
 
     /// Release the lease using CAS - clears holderIdentity instead of deleting.
-    /// We always verify we're still the holder before releasing to avoid clearing
-    /// someone else's lease.
+    /// We always verify we're still the holder before releasing to avoid clearing someone else's lease.
     async fn release_lease_cas(&self, lease_name: &str) -> Result<String, CoordinationError> {
         let now = Utc::now();
 

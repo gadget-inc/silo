@@ -670,6 +670,7 @@ pub struct ShardOwnershipTracker {
 
 impl ShardOwnershipTracker {
     /// Create a new tracker.
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
     }

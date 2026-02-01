@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use silo::coordination::{Coordinator, EtcdCoordinator, ShardSplitter};
 use silo::coordination::{SplitCleanupStatus, SplitPhase};
@@ -7,6 +7,22 @@ use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::settings::{Backend, DatabaseTemplate};
 use silo::shard_range::ShardId;
+
+/// Wait until a condition becomes true or timeout is reached.
+async fn wait_until<F, Fut>(timeout: Duration, mut f: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if f().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    false
+}
 
 // Global mutex to serialize coordination tests
 // Note: If a test panics, this mutex becomes poisoned. Use lock().unwrap_or_else()
@@ -71,12 +87,12 @@ async fn request_split_creates_split_record() {
     assert_eq!(shards.len(), 1);
     let shard_id = shards[0];
 
-    // Create orchestrator for split operations
+    // Create splitter for split operations
 
-    let orchestrator = ShardSplitter::new(&c1);
+    let splitter = ShardSplitter::new(Arc::new(c1.clone()));
 
     // Request a split
-    let split = orchestrator
+    let split = splitter
         .request_split(shard_id, "m".to_string())
         .await
         .expect("request split should succeed");
@@ -87,7 +103,7 @@ async fn request_split_creates_split_record() {
     assert_ne!(split.left_child_id, split.right_child_id);
 
     // Verify we can get the split status
-    let status = orchestrator
+    let status = splitter
         .get_split_status(shard_id)
         .await
         .expect("get split status");
@@ -151,11 +167,11 @@ async fn request_split_fails_if_not_owner() {
     );
     let c2_shard = c2_shards[0];
 
-    // Create orchestrator for c1 and try to split a shard that c1 doesn't own
+    // Create splitter for c1 and try to split a shard that c1 doesn't own
 
-    let orchestrator = ShardSplitter::new(&c1);
+    let splitter = ShardSplitter::new(Arc::new(c1.clone()));
 
-    let result = orchestrator.request_split(c2_shard, "m".to_string()).await;
+    let result = splitter.request_split(c2_shard, "m".to_string()).await;
     assert!(result.is_err());
 
     c1.shutdown().await.unwrap();
@@ -190,18 +206,18 @@ async fn request_split_fails_if_already_in_progress() {
     let shards = c1.owned_shards().await;
     let shard_id = shards[0];
 
-    // Create orchestrator for split operations
+    // Create splitter for split operations
 
-    let orchestrator = ShardSplitter::new(&c1);
+    let splitter = ShardSplitter::new(Arc::new(c1.clone()));
 
     // First split request should succeed
-    let _split = orchestrator
+    let _split = splitter
         .request_split(shard_id, "m".to_string())
         .await
         .expect("first split should succeed");
 
     // Second split request should fail
-    let result = orchestrator.request_split(shard_id, "n".to_string()).await;
+    let result = splitter.request_split(shard_id, "n".to_string()).await;
     assert!(result.is_err());
 
     c1.shutdown().await.unwrap();
@@ -251,11 +267,11 @@ async fn request_split_fails_for_invalid_split_point() {
         format!("{}z", shard_info.range.end)
     };
 
-    // Create orchestrator and try to split
+    // Create splitter and try to split
 
-    let orchestrator = ShardSplitter::new(&c1);
+    let splitter = ShardSplitter::new(Arc::new(c1.clone()));
 
-    let result = orchestrator.request_split(shard_id, invalid_point).await;
+    let result = splitter.request_split(shard_id, invalid_point).await;
     assert!(result.is_err());
 
     c1.shutdown().await.unwrap();
@@ -288,11 +304,11 @@ async fn update_cleanup_status_works() {
     let shards = c1.owned_shards().await;
     let shard_id = shards[0];
 
-    // Create orchestrator and update cleanup status
+    // Create splitter and update cleanup status
 
-    let orchestrator = ShardSplitter::new(&c1);
+    let splitter = ShardSplitter::new(Arc::new(c1.clone()));
 
-    orchestrator
+    splitter
         .update_cleanup_status(shard_id, SplitCleanupStatus::CleanupRunning)
         .await
         .expect("update cleanup status should succeed");
@@ -332,22 +348,22 @@ async fn is_shard_paused_returns_correct_values() {
     let shards = c1.owned_shards().await;
     let shard_id = shards[0];
 
-    // Create orchestrator
+    // Create splitter
 
-    let orchestrator = ShardSplitter::new(&c1);
+    let splitter = ShardSplitter::new(Arc::new(c1.clone()));
 
     // Before split, shard should not be paused
-    assert!(!orchestrator.is_shard_paused(shard_id).await);
+    assert!(!splitter.is_shard_paused(shard_id).await);
 
     // After requesting a split (in SplitRequested phase), shard should not be paused
     // (traffic is only paused in SplitPausing, SplitCloning, SplitUpdatingMap phases)
-    let _split = orchestrator
+    let _split = splitter
         .request_split(shard_id, "m".to_string())
         .await
         .expect("request split");
 
     // SplitRequested does NOT pause traffic
-    assert!(!orchestrator.is_shard_paused(shard_id).await);
+    assert!(!splitter.is_shard_paused(shard_id).await);
 
     c1.shutdown().await.unwrap();
     let _ = h1.abort();
@@ -380,11 +396,11 @@ async fn split_state_persists_across_restart() {
     let shards = c1.owned_shards().await;
     let shard_id = shards[0];
 
-    // Create orchestrator and request split
+    // Create splitter and request split
 
-    let orchestrator1 = ShardSplitter::new(&c1);
+    let splitter1 = ShardSplitter::new(Arc::new(c1.clone()));
 
-    let split = orchestrator1
+    let split = splitter1
         .request_split(shard_id, "m".to_string())
         .await
         .expect("request split");
@@ -414,12 +430,12 @@ async fn split_state_persists_across_restart() {
 
     assert!(c2.wait_converged(Duration::from_secs(10)).await);
 
-    // Create orchestrator for c2 and check split status
+    // Create splitter for c2 and check split status
 
-    let orchestrator2 = ShardSplitter::new(&c2);
+    let splitter2 = ShardSplitter::new(Arc::new(c2.clone()));
 
     // Split state should still be there
-    let status = orchestrator2
+    let status = splitter2
         .get_split_status(shard_id)
         .await
         .expect("get split status");
@@ -456,13 +472,13 @@ async fn get_split_status_returns_none_for_nonexistent() {
 
     assert!(c1.wait_converged(Duration::from_secs(10)).await);
 
-    // Create orchestrator and check split status
+    // Create splitter and check split status
 
-    let orchestrator = ShardSplitter::new(&c1);
+    let splitter = ShardSplitter::new(Arc::new(c1.clone()));
 
     // Check split status for a random shard ID that doesn't have a split
     let random_shard_id = ShardId::new();
-    let status = orchestrator
+    let status = splitter
         .get_split_status(random_shard_id)
         .await
         .expect("get split status should succeed");
@@ -502,24 +518,24 @@ async fn execute_split_completes_full_cycle() {
     let shards = c1.owned_shards().await;
     let shard_id = shards[0];
 
-    // Create orchestrator
+    // Create splitter
 
-    let orchestrator = ShardSplitter::new(&c1);
+    let splitter = ShardSplitter::new(Arc::new(c1.clone()));
 
     // Request and execute the split
-    let split = orchestrator
+    let split = splitter
         .request_split(shard_id, "m".to_string())
         .await
         .expect("request split should succeed");
 
     // Execute the split to completion
-    orchestrator
+    splitter
         .execute_split(shard_id, || c1.get_shard_owner_map())
         .await
         .expect("execute split should succeed");
 
     // Verify split is complete
-    let status = orchestrator
+    let status = splitter
         .get_split_status(shard_id)
         .await
         .expect("get status");
@@ -548,20 +564,64 @@ async fn execute_split_completes_full_cycle() {
         "right child should exist"
     );
 
-    // Children should have correct parent reference and cleanup status
+    // Children should have correct parent reference
     let left_info = shard_map.get_shard(&split.left_child_id).unwrap();
     let right_info = shard_map.get_shard(&split.right_child_id).unwrap();
     assert_eq!(left_info.parent_shard_id, Some(shard_id));
     assert_eq!(right_info.parent_shard_id, Some(shard_id));
-    assert_eq!(left_info.cleanup_status, SplitCleanupStatus::CleanupPending);
+
+    // Cleanup status should indicate work is needed (cleanup is triggered on shard open,
+    // so status may be CleanupPending, CleanupRunning, or CleanupDone depending on timing)
+    assert!(
+        left_info.cleanup_status.needs_work(),
+        "left child should need cleanup work, got {:?}",
+        left_info.cleanup_status
+    );
+    assert!(
+        right_info.cleanup_status.needs_work(),
+        "right child should need cleanup work, got {:?}",
+        right_info.cleanup_status
+    );
+
+    // Wait for cleanup to complete - the coordinator runs cleanup every 5 seconds
+    let cleanup_complete = wait_until(Duration::from_secs(30), || async {
+        let Ok(map) = c1.get_shard_map().await else {
+            return false;
+        };
+        let Some(left) = map.get_shard(&split.left_child_id) else {
+            return false;
+        };
+        let Some(right) = map.get_shard(&split.right_child_id) else {
+            return false;
+        };
+        left.cleanup_status == SplitCleanupStatus::CompactionDone
+            && right.cleanup_status == SplitCleanupStatus::CompactionDone
+    })
+    .await;
+
+    assert!(
+        cleanup_complete,
+        "cleanup should complete automatically via background task"
+    );
+
+    // Verify final cleanup status
+    let final_map = c1.get_shard_map().await.expect("get_shard_map");
+    let left_final = final_map.get_shard(&split.left_child_id).unwrap();
+    let right_final = final_map.get_shard(&split.right_child_id).unwrap();
     assert_eq!(
-        right_info.cleanup_status,
-        SplitCleanupStatus::CleanupPending
+        left_final.cleanup_status,
+        SplitCleanupStatus::CompactionDone,
+        "left child should have CompactionDone status after cleanup"
+    );
+    assert_eq!(
+        right_final.cleanup_status,
+        SplitCleanupStatus::CompactionDone,
+        "right child should have CompactionDone status after cleanup"
     );
 
     // Tenant routing should work correctly
-    let tenant_a = shard_map.shard_for_tenant("a").unwrap();
-    let tenant_z = shard_map.shard_for_tenant("z").unwrap();
+    let tenant_a = final_map.shard_for_tenant("a").unwrap();
+    let tenant_z = final_map.shard_for_tenant("z").unwrap();
     assert_eq!(tenant_a.id, split.left_child_id);
     assert_eq!(tenant_z.id, split.right_child_id);
 
@@ -595,53 +655,49 @@ async fn shard_paused_during_split_execution() {
     let shards = c1.owned_shards().await;
     let shard_id = shards[0];
 
-    // Create orchestrator
+    // Create splitter
 
-    let orchestrator = ShardSplitter::new(&c1);
+    let splitter = ShardSplitter::new(Arc::new(c1.clone()));
 
     // Request split but don't execute yet
-    let _split = orchestrator
+    let _split = splitter
         .request_split(shard_id, "m".to_string())
         .await
         .expect("request split");
 
     // In SplitRequested, not paused
     assert!(
-        !orchestrator.is_shard_paused(shard_id).await,
+        !splitter.is_shard_paused(shard_id).await,
         "SplitRequested should not pause traffic"
     );
 
     // Advance to SplitPausing
-    orchestrator
+    splitter
         .advance_split_phase(shard_id)
         .await
         .expect("advance to pausing");
 
     // Now should be paused
     assert!(
-        orchestrator.is_shard_paused(shard_id).await,
+        splitter.is_shard_paused(shard_id).await,
         "SplitPausing should pause traffic"
     );
 
-    let status = orchestrator
-        .get_split_status(shard_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let status = splitter.get_split_status(shard_id).await.unwrap().unwrap();
     assert_eq!(status.phase, SplitPhase::SplitPausing);
 
     // Advance to SplitCloning - still paused
-    orchestrator
+    splitter
         .advance_split_phase(shard_id)
         .await
         .expect("advance to cloning");
     assert!(
-        orchestrator.is_shard_paused(shard_id).await,
+        splitter.is_shard_paused(shard_id).await,
         "SplitCloning should pause traffic"
     );
 
     // Clean up by executing the rest
-    orchestrator
+    splitter
         .execute_split(shard_id, || c1.get_shard_owner_map())
         .await
         .expect("execute split");
@@ -676,12 +732,12 @@ async fn execute_split_fails_without_request() {
     let shards = c1.owned_shards().await;
     let shard_id = shards[0];
 
-    // Create orchestrator
+    // Create splitter
 
-    let orchestrator = ShardSplitter::new(&c1);
+    let splitter = ShardSplitter::new(Arc::new(c1.clone()));
 
     // Try to execute without requesting first
-    let result = orchestrator
+    let result = splitter
         .execute_split(shard_id, || c1.get_shard_owner_map())
         .await;
     assert!(result.is_err(), "execute_split should fail without request");
@@ -716,36 +772,32 @@ async fn execute_split_resumes_from_partial_state() {
     let shards = c1.owned_shards().await;
     let shard_id = shards[0];
 
-    // Create orchestrator
+    // Create splitter
 
-    let orchestrator = ShardSplitter::new(&c1);
+    let splitter = ShardSplitter::new(Arc::new(c1.clone()));
 
     // Request split and advance to SplitPausing
-    let split = orchestrator
+    let split = splitter
         .request_split(shard_id, "m".to_string())
         .await
         .expect("request split");
-    orchestrator
+    splitter
         .advance_split_phase(shard_id)
         .await
         .expect("advance to pausing");
 
     // Verify we're in SplitPausing
-    let status = orchestrator
-        .get_split_status(shard_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let status = splitter.get_split_status(shard_id).await.unwrap().unwrap();
     assert_eq!(status.phase, SplitPhase::SplitPausing);
 
     // Now execute should resume from SplitPausing and complete
-    orchestrator
+    splitter
         .execute_split(shard_id, || c1.get_shard_owner_map())
         .await
         .expect("execute split from partial state");
 
     // Verify completion
-    let status = orchestrator
+    let status = splitter
         .get_split_status(shard_id)
         .await
         .expect("get status");
@@ -787,16 +839,16 @@ async fn sequential_splits_work_correctly() {
     let shards = c1.owned_shards().await;
     let shard_id = shards[0];
 
-    // Create orchestrator
+    // Create splitter
 
-    let orchestrator = ShardSplitter::new(&c1);
+    let splitter = ShardSplitter::new(Arc::new(c1.clone()));
 
     // First split at "m"
-    let split1 = orchestrator
+    let split1 = splitter
         .request_split(shard_id, "m".to_string())
         .await
         .expect("first split request");
-    orchestrator
+    splitter
         .execute_split(shard_id, || c1.get_shard_owner_map())
         .await
         .expect("first split execute");
@@ -807,11 +859,11 @@ async fn sequential_splits_work_correctly() {
 
     // Second split: split the left child at "g"
     let left_child_id = split1.left_child_id;
-    let split2 = orchestrator
+    let split2 = splitter
         .request_split(left_child_id, "g".to_string())
         .await
         .expect("second split request");
-    orchestrator
+    splitter
         .execute_split(left_child_id, || c1.get_shard_owner_map())
         .await
         .expect("second split execute");
@@ -894,15 +946,15 @@ async fn split_in_multi_node_cluster() {
         .midpoint()
         .expect("shard range should have a midpoint");
 
-    // Create orchestrator and split the shard
+    // Create splitter and split the shard
 
-    let orchestrator = ShardSplitter::new(&c1);
+    let splitter = ShardSplitter::new(Arc::new(c1.clone()));
 
-    let split = orchestrator
+    let split = splitter
         .request_split(shard_to_split, split_point)
         .await
         .expect("request split");
-    orchestrator
+    splitter
         .execute_split(shard_to_split, || c1.get_shard_owner_map())
         .await
         .expect("execute split");
@@ -963,15 +1015,15 @@ async fn crash_recovery_early_phase_abandons_split() {
     let shards = c1.owned_shards().await;
     let shard_id = shards[0];
 
-    // Create orchestrator, request split and advance to SplitPausing (early phase)
+    // Create splitter, request split and advance to SplitPausing (early phase)
 
-    let orchestrator1 = ShardSplitter::new(&c1);
+    let splitter1 = ShardSplitter::new(Arc::new(c1.clone()));
 
-    let _split = orchestrator1
+    let _split = splitter1
         .request_split(shard_id, "m".to_string())
         .await
         .expect("request split");
-    orchestrator1
+    splitter1
         .advance_split_phase(shard_id)
         .await
         .expect("advance to pausing");
@@ -996,18 +1048,18 @@ async fn crash_recovery_early_phase_abandons_split() {
 
     assert!(c2.wait_converged(Duration::from_secs(10)).await);
 
-    // Create orchestrator for c2
+    // Create splitter for c2
 
-    let orchestrator2 = ShardSplitter::new(&c2);
+    let splitter2 = ShardSplitter::new(Arc::new(c2.clone()));
 
     // Early phase crash should abandon the split
     // The coordinator should detect the stale split and clean it up
-    orchestrator2
+    splitter2
         .recover_stale_splits()
         .await
         .expect("recover stale splits");
 
-    let status = orchestrator2
+    let status = splitter2
         .get_split_status(shard_id)
         .await
         .expect("get status");
@@ -1052,25 +1104,21 @@ async fn crash_recovery_late_phase_resumes_split() {
     let shards = c1.owned_shards().await;
     let shard_id = shards[0];
 
-    // Create orchestrator, request split and advance through early phases
+    // Create splitter, request split and advance through early phases
 
-    let orchestrator1 = ShardSplitter::new(&c1);
+    let splitter1 = ShardSplitter::new(Arc::new(c1.clone()));
 
-    let split = orchestrator1
+    let split = splitter1
         .request_split(shard_id, "m".to_string())
         .await
         .expect("request split");
 
     // Advance to SplitUpdatingMap (late phase)
-    orchestrator1.advance_split_phase(shard_id).await.unwrap(); // -> SplitPausing
-    orchestrator1.advance_split_phase(shard_id).await.unwrap(); // -> SplitCloning
-    orchestrator1.advance_split_phase(shard_id).await.unwrap(); // -> SplitUpdatingMap
+    splitter1.advance_split_phase(shard_id).await.unwrap(); // -> SplitPausing
+    splitter1.advance_split_phase(shard_id).await.unwrap(); // -> SplitCloning
+    splitter1.advance_split_phase(shard_id).await.unwrap(); // -> SplitUpdatingMap
 
-    let status = orchestrator1
-        .get_split_status(shard_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let status = splitter1.get_split_status(shard_id).await.unwrap().unwrap();
     assert_eq!(status.phase, SplitPhase::SplitUpdatingMap);
 
     // Simulate crash
@@ -1093,12 +1141,12 @@ async fn crash_recovery_late_phase_resumes_split() {
 
     assert!(c2.wait_converged(Duration::from_secs(10)).await);
 
-    // Create orchestrator for c2
+    // Create splitter for c2
 
-    let orchestrator2 = ShardSplitter::new(&c2);
+    let splitter2 = ShardSplitter::new(Arc::new(c2.clone()));
 
     // Late phase crash should preserve split for resumption
-    let status = orchestrator2
+    let status = splitter2
         .get_split_status(shard_id)
         .await
         .expect("get status");
@@ -1106,13 +1154,13 @@ async fn crash_recovery_late_phase_resumes_split() {
     assert_eq!(status.unwrap().phase, SplitPhase::SplitUpdatingMap);
 
     // Resume and complete the split
-    orchestrator2
+    splitter2
         .execute_split(shard_id, || c2.get_shard_owner_map())
         .await
         .expect("resume split should succeed");
 
     // Verify completion
-    let status = orchestrator2
+    let status = splitter2
         .get_split_status(shard_id)
         .await
         .expect("get status");
@@ -1127,7 +1175,7 @@ async fn crash_recovery_late_phase_resumes_split() {
     let _ = h2.abort();
 }
 
-mod orchestrator_unit_tests {
+mod splitter_unit_tests {
     use async_trait::async_trait;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
@@ -1142,7 +1190,7 @@ mod orchestrator_unit_tests {
     use silo::factory::ShardFactory;
     use silo::shard_range::{ShardId, ShardMap, SplitInProgress};
 
-    /// Mock coordinator for testing the orchestrator logic.
+    /// Mock coordinator for testing the splitter logic.
     /// Implements both Coordinator and SplitStorageBackend.
     struct MockSplitBackend {
         base: CoordinatorBase,
@@ -1264,25 +1312,25 @@ mod orchestrator_unit_tests {
         let factory = Arc::new(ShardFactory::new_noop());
 
         let mock = MockSplitBackend::new(shard_map.clone(), owned.clone(), factory);
-        let orchestrator = ShardSplitter::new(&mock);
+        let splitter = ShardSplitter::new(Arc::new(mock));
 
         // Get a shard ID from the map
         let shard_id = shard_map.lock().await.shard_ids()[0];
 
         // Should fail because we don't own the shard
         // Use "2" as the split point since shard 0 covers "" to "4" with 4 shards
-        let result = orchestrator.request_split(shard_id, "2".to_string()).await;
+        let result = splitter.request_split(shard_id, "2".to_string()).await;
         assert!(matches!(result, Err(CoordinationError::NotShardOwner(_))));
 
         // Add ownership
         owned.lock().await.insert(shard_id);
 
         // Should succeed now
-        let result = orchestrator.request_split(shard_id, "2".to_string()).await;
+        let result = splitter.request_split(shard_id, "2".to_string()).await;
         assert!(result.is_ok());
 
         // Should fail if we try again (split already in progress)
-        let result = orchestrator.request_split(shard_id, "3".to_string()).await;
+        let result = splitter.request_split(shard_id, "3".to_string()).await;
         assert!(matches!(
             result,
             Err(CoordinationError::SplitAlreadyInProgress(_))
@@ -1296,26 +1344,26 @@ mod orchestrator_unit_tests {
         let factory = Arc::new(ShardFactory::new_noop());
 
         let mock = MockSplitBackend::new(shard_map.clone(), owned.clone(), factory);
-        let orchestrator = ShardSplitter::new(&mock);
+        let splitter = ShardSplitter::new(Arc::new(mock));
 
         let shard_id = shard_map.lock().await.shard_ids()[0];
         owned.lock().await.insert(shard_id);
 
         // Not paused initially
-        assert!(!orchestrator.is_shard_paused(shard_id).await);
+        assert!(!splitter.is_shard_paused(shard_id).await);
 
         // Request a split (use "2" since shard 0 covers "" to "4" with 4 shards)
-        let split = orchestrator
+        let split = splitter
             .request_split(shard_id, "2".to_string())
             .await
             .unwrap();
         assert_eq!(split.phase, SplitPhase::SplitRequested);
 
         // Still not paused (SplitRequested doesn't pause traffic)
-        assert!(!orchestrator.is_shard_paused(shard_id).await);
+        assert!(!splitter.is_shard_paused(shard_id).await);
 
         // Advance to pausing phase
-        orchestrator.advance_split_phase(shard_id).await.unwrap();
-        assert!(orchestrator.is_shard_paused(shard_id).await);
+        splitter.advance_split_phase(shard_id).await.unwrap();
+        assert!(splitter.is_shard_paused(shard_id).await);
     }
 }

@@ -305,7 +305,7 @@ impl JobStoreShard {
 
     /// Scan all held leases and mark any expired ones as failed with a WORKER_CRASHED error code, or as Cancelled if the job was cancelled.
     /// For RefreshFloatingLimit tasks, resets the floating limit state so it can be retried on next periodic refresh.
-    /// [SILO-SPLIT-AWARE-1] Skips and deletes leases for tenants outside the shard's range.
+    /// Skips and deletes leases for tenants outside the shard's range.
     /// Returns the number of expired leases reaped.
     pub async fn reap_expired_leases(&self, tenant: &str) -> Result<usize, JobStoreShardError> {
         // Scan leases under lease/
@@ -334,7 +334,7 @@ impl JobStoreShard {
                 Err(_) => continue,
             };
 
-            // [SILO-SPLIT-AWARE-1] Check if lease's tenant is within shard range
+            // Check if lease's tenant is within shard range
             let lease_tenant = decoded.tenant();
             let decoded_tenant = decode_tenant(lease_tenant);
 
