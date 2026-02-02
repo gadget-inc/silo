@@ -237,6 +237,12 @@ pub struct CoordinationConfig {
     /// Kubernetes namespace for Lease objects (default: "default")
     #[serde(default = "default_k8s_namespace")]
     pub k8s_namespace: String,
+
+    /// Placement rings this node participates in.
+    /// Empty list means node only participates in the default ring.
+    /// To participate in both default and named rings, explicitly include "default".
+    #[serde(default)]
+    pub placement_rings: Vec<String>,
 }
 
 impl Default for CoordinationConfig {
@@ -249,6 +255,7 @@ impl Default for CoordinationConfig {
             advertised_grpc_addr: None,
             etcd_endpoints: default_etcd_endpoints(),
             k8s_namespace: default_k8s_namespace(),
+            placement_rings: Vec::new(),
         }
     }
 }

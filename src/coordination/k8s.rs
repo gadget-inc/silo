@@ -33,6 +33,9 @@ pub struct K8sCoordinatorConfig {
     pub grpc_addr: String,
     pub initial_shard_count: u32,
     pub lease_duration_secs: i64,
+    /// Placement rings this node participates in.
+    /// Empty means the node participates in the default ring only.
+    pub placement_rings: Vec<String>,
 }
 
 /// Kubernetes Lease-based coordinator for distributed shard ownership.
@@ -87,6 +90,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
             grpc_addr,
             initial_shard_count,
             lease_duration_secs,
+            placement_rings,
         } = config;
 
         // Load or create the shard map in a ConfigMap
@@ -103,6 +107,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
             grpc_addr.clone(),
             shard_map,
             factory,
+            placement_rings.clone(),
         ));
 
         // Create or update membership lease
@@ -113,6 +118,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
             grpc_addr: grpc_addr.clone(),
             startup_time_ms: base.startup_time_ms,
             hostname: get_hostname(),
+            placement_rings: placement_rings.clone(),
         };
         let member_info_json = serde_json::to_string(&member_info)
             .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
@@ -697,6 +703,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
             grpc_addr: self.base.grpc_addr.clone(),
             startup_time_ms: self.base.startup_time_ms,
             hostname: get_hostname(),
+            placement_rings: self.base.placement_rings.clone(),
         };
         let member_info_json = serde_json::to_string(&member_info)
             .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
@@ -729,22 +736,25 @@ impl<B: K8sBackend> K8sCoordinator<B> {
     async fn reconcile_shards(&self) -> Result<(), CoordinationError> {
         let members = {
             let cache = self.members_cache.lock().await;
-            cache.iter().map(|m| m.node_id.clone()).collect::<Vec<_>>()
+            cache.clone()
         };
+        let member_ids: Vec<String> = members.iter().map(|m| m.node_id.clone()).collect();
 
         // Safety check: if we don't see ourselves in the member list, our membership lease may have expired or there's a connectivity issue. Don't reconcile based on incomplete membership data - it would cause us to release all shards.
         if members.is_empty() {
             warn!(node_id = %self.base.node_id, "reconcile: no members found, skipping reconcile");
             return Ok(());
         }
-        if !members.contains(&self.base.node_id) {
-            warn!(node_id = %self.base.node_id, members = ?members, "reconcile: our node not in member list, skipping reconcile (membership may have expired)");
+        if !member_ids.contains(&self.base.node_id) {
+            warn!(node_id = %self.base.node_id, members = ?member_ids, "reconcile: our node not in member list, skipping reconcile (membership may have expired)");
             return Ok(());
         }
 
-        let shard_ids = self.base.shard_ids().await;
-        let desired = compute_desired_shards_for_node(&shard_ids, &self.base.node_id, &members);
-        debug!(node_id = %self.base.node_id, members = ?members, desired = ?desired, "reconcile: begin");
+        let shard_map = self.base.shard_map.lock().await;
+        let shards: Vec<&crate::shard_range::ShardInfo> = shard_map.shards().iter().collect();
+        let desired = compute_desired_shards_for_node(&shards, &self.base.node_id, &members);
+        drop(shard_map);
+        debug!(node_id = %self.base.node_id, members = ?member_ids, desired = ?desired, "reconcile: begin");
 
         // Release undesired shards (sorted for deterministic ordering)
         {
@@ -813,10 +823,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         guard
     }
 
-    async fn get_active_member_ids(&self) -> Result<Vec<String>, CoordinationError> {
-        let cache = self.members_cache.lock().await;
-        Ok(cache.iter().map(|m| m.node_id.clone()).collect())
-    }
+
 
     /// Reload the shard map from ConfigMap into local cache.
     async fn reload_shard_map(&self) -> Result<(), CoordinationError> {
@@ -845,11 +852,19 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         Ok(())
     }
 
-    /// Try to update the shard map ConfigMap after a split (single attempt).
-    async fn try_update_shard_map_for_split(
-        &self,
-        split: &SplitInProgress,
-    ) -> Result<(), CoordinationError> {
+    /// Modify the shard map ConfigMap with CAS (Compare-And-Swap) semantics.
+    ///
+    /// This is a generic helper for all shard map modifications. It:
+    /// 1. Reads the current shard map from the ConfigMap
+    /// 2. Calls the provided `modify` closure to transform the shard map
+    /// 3. Writes the updated shard map back with CAS using resourceVersion
+    /// 4. Updates the local cache on success
+    ///
+    /// Returns the result from the modify closure on success.
+    async fn modify_shard_map_cas<T, F>(&self, modify: F) -> Result<T, CoordinationError>
+    where
+        F: FnOnce(&mut ShardMap) -> Result<T, CoordinationError>,
+    {
         let configmap_name = format!("{}-shard-map", self.cluster_prefix);
 
         // Read current shard map
@@ -876,13 +891,8 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         let mut shard_map: ShardMap = serde_json::from_str(data)
             .map_err(|e| CoordinationError::BackendError(format!("invalid shard map: {}", e)))?;
 
-        // Apply the split to the shard map
-        shard_map.split_shard(
-            &split.parent_shard_id,
-            &split.split_point,
-            split.left_child_id,
-            split.right_child_id,
-        )?;
+        // Apply the modification
+        let result = modify(&mut shard_map)?;
 
         let new_map_json = serde_json::to_string(&shard_map)
             .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
@@ -907,42 +917,47 @@ impl<B: K8sBackend> K8sCoordinator<B> {
             .await
         {
             Ok(_) => {
-                // Update local shard map
+                // Update local shard map cache
                 *self.base.shard_map.lock().await = shard_map;
-
-                info!(
-                    parent_shard_id = %split.parent_shard_id,
-                    left_child_id = %split.left_child_id,
-                    right_child_id = %split.right_child_id,
-                    split_point = %split.split_point,
-                    "shard map updated for split (k8s)"
-                );
-
-                Ok(())
+                Ok(result)
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                // Check if this is a CAS conflict (409 Conflict)
+                let err_str = e.to_string();
+                if err_str.contains("409") || err_str.contains("Conflict") {
+                    Err(CoordinationError::BackendError(
+                        "CAS conflict: resourceVersion mismatch".into(),
+                    ))
+                } else {
+                    Err(CoordinationError::BackendError(err_str))
+                }
+            }
         }
     }
 
-    /// Update the shard map ConfigMap after a split with retry logic.
-    async fn update_shard_map_for_split(
+    /// Modify the shard map with automatic retry on CAS conflicts.
+    ///
+    /// Wraps `modify_shard_map_cas` with exponential backoff retry logic.
+    async fn modify_shard_map_with_retry<T, F>(
         &self,
-        split: &SplitInProgress,
-    ) -> Result<(), CoordinationError> {
-        // Retry with exponential backoff to handle concurrent modifications
-        // (e.g., cleanup tasks updating cleanup status while a split is in progress)
+        operation_name: &str,
+        mut modify: F,
+    ) -> Result<T, CoordinationError>
+    where
+        F: FnMut(&mut ShardMap) -> Result<T, CoordinationError>,
+    {
         let max_retries = 10;
         let mut delay = Duration::from_millis(10);
 
         for attempt in 0..max_retries {
-            match self.try_update_shard_map_for_split(split).await {
-                Ok(()) => return Ok(()),
+            match self.modify_shard_map_cas(&mut modify).await {
+                Ok(result) => return Ok(result),
                 Err(CoordinationError::BackendError(msg))
                     if msg.contains("CAS conflict: resourceVersion mismatch") =>
                 {
                     if attempt < max_retries - 1 {
                         debug!(
-                            parent_shard_id = %split.parent_shard_id,
+                            operation = operation_name,
                             attempt = attempt,
                             "shard map update hit CAS conflict, retrying"
                         );
@@ -955,9 +970,36 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         }
 
         Err(CoordinationError::BackendError(format!(
-            "failed to update shard map for split after {} retries",
-            max_retries
+            "failed to {} after {} retries",
+            operation_name, max_retries
         )))
+    }
+
+    /// Update the shard map ConfigMap after a split with retry logic.
+    async fn update_shard_map_for_split(
+        &self,
+        split: &SplitInProgress,
+    ) -> Result<(), CoordinationError> {
+        let parent_id = split.parent_shard_id;
+        let left_id = split.left_child_id;
+        let right_id = split.right_child_id;
+        let split_point = split.split_point.clone();
+
+        self.modify_shard_map_with_retry("update shard map for split", |shard_map| {
+            shard_map.split_shard(&parent_id, &split_point, left_id, right_id)?;
+            Ok(())
+        })
+        .await?;
+
+        info!(
+            parent_shard_id = %split.parent_shard_id,
+            left_child_id = %split.left_child_id,
+            right_child_id = %split.right_child_id,
+            split_point = %split.split_point,
+            "shard map updated for split (k8s)"
+        );
+
+        Ok(())
     }
 }
 
@@ -1131,20 +1173,21 @@ impl<B: K8sBackend> Coordinator for K8sCoordinator<B> {
             // This ensures reconciliation runs even if the watcher hasn't fired an event.
             self.membership_changed.notify_one();
 
-            let member_ids = match self.get_active_member_ids().await {
-                Ok(m) => m,
-                Err(_) => {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
+            // Get full member info for ring-aware convergence check
+            let members = {
+                let cache = self.members_cache.lock().await;
+                cache.clone()
             };
-            if member_ids.is_empty() {
+            let member_ids: Vec<String> = members.iter().map(|m| m.node_id.clone()).collect();
+            if members.is_empty() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
-            let shard_ids = self.base.shard_ids().await;
+            let shard_map = self.base.shard_map.lock().await;
+            let shards: Vec<&crate::shard_range::ShardInfo> = shard_map.shards().iter().collect();
             let desired: HashSet<ShardId> =
-                compute_desired_shards_for_node(&shard_ids, &self.base.node_id, &member_ids);
+                compute_desired_shards_for_node(&shards, &self.base.node_id, &members);
+            drop(shard_map);
             let owned_now: HashSet<ShardId> = {
                 let guard = self.base.owned.lock().await;
                 if *guard == desired {
@@ -1170,24 +1213,29 @@ impl<B: K8sBackend> Coordinator for K8sCoordinator<B> {
         }
 
         // Log diff on timeout
-        if let Ok(member_ids) = self.get_active_member_ids().await {
-            let shard_ids = self.base.shard_ids().await;
-            let desired: HashSet<ShardId> =
-                compute_desired_shards_for_node(&shard_ids, &self.base.node_id, &member_ids);
-            let owned_now: HashSet<ShardId> = {
-                let g = self.base.owned.lock().await;
-                g.clone()
-            };
-            let missing: Vec<ShardId> = desired.difference(&owned_now).copied().collect();
-            let extra: Vec<ShardId> = owned_now.difference(&desired).copied().collect();
-            warn!(
-                node_id = %self.base.node_id,
-                members = ?member_ids,
-                missing = ?missing,
-                extra = ?extra,
-                "wait_converged: timed out"
-            );
-        }
+        let members = {
+            let cache = self.members_cache.lock().await;
+            cache.clone()
+        };
+        let member_ids: Vec<String> = members.iter().map(|m| m.node_id.clone()).collect();
+        let shard_map = self.base.shard_map.lock().await;
+        let shards: Vec<&crate::shard_range::ShardInfo> = shard_map.shards().iter().collect();
+        let desired: HashSet<ShardId> =
+            compute_desired_shards_for_node(&shards, &self.base.node_id, &members);
+        drop(shard_map);
+        let owned_now: HashSet<ShardId> = {
+            let g = self.base.owned.lock().await;
+            g.clone()
+        };
+        let missing: Vec<ShardId> = desired.difference(&owned_now).copied().collect();
+        let extra: Vec<ShardId> = owned_now.difference(&desired).copied().collect();
+        warn!(
+            node_id = %self.base.node_id,
+            members = ?member_ids,
+            missing = ?missing,
+            extra = ?extra,
+            "wait_converged: timed out"
+        );
         false
     }
 
@@ -1199,6 +1247,26 @@ impl<B: K8sBackend> Coordinator for K8sCoordinator<B> {
     async fn get_shard_owner_map(&self) -> Result<ShardOwnerMap, CoordinationError> {
         let members = self.get_members().await?;
         Ok(self.base.compute_shard_owner_map(&members).await)
+    }
+
+    async fn update_shard_placement_ring(
+        &self,
+        shard_id: &crate::shard_range::ShardId,
+        ring: Option<&str>,
+    ) -> Result<(Option<String>, Option<String>), CoordinationError> {
+        let sid = *shard_id;
+        let new_ring = ring.map(|s| s.to_string());
+
+        self.modify_shard_map_with_retry("update shard placement ring", move |shard_map| {
+            let shard = shard_map
+                .get_shard_mut(&sid)
+                .ok_or(CoordinationError::ShardNotFound(sid))?;
+
+            let previous = shard.placement_ring.clone();
+            shard.placement_ring = new_ring.clone();
+            Ok((previous, new_ring.clone()))
+        })
+        .await
     }
 }
 
@@ -1234,6 +1302,7 @@ pub struct K8sShardGuard<B: K8sBackend> {
 }
 
 impl<B: K8sBackend> K8sShardGuard<B> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         shard_id: ShardId,
         backend: B,

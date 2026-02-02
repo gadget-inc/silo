@@ -41,7 +41,7 @@ impl MockPausedCoordinator {
         let shard_map = ShardMap::create_initial(num_shards).expect("create shard map");
         let owned_shards: HashSet<ShardId> = shard_map.shard_ids().into_iter().collect();
         let factory = Arc::new(ShardFactory::new_noop());
-        let base = CoordinatorBase::new(node_id, grpc_addr, shard_map, factory);
+        let base = CoordinatorBase::new(node_id, grpc_addr, shard_map, factory, Vec::new());
         // Pre-populate owned shards
         *base.owned.lock().await = owned_shards;
         Self {
@@ -67,6 +67,7 @@ impl Coordinator for MockPausedCoordinator {
             grpc_addr: self.base.grpc_addr.clone(),
             hostname: Some("test-host".to_string()),
             startup_time_ms: Some(0),
+            placement_rings: self.base.placement_rings.clone(),
         }])
     }
 
@@ -99,6 +100,21 @@ impl Coordinator for MockPausedCoordinator {
     /// Overrides the default trait implementation to use our test flag.
     async fn is_shard_paused(&self, _shard_id: ShardId) -> bool {
         self.shard_paused.load(Ordering::SeqCst)
+    }
+
+    async fn update_shard_placement_ring(
+        &self,
+        shard_id: &ShardId,
+        ring: Option<&str>,
+    ) -> Result<(Option<String>, Option<String>), CoordinationError> {
+        let mut shard_map = self.base.shard_map.lock().await;
+        let shard = shard_map
+            .get_shard_mut(shard_id)
+            .ok_or_else(|| CoordinationError::ShardNotFound(*shard_id))?;
+        let previous = shard.placement_ring.clone();
+        let current = ring.map(|s| s.to_string());
+        shard.placement_ring = current.clone();
+        Ok((previous, current))
     }
 }
 

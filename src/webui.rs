@@ -87,6 +87,8 @@ pub struct ShardRow {
     pub cleanup_status: Option<String>,
     /// Parent shard ID if this shard was created from a split
     pub parent_shard_id: Option<String>,
+    /// Placement ring this shard belongs to (None = default ring)
+    pub placement_ring: Option<String>,
 }
 
 #[derive(Clone)]
@@ -108,6 +110,8 @@ pub struct MemberRow {
     pub shard_count: usize,
     pub uptime: String,
     pub hostname: Option<String>,
+    /// Placement rings this member participates in (empty = default only)
+    pub placement_rings: Vec<String>,
 }
 
 #[derive(Template)]
@@ -991,6 +995,7 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
                 shard_count,
                 uptime: format_uptime(member_info.startup_time_ms),
                 hostname: member_info.hostname,
+                placement_rings: member_info.placement_rings,
             });
         }
     }
@@ -1074,10 +1079,16 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
             }
         });
 
-        let parent_shard_id = shard_map
+        let (parent_shard_id, placement_ring) = shard_map
             .as_ref()
             .and_then(|map| map.get_shard(&shard_id))
-            .and_then(|info| info.parent_shard_id.map(|p| p.to_string()));
+            .map(|info| {
+                (
+                    info.parent_shard_id.map(|p| p.to_string()),
+                    info.placement_ring.clone(),
+                )
+            })
+            .unwrap_or((None, None));
 
         shards.push(ShardRow {
             name: shard_id.to_string(),
@@ -1086,6 +1097,7 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
             split_phase,
             cleanup_status,
             parent_shard_id,
+            placement_ring,
         });
     }
 
@@ -1107,6 +1119,7 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
             shard_count: shards.len(),
             uptime: "unknown".to_string(),
             hostname: crate::coordination::get_hostname(),
+            placement_rings: state.config.coordination.placement_rings.clone(),
         });
     }
 

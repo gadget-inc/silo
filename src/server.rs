@@ -442,7 +442,22 @@ impl Silo for SiloService {
                     node_id,
                     range_start: shard_info.range.start.clone(),
                     range_end: shard_info.range.end.clone(),
+                    placement_ring: shard_info.placement_ring.clone(),
                 }
+            })
+            .collect();
+
+        // Get all cluster members with their ring participation
+        let member_infos = coord
+            .get_members()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let members: Vec<ClusterMember> = member_infos
+            .iter()
+            .map(|m| ClusterMember {
+                node_id: m.node_id.clone(),
+                grpc_addr: m.grpc_addr.clone(),
+                placement_rings: m.placement_rings.clone(),
             })
             .collect();
 
@@ -451,6 +466,7 @@ impl Silo for SiloService {
             shard_owners,
             this_node_id: coord.node_id().to_string(),
             this_grpc_addr: coord.grpc_addr().to_string(),
+            members,
         }))
     }
 
@@ -1401,6 +1417,27 @@ impl Silo for SiloService {
         Ok(Response::new(GetNodeInfoResponse {
             node_id: coord.node_id().to_string(),
             owned_shards,
+            placement_rings: self.cfg.coordination.placement_rings.clone(),
+        }))
+    }
+
+    async fn configure_shard(
+        &self,
+        req: Request<ConfigureShardRequest>,
+    ) -> Result<Response<ConfigureShardResponse>, Status> {
+        let r = req.into_inner();
+        let shard_id = Self::parse_shard_id(&r.shard)?;
+
+        // Update the shard's placement ring via the coordinator
+        let (previous, current) = self
+            .coordinator
+            .update_shard_placement_ring(&shard_id, r.placement_ring.as_deref())
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(ConfigureShardResponse {
+            previous_ring: previous.unwrap_or_default(),
+            current_ring: current.unwrap_or_default(),
         }))
     }
 }

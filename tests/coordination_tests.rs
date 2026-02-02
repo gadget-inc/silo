@@ -66,6 +66,7 @@ async fn multiple_nodes_own_unique_shards() {
         num_shards,
         10,
         make_test_factory(&prefix, "n1"),
+        Vec::new(),
     )
     .await
     .expect("start c1");
@@ -77,6 +78,7 @@ async fn multiple_nodes_own_unique_shards() {
         num_shards,
         10,
         make_test_factory(&prefix, "n2"),
+        Vec::new(),
     )
     .await
     .expect("start c2");
@@ -88,6 +90,7 @@ async fn multiple_nodes_own_unique_shards() {
         num_shards,
         10,
         make_test_factory(&prefix, "n3"),
+        Vec::new(),
     )
     .await
     .expect("start c3");
@@ -166,6 +169,7 @@ async fn adding_a_node_rebalances_shards() {
         num_shards,
         10,
         make_test_factory(&prefix, "n1"),
+        Vec::new(),
     )
     .await
     .unwrap();
@@ -177,6 +181,7 @@ async fn adding_a_node_rebalances_shards() {
         num_shards,
         10,
         make_test_factory(&prefix, "n2"),
+        Vec::new(),
     )
     .await
     .unwrap();
@@ -202,6 +207,7 @@ async fn adding_a_node_rebalances_shards() {
         num_shards,
         10,
         make_test_factory(&prefix, "n3"),
+        Vec::new(),
     )
     .await
     .unwrap();
@@ -260,6 +266,7 @@ async fn removing_a_node_rebalances_shards() {
         num_shards,
         10,
         make_test_factory(&prefix, "n1"),
+        Vec::new(),
     )
     .await
     .unwrap();
@@ -271,6 +278,7 @@ async fn removing_a_node_rebalances_shards() {
         num_shards,
         10,
         make_test_factory(&prefix, "n2"),
+        Vec::new(),
     )
     .await
     .unwrap();
@@ -282,6 +290,7 @@ async fn removing_a_node_rebalances_shards() {
         num_shards,
         10,
         make_test_factory(&prefix, "n3"),
+        Vec::new(),
     )
     .await
     .unwrap();
@@ -331,6 +340,7 @@ async fn rapid_membership_churn_converges() {
         num_shards,
         10,
         make_test_factory(&prefix, "n1"),
+        Vec::new(),
     )
     .await
     .unwrap();
@@ -343,6 +353,7 @@ async fn rapid_membership_churn_converges() {
         num_shards,
         10,
         make_test_factory(&prefix, "n2"),
+        Vec::new(),
     )
     .await
     .unwrap();
@@ -355,6 +366,7 @@ async fn rapid_membership_churn_converges() {
         num_shards,
         10,
         make_test_factory(&prefix, "n3"),
+        Vec::new(),
     )
     .await
     .unwrap();
@@ -372,6 +384,7 @@ async fn rapid_membership_churn_converges() {
         num_shards,
         10,
         make_test_factory(&prefix, "n2b"),
+        Vec::new(),
     )
     .await
     .unwrap();
@@ -441,6 +454,7 @@ async fn membership_persists_beyond_lease_ttl() {
         num_shards,
         lease_ttl_secs,
         make_test_factory(&prefix, "n1"),
+        Vec::new(),
     )
     .await
     .expect("start coordinator");
@@ -516,6 +530,7 @@ async fn multi_node_ownership_stable_over_time() {
         num_shards,
         lease_ttl_secs,
         make_test_factory(&prefix, "n1"),
+        Vec::new(),
     )
     .await
     .unwrap();
@@ -528,6 +543,7 @@ async fn multi_node_ownership_stable_over_time() {
         num_shards,
         lease_ttl_secs,
         make_test_factory(&prefix, "n2"),
+        Vec::new(),
     )
     .await
     .unwrap();
@@ -592,6 +608,7 @@ async fn shard_owner_map_matches_actual_ownership() {
         num_shards,
         lease_ttl_secs,
         make_test_factory(&prefix, "n1"),
+        Vec::new(),
     )
     .await
     .unwrap();
@@ -604,6 +621,7 @@ async fn shard_owner_map_matches_actual_ownership() {
         num_shards,
         lease_ttl_secs,
         make_test_factory(&prefix, "n2"),
+        Vec::new(),
     )
     .await
     .unwrap();

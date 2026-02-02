@@ -10,9 +10,9 @@ use std::path::Path;
 
 use crate::pb::silo_client::SiloClient;
 use crate::pb::{
-    CancelJobRequest, CpuProfileRequest, DeleteJobRequest, ExpediteJobRequest,
-    GetClusterInfoRequest, GetJobRequest, GetSplitStatusRequest, QueryRequest, RequestSplitRequest,
-    RestartJobRequest,
+    CancelJobRequest, ConfigureShardRequest, CpuProfileRequest, DeleteJobRequest,
+    ExpediteJobRequest, GetClusterInfoRequest, GetJobRequest, GetSplitStatusRequest, QueryRequest,
+    RequestSplitRequest, RestartJobRequest,
 };
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -712,6 +712,55 @@ pub async fn shard_split_status<W: Write>(
         )?;
     } else {
         writeln!(out, "No split in progress for shard {}", shard)?;
+    }
+
+    Ok(())
+}
+
+/// Configure a shard's placement ring.
+///
+/// This command changes which placement ring a shard belongs to. After changing
+/// the ring, the shard will be handed off to a node that participates in the
+/// new ring.
+pub async fn shard_configure<W: Write>(
+    opts: &GlobalOptions,
+    out: &mut W,
+    shard: &str,
+    ring: Option<String>,
+) -> anyhow::Result<()> {
+    let mut client = connect(&opts.address).await?;
+
+    let response = client
+        .configure_shard(ConfigureShardRequest {
+            tenant: opts.tenant.clone(),
+            shard: shard.to_string(),
+            placement_ring: ring.clone(),
+        })
+        .await?
+        .into_inner();
+
+    if opts.json {
+        let json_output = serde_json::json!({
+            "shard_id": shard,
+            "previous_ring": response.previous_ring,
+            "current_ring": response.current_ring,
+        });
+        writeln!(out, "{}", serde_json::to_string_pretty(&json_output)?)?;
+    } else {
+        let previous_display = if response.previous_ring.is_empty() {
+            "(default)"
+        } else {
+            &response.previous_ring
+        };
+        let current_display = if response.current_ring.is_empty() {
+            "(default)"
+        } else {
+            &response.current_ring
+        };
+
+        writeln!(out, "Shard {} configured", shard)?;
+        writeln!(out, "Previous ring: {}", previous_display)?;
+        writeln!(out, "Current ring:  {}", current_display)?;
     }
 
     Ok(())

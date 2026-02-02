@@ -377,6 +377,14 @@ message ShardOwner {
   string node_id = 3;   // Unique identifier of the owning node.
   string range_start = 4; // Inclusive start of the tenant_id range owned by this shard.
   string range_end = 5;   // Exclusive end of the tenant_id range owned by this shard.
+  optional string placement_ring = 6; // Placement ring this shard belongs to (empty = default ring).
+}
+
+// Information about a cluster member node.
+message ClusterMember {
+  string node_id = 1;                   // Unique identifier of this node.
+  string grpc_addr = 2;                 // gRPC address of this node.
+  repeated string placement_rings = 3;  // Placement rings this node participates in.
 }
 
 // Cluster topology information.
@@ -385,6 +393,7 @@ message GetClusterInfoResponse {
   repeated ShardOwner shard_owners = 2; // Mapping of each shard to its owner.
   string this_node_id = 3;              // Node ID of the server responding.
   string this_grpc_addr = 4;            // gRPC address of the server responding.
+  repeated ClusterMember members = 5;   // All cluster members with their ring participation.
 }
 
 // Request to reset all shards owned by this server.
@@ -456,8 +465,22 @@ message GetNodeInfoRequest {}
 
 // Response with node information and details for all shards owned by this node.
 message GetNodeInfoResponse {
-  string node_id = 1;                     // Unique identifier of this node.
+  string node_id = 1;                       // Unique identifier of this node.
   repeated OwnedShardInfo owned_shards = 2; // Information for each shard owned by this node.
+  repeated string placement_rings = 3;      // Placement rings this node participates in.
+}
+
+// Request to configure a shard's placement ring.
+message ConfigureShardRequest {
+  string shard = 1;                   // The shard ID (UUID) to configure.
+  optional string placement_ring = 2; // The placement ring to assign (empty/null = default ring).
+  optional string tenant = 100;       // Optional tenant ID (for multi-tenant mode).
+}
+
+// Response after configuring a shard's placement ring.
+message ConfigureShardResponse {
+  string previous_ring = 1; // The placement ring before the change (empty = default ring).
+  string current_ring = 2;  // The placement ring after the change (empty = default ring).
 }
 
 // The Silo job queue service.
@@ -544,6 +567,12 @@ service Silo {
   // Returns the current phase and child shard IDs if a split is in progress.
   // If no split is in progress, returns with in_progress=false.
   rpc GetSplitStatus(GetSplitStatusRequest) returns (GetSplitStatusResponse);
+
+  // Configure a shard's placement ring.
+  // Changes which placement ring the shard belongs to, affecting which nodes can own it.
+  // The shard will be handed off to a node that participates in the new ring.
+  // Returns the previous and current ring assignments.
+  rpc ConfigureShard(ConfigureShardRequest) returns (ConfigureShardResponse);
 
   // Reset all shards owned by this server.
   // WARNING: Destructive operation. Only available in dev mode.

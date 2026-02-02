@@ -26,6 +26,7 @@ async fn none_coordinator_owns_all_shards() {
         "http://localhost:50051",
         16,
         make_test_factory(),
+        Vec::new(),
     )
     .await;
 
@@ -43,6 +44,7 @@ async fn none_coordinator_always_converged() {
         "http://localhost:50051",
         16,
         make_test_factory(),
+        Vec::new(),
     )
     .await;
 
@@ -56,6 +58,7 @@ async fn none_coordinator_single_member() {
         "http://localhost:50051",
         16,
         make_test_factory(),
+        Vec::new(),
     )
     .await;
 
@@ -71,6 +74,7 @@ async fn none_coordinator_shard_map() {
         "http://localhost:50051",
         4,
         make_test_factory(),
+        Vec::new(),
     )
     .await;
 

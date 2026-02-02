@@ -281,6 +281,11 @@ pub struct ShardInfo {
     pub created_at_ms: i64,
     /// If this shard was created by splitting another shard, the parent's ID.
     pub parent_shard_id: Option<ShardId>,
+    /// The placement ring this shard belongs to.
+    /// None means the shard is on the default ring.
+    /// Only nodes that participate in this ring will be considered for ownership.
+    #[serde(default)]
+    pub placement_ring: Option<String>,
 }
 
 impl ShardInfo {
@@ -294,6 +299,7 @@ impl ShardInfo {
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0),
             parent_shard_id: None,
+            placement_ring: None,
         }
     }
 
@@ -304,6 +310,7 @@ impl ShardInfo {
             range,
             created_at_ms,
             parent_shard_id: None,
+            placement_ring: None,
         }
     }
 
@@ -318,7 +325,18 @@ impl ShardInfo {
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0),
             parent_shard_id: Some(parent_id),
+            placement_ring: None,
         }
+    }
+
+    /// Get the placement ring for this shard.
+    pub fn placement_ring(&self) -> Option<&str> {
+        self.placement_ring.as_deref()
+    }
+
+    /// Set the placement ring for this shard.
+    pub fn set_placement_ring(&mut self, ring: Option<String>) {
+        self.placement_ring = ring;
     }
 
     /// Check if this shard's range contains the given tenant ID.
@@ -512,6 +530,11 @@ impl ShardMap {
     /// Find a shard by its ID.
     pub fn get_shard(&self, id: &ShardId) -> Option<&ShardInfo> {
         self.shards.iter().find(|s| &s.id == id)
+    }
+
+    /// Find a shard by its ID and return a mutable reference.
+    pub fn get_shard_mut(&mut self, id: &ShardId) -> Option<&mut ShardInfo> {
+        self.shards.iter_mut().find(|s| &s.id == id)
     }
 
     /// Get all shard IDs.
