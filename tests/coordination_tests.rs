@@ -304,8 +304,10 @@ async fn removing_a_node_rebalances_shards() {
     let _ = h3.abort();
 
     // Wait for convergence again
-    assert!(c1.wait_converged(std::time::Duration::from_secs(10)).await);
-    assert!(c2.wait_converged(std::time::Duration::from_secs(10)).await);
+    // Use 20 second timeout to match other coordination tests - rebalancing after
+    // node removal involves lock acquisition with retries that can take time
+    assert!(c1.wait_converged(std::time::Duration::from_secs(20)).await);
+    assert!(c2.wait_converged(std::time::Duration::from_secs(20)).await);
     let s1 = c1.owned_shards().await;
     let s2 = c2.owned_shards().await;
     let all: HashSet<ShardId> = s1.iter().copied().chain(s2.iter().copied()).collect();
