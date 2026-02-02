@@ -4,11 +4,10 @@ use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::factory::ShardFactory;
-use crate::job_store_shard::JobStoreShard;
-use crate::shard_range::{ShardId, ShardMap, ShardRange, SplitInProgress};
+use crate::shard_range::{ShardId, ShardMap, SplitInProgress};
 
 use super::{CoordinationError, ShardOwnerMap};
 
@@ -47,6 +46,20 @@ impl fmt::Display for SplitCleanupStatus {
             SplitCleanupStatus::CleanupRunning => write!(f, "CleanupRunning"),
             SplitCleanupStatus::CleanupDone => write!(f, "CleanupDone"),
             SplitCleanupStatus::CompactionDone => write!(f, "CompactionDone"),
+        }
+    }
+}
+
+impl std::str::FromStr for SplitCleanupStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "CleanupPending" => Ok(SplitCleanupStatus::CleanupPending),
+            "CleanupRunning" => Ok(SplitCleanupStatus::CleanupRunning),
+            "CleanupDone" => Ok(SplitCleanupStatus::CleanupDone),
+            "CompactionDone" => Ok(SplitCleanupStatus::CompactionDone),
+            _ => Err(format!("unknown cleanup status: {}", s)),
         }
     }
 }
@@ -142,15 +155,6 @@ pub trait SplitStorageBackend: Send + Sync {
 
     /// Reload the shard map from storage into the local cache.
     async fn reload_shard_map(&self) -> Result<(), CoordinationError>;
-
-    /// Update cleanup status for a shard in the shard map.
-    ///
-    /// This should use CAS semantics to ensure atomic updates.
-    async fn update_cleanup_status_in_shard_map(
-        &self,
-        shard_id: ShardId,
-        status: SplitCleanupStatus,
-    ) -> Result<(), CoordinationError>;
 
     /// List all split records (for recovery scanning).
     async fn list_all_splits(&self) -> Result<Vec<SplitInProgress>, CoordinationError>;
@@ -288,116 +292,6 @@ impl ShardSplitter {
             Ok(Some(split)) => split.phase.traffic_paused(),
             _ => false,
         }
-    }
-
-    /// Update the cleanup status for a shard.
-    pub async fn update_cleanup_status(
-        &self,
-        shard_id: ShardId,
-        status: SplitCleanupStatus,
-    ) -> Result<(), CoordinationError> {
-        self.coordinator
-            .update_cleanup_status_in_shard_map(shard_id, status)
-            .await
-    }
-
-    /// Run cleanup for a single shard.
-    ///
-    /// This method performs the complete cleanup workflow:
-    /// 1. Update status to CleanupRunning
-    /// 2. Delete keys outside the shard's range
-    /// 3. Update status to CleanupDone
-    /// 4. Run compaction to reclaim space
-    /// 5. Update status to CompactionDone
-    ///
-    /// This is designed to be called from a spawned task, taking owned/cloned references.
-    pub async fn run_cleanup(
-        &self,
-        shard_id: ShardId,
-        range: &ShardRange,
-        shard: Arc<JobStoreShard>,
-    ) -> Result<(), CoordinationError> {
-        self.update_cleanup_status_with_retry(shard_id, SplitCleanupStatus::CleanupRunning)
-            .await?;
-
-        info!(
-            shard_id = %shard_id,
-            range = %range,
-            "starting post-split cleanup"
-        );
-
-        // Run cleanup - delete keys outside the shard's range
-        let result = shard
-            .after_split_cleanup_defunct_data(range, 1000)
-            .await
-            .map_err(|e| CoordinationError::BackendError(format!("cleanup failed: {}", e)))?;
-
-        info!(
-            shard_id = %shard_id,
-            keys_deleted = result.keys_deleted,
-            keys_scanned = result.keys_scanned,
-            "post-split cleanup complete"
-        );
-
-        self.update_cleanup_status_with_retry(shard_id, SplitCleanupStatus::CleanupDone)
-            .await?;
-
-        // Run compaction to reclaim storage space
-        shard
-            .run_full_compaction()
-            .await
-            .map_err(|e| CoordinationError::BackendError(format!("compaction failed: {}", e)))?;
-
-        self.update_cleanup_status_with_retry(shard_id, SplitCleanupStatus::CompactionDone)
-            .await?;
-
-        info!(
-            shard_id = %shard_id,
-            "post-split cleanup and compaction complete"
-        );
-
-        Ok(())
-    }
-
-    /// Update cleanup status with retry logic for CAS conflicts.
-    ///
-    /// When multiple shards are being cleaned up concurrently, CAS operations on the
-    /// shard map can conflict. This method retries with exponential backoff.
-    async fn update_cleanup_status_with_retry(
-        &self,
-        shard_id: ShardId,
-        status: SplitCleanupStatus,
-    ) -> Result<(), CoordinationError> {
-        let max_retries = 10;
-        let mut delay = std::time::Duration::from_millis(10);
-
-        for attempt in 0..max_retries {
-            match self.update_cleanup_status(shard_id, status).await {
-                Ok(()) => return Ok(()),
-                Err(CoordinationError::BackendError(msg))
-                    if msg.contains("modified concurrently")
-                        || msg.contains("CAS conflict")
-                        || msg.contains("resourceVersion mismatch") =>
-                {
-                    if attempt < max_retries - 1 {
-                        debug!(
-                            shard_id = %shard_id,
-                            status = %status,
-                            attempt = attempt,
-                            "cleanup status update hit CAS conflict, retrying"
-                        );
-                        tokio::time::sleep(delay).await;
-                        delay = std::cmp::min(delay * 2, std::time::Duration::from_secs(1));
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        Err(CoordinationError::BackendError(format!(
-            "failed to update cleanup status after {} retries",
-            max_retries
-        )))
     }
 
     /// Advance the split to the next phase.
@@ -585,36 +479,38 @@ impl ShardSplitter {
                         }
                     }
 
-                    // Open the child shards we own and trigger cleanup
+                    // Open the child shards we own and set their cleanup status
                     for child_id in children_we_own {
-                        // Look up the child's range and cleanup status from the reloaded shard map
-                        let (range, cleanup_status) = {
+                        // Look up the child's range from the reloaded shard map
+                        let range = {
                             let map = self.ctx.shard_map.lock().await;
                             let info = map
                                 .get_shard(&child_id)
                                 .ok_or(CoordinationError::ShardNotFound(child_id))?;
-                            (info.range.clone(), info.cleanup_status)
+                            info.range.clone()
                         };
+                        self.ctx
+                            .factory
+                            .open(&child_id, &range)
+                            .await
+                            .map_err(|e| {
+                                CoordinationError::BackendError(format!(
+                                    "failed to open child shard {}: {}",
+                                    child_id, e
+                                ))
+                            })?;
 
-                        let shard =
-                            self.ctx
-                                .factory
-                                .open(&child_id, &range)
+                        if let Some(shard) = self.ctx.factory.get(&child_id) {
+                            shard
+                                .set_cleanup_status(SplitCleanupStatus::CleanupPending)
                                 .await
                                 .map_err(|e| {
                                     CoordinationError::BackendError(format!(
-                                        "failed to open child shard {}: {}",
+                                        "failed to set cleanup status for child shard {}: {}",
                                         child_id, e
                                     ))
                                 })?;
-
-                        maybe_spawn_cleanup(
-                            child_id,
-                            &range,
-                            cleanup_status,
-                            &shard,
-                            Arc::clone(&self.coordinator),
-                        );
+                        }
 
                         info!(
                             child_shard_id = %child_id,
@@ -673,38 +569,5 @@ impl ShardSplitter {
         }
 
         Ok(())
-    }
-}
-
-/// Spawn a background cleanup task for a shard if needed.
-/// This checks the cleanup status and spawns a background task to perform post-split cleanup if the shard has pending cleanup work. The cleanup runs asynchronously and doesn't block the caller.
-pub fn maybe_spawn_cleanup(
-    shard_id: ShardId,
-    range: &ShardRange,
-    cleanup_status: SplitCleanupStatus,
-    shard: &Arc<JobStoreShard>,
-    coordinator: Arc<dyn Coordinator>,
-) {
-    if cleanup_status.needs_work() {
-        info!(
-            shard_id = %shard_id,
-            cleanup_status = %cleanup_status,
-            "shard needs post-split cleanup, spawning cleanup task"
-        );
-        let shard_clone = Arc::clone(shard);
-        let range_clone = range.clone();
-        tokio::spawn(async move {
-            let splitter = ShardSplitter::new(coordinator);
-            if let Err(e) = splitter
-                .run_cleanup(shard_id, &range_clone, shard_clone)
-                .await
-            {
-                warn!(
-                    shard_id = %shard_id,
-                    error = %e,
-                    "cleanup failed, will retry on next shard open"
-                );
-            }
-        });
     }
 }

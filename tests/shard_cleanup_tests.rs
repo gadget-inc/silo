@@ -388,3 +388,370 @@ fn test_extract_tenant_from_key() {
     // No match
     assert_eq!(extract_tenant_from_key("other/key", "jobs/"), None);
 }
+
+/// Test that cleanup status is stored in and retrieved from the shard database
+#[silo::test]
+async fn cleanup_status_stored_in_shard_database() {
+    use silo::coordination::SplitCleanupStatus;
+
+    let (_tmp, shard) = open_temp_shard().await;
+
+    // Initially, cleanup status should be CompactionDone (default)
+    let initial_status = shard
+        .get_cleanup_status()
+        .await
+        .expect("get initial cleanup status");
+    assert_eq!(initial_status, SplitCleanupStatus::CompactionDone);
+
+    // Set cleanup status to CleanupPending
+    shard
+        .set_cleanup_status(SplitCleanupStatus::CleanupPending)
+        .await
+        .expect("set cleanup pending");
+
+    let status = shard
+        .get_cleanup_status()
+        .await
+        .expect("get cleanup status");
+    assert_eq!(status, SplitCleanupStatus::CleanupPending);
+
+    // Set to CleanupRunning
+    shard
+        .set_cleanup_status(SplitCleanupStatus::CleanupRunning)
+        .await
+        .expect("set cleanup running");
+
+    let status = shard
+        .get_cleanup_status()
+        .await
+        .expect("get cleanup status");
+    assert_eq!(status, SplitCleanupStatus::CleanupRunning);
+
+    // Set to CleanupDone
+    shard
+        .set_cleanup_status(SplitCleanupStatus::CleanupDone)
+        .await
+        .expect("set cleanup done");
+
+    let status = shard
+        .get_cleanup_status()
+        .await
+        .expect("get cleanup status");
+    assert_eq!(status, SplitCleanupStatus::CleanupDone);
+
+    // Set to CompactionDone
+    shard
+        .set_cleanup_status(SplitCleanupStatus::CompactionDone)
+        .await
+        .expect("set compaction done");
+
+    let status = shard
+        .get_cleanup_status()
+        .await
+        .expect("get cleanup status");
+    assert_eq!(status, SplitCleanupStatus::CompactionDone);
+}
+
+/// Test that after_split_cleanup_defunct_data sets cleanup status correctly
+#[silo::test]
+async fn cleanup_sets_status_to_running_then_done() {
+    use silo::coordination::SplitCleanupStatus;
+    use silo::shard_range::ShardRange;
+
+    let (_tmp, shard) = open_temp_shard().await;
+
+    // Set initial status to CleanupPending (as if just created from split)
+    shard
+        .set_cleanup_status(SplitCleanupStatus::CleanupPending)
+        .await
+        .expect("set cleanup pending");
+
+    let range = ShardRange::new("", "mmm");
+
+    // Run cleanup (this should set status to CleanupRunning, then CleanupDone)
+    let result = shard
+        .after_split_cleanup_defunct_data(&range, 10)
+        .await
+        .expect("cleanup should succeed");
+
+    assert!(result.complete);
+
+    // After cleanup, status should be CleanupDone
+    let status = shard
+        .get_cleanup_status()
+        .await
+        .expect("get cleanup status");
+    assert_eq!(status, SplitCleanupStatus::CleanupDone);
+}
+
+/// Test that run_full_compaction sets cleanup status to CompactionDone
+#[silo::test]
+async fn compaction_sets_status_to_compaction_done() {
+    use silo::coordination::SplitCleanupStatus;
+
+    let (_tmp, shard) = open_temp_shard().await;
+
+    // Set status to CleanupDone (as if cleanup just finished)
+    shard
+        .set_cleanup_status(SplitCleanupStatus::CleanupDone)
+        .await
+        .expect("set cleanup done");
+
+    // Run compaction
+    shard
+        .run_full_compaction()
+        .await
+        .expect("compaction should succeed");
+
+    // After compaction, status should be CompactionDone
+    let status = shard
+        .get_cleanup_status()
+        .await
+        .expect("get cleanup status");
+    assert_eq!(status, SplitCleanupStatus::CompactionDone);
+}
+
+/// Test that re-opening a shard after cleanup has completed doesn't restart cleanup
+#[silo::test]
+async fn reopening_shard_after_cleanup_preserves_status() {
+    use silo::coordination::SplitCleanupStatus;
+    use silo::gubernator::MockGubernatorClient;
+    use silo::job_store_shard::JobStoreShard;
+    use silo::settings::{Backend, DatabaseConfig};
+    use silo::shard_range::ShardRange;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().to_string_lossy().to_string();
+    let rate_limiter = MockGubernatorClient::new_arc();
+
+    // First, create the shard and complete cleanup
+    {
+        let cfg = DatabaseConfig {
+            name: "test".to_string(),
+            backend: Backend::Fs,
+            path: path.clone(),
+            flush_interval_ms: Some(10),
+            wal: None,
+            apply_wal_on_close: true,
+        };
+
+        let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, ShardRange::full())
+            .await
+            .expect("open shard first time");
+
+        // Simulate a split child: set status to CleanupPending
+        shard
+            .set_cleanup_status(SplitCleanupStatus::CleanupPending)
+            .await
+            .expect("set cleanup pending");
+
+        // Run cleanup
+        let range = ShardRange::new("", "mmm");
+        let result = shard
+            .after_split_cleanup_defunct_data(&range, 10)
+            .await
+            .expect("cleanup should succeed");
+        assert!(result.complete);
+
+        // Verify status is CleanupDone
+        let status = shard.get_cleanup_status().await.expect("get status");
+        assert_eq!(status, SplitCleanupStatus::CleanupDone);
+
+        // Verify cleanup_completed_at is set
+        let cleanup_completed_at = shard
+            .get_cleanup_completed_at_ms()
+            .await
+            .expect("get cleanup completed at");
+        assert!(
+            cleanup_completed_at.is_some(),
+            "cleanup_completed_at should be set after cleanup"
+        );
+
+        // Close the shard
+        shard.close().await.expect("close shard");
+    }
+
+    // Now re-open the shard
+    {
+        let cfg = DatabaseConfig {
+            name: "test".to_string(),
+            backend: Backend::Fs,
+            path: path.clone(),
+            flush_interval_ms: Some(10),
+            wal: None,
+            apply_wal_on_close: true,
+        };
+
+        let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, ShardRange::full())
+            .await
+            .expect("reopen shard");
+
+        // Status should still be CleanupDone (not reset to CompactionDone or anything else)
+        let status = shard.get_cleanup_status().await.expect("get status");
+        assert_eq!(
+            status,
+            SplitCleanupStatus::CleanupDone,
+            "cleanup status should be preserved after reopen"
+        );
+
+        // cleanup_completed_at should still be set
+        let cleanup_completed_at = shard
+            .get_cleanup_completed_at_ms()
+            .await
+            .expect("get cleanup completed at");
+        assert!(
+            cleanup_completed_at.is_some(),
+            "cleanup_completed_at should be preserved after reopen"
+        );
+
+        shard.close().await.expect("close shard");
+    }
+}
+
+/// Test that shard creation timestamp is set on first open
+#[silo::test]
+async fn shard_created_at_is_set_on_first_open() {
+    let (_tmp, shard) = open_temp_shard().await;
+
+    let created_at = shard.get_created_at_ms().await.expect("get created_at");
+
+    assert!(
+        created_at.is_some(),
+        "created_at should be set on first open"
+    );
+
+    let ts = created_at.unwrap();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    // Should be within the last few seconds
+    assert!(
+        (now_ms - ts).abs() < 5000,
+        "created_at should be recent (within 5s)"
+    );
+}
+
+/// Test that shard creation timestamp is preserved across reopens
+#[silo::test]
+async fn shard_created_at_preserved_across_reopen() {
+    use silo::gubernator::MockGubernatorClient;
+    use silo::job_store_shard::JobStoreShard;
+    use silo::settings::{Backend, DatabaseConfig};
+    use silo::shard_range::ShardRange;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().to_string_lossy().to_string();
+    let rate_limiter = MockGubernatorClient::new_arc();
+
+    let original_created_at: i64;
+
+    // First open
+    {
+        let cfg = DatabaseConfig {
+            name: "test".to_string(),
+            backend: Backend::Fs,
+            path: path.clone(),
+            flush_interval_ms: Some(10),
+            wal: None,
+            apply_wal_on_close: true,
+        };
+
+        let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, ShardRange::full())
+            .await
+            .expect("first open");
+
+        original_created_at = shard
+            .get_created_at_ms()
+            .await
+            .expect("get created_at")
+            .expect("created_at should be set");
+
+        shard.close().await.expect("close");
+    }
+
+    // Wait a bit to ensure any subsequent timestamp would be different
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Reopen
+    {
+        let cfg = DatabaseConfig {
+            name: "test".to_string(),
+            backend: Backend::Fs,
+            path: path.clone(),
+            flush_interval_ms: Some(10),
+            wal: None,
+            apply_wal_on_close: true,
+        };
+
+        let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, ShardRange::full())
+            .await
+            .expect("reopen");
+
+        let reopened_created_at = shard
+            .get_created_at_ms()
+            .await
+            .expect("get created_at")
+            .expect("created_at should still be set");
+
+        assert_eq!(
+            original_created_at, reopened_created_at,
+            "created_at should be preserved across reopens"
+        );
+
+        shard.close().await.expect("close");
+    }
+}
+
+/// Test that cleanup_completed_at is only set when cleanup actually completes
+#[silo::test]
+async fn cleanup_completed_at_only_set_on_actual_completion() {
+    use silo::coordination::SplitCleanupStatus;
+    use silo::shard_range::ShardRange;
+
+    let (_tmp, shard) = open_temp_shard().await;
+
+    // Initially, cleanup_completed_at should not be set
+    let initial = shard
+        .get_cleanup_completed_at_ms()
+        .await
+        .expect("get cleanup_completed_at");
+    assert!(
+        initial.is_none(),
+        "cleanup_completed_at should not be set initially"
+    );
+
+    // Set status to CleanupPending (simulating split child)
+    shard
+        .set_cleanup_status(SplitCleanupStatus::CleanupPending)
+        .await
+        .expect("set pending");
+
+    // Check still not set
+    let after_pending = shard
+        .get_cleanup_completed_at_ms()
+        .await
+        .expect("get cleanup_completed_at");
+    assert!(
+        after_pending.is_none(),
+        "cleanup_completed_at should not be set after just setting pending"
+    );
+
+    // Run cleanup
+    let range = ShardRange::new("", "mmm");
+    shard
+        .after_split_cleanup_defunct_data(&range, 10)
+        .await
+        .expect("cleanup");
+
+    // Now it should be set
+    let after_cleanup = shard
+        .get_cleanup_completed_at_ms()
+        .await
+        .expect("get cleanup_completed_at");
+    assert!(
+        after_cleanup.is_some(),
+        "cleanup_completed_at should be set after cleanup completes"
+    );
+}

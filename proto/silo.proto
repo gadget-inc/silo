@@ -387,18 +387,6 @@ message GetClusterInfoResponse {
   string this_grpc_addr = 4;            // gRPC address of the server responding.
 }
 
-// Request to get job counters for a shard.
-// Used for efficient job count queries without scanning all jobs.
-message GetShardCountersRequest {
-  string shard = 1; // Shard ID (UUID) to get counters for.
-}
-
-// Response with shard job counters.
-message GetShardCountersResponse {
-  int64 total_jobs = 1;     // Total number of jobs in the shard (not deleted).
-  int64 completed_jobs = 2; // Number of jobs in terminal states (Succeeded, Failed, Cancelled).
-}
-
 // Request to reset all shards owned by this server.
 // WARNING: Destructive operation. Only available in dev mode.
 message ResetShardsRequest {}
@@ -453,12 +441,34 @@ message GetSplitStatusResponse {
   int64 requested_at_ms = 7;   // Unix timestamp (ms) when split was requested.
 }
 
+// Information about a shard owned by a node, including counters and cleanup status.
+message OwnedShardInfo {
+  string shard_id = 1;        // The shard ID (UUID).
+  int64 total_jobs = 2;       // Total number of jobs in the shard (not deleted).
+  int64 completed_jobs = 3;   // Number of jobs in terminal states (Succeeded, Failed, Cancelled).
+  string cleanup_status = 4;  // Cleanup status: "CompactionDone", "CleanupPending", "CleanupRunning", "CleanupDone".
+  int64 created_at_ms = 5;    // Unix timestamp (ms) when this shard was first created/initialized.
+  int64 cleanup_completed_at_ms = 6; // Unix timestamp (ms) when cleanup completed (0 if not applicable or not completed).
+}
+
+// Request to get node information including owned shards with their counters and cleanup status.
+message GetNodeInfoRequest {}
+
+// Response with node information and details for all shards owned by this node.
+message GetNodeInfoResponse {
+  string node_id = 1;                     // Unique identifier of this node.
+  repeated OwnedShardInfo owned_shards = 2; // Information for each shard owned by this node.
+}
+
 // The Silo job queue service.
 service Silo {
   // Get cluster topology for client-side routing.
   // Returns shard ownership information so clients can route requests to the correct node.
   rpc GetClusterInfo(GetClusterInfoRequest) returns (GetClusterInfoResponse);
   
+  // Get information about this node and all the shards it owns.
+  rpc GetNodeInfo(GetNodeInfoRequest) returns (GetNodeInfoResponse);
+
   // Enqueue a new job for processing.
   // The job will be scheduled according to its start_at_ms and processed when limits allow.
   rpc Enqueue(EnqueueRequest) returns (EnqueueResponse);
@@ -518,16 +528,6 @@ service Silo {
   // First message contains schema, subsequent messages contain record batches.
   rpc QueryArrow(QueryArrowRequest) returns (stream ArrowIpcMessage);
   
-
-  // Get job counters for a shard.
-  // Returns total jobs and completed jobs without scanning all job data.
-  rpc GetShardCounters(GetShardCountersRequest) returns (GetShardCountersResponse);
-
-  // Reset all shards owned by this server.
-  // WARNING: Destructive operation. Only available in dev mode.
-  // Clears all jobs, tasks, queues, and other data.
-  rpc ResetShards(ResetShardsRequest) returns (ResetShardsResponse);
-  
   // Capture a CPU profile from this node.
   // Returns pprof protobuf data that can be analyzed with pprof or go tool pprof.
   // The profile captures CPU usage for the specified duration.
@@ -544,5 +544,9 @@ service Silo {
   // Returns the current phase and child shard IDs if a split is in progress.
   // If no split is in progress, returns with in_progress=false.
   rpc GetSplitStatus(GetSplitStatusRequest) returns (GetSplitStatusResponse);
-}
 
+  // Reset all shards owned by this server.
+  // WARNING: Destructive operation. Only available in dev mode.
+  // Clears all jobs, tasks, queues, and other data.
+  rpc ResetShards(ResetShardsRequest) returns (ResetShardsResponse);
+}

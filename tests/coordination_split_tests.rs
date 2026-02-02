@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use silo::coordination::SplitPhase;
 use silo::coordination::{Coordinator, EtcdCoordinator, ShardSplitter};
-use silo::coordination::{SplitCleanupStatus, SplitPhase};
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::settings::{Backend, DatabaseTemplate};
@@ -278,50 +278,6 @@ async fn request_split_fails_for_invalid_split_point() {
     let _ = h1.abort();
 }
 
-/// Test that update_cleanup_status works correctly
-#[silo::test(flavor = "multi_thread", worker_threads = 4)]
-async fn update_cleanup_status_works() {
-    let _guard = acquire_test_mutex();
-
-    let prefix = unique_prefix();
-    let num_shards: u32 = 1;
-    let cfg = silo::settings::AppConfig::load(None).expect("load default config");
-
-    let (c1, h1) = EtcdCoordinator::start(
-        &cfg.coordination.etcd_endpoints,
-        &prefix,
-        "n1",
-        "http://127.0.0.1:50051",
-        num_shards,
-        10,
-        make_test_factory(&prefix, "n1"),
-    )
-    .await
-    .expect("start coordinator");
-
-    assert!(c1.wait_converged(Duration::from_secs(10)).await);
-
-    let shards = c1.owned_shards().await;
-    let shard_id = shards[0];
-
-    // Create splitter and update cleanup status
-
-    let splitter = ShardSplitter::new(Arc::new(c1.clone()));
-
-    splitter
-        .update_cleanup_status(shard_id, SplitCleanupStatus::CleanupRunning)
-        .await
-        .expect("update cleanup status should succeed");
-
-    // Verify the update
-    let shard_map = c1.get_shard_map().await.expect("get shard map");
-    let shard = shard_map.get_shard(&shard_id).unwrap();
-    assert_eq!(shard.cleanup_status, SplitCleanupStatus::CleanupRunning);
-
-    c1.shutdown().await.unwrap();
-    let _ = h1.abort();
-}
-
 /// Test that is_shard_paused returns correct values
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
 async fn is_shard_paused_returns_correct_values() {
@@ -570,58 +526,9 @@ async fn execute_split_completes_full_cycle() {
     assert_eq!(left_info.parent_shard_id, Some(shard_id));
     assert_eq!(right_info.parent_shard_id, Some(shard_id));
 
-    // Cleanup status should indicate work is needed (cleanup is triggered on shard open,
-    // so status may be CleanupPending, CleanupRunning, or CleanupDone depending on timing)
-    assert!(
-        left_info.cleanup_status.needs_work(),
-        "left child should need cleanup work, got {:?}",
-        left_info.cleanup_status
-    );
-    assert!(
-        right_info.cleanup_status.needs_work(),
-        "right child should need cleanup work, got {:?}",
-        right_info.cleanup_status
-    );
-
-    // Wait for cleanup to complete - the coordinator runs cleanup every 5 seconds
-    let cleanup_complete = wait_until(Duration::from_secs(30), || async {
-        let Ok(map) = c1.get_shard_map().await else {
-            return false;
-        };
-        let Some(left) = map.get_shard(&split.left_child_id) else {
-            return false;
-        };
-        let Some(right) = map.get_shard(&split.right_child_id) else {
-            return false;
-        };
-        left.cleanup_status == SplitCleanupStatus::CompactionDone
-            && right.cleanup_status == SplitCleanupStatus::CompactionDone
-    })
-    .await;
-
-    assert!(
-        cleanup_complete,
-        "cleanup should complete automatically via background task"
-    );
-
-    // Verify final cleanup status
-    let final_map = c1.get_shard_map().await.expect("get_shard_map");
-    let left_final = final_map.get_shard(&split.left_child_id).unwrap();
-    let right_final = final_map.get_shard(&split.right_child_id).unwrap();
-    assert_eq!(
-        left_final.cleanup_status,
-        SplitCleanupStatus::CompactionDone,
-        "left child should have CompactionDone status after cleanup"
-    );
-    assert_eq!(
-        right_final.cleanup_status,
-        SplitCleanupStatus::CompactionDone,
-        "right child should have CompactionDone status after cleanup"
-    );
-
     // Tenant routing should work correctly
-    let tenant_a = final_map.shard_for_tenant("a").unwrap();
-    let tenant_z = final_map.shard_for_tenant("z").unwrap();
+    let tenant_a = shard_map.shard_for_tenant("a").unwrap();
+    let tenant_z = shard_map.shard_for_tenant("z").unwrap();
     assert_eq!(tenant_a.id, split.left_child_id);
     assert_eq!(tenant_z.id, split.right_child_id);
 
@@ -1184,9 +1091,7 @@ mod splitter_unit_tests {
 
     use silo::coordination::CoordinationError;
     use silo::coordination::split::{ShardSplitter, SplitStorageBackend};
-    use silo::coordination::{
-        Coordinator, CoordinatorBase, MemberInfo, ShardOwnerMap, SplitCleanupStatus, SplitPhase,
-    };
+    use silo::coordination::{Coordinator, CoordinatorBase, MemberInfo, ShardOwnerMap, SplitPhase};
     use silo::factory::ShardFactory;
     use silo::shard_range::{ShardId, ShardMap, SplitInProgress};
 
@@ -1287,16 +1192,6 @@ mod splitter_unit_tests {
         }
 
         async fn reload_shard_map(&self) -> Result<(), CoordinationError> {
-            Ok(())
-        }
-
-        async fn update_cleanup_status_in_shard_map(
-            &self,
-            shard_id: ShardId,
-            status: SplitCleanupStatus,
-        ) -> Result<(), CoordinationError> {
-            let mut shard_map = self.base.shard_map.lock().await;
-            shard_map.update_cleanup_status(&shard_id, status)?;
             Ok(())
         }
 

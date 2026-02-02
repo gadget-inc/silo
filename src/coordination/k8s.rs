@@ -17,7 +17,7 @@ use crate::shard_range::{ShardId, ShardMap, SplitInProgress};
 use super::k8s_backend::{ConfigMapWatchEvent, K8sBackend, KubeBackend, LeaseWatchEvent};
 use super::{
     CoordinationError, Coordinator, CoordinatorBase, MemberInfo, ShardOwnerMap, ShardPhase,
-    SplitCleanupStatus, SplitStorageBackend, compute_desired_shards_for_node, get_hostname, keys,
+    SplitStorageBackend, compute_desired_shards_for_node, get_hostname, keys,
 };
 
 /// Format a chrono DateTime for K8S MicroTime (RFC3339 with microseconds and Z suffix)
@@ -959,114 +959,6 @@ impl<B: K8sBackend> K8sCoordinator<B> {
             max_retries
         )))
     }
-
-    /// Try to update cleanup status in the shard map (single attempt).
-    async fn try_update_cleanup_status_in_shard_map(
-        &self,
-        shard_id: ShardId,
-        status: SplitCleanupStatus,
-    ) -> Result<(), CoordinationError> {
-        let configmap_name = format!("{}-shard-map", self.cluster_prefix);
-
-        // Read current shard map
-        let existing = self
-            .backend
-            .get_configmap(&self.namespace, &configmap_name)
-            .await?
-            .ok_or_else(|| {
-                CoordinationError::BackendError("shard map ConfigMap not found".into())
-            })?;
-
-        let current_rv = existing.metadata.resource_version.as_ref().ok_or_else(|| {
-            CoordinationError::BackendError("no resourceVersion on shard map".into())
-        })?;
-
-        let data = existing
-            .data
-            .as_ref()
-            .and_then(|d| d.get("shard_map.json"))
-            .ok_or_else(|| {
-                CoordinationError::BackendError("shard map ConfigMap has no data".into())
-            })?;
-
-        let mut shard_map: ShardMap = serde_json::from_str(data)
-            .map_err(|e| CoordinationError::BackendError(format!("invalid shard map: {}", e)))?;
-
-        // Update cleanup status
-        shard_map.update_cleanup_status(&shard_id, status)?;
-
-        let new_map_json = serde_json::to_string(&shard_map)
-            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
-
-        // Use replace with resourceVersion for CAS
-        let updated_cm = ConfigMap {
-            metadata: kube::api::ObjectMeta {
-                name: Some(configmap_name.clone()),
-                namespace: Some(self.namespace.clone()),
-                resource_version: Some(current_rv.clone()),
-                uid: existing.metadata.uid.clone(),
-                labels: existing.metadata.labels.clone(),
-                ..Default::default()
-            },
-            data: Some([("shard_map.json".to_string(), new_map_json)].into()),
-            ..Default::default()
-        };
-
-        match self
-            .backend
-            .replace_configmap(&self.namespace, &configmap_name, &updated_cm)
-            .await
-        {
-            Ok(_) => {
-                // Update local shard map
-                *self.base.shard_map.lock().await = shard_map;
-
-                debug!(shard_id = %shard_id, status = %status, "cleanup status updated (k8s)");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Update cleanup status in the shard map with retry logic.
-    async fn update_cleanup_status_in_shard_map(
-        &self,
-        shard_id: ShardId,
-        status: SplitCleanupStatus,
-    ) -> Result<(), CoordinationError> {
-        // Retry with exponential backoff to handle concurrent modifications
-        // (e.g., another cleanup task or split operation updating the shard map)
-        let max_retries = 10;
-        let mut delay = Duration::from_millis(10);
-
-        for attempt in 0..max_retries {
-            match self
-                .try_update_cleanup_status_in_shard_map(shard_id, status)
-                .await
-            {
-                Ok(()) => return Ok(()),
-                Err(CoordinationError::BackendError(msg))
-                    if msg.contains("CAS conflict: resourceVersion mismatch") =>
-                {
-                    if attempt < max_retries - 1 {
-                        debug!(
-                            shard_id = %shard_id,
-                            attempt = attempt,
-                            "cleanup status update hit CAS conflict, retrying"
-                        );
-                        tokio::time::sleep(delay).await;
-                        delay = std::cmp::min(delay * 2, Duration::from_secs(1));
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        Err(CoordinationError::BackendError(format!(
-            "failed to update cleanup status after {} retries",
-            max_retries
-        )))
-    }
 }
 
 #[async_trait]
@@ -1149,14 +1041,6 @@ impl<B: K8sBackend> SplitStorageBackend for K8sCoordinator<B> {
 
     async fn reload_shard_map(&self) -> Result<(), CoordinationError> {
         K8sCoordinator::reload_shard_map(self).await
-    }
-
-    async fn update_cleanup_status_in_shard_map(
-        &self,
-        shard_id: ShardId,
-        status: SplitCleanupStatus,
-    ) -> Result<(), CoordinationError> {
-        K8sCoordinator::update_cleanup_status_in_shard_map(self, shard_id, status).await
     }
 
     async fn list_all_splits(&self) -> Result<Vec<SplitInProgress>, CoordinationError> {
@@ -1436,7 +1320,7 @@ impl<B: K8sBackend> K8sShardGuard<B> {
         owned_arc: Arc<Mutex<HashSet<ShardId>>>,
         factory: Arc<ShardFactory>,
         shard_map: Arc<Mutex<ShardMap>>,
-        coordinator: Arc<dyn Coordinator>,
+        _coordinator: Arc<dyn Coordinator>,
     ) {
         let lease_name = self.lease_name();
 
@@ -1484,11 +1368,11 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                         // Try to acquire the lease with CAS semantics
                         match self.try_acquire_lease_cas(&lease_name).await {
                             Ok((rv, uid)) => {
-                                // Look up the shard's range and cleanup status from the shard map
-                                let (range, cleanup_status) = {
+                                // Look up the shard's range from the shard map
+                                let range = {
                                     let map = shard_map.lock().await;
                                     match map.get_shard(&self.shard_id) {
-                                        Some(info) => (info.range.clone(), info.cleanup_status),
+                                        Some(info) => info.range.clone(),
                                         None => {
                                             tracing::error!(shard_id = %self.shard_id, "shard not found in shard map");
                                             let _ = self.release_lease_cas(&lease_name).await;
@@ -1498,7 +1382,7 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                                 };
                                 // Open the shard BEFORE marking as Held - if open fails,
                                 // we should release the lease and not claim ownership.
-                                let shard = match factory.open(&self.shard_id, &range).await {
+                                let _shard = match factory.open(&self.shard_id, &range).await {
                                     Ok(shard) => shard,
                                     Err(e) => {
                                         // Failed to open - release the lease and retry
@@ -1511,15 +1395,6 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                                         continue;
                                     }
                                 };
-
-                                // Dispatch cleanup asynchronously if needed
-                                crate::coordination::split::maybe_spawn_cleanup(
-                                    self.shard_id,
-                                    &range,
-                                    cleanup_status,
-                                    &shard,
-                                    Arc::clone(&coordinator),
-                                );
 
                                 {
                                     let mut st = self.state.lock().await;

@@ -4,8 +4,9 @@
 //! This module provides methods to:
 //! - Delete keys that don't belong in this shard's range
 //! - Run compaction to reclaim storage space from deleted keys
-//! - Track cleanup progress for crash recovery
+//! - Track cleanup progress and status for crash recovery
 
+use crate::coordination::SplitCleanupStatus;
 use crate::keys::{decode_tenant, tasks_prefix};
 use crate::shard_range::ShardRange;
 use slatedb::WriteBatch;
@@ -27,11 +28,7 @@ const TENANT_PREFIXED_KEYS: &[&str] = &[
     "idx/meta/",
 ];
 
-/// Key for storing cleanup progress checkpoint.
-const CLEANUP_PROGRESS_KEY: &str = "_silo_cleanup/progress";
-
-/// Key for storing cleanup completion marker.
-const CLEANUP_COMPLETE_KEY: &str = "_silo_cleanup/complete";
+use crate::keys;
 
 /// Progress tracking for cleanup operation.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -82,6 +79,10 @@ impl JobStoreShard {
             });
         }
 
+        // Update status to CleanupRunning when starting
+        self.set_cleanup_status(SplitCleanupStatus::CleanupRunning)
+            .await?;
+
         info!(
             shard = %self.name,
             range = %range,
@@ -109,6 +110,11 @@ impl JobStoreShard {
         // Mark cleanup as complete
         progress.complete = true;
         self.save_split_cleanup_progress(&progress).await?;
+
+        // Update status to CleanupDone and record completion timestamp
+        self.set_cleanup_status(SplitCleanupStatus::CleanupDone)
+            .await?;
+        self.set_cleanup_completed_at_ms().await?;
 
         info!(
             shard = %self.name,
@@ -330,7 +336,7 @@ impl JobStoreShard {
 
     /// Load cleanup progress from the database.
     async fn load_split_cleanup_progress(&self) -> Result<CleanupProgress, JobStoreShardError> {
-        match self.db.get(CLEANUP_PROGRESS_KEY.as_bytes()).await? {
+        match self.db.get(keys::cleanup_progress_key().as_bytes()).await? {
             Some(data) => {
                 let progress: CleanupProgress = serde_json::from_slice(&data)?;
                 Ok(progress)
@@ -345,15 +351,17 @@ impl JobStoreShard {
         progress: &CleanupProgress,
     ) -> Result<(), JobStoreShardError> {
         let data = serde_json::to_vec(progress)?;
-        self.db.put(CLEANUP_PROGRESS_KEY.as_bytes(), &data).await?;
+        self.db
+            .put(keys::cleanup_progress_key().as_bytes(), &data)
+            .await?;
         Ok(())
     }
 
     /// Clear cleanup progress markers (called after compaction completes).
     pub async fn clear_cleanup_progress(&self) -> Result<(), JobStoreShardError> {
         let mut batch = WriteBatch::new();
-        batch.delete(CLEANUP_PROGRESS_KEY.as_bytes());
-        batch.delete(CLEANUP_COMPLETE_KEY.as_bytes());
+        batch.delete(keys::cleanup_progress_key().as_bytes());
+        batch.delete(keys::cleanup_complete_key().as_bytes());
         self.db.write(batch).await?;
         Ok(())
     }
@@ -385,6 +393,10 @@ impl JobStoreShard {
         // Clear cleanup progress markers since we're done
         self.clear_cleanup_progress().await?;
 
+        // Set status to CompactionDone - cleanup is fully complete
+        self.set_cleanup_status(SplitCleanupStatus::CompactionDone)
+            .await?;
+
         Ok(())
     }
 
@@ -401,6 +413,103 @@ impl JobStoreShard {
     pub async fn is_split_cleanup_complete(&self) -> Result<bool, JobStoreShardError> {
         let progress = self.load_split_cleanup_progress().await?;
         Ok(progress.complete)
+    }
+
+    /// Get the cleanup status stored in this shard's database.
+    ///
+    /// This is the authoritative source of truth for the shard's cleanup state.
+    /// Returns `CompactionDone` if no status has been set (e.g., for shards that
+    /// were not created by a split).
+    pub async fn get_cleanup_status(&self) -> Result<SplitCleanupStatus, JobStoreShardError> {
+        match self.db.get(keys::cleanup_status_key().as_bytes()).await? {
+            Some(data) => {
+                let status: SplitCleanupStatus = serde_json::from_slice(&data)?;
+                Ok(status)
+            }
+            None => Ok(SplitCleanupStatus::CompactionDone),
+        }
+    }
+
+    /// Set the cleanup status in this shard's database.
+    ///
+    /// This updates the authoritative cleanup status for this shard.
+    pub async fn set_cleanup_status(
+        &self,
+        status: SplitCleanupStatus,
+    ) -> Result<(), JobStoreShardError> {
+        let data = serde_json::to_vec(&status)?;
+        self.db
+            .put(keys::cleanup_status_key().as_bytes(), &data)
+            .await?;
+        Ok(())
+    }
+
+    /// Get the timestamp (ms) when this shard was first created/initialized.
+    /// Returns None if not set (e.g., older shards without this metadata).
+    pub async fn get_created_at_ms(&self) -> Result<Option<i64>, JobStoreShardError> {
+        match self.db.get(keys::shard_created_at_key().as_bytes()).await? {
+            Some(data) => {
+                let ts: i64 = serde_json::from_slice(&data)?;
+                Ok(Some(ts))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Set the shard creation timestamp. Only sets it if not already set.
+    /// This should be called when the shard is first opened/created.
+    pub async fn set_created_at_ms_if_unset(&self) -> Result<(), JobStoreShardError> {
+        // Check if already set
+        if self
+            .db
+            .get(keys::shard_created_at_key().as_bytes())
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        let data = serde_json::to_vec(&now_ms)?;
+        self.db
+            .put(keys::shard_created_at_key().as_bytes(), &data)
+            .await?;
+        Ok(())
+    }
+
+    /// Get the timestamp (ms) when cleanup completed for this shard.
+    /// Returns None if cleanup hasn't completed or this isn't a split child.
+    pub async fn get_cleanup_completed_at_ms(&self) -> Result<Option<i64>, JobStoreShardError> {
+        match self
+            .db
+            .get(keys::cleanup_completed_at_key().as_bytes())
+            .await?
+        {
+            Some(data) => {
+                let ts: i64 = serde_json::from_slice(&data)?;
+                Ok(Some(ts))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Set the cleanup completion timestamp to now.
+    /// Called when cleanup finishes successfully.
+    pub async fn set_cleanup_completed_at_ms(&self) -> Result<(), JobStoreShardError> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        let data = serde_json::to_vec(&now_ms)?;
+        self.db
+            .put(keys::cleanup_completed_at_key().as_bytes(), &data)
+            .await?;
+        Ok(())
     }
 }
 

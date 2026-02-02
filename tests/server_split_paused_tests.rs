@@ -11,8 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use silo::coordination::{
-    CoordinationError, Coordinator, CoordinatorBase, MemberInfo, ShardOwnerMap, SplitCleanupStatus,
-    SplitStorageBackend,
+    CoordinationError, Coordinator, CoordinatorBase, MemberInfo, ShardOwnerMap, SplitStorageBackend,
 };
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
@@ -130,14 +129,6 @@ impl SplitStorageBackend for MockPausedCoordinator {
 
     async fn reload_shard_map(&self) -> Result<(), CoordinationError> {
         Ok(())
-    }
-
-    async fn update_cleanup_status_in_shard_map(
-        &self,
-        _shard_id: ShardId,
-        _status: SplitCleanupStatus,
-    ) -> Result<(), CoordinationError> {
-        Err(CoordinationError::NotSupported)
     }
 
     async fn list_all_splits(&self) -> Result<Vec<SplitInProgress>, CoordinationError> {

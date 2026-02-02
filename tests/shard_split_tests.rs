@@ -228,19 +228,17 @@ fn shard_range_midpoint_can_be_used_for_split() {
 }
 
 #[test]
-fn shard_info_new_has_compaction_done_status() {
+fn shard_info_new_has_no_parent() {
     let info = ShardInfo::new(ShardId::new(), ShardRange::full());
-    assert_eq!(info.cleanup_status, SplitCleanupStatus::CompactionDone);
     assert!(info.parent_shard_id.is_none());
 }
 
 #[test]
-fn shard_info_from_split_has_cleanup_pending_status() {
+fn shard_info_from_split_has_parent_reference() {
     let parent_id = ShardId::new();
     let info = ShardInfo::from_split(ShardId::new(), ShardRange::new("a", "m"), parent_id);
 
-    // [SILO-SPLIT-CLEANUP-START-1] Children from split have CleanupPending
-    assert_eq!(info.cleanup_status, SplitCleanupStatus::CleanupPending);
+    // Children from split have reference to their parent
     assert_eq!(info.parent_shard_id, Some(parent_id));
 }
 
@@ -282,10 +280,6 @@ fn shard_map_split_shard_basic() {
     // Children should have parent reference
     assert_eq!(left.parent_shard_id, Some(original_shard_id));
     assert_eq!(right.parent_shard_id, Some(original_shard_id));
-
-    // Children should have CleanupPending status
-    assert_eq!(left.cleanup_status, SplitCleanupStatus::CleanupPending);
-    assert_eq!(right.cleanup_status, SplitCleanupStatus::CleanupPending);
 }
 
 #[test]
@@ -395,72 +389,6 @@ fn shard_map_sequential_splits() {
 }
 
 #[test]
-fn shard_map_update_cleanup_status() {
-    let mut map = ShardMap::create_initial(1).expect("create initial map");
-    let shard_id = map.shards()[0].id;
-    let left_id = ShardId::new();
-
-    map.split_shard(&shard_id, "m", left_id, ShardId::new())
-        .expect("split should succeed");
-
-    // Child should start with CleanupPending
-    assert_eq!(
-        map.get_shard(&left_id).unwrap().cleanup_status,
-        SplitCleanupStatus::CleanupPending
-    );
-
-    // Update to CleanupRunning
-    map.update_cleanup_status(&left_id, SplitCleanupStatus::CleanupRunning)
-        .expect("update should succeed");
-    assert_eq!(
-        map.get_shard(&left_id).unwrap().cleanup_status,
-        SplitCleanupStatus::CleanupRunning
-    );
-
-    // Update to CleanupDone
-    map.update_cleanup_status(&left_id, SplitCleanupStatus::CleanupDone)
-        .expect("update should succeed");
-    assert_eq!(
-        map.get_shard(&left_id).unwrap().cleanup_status,
-        SplitCleanupStatus::CleanupDone
-    );
-
-    // Update to CompactionDone
-    map.update_cleanup_status(&left_id, SplitCleanupStatus::CompactionDone)
-        .expect("update should succeed");
-    assert_eq!(
-        map.get_shard(&left_id).unwrap().cleanup_status,
-        SplitCleanupStatus::CompactionDone
-    );
-}
-
-#[test]
-fn shard_map_shards_needing_cleanup() {
-    let mut map = ShardMap::create_initial(1).expect("create initial map");
-    let shard_id = map.shards()[0].id;
-
-    // Initially no shards need cleanup
-    assert!(map.shards_needing_cleanup().is_empty());
-
-    // After split, both children need cleanup
-    let left_id = ShardId::new();
-    let right_id = ShardId::new();
-    map.split_shard(&shard_id, "m", left_id, right_id)
-        .expect("split should succeed");
-
-    let needing_cleanup = map.shards_needing_cleanup();
-    assert_eq!(needing_cleanup.len(), 2);
-
-    // Complete cleanup on one shard
-    map.update_cleanup_status(&left_id, SplitCleanupStatus::CompactionDone)
-        .expect("update should succeed");
-
-    let needing_cleanup = map.shards_needing_cleanup();
-    assert_eq!(needing_cleanup.len(), 1);
-    assert_eq!(needing_cleanup[0].id, right_id);
-}
-
-#[test]
 fn cleanup_status_serialization_roundtrip() {
     let statuses = [
         SplitCleanupStatus::CleanupPending,
@@ -513,31 +441,14 @@ fn split_in_progress_serialization_roundtrip() {
 }
 
 #[test]
-fn shard_info_with_cleanup_status_serialization() {
-    let info = ShardInfo::from_split(ShardId::new(), ShardRange::new("a", "m"), ShardId::new());
+fn shard_info_serialization_with_parent() {
+    let parent_id = ShardId::new();
+    let info = ShardInfo::from_split(ShardId::new(), ShardRange::new("a", "m"), parent_id);
 
     let json = serde_json::to_string(&info).expect("serialize");
     let deserialized: ShardInfo = serde_json::from_str(&json).expect("deserialize");
 
-    assert_eq!(info.cleanup_status, deserialized.cleanup_status);
     assert_eq!(info.parent_shard_id, deserialized.parent_shard_id);
-}
-
-#[test]
-fn shard_info_default_cleanup_status_on_deserialize() {
-    // Simulate old JSON without cleanup_status field
-    let json = r#"{
-        "id": "00000000-0000-0000-0000-000000000001",
-        "range": {"start": "", "end": ""},
-        "created_at_ms": 0,
-        "parent_shard_id": null
-    }"#;
-
-    let deserialized: ShardInfo = serde_json::from_str(json).expect("deserialize");
-
-    // Should default to CompactionDone (backward compatible)
-    assert_eq!(
-        deserialized.cleanup_status,
-        SplitCleanupStatus::CompactionDone
-    );
+    assert_eq!(info.id, deserialized.id);
+    assert_eq!(info.range, deserialized.range);
 }

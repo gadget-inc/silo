@@ -247,6 +247,9 @@ impl JobStoreShard {
             metrics,
         });
 
+        // Set the shard creation timestamp if this is the first time opening
+        shard.set_created_at_ms_if_unset().await?;
+
         Ok(shard)
     }
 

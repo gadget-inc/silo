@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
 
-use crate::coordination::{SplitCleanupStatus, SplitPhase};
+use crate::coordination::SplitPhase;
 
 /// A unique identifier for a shard.
 ///
@@ -281,9 +281,6 @@ pub struct ShardInfo {
     pub created_at_ms: i64,
     /// If this shard was created by splitting another shard, the parent's ID.
     pub parent_shard_id: Option<ShardId>,
-    /// Cleanup status for post-split data cleanup.
-    #[serde(default)]
-    pub cleanup_status: SplitCleanupStatus,
 }
 
 impl ShardInfo {
@@ -297,7 +294,6 @@ impl ShardInfo {
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0),
             parent_shard_id: None,
-            cleanup_status: SplitCleanupStatus::CompactionDone,
         }
     }
 
@@ -308,12 +304,11 @@ impl ShardInfo {
             range,
             created_at_ms,
             parent_shard_id: None,
-            cleanup_status: SplitCleanupStatus::CompactionDone,
         }
     }
 
     /// Create a new shard info that was split from a parent.
-    /// The new shard has CleanupPending status since it needs to clean defunct data.
+    /// Note: The cleanup status is stored in the shard's database, not in the shard map.
     pub fn from_split(id: ShardId, range: ShardRange, parent_id: ShardId) -> Self {
         Self {
             id,
@@ -323,7 +318,6 @@ impl ShardInfo {
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0),
             parent_shard_id: Some(parent_id),
-            cleanup_status: SplitCleanupStatus::CleanupPending,
         }
     }
 
@@ -602,9 +596,8 @@ impl ShardMap {
     /// This removes the parent shard and replaces it with two child shards
     /// whose ranges are [parent_start, split_point) and [split_point, parent_end).
     ///
-    /// The children are created with:
-    /// - CleanupPending status (they need to clean defunct data)
-    /// - parent_shard_id set to the parent's ID
+    /// The children are created with parent_shard_id set to the parent's ID.
+    /// Note: Cleanup status is stored in each shard's database, not in the shard map.
     ///
     /// # Returns
     /// Returns `(left_child_info, right_child_info)` on success.
@@ -631,7 +624,7 @@ impl ShardMap {
         // [SILO-COORD-INV-2] Compute child ranges
         let (left_range, right_range) = parent.range.split(split_point)?;
 
-        // Create child shards with CleanupPending status
+        // Create child shards
         let left_child = ShardInfo::from_split(left_child_id, left_range, *parent_id);
         let right_child = ShardInfo::from_split(right_child_id, right_range, *parent_id);
 
@@ -648,33 +641,6 @@ impl ShardMap {
         self.validate()?;
 
         Ok((left_child, right_child))
-    }
-
-    /// Update the cleanup status for a shard.
-    ///
-    /// Used during post-split cleanup to track progress.
-    pub fn update_cleanup_status(
-        &mut self,
-        shard_id: &ShardId,
-        status: SplitCleanupStatus,
-    ) -> Result<(), ShardMapError> {
-        let shard = self
-            .shards
-            .iter_mut()
-            .find(|s| &s.id == shard_id)
-            .ok_or(ShardMapError::ShardNotFound(*shard_id))?;
-
-        shard.cleanup_status = status;
-        self.version += 1;
-        Ok(())
-    }
-
-    /// Get all shards that need cleanup (CleanupPending or CleanupRunning).
-    pub fn shards_needing_cleanup(&self) -> Vec<&ShardInfo> {
-        self.shards
-            .iter()
-            .filter(|s| s.cleanup_status.needs_work())
-            .collect()
     }
 }
 

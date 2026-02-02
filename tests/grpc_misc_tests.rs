@@ -467,25 +467,33 @@ async fn grpc_server_report_refresh_outcome_missing_outcome() -> anyhow::Result<
     Ok(())
 }
 
-/// Test that GetShardCounters returns correct counts for empty shard
+/// Test that GetNodeInfo returns correct counts for empty shard
 #[silo::test(flavor = "multi_thread")]
-async fn grpc_server_get_shard_counters_empty() -> anyhow::Result<()> {
+async fn grpc_server_get_node_info_empty() -> anyhow::Result<()> {
     let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
         let (factory, _tmp) = create_test_factory().await?;
         let (mut client, shutdown_tx, server, _addr) =
             setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
 
-        // Get counters for empty shard
+        // Get node info
         let resp = client
-            .get_shard_counters(GetShardCountersRequest {
-                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
-            })
+            .get_node_info(GetNodeInfoRequest {})
             .await?
             .into_inner();
 
-        assert_eq!(resp.total_jobs, 0, "empty shard should have 0 total_jobs");
+        // Find our test shard
+        let test_shard = resp
+            .owned_shards
+            .iter()
+            .find(|s| s.shard_id == crate::grpc_integration_helpers::TEST_SHARD_ID.to_string())
+            .expect("test shard should be in owned_shards");
+
         assert_eq!(
-            resp.completed_jobs, 0,
+            test_shard.total_jobs, 0,
+            "empty shard should have 0 total_jobs"
+        );
+        assert_eq!(
+            test_shard.completed_jobs, 0,
             "empty shard should have 0 completed_jobs"
         );
 
@@ -497,28 +505,39 @@ async fn grpc_server_get_shard_counters_empty() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Test that GetShardCounters correctly tracks job lifecycle
+/// Helper to get counters for a specific shard from GetNodeInfo response
+fn get_shard_counters_from_node_info(resp: &GetNodeInfoResponse, shard_id: &str) -> (i64, i64) {
+    let shard = resp
+        .owned_shards
+        .iter()
+        .find(|s| s.shard_id == shard_id)
+        .expect("shard should be in owned_shards");
+    (shard.total_jobs, shard.completed_jobs)
+}
+
+/// Test that GetNodeInfo correctly tracks job lifecycle
 #[silo::test(flavor = "multi_thread")]
-async fn grpc_server_get_shard_counters_tracks_lifecycle() -> anyhow::Result<()> {
+async fn grpc_server_get_node_info_tracks_lifecycle() -> anyhow::Result<()> {
     let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
         let (factory, _tmp) = create_test_factory().await?;
         let (mut client, shutdown_tx, server, _addr) =
             setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
 
+        let test_shard_id = crate::grpc_integration_helpers::TEST_SHARD_ID.to_string();
+
         // Initially empty
         let resp = client
-            .get_shard_counters(GetShardCountersRequest {
-                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
-            })
+            .get_node_info(GetNodeInfoRequest {})
             .await?
             .into_inner();
-        assert_eq!(resp.total_jobs, 0);
-        assert_eq!(resp.completed_jobs, 0);
+        let (total, completed) = get_shard_counters_from_node_info(&resp, &test_shard_id);
+        assert_eq!(total, 0);
+        assert_eq!(completed, 0);
 
         // Enqueue a job
         let enq_resp = client
             .enqueue(EnqueueRequest {
-                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                shard: test_shard_id.clone(),
                 id: "test-job-1".to_string(),
                 priority: 5,
                 start_at_ms: 0,
@@ -539,21 +558,20 @@ async fn grpc_server_get_shard_counters_tracks_lifecycle() -> anyhow::Result<()>
 
         // Check counters after enqueue
         let resp = client
-            .get_shard_counters(GetShardCountersRequest {
-                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
-            })
+            .get_node_info(GetNodeInfoRequest {})
             .await?
             .into_inner();
-        assert_eq!(resp.total_jobs, 1, "should have 1 total job after enqueue");
+        let (total, completed) = get_shard_counters_from_node_info(&resp, &test_shard_id);
+        assert_eq!(total, 1, "should have 1 total job after enqueue");
         assert_eq!(
-            resp.completed_jobs, 0,
+            completed, 0,
             "should have 0 completed jobs (still scheduled)"
         );
 
         // Enqueue another job
         let _ = client
             .enqueue(EnqueueRequest {
-                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                shard: test_shard_id.clone(),
                 id: "test-job-2".to_string(),
                 priority: 5,
                 start_at_ms: 0,
@@ -572,18 +590,17 @@ async fn grpc_server_get_shard_counters_tracks_lifecycle() -> anyhow::Result<()>
 
         // Check counters after second enqueue
         let resp = client
-            .get_shard_counters(GetShardCountersRequest {
-                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
-            })
+            .get_node_info(GetNodeInfoRequest {})
             .await?
             .into_inner();
-        assert_eq!(resp.total_jobs, 2, "should have 2 total jobs");
-        assert_eq!(resp.completed_jobs, 0, "should have 0 completed jobs");
+        let (total, completed) = get_shard_counters_from_node_info(&resp, &test_shard_id);
+        assert_eq!(total, 2, "should have 2 total jobs");
+        assert_eq!(completed, 0, "should have 0 completed jobs");
 
         // Lease and complete a job
         let lease_resp = client
             .lease_tasks(LeaseTasksRequest {
-                shard: Some(crate::grpc_integration_helpers::TEST_SHARD_ID.to_string()),
+                shard: Some(test_shard_id.clone()),
                 worker_id: "test-worker".to_string(),
                 max_tasks: 1,
                 task_group: "default".to_string(),
@@ -595,7 +612,7 @@ async fn grpc_server_get_shard_counters_tracks_lifecycle() -> anyhow::Result<()>
         let task = &lease_resp.tasks[0];
         client
             .report_outcome(ReportOutcomeRequest {
-                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                shard: test_shard_id.clone(),
                 task_id: task.id.clone(),
                 outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
                     encoding: Some(serialized_bytes::Encoding::Msgpack(
@@ -607,24 +624,20 @@ async fn grpc_server_get_shard_counters_tracks_lifecycle() -> anyhow::Result<()>
 
         // Check counters after completion
         let resp = client
-            .get_shard_counters(GetShardCountersRequest {
-                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
-            })
+            .get_node_info(GetNodeInfoRequest {})
             .await?
             .into_inner();
+        let (total, completed) = get_shard_counters_from_node_info(&resp, &test_shard_id);
         assert_eq!(
-            resp.total_jobs, 2,
+            total, 2,
             "should still have 2 total jobs (completed jobs count toward total)"
         );
-        assert_eq!(
-            resp.completed_jobs, 1,
-            "should have 1 completed job after success"
-        );
+        assert_eq!(completed, 1, "should have 1 completed job after success");
 
         // Delete the completed job
         client
             .delete_job(DeleteJobRequest {
-                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                shard: test_shard_id.clone(),
                 id: task.job_id.clone(),
                 tenant: None,
             })
@@ -632,14 +645,13 @@ async fn grpc_server_get_shard_counters_tracks_lifecycle() -> anyhow::Result<()>
 
         // Check counters after deletion
         let resp = client
-            .get_shard_counters(GetShardCountersRequest {
-                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
-            })
+            .get_node_info(GetNodeInfoRequest {})
             .await?
             .into_inner();
-        assert_eq!(resp.total_jobs, 1, "should have 1 total job after deletion");
+        let (total, completed) = get_shard_counters_from_node_info(&resp, &test_shard_id);
+        assert_eq!(total, 1, "should have 1 total job after deletion");
         assert_eq!(
-            resp.completed_jobs, 0,
+            completed, 0,
             "should have 0 completed jobs after deleting the completed one"
         );
 

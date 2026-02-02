@@ -10,8 +10,6 @@ use tracing::{debug, error, info, warn};
 use crate::factory::ShardFactory;
 use crate::shard_range::{ShardId, ShardMap, SplitInProgress};
 
-use super::SplitCleanupStatus;
-
 // Re-export ShardPhase for backwards compatibility (tests reference it from here)
 pub use super::ShardPhase;
 
@@ -698,70 +696,6 @@ impl SplitStorageBackend for EtcdCoordinator {
         EtcdCoordinator::reload_shard_map(self).await
     }
 
-    async fn update_cleanup_status_in_shard_map(
-        &self,
-        shard_id: ShardId,
-        status: SplitCleanupStatus,
-    ) -> Result<(), CoordinationError> {
-        let shard_map_key = keys::shard_map_key(&self.cluster_prefix);
-
-        // Read current shard map
-        let resp = self
-            .client
-            .kv_client()
-            .get(shard_map_key.clone(), None)
-            .await
-            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
-
-        let kv = resp
-            .kvs()
-            .first()
-            .ok_or_else(|| CoordinationError::BackendError("shard map not found".to_string()))?;
-
-        let current_version = kv.mod_revision();
-        let value = String::from_utf8_lossy(kv.value());
-        let mut shard_map: ShardMap = serde_json::from_str(&value)
-            .map_err(|e| CoordinationError::BackendError(format!("invalid shard map: {}", e)))?;
-
-        // Update cleanup status
-        shard_map.update_cleanup_status(&shard_id, status)?;
-
-        let new_map_json = serde_json::to_string(&shard_map)
-            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
-
-        // Use CAS to update atomically
-        let txn = etcd_client::Txn::new()
-            .when([etcd_client::Compare::mod_revision(
-                shard_map_key.clone(),
-                etcd_client::CompareOp::Equal,
-                current_version,
-            )])
-            .and_then([etcd_client::TxnOp::put(
-                shard_map_key.clone(),
-                new_map_json,
-                None,
-            )]);
-
-        let txn_resp = self
-            .client
-            .kv_client()
-            .txn(txn)
-            .await
-            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
-
-        if !txn_resp.succeeded() {
-            return Err(CoordinationError::BackendError(
-                "shard map was modified concurrently".to_string(),
-            ));
-        }
-
-        // Update local shard map
-        *self.base.shard_map.lock().await = shard_map;
-
-        debug!(shard_id = %shard_id, status = %status, "cleanup status updated");
-        Ok(())
-    }
-
     async fn list_all_splits(&self) -> Result<Vec<SplitInProgress>, CoordinationError> {
         let splits_prefix = keys::splits_prefix(&self.cluster_prefix);
         let resp = self
@@ -955,7 +889,7 @@ impl EtcdShardGuard {
         owned_arc: Arc<Mutex<HashSet<ShardId>>>,
         factory: Arc<ShardFactory>,
         shard_map: Arc<Mutex<ShardMap>>,
-        coordinator: Arc<dyn Coordinator>,
+        _coordinator: Arc<dyn Coordinator>,
     ) {
         use tracing::{Instrument, info_span};
 
@@ -1071,11 +1005,11 @@ impl EtcdShardGuard {
                                         }
                                     });
 
-                                    // Look up the shard's range and cleanup status from the shard map
-                                    let (range, cleanup_status) = {
+                                    // Look up the shard's range from the shard map
+                                    let range = {
                                         let map = shard_map.lock().await;
                                         match map.get_shard(&self.shard_id) {
-                                            Some(info) => (info.range.clone(), info.cleanup_status),
+                                            Some(info) => info.range.clone(),
                                             None => {
                                                 tracing::error!(shard_id = %self.shard_id, "shard not found in shard map");
                                                 let mut lock_cli = self.client.lock_client();
@@ -1085,7 +1019,7 @@ impl EtcdShardGuard {
                                         }
                                     };
                                     // Open the shard BEFORE marking as Held - if open fails, we should release the lock and not claim ownership.
-                                    let shard = match factory.open(&self.shard_id, &range).await {
+                                    let _shard = match factory.open(&self.shard_id, &range).await {
                                         Ok(shard) => shard,
                                         Err(e) => {
                                             // Failed to open - release the lock and retry
@@ -1099,15 +1033,6 @@ impl EtcdShardGuard {
                                             continue;
                                         }
                                     };
-
-                                    // Dispatch cleanup asynchronously if needed
-                                    crate::coordination::split::maybe_spawn_cleanup(
-                                        self.shard_id,
-                                        &range,
-                                        cleanup_status,
-                                        &shard,
-                                        Arc::clone(&coordinator),
-                                    );
 
                                     {
                                         let mut st = self.state.lock().await;
