@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 /**
- * Validates that all SILO-* tags found in the Alloy model exist in the Rust
- * implementation, and vice versa.
+ * Validates that all SILO-* sigils found in the Alloy model exist in the Rust implementation, and vice versa.
  *
- * Usage: node scripts/validate-silo-tags.js
+ * Usage: node scripts/validate-silo-sigils.js
  */
 
 const fs = require("fs");

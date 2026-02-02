@@ -138,7 +138,7 @@ impl ShardRange {
     /// # Errors
     /// Returns an error if the split point is not strictly within the range.
     pub fn split(&self, split_point: &str) -> Result<(ShardRange, ShardRange), ShardMapError> {
-        // [SILO-RANGE-1] Validate that split_point is within this range
+        // Validate that split_point is within this range
         if !self.contains(split_point) {
             return Err(ShardMapError::InvalidSplitPoint(format!(
                 "split point '{}' is not within range {}",
@@ -387,13 +387,16 @@ impl SplitInProgress {
         }
     }
 
-    /// Advance to the next phase.
+    /// [SILO-COORD-INV-9] Advance to the next phase.
+    ///
+    /// Split phases only progress forward: SplitRequested -> SplitPausing ->
+    /// SplitCloning -> SplitComplete. There is no way to regress to an earlier
+    /// phase. SplitComplete is terminal.
     pub fn advance_phase(&mut self) {
         self.phase = match self.phase {
             SplitPhase::SplitRequested => SplitPhase::SplitPausing,
             SplitPhase::SplitPausing => SplitPhase::SplitCloning,
-            SplitPhase::SplitCloning => SplitPhase::SplitUpdatingMap,
-            SplitPhase::SplitUpdatingMap => SplitPhase::SplitComplete,
+            SplitPhase::SplitCloning => SplitPhase::SplitComplete,
             SplitPhase::SplitComplete => SplitPhase::SplitComplete, // Terminal
         };
     }
@@ -614,10 +617,14 @@ impl ShardMap {
         map
     }
 
-    /// [SILO-SPLIT-MAP-1] Atomically split a shard into two children.
+    /// [SILO-COORD-INV-12] Atomically split a shard into two children.
     ///
     /// This removes the parent shard and replaces it with two child shards
     /// whose ranges are [parent_start, split_point) and [split_point, parent_end).
+    ///
+    /// Once children are added to the shard map, they persist indefinitely - there
+    /// is no operation to delete a shard from the map. This ensures that committed
+    /// splits cannot be undone and the children remain available.
     ///
     /// The children are created with parent_shard_id set to the parent's ID.
     /// Note: Cleanup status is stored in each shard's database, not in the shard map.

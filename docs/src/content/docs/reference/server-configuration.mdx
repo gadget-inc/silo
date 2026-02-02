@@ -408,9 +408,9 @@ For example:
 
 ```toml
 [database]
-# If DATABASE_PATH is set to "/data/silo", this becomes "/data/silo/shard-%shard%"
-# If DATABASE_PATH is not set, this becomes "/var/lib/silo/shard-%shard%"
-path = "${DATABASE_PATH:-/var/lib/silo}/shard-%shard%"
+# If DATABASE_PATH is set to "/data/silo", this becomes "/data/silo/%shard%"
+# If DATABASE_PATH is not set, this becomes "/var/lib/silo/%shard%"
+path = "${DATABASE_PATH:-/var/lib/silo}/%shard%"
 ```
 
 ### Substituting pod IPs in for advertised_grpc_addr in Kubernetes

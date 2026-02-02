@@ -255,7 +255,7 @@ impl SiloService {
         shard_id: &crate::shard_range::ShardId,
     ) -> Result<Arc<JobStoreShard>, Status> {
         if let Some(shard) = self.factory.get(shard_id) {
-            // [SILO-ROUTE-PAUSED-1] Check if this shard is paused for split
+            // Check if this shard is paused for split
             if self.coordinator.is_shard_paused(*shard_id).await {
                 tracing::debug!(
                     shard_id = %shard_id,

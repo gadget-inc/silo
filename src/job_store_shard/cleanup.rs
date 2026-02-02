@@ -1,4 +1,4 @@
-//! [SILO-SPLIT-CLEANUP-1] Post-split cleanup operations for JobStoreShard.
+//! Post-split cleanup operations for JobStoreShard.
 //!
 //! After a shard split, child shards contain defunct data (keys outside their tenant range).
 //! This module provides methods to:
@@ -55,7 +55,7 @@ pub struct CleanupResult {
 }
 
 impl JobStoreShard {
-    /// [SILO-SPLIT-CLEANUP-1] Delete keys outside this shard's tenant range.
+    /// Delete keys outside this shard's tenant range.
     ///
     /// After a split, child shards contain data from the parent shard that may not belong to them based on their tenant range. This method scans all keys and deletes those with tenant_ids outside the shard's range.
     pub async fn after_split_cleanup_defunct_data(
@@ -430,13 +430,27 @@ impl JobStoreShard {
         }
     }
 
-    /// Set the cleanup status in this shard's database.
+    /// [SILO-COORD-INV-8] Set the cleanup status in this shard's database.
     ///
     /// This updates the authoritative cleanup status for this shard.
+    /// Status can only progress forward: Pending -> Running -> Done -> CompactionDone.
+    /// Attempting to set a status that would regress is logged as a warning but
+    /// allowed (for crash recovery scenarios where we may re-process).
     pub async fn set_cleanup_status(
         &self,
         status: SplitCleanupStatus,
     ) -> Result<(), JobStoreShardError> {
+        // Check current status to validate forward progression
+        let current = self.get_cleanup_status().await?;
+        if !current.can_transition_to(status) {
+            tracing::warn!(
+                shard = %self.name,
+                current = %current,
+                new = %status,
+                "cleanup status regression detected (allowing for crash recovery)"
+            );
+        }
+
         let data = serde_json::to_vec(&status)?;
         self.db
             .put(keys::cleanup_status_key().as_bytes(), &data)

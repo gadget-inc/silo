@@ -17,31 +17,11 @@ fn cleanup_status_needs_work() {
 
 #[test]
 fn split_phase_traffic_paused() {
+    // Traffic is paused during SplitPausing and SplitCloning (which includes map update)
     assert!(!SplitPhase::SplitRequested.traffic_paused());
     assert!(SplitPhase::SplitPausing.traffic_paused());
     assert!(SplitPhase::SplitCloning.traffic_paused());
-    assert!(SplitPhase::SplitUpdatingMap.traffic_paused());
     assert!(!SplitPhase::SplitComplete.traffic_paused());
-}
-
-#[test]
-fn split_phase_is_early_phase() {
-    // [SILO-SPLIT-CRASH-1] Early phases are before children exist
-    assert!(SplitPhase::SplitRequested.is_early_phase());
-    assert!(SplitPhase::SplitPausing.is_early_phase());
-    assert!(SplitPhase::SplitCloning.is_early_phase());
-    assert!(!SplitPhase::SplitUpdatingMap.is_early_phase());
-    assert!(!SplitPhase::SplitComplete.is_early_phase());
-}
-
-#[test]
-fn split_phase_is_late_phase() {
-    // [SILO-SPLIT-CRASH-2] Late phases are after children exist
-    assert!(!SplitPhase::SplitRequested.is_late_phase());
-    assert!(!SplitPhase::SplitPausing.is_late_phase());
-    assert!(!SplitPhase::SplitCloning.is_late_phase());
-    assert!(SplitPhase::SplitUpdatingMap.is_late_phase());
-    assert!(SplitPhase::SplitComplete.is_late_phase());
 }
 
 #[test]
@@ -49,10 +29,6 @@ fn split_phase_display() {
     assert_eq!(format!("{}", SplitPhase::SplitRequested), "SplitRequested");
     assert_eq!(format!("{}", SplitPhase::SplitPausing), "SplitPausing");
     assert_eq!(format!("{}", SplitPhase::SplitCloning), "SplitCloning");
-    assert_eq!(
-        format!("{}", SplitPhase::SplitUpdatingMap),
-        "SplitUpdatingMap"
-    );
     assert_eq!(format!("{}", SplitPhase::SplitComplete), "SplitComplete");
 }
 
@@ -82,9 +58,6 @@ fn split_in_progress_advance_phase() {
 
     split.advance_phase();
     assert_eq!(split.phase, SplitPhase::SplitCloning);
-
-    split.advance_phase();
-    assert_eq!(split.phase, SplitPhase::SplitUpdatingMap);
 
     split.advance_phase();
     assert_eq!(split.phase, SplitPhase::SplitComplete);
@@ -410,7 +383,6 @@ fn split_phase_serialization_roundtrip() {
         SplitPhase::SplitRequested,
         SplitPhase::SplitPausing,
         SplitPhase::SplitCloning,
-        SplitPhase::SplitUpdatingMap,
         SplitPhase::SplitComplete,
     ];
 

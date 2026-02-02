@@ -3499,9 +3499,13 @@ async fn k8s_child_shards_usable_after_split() {
     handle.abort();
 }
 
-/// Test crash recovery during late phase resumes the split.
+/// Test crash recovery during cloning phase abandons the split.
+///
+/// With the simplified split model, ALL incomplete splits are abandoned on crash.
+/// The shard map update is the commit point - if children don't exist in the
+/// shard map, the split never completed and is safely abandoned.
 #[silo::test(flavor = "multi_thread", worker_threads = 2)]
-async fn k8s_crash_recovery_late_phase_resumes_split() {
+async fn k8s_crash_recovery_cloning_phase_abandons_split() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
     let num_shards: u32 = 1;
@@ -3510,7 +3514,7 @@ async fn k8s_crash_recovery_late_phase_resumes_split() {
     let (c1, h1) = start_coordinator!(
         &namespace,
         &prefix,
-        "crash-late-1",
+        "crash-cloning-1",
         "http://127.0.0.1:50051",
         num_shards
     );
@@ -3521,21 +3525,20 @@ async fn k8s_crash_recovery_late_phase_resumes_split() {
     let owned = c1.owned_shards().await;
     let shard_id = owned[0];
 
-    // Create splitter and request split, advance to SplitUpdatingMap (late phase)
+    // Create splitter and request split, advance to SplitCloning phase
 
     let splitter1 = ShardSplitter::new(c1.clone());
 
-    let split = splitter1
+    let _split = splitter1
         .request_split(shard_id, "m".to_string())
         .await
         .expect("request_split");
 
     splitter1.advance_split_phase(shard_id).await.unwrap(); // -> SplitPausing
     splitter1.advance_split_phase(shard_id).await.unwrap(); // -> SplitCloning
-    splitter1.advance_split_phase(shard_id).await.unwrap(); // -> SplitUpdatingMap
 
     let status = splitter1.get_split_status(shard_id).await.unwrap().unwrap();
-    assert_eq!(status.phase, SplitPhase::SplitUpdatingMap);
+    assert_eq!(status.phase, SplitPhase::SplitCloning);
 
     // Simulate crash
     c1.shutdown().await.unwrap();
@@ -3547,12 +3550,12 @@ async fn k8s_crash_recovery_late_phase_resumes_split() {
         make_coordinator_config(
             &namespace,
             &prefix,
-            "crash-late-1",
+            "crash-cloning-1",
             "http://127.0.0.1:50051",
             num_shards,
             10,
         ),
-        make_test_factory("crash-late-1-restart"),
+        make_test_factory("crash-cloning-1-restart"),
     )
     .await
     .expect("restart coordinator");
@@ -3564,31 +3567,26 @@ async fn k8s_crash_recovery_late_phase_resumes_split() {
 
     let splitter2 = ShardSplitter::new(c2.clone());
 
-    // Late phase split should be preserved
-    let status = splitter2
-        .get_split_status(shard_id)
-        .await
-        .expect("get status");
-    assert!(status.is_some(), "late phase split should be preserved");
-    assert_eq!(status.unwrap().phase, SplitPhase::SplitUpdatingMap);
-
-    // Resume and complete the split
+    // Recover stale splits - should abandon the incomplete split
     splitter2
-        .execute_split(shard_id, || c2.get_shard_owner_map())
+        .recover_stale_splits()
         .await
-        .expect("resume split should succeed");
+        .expect("recover stale splits");
 
-    // Verify completion
+    // Split should be abandoned (deleted)
     let status = splitter2
         .get_split_status(shard_id)
         .await
         .expect("get status");
-    assert!(status.is_none(), "split should complete");
+    assert!(status.is_none(), "incomplete split should be abandoned");
 
+    // Shard map should still have original shard (split was not committed)
     let shard_map = c2.get_shard_map().await.unwrap();
-    assert_eq!(shard_map.len(), 2);
-    assert!(shard_map.get_shard(&split.left_child_id).is_some());
-    assert!(shard_map.get_shard(&split.right_child_id).is_some());
+    assert_eq!(shard_map.len(), 1, "shard map should have original shard");
+    assert!(
+        shard_map.get_shard(&shard_id).is_some(),
+        "original shard should still exist"
+    );
 
     c2.shutdown().await.unwrap();
     h2.abort();
