@@ -11,12 +11,14 @@ jobs:
     runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-test-env
         with:
-          toolchain: "1.89.0"
-          components: rustfmt
-      - name: Check formatting
+          cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Check Rust formatting
         run: rustfmt --check --edition=2024 **/*.rs
+      - name: Validate SILO sigils synchronized
+        run: node scripts/validate-silo-sigils.js
 
   test:
     name: Rust tests
@@ -107,9 +109,6 @@ jobs:
       - name: Verify job_shard.als
         shell: bash
         run: node scripts/run-alloy-verification.mjs specs/job_shard.als
-      - name: Validate SILO tags synchronized
-        shell: bash
-        run: node scripts/validate-silo-tags.js
 
   alloy-coordination:
     name: Alloy verification (coordination)
