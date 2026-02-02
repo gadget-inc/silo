@@ -369,7 +369,7 @@ impl ShardFactory {
         }
     }
 
-    /// [SILO-SPLIT-CLONE-1] Clone a shard to create a child shard for splitting.
+    /// Clone a shard to create a child shard for splitting.
     ///
     /// This creates a point-in-time clone of the parent shard's database using
     /// SlateDB's checkpoint and clone functionality. The clone shares SST files

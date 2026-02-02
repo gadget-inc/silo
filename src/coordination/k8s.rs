@@ -748,7 +748,10 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         };
         let member_ids: Vec<String> = members.iter().map(|m| m.node_id.clone()).collect();
 
-        // Safety check: if we don't see ourselves in the member list, our membership lease may have expired or there's a connectivity issue. Don't reconcile based on incomplete membership data - it would cause us to release all shards.
+        // [SILO-COORD-INV-6] Safety check: if we don't see ourselves in the member list,
+        // our membership lease may have expired or there's a connectivity issue. Don't
+        // reconcile based on incomplete membership data - it would cause us to release
+        // all shards. This enforces that shard leases require active cluster membership.
         if members.is_empty() {
             warn!(node_id = %self.base.node_id, "reconcile: no members found, skipping reconcile");
             return Ok(());
@@ -1629,7 +1632,12 @@ impl<B: K8sBackend> K8sShardGuard<B> {
         }
     }
 
-    /// Try to acquire the lease using compare-and-swap semantics.
+    /// [SILO-COORD-INV-1] Try to acquire the lease using compare-and-swap semantics.
+    ///
+    /// This enforces the no-split-brain invariant: at most one node can hold a lease
+    /// for a shard at any time. The K8s resourceVersion field provides CAS semantics -
+    /// if another node acquired the lease between our read and write, our replace
+    /// operation will fail with a conflict error.
     async fn try_acquire_lease_cas(
         &self,
         lease_name: &str,
@@ -1877,7 +1885,10 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                 break;
             }
 
-            // Renew with CAS to detect if we lost the lease
+            // [SILO-COORD-INV-4] Renew with CAS to detect if we lost the lease.
+            // If renewal fails (CAS conflict), we've lost ownership - this prevents
+            // a "flapped" node (one that lost connectivity) from continuing to serve
+            // requests after another node has acquired the shard.
             match self.renew_lease_cas(lease_name).await {
                 Ok(new_rv) => {
                     // Update our fencing token

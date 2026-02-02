@@ -6,6 +6,20 @@
 //! - `none`: Single-node mode, no coordination (for local development)
 //! - `etcd`: Distributed coordination using etcd leases and locks
 //! - `k8s`: Distributed coordination using Kubernetes Lease objects
+//!
+//! # Membership and Shard Ownership Model
+//!
+//! [SILO-COORD-INV-10] A node's state is either "member" (active in the cluster with
+//! a valid membership lease) or "not a member" (no valid lease). The Alloy model also
+//! defines a "flapped" state for nodes that have lost membership but still think they
+//! own shards - in the Rust implementation, this dangerous state is prevented by:
+//!
+//! 1. Shard lease renewal uses CAS semantics - if we've lost our membership, renewal
+//!    fails and we close our shards immediately (see SILO-COORD-INV-4)
+//! 2. Before reconciling shard ownership, we verify our own membership (SILO-COORD-INV-6)
+//!
+//! This means a node is effectively "member XOR not-member" with no intermediate state
+//! where it could serve requests without valid leases.
 
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};

@@ -11,11 +11,15 @@ use crate::shard_range::{ShardId, ShardMap, SplitInProgress};
 
 use super::{CoordinationError, ShardOwnerMap};
 
-/// Status of post-split cleanup for a shard.
+/// [SILO-COORD-INV-8] Status of post-split cleanup for a shard.
 ///
 /// After a split, child shards contain defunct data (keys outside their new range).
 /// This status tracks the progression through cleanup phases:
 /// CleanupPending -> CleanupRunning -> CleanupDone -> CompactionDone
+///
+/// Status only progresses forward through this sequence - it cannot regress
+/// to an earlier state. This ensures cleanup work is not repeated and the
+/// state machine progresses monotonically.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SplitCleanupStatus {
     /// Initial state for new shards or shards that don't need cleanup
@@ -36,6 +40,25 @@ impl SplitCleanupStatus {
             self,
             Self::CleanupPending | Self::CleanupRunning | Self::CleanupDone
         )
+    }
+
+    /// Returns the ordinal value for ordering comparisons.
+    /// Higher values represent later states in the cleanup progression.
+    fn ordinal(&self) -> u8 {
+        match self {
+            Self::CleanupPending => 0,
+            Self::CleanupRunning => 1,
+            Self::CleanupDone => 2,
+            Self::CompactionDone => 3,
+        }
+    }
+
+    /// [SILO-COORD-INV-8] Check if transitioning from current to new_status is valid.
+    ///
+    /// Status can only progress forward: Pending -> Running -> Done -> CompactionDone.
+    /// Returns true if the transition is valid (same state or forward progress).
+    pub fn can_transition_to(&self, new_status: Self) -> bool {
+        new_status.ordinal() >= self.ordinal()
     }
 }
 
@@ -64,7 +87,7 @@ impl std::str::FromStr for SplitCleanupStatus {
     }
 }
 
-/// [SILO-SPLIT-REQ-1] Phases of a shard split operation.
+/// Phases of a shard split operation.
 ///
 /// A split operation divides one parent shard into two child shards at a
 /// specified split point. The phases ensure traffic is paused, data is cloned,
@@ -209,7 +232,7 @@ impl ShardSplitter {
         Self { coordinator, ctx }
     }
 
-    /// [SILO-SPLIT-REQ-1] Request a shard split.
+    /// Request a shard split.
     ///
     /// Validates that this node owns the shard, the split point is valid,
     /// and no split is already in progress. Then creates and stores the
@@ -224,7 +247,9 @@ impl ShardSplitter {
             return Err(CoordinationError::NotShardOwner(shard_id));
         }
 
-        // Verify the shard exists in the shard map and validate split point
+        // [SILO-COORD-INV-7] Verify the shard exists in the shard map and validate split point.
+        // Split operations must reference an existing parent shard - we cannot split
+        // a shard that doesn't exist in the authoritative shard map.
         {
             let shard_map = self.ctx.shard_map.lock().await;
             let shard_info = shard_map
@@ -367,6 +392,9 @@ impl ShardSplitter {
                     );
                 }
                 SplitPhase::SplitCloning => {
+                    // [SILO-COORD-INV-5] Traffic is paused before we reach this phase.
+                    // The state machine ensures we pass through SplitPausing before
+                    // SplitCloning, and traffic_paused() returns true for both phases.
                     // Clone the database for both children
                     info!(
                         parent_shard_id = %parent_shard_id,
@@ -519,7 +547,10 @@ impl ShardSplitter {
                     );
                 }
                 SplitPhase::SplitComplete => {
-                    // Clean up: delete the split record
+                    // [SILO-COORD-INV-13] Clean up: delete the split record.
+                    // The split is already committed (children exist in shard map).
+                    // Deleting the split record just removes the tracking metadata.
+                    // The committed state (children in shard map) is preserved.
                     self.coordinator.delete_split(&parent_shard_id).await?;
                     info!(
                         parent_shard_id = %parent_shard_id,
@@ -533,10 +564,13 @@ impl ShardSplitter {
 
     /// Recover from stale split operations after a node restart.
     ///
-    /// [SILO-SPLIT-CRASH-1] All incomplete splits are abandoned on crash.
+    /// [SILO-COORD-INV-11] All incomplete splits are abandoned on crash.
     /// The shard map update is the commit point - if children don't exist in the
     /// shard map, the split never completed and is safe to abandon. Orphaned
     /// clone databases may exist but don't affect correctness.
+    ///
+    /// This preserves the parent shard when a crash occurs before the commit point,
+    /// ensuring no data is lost during failed splits.
     pub async fn recover_stale_splits(&self) -> Result<(), CoordinationError> {
         let splits = self.coordinator.list_all_splits().await?;
 
