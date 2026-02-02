@@ -227,13 +227,18 @@ impl JobStoreShard {
         let db = db_builder.build().await?;
         let db = Arc::new(db);
         let concurrency = Arc::new(ConcurrencyManager::new());
-        let broker = TaskBroker::new(
-            Arc::clone(&db),
-            Arc::clone(&concurrency),
-            name.clone(),
-            metrics.clone(),
-            range,
-        );
+
+        // Hydrate concurrency counts from durable state BEFORE starting the broker.
+        // This is critical for correctness: without this, try_reserve() calls during
+        // early requests would see count=0 and allow more grants than the limit.
+        // The hydration must complete synchronously before the shard is considered ready.
+        concurrency
+            .counts()
+            .hydrate(&db, &range)
+            .await
+            .map_err(JobStoreShardError::Slate)?;
+
+        let broker = TaskBroker::new(Arc::clone(&db), name.clone(), metrics.clone(), range);
         broker.start();
 
         let shard = Arc::new(Self {
