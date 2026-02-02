@@ -30,6 +30,7 @@ async fn create_multi_shard_factory(
         path: format!("{}/shard_%shard%", base_path),
         wal: None,
         apply_wal_on_close: true,
+        slatedb: None,
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();

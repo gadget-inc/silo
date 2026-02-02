@@ -61,6 +61,7 @@ pub async fn create_test_factory() -> anyhow::Result<(Arc<ShardFactory>, tempfil
         path: tmp.path().join("%shard%").to_string_lossy().to_string(),
         wal: None,
         apply_wal_on_close: true,
+        slatedb: None,
     };
     let rate_limiter = MockGubernatorClient::new_arc();
     let factory = ShardFactory::new(template, rate_limiter, None);

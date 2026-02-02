@@ -7,6 +7,15 @@ use silo::settings::{
 };
 use silo::shard_range::{ShardMap, ShardRange};
 use silo::storage::resolve_object_store;
+use std::time::Duration;
+
+/// Create SlateDB settings with a fast flush interval for tests
+fn fast_flush_slatedb_settings() -> slatedb::config::Settings {
+    slatedb::config::Settings {
+        flush_interval: Some(Duration::from_millis(10)),
+        ..Default::default()
+    }
+}
 
 #[silo::test]
 async fn open_fs_db_from_config() {
@@ -25,6 +34,7 @@ async fn open_fs_db_from_config() {
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
             wal: None,
             apply_wal_on_close: true,
+            slatedb: None,
         },
     };
 
@@ -64,12 +74,12 @@ async fn shard_with_local_wal_has_wal_close_config() {
         name: "test".to_string(),
         backend: Backend::Fs,
         path: data_dir.path().to_string_lossy().to_string(),
-        flush_interval_ms: Some(10),
         wal: Some(WalConfig {
             backend: Backend::Fs,
             path: wal_dir.path().to_string_lossy().to_string(),
         }),
         apply_wal_on_close: true,
+        slatedb: Some(fast_flush_slatedb_settings()),
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
@@ -99,9 +109,9 @@ async fn shard_without_local_wal_has_no_wal_close_config() {
         name: "test".to_string(),
         backend: Backend::Fs,
         path: data_dir.path().to_string_lossy().to_string(),
-        flush_interval_ms: Some(10),
         wal: None,
         apply_wal_on_close: true,
+        slatedb: Some(fast_flush_slatedb_settings()),
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
@@ -126,12 +136,12 @@ async fn close_with_flush_wal_removes_local_wal_directory() {
         name: "test".to_string(),
         backend: Backend::Fs,
         path: data_dir.path().to_string_lossy().to_string(),
-        flush_interval_ms: Some(10),
         wal: Some(WalConfig {
             backend: Backend::Fs,
             path: wal_dir.path().to_string_lossy().to_string(),
         }),
         apply_wal_on_close: true,
+        slatedb: Some(fast_flush_slatedb_settings()),
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
@@ -173,12 +183,12 @@ async fn close_without_flush_wal_preserves_local_wal_directory() {
         name: "test".to_string(),
         backend: Backend::Fs,
         path: data_dir.path().to_string_lossy().to_string(),
-        flush_interval_ms: Some(10),
         wal: Some(WalConfig {
             backend: Backend::Fs,
             path: wal_dir.path().to_string_lossy().to_string(),
         }),
         apply_wal_on_close: false, // Disable apply on close
+        slatedb: Some(fast_flush_slatedb_settings()),
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
@@ -219,12 +229,12 @@ async fn data_persists_after_close_with_flush_and_reopen() {
             name: "test".to_string(),
             backend: Backend::Fs,
             path: data_dir.path().to_string_lossy().to_string(),
-            flush_interval_ms: Some(10),
             wal: Some(WalConfig {
                 backend: Backend::Fs,
                 path: wal_dir.path().to_string_lossy().to_string(),
             }),
             apply_wal_on_close: true,
+            slatedb: Some(fast_flush_slatedb_settings()),
         };
 
         let rate_limiter = MockGubernatorClient::new_arc();
@@ -251,12 +261,12 @@ async fn data_persists_after_close_with_flush_and_reopen() {
             name: "test".to_string(),
             backend: Backend::Fs,
             path: data_path.to_string_lossy().to_string(),
-            flush_interval_ms: Some(10),
             wal: Some(WalConfig {
                 backend: Backend::Fs,
                 path: new_wal_dir.path().to_string_lossy().to_string(),
             }),
             apply_wal_on_close: true,
+            slatedb: Some(fast_flush_slatedb_settings()),
         };
 
         let rate_limiter = MockGubernatorClient::new_arc();
@@ -293,6 +303,7 @@ async fn factory_close_all_flushes_all_shards_wal() {
             path: wal_dir.path().join("%shard%").to_string_lossy().to_string(),
         }),
         apply_wal_on_close: true,
+        slatedb: None,
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
@@ -477,4 +488,101 @@ fn resolve_object_store_memory_returns_same_path() {
 
     // Memory backend should return the path as-is
     assert_eq!(result.canonical_path, "my-test-path");
+}
+
+#[silo::test]
+fn parse_toml_with_full_slatedb_settings() {
+    // Test that TOML config with full [database.slatedb] section parses correctly
+    // Note: SlateDB's Settings requires all fields when deserializing via TOML/serde
+    // because it doesn't use #[serde(default)] on individual fields
+    let toml_str = r#"
+[database]
+backend = "fs"
+path = "/tmp/silo-%shard%"
+
+[database.slatedb]
+flush_interval = "50ms"
+manifest_poll_interval = "1s"
+manifest_update_timeout = "300s"
+min_filter_keys = 1000
+filter_bits_per_key = 10
+l0_sst_size_bytes = 33554432
+l0_max_ssts = 4
+max_unflushed_bytes = 536870912
+
+[database.slatedb.compactor_options]
+poll_interval = "5s"
+manifest_update_timeout = "300s"
+max_sst_size = 268435456
+max_concurrent_compactions = 4
+
+[database.slatedb.object_store_cache_options]
+max_cache_size_bytes = 17179869184
+part_size_bytes = 4194304
+cache_puts = false
+scan_interval = "3600s"
+"#;
+
+    let cfg: AppConfig = toml::from_str(toml_str).expect("parse TOML");
+
+    // Verify the slatedb settings were parsed
+    let slatedb_settings = cfg
+        .database
+        .slatedb
+        .expect("slatedb settings should be present");
+    assert_eq!(
+        slatedb_settings.flush_interval,
+        Some(std::time::Duration::from_millis(50))
+    );
+    assert_eq!(slatedb_settings.l0_sst_size_bytes, 33554432);
+    assert_eq!(slatedb_settings.l0_max_ssts, 4);
+}
+
+#[silo::test]
+fn parse_toml_without_slatedb_settings() {
+    // Test that TOML config without [database.slatedb] section still works
+    let toml_str = r#"
+[database]
+backend = "fs"
+path = "/tmp/silo-%shard%"
+"#;
+
+    let cfg: AppConfig = toml::from_str(toml_str).expect("parse TOML");
+
+    // slatedb should be None when not specified
+    assert!(cfg.database.slatedb.is_none());
+}
+
+#[silo::test]
+async fn factory_passes_slatedb_settings_to_shards() {
+    // Test that ShardFactory passes slatedb settings from template to opened shards
+    let tmp = tempfile::tempdir().unwrap();
+
+    let template = DatabaseTemplate {
+        backend: Backend::Fs,
+        path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+        wal: None,
+        apply_wal_on_close: true,
+        slatedb: Some(slatedb::config::Settings {
+            flush_interval: Some(std::time::Duration::from_millis(25)),
+            l0_sst_size_bytes: 16777216, // 16MB
+            ..Default::default()
+        }),
+    };
+
+    let rate_limiter = MockGubernatorClient::new_arc();
+    let factory = ShardFactory::new(template, rate_limiter, None);
+
+    let shard_map = ShardMap::create_initial(1).expect("create shard map");
+    let shard_id = shard_map.shards()[0].id;
+    let shard = factory
+        .open(&shard_id, &ShardRange::full())
+        .await
+        .expect("open shard");
+
+    // Verify the shard works with the custom settings
+    shard.db().put(b"key", b"value").await.expect("put");
+    shard.db().flush().await.expect("flush");
+    let result = shard.db().get(b"key").await.expect("get");
+    assert_eq!(result.unwrap().as_ref(), b"value");
 }

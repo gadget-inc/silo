@@ -120,16 +120,66 @@ When running on pure object storage, your Silo instances don't necessarily need 
 
 ### SlateDB Configuration
 
-Silo uses SlateDB for storage, which has additional configuration options for compaction, caching, and performance tuning. While Silo doesn't expose all SlateDB options directly, you can refer to the [SlateDB Configuration Documentation](https://slatedb.io/docs/reference/configuration) for details on how the underlying storage engine works.
+Silo uses [SlateDB](https://slatedb.io/) as its embedded storage engine. You can configure SlateDB-specific options via the `[database.slatedb]` section. All SlateDB configuration options are passed directly to SlateDB, so you can refer to the [SlateDB Configuration Documentation](https://docs.rs/slatedb/latest/slatedb/config/struct.Settings.html) for the full list of available options.
 
-Currently exposed SlateDB options:
+```toml
+[database]
+backend = "gcs"
+path = "gs://my-bucket/silo/%shard%"
+
+[database.slatedb]
+flush_interval = "100ms"
+l0_sst_size_bytes = 67108864
+l0_max_ssts = 8
+
+[database.slatedb.compactor_options]
+poll_interval = "5s"
+max_sst_size = 1073741824
+```
+
+#### Common SlateDB Options
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `flush_interval_ms` | number | SlateDB default | Interval for flushing memtable to SSTs (internal use only) |
+| `flush_interval` | duration | `"100ms"` | How often to flush the memtable to SST files |
+| `l0_sst_size_bytes` | number | `67108864` | Target size for L0 SST files (64MB default) |
+| `l0_max_ssts` | number | `8` | Maximum number of L0 SSTs before compaction triggers |
+| `max_unflushed_bytes` | number | `536870912` | Maximum unflushed data in memory (512MB default) |
+
+#### Compactor Options
+
+Configure compaction behavior via `[database.slatedb.compactor_options]`:
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `poll_interval` | duration | `"5s"` | How often to check for compaction work |
+| `max_sst_size` | number | `1073741824` | Maximum size of compacted SST files (1GB default) |
+| `max_concurrent_compactions` | number | `4` | Maximum concurrent compaction jobs |
+
+#### Garbage Collector Options
+
+Configure garbage collection via `[database.slatedb.garbage_collector_options]`:
+
+```toml
+[database.slatedb.garbage_collector_options.manifest_options]
+interval = "300s"
+min_age = "86400s"
+
+[database.slatedb.garbage_collector_options.wal_options]
+interval = "60s"
+min_age = "60s"
+```
 
 <Aside>
-Most SlateDB options use sensible defaults. The `flush_interval_ms` option is primarily used for testing and simulation scenarios.
+Duration values use human-readable strings like `"100ms"`, `"5s"`, `"1m"`, `"1h"`. This format is provided by SlateDB's configuration system.
+</Aside>
+
+<Aside type="caution">
+Most SlateDB options use sensible defaults tuned for general workloads. Only adjust these settings if you understand the performance implications. Misconfigured compaction or garbage collection can lead to degraded performance or excessive storage usage.
+</Aside>
+
+<Aside type="tip">
+If the `[database.slatedb]` section is omitted entirely, Silo uses SlateDB's sensible defaults. This is the recommended approach for most deployments. Only add this section if you need to tune specific storage engine parameters.
 </Aside>
 
 ---

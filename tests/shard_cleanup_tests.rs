@@ -530,9 +530,9 @@ async fn reopening_shard_after_cleanup_preserves_status() {
             name: "test".to_string(),
             backend: Backend::Fs,
             path: path.clone(),
-            flush_interval_ms: Some(10),
             wal: None,
             apply_wal_on_close: true,
+            slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, ShardRange::full())
@@ -577,9 +577,9 @@ async fn reopening_shard_after_cleanup_preserves_status() {
             name: "test".to_string(),
             backend: Backend::Fs,
             path: path.clone(),
-            flush_interval_ms: Some(10),
             wal: None,
             apply_wal_on_close: true,
+            slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, ShardRange::full())
@@ -653,9 +653,9 @@ async fn shard_created_at_preserved_across_reopen() {
             name: "test".to_string(),
             backend: Backend::Fs,
             path: path.clone(),
-            flush_interval_ms: Some(10),
             wal: None,
             apply_wal_on_close: true,
+            slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, ShardRange::full())
@@ -680,9 +680,9 @@ async fn shard_created_at_preserved_across_reopen() {
             name: "test".to_string(),
             backend: Backend::Fs,
             path: path.clone(),
-            flush_interval_ms: Some(10),
             wal: None,
             apply_wal_on_close: true,
+            slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, ShardRange::full())
