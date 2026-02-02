@@ -68,8 +68,7 @@ impl Write for DstWriter {
 /// - Thread names/IDs disabled (ordering could vary)
 /// - No file/line numbers (could change with code edits)
 ///
-/// Panics if called more than once in the same process - each DST scenario
-/// must run in its own process for true determinism.
+/// Panics if called more than once in the same process - each DST scenario must run in its own process for true determinism.
 fn init_deterministic_tracing() {
     use std::sync::atomic::{AtomicBool, Ordering};
     static INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -265,6 +264,39 @@ pub async fn connect_to_server(
         .into())
 }
 
+/// Create SlateDB settings suitable for DST tests.
+///
+/// Compaction is disabled because slatedb's compactor uses `spawn_blocking` and `block_on`
+/// which are incompatible with turmoil's single-threaded simulated runtime.
+pub fn dst_slatedb_settings() -> slatedb::config::Settings {
+    slatedb::config::Settings {
+        compactor_options: None,
+        ..Default::default()
+    }
+}
+
+/// Create a DatabaseTemplate using TurmoilFs backend for DST tests.
+///
+/// This is the recommended configuration for K8s coordination tests because:
+/// - TurmoilFs provides deterministic filesystem operations within turmoil
+/// - Supports SlateDB cloning which is needed for shard splits
+/// - Has compaction disabled for turmoil compatibility
+///
+/// The `storage_root` should be a shared path that all nodes can access.
+/// Use `{shard}` placeholder in the path for per-shard subdirectories.
+pub fn dst_turmoilfs_database_template(
+    storage_root: &std::path::Path,
+) -> silo::settings::DatabaseTemplate {
+    let path = storage_root.join("{shard}").to_string_lossy().to_string();
+    silo::settings::DatabaseTemplate {
+        backend: Backend::TurmoilFs,
+        path,
+        wal: None,
+        apply_wal_on_close: true,
+        slatedb: Some(dst_slatedb_settings()),
+    }
+}
+
 /// Helper to create a standard server host for tests
 pub async fn setup_server(port: u16) -> turmoil::Result<()> {
     tracing::trace!(port = port, "setup_server: starting");
@@ -284,7 +316,7 @@ pub async fn setup_server(port: u16) -> turmoil::Result<()> {
             path: "mem://shard-{shard}".to_string(),
             wal: None,
             apply_wal_on_close: true,
-            slatedb: None,
+            slatedb: Some(dst_slatedb_settings()),
         },
     };
 
@@ -798,13 +830,6 @@ impl GlobalConcurrencyTracker {
                 );
             }
         }
-    }
-
-    /// Get the current holder count for a tenant+queue combination
-    pub fn holder_count(&self, tenant: &str, queue: &str) -> usize {
-        let holders = self.holders.lock().unwrap();
-        let composite_key = format!("{}|{}", tenant, queue);
-        holders.get(&composite_key).map(|s| s.len()).unwrap_or(0)
     }
 
     /// Get the total holder count for a queue across all tenants.

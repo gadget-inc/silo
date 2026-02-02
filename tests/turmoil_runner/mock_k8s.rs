@@ -18,6 +18,7 @@ use chrono::Utc;
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
+use rand::Rng;
 use silo::coordination::{
     ConfigMapWatchEvent, ConfigMapWatchStream, CoordinationError, K8sBackend, LeaseWatchEvent,
     LeaseWatchStream,
@@ -128,14 +129,17 @@ impl MockK8sState {
 
     fn generate_uid(&self) -> String {
         let rv = self.resource_version.load(Ordering::SeqCst);
-        format!("uid-{}-{}", rv, fastrand::u64(..))
+        // Use rand::rng() which goes through getrandom, which mad-turmoil patches
+        // for deterministic simulation. Do NOT use fastrand as it has its own PRNG
+        // that isn't properly tracked across async task scheduling.
+        format!("uid-{}-{}", rv, rand::rng().random::<u64>())
     }
 
     /// Check if an operation should fail based on failure_rate
     async fn should_fail(&self) -> bool {
         let rate = *self.failure_rate.lock().await;
         if rate > 0.0 {
-            fastrand::f64() < rate
+            rand::rng().random::<f64>() < rate
         } else {
             false
         }

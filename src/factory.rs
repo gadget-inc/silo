@@ -265,11 +265,15 @@ impl ShardFactory {
 
     /// Close a specific shard and remove it from the factory.
     pub async fn close(&self, shard_id: &ShardId) -> Result<(), JobStoreShardError> {
+        tracing::trace!(shard_id = %shard_id, "factory.close: removing from instances");
         if let Some((_, entry)) = self.instances.remove(shard_id)
             && let Some(shard) = entry.get()
         {
+            tracing::trace!(shard_id = %shard_id, "factory.close: calling shard.close()");
             shard.close().await?;
             tracing::info!(shard_id = %shard_id, "closed shard");
+        } else {
+            tracing::trace!(shard_id = %shard_id, "factory.close: shard not found in instances");
         }
         Ok(())
     }
