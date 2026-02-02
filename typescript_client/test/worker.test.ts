@@ -616,6 +616,164 @@ describe("SiloWorker", () => {
     });
   });
 
+  describe("graceful shutdown", () => {
+    it("does not abort task signal when shutdown begins", async () => {
+      const task = createTask("task-shutdown", "job-shutdown");
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
+      const reportOutcome = vi.fn().mockResolvedValue(undefined);
+      const client = createMockClient({ leaseTasks, reportOutcome });
+
+      let signalWasAbortedDuringTask = false;
+      let taskStartedResolve: () => void;
+      let continueTaskResolve: () => void;
+      const taskStarted = new Promise<void>((r) => {
+        taskStartedResolve = r;
+      });
+      const continueTask = new Promise<void>((r) => {
+        continueTaskResolve = r;
+      });
+
+      const handler: TaskHandler = async (ctx) => {
+        // Signal task has started
+        taskStartedResolve();
+        // Wait until we're told to continue (after stop() is called)
+        await continueTask;
+        // Check if signal was aborted after shutdown was called
+        signalWasAbortedDuringTask = ctx.cancellationSignal.aborted;
+        return { type: "success", result: { completed: true } };
+      };
+
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler,
+        pollIntervalMs: 10,
+      });
+
+      worker.start();
+
+      // Wait for task to start
+      await taskStarted;
+
+      // Call stop - this begins shutdown
+      const stopPromise = worker.stop();
+
+      // Allow task to continue after stop has been called
+      continueTaskResolve!();
+
+      await stopPromise;
+
+      // The signal should NOT have been aborted
+      expect(signalWasAbortedDuringTask).toBe(false);
+
+      // The task should have completed successfully
+      expect(reportOutcome).toHaveBeenCalledWith({
+        taskId: "task-shutdown",
+        outcome: { type: "success", result: { completed: true } },
+        shard: "00000000-0000-0000-0000-000000000001",
+      });
+    });
+
+    it("allows tasks to complete after shutdown begins", async () => {
+      const task = createTask("task-complete", "job-complete");
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
+      const reportOutcome = vi.fn().mockResolvedValue(undefined);
+      const client = createMockClient({ leaseTasks, reportOutcome });
+
+      let taskCompleted = false;
+      let resolveTaskStarted: () => void;
+      const taskStarted = new Promise<void>((resolve) => {
+        resolveTaskStarted = resolve;
+      });
+
+      const handler: TaskHandler = async () => {
+        resolveTaskStarted();
+        // Simulate some work that takes time
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        taskCompleted = true;
+        return { type: "success", result: { done: true } };
+      };
+
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler,
+        pollIntervalMs: 10,
+      });
+
+      worker.start();
+
+      // Wait for task to start
+      await taskStarted;
+
+      // Immediately call stop
+      await worker.stop();
+
+      // Task should have completed despite shutdown being called
+      expect(taskCompleted).toBe(true);
+      expect(reportOutcome).toHaveBeenCalledWith({
+        taskId: "task-complete",
+        outcome: { type: "success", result: { done: true } },
+        shard: "00000000-0000-0000-0000-000000000001",
+      });
+    });
+
+    it("does not report cancelled outcome for tasks running during shutdown", async () => {
+      const task = createTask("task-not-cancelled", "job-not-cancelled");
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
+      const reportOutcome = vi.fn().mockResolvedValue(undefined);
+      const client = createMockClient({ leaseTasks, reportOutcome });
+
+      let resolveTaskStarted: () => void;
+      const taskStarted = new Promise<void>((resolve) => {
+        resolveTaskStarted = resolve;
+      });
+
+      const handler: TaskHandler = async () => {
+        resolveTaskStarted();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return { type: "success", result: {} };
+      };
+
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler,
+        pollIntervalMs: 10,
+      });
+
+      worker.start();
+      await taskStarted;
+      await worker.stop();
+
+      // Should NOT have reported a cancelled outcome
+      expect(reportOutcome).toHaveBeenCalledTimes(1);
+      expect(reportOutcome).toHaveBeenCalledWith({
+        taskId: "task-not-cancelled",
+        outcome: { type: "success", result: {} },
+        shard: "00000000-0000-0000-0000-000000000001",
+      });
+      // Verify it was NOT called with cancelled
+      expect(reportOutcome).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          outcome: { type: "cancelled" },
+        }),
+      );
+    });
+  });
+
   describe("TaskContext", () => {
     it("provides abort signal and cancel method in context", async () => {
       const task = createTask("task-sig", "job-sig");
@@ -630,7 +788,7 @@ describe("SiloWorker", () => {
       let receivedCancel: (() => Promise<void>) | undefined;
 
       const handler: TaskHandler = async (ctx) => {
-        receivedSignal = ctx.signal;
+        receivedSignal = ctx.cancellationSignal;
         receivedCancel = ctx.cancel.bind(ctx);
         return { type: "success", result: {} };
       };
