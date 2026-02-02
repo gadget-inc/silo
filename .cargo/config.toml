@@ -1,0 +1,5 @@
+# Enable tokio_unstable to allow deterministic task scheduling in turmoil DST tests.
+# Without this, tokio's internal task scheduler uses unseeded randomness, causing
+# non-deterministic task polling order when multiple tasks are ready simultaneously.
+[build]
+rustflags = ["--cfg", "tokio_unstable"]

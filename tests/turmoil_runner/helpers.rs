@@ -264,6 +264,39 @@ pub async fn connect_to_server(
         .into())
 }
 
+/// Create SlateDB settings suitable for DST tests.
+///
+/// Compaction is disabled because slatedb's compactor uses `spawn_blocking` and `block_on`
+/// which are incompatible with turmoil's single-threaded simulated runtime.
+pub fn dst_slatedb_settings() -> slatedb::config::Settings {
+    slatedb::config::Settings {
+        compactor_options: None,
+        ..Default::default()
+    }
+}
+
+/// Create a DatabaseTemplate using TurmoilFs backend for DST tests.
+///
+/// This is the recommended configuration for K8s coordination tests because:
+/// - TurmoilFs provides deterministic filesystem operations within turmoil
+/// - Supports SlateDB cloning which is needed for shard splits
+/// - Has compaction disabled for turmoil compatibility
+///
+/// The `storage_root` should be a shared path that all nodes can access.
+/// Use `{shard}` placeholder in the path for per-shard subdirectories.
+pub fn dst_turmoilfs_database_template(
+    storage_root: &std::path::Path,
+) -> silo::settings::DatabaseTemplate {
+    let path = storage_root.join("{shard}").to_string_lossy().to_string();
+    silo::settings::DatabaseTemplate {
+        backend: Backend::TurmoilFs,
+        path,
+        wal: None,
+        apply_wal_on_close: true,
+        slatedb: Some(dst_slatedb_settings()),
+    }
+}
+
 /// Helper to create a standard server host for tests
 pub async fn setup_server(port: u16) -> turmoil::Result<()> {
     tracing::trace!(port = port, "setup_server: starting");
@@ -283,7 +316,7 @@ pub async fn setup_server(port: u16) -> turmoil::Result<()> {
             path: "mem://shard-{shard}".to_string(),
             wal: None,
             apply_wal_on_close: true,
-            slatedb: None,
+            slatedb: Some(dst_slatedb_settings()),
         },
     };
 

@@ -27,8 +27,9 @@
 
 use crate::helpers::{
     ConcurrencyLimit, EnqueueRequest, HashMap, InvariantTracker, LeaseTasksRequest, Limit,
-    ReportOutcomeRequest, RetryPolicy, SerializedBytes, create_turmoil_client, get_seed, limit,
-    report_outcome_request, run_scenario_impl, serialized_bytes, turmoil,
+    ReportOutcomeRequest, RetryPolicy, SerializedBytes, create_turmoil_client,
+    dst_turmoilfs_database_template, get_seed, limit, report_outcome_request, run_scenario_impl,
+    serialized_bytes, turmoil,
 };
 use crate::mock_k8s::{MockK8sBackend, MockK8sState};
 use rand::rngs::StdRng;
@@ -39,9 +40,7 @@ use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::pb::Task;
 use silo::server::run_server_with_incoming;
-use silo::settings::{
-    AppConfig, Backend, DatabaseTemplate, GubernatorSettings, LoggingConfig, WebUiConfig,
-};
+use silo::settings::{AppConfig, GubernatorSettings, LoggingConfig, WebUiConfig};
 use silo::shard_range::ShardId;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
@@ -56,6 +55,9 @@ const NUM_SHARDS: u32 = 4;
 const BASE_PORT: u16 = 9960;
 const CLUSTER_PREFIX: &str = "silo-worker-test";
 const NAMESPACE: &str = "default";
+
+/// Storage root for TurmoilFs - shared across all nodes so shard data is accessible
+const STORAGE_ROOT: &str = "/data/silo-k8s-shards";
 
 /// Concurrency limit configurations for testing
 const WORKER_LIMITS: &[(&str, u32)] = &[
@@ -122,15 +124,10 @@ impl ScenarioConfig {
     }
 }
 
-fn make_shard_factory(node_id: &str) -> Arc<ShardFactory> {
+fn make_shard_factory() -> Arc<ShardFactory> {
+    let storage_root = std::path::Path::new(STORAGE_ROOT);
     Arc::new(ShardFactory::new(
-        DatabaseTemplate {
-            backend: Backend::Memory,
-            path: format!("mem://shard-{{shard}}-{}", node_id),
-            wal: None,
-            apply_wal_on_close: true,
-            slatedb: None,
-        },
+        dst_turmoilfs_database_template(storage_root),
         MockGubernatorClient::new_arc(),
         None,
     ))
@@ -155,7 +152,7 @@ async fn setup_node_server(
     // to avoid failing during initial convergence
 
     let backend = MockK8sBackend::new(k8s_state, NAMESPACE);
-    let factory = make_shard_factory(&node_id);
+    let factory = make_shard_factory();
 
     // mad-turmoil patches RNG to be deterministic, so we don't need seeded shard IDs
     let (coordinator, _handle) = K8sCoordinator::start_with_backend(
@@ -196,13 +193,8 @@ async fn setup_node_server(
         webui: WebUiConfig::default(),
         logging: LoggingConfig::default(),
         metrics: silo::settings::MetricsConfig::default(),
-        database: silo::settings::DatabaseTemplate {
-            backend: Backend::Memory,
-            path: format!("mem://shard-{{shard}}-{}", node_id),
-            wal: None,
-            apply_wal_on_close: true,
-            slatedb: None,
-        },
+        // Database template for the server - actual shards are managed by the coordinator's factory
+        database: dst_turmoilfs_database_template(std::path::Path::new(STORAGE_ROOT)),
     };
 
     let addr = (IpAddr::from(Ipv4Addr::UNSPECIFIED), port);

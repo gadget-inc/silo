@@ -28,8 +28,9 @@
 
 use crate::helpers::{
     ConcurrencyLimit, EnqueueRequest, HashMap, InvariantTracker, LeaseTasksRequest, Limit,
-    ReportOutcomeRequest, RetryPolicy, SerializedBytes, create_turmoil_client, get_seed, limit,
-    report_outcome_request, run_scenario_impl, serialized_bytes, turmoil,
+    ReportOutcomeRequest, RetryPolicy, SerializedBytes, create_turmoil_client,
+    dst_turmoilfs_database_template, get_seed, limit, report_outcome_request, run_scenario_impl,
+    serialized_bytes, turmoil,
 };
 use crate::mock_k8s::{MockK8sBackend, MockK8sState};
 use rand::rngs::StdRng;
@@ -40,9 +41,7 @@ use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::pb::Task;
 use silo::server::run_server_with_incoming;
-use silo::settings::{
-    AppConfig, Backend, DatabaseTemplate, GubernatorSettings, LoggingConfig, WebUiConfig,
-};
+use silo::settings::{AppConfig, GubernatorSettings, LoggingConfig, WebUiConfig};
 use silo::shard_range::ShardId;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
@@ -126,20 +125,9 @@ impl ScenarioConfig {
 
 /// Create a shard factory using turmoil's simulated filesystem for split testing.
 /// All nodes share the same storage root so that shard cloning works correctly.
-/// Using TurmoilFs backend ensures fully deterministic filesystem operations for DST.
 fn make_shard_factory(storage_root: &std::path::Path) -> Arc<ShardFactory> {
-    // Use {shard} placeholder so each shard gets its own subdirectory
-    let path = storage_root.join("{shard}").to_string_lossy().to_string();
     Arc::new(ShardFactory::new(
-        DatabaseTemplate {
-            // Use TurmoilFs backend for split tests - this uses turmoil's simulated filesystem
-            // which provides full determinism for DST while supporting SlateDB cloning
-            backend: Backend::TurmoilFs,
-            path,
-            wal: None,
-            apply_wal_on_close: true,
-            slatedb: None,
-        },
+        dst_turmoilfs_database_template(storage_root),
         MockGubernatorClient::new_arc(),
         None,
     ))
@@ -200,13 +188,8 @@ async fn setup_node_server(
         webui: WebUiConfig::default(),
         logging: LoggingConfig::default(),
         metrics: silo::settings::MetricsConfig::default(),
-        database: silo::settings::DatabaseTemplate {
-            backend: Backend::Memory,
-            path: format!("mem://shard-{{shard}}-{}", node_id),
-            wal: None,
-            apply_wal_on_close: true,
-            slatedb: None,
-        },
+        // Database template for the server - actual shards are managed by the coordinator's factory
+        database: dst_turmoilfs_database_template(&storage_root),
     };
 
     let addr = (IpAddr::from(Ipv4Addr::UNSPECIFIED), port);
