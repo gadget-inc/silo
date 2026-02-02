@@ -20,7 +20,10 @@ pub enum Task {
         id: String,
         tenant: String,
         job_id: String,
+        /// Total attempt number (monotonically increasing, 1-based)
         attempt_number: u32,
+        /// Attempt number within current run (resets to 1 on job restart)
+        relative_attempt_number: u32,
         held_queues: Vec<String>,
         task_group: String,
     },
@@ -31,7 +34,10 @@ pub enum Task {
         priority: u8,
         tenant: String,
         job_id: String,
+        /// Total attempt number (monotonically increasing, 1-based)
         attempt_number: u32,
+        /// Attempt number within current run (resets to 1 on job restart)
+        relative_attempt_number: u32,
         request_id: String,
         task_group: String,
     },
@@ -40,7 +46,10 @@ pub enum Task {
         task_id: String,
         tenant: String,
         job_id: String,
+        /// Total attempt number (monotonically increasing, 1-based)
         attempt_number: u32,
+        /// Attempt number within current run (resets to 1 on job restart)
+        relative_attempt_number: u32,
         /// Index of the current limit being checked in the job's limits array
         limit_index: u32,
         /// Rate limit parameters (serialized for storage)
@@ -140,7 +149,10 @@ pub enum ConcurrencyAction {
         start_time_ms: i64,
         priority: u8,
         job_id: String,
+        /// Total attempt number (monotonically increasing, 1-based)
         attempt_number: u32,
+        /// Attempt number within current run (resets to 1 on job restart)
+        relative_attempt_number: u32,
         task_group: String,
     },
 }

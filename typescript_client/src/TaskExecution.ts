@@ -1,11 +1,17 @@
-import type { Task as ProtoTask } from "./pb/silo";
+import type { Task as ProtoTask, Limit } from "./pb/silo";
 import { decodeBytes, type SiloGRPCClient } from "./client";
-import { combineAbortSignals } from "./utils";
+
+export type { Limit } from "./pb/silo";
+export type {
+  ConcurrencyLimit,
+  FloatingConcurrencyLimit,
+  GubernatorRateLimit,
+} from "./pb/silo";
 
 /**
  * Reason why a task was cancelled.
  */
-export type CancellationReason = "server" | "client" | "worker_shutdown";
+export type CancellationReason = "server" | "client";
 
 /**
  * A task received from Silo, with the payload decoded.
@@ -25,8 +31,10 @@ export interface Task<
   id: string;
   /** ID of the job this task belongs to */
   jobId: string;
-  /** Which attempt this is (1 = first attempt) */
+  /** Which attempt this is (1 = first attempt). Monotonically increasing across restarts. */
   attemptNumber: number;
+  /** Attempt number within the current run (1 = first attempt since last restart). Resets on restart. */
+  relativeAttemptNumber: number;
   /** How long the lease lasts in milliseconds. Heartbeat before this expires. */
   leaseMs: bigint;
   /** The decoded job payload */
@@ -39,10 +47,12 @@ export interface Task<
   taskGroup: string;
   /** Tenant ID if multi-tenancy is enabled */
   tenantId?: string;
-  /** True if this is the final attempt (no more retries after this) */
+  /** True if this is the final attempt within the current run (no more retries after this unless restarted) */
   isLastAttempt: boolean;
   /** Metadata key/value pairs from the job */
   metadata: Metadata;
+  /** Limits declared on this job (concurrency, rate, floating) */
+  limits: Limit[];
 }
 /**
  * Transform a raw protobuf Task into a userland Task with decoded payload.
@@ -55,6 +65,7 @@ export function transformTask<
     id: protoTask.id,
     jobId: protoTask.jobId,
     attemptNumber: protoTask.attemptNumber,
+    relativeAttemptNumber: protoTask.relativeAttemptNumber,
     leaseMs: protoTask.leaseMs,
     payload: decodeBytes<Payload>(
       protoTask.payload?.encoding.oneofKind === "msgpack"
@@ -68,6 +79,7 @@ export function transformTask<
     tenantId: protoTask.tenantId,
     isLastAttempt: protoTask.isLastAttempt,
     metadata: protoTask.metadata as Metadata,
+    limits: protoTask.limits,
   };
 }
 
@@ -86,10 +98,8 @@ export class TaskExecution<
   /** The worker ID */
   public readonly workerId: string;
 
-  /** Abort controller for this specific task */
+  /** Abort controller for this specific task's cancellation signal */
   private readonly _taskAbortController: AbortController;
-  /** Combined signal that aborts on task cancel OR worker shutdown */
-  private readonly _combinedSignal: AbortSignal;
   /** Whether the task has been cancelled (by server or client) */
   private _cancelled: boolean = false;
   /** The reason for cancellation if cancelled */
@@ -102,7 +112,6 @@ export class TaskExecution<
   constructor(
     task: Task<Payload, Metadata>,
     workerId: string,
-    workerAbortSignal: AbortSignal,
     client: SiloGRPCClient,
   ) {
     this.task = task;
@@ -110,29 +119,15 @@ export class TaskExecution<
     this._client = client;
 
     this._taskAbortController = new AbortController();
-
-    // Create a combined signal that aborts when EITHER the task or worker is aborted
-    this._combinedSignal = combineAbortSignals(
-      workerAbortSignal,
-      this._taskAbortController.signal,
-    );
-
-    // Track when worker shutdown causes abort
-    workerAbortSignal.addEventListener(
-      "abort",
-      () => {
-        if (!this._cancelled) {
-          this._cancelled = true;
-          this._cancellationReason = "worker_shutdown";
-        }
-      },
-      { once: true },
-    );
   }
 
-  /** The combined abort signal for this task */
+  /**
+   * The cancellation signal for this task.
+   * Only aborts when the task is explicitly cancelled (by server or client),
+   * NOT when the worker shuts down.
+   */
   get signal(): AbortSignal {
-    return this._combinedSignal;
+    return this._taskAbortController.signal;
   }
 
   /** Whether this task has been cancelled */
@@ -145,13 +140,9 @@ export class TaskExecution<
     return this._cancellationReason;
   }
 
-  /** Whether the cancellation was due to server-side cancel (should report Cancelled outcome) */
+  /** Whether the task was cancelled and should report Cancelled outcome */
   get shouldReportCancelled(): boolean {
-    return (
-      this._cancelled &&
-      (this._cancellationReason === "server" ||
-        this._cancellationReason === "client")
-    );
+    return this._cancelled;
   }
 
   /**

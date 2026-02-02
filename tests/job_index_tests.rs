@@ -252,12 +252,14 @@ async fn reaper_without_retries_marks_failed_in_index() {
             tenant,
             job_id,
             attempt_number,
+            relative_attempt_number,
             ..
         } => Task::RunAttempt {
             id: id.as_str().to_string(),
             tenant: tenant.as_str().to_string(),
             job_id: job_id.as_str().to_string(),
             attempt_number: *attempt_number,
+            relative_attempt_number: *relative_attempt_number,
             held_queues: Vec::new(),
             task_group: "default".to_string(),
         },
@@ -327,12 +329,14 @@ async fn reaper_with_retries_moves_to_scheduled_in_index() {
             tenant,
             job_id,
             attempt_number,
+            relative_attempt_number,
             ..
         } => Task::RunAttempt {
             id: id.as_str().to_string(),
             tenant: tenant.as_str().to_string(),
             job_id: job_id.as_str().to_string(),
             attempt_number: *attempt_number,
+            relative_attempt_number: *relative_attempt_number,
             held_queues: Vec::new(),
             task_group: "default".to_string(),
         },

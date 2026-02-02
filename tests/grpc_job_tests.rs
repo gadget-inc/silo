@@ -932,3 +932,256 @@ async fn grpc_get_job_next_attempt_cancelled() -> anyhow::Result<()> {
     .expect("test timed out")?;
     Ok(())
 }
+
+/// Test that leased tasks include job limits
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_lease_tasks_includes_limits() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        // Create limits to enqueue with the job
+        let concurrency_limit = Limit {
+            limit: Some(limit::Limit::Concurrency(ConcurrencyLimit {
+                key: "test-concurrency-key".to_string(),
+                max_concurrency: 5,
+            })),
+        };
+
+        let rate_limit = Limit {
+            limit: Some(limit::Limit::RateLimit(GubernatorRateLimit {
+                name: "test-rate-limit".to_string(),
+                unique_key: "test-rate-key".to_string(),
+                limit: 100,
+                duration_ms: 60_000,
+                hits: 1,
+                algorithm: GubernatorAlgorithm::TokenBucket as i32,
+                behavior: 0,
+                retry_policy: Some(RateLimitRetryPolicy {
+                    initial_backoff_ms: 1000,
+                    max_backoff_ms: 30000,
+                    backoff_multiplier: 2.0,
+                    max_retries: 5,
+                }),
+            })),
+        };
+
+        // Enqueue a job with limits
+        let enq = EnqueueRequest {
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+            id: "limits_test_job".to_string(),
+            priority: 10,
+            start_at_ms: 0,
+            retry_policy: None,
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                    rmp_serde::to_vec(&serde_json::json!({"test": "data"})).unwrap(),
+                )),
+            }),
+            limits: vec![concurrency_limit.clone(), rate_limit.clone()],
+            tenant: None,
+            metadata: std::collections::HashMap::new(),
+            task_group: "default".to_string(),
+        };
+        let _ = client.enqueue(enq).await?;
+
+        // Lease the task
+        let lease_resp = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: Some(crate::grpc_integration_helpers::TEST_SHARD_ID.to_string()),
+                worker_id: "w1".to_string(),
+                max_tasks: 1,
+                task_group: "default".to_string(),
+            })
+            .await?
+            .into_inner();
+
+        // Verify task was leased
+        assert_eq!(lease_resp.tasks.len(), 1);
+        let task = &lease_resp.tasks[0];
+        assert_eq!(task.job_id, "limits_test_job");
+
+        // Verify limits are included in the task
+        assert_eq!(
+            task.limits.len(),
+            2,
+            "task should have 2 limits, got {:?}",
+            task.limits
+        );
+
+        // Verify first limit is the concurrency limit
+        let first_limit = &task.limits[0];
+        match &first_limit.limit {
+            Some(limit::Limit::Concurrency(c)) => {
+                assert_eq!(c.key, "test-concurrency-key");
+                assert_eq!(c.max_concurrency, 5);
+            }
+            other => panic!("expected concurrency limit, got {:?}", other),
+        }
+
+        // Verify second limit is the rate limit
+        let second_limit = &task.limits[1];
+        match &second_limit.limit {
+            Some(limit::Limit::RateLimit(r)) => {
+                assert_eq!(r.name, "test-rate-limit");
+                assert_eq!(r.unique_key, "test-rate-key");
+                assert_eq!(r.limit, 100);
+                assert_eq!(r.duration_ms, 60_000);
+            }
+            other => panic!("expected rate limit, got {:?}", other),
+        }
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// Test that leased tasks include floating concurrency limits
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_lease_tasks_includes_floating_concurrency_limit() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        // Create a floating concurrency limit
+        let floating_limit = Limit {
+            limit: Some(limit::Limit::FloatingConcurrency(
+                FloatingConcurrencyLimit {
+                    key: "test-floating-key".to_string(),
+                    default_max_concurrency: 10,
+                    refresh_interval_ms: 30_000,
+                    metadata: [
+                        ("org_id".to_string(), "org-123".to_string()),
+                        ("tier".to_string(), "premium".to_string()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+            )),
+        };
+
+        // Enqueue a job with the floating limit
+        let enq = EnqueueRequest {
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+            id: "floating_limits_test_job".to_string(),
+            priority: 10,
+            start_at_ms: 0,
+            retry_policy: None,
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                    rmp_serde::to_vec(&serde_json::json!({"test": "data"})).unwrap(),
+                )),
+            }),
+            limits: vec![floating_limit.clone()],
+            tenant: None,
+            metadata: std::collections::HashMap::new(),
+            task_group: "default".to_string(),
+        };
+        let _ = client.enqueue(enq).await?;
+
+        // Lease the task
+        let lease_resp = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: Some(crate::grpc_integration_helpers::TEST_SHARD_ID.to_string()),
+                worker_id: "w1".to_string(),
+                max_tasks: 1,
+                task_group: "default".to_string(),
+            })
+            .await?
+            .into_inner();
+
+        // Verify task was leased
+        assert_eq!(lease_resp.tasks.len(), 1);
+        let task = &lease_resp.tasks[0];
+        assert_eq!(task.job_id, "floating_limits_test_job");
+
+        // Verify floating concurrency limit is included
+        assert_eq!(
+            task.limits.len(),
+            1,
+            "task should have 1 limit, got {:?}",
+            task.limits
+        );
+
+        let limit = &task.limits[0];
+        match &limit.limit {
+            Some(limit::Limit::FloatingConcurrency(f)) => {
+                assert_eq!(f.key, "test-floating-key");
+                assert_eq!(f.default_max_concurrency, 10);
+                assert_eq!(f.refresh_interval_ms, 30_000);
+                assert_eq!(f.metadata.get("org_id"), Some(&"org-123".to_string()));
+                assert_eq!(f.metadata.get("tier"), Some(&"premium".to_string()));
+            }
+            other => panic!("expected floating concurrency limit, got {:?}", other),
+        }
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// Test that leased tasks with no limits have empty limits array
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_lease_tasks_empty_limits() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        // Enqueue a job without limits
+        let enq = EnqueueRequest {
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+            id: "no_limits_test_job".to_string(),
+            priority: 10,
+            start_at_ms: 0,
+            retry_policy: None,
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                    rmp_serde::to_vec(&serde_json::json!({"test": "data"})).unwrap(),
+                )),
+            }),
+            limits: vec![],
+            tenant: None,
+            metadata: std::collections::HashMap::new(),
+            task_group: "default".to_string(),
+        };
+        let _ = client.enqueue(enq).await?;
+
+        // Lease the task
+        let lease_resp = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: Some(crate::grpc_integration_helpers::TEST_SHARD_ID.to_string()),
+                worker_id: "w1".to_string(),
+                max_tasks: 1,
+                task_group: "default".to_string(),
+            })
+            .await?
+            .into_inner();
+
+        // Verify task was leased
+        assert_eq!(lease_resp.tasks.len(), 1);
+        let task = &lease_resp.tasks[0];
+        assert_eq!(task.job_id, "no_limits_test_job");
+
+        // Verify limits array is empty
+        assert!(
+            task.limits.is_empty(),
+            "task should have no limits, got {:?}",
+            task.limits
+        );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}

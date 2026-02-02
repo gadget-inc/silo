@@ -36,7 +36,8 @@ impl JobStoreShard {
 
         let mut out: Vec<LeasedTask> = Vec::new();
         let mut refresh_out: Vec<LeasedRefreshTask> = Vec::new();
-        let mut pending_attempts: Vec<(String, JobView, String, u32)> = Vec::new();
+        // Tuple: (tenant, job_view, job_id, attempt_number, relative_attempt_number)
+        let mut pending_attempts: Vec<(String, JobView, String, u32, u32)> = Vec::new();
 
         // Track grants made during this dequeue for rollback on failure
         // Format: (tenant, queue, task_id)
@@ -104,6 +105,7 @@ impl JobStoreShard {
                         tenant,
                         job_id,
                         attempt_number,
+                        relative_attempt_number,
                         request_id,
                         task_group: req_task_group,
                     } => {
@@ -158,6 +160,7 @@ impl JobStoreShard {
                                     tenant: tenant.clone(),
                                     job_id: job_id.clone(),
                                     attempt_number: *attempt_number,
+                                    relative_attempt_number: *relative_attempt_number,
                                     held_queues: vec![queue.clone()],
                                     task_group: req_task_group.clone(),
                                 };
@@ -181,6 +184,7 @@ impl JobStoreShard {
                                 let attempt = JobAttempt {
                                     job_id: job_id.clone(),
                                     attempt_number: *attempt_number,
+                                    relative_attempt_number: *relative_attempt_number,
                                     task_id: request_id.clone(),
                                     status: AttemptStatus::Running {
                                         started_at_ms: now_ms,
@@ -197,6 +201,7 @@ impl JobStoreShard {
                                     view,
                                     job_id.clone(),
                                     *attempt_number,
+                                    *relative_attempt_number,
                                 ));
                                 ack_keys.push(entry.key.clone());
                                 // Grant already recorded by try_reserve - no need to call record_grant
@@ -226,6 +231,7 @@ impl JobStoreShard {
                         tenant,
                         job_id,
                         attempt_number,
+                        relative_attempt_number: check_relative_attempt_number,
                         limit_index,
                         rate_limit,
                         retry_count,
@@ -264,6 +270,7 @@ impl JobStoreShard {
                                         check_task_id,
                                         job_id,
                                         *attempt_number,
+                                        *check_relative_attempt_number,
                                         (*limit_index + 1) as usize, // next limit after current
                                         &job_view.limits(),
                                         *priority,
@@ -302,6 +309,7 @@ impl JobStoreShard {
                                     &tenant,
                                     job_id,
                                     *attempt_number,
+                                    *check_relative_attempt_number,
                                     *limit_index,
                                     rate_limit,
                                     *retry_count,
@@ -320,6 +328,7 @@ impl JobStoreShard {
                                     &tenant,
                                     job_id,
                                     *attempt_number,
+                                    *check_relative_attempt_number,
                                     *limit_index,
                                     rate_limit,
                                     *retry_count,
@@ -367,18 +376,21 @@ impl JobStoreShard {
                     }
                     Task::RunAttempt { .. } => {}
                 }
-                let (task_id, tenant, job_id, attempt_number) = match task {
+                let (task_id, tenant, job_id, attempt_number, relative_attempt_number) = match task
+                {
                     Task::RunAttempt {
                         id,
                         tenant,
                         job_id,
                         attempt_number,
+                        relative_attempt_number,
                         ..
                     } => (
                         id.clone(),
                         tenant.to_string(),
                         job_id.to_string(),
                         *attempt_number,
+                        *relative_attempt_number,
                     ),
                     Task::RequestTicket { .. }
                     | Task::CheckRateLimit { .. }
@@ -454,6 +466,7 @@ impl JobStoreShard {
                     let attempt = JobAttempt {
                         job_id: job_id.clone(),
                         attempt_number,
+                        relative_attempt_number,
                         task_id: task_id.clone(),
                         status: AttemptStatus::Running {
                             started_at_ms: now_ms,
@@ -464,7 +477,13 @@ impl JobStoreShard {
                     batch.put(akey.as_bytes(), &attempt_val);
 
                     // Defer constructing AttemptView; fetch from DB after batch is written
-                    pending_attempts.push((tenant.clone(), view, job_id.clone(), attempt_number));
+                    pending_attempts.push((
+                        tenant.clone(),
+                        view,
+                        job_id.clone(),
+                        attempt_number,
+                        relative_attempt_number,
+                    ));
                     ack_keys.push(entry.key.clone());
 
                     // Track for DST event emission after commit
@@ -541,7 +560,9 @@ impl JobStoreShard {
         }
 
         // Build LeasedTask results from pending_attempts
-        for (tenant, job_view, job_id, attempt_number) in pending_attempts.into_iter() {
+        for (tenant, job_view, job_id, attempt_number, _relative_attempt_number) in
+            pending_attempts.into_iter()
+        {
             let attempt_view = self
                 .get_job_attempt(tenant.as_str(), &job_id, attempt_number)
                 .await?

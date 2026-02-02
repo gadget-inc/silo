@@ -33,7 +33,7 @@ const RUN_INTEGRATION =
  */
 async function waitFor(
   condition: () => boolean | Promise<boolean>,
-  options?: { timeout?: number; interval?: number }
+  options?: { timeout?: number; interval?: number },
 ): Promise<void> {
   const timeout = options?.timeout ?? 5000;
   const interval = options?.interval ?? 50;
@@ -91,8 +91,11 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
   >(
     handler: TaskHandler<Payload, Metadata, Result>,
     options?: Partial<
-      Omit<SiloWorkerOptions<Payload, Metadata, Result>, "client" | "workerId" | "handler">
-    >
+      Omit<
+        SiloWorkerOptions<Payload, Metadata, Result>,
+        "client" | "workerId" | "handler"
+      >
+    >,
   ): SiloWorker<Payload, Metadata, Result> {
     const worker = new SiloWorker<Payload, Metadata, Result>({
       client,
@@ -201,8 +204,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
             taskGroup: DEFAULT_TASK_GROUP,
             payload: { index: i },
             priority: 1,
-          })
-        )
+          }),
+        ),
       );
 
       // Wait until we've seen concurrent execution
@@ -236,8 +239,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
             taskGroup: DEFAULT_TASK_GROUP,
             payload: { label },
             priority: 1,
-          })
-        )
+          }),
+        ),
       );
 
       // Wait until all jobs are processed
@@ -411,8 +414,8 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
             taskGroup: DEFAULT_TASK_GROUP,
             payload: { index: i },
             priority: 1,
-          })
-        )
+          }),
+        ),
       );
 
       // Wait until enough tasks are processed
@@ -424,18 +427,18 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
   });
 
   describe("abort signal", () => {
-    it("provides abort signal that is aborted on stop", async () => {
+    it("provides abort signal that is only aborted on cancellation, not worker stop", async () => {
       let signalAborted = false;
-      let taskStarted = false;
+      let taskCompleted = false;
 
       const handler: TaskHandler = async (ctx) => {
-        taskStarted = true;
-        ctx.signal.addEventListener("abort", () => {
+        ctx.cancellationSignal.addEventListener("abort", () => {
           signalAborted = true;
         });
 
-        // Long-running task
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+        // Short-running task that should complete normally
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        taskCompleted = true;
         return { type: "success", result: {} };
       };
 
@@ -445,22 +448,19 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       await client.enqueue({
         tenant: DEFAULT_TENANT,
         taskGroup: DEFAULT_TASK_GROUP,
-        payload: { action: "long" },
+        payload: { action: "short" },
         priority: 1,
       });
 
-      // Wait for task to start
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      // Wait for task to complete
+      await waitFor(() => taskCompleted, { timeout: 5000 });
 
-      // If we got a task to process
-      if (taskStarted) {
-        // Stop immediately - should abort signal
-        await worker.stop(100);
-        expect(signalAborted).toBe(true);
-      } else {
-        // Worker didn't pick up our task, just stop and skip the assertion
-        await worker.stop();
-      }
+      // Stop the worker
+      await worker.stop();
+
+      // Signal should NOT have been aborted - worker shutdown no longer aborts signals
+      // (only server cancellation or ctx.cancel() aborts the signal)
+      expect(signalAborted).toBe(false);
     });
   });
 
@@ -566,65 +566,61 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       expect(job.status).toBe(JobStatus.Succeeded);
     });
 
-    it(
-      "multiple workers on different task groups only receive their own tasks",
-      async () => {
-        const processedByWorkerA: string[] = [];
-        const processedByWorkerB: string[] = [];
-        const taskGroupA = `group-a-${Date.now()}`;
-        const taskGroupB = `group-b-${Date.now()}`;
+    it("multiple workers on different task groups only receive their own tasks", async () => {
+      const processedByWorkerA: string[] = [];
+      const processedByWorkerB: string[] = [];
+      const taskGroupA = `group-a-${Date.now()}`;
+      const taskGroupB = `group-b-${Date.now()}`;
 
-        // Enqueue tasks FIRST so they're ready when workers start polling
-        await client.enqueue({
-          tenant: DEFAULT_TENANT,
-          taskGroup: taskGroupA,
-          payload: { message: "task-for-A" },
-          priority: 1,
-        });
+      // Enqueue tasks FIRST so they're ready when workers start polling
+      await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        taskGroup: taskGroupA,
+        payload: { message: "task-for-A" },
+        priority: 1,
+      });
 
-        await client.enqueue({
-          tenant: DEFAULT_TENANT,
-          taskGroup: taskGroupB,
-          payload: { message: "task-for-B" },
-          priority: 1,
-        });
+      await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        taskGroup: taskGroupB,
+        payload: { message: "task-for-B" },
+        priority: 1,
+      });
 
-        // Worker A polls task group A
-        const handlerA: TaskHandler<{ message: string }> = async (ctx) => {
-          processedByWorkerA.push(ctx.task.payload.message);
-          return { type: "success", result: {} };
-        };
-        const workerA = createWorker(handlerA, { taskGroup: taskGroupA });
+      // Worker A polls task group A
+      const handlerA: TaskHandler<{ message: string }> = async (ctx) => {
+        processedByWorkerA.push(ctx.task.payload.message);
+        return { type: "success", result: {} };
+      };
+      const workerA = createWorker(handlerA, { taskGroup: taskGroupA });
 
-        // Worker B polls task group B
-        const handlerB: TaskHandler<{ message: string }> = async (ctx) => {
-          processedByWorkerB.push(ctx.task.payload.message);
-          return { type: "success", result: {} };
-        };
-        const workerB = createWorker(handlerB, { taskGroup: taskGroupB });
+      // Worker B polls task group B
+      const handlerB: TaskHandler<{ message: string }> = async (ctx) => {
+        processedByWorkerB.push(ctx.task.payload.message);
+        return { type: "success", result: {} };
+      };
+      const workerB = createWorker(handlerB, { taskGroup: taskGroupB });
 
-        workerA.start();
-        workerB.start();
+      workerA.start();
+      workerB.start();
 
-        // Wait until both tasks are processed
-        // In a multi-server cluster, workers use random server selection to avoid
-        // lock-step polling patterns. Use a longer timeout to account for variance.
-        await waitFor(
-          () =>
-            processedByWorkerA.includes("task-for-A") &&
-            processedByWorkerB.includes("task-for-B"),
-          { timeout: 10000 }
-        );
+      // Wait until both tasks are processed
+      // In a multi-server cluster, workers use random server selection to avoid
+      // lock-step polling patterns. Use a longer timeout to account for variance.
+      await waitFor(
+        () =>
+          processedByWorkerA.includes("task-for-A") &&
+          processedByWorkerB.includes("task-for-B"),
+        { timeout: 10000 },
+      );
 
-        // Each worker should only have processed its own task group's tasks
-        expect(processedByWorkerA).toContain("task-for-A");
-        expect(processedByWorkerA).not.toContain("task-for-B");
+      // Each worker should only have processed its own task group's tasks
+      expect(processedByWorkerA).toContain("task-for-A");
+      expect(processedByWorkerA).not.toContain("task-for-B");
 
-        expect(processedByWorkerB).toContain("task-for-B");
-        expect(processedByWorkerB).not.toContain("task-for-A");
-      },
-      15000
-    );
+      expect(processedByWorkerB).toContain("task-for-B");
+      expect(processedByWorkerB).not.toContain("task-for-A");
+    }, 15000);
   });
 
   describe("floating concurrency limit refresh", () => {
@@ -640,7 +636,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
           SiloWorkerOptions<Payload, Metadata, Result>,
           "client" | "workerId" | "handler" | "refreshHandler"
         >
-      >
+      >,
     ): SiloWorker<Payload, Metadata, Result> {
       const worker = new SiloWorker<Payload, Metadata, Result>({
         client,
@@ -988,12 +984,12 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         taskStarted = true;
 
         // Listen for abort
-        ctx.signal.addEventListener("abort", () => {
+        ctx.cancellationSignal.addEventListener("abort", () => {
           signalAborted = true;
         });
 
         // Wait indefinitely for abort (like the passing tests do)
-        while (!ctx.signal.aborted) {
+        while (!ctx.cancellationSignal.aborted) {
           await new Promise((resolve) => setTimeout(resolve, 50));
         }
 
@@ -1031,7 +1027,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
           const job = await client.getJob(handle.id, DEFAULT_TENANT);
           return job.status === JobStatus.Cancelled;
         },
-        { timeout: 5000 }
+        { timeout: 5000 },
       );
 
       const finalJob = await client.getJob(handle.id, DEFAULT_TENANT);
@@ -1046,7 +1042,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         taskStarted = true;
 
         // Wait while checking for abort
-        while (!ctx.signal.aborted) {
+        while (!ctx.cancellationSignal.aborted) {
           await new Promise((resolve) => setTimeout(resolve, 50));
         }
 
@@ -1080,7 +1076,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
           const job = await client.getJob(handle.id, DEFAULT_TENANT);
           return job.status === JobStatus.Cancelled;
         },
-        { timeout: 5000 }
+        { timeout: 5000 },
       );
 
       const finalJob = await client.getJob(handle.id, DEFAULT_TENANT);
@@ -1101,7 +1097,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         // Call cancel from the handler
         await ctx.cancel();
         cancelCalled = true;
-        signalAbortedAfterCancel = ctx.signal.aborted;
+        signalAbortedAfterCancel = ctx.cancellationSignal.aborted;
 
         // Return normally (will be ignored because cancelled)
         return { type: "success", result: {} };
@@ -1133,7 +1129,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
           const job = await client.getJob(handle.id, DEFAULT_TENANT);
           return job.status === JobStatus.Cancelled;
         },
-        { timeout: 5000 }
+        { timeout: 5000 },
       );
 
       const finalJob = await client.getJob(handle.id, DEFAULT_TENANT);
@@ -1213,7 +1209,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
           const job = await client.getJob(handle.id, DEFAULT_TENANT);
           return job.status === JobStatus.Succeeded;
         },
-        { timeout: 5000 }
+        { timeout: 5000 },
       );
 
       // Trying to cancel after completion should throw an error
@@ -1229,23 +1225,25 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       const abortedTasks: string[] = [];
       const completedTasks: string[] = [];
 
-      const handler: TaskHandler<{ index: number; shouldWait: boolean }> =
-        async (ctx) => {
-          const taskKey = `task-${ctx.task.payload.index}`;
+      const handler: TaskHandler<{
+        index: number;
+        shouldWait: boolean;
+      }> = async (ctx) => {
+        const taskKey = `task-${ctx.task.payload.index}`;
 
-          if (ctx.task.payload.shouldWait) {
-            // These tasks wait for abort
-            while (!ctx.signal.aborted) {
-              await new Promise((resolve) => setTimeout(resolve, 50));
-            }
-            abortedTasks.push(taskKey);
-          } else {
-            // These tasks complete immediately
-            completedTasks.push(taskKey);
+        if (ctx.task.payload.shouldWait) {
+          // These tasks wait for abort
+          while (!ctx.cancellationSignal.aborted) {
+            await new Promise((resolve) => setTimeout(resolve, 50));
           }
+          abortedTasks.push(taskKey);
+        } else {
+          // These tasks complete immediately
+          completedTasks.push(taskKey);
+        }
 
-          return { type: "success", result: {} };
-        };
+        return { type: "success", result: {} };
+      };
 
       const worker = createWorker(handler, {
         heartbeatIntervalMs: 100,
@@ -1305,7 +1303,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       const handler: TaskHandler = async (ctx) => {
         handlerExecutionCount++;
 
-        ctx.signal.addEventListener("abort", () => {
+        ctx.cancellationSignal.addEventListener("abort", () => {
           abortCount++;
         });
 
@@ -1317,7 +1315,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         await ctx.cancel();
         await ctx.cancel();
 
-        expect(ctx.signal.aborted).toBe(true);
+        expect(ctx.cancellationSignal.aborted).toBe(true);
 
         return { type: "success", result: {} };
       };
@@ -1387,7 +1385,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
           const job = await client.getJob(handle.id, DEFAULT_TENANT);
           return job.status === JobStatus.Cancelled;
         },
-        { timeout: 5000 }
+        { timeout: 5000 },
       );
 
       // Should only have one attempt (no retries on cancellation)
@@ -1398,26 +1396,19 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       expect(attemptCount).toBe(1);
     });
 
-    it("worker shutdown aborts running tasks", async () => {
+    it("worker shutdown does not abort running tasks' cancellation signal", async () => {
       let taskStarted = false;
       let signalAborted = false;
-      let signalAbortReason: string | null = null;
 
       const handler: TaskHandler = async (ctx) => {
         taskStarted = true;
 
-        ctx.signal.addEventListener("abort", () => {
+        ctx.cancellationSignal.addEventListener("abort", () => {
           signalAborted = true;
-          signalAbortReason = "signal_aborted";
         });
 
-        // Long-running work
-        for (let i = 0; i < 100; i++) {
-          if (ctx.signal.aborted) {
-            break;
-          }
-          await new Promise((resolve) => setTimeout(resolve, 50));
-        }
+        // Short-running work that completes before shutdown
+        await new Promise((resolve) => setTimeout(resolve, 200));
 
         return { type: "success", result: {} };
       };
@@ -1431,18 +1422,22 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       await client.enqueue({
         tenant: DEFAULT_TENANT,
         taskGroup: DEFAULT_TASK_GROUP,
-        payload: { action: "long-task" },
+        payload: { action: "task" },
         priority: 1,
       });
 
       // Wait for task to start
       await waitFor(() => taskStarted, { timeout: 5000 });
 
-      // Stop the worker (should abort signal)
+      // Give task time to complete
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      // Stop the worker
       await worker.stop(500);
 
-      expect(signalAborted).toBe(true);
-      expect(signalAbortReason).toBe("signal_aborted");
+      // Signal should NOT be aborted - worker shutdown no longer aborts signals
+      // (only server cancellation or ctx.cancel() aborts the signal)
+      expect(signalAborted).toBe(false);
     });
   });
 });

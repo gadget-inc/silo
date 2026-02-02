@@ -15,17 +15,19 @@ import { Task, TaskExecution, transformTask } from "./TaskExecution";
  *
  * @typeParam T The type of the decoded payload. Defaults to `unknown`.
  */
-export interface TaskContext<Payload = unknown, Metadata extends Record<string, string> = Record<string, string>> {
+export interface TaskContext<
+  Payload = unknown,
+  Metadata extends Record<string, string> = Record<string, string>,
+> {
   /** The task being executed, with decoded payload */
   task: Task<Payload, Metadata>;
   /**
-   * Signal that is aborted when the task should stop processing.
+   * Signal that is aborted when the task is cancelled.
    * This signal is triggered when:
-   * - The worker is stopping (graceful shutdown)
    * - The server reports the job as cancelled (via heartbeat)
    * - The handler explicitly calls cancel()
    */
-  signal: AbortSignal;
+  cancellationSignal: AbortSignal;
   /**
    * Cancel this task. This will:
    * 1. Abort the task's signal immediately
@@ -55,9 +57,11 @@ export interface TaskContext<Payload = unknown, Metadata extends Record<string, 
  *
  * @typeParam T The type of the decoded payload. Defaults to `unknown`.
  */
-export type TaskHandler<Payload = unknown, Metadata extends Record<string, string> = Record<string, string>, Result = unknown> = (
-  context: TaskContext<Payload, Metadata>
-) => Promise<TaskOutcome<Result>>;
+export type TaskHandler<
+  Payload = unknown,
+  Metadata extends Record<string, string> = Record<string, string>,
+  Result = unknown,
+> = (context: TaskContext<Payload, Metadata>) => Promise<TaskOutcome<Result>>;
 
 /**
  * Context passed to refresh handlers for floating concurrency limit refreshes.
@@ -101,7 +105,11 @@ export type RefreshHandler = (context: RefreshTaskContext) => Promise<number>;
  *
  * @typeParam T The type of the decoded payload. Defaults to `unknown`.
  */
-export interface SiloWorkerOptions<Payload = unknown, Metadata extends Record<string, string> = Record<string, string>, Result = unknown> {
+export interface SiloWorkerOptions<
+  Payload = unknown,
+  Metadata extends Record<string, string> = Record<string, string>,
+  Result = unknown,
+> {
   /** The silo client to use for communication */
   client: SiloGRPCClient;
   /** Unique identifier for this worker */
@@ -216,7 +224,11 @@ export interface SiloWorkerOptions<Payload = unknown, Metadata extends Record<st
  * await worker.stop();
  * ```
  */
-export class SiloWorker<Payload = unknown, Metadata extends Record<string, string> = Record<string, string>, Result = unknown> {
+export class SiloWorker<
+  Payload = unknown,
+  Metadata extends Record<string, string> = Record<string, string>,
+  Result = unknown,
+> {
   private readonly _client: SiloGRPCClient;
   private readonly _workerId: string;
   private readonly _taskGroup: string;
@@ -229,7 +241,7 @@ export class SiloWorker<Payload = unknown, Metadata extends Record<string, strin
   private readonly _heartbeatIntervalMs: number;
   private readonly _onError: (
     error: Error,
-    context?: { taskId?: string }
+    context?: { taskId?: string },
   ) => void;
 
   private _running = false;
@@ -261,7 +273,7 @@ export class SiloWorker<Payload = unknown, Metadata extends Record<string, strin
       ((error, ctx) => {
         console.error(
           `[SiloWorker] Error${ctx?.taskId ? ` (task ${ctx.taskId})` : ""}:`,
-          error
+          error,
         );
       });
 
@@ -331,7 +343,7 @@ export class SiloWorker<Payload = unknown, Metadata extends Record<string, strin
     // Wait for all queued and active tasks to complete with timeout
     const queueIdlePromise = this._taskQueue.onIdle();
     const timeoutPromise = new Promise<void>((resolve) =>
-      setTimeout(resolve, timeoutMs)
+      setTimeout(resolve, timeoutMs),
     );
     await Promise.race([queueIdlePromise, timeoutPromise]);
 
@@ -360,7 +372,7 @@ export class SiloWorker<Payload = unknown, Metadata extends Record<string, strin
       } catch (error) {
         if (this._running) {
           this._onError(
-            error instanceof Error ? error : new Error(String(error))
+            error instanceof Error ? error : new Error(String(error)),
           );
         }
       }
@@ -403,7 +415,7 @@ export class SiloWorker<Payload = unknown, Metadata extends Record<string, strin
         maxTasks: tasksToRequest,
         taskGroup: this._taskGroup,
       },
-      serverIndex
+      serverIndex,
     );
 
     // Add regular job tasks to the queue
@@ -416,7 +428,7 @@ export class SiloWorker<Payload = unknown, Metadata extends Record<string, strin
       if (!this._refreshHandler) {
         throw new Error(
           `Worker received ${result.refreshTasks.length} floating limit refresh task(s) but no refreshHandler is configured. ` +
-            `Configure a refreshHandler in SiloWorkerOptions to handle floating concurrency limits.`
+            `Configure a refreshHandler in SiloWorkerOptions to handle floating concurrency limits.`,
         );
       }
       for (const refreshTask of result.refreshTasks) {
@@ -432,12 +444,7 @@ export class SiloWorker<Payload = unknown, Metadata extends Record<string, strin
     const task = transformTask<Payload, Metadata>(protoTask);
 
     // Create TaskExecution to manage this task's state
-    const execution = new TaskExecution(
-      task,
-      this._workerId,
-      this._abortController?.signal ?? new AbortController().signal,
-      this._client
-    );
+    const execution = new TaskExecution(task, this._workerId, this._client);
     this._activeExecutions.set(task.id, execution);
 
     // Start heartbeat for this task immediately
@@ -447,7 +454,7 @@ export class SiloWorker<Payload = unknown, Metadata extends Record<string, strin
           error instanceof Error ? error : new Error(String(error)),
           {
             taskId: task.id,
-          }
+          },
         );
       });
     }, this._heartbeatIntervalMs);
@@ -463,7 +470,7 @@ export class SiloWorker<Payload = unknown, Metadata extends Record<string, strin
           error instanceof Error ? error : new Error(String(error)),
           {
             taskId: task.id,
-          }
+          },
         );
       })
       .finally(() => {
@@ -491,7 +498,7 @@ export class SiloWorker<Payload = unknown, Metadata extends Record<string, strin
           error instanceof Error ? error : new Error(String(error)),
           {
             taskId: task.id,
-          }
+          },
         );
       });
     }, this._heartbeatIntervalMs);
@@ -507,7 +514,7 @@ export class SiloWorker<Payload = unknown, Metadata extends Record<string, strin
           error instanceof Error ? error : new Error(String(error)),
           {
             taskId: task.id,
-          }
+          },
         );
       })
       .finally(() => {
@@ -524,11 +531,11 @@ export class SiloWorker<Payload = unknown, Metadata extends Record<string, strin
    * Execute a single task with its TaskExecution and report its outcome.
    */
   private async _executeTaskWithExecution(
-    execution: TaskExecution<Payload, Metadata>
+    execution: TaskExecution<Payload, Metadata>,
   ): Promise<void> {
     const context: TaskContext<Payload, Metadata> = {
       task: execution.task,
-      signal: execution.signal,
+      cancellationSignal: execution.signal,
       cancel: () => execution.cancelFromClient(),
     };
 
@@ -567,7 +574,7 @@ export class SiloWorker<Payload = unknown, Metadata extends Record<string, strin
    */
   private async _executeRefreshTask(
     task: RefreshTask,
-    shard: string
+    shard: string,
   ): Promise<void> {
     const context: RefreshTaskContext = {
       task,
@@ -644,7 +651,7 @@ export class SiloWorker<Payload = unknown, Metadata extends Record<string, strin
           clearTimeout(timeout);
           resolve();
         },
-        { once: true }
+        { once: true },
       );
     });
   }

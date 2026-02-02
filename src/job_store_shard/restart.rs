@@ -11,7 +11,7 @@ use crate::dst_events::{self, DstEvent};
 use crate::job::{JobStatus, JobStatusKind};
 use crate::job_store_shard::helpers::{decode_job_status_owned, now_epoch_ms};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
-use crate::keys::{idx_status_time_key, job_cancelled_key, job_status_key};
+use crate::keys::{attempt_prefix, idx_status_time_key, job_cancelled_key, job_status_key};
 use crate::task::Task;
 use tracing::debug;
 
@@ -42,14 +42,16 @@ impl JobStoreShard {
     /// - For cancelled jobs: clears cancellation flag and creates new task
     /// - For failed jobs: creates new task (job already has no cancellation flag)
     /// - Returns error for running, scheduled, or succeeded jobs
-    /// - The job gets a fresh set of retries starting from attempt 1
+    /// - The job gets a fresh set of retries with a reset retry schedule
+    /// - Total attempt numbers are monotonically increasing (e.g., 1,2,3 -> restart -> 4,5,6)
+    /// - Relative attempt numbers (for retry scheduling) reset to 1 on restart
     ///
     /// Per Alloy spec:
     /// - [SILO-RESTART-1] Pre: job exists and is in restartable state (Cancelled or Failed)
     /// - [SILO-RESTART-2] Pre: job is NOT Succeeded (truly terminal)
     /// - [SILO-RESTART-3] Pre: no active tasks for this job (checked via status)
     /// - [SILO-RESTART-4] Post: Clear cancellation record if present
-    /// - [SILO-RESTART-5] Post: Create new task in DB queue with attempt 1
+    /// - [SILO-RESTART-5] Post: Create new task in DB queue with next attempt number
     /// - [SILO-RESTART-6] Post: Set status to Scheduled
     ///
     /// Uses a transaction with optimistic concurrency control to detect if the job state
@@ -173,21 +175,45 @@ impl JobStoreShard {
         // Decrement completed jobs counter - job is going from terminal to scheduled
         self.decrement_completed_jobs_counter_txn(&txn)?;
 
-        // [SILO-RESTART-5] Post: Create new task in DB queue with attempt 1 (fresh retries)
+        // Find the maximum attempt number from existing attempts
+        // We scan the attempts prefix to find the highest attempt number
+        let prefix = attempt_prefix(tenant, id);
+        let start = prefix.as_bytes().to_vec();
+        let mut end = start.clone();
+        end.push(0xFF);
+
+        let mut max_attempt_number: u32 = 0;
+        let mut iter = txn.scan::<Vec<u8>, _>(start..=end).await?;
+        while let Some(kv) = iter.next().await? {
+            // Key format: attempts/<tenant>/<job-id>/<attempt-number>
+            // Extract the attempt number from the key
+            let key_str = String::from_utf8_lossy(&kv.key);
+            if let Some(attempt_str) = key_str.rsplit('/').next()
+                && let Ok(attempt_num) = attempt_str.parse::<u32>()
+            {
+                max_attempt_number = max_attempt_number.max(attempt_num);
+            }
+        }
+
+        // [SILO-RESTART-5] Post: Create new task in DB queue with next attempt number
+        // Attempt numbers are monotonically increasing; relative attempts reset to 1 on restart
+        let next_attempt_number = max_attempt_number + 1;
         let new_task_id = Uuid::new_v4().to_string();
         let task_group = job_view.task_group().to_string();
         let new_task = Task::RunAttempt {
             id: new_task_id,
             tenant: tenant.to_string(),
             job_id: id.to_string(),
-            attempt_number: 1, // Fresh start - retry counter reset
+            attempt_number: next_attempt_number,
+            relative_attempt_number: 1, // Reset to 1 on restart
             held_queues: Vec::new(),
             task_group: task_group.clone(),
         };
 
         // Use a temporary WriteBatch to encode the task, then extract and put via txn
         let task_value = crate::codec::encode_task(&new_task)?;
-        let task_key = crate::keys::task_key(&task_group, start_at_ms, priority, id, 1);
+        let task_key =
+            crate::keys::task_key(&task_group, start_at_ms, priority, id, next_attempt_number);
         txn.put(task_key.as_bytes(), &task_value)?;
 
         // Commit the transaction

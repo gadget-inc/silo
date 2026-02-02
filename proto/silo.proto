@@ -236,17 +236,19 @@ message LeaseTasksRequest {
 
 // A task representing a single job attempt leased to a worker.
 message Task {
-  string id = 1;              // Unique task ID (different from job ID).
-  string job_id = 2;          // ID of the job this task belongs to.
-  uint32 attempt_number = 3;  // Which attempt this is (1 = first attempt).
-  int64 lease_ms = 4;         // How long the lease lasts. Heartbeat before this expires.
-  SerializedBytes payload = 5;   // The job's payload for the worker to process.
-  uint32 priority = 6;        // Job priority (for informational purposes).
-  string shard = 7;           // Shard ID (UUID) this task came from (needed for reporting outcome).
-  string task_group = 8;      // Task group this task belongs to.
-  optional string tenant_id = 9;       // Tenant ID if multi-tenancy is enabled.
-  bool is_last_attempt = 10;           // True if this is the final attempt (no more retries after this).
-  map<string, string> metadata = 11;   // Metadata key/value pairs from the job.
+  string id = 1;                      // Unique task ID (different from job ID).
+  string job_id = 2;                  // ID of the job this task belongs to.
+  optional string tenant_id = 3;      // Tenant ID if multi-tenancy is enabled.
+  uint32 attempt_number = 4;          // Which attempt this is (1 = first attempt). Monotonically increasing across restarts.
+  uint32 relative_attempt_number = 5; // Attempt within current run (1 = first attempt since last restart). Resets on restart.
+  bool is_last_attempt = 6;           // True if this is the final attempt (no more retries after this run).
+  map<string, string> metadata = 7;   // Metadata key/value pairs from the job.
+  repeated Limit limits = 8;          // Limits declared on this job (concurrency, rate, floating).
+  SerializedBytes payload = 9;        // The job's payload for the worker to process.
+  uint32 priority = 10;               // Job priority (for informational purposes).
+  string shard = 11;                  // Shard ID (UUID) this task came from (needed for reporting outcome).
+  string task_group = 12;             // Task group this task belongs to.
+  int64 lease_ms = 13;                // How long the lease lasts. Heartbeat before this expires.
 }
 
 // Task for refreshing a floating concurrency limit.

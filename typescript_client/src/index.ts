@@ -45,7 +45,14 @@ export {
   type RefreshTaskContext,
   type RefreshHandler,
 } from "./worker";
-export { type CancellationReason, type Task } from "./TaskExecution";
+export {
+  type CancellationReason,
+  type Task,
+  type Limit,
+  type ConcurrencyLimit,
+  type FloatingConcurrencyLimit,
+  type GubernatorRateLimit,
+} from "./TaskExecution";
 export { JobHandle } from "./JobHandle";
 export type {
   QueryResponse,

@@ -176,7 +176,8 @@ async fn restart_failed_job() {
             "failed job should be Scheduled after restart"
         );
 
-        // [SILO-RESTART-5] Verify a new task exists with attempt number 1
+        // [SILO-RESTART-5] Verify a new task exists with monotonically increasing attempt number
+        // After 1 failed attempt, restart creates attempt 2 (not reset to 1)
         let tasks = shard.peek_tasks("default", 10).await.expect("peek");
         assert!(!tasks.is_empty(), "new task should exist after restart");
         match &tasks[0] {
@@ -187,8 +188,8 @@ async fn restart_failed_job() {
             } => {
                 assert_eq!(jid, &job_id);
                 assert_eq!(
-                    *attempt_number, 1,
-                    "restart should reset attempt number to 1 for fresh retries"
+                    *attempt_number, 2,
+                    "restart should continue attempt numbers monotonically (was 1, now 2)"
                 );
             }
             _ => panic!("expected RunAttempt task"),
@@ -505,7 +506,9 @@ async fn restart_failed_job_with_retry_policy_resets_retries() {
             .expect("exists");
         assert_eq!(status_after.kind, JobStatusKind::Scheduled);
 
-        // Verify new task has attempt number 1 (fresh start)
+        // Verify new task has monotonically increasing attempt number
+        // After 3 failed attempts, restart creates attempt 4 (not reset to 1)
+        // The retry SCHEDULE resets, but attempt numbers continue monotonically
         let tasks = shard.peek_tasks("default", 10).await.expect("peek");
         match &tasks[0] {
             Task::RunAttempt {
@@ -515,8 +518,8 @@ async fn restart_failed_job_with_retry_policy_resets_retries() {
             } => {
                 assert_eq!(jid, &job_id);
                 assert_eq!(
-                    *attempt_number, 1,
-                    "restart should reset to attempt 1 for fresh retries"
+                    *attempt_number, 4,
+                    "restart should continue attempt numbers monotonically (was 3, now 4)"
                 );
             }
             _ => panic!("expected RunAttempt task"),

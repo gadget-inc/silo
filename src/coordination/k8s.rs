@@ -527,6 +527,14 @@ impl<B: K8sBackend> K8sCoordinator<B> {
                                 }
                                 LeaseWatchEvent::InitDone => {
                                     debug!(node_id = %self.base.node_id, "shard lease watcher init done");
+                                    // After initial sync completes, notify all waiting guards to retry.
+                                    // This handles the race where guards started waiting before the watcher
+                                    // finished syncing and saw available leases. Without this, guards would
+                                    // have to wait for the 500ms timeout before retrying.
+                                    let notifiers = self.shard_available_notifiers.lock().await;
+                                    for notifier in notifiers.values() {
+                                        notifier.notify_waiters();
+                                    }
                                 }
                             }
                         }

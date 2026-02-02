@@ -851,10 +851,13 @@ impl Silo for SiloService {
                 let attempt = lt.attempt();
                 let task_group = job.task_group().to_string();
                 let attempt_number = attempt.attempt_number();
+                let relative_attempt_number = attempt.relative_attempt_number();
+                let tenant_str = lt.tenant_id().to_string();
+                let job_id_str = job.id().to_string();
 
                 // Record attempt and wait time metrics
                 if let Some(ref m) = self.metrics {
-                    let is_retry = attempt_number > 1;
+                    let is_retry = relative_attempt_number > 1;
                     m.record_attempt(&shard_str, &task_group, is_retry);
 
                     // Calculate wait time in seconds (enqueue to now)
@@ -866,26 +869,23 @@ impl Silo for SiloService {
                     m.inc_task_leases_active(&shard_str, &task_group);
                 }
 
-                // Determine if this is the last attempt based on retry policy
+                // Determine if this is the last attempt based on retry policy and relative attempt
                 let max_attempts = job
                     .retry_policy()
                     .map(|p| p.retry_count + 1) // retry_count is retries after first attempt
                     .unwrap_or(1); // No retry policy means only 1 attempt
-                let is_last_attempt = attempt_number >= max_attempts;
+                let is_last_attempt = relative_attempt_number >= max_attempts;
 
                 // Get tenant_id, using None if it's the default "-" tenant
-                let tenant_id = {
-                    let tid = lt.tenant_id();
-                    if tid == "-" {
-                        None
-                    } else {
-                        Some(tid.to_string())
-                    }
+                let tenant_id = if tenant_str == "-" {
+                    None
+                } else {
+                    Some(tenant_str)
                 };
 
                 all_tasks.push(Task {
                     id: attempt.task_id().to_string(),
-                    job_id: job.id().to_string(),
+                    job_id: job_id_str,
                     attempt_number,
                     lease_ms: DEFAULT_LEASE_MS,
                     payload: Some(SerializedBytes {
@@ -899,6 +899,12 @@ impl Silo for SiloService {
                     tenant_id,
                     is_last_attempt,
                     metadata: job.metadata().into_iter().collect(),
+                    limits: job
+                        .limits()
+                        .into_iter()
+                        .map(job_limit_to_proto_limit)
+                        .collect(),
+                    relative_attempt_number,
                 });
             }
 

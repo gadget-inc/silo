@@ -41,6 +41,7 @@ function createTask(
     id,
     jobId,
     attemptNumber: 1,
+    relativeAttemptNumber: 1,
     leaseMs: 30000n,
     payload: {
       encoding: {
@@ -53,6 +54,7 @@ function createTask(
     taskGroup: "default",
     isLastAttempt: false,
     metadata: {},
+    limits: [],
   };
 }
 
@@ -248,6 +250,110 @@ describe("SiloWorker", () => {
         outcome: { type: "success", result: { processed: true } },
         shard: "00000000-0000-0000-0000-000000000001",
       });
+    });
+
+    it("passes limits to handler in task context", async () => {
+      const taskWithLimits: Task = {
+        id: "task-limits-1",
+        jobId: "job-limits-1",
+        attemptNumber: 1,
+        relativeAttemptNumber: 1,
+        leaseMs: 30000n,
+        payload: {
+          encoding: {
+            oneofKind: "msgpack",
+            msgpack: encodeBytes({ test: "data" }),
+          },
+        },
+        priority: 10,
+        shard: "00000000-0000-0000-0000-000000000001",
+        taskGroup: "default",
+        isLastAttempt: false,
+        metadata: {},
+        limits: [
+          {
+            limit: {
+              oneofKind: "concurrency",
+              concurrency: {
+                key: "test-concurrency-key",
+                maxConcurrency: 5,
+              },
+            },
+          },
+          {
+            limit: {
+              oneofKind: "rateLimit",
+              rateLimit: {
+                name: "test-rate-limit",
+                uniqueKey: "test-rate-key",
+                limit: 100n,
+                durationMs: 60000n,
+                hits: 1,
+                algorithm: 0, // TokenBucket
+                behavior: 0,
+                retryPolicy: {
+                  initialBackoffMs: 1000n,
+                  maxBackoffMs: 30000n,
+                  backoffMultiplier: 2.0,
+                  maxRetries: 5,
+                },
+              },
+            },
+          },
+        ],
+      };
+
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce(tasksResult([taskWithLimits]))
+        .mockResolvedValue(tasksResult([]));
+      const reportOutcome = vi.fn().mockResolvedValue(undefined);
+      const client = createMockClient({ leaseTasks, reportOutcome });
+
+      let receivedLimits: unknown[] = [];
+      const handler: TaskHandler = async (ctx) => {
+        receivedLimits = ctx.task.limits;
+        return { type: "success", result: {} };
+      };
+
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler,
+        pollIntervalMs: 10,
+      });
+
+      worker.start();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await worker.stop();
+
+      // Verify limits were passed to handler
+      expect(receivedLimits).toHaveLength(2);
+
+      // Check concurrency limit
+      const concurrencyLimit = receivedLimits[0] as {
+        limit: {
+          oneofKind: string;
+          concurrency: { key: string; maxConcurrency: number };
+        };
+      };
+      expect(concurrencyLimit.limit.oneofKind).toBe("concurrency");
+      expect(concurrencyLimit.limit.concurrency.key).toBe(
+        "test-concurrency-key",
+      );
+      expect(concurrencyLimit.limit.concurrency.maxConcurrency).toBe(5);
+
+      // Check rate limit
+      const rateLimit = receivedLimits[1] as {
+        limit: {
+          oneofKind: string;
+          rateLimit: { name: string; uniqueKey: string };
+        };
+      };
+      expect(rateLimit.limit.oneofKind).toBe("rateLimit");
+      expect(rateLimit.limit.rateLimit.name).toBe("test-rate-limit");
+      expect(rateLimit.limit.rateLimit.uniqueKey).toBe("test-rate-key");
     });
 
     it("executes tasks and reports failure", async () => {
@@ -616,6 +722,164 @@ describe("SiloWorker", () => {
     });
   });
 
+  describe("graceful shutdown", () => {
+    it("does not abort task signal when shutdown begins", async () => {
+      const task = createTask("task-shutdown", "job-shutdown");
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
+      const reportOutcome = vi.fn().mockResolvedValue(undefined);
+      const client = createMockClient({ leaseTasks, reportOutcome });
+
+      let signalWasAbortedDuringTask = false;
+      let taskStartedResolve: () => void;
+      let continueTaskResolve: () => void;
+      const taskStarted = new Promise<void>((r) => {
+        taskStartedResolve = r;
+      });
+      const continueTask = new Promise<void>((r) => {
+        continueTaskResolve = r;
+      });
+
+      const handler: TaskHandler = async (ctx) => {
+        // Signal task has started
+        taskStartedResolve();
+        // Wait until we're told to continue (after stop() is called)
+        await continueTask;
+        // Check if signal was aborted after shutdown was called
+        signalWasAbortedDuringTask = ctx.cancellationSignal.aborted;
+        return { type: "success", result: { completed: true } };
+      };
+
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler,
+        pollIntervalMs: 10,
+      });
+
+      worker.start();
+
+      // Wait for task to start
+      await taskStarted;
+
+      // Call stop - this begins shutdown
+      const stopPromise = worker.stop();
+
+      // Allow task to continue after stop has been called
+      continueTaskResolve!();
+
+      await stopPromise;
+
+      // The signal should NOT have been aborted
+      expect(signalWasAbortedDuringTask).toBe(false);
+
+      // The task should have completed successfully
+      expect(reportOutcome).toHaveBeenCalledWith({
+        taskId: "task-shutdown",
+        outcome: { type: "success", result: { completed: true } },
+        shard: "00000000-0000-0000-0000-000000000001",
+      });
+    });
+
+    it("allows tasks to complete after shutdown begins", async () => {
+      const task = createTask("task-complete", "job-complete");
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
+      const reportOutcome = vi.fn().mockResolvedValue(undefined);
+      const client = createMockClient({ leaseTasks, reportOutcome });
+
+      let taskCompleted = false;
+      let resolveTaskStarted: () => void;
+      const taskStarted = new Promise<void>((resolve) => {
+        resolveTaskStarted = resolve;
+      });
+
+      const handler: TaskHandler = async () => {
+        resolveTaskStarted();
+        // Simulate some work that takes time
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        taskCompleted = true;
+        return { type: "success", result: { done: true } };
+      };
+
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler,
+        pollIntervalMs: 10,
+      });
+
+      worker.start();
+
+      // Wait for task to start
+      await taskStarted;
+
+      // Immediately call stop
+      await worker.stop();
+
+      // Task should have completed despite shutdown being called
+      expect(taskCompleted).toBe(true);
+      expect(reportOutcome).toHaveBeenCalledWith({
+        taskId: "task-complete",
+        outcome: { type: "success", result: { done: true } },
+        shard: "00000000-0000-0000-0000-000000000001",
+      });
+    });
+
+    it("does not report cancelled outcome for tasks running during shutdown", async () => {
+      const task = createTask("task-not-cancelled", "job-not-cancelled");
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
+      const reportOutcome = vi.fn().mockResolvedValue(undefined);
+      const client = createMockClient({ leaseTasks, reportOutcome });
+
+      let resolveTaskStarted: () => void;
+      const taskStarted = new Promise<void>((resolve) => {
+        resolveTaskStarted = resolve;
+      });
+
+      const handler: TaskHandler = async () => {
+        resolveTaskStarted();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return { type: "success", result: {} };
+      };
+
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler,
+        pollIntervalMs: 10,
+      });
+
+      worker.start();
+      await taskStarted;
+      await worker.stop();
+
+      // Should NOT have reported a cancelled outcome
+      expect(reportOutcome).toHaveBeenCalledTimes(1);
+      expect(reportOutcome).toHaveBeenCalledWith({
+        taskId: "task-not-cancelled",
+        outcome: { type: "success", result: {} },
+        shard: "00000000-0000-0000-0000-000000000001",
+      });
+      // Verify it was NOT called with cancelled
+      expect(reportOutcome).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          outcome: { type: "cancelled" },
+        }),
+      );
+    });
+  });
+
   describe("TaskContext", () => {
     it("provides abort signal and cancel method in context", async () => {
       const task = createTask("task-sig", "job-sig");
@@ -630,7 +894,7 @@ describe("SiloWorker", () => {
       let receivedCancel: (() => Promise<void>) | undefined;
 
       const handler: TaskHandler = async (ctx) => {
-        receivedSignal = ctx.signal;
+        receivedSignal = ctx.cancellationSignal;
         receivedCancel = ctx.cancel.bind(ctx);
         return { type: "success", result: {} };
       };
