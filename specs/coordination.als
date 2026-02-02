@@ -54,11 +54,11 @@ one sig SplitRequested extends SplitPhase {}
 /** Traffic to parent shard is being paused (returning retryable errors) */
 one sig SplitPausing extends SplitPhase {}
 
-/** SlateDB clone operation is in progress */
+/** SlateDB clone operation and shard map update in progress.
+ * This phase clones both child databases, then atomically updates the shard map.
+ * The shard map update is the commit point - once children exist in the shard map,
+ * the split is committed. */
 one sig SplitCloning extends SplitPhase {}
-
-/** Shard map is being updated atomically */
-one sig SplitUpdatingMap extends SplitPhase {}
 
 /** Split is complete, children are active */
 one sig SplitComplete extends SplitPhase {}
@@ -567,7 +567,7 @@ fun splitPhaseAt[s: Shard, t: Time]: set SplitPhase {
 /** Check if traffic is paused to a shard (during split) */
 pred trafficPaused[s: Shard, t: Time] {
     splitInProgressFor[s, t] and 
-    splitPhaseAt[s, t] in (SplitPausing + SplitCloning + SplitUpdatingMap)
+    splitPhaseAt[s, t] in (SplitPausing + SplitCloning)
 }
 
 /** Check if a split has completed for a shard */
@@ -703,6 +703,7 @@ pred splitCloneDb[n: Node, s: Shard, t: Time, tnext: Time] {
  * 
  * This atomically replaces the parent shard with the two child shards
  * in the shard map. The parent shard is removed, children are added.
+ * THIS IS THE COMMIT POINT - once children exist in the shard map, the split is committed.
  * 
  * Preconditions:
  * - Split is in SplitCloning phase
@@ -712,7 +713,9 @@ pred splitCloneDb[n: Node, s: Shard, t: Time, tnext: Time] {
  * - Parent shard no longer exists in map
  * - Child shards exist with proper ranges
  * - Children have cleanup pending
- * - Split transitions to SplitUpdatingMap phase
+ * - Split transitions to SplitComplete phase (commit point reached)
+ * - Parent lease is released
+ * - Children have no leases yet
  */
 pred splitUpdateMap[n: Node, s: Shard, t: Time, tnext: Time] {
     -- Pre: Split exists in SplitCloning phase
@@ -750,51 +753,7 @@ pred splitUpdateMap[n: Node, s: Shard, t: Time, tnext: Time] {
                 smeRight.sme_cleanupStatus = CleanupPending
             }
             
-            -- Post: Split transitions to SplitUpdatingMap
-            some sp: SplitInProgress | {
-                sp.split_parent = s 
-                sp.split_time = tnext
-                sp.split_phase = SplitUpdatingMap
-                sp.split_point = orig.split_point
-                sp.split_leftChild = leftChild
-                sp.split_rightChild = rightChild
-            }
-        }
-    }
-    
-    -- Frame: Other shards unchanged
-    all s2: Shard | s2 != s and shardExists[s2, t] and s2 not in splitFor[s, t].(split_leftChild + split_rightChild) implies 
-        shardExists[s2, tnext]
-}
-
-/**
- * [SILO-SPLIT-COMPLETE-1] Complete the split and resume traffic.
- * 
- * The split is marked complete. The parent lease is released, and 
- * the children can now be acquired by nodes (may be same or different nodes).
- * 
- * Preconditions:
- * - Split is in SplitUpdatingMap phase
- * - Node holds lease on parent
- * 
- * Postconditions:
- * - Split is in SplitComplete phase
- * - Parent lease is released
- * - Child shards have no leases yet
- */
-pred splitComplete[n: Node, s: Shard, t: Time, tnext: Time] {
-    -- Pre: Split exists in SplitUpdatingMap phase
-    splitInProgressFor[s, t]
-    splitPhaseAt[s, t] = SplitUpdatingMap
-    
-    -- Pre: Node holds lease on parent
-    holdsLease[n, s, t]
-    
-    some orig: splitFor[s, t] | {
-        let leftChild = orig.split_leftChild,
-            rightChild = orig.split_rightChild | {
-            
-            -- Post: Split is complete
+            -- Post: Split transitions to SplitComplete (commit point)
             some sp: SplitInProgress | {
                 sp.split_parent = s 
                 sp.split_time = tnext
@@ -812,6 +771,32 @@ pred splitComplete[n: Node, s: Shard, t: Time, tnext: Time] {
             not hasLeaseHolder[rightChild, tnext]
         }
     }
+    
+    -- Frame: Other shards unchanged
+    all s2: Shard | s2 != s and shardExists[s2, t] and s2 not in splitFor[s, t].(split_leftChild + split_rightChild) implies 
+        shardExists[s2, tnext]
+}
+
+/**
+ * [SILO-SPLIT-COMPLETE-1] Complete the split and cleanup.
+ * 
+ * The split record is deleted after completion. This is just cleanup
+ * of the split record - the actual work was done in splitUpdateMap.
+ * 
+ * Preconditions:
+ * - Split is in SplitComplete phase
+ * - Node holds lease on a child
+ * 
+ * Postconditions:
+ * - Split record is deleted
+ */
+pred splitCleanup[n: Node, s: Shard, t: Time, tnext: Time] {
+    -- Pre: Split exists in SplitComplete phase
+    splitInProgressFor[s, t]
+    splitPhaseAt[s, t] = SplitComplete
+    
+    -- Post: Split record deleted
+    not splitInProgressFor[s, tnext]
 }
 
 /** Get the worker's cached route for a tenant at time t */
@@ -1294,10 +1279,10 @@ fact wellFormed {
         (shardExists[sp.split_leftChild, t] and shardExists[sp.split_rightChild, t]) implies
             shardRangeEnd[sp.split_leftChild, t] = shardRangeStart[sp.split_rightChild, t]
     
-    -- [SILO-COORD-INV-9] Split parent exists (unless in late phase where it's removed)
+    -- [SILO-COORD-INV-9] Split parent exists (unless in SplitComplete where it's been removed)
     all sp: SplitInProgress |
         shardExists[sp.split_parent, sp.split_time] or 
-        sp.split_phase in (SplitUpdatingMap + SplitComplete)
+        sp.split_phase = SplitComplete
     
     -- At most one cache entry per (worker, tenant) at each time
     all w: Worker, tenant: TenantId, t: Time | 
@@ -1450,8 +1435,7 @@ pred step[t: Time, tnext: Time] {
     or (some n: Node, s: Shard | splitPauseTrafficStep[n, s, t, tnext])
     or (some n: Node, s: Shard | splitCloneDbStep[n, s, t, tnext])
     or (some n: Node, s: Shard | splitUpdateMapStep[n, s, t, tnext])
-    or (some n: Node, s: Shard | splitCompleteStep[n, s, t, tnext])
-    or (some n: Node, s: Shard | splitResumeStep[n, s, t, tnext])  -- Resume after crash
+    or (some n: Node, s: Shard | splitCleanupStep[n, s, t, tnext])
     
     -- Cleanup and compaction
     or (some n: Node, s: Shard | splitCleanupStartStep[n, s, t, tnext])
@@ -1518,21 +1502,18 @@ pred nodeFlapStep[n: Node, t: Time, tnext: Time] {
     -- All leases held by this node expire
     all s: Shard | holdsLease[n, s, t] implies not hasLeaseHolder[s, tnext]
     
-    -- [SILO-SPLIT-CRASH-1] Splits in early phases are abandoned when the node crashes
-    -- A split before SplitUpdatingMap phase is abandoned because the parent shard still exists
-    -- and the children don't exist yet. The split state is simply cleared.
+    -- [SILO-SPLIT-CRASH-1] All incomplete splits are abandoned when the node crashes.
+    -- The shard map update is the commit point - if children don't exist in the shard map,
+    -- the split never completed and is safe to abandon. Orphaned clone databases may exist
+    -- but don't affect correctness.
     all s: Shard | (holdsLease[n, s, t] and splitInProgressFor[s, t] and 
                     splitPhaseAt[s, t] in (SplitRequested + SplitPausing + SplitCloning)) implies
         not splitInProgressFor[s, tnext]
     
-    -- [SILO-SPLIT-CRASH-2] Splits in late phases (UpdateMap, Complete) are preserved
-    -- because children exist and the split needs to be completed by another node.
-    -- The split state persists so another node can resume it.
+    -- SplitComplete phase splits are also cleaned up (just the record deletion)
     all s: Shard | (holdsLease[n, s, t] and splitInProgressFor[s, t] and 
-                    splitPhaseAt[s, t] in (SplitUpdatingMap + SplitComplete)) implies {
-        splitInProgressFor[s, tnext]
-        splitPhaseAt[s, tnext] = splitPhaseAt[s, t]
-    }
+                    splitPhaseAt[s, t] = SplitComplete) implies
+        not splitInProgressFor[s, tnext]
     
     -- Splits not involving shards held by n are unchanged
     all s: Shard | not holdsLease[n, s, t] implies {
@@ -1748,9 +1729,9 @@ pred splitUpdateMapStep[n: Node, s: Shard, t: Time, tnext: Time] {
             shardParent[rightChild, tnext] = s
             shardSplitCleanupStatus[rightChild, tnext] = CleanupPending
             
-            -- Split phase advances
+            -- Split phase advances to SplitComplete (commit point reached)
             splitInProgressFor[s, tnext]
-            splitPhaseAt[s, tnext] = SplitUpdatingMap
+            splitPhaseAt[s, tnext] = SplitComplete
             some next: splitFor[s, tnext] | {
                 next.split_point = orig.split_point
                 next.split_leftChild = leftChild
@@ -1783,48 +1764,39 @@ pred splitUpdateMapStep[n: Node, s: Shard, t: Time, tnext: Time] {
     workerFrame[t, tnext]
 }
 
-/** Split complete with full frame conditions */
-pred splitCompleteStep[n: Node, s: Shard, t: Time, tnext: Time] {
+/** Split cleanup - delete the split record after completion.
+ * With the simplified model, the split record is just cleaned up after the
+ * shard map update (commit point) has occurred. */
+pred splitCleanupStep[n: Node, s: Shard, t: Time, tnext: Time] {
     -- Preconditions
     splitInProgressFor[s, t]
-    splitPhaseAt[s, t] = SplitUpdatingMap
+    splitPhaseAt[s, t] = SplitComplete
     
-    -- Postconditions: Split marked complete
-    splitInProgressFor[s, tnext]
-    splitPhaseAt[s, tnext] = SplitComplete
-    some orig: splitFor[s, t], next: splitFor[s, tnext] | {
-        next.split_point = orig.split_point
-        next.split_leftChild = orig.split_leftChild
-        next.split_rightChild = orig.split_rightChild
-    }
+    -- Postconditions: Split record deleted
+    not splitInProgressFor[s, tnext]
     
     -- Frame conditions
     membershipFrame[t, tnext]
     shardMapFrame[t, tnext]
     leaseFrame[t, tnext]
-    splitFrameExcept[s, t, tnext]
     workerFrame[t, tnext]
 }
 
 /**
- * [SILO-SPLIT-RESUME-1] A new node resumes a split that was interrupted after UpdateMap.
- * 
- * When a node crashes after splitUpdateMap but before splitComplete, the children
- * exist but the split is not marked complete. A new node that acquires leases on
- * the children can complete the split.
- * 
- * Preconditions:
- * - Split is in SplitUpdatingMap phase (left by crashed node)
- * - Children shards exist
- * - New node holds leases on both children (acquired after previous owner crashed)
- * 
- * Postconditions:
- * - Split advances to SplitComplete
+ * NOTE: Split resume is no longer needed with the simplified split model.
+ * All incomplete splits are abandoned on crash. The shard map update is
+ * the commit point - if children don't exist in the shard map, the split
+ * never completed and is safe to abandon.
+ *
+ * This predicate is kept as a placeholder but is never used.
  */
-pred splitResumeStep[n: Node, s: Shard, t: Time, tnext: Time] {
-    -- Preconditions
+pred splitResumeStep_UNUSED[n: Node, s: Shard, t: Time, tnext: Time] {
+    -- This predicate is unused - all incomplete splits are abandoned
+    -- Keeping this as documentation of the old behavior
+    
+    -- Preconditions (would have been)
     splitInProgressFor[s, t]
-    splitPhaseAt[s, t] = SplitUpdatingMap
+    splitPhaseAt[s, t] = SplitComplete  -- Only SplitComplete can exist after crash
     
     some orig: splitFor[s, t] | {
         let leftChild = orig.split_leftChild,
@@ -2094,7 +2066,7 @@ assert leaseHolderCountAtMostOne {
  */
 assert splitParentExists {
     all sp: SplitInProgress | shardExists[sp.split_parent, sp.split_time] or
-        sp.split_phase in (SplitUpdatingMap + SplitComplete)  -- Parent may be removed in these phases
+        sp.split_phase = SplitComplete  -- Parent removed when split reaches SplitComplete (commit point)
 }
 
 /**
@@ -2119,17 +2091,15 @@ assert cleanupStatusMonotonic {
  * [SILO-COORD-INV-17] Split phases only progress forward.
  * 
  * Once a split transitions to a later phase, it cannot go backwards.
- * Progression: SplitRequested -> SplitPausing -> SplitCloning -> SplitUpdatingMap -> SplitComplete
+ * Progression: SplitRequested -> SplitPausing -> SplitCloning -> SplitComplete
  */
 assert splitPhaseMonotonic {
     all s: Shard, t1, t2: Time | 
         lt[t1, t2] and splitInProgressFor[s, t1] and splitInProgressFor[s, t2] implies {
             (splitPhaseAt[s, t1] = SplitPausing implies 
-                splitPhaseAt[s, t2] in (SplitPausing + SplitCloning + SplitUpdatingMap + SplitComplete))
+                splitPhaseAt[s, t2] in (SplitPausing + SplitCloning + SplitComplete))
             (splitPhaseAt[s, t1] = SplitCloning implies 
-                splitPhaseAt[s, t2] in (SplitCloning + SplitUpdatingMap + SplitComplete))
-            (splitPhaseAt[s, t1] = SplitUpdatingMap implies 
-                splitPhaseAt[s, t2] in (SplitUpdatingMap + SplitComplete))
+                splitPhaseAt[s, t2] in (SplitCloning + SplitComplete))
             (splitPhaseAt[s, t1] = SplitComplete implies 
                 splitPhaseAt[s, t2] = SplitComplete)
         }
@@ -2178,13 +2148,12 @@ assert earlySplitCrashPreservesParent {
  * [SILO-COORD-INV-21] Split children persist once created.
  * 
  * If the split's children exist at some time, they continue to exist
- * at all later times (no shard deletion). This ensures that even if
- * a crash happens after splitUpdateMap, the children remain available
- * for the split to be resumed.
+ * at all later times (no shard deletion). This ensures that the children
+ * remain available once the split commits.
  * 
  * Note: The splitUpdateMapStep transition creates children atomically
- * with the phase change to SplitUpdatingMap. This assertion verifies
- * that children, once created, are never deleted.
+ * with the phase change to SplitComplete (commit point). This assertion
+ * verifies that children, once created, are never deleted.
  */
 assert splitChildrenPersist {
     all sp: SplitInProgress, t1, t2: Time |
@@ -2196,20 +2165,20 @@ assert splitChildrenPersist {
 }
 
 /**
- * [SILO-COORD-INV-22] Split can always be completed eventually.
+ * [SILO-COORD-INV-22] Committed splits preserve their state.
  * 
- * If a split reaches UpdateMap phase, the split state must persist until
- * it reaches Complete. This ensures the split can be resumed after a crash.
- * (Note: The split state is only cleared once it reaches Complete phase,
- * not when it's abandoned in early phases.)
+ * If a split reaches SplitComplete phase (committed), the split state
+ * can be cleaned up. Before SplitComplete, any crash abandons the split.
+ * This simplification means there's no "resume" logic - all incomplete
+ * splits are abandoned and the shard map is the source of truth.
  */
-assert lateSplitStatePreserved {
+assert committedSplitStatePreserved {
     all s: Shard, t1, t2: Time |
-        -- If split is in UpdateMap at t1 and still tracked at t2
-        (splitInProgressFor[s, t1] and splitPhaseAt[s, t1] = SplitUpdatingMap and
+        -- If split is in Complete at t1 and still tracked at t2
+        (splitInProgressFor[s, t1] and splitPhaseAt[s, t1] = SplitComplete and
          lt[t1, t2] and splitInProgressFor[s, t2]) implies
-        -- Then phase is UpdateMap or Complete (not regressed)
-        splitPhaseAt[s, t2] in (SplitUpdatingMap + SplitComplete)
+        -- Then phase remains Complete (not regressed, just waiting for cleanup)
+        splitPhaseAt[s, t2] = SplitComplete
 }
 
 /**
@@ -2341,13 +2310,12 @@ pred exampleShardSplit {
         some tSplit: Time | splitInProgressFor[parent, tSplit]
         
         -- Split goes through all phases
-        some t1, t2, t3, t4, t5: Time | {
-            lt[t1, t2] and lt[t2, t3] and lt[t3, t4] and lt[t4, t5]
+        some t1, t2, t3, t4: Time | {
+            lt[t1, t2] and lt[t2, t3] and lt[t3, t4]
             splitPhaseAt[parent, t1] = SplitRequested
             splitPhaseAt[parent, t2] = SplitPausing
             splitPhaseAt[parent, t3] = SplitCloning
-            splitPhaseAt[parent, t4] = SplitUpdatingMap
-            splitPhaseAt[parent, t5] = SplitComplete
+            splitPhaseAt[parent, t4] = SplitComplete
         }
         
         -- After split update map, children exist with cleanup pending
@@ -2450,33 +2418,34 @@ pred exampleCrashDuringEarlySplit {
 }
 
 /**
- * Example: Crash during split after UpdateMap (late phase).
+ * Example: Crash during split after commit (SplitComplete phase).
  * 
  * Simplified scenario showing the key property:
- * - Split reaches SplitUpdatingMap phase (children exist)
+ * - Split reaches SplitComplete phase (children exist in shard map)
  * - Node that was doing the split flaps
- * - Children still exist and split state is preserved
+ * - Children still exist (shard map is source of truth)
  * 
- * Key property: The children are created atomically in UpdateMap,
- * so they persist even if the node crashes.
+ * Key property: The shard map update is the commit point.
+ * Once children exist in the shard map, they persist even if the node crashes.
+ * Incomplete splits (before shard map update) are simply abandoned.
  */
-pred exampleCrashDuringLateSplit {
+pred exampleCrashAfterSplitCommit {
     some n: Node, parent, left, right: Shard | {
         left != right
         parent != left and parent != right
         
-        -- At some point, split is in UpdateMap phase
-        some tUpdate: Time | {
-            splitInProgressFor[parent, tUpdate]
-            splitPhaseAt[parent, tUpdate] = SplitUpdatingMap
-            shardExists[left, tUpdate]
-            shardExists[right, tUpdate]
+        -- At some point, split is in Complete phase (committed)
+        some tComplete: Time | {
+            splitInProgressFor[parent, tComplete]
+            splitPhaseAt[parent, tComplete] = SplitComplete
+            shardExists[left, tComplete]
+            shardExists[right, tComplete]
         }
         
         -- Node flaps at some point
         some tFlap: Time | hasFlapped[n, tFlap]
         
-        -- Children persist after the flap
+        -- Children persist after the flap (shard map is source of truth)
         some tAfter: Time | {
             shardExists[left, tAfter]
             shardExists[right, tAfter]
@@ -2562,8 +2531,8 @@ run exampleCrashDuringEarlySplit for 4 but
     10 SplitInProgress, 0 WorkerRouteCache, 0 WorkerRequest, 0 WorkerRetryableError,
     10 TenantOrder
 
--- Crash during late split phase (children persist)
-run exampleCrashDuringLateSplit for 3 but 
+-- Crash after split commit (children persist)
+run exampleCrashAfterSplitCommit for 3 but 
     exactly 1 Node, exactly 3 Shard, exactly 1 Addr, 
     exactly 4 TenantId, exactly 10 Time, exactly 1 SplitPoint, exactly 0 Worker,
     10 NodeMembership, 10 NodeFlapped, 20 ShardMapEntry, 10 ShardLease, 
@@ -2683,8 +2652,8 @@ check splitChildrenPersist for 3 but
     6 SplitInProgress, 0 WorkerRouteCache, 0 WorkerRequest, 0 WorkerRetryableError,
     8 TenantOrder
 
--- Late split state preserved for resumption
-check lateSplitStatePreserved for 3 but 
+-- Committed split state preserved (no regression)
+check committedSplitStatePreserved for 3 but 
     2 Node, 3 Shard, 2 Addr, 4 TenantId, 6 Time, 1 SplitPoint, 0 Worker,
     6 NodeMembership, 6 NodeFlapped, 12 ShardMapEntry, 6 ShardLease,
     6 SplitInProgress, 0 WorkerRouteCache, 0 WorkerRequest, 0 WorkerRetryableError,

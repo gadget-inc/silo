@@ -392,8 +392,7 @@ impl SplitInProgress {
         self.phase = match self.phase {
             SplitPhase::SplitRequested => SplitPhase::SplitPausing,
             SplitPhase::SplitPausing => SplitPhase::SplitCloning,
-            SplitPhase::SplitCloning => SplitPhase::SplitUpdatingMap,
-            SplitPhase::SplitUpdatingMap => SplitPhase::SplitComplete,
+            SplitPhase::SplitCloning => SplitPhase::SplitComplete,
             SplitPhase::SplitComplete => SplitPhase::SplitComplete, // Terminal
         };
     }

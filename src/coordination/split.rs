@@ -69,16 +69,21 @@ impl std::str::FromStr for SplitCleanupStatus {
 /// A split operation divides one parent shard into two child shards at a
 /// specified split point. The phases ensure traffic is paused, data is cloned,
 /// and the shard map is atomically updated.
+///
+/// The shard map update is the "point of no return" - once children exist in the
+/// shard map, the split is committed. If we crash before the shard map update,
+/// the split is abandoned and can be retried (potentially leaving orphaned clone
+/// databases that will be garbage collected later).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SplitPhase {
     /// Split has been requested but not started
     SplitRequested,
     /// Traffic to parent shard is being paused (returning retryable errors)
     SplitPausing,
-    /// SlateDB clone operation is in progress
+    /// SlateDB clone operation and shard map update in progress.
+    /// This phase clones both child databases, then atomically updates the shard map.
+    /// The shard map update is the commit point.
     SplitCloning,
-    /// Shard map is being updated atomically
-    SplitUpdatingMap,
     /// Split is complete, children are active
     SplitComplete,
 }
@@ -87,28 +92,7 @@ impl SplitPhase {
     /// Returns true if traffic to the parent shard should be paused
     /// (returning retryable errors to clients)
     pub fn traffic_paused(&self) -> bool {
-        matches!(
-            self,
-            SplitPhase::SplitPausing | SplitPhase::SplitCloning | SplitPhase::SplitUpdatingMap
-        )
-    }
-
-    /// Returns true if this is an early phase (before children exist in the map).
-    /// [SILO-SPLIT-CRASH-1] Early phase crashes abandon the split.
-    pub fn is_early_phase(&self) -> bool {
-        matches!(
-            self,
-            SplitPhase::SplitRequested | SplitPhase::SplitPausing | SplitPhase::SplitCloning
-        )
-    }
-
-    /// Returns true if this is a late phase (children exist in the map).
-    /// [SILO-SPLIT-CRASH-2] Late phase crashes preserve the split state for resumption.
-    pub fn is_late_phase(&self) -> bool {
-        matches!(
-            self,
-            SplitPhase::SplitUpdatingMap | SplitPhase::SplitComplete
-        )
+        matches!(self, SplitPhase::SplitPausing | SplitPhase::SplitCloning)
     }
 }
 
@@ -118,7 +102,6 @@ impl fmt::Display for SplitPhase {
             SplitPhase::SplitRequested => write!(f, "SplitRequested"),
             SplitPhase::SplitPausing => write!(f, "SplitPausing"),
             SplitPhase::SplitCloning => write!(f, "SplitCloning"),
-            SplitPhase::SplitUpdatingMap => write!(f, "SplitUpdatingMap"),
             SplitPhase::SplitComplete => write!(f, "SplitComplete"),
         }
     }
@@ -297,6 +280,8 @@ impl ShardSplitter {
     /// Advance the split to the next phase.
     ///
     /// This is primarily for testing to control the split state machine step by step.
+    /// Note: This only advances the phase marker, it does NOT perform the actual work
+    /// (cloning, shard map update, etc.). Use `execute_split` for full split execution.
     pub async fn advance_split_phase(
         &self,
         parent_shard_id: ShardId,
@@ -307,8 +292,9 @@ impl ShardSplitter {
             .await?
             .ok_or(CoordinationError::NoSplitInProgress(parent_shard_id))?;
 
-        // Verify ownership for early phases
-        if split.phase.is_early_phase() && !self.ctx.owns_shard(&parent_shard_id).await {
+        // Verify ownership (not needed for SplitComplete which is just cleanup)
+        if split.phase != SplitPhase::SplitComplete && !self.ctx.owns_shard(&parent_shard_id).await
+        {
             return Err(CoordinationError::NotShardOwner(parent_shard_id));
         }
 
@@ -327,7 +313,11 @@ impl ShardSplitter {
     /// Execute a split operation through all phases to completion.
     ///
     /// This method drives the split through the state machine:
-    /// SplitRequested -> SplitPausing -> SplitCloning -> SplitUpdatingMap -> SplitComplete
+    /// SplitRequested -> SplitPausing -> SplitCloning -> SplitComplete
+    ///
+    /// The shard map update (inside SplitCloning) is the "point of no return".
+    /// If we crash before the shard map update, the split is abandoned on recovery.
+    /// Orphaned clone databases may be left behind but don't affect correctness.
     ///
     /// The `get_shard_owner_map` closure is used to compute ownership after the shard map
     /// is updated, since this requires backend-specific member information.
@@ -348,8 +338,10 @@ impl ShardSplitter {
                 .await?
                 .ok_or(CoordinationError::NoSplitInProgress(parent_shard_id))?;
 
-            // Verify we own the shard (for early phases)
-            if split.phase.is_early_phase() && !self.ctx.owns_shard(&parent_shard_id).await {
+            // Verify we own the shard (not needed for SplitComplete which is just cleanup)
+            if split.phase != SplitPhase::SplitComplete
+                && !self.ctx.owns_shard(&parent_shard_id).await
+            {
                 return Err(CoordinationError::NotShardOwner(parent_shard_id));
             }
 
@@ -407,16 +399,13 @@ impl ShardSplitter {
                             ))
                         })?;
 
-                    // Advance to SplitUpdatingMap
-                    split.advance_phase();
-                    self.coordinator.store_split(&split).await?;
                     info!(
                         parent_shard_id = %parent_shard_id,
-                        phase = %split.phase,
-                        "cloning complete, advancing to map update phase"
+                        left_child = %split.left_child_id,
+                        right_child = %split.right_child_id,
+                        "cloning complete, updating shard map"
                     );
-                }
-                SplitPhase::SplitUpdatingMap => {
+
                     // Pre-add BOTH children to owned set BEFORE updating the shard map.
                     // This prevents a race condition where the shard map watch fires and
                     // shard guards try to acquire children before we've opened them.
@@ -429,7 +418,8 @@ impl ShardSplitter {
                         }
                     }
 
-                    // Update the shard map atomically
+                    // Update the shard map atomically - THIS IS THE COMMIT POINT
+                    // After this succeeds, the split is committed and children exist.
                     self.coordinator.update_shard_map_for_split(&split).await?;
 
                     // Reload the shard map to update local cache
@@ -543,9 +533,10 @@ impl ShardSplitter {
 
     /// Recover from stale split operations after a node restart.
     ///
-    /// Scans for split records initiated by this node and either:
-    /// - [SILO-SPLIT-CRASH-1] Abandons early-phase splits
-    /// - [SILO-SPLIT-CRASH-2] Preserves late-phase splits for resumption
+    /// [SILO-SPLIT-CRASH-1] All incomplete splits are abandoned on crash.
+    /// The shard map update is the commit point - if children don't exist in the
+    /// shard map, the split never completed and is safe to abandon. Orphaned
+    /// clone databases may exist but don't affect correctness.
     pub async fn recover_stale_splits(&self) -> Result<(), CoordinationError> {
         let splits = self.coordinator.list_all_splits().await?;
 
@@ -555,17 +546,32 @@ impl ShardSplitter {
                 continue;
             }
 
-            if split.phase.is_early_phase() {
+            // Check if children exist in the shard map (split committed)
+            let children_exist = {
+                let shard_map = self.ctx.shard_map.lock().await;
+                shard_map.get_shard(&split.left_child_id).is_some()
+            };
+
+            if children_exist {
+                // Split committed (shard map was updated). Just clean up the record.
                 info!(
                     parent_shard_id = %split.parent_shard_id,
                     phase = %split.phase,
-                    "abandoning stale early-phase split"
+                    "cleaning up completed split record"
                 );
-                self.coordinator
-                    .delete_split(&split.parent_shard_id)
-                    .await?;
+            } else {
+                // Split did not commit. Abandon it.
+                // Any orphaned clone databases will be garbage collected later.
+                info!(
+                    parent_shard_id = %split.parent_shard_id,
+                    phase = %split.phase,
+                    "abandoning incomplete split"
+                );
             }
-            // Late-phase splits are preserved for resumption via execute_split()
+
+            self.coordinator
+                .delete_split(&split.parent_shard_id)
+                .await?;
         }
 
         Ok(())

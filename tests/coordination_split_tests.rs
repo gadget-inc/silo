@@ -319,7 +319,7 @@ async fn is_shard_paused_returns_correct_values() {
     assert!(!splitter.is_shard_paused(shard_id).await);
 
     // After requesting a split (in SplitRequested phase), shard should not be paused
-    // (traffic is only paused in SplitPausing, SplitCloning, SplitUpdatingMap phases)
+    // (traffic is only paused in SplitPausing and SplitCloning phases)
     let _split = splitter
         .request_split(shard_id, "m".to_string())
         .await
@@ -1003,16 +1003,20 @@ async fn crash_recovery_early_phase_abandons_split() {
     let _ = h2.abort();
 }
 
-/// Test crash recovery during late phase (split should be resumed)
+/// Test crash recovery during cloning phase (split should be abandoned)
+///
+/// With the simplified split model, ALL incomplete splits are abandoned on crash.
+/// The shard map update is the commit point - if children don't exist in the
+/// shard map, the split never completed and is safely abandoned.
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
-async fn crash_recovery_late_phase_resumes_split() {
+async fn crash_recovery_cloning_phase_abandons_split() {
     let _guard = acquire_test_mutex();
 
     let prefix = unique_prefix();
     let num_shards: u32 = 1;
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
 
-    // Start first coordinator and advance split to late phase
+    // Start first coordinator and advance split to cloning phase
     let (c1, h1) = EtcdCoordinator::start(
         &cfg.coordination.etcd_endpoints,
         &prefix,
@@ -1031,22 +1035,21 @@ async fn crash_recovery_late_phase_resumes_split() {
     let shards = c1.owned_shards().await;
     let shard_id = shards[0];
 
-    // Create splitter, request split and advance through early phases
+    // Create splitter, request split and advance to cloning phase
 
     let splitter1 = ShardSplitter::new(Arc::new(c1.clone()));
 
-    let split = splitter1
+    let _split = splitter1
         .request_split(shard_id, "m".to_string())
         .await
         .expect("request split");
 
-    // Advance to SplitUpdatingMap (late phase)
+    // Advance to SplitCloning phase
     splitter1.advance_split_phase(shard_id).await.unwrap(); // -> SplitPausing
     splitter1.advance_split_phase(shard_id).await.unwrap(); // -> SplitCloning
-    splitter1.advance_split_phase(shard_id).await.unwrap(); // -> SplitUpdatingMap
 
     let status = splitter1.get_split_status(shard_id).await.unwrap().unwrap();
-    assert_eq!(status.phase, SplitPhase::SplitUpdatingMap);
+    assert_eq!(status.phase, SplitPhase::SplitCloning);
 
     // Simulate crash
     c1.shutdown().await.unwrap();
@@ -1073,31 +1076,26 @@ async fn crash_recovery_late_phase_resumes_split() {
 
     let splitter2 = ShardSplitter::new(Arc::new(c2.clone()));
 
-    // Late phase crash should preserve split for resumption
-    let status = splitter2
-        .get_split_status(shard_id)
-        .await
-        .expect("get status");
-    assert!(status.is_some(), "late phase split should be preserved");
-    assert_eq!(status.unwrap().phase, SplitPhase::SplitUpdatingMap);
-
-    // Resume and complete the split
+    // Recover stale splits - should abandon the incomplete split
     splitter2
-        .execute_split(shard_id, || c2.get_shard_owner_map())
+        .recover_stale_splits()
         .await
-        .expect("resume split should succeed");
+        .expect("recover stale splits");
 
-    // Verify completion
+    // Split should be abandoned (deleted)
     let status = splitter2
         .get_split_status(shard_id)
         .await
         .expect("get status");
-    assert!(status.is_none(), "split should complete");
+    assert!(status.is_none(), "incomplete split should be abandoned");
 
+    // Shard map should still have original shard (split was not committed)
     let shard_map = c2.get_shard_map().await.expect("get shard map");
-    assert_eq!(shard_map.len(), 2);
-    assert!(shard_map.get_shard(&split.left_child_id).is_some());
-    assert!(shard_map.get_shard(&split.right_child_id).is_some());
+    assert_eq!(shard_map.len(), 1, "shard map should have original shard");
+    assert!(
+        shard_map.get_shard(&shard_id).is_some(),
+        "original shard should still exist"
+    );
 
     c2.shutdown().await.unwrap();
     let _ = h2.abort();

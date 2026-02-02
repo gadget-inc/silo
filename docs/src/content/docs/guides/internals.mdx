@@ -56,13 +56,12 @@ The split operation proceeds through several phases:
 
 1. **SplitRequested** — The split is initiated on the node owning the shard.
 2. **SplitPausing** — Traffic to the parent shard is paused (clients receive retryable errors).
-3. **SplitCloning** — The underlying SlateDB database is cloned for both child shards.
-4. **SplitUpdatingMap** — The shard map is atomically updated to replace the parent with the two children.
-5. **SplitComplete** — Children are active and ready to serve traffic.
+3. **SplitCloning** — The underlying SlateDB database is cloned for both child shards, then the shard map is atomically updated to replace the parent with the two children. The shard map update is the **commit point**.
+4. **SplitComplete** — Children are active and ready to serve traffic. The split record is cleaned up.
 
 After a split completes, each child shard contains cloned data from the parent. A background cleanup process then removes any data that falls outside each child's new range (defunct keys), followed by a compaction to reclaim storage.
 
-For crash recovery, splits in early phases (before the shard map is updated) are abandoned and the parent remains intact. Splits in late phases (after children exist in the shard map) can be resumed to completion.
+For crash recovery, the shard map is the source of truth. If a crash occurs before the shard map update (commit point), the split is abandoned and the parent remains intact. Any orphaned clone databases are left behind but don't affect correctness—they're just wasted storage that can be garbage collected later. If a crash occurs after the shard map update, the split is committed and children exist in the shard map.
 
 The clustering approach is modelled after something similar to Google Cloud Bigtable, where individual compute node members all hold leases over some subset of the overall shards. Unlike Bigtable, there's no central coordiantor managing which bits are assigned to which nodes. Instead, we just manage an internal hash ring that assigns the entire shard space to all the nodes, shifting around as few shards as possible when cluster membership changes.
 
