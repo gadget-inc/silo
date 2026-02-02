@@ -899,6 +899,7 @@ impl Silo for SiloService {
                     tenant_id,
                     is_last_attempt,
                     metadata: job.metadata().into_iter().collect(),
+                    limits: job.limits().into_iter().map(job_limit_to_proto_limit).collect(),
                 });
             }
 

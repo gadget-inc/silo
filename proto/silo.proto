@@ -247,6 +247,7 @@ message Task {
   optional string tenant_id = 9;       // Tenant ID if multi-tenancy is enabled.
   bool is_last_attempt = 10;           // True if this is the final attempt (no more retries after this).
   map<string, string> metadata = 11;   // Metadata key/value pairs from the job.
+  repeated Limit limits = 12;          // Limits declared on this job (concurrency, rate, floating).
 }
 
 // Task for refreshing a floating concurrency limit.

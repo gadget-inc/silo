@@ -654,6 +654,10 @@ export interface Task {
     metadata: {
         [key: string]: string;
     }; // Metadata key/value pairs from the job.
+    /**
+     * @generated from protobuf field: repeated silo.v1.Limit limits = 12
+     */
+    limits: Limit[]; // Limits declared on this job (concurrency, rate, floating).
 }
 /**
  * Task for refreshing a floating concurrency limit.
@@ -1031,33 +1035,6 @@ export interface GetClusterInfoResponse {
     thisGrpcAddr: string; // gRPC address of the server responding.
 }
 /**
- * Request to get job counters for a shard.
- * Used for efficient job count queries without scanning all jobs.
- *
- * @generated from protobuf message silo.v1.GetShardCountersRequest
- */
-export interface GetShardCountersRequest {
-    /**
-     * @generated from protobuf field: string shard = 1
-     */
-    shard: string; // Shard ID (UUID) to get counters for.
-}
-/**
- * Response with shard job counters.
- *
- * @generated from protobuf message silo.v1.GetShardCountersResponse
- */
-export interface GetShardCountersResponse {
-    /**
-     * @generated from protobuf field: int64 total_jobs = 1
-     */
-    totalJobs: bigint; // Total number of jobs in the shard (not deleted).
-    /**
-     * @generated from protobuf field: int64 completed_jobs = 2
-     */
-    completedJobs: bigint; // Number of jobs in terminal states (Succeeded, Failed, Cancelled).
-}
-/**
  * Request to reset all shards owned by this server.
  * WARNING: Destructive operation. Only available in dev mode.
  *
@@ -1111,6 +1088,140 @@ export interface CpuProfileResponse {
      * @generated from protobuf field: uint64 samples = 3
      */
     samples: bigint; // Number of samples collected.
+}
+/**
+ * Request to initiate a shard split operation.
+ *
+ * @generated from protobuf message silo.v1.RequestSplitRequest
+ */
+export interface RequestSplitRequest {
+    /**
+     * @generated from protobuf field: string shard_id = 1
+     */
+    shardId: string; // Shard ID (UUID) of the shard to split.
+    /**
+     * @generated from protobuf field: string split_point = 2
+     */
+    splitPoint: string; // Tenant ID where to split the keyspace.
+}
+/**
+ * Response after initiating a shard split.
+ *
+ * @generated from protobuf message silo.v1.RequestSplitResponse
+ */
+export interface RequestSplitResponse {
+    /**
+     * @generated from protobuf field: string left_child_id = 1
+     */
+    leftChildId: string; // UUID of the left child shard [parent_start, split_point).
+    /**
+     * @generated from protobuf field: string right_child_id = 2
+     */
+    rightChildId: string; // UUID of the right child shard [split_point, parent_end).
+    /**
+     * @generated from protobuf field: string phase = 3
+     */
+    phase: string; // Current split phase (e.g., "SplitRequested").
+}
+/**
+ * Request to get the status of a shard split operation.
+ *
+ * @generated from protobuf message silo.v1.GetSplitStatusRequest
+ */
+export interface GetSplitStatusRequest {
+    /**
+     * @generated from protobuf field: string shard_id = 1
+     */
+    shardId: string; // Parent shard ID (UUID) of the split operation.
+}
+/**
+ * Response with the current split status.
+ * Returns empty if no split is in progress for the shard.
+ *
+ * @generated from protobuf message silo.v1.GetSplitStatusResponse
+ */
+export interface GetSplitStatusResponse {
+    /**
+     * @generated from protobuf field: bool in_progress = 1
+     */
+    inProgress: boolean; // True if a split is in progress for this shard.
+    /**
+     * @generated from protobuf field: string phase = 2
+     */
+    phase: string; // Current split phase (empty if not in progress).
+    /**
+     * @generated from protobuf field: string left_child_id = 3
+     */
+    leftChildId: string; // UUID of the left child shard (empty if not in progress).
+    /**
+     * @generated from protobuf field: string right_child_id = 4
+     */
+    rightChildId: string; // UUID of the right child shard (empty if not in progress).
+    /**
+     * @generated from protobuf field: string split_point = 5
+     */
+    splitPoint: string; // Tenant ID at which the split occurs (empty if not in progress).
+    /**
+     * @generated from protobuf field: string initiator_node_id = 6
+     */
+    initiatorNodeId: string; // Node ID that initiated the split.
+    /**
+     * @generated from protobuf field: int64 requested_at_ms = 7
+     */
+    requestedAtMs: bigint; // Unix timestamp (ms) when split was requested.
+}
+/**
+ * Information about a shard owned by a node, including counters and cleanup status.
+ *
+ * @generated from protobuf message silo.v1.OwnedShardInfo
+ */
+export interface OwnedShardInfo {
+    /**
+     * @generated from protobuf field: string shard_id = 1
+     */
+    shardId: string; // The shard ID (UUID).
+    /**
+     * @generated from protobuf field: int64 total_jobs = 2
+     */
+    totalJobs: bigint; // Total number of jobs in the shard (not deleted).
+    /**
+     * @generated from protobuf field: int64 completed_jobs = 3
+     */
+    completedJobs: bigint; // Number of jobs in terminal states (Succeeded, Failed, Cancelled).
+    /**
+     * @generated from protobuf field: string cleanup_status = 4
+     */
+    cleanupStatus: string; // Cleanup status: "CompactionDone", "CleanupPending", "CleanupRunning", "CleanupDone".
+    /**
+     * @generated from protobuf field: int64 created_at_ms = 5
+     */
+    createdAtMs: bigint; // Unix timestamp (ms) when this shard was first created/initialized.
+    /**
+     * @generated from protobuf field: int64 cleanup_completed_at_ms = 6
+     */
+    cleanupCompletedAtMs: bigint; // Unix timestamp (ms) when cleanup completed (0 if not applicable or not completed).
+}
+/**
+ * Request to get node information including owned shards with their counters and cleanup status.
+ *
+ * @generated from protobuf message silo.v1.GetNodeInfoRequest
+ */
+export interface GetNodeInfoRequest {
+}
+/**
+ * Response with node information and details for all shards owned by this node.
+ *
+ * @generated from protobuf message silo.v1.GetNodeInfoResponse
+ */
+export interface GetNodeInfoResponse {
+    /**
+     * @generated from protobuf field: string node_id = 1
+     */
+    nodeId: string; // Unique identifier of this node.
+    /**
+     * @generated from protobuf field: repeated silo.v1.OwnedShardInfo owned_shards = 2
+     */
+    ownedShards: OwnedShardInfo[]; // Information for each shard owned by this node.
 }
 /**
  * Rate limiting algorithm for Gubernator-based limits.
@@ -3000,7 +3111,8 @@ class Task$Type extends MessageType<Task> {
             { no: 8, name: "task_group", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
             { no: 9, name: "tenant_id", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
             { no: 10, name: "is_last_attempt", kind: "scalar", T: 8 /*ScalarType.BOOL*/ },
-            { no: 11, name: "metadata", kind: "map", K: 9 /*ScalarType.STRING*/, V: { kind: "scalar", T: 9 /*ScalarType.STRING*/ } }
+            { no: 11, name: "metadata", kind: "map", K: 9 /*ScalarType.STRING*/, V: { kind: "scalar", T: 9 /*ScalarType.STRING*/ } },
+            { no: 12, name: "limits", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => Limit }
         ]);
     }
     create(value?: PartialMessage<Task>): Task {
@@ -3014,6 +3126,7 @@ class Task$Type extends MessageType<Task> {
         message.taskGroup = "";
         message.isLastAttempt = false;
         message.metadata = {};
+        message.limits = [];
         if (value !== undefined)
             reflectionMergePartial<Task>(this, message, value);
         return message;
@@ -3055,6 +3168,9 @@ class Task$Type extends MessageType<Task> {
                     break;
                 case /* map<string, string> metadata */ 11:
                     this.binaryReadMap11(message.metadata, reader, options);
+                    break;
+                case /* repeated silo.v1.Limit limits */ 12:
+                    message.limits.push(Limit.internalBinaryRead(reader, reader.uint32(), options));
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -3117,6 +3233,9 @@ class Task$Type extends MessageType<Task> {
         /* map<string, string> metadata = 11; */
         for (let k of globalThis.Object.keys(message.metadata))
             writer.tag(11, WireType.LengthDelimited).fork().tag(1, WireType.LengthDelimited).string(k).tag(2, WireType.LengthDelimited).string(message.metadata[k]).join();
+        /* repeated silo.v1.Limit limits = 12; */
+        for (let i = 0; i < message.limits.length; i++)
+            Limit.internalBinaryWrite(message.limits[i], writer.tag(12, WireType.LengthDelimited).fork(), options).join();
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -4335,108 +4454,6 @@ class GetClusterInfoResponse$Type extends MessageType<GetClusterInfoResponse> {
  */
 export const GetClusterInfoResponse = new GetClusterInfoResponse$Type();
 // @generated message type with reflection information, may provide speed optimized methods
-class GetShardCountersRequest$Type extends MessageType<GetShardCountersRequest> {
-    constructor() {
-        super("silo.v1.GetShardCountersRequest", [
-            { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
-        ]);
-    }
-    create(value?: PartialMessage<GetShardCountersRequest>): GetShardCountersRequest {
-        const message = globalThis.Object.create((this.messagePrototype!));
-        message.shard = "";
-        if (value !== undefined)
-            reflectionMergePartial<GetShardCountersRequest>(this, message, value);
-        return message;
-    }
-    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: GetShardCountersRequest): GetShardCountersRequest {
-        let message = target ?? this.create(), end = reader.pos + length;
-        while (reader.pos < end) {
-            let [fieldNo, wireType] = reader.tag();
-            switch (fieldNo) {
-                case /* string shard */ 1:
-                    message.shard = reader.string();
-                    break;
-                default:
-                    let u = options.readUnknownField;
-                    if (u === "throw")
-                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
-                    let d = reader.skip(wireType);
-                    if (u !== false)
-                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
-            }
-        }
-        return message;
-    }
-    internalBinaryWrite(message: GetShardCountersRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
-        /* string shard = 1; */
-        if (message.shard !== "")
-            writer.tag(1, WireType.LengthDelimited).string(message.shard);
-        let u = options.writeUnknownFields;
-        if (u !== false)
-            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
-        return writer;
-    }
-}
-/**
- * @generated MessageType for protobuf message silo.v1.GetShardCountersRequest
- */
-export const GetShardCountersRequest = new GetShardCountersRequest$Type();
-// @generated message type with reflection information, may provide speed optimized methods
-class GetShardCountersResponse$Type extends MessageType<GetShardCountersResponse> {
-    constructor() {
-        super("silo.v1.GetShardCountersResponse", [
-            { no: 1, name: "total_jobs", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
-            { no: 2, name: "completed_jobs", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ }
-        ]);
-    }
-    create(value?: PartialMessage<GetShardCountersResponse>): GetShardCountersResponse {
-        const message = globalThis.Object.create((this.messagePrototype!));
-        message.totalJobs = 0n;
-        message.completedJobs = 0n;
-        if (value !== undefined)
-            reflectionMergePartial<GetShardCountersResponse>(this, message, value);
-        return message;
-    }
-    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: GetShardCountersResponse): GetShardCountersResponse {
-        let message = target ?? this.create(), end = reader.pos + length;
-        while (reader.pos < end) {
-            let [fieldNo, wireType] = reader.tag();
-            switch (fieldNo) {
-                case /* int64 total_jobs */ 1:
-                    message.totalJobs = reader.int64().toBigInt();
-                    break;
-                case /* int64 completed_jobs */ 2:
-                    message.completedJobs = reader.int64().toBigInt();
-                    break;
-                default:
-                    let u = options.readUnknownField;
-                    if (u === "throw")
-                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
-                    let d = reader.skip(wireType);
-                    if (u !== false)
-                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
-            }
-        }
-        return message;
-    }
-    internalBinaryWrite(message: GetShardCountersResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
-        /* int64 total_jobs = 1; */
-        if (message.totalJobs !== 0n)
-            writer.tag(1, WireType.Varint).int64(message.totalJobs);
-        /* int64 completed_jobs = 2; */
-        if (message.completedJobs !== 0n)
-            writer.tag(2, WireType.Varint).int64(message.completedJobs);
-        let u = options.writeUnknownFields;
-        if (u !== false)
-            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
-        return writer;
-    }
-}
-/**
- * @generated MessageType for protobuf message silo.v1.GetShardCountersResponse
- */
-export const GetShardCountersResponse = new GetShardCountersResponse$Type();
-// @generated message type with reflection information, may provide speed optimized methods
 class ResetShardsRequest$Type extends MessageType<ResetShardsRequest> {
     constructor() {
         super("silo.v1.ResetShardsRequest", []);
@@ -4639,11 +4656,452 @@ class CpuProfileResponse$Type extends MessageType<CpuProfileResponse> {
  * @generated MessageType for protobuf message silo.v1.CpuProfileResponse
  */
 export const CpuProfileResponse = new CpuProfileResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class RequestSplitRequest$Type extends MessageType<RequestSplitRequest> {
+    constructor() {
+        super("silo.v1.RequestSplitRequest", [
+            { no: 1, name: "shard_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "split_point", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value?: PartialMessage<RequestSplitRequest>): RequestSplitRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.shardId = "";
+        message.splitPoint = "";
+        if (value !== undefined)
+            reflectionMergePartial<RequestSplitRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: RequestSplitRequest): RequestSplitRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string shard_id */ 1:
+                    message.shardId = reader.string();
+                    break;
+                case /* string split_point */ 2:
+                    message.splitPoint = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: RequestSplitRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string shard_id = 1; */
+        if (message.shardId !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.shardId);
+        /* string split_point = 2; */
+        if (message.splitPoint !== "")
+            writer.tag(2, WireType.LengthDelimited).string(message.splitPoint);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.RequestSplitRequest
+ */
+export const RequestSplitRequest = new RequestSplitRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class RequestSplitResponse$Type extends MessageType<RequestSplitResponse> {
+    constructor() {
+        super("silo.v1.RequestSplitResponse", [
+            { no: 1, name: "left_child_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "right_child_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 3, name: "phase", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value?: PartialMessage<RequestSplitResponse>): RequestSplitResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.leftChildId = "";
+        message.rightChildId = "";
+        message.phase = "";
+        if (value !== undefined)
+            reflectionMergePartial<RequestSplitResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: RequestSplitResponse): RequestSplitResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string left_child_id */ 1:
+                    message.leftChildId = reader.string();
+                    break;
+                case /* string right_child_id */ 2:
+                    message.rightChildId = reader.string();
+                    break;
+                case /* string phase */ 3:
+                    message.phase = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: RequestSplitResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string left_child_id = 1; */
+        if (message.leftChildId !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.leftChildId);
+        /* string right_child_id = 2; */
+        if (message.rightChildId !== "")
+            writer.tag(2, WireType.LengthDelimited).string(message.rightChildId);
+        /* string phase = 3; */
+        if (message.phase !== "")
+            writer.tag(3, WireType.LengthDelimited).string(message.phase);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.RequestSplitResponse
+ */
+export const RequestSplitResponse = new RequestSplitResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class GetSplitStatusRequest$Type extends MessageType<GetSplitStatusRequest> {
+    constructor() {
+        super("silo.v1.GetSplitStatusRequest", [
+            { no: 1, name: "shard_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value?: PartialMessage<GetSplitStatusRequest>): GetSplitStatusRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.shardId = "";
+        if (value !== undefined)
+            reflectionMergePartial<GetSplitStatusRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: GetSplitStatusRequest): GetSplitStatusRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string shard_id */ 1:
+                    message.shardId = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: GetSplitStatusRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string shard_id = 1; */
+        if (message.shardId !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.shardId);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.GetSplitStatusRequest
+ */
+export const GetSplitStatusRequest = new GetSplitStatusRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class GetSplitStatusResponse$Type extends MessageType<GetSplitStatusResponse> {
+    constructor() {
+        super("silo.v1.GetSplitStatusResponse", [
+            { no: 1, name: "in_progress", kind: "scalar", T: 8 /*ScalarType.BOOL*/ },
+            { no: 2, name: "phase", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 3, name: "left_child_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 4, name: "right_child_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 5, name: "split_point", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 6, name: "initiator_node_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 7, name: "requested_at_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ }
+        ]);
+    }
+    create(value?: PartialMessage<GetSplitStatusResponse>): GetSplitStatusResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.inProgress = false;
+        message.phase = "";
+        message.leftChildId = "";
+        message.rightChildId = "";
+        message.splitPoint = "";
+        message.initiatorNodeId = "";
+        message.requestedAtMs = 0n;
+        if (value !== undefined)
+            reflectionMergePartial<GetSplitStatusResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: GetSplitStatusResponse): GetSplitStatusResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* bool in_progress */ 1:
+                    message.inProgress = reader.bool();
+                    break;
+                case /* string phase */ 2:
+                    message.phase = reader.string();
+                    break;
+                case /* string left_child_id */ 3:
+                    message.leftChildId = reader.string();
+                    break;
+                case /* string right_child_id */ 4:
+                    message.rightChildId = reader.string();
+                    break;
+                case /* string split_point */ 5:
+                    message.splitPoint = reader.string();
+                    break;
+                case /* string initiator_node_id */ 6:
+                    message.initiatorNodeId = reader.string();
+                    break;
+                case /* int64 requested_at_ms */ 7:
+                    message.requestedAtMs = reader.int64().toBigInt();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: GetSplitStatusResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* bool in_progress = 1; */
+        if (message.inProgress !== false)
+            writer.tag(1, WireType.Varint).bool(message.inProgress);
+        /* string phase = 2; */
+        if (message.phase !== "")
+            writer.tag(2, WireType.LengthDelimited).string(message.phase);
+        /* string left_child_id = 3; */
+        if (message.leftChildId !== "")
+            writer.tag(3, WireType.LengthDelimited).string(message.leftChildId);
+        /* string right_child_id = 4; */
+        if (message.rightChildId !== "")
+            writer.tag(4, WireType.LengthDelimited).string(message.rightChildId);
+        /* string split_point = 5; */
+        if (message.splitPoint !== "")
+            writer.tag(5, WireType.LengthDelimited).string(message.splitPoint);
+        /* string initiator_node_id = 6; */
+        if (message.initiatorNodeId !== "")
+            writer.tag(6, WireType.LengthDelimited).string(message.initiatorNodeId);
+        /* int64 requested_at_ms = 7; */
+        if (message.requestedAtMs !== 0n)
+            writer.tag(7, WireType.Varint).int64(message.requestedAtMs);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.GetSplitStatusResponse
+ */
+export const GetSplitStatusResponse = new GetSplitStatusResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class OwnedShardInfo$Type extends MessageType<OwnedShardInfo> {
+    constructor() {
+        super("silo.v1.OwnedShardInfo", [
+            { no: 1, name: "shard_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "total_jobs", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 3, name: "completed_jobs", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 4, name: "cleanup_status", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 5, name: "created_at_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 6, name: "cleanup_completed_at_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ }
+        ]);
+    }
+    create(value?: PartialMessage<OwnedShardInfo>): OwnedShardInfo {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.shardId = "";
+        message.totalJobs = 0n;
+        message.completedJobs = 0n;
+        message.cleanupStatus = "";
+        message.createdAtMs = 0n;
+        message.cleanupCompletedAtMs = 0n;
+        if (value !== undefined)
+            reflectionMergePartial<OwnedShardInfo>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: OwnedShardInfo): OwnedShardInfo {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string shard_id */ 1:
+                    message.shardId = reader.string();
+                    break;
+                case /* int64 total_jobs */ 2:
+                    message.totalJobs = reader.int64().toBigInt();
+                    break;
+                case /* int64 completed_jobs */ 3:
+                    message.completedJobs = reader.int64().toBigInt();
+                    break;
+                case /* string cleanup_status */ 4:
+                    message.cleanupStatus = reader.string();
+                    break;
+                case /* int64 created_at_ms */ 5:
+                    message.createdAtMs = reader.int64().toBigInt();
+                    break;
+                case /* int64 cleanup_completed_at_ms */ 6:
+                    message.cleanupCompletedAtMs = reader.int64().toBigInt();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: OwnedShardInfo, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string shard_id = 1; */
+        if (message.shardId !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.shardId);
+        /* int64 total_jobs = 2; */
+        if (message.totalJobs !== 0n)
+            writer.tag(2, WireType.Varint).int64(message.totalJobs);
+        /* int64 completed_jobs = 3; */
+        if (message.completedJobs !== 0n)
+            writer.tag(3, WireType.Varint).int64(message.completedJobs);
+        /* string cleanup_status = 4; */
+        if (message.cleanupStatus !== "")
+            writer.tag(4, WireType.LengthDelimited).string(message.cleanupStatus);
+        /* int64 created_at_ms = 5; */
+        if (message.createdAtMs !== 0n)
+            writer.tag(5, WireType.Varint).int64(message.createdAtMs);
+        /* int64 cleanup_completed_at_ms = 6; */
+        if (message.cleanupCompletedAtMs !== 0n)
+            writer.tag(6, WireType.Varint).int64(message.cleanupCompletedAtMs);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.OwnedShardInfo
+ */
+export const OwnedShardInfo = new OwnedShardInfo$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class GetNodeInfoRequest$Type extends MessageType<GetNodeInfoRequest> {
+    constructor() {
+        super("silo.v1.GetNodeInfoRequest", []);
+    }
+    create(value?: PartialMessage<GetNodeInfoRequest>): GetNodeInfoRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        if (value !== undefined)
+            reflectionMergePartial<GetNodeInfoRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: GetNodeInfoRequest): GetNodeInfoRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: GetNodeInfoRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.GetNodeInfoRequest
+ */
+export const GetNodeInfoRequest = new GetNodeInfoRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class GetNodeInfoResponse$Type extends MessageType<GetNodeInfoResponse> {
+    constructor() {
+        super("silo.v1.GetNodeInfoResponse", [
+            { no: 1, name: "node_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "owned_shards", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => OwnedShardInfo }
+        ]);
+    }
+    create(value?: PartialMessage<GetNodeInfoResponse>): GetNodeInfoResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.nodeId = "";
+        message.ownedShards = [];
+        if (value !== undefined)
+            reflectionMergePartial<GetNodeInfoResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: GetNodeInfoResponse): GetNodeInfoResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string node_id */ 1:
+                    message.nodeId = reader.string();
+                    break;
+                case /* repeated silo.v1.OwnedShardInfo owned_shards */ 2:
+                    message.ownedShards.push(OwnedShardInfo.internalBinaryRead(reader, reader.uint32(), options));
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: GetNodeInfoResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string node_id = 1; */
+        if (message.nodeId !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.nodeId);
+        /* repeated silo.v1.OwnedShardInfo owned_shards = 2; */
+        for (let i = 0; i < message.ownedShards.length; i++)
+            OwnedShardInfo.internalBinaryWrite(message.ownedShards[i], writer.tag(2, WireType.LengthDelimited).fork(), options).join();
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.GetNodeInfoResponse
+ */
+export const GetNodeInfoResponse = new GetNodeInfoResponse$Type();
 /**
  * @generated ServiceType for protobuf service silo.v1.Silo
  */
 export const Silo = new ServiceType("silo.v1.Silo", [
     { name: "GetClusterInfo", options: {}, I: GetClusterInfoRequest, O: GetClusterInfoResponse },
+    { name: "GetNodeInfo", options: {}, I: GetNodeInfoRequest, O: GetNodeInfoResponse },
     { name: "Enqueue", options: {}, I: EnqueueRequest, O: EnqueueResponse },
     { name: "GetJob", options: {}, I: GetJobRequest, O: GetJobResponse },
     { name: "GetJobResult", options: {}, I: GetJobResultRequest, O: GetJobResultResponse },
@@ -4657,7 +5115,8 @@ export const Silo = new ServiceType("silo.v1.Silo", [
     { name: "Heartbeat", options: {}, I: HeartbeatRequest, O: HeartbeatResponse },
     { name: "Query", options: {}, I: QueryRequest, O: QueryResponse },
     { name: "QueryArrow", serverStreaming: true, options: {}, I: QueryArrowRequest, O: ArrowIpcMessage },
-    { name: "GetShardCounters", options: {}, I: GetShardCountersRequest, O: GetShardCountersResponse },
-    { name: "ResetShards", options: {}, I: ResetShardsRequest, O: ResetShardsResponse },
-    { name: "CpuProfile", options: {}, I: CpuProfileRequest, O: CpuProfileResponse }
+    { name: "CpuProfile", options: {}, I: CpuProfileRequest, O: CpuProfileResponse },
+    { name: "RequestSplit", options: {}, I: RequestSplitRequest, O: RequestSplitResponse },
+    { name: "GetSplitStatus", options: {}, I: GetSplitStatusRequest, O: GetSplitStatusResponse },
+    { name: "ResetShards", options: {}, I: ResetShardsRequest, O: ResetShardsResponse }
 ]);

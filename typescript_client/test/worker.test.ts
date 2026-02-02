@@ -53,6 +53,7 @@ function createTask(
     taskGroup: "default",
     isLastAttempt: false,
     metadata: {},
+    limits: [],
   };
 }
 
@@ -248,6 +249,101 @@ describe("SiloWorker", () => {
         outcome: { type: "success", result: { processed: true } },
         shard: "00000000-0000-0000-0000-000000000001",
       });
+    });
+
+    it("passes limits to handler in task context", async () => {
+      const taskWithLimits: Task = {
+        id: "task-limits-1",
+        jobId: "job-limits-1",
+        attemptNumber: 1,
+        leaseMs: 30000n,
+        payload: {
+          encoding: {
+            oneofKind: "msgpack",
+            msgpack: encodeBytes({ test: "data" }),
+          },
+        },
+        priority: 10,
+        shard: "00000000-0000-0000-0000-000000000001",
+        taskGroup: "default",
+        isLastAttempt: false,
+        metadata: {},
+        limits: [
+          {
+            limit: {
+              oneofKind: "concurrency",
+              concurrency: {
+                key: "test-concurrency-key",
+                maxConcurrency: 5,
+              },
+            },
+          },
+          {
+            limit: {
+              oneofKind: "rateLimit",
+              rateLimit: {
+                name: "test-rate-limit",
+                uniqueKey: "test-rate-key",
+                limit: 100n,
+                durationMs: 60000n,
+                hits: 1,
+                algorithm: 0, // TokenBucket
+                behavior: 0,
+                retryPolicy: {
+                  initialBackoffMs: 1000n,
+                  maxBackoffMs: 30000n,
+                  backoffMultiplier: 2.0,
+                  maxRetries: 5,
+                },
+              },
+            },
+          },
+        ],
+      };
+
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce(tasksResult([taskWithLimits]))
+        .mockResolvedValue(tasksResult([]));
+      const reportOutcome = vi.fn().mockResolvedValue(undefined);
+      const client = createMockClient({ leaseTasks, reportOutcome });
+
+      let receivedLimits: unknown[] = [];
+      const handler: TaskHandler = async (ctx) => {
+        receivedLimits = ctx.task.limits;
+        return { type: "success", result: {} };
+      };
+
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler,
+        pollIntervalMs: 10,
+      });
+
+      worker.start();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await worker.stop();
+
+      // Verify limits were passed to handler
+      expect(receivedLimits).toHaveLength(2);
+
+      // Check concurrency limit
+      const concurrencyLimit = receivedLimits[0] as {
+        limit: { oneofKind: string; concurrency: { key: string; maxConcurrency: number } };
+      };
+      expect(concurrencyLimit.limit.oneofKind).toBe("concurrency");
+      expect(concurrencyLimit.limit.concurrency.key).toBe("test-concurrency-key");
+      expect(concurrencyLimit.limit.concurrency.maxConcurrency).toBe(5);
+
+      // Check rate limit
+      const rateLimit = receivedLimits[1] as {
+        limit: { oneofKind: string; rateLimit: { name: string; uniqueKey: string } };
+      };
+      expect(rateLimit.limit.oneofKind).toBe("rateLimit");
+      expect(rateLimit.limit.rateLimit.name).toBe("test-rate-limit");
+      expect(rateLimit.limit.rateLimit.uniqueKey).toBe("test-rate-key");
     });
 
     it("executes tasks and reports failure", async () => {
