@@ -648,7 +648,9 @@ pub fn run() {
 
             // Log final concurrency state for all limit keys
             for config in LIMIT_CONFIGS {
-                let holder_count = verify_tracker.concurrency.holder_count(config.key);
+                let holder_count = verify_tracker
+                    .concurrency
+                    .total_holder_count_for_queue(config.key);
                 tracing::trace!(
                     limit_key = config.key,
                     remaining_holders = holder_count,

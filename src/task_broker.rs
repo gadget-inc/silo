@@ -209,8 +209,15 @@ impl TaskBroker {
 
         let broker = Arc::clone(self);
         tokio::spawn(async move {
-            // Hydrate concurrency holders from durable state on startup
-            let _ = broker.concurrency.counts().hydrate(&broker.db).await;
+            // Hydrate concurrency holders from durable state on startup.
+            // Pass the shard range to filter out holders for tenants outside this shard.
+            // This is critical after shard splits where both children have the same
+            // holder records - without filtering, both would grant duplicate tickets.
+            let _ = broker
+                .concurrency
+                .counts()
+                .hydrate(&broker.db, &broker.range)
+                .await;
             tokio::time::sleep(Duration::from_millis(10)).await;
 
             let min_sleep_ms = 5;

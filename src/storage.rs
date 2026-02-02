@@ -88,5 +88,18 @@ pub fn resolve_object_store(backend: &Backend, path: &str) -> Result<ResolvedSto
                 root_path: canonical_path,
             })
         }
+        #[cfg(feature = "dst")]
+        Backend::TurmoilFs => {
+            // Use turmoil's simulated filesystem for deterministic testing
+            let store =
+                crate::turmoil_object_store::TurmoilObjectStore::new(path).map_err(|e| {
+                    StorageError::InvalidUrl(format!("failed to create TurmoilFs: {}", e))
+                })?;
+            Ok(ResolvedStore {
+                store: Arc::new(store),
+                canonical_path: String::new(),
+                root_path: path.to_string(),
+            })
+        }
     }
 }

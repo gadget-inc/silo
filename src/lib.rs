@@ -20,6 +20,8 @@ pub mod storage;
 pub mod task;
 pub mod task_broker;
 pub mod trace;
+#[cfg(feature = "dst")]
+pub mod turmoil_object_store;
 pub mod webui;
 pub use silo_macros::test;
 pub mod pb {
