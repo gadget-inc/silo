@@ -11,7 +11,6 @@ use slatedb::{Db, WriteBatch};
 use tokio::sync::Notify;
 
 use crate::codec::decode_task;
-use crate::concurrency::ConcurrencyManager;
 use crate::keys::decode_tenant;
 use crate::metrics::Metrics;
 use crate::shard_range::ShardRange;
@@ -43,8 +42,6 @@ pub struct TaskBroker {
     notify: Arc<Notify>,
     // Whether the background scanner should be woken up
     scan_requested: Arc<AtomicBool>,
-    // The concurrency manager to use to grant tickets to tasks
-    concurrency: Arc<ConcurrencyManager>,
     // The target buffer size
     target_buffer: usize,
     // The batch size for the background scanner to read out of the DB
@@ -60,7 +57,6 @@ pub struct TaskBroker {
 impl TaskBroker {
     pub fn new(
         db: Arc<Db>,
-        concurrency: Arc<ConcurrencyManager>,
         shard_name: String,
         metrics: Option<Metrics>,
         range: ShardRange,
@@ -72,7 +68,6 @@ impl TaskBroker {
             running: Arc::new(AtomicBool::new(false)),
             notify: Arc::new(Notify::new()),
             scan_requested: Arc::new(AtomicBool::new(false)),
-            concurrency,
             target_buffer: 4096,
             scan_batch: 1024,
             shard_name,
@@ -209,16 +204,9 @@ impl TaskBroker {
 
         let broker = Arc::clone(self);
         tokio::spawn(async move {
-            // Hydrate concurrency holders from durable state on startup.
-            // Pass the shard range to filter out holders for tenants outside this shard.
-            // This is critical after shard splits where both children have the same
-            // holder records - without filtering, both would grant duplicate tickets.
-            let _ = broker
-                .concurrency
-                .counts()
-                .hydrate(&broker.db, &broker.range)
-                .await;
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            // Note: Concurrency holders are hydrated synchronously in
+            // JobStoreShard::open_with_resolved_store() before this broker starts.
+            // This ensures concurrent limits are enforced correctly from the first request.
 
             let min_sleep_ms = 5;
             let max_sleep_ms = 1000;

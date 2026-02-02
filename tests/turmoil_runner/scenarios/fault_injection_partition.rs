@@ -2,11 +2,10 @@
 
 use crate::helpers::{
     AttemptStatus, EnqueueRequest, GetJobRequest, HashMap, JobStatus, LeaseTasksRequest,
-    ReportOutcomeRequest, SerializedBytes, TEST_SHARD_ID, get_seed, report_outcome_request,
-    run_scenario_impl, serialized_bytes, setup_server, turmoil, turmoil_connector,
-    verify_server_invariants,
+    ReportOutcomeRequest, SerializedBytes, SiloClient, TEST_SHARD_ID, connect_to_server, get_seed,
+    report_outcome_request, run_scenario_impl, serialized_bytes, setup_server, turmoil,
+    turmoil_connector, verify_server_invariants,
 };
-use silo::pb::silo_client::SiloClient;
 use std::time::Duration;
 use tonic::transport::Endpoint;
 
@@ -18,13 +17,8 @@ pub fn run() {
         sim.host("server", || async move { setup_server(9901).await });
 
         sim.client("client", async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            let mut client = connect_to_server("http://server:9901").await?;
             tracing::trace!("client_start");
-
-            let ch = Endpoint::new("http://server:9901")?
-                .connect_with_connector(turmoil_connector())
-                .await?;
-            let mut client = SiloClient::new(ch);
 
             // Verify initial server state
             if let Ok(state) = verify_server_invariants(&mut client, TEST_SHARD_ID).await {

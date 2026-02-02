@@ -22,11 +22,10 @@
 
 use crate::helpers::{
     ConcurrencyLimit, EnqueueRequest, GetJobRequest, HashMap, JobStatus, LeaseTasksRequest, Limit,
-    ReportOutcomeRequest, SerializedBytes, TEST_SHARD_ID, check_holder_limits, get_seed, limit,
-    report_outcome_request, run_scenario_impl, serialized_bytes, setup_server, turmoil_connector,
-    verify_server_invariants,
+    ReportOutcomeRequest, SerializedBytes, SiloClient, TEST_SHARD_ID, check_holder_limits,
+    connect_to_server, get_seed, limit, report_outcome_request, run_scenario_impl,
+    serialized_bytes, setup_server, turmoil_connector, verify_server_invariants,
 };
-use silo::pb::silo_client::SiloClient;
 use silo::pb::{CancelJobRequest, ExpediteJobRequest};
 use std::collections::HashMap as StdHashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -53,12 +52,7 @@ pub fn run() {
 
         // Producer: Enqueues jobs A, B, C, D with different priorities
         sim.client("producer", async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-
-            let ch = Endpoint::new("http://server:9922")?
-                .connect_with_connector(turmoil_connector())
-                .await?;
-            let mut client = SiloClient::new(ch);
+            let mut client = connect_to_server("http://server:9922").await?;
 
             // Enqueue job A - highest priority (lowest number)
             tracing::trace!(job_id = "job-A", priority = 10, "enqueue");

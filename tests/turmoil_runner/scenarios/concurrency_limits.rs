@@ -18,13 +18,12 @@
 
 use crate::helpers::{
     AttemptStatus, ConcurrencyLimit, EnqueueRequest, GetJobRequest, HashMap, InvariantTracker,
-    JobStatus, LeaseTasksRequest, Limit, ReportOutcomeRequest, SerializedBytes, TEST_SHARD_ID,
-    Task, get_seed, limit, report_outcome_request, run_scenario_impl, serialized_bytes,
-    setup_server, turmoil_connector,
+    JobStatus, LeaseTasksRequest, Limit, ReportOutcomeRequest, SerializedBytes, SiloClient,
+    TEST_SHARD_ID, Task, connect_to_server, get_seed, limit, report_outcome_request,
+    run_scenario_impl, serialized_bytes, setup_server, turmoil_connector,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use silo::pb::silo_client::SiloClient;
 use std::collections::{HashMap as StdHashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -106,13 +105,8 @@ pub fn run() {
         let enqueue_counter1 = Arc::clone(&total_enqueued);
         let enqueued_jobs1 = Arc::clone(&enqueued_jobs);
         sim.client("producer1", async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
             let mut rng = StdRng::seed_from_u64(producer_seed.wrapping_add(1));
-
-            let ch = Endpoint::new("http://server:9905")?
-                .connect_with_connector(turmoil_connector())
-                .await?;
-            let mut client = SiloClient::new(ch);
+            let mut client = connect_to_server("http://server:9905").await?;
 
             // Build list of all jobs to enqueue, then shuffle
             let mut jobs: Vec<(usize, usize)> = Vec::new();
@@ -195,14 +189,10 @@ pub fn run() {
         let enqueue_counter2 = Arc::clone(&total_enqueued);
         let enqueued_jobs2 = Arc::clone(&enqueued_jobs);
         sim.client("producer2", async move {
-            // Start slightly later to create interleaving with producer1
-            tokio::time::sleep(Duration::from_millis(80)).await;
+            // Start slightly later than producer1 to create interleaving
+            tokio::time::sleep(Duration::from_millis(30)).await;
             let mut rng = StdRng::seed_from_u64(producer2_seed.wrapping_add(2));
-
-            let ch = Endpoint::new("http://server:9905")?
-                .connect_with_connector(turmoil_connector())
-                .await?;
-            let mut client = SiloClient::new(ch);
+            let mut client = connect_to_server("http://server:9905").await?;
 
             let mut jobs: Vec<(usize, usize)> = Vec::new();
             for (limit_idx, _) in LIMIT_CONFIGS.iter().enumerate() {

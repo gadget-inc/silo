@@ -27,6 +27,7 @@ use tracing_subscriber::prelude::*;
 use turmoil::net::TcpListener;
 
 // Re-export common types needed by scenarios
+pub use silo::pb::silo_client::SiloClient;
 pub use silo::pb::{
     AttemptStatus, ConcurrencyLimit, EnqueueRequest, GetJobRequest, JobStatus, LeaseTasksRequest,
     Limit, QueryRequest, ReportOutcomeRequest, RetryPolicy, SerializedBytes, Task, limit,
@@ -150,7 +151,7 @@ pub use silo::cluster_client::ClientConfig;
 pub async fn create_turmoil_client(
     uri: &str,
     config: &ClientConfig,
-) -> turmoil::Result<silo::pb::silo_client::SiloClient<tonic::transport::Channel>> {
+) -> turmoil::Result<SiloClient<tonic::transport::Channel>> {
     let endpoint = tonic::transport::Endpoint::new(uri.to_string())
         .map_err(|e| e.to_string())?
         .connect_timeout(config.connect_timeout)
@@ -201,8 +202,72 @@ pub async fn create_turmoil_client(
         .into())
 }
 
+/// Connect to a DST server, waiting for it to be ready.
+pub async fn connect_to_server(
+    uri: &str,
+) -> turmoil::Result<SiloClient<tonic::transport::Channel>> {
+    const MAX_ATTEMPTS: u32 = 20;
+    const INITIAL_BACKOFF_MS: u64 = 25;
+    const MAX_BACKOFF_MS: u64 = 500;
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+    let endpoint = tonic::transport::Endpoint::new(uri.to_string())
+        .map_err(|e| e.to_string())?
+        .connect_timeout(CONNECT_TIMEOUT);
+
+    let mut last_error = None;
+    let mut backoff_ms = INITIAL_BACKOFF_MS;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let connect_result = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            endpoint.connect_with_connector(turmoil_connector()),
+        )
+        .await;
+
+        match connect_result {
+            Ok(Ok(channel)) => {
+                tracing::trace!(attempt = attempt, uri = uri, "connected to server");
+                return Ok(SiloClient::new(channel));
+            }
+            Ok(Err(e)) => {
+                tracing::trace!(
+                    attempt = attempt,
+                    max_attempts = MAX_ATTEMPTS,
+                    error = %e,
+                    uri = uri,
+                    backoff_ms = backoff_ms,
+                    "connection attempt failed, retrying"
+                );
+                last_error = Some(e.to_string());
+            }
+            Err(_elapsed) => {
+                tracing::trace!(
+                    attempt = attempt,
+                    max_attempts = MAX_ATTEMPTS,
+                    uri = uri,
+                    backoff_ms = backoff_ms,
+                    "connection attempt timed out, retrying"
+                );
+                last_error = Some("connection timed out".to_string());
+            }
+        }
+
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            // Exponential backoff with cap
+            backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+        }
+    }
+
+    Err(last_error
+        .unwrap_or_else(|| "no connection attempts made".to_string())
+        .into())
+}
+
 /// Helper to create a standard server host for tests
 pub async fn setup_server(port: u16) -> turmoil::Result<()> {
+    tracing::trace!(port = port, "setup_server: starting");
     let cfg = AppConfig {
         server: silo::settings::ServerConfig {
             grpc_addr: format!("0.0.0.0:{}", port),
@@ -227,14 +292,18 @@ pub async fn setup_server(port: u16) -> turmoil::Result<()> {
     let factory = ShardFactory::new(cfg.database.clone(), rate_limiter, None);
     // For DST tests, use a fixed shard ID (zero UUID) for simplicity
     let test_shard_id = ShardId::parse("00000000-0000-0000-0000-000000000000").unwrap();
+    tracing::trace!("setup_server: opening shard");
     let _ = factory
         .open(&test_shard_id, &ShardRange::full())
         .await
         .map_err(|e| e.to_string())?;
     let factory = Arc::new(factory);
+    tracing::trace!("setup_server: shard opened");
 
     let addr = (IpAddr::from(Ipv4Addr::UNSPECIFIED), port);
+    tracing::trace!(port = port, "setup_server: binding TCP listener");
     let listener = TcpListener::bind(addr).await.map_err(|e| e.to_string())?;
+    tracing::trace!(port = port, "setup_server: TCP listener bound");
 
     struct Accepted(turmoil::net::TcpStream);
     impl tonic::transport::server::Connected for Accepted {
@@ -285,6 +354,7 @@ pub async fn setup_server(port: u16) -> turmoil::Result<()> {
     };
 
     // Create a NoneCoordinator for single-node DST test mode
+    tracing::trace!("setup_server: creating coordinator");
     let coordinator = Arc::new(
         NoneCoordinator::new(
             "dst-test-node",
@@ -294,19 +364,15 @@ pub async fn setup_server(port: u16) -> turmoil::Result<()> {
         )
         .await,
     );
+    tracing::trace!("setup_server: coordinator created");
 
     let (_tx, rx) = tokio::sync::broadcast::channel::<()>(1);
-    run_server_with_incoming(
-        incoming,
-        factory,
-        coordinator,
-        silo::settings::AppConfig::load(None).unwrap(),
-        None,
-        rx,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    tracing::trace!("setup_server: starting server");
+    run_server_with_incoming(incoming, factory, coordinator, cfg, None, rx)
+        .await
+        .map_err(|e| e.to_string())?;
 
+    tracing::trace!("setup_server: server stopped");
     Ok(())
 }
 
@@ -638,6 +704,7 @@ pub fn verify_determinism(scenario: &str, seed: u64) {
 ///
 /// Note: The actual system uses `tenant|queue` as the composite key - each tenant
 /// has its own separate limit for each queue name. This tracker mirrors that behavior.
+/// Jobs for a given tenant should only be routed to one shard at a time.
 #[derive(Debug, Default)]
 pub struct GlobalConcurrencyTracker {
     /// Maps tenant|queue -> set of (task_id, job_id) pairs currently holding the limit

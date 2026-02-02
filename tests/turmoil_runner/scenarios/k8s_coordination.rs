@@ -190,7 +190,7 @@ async fn setup_node_server(
             dev_mode: false,
         },
         coordination: silo::settings::CoordinationConfig::default(),
-        tenancy: silo::settings::TenancyConfig { enabled: false },
+        tenancy: silo::settings::TenancyConfig { enabled: true },
         gubernator: GubernatorSettings::default(),
         webui: WebUiConfig::default(),
         logging: LoggingConfig::default(),
@@ -324,7 +324,9 @@ pub fn run() {
         // Invariant tracker for DST events
         let tracker = Arc::new(InvariantTracker::new());
 
-        // Register concurrency limits
+        // Register concurrency limits - each tenant gets its own limits tracked separately.
+        // This scenario uses shard-specific tenants (e.g., "shard-0", "shard-1") so that
+        // jobs routed to different shards don't share concurrency limits in the tracker.
         for (key, max_conc) in WORKER_LIMITS {
             if *max_conc > 0 {
                 tracker.concurrency.register_limit(key, *max_conc);
@@ -494,9 +496,12 @@ pub fn run() {
                 let delay_ms = rng.random_range(50..200);
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 
-                // Round-robin across shards to exercise routing
+                // Round-robin across shards to exercise routing.
+                // Use a shard-specific tenant so each shard's concurrency limits are
+                // tracked independently (matching how the actual system works).
                 let shard_idx = (i as usize) % shard_ids.len();
                 let shard_id = &shard_ids[shard_idx];
+                let tenant = format!("shard-{}", shard_idx);
 
                 // Find the current owner of this shard (with retry on failure)
                 let owner = match producer_k8s_state
@@ -562,6 +567,7 @@ pub fn run() {
                 tracing::trace!(
                     job_id = %job_id,
                     shard = %shard_id,
+                    tenant = %tenant,
                     target_node = ?target_node,
                     limit_key = limit_key,
                     "enqueue"
@@ -584,7 +590,7 @@ pub fn run() {
                             )),
                         }),
                         limits,
-                        tenant: None,
+                        tenant: Some(tenant.clone()),
                         metadata: HashMap::new(),
                         task_group: "default".to_string(),
                     }))

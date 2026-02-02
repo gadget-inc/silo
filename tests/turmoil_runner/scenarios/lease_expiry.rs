@@ -8,15 +8,13 @@
 
 use crate::helpers::{
     AttemptStatus, EnqueueRequest, GetJobRequest, HashMap, JobStateTracker, JobStatus,
-    LeaseTasksRequest, ReportOutcomeRequest, RetryPolicy, SerializedBytes, TEST_SHARD_ID, get_seed,
-    report_outcome_request, run_scenario_impl, serialized_bytes, setup_server, turmoil,
-    turmoil_connector,
+    LeaseTasksRequest, ReportOutcomeRequest, RetryPolicy, SerializedBytes, TEST_SHARD_ID,
+    connect_to_server, get_seed, report_outcome_request, run_scenario_impl, serialized_bytes,
+    setup_server, turmoil,
 };
-use silo::pb::silo_client::SiloClient;
 use std::sync::Arc as StdArc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
-use tonic::transport::Endpoint;
 
 pub fn run() {
     let seed = get_seed();
@@ -40,12 +38,7 @@ pub fn run() {
 
         // Worker 1 - leases and crashes (partition)
         sim.client("worker1", async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-
-            let ch = Endpoint::new("http://server:9903")?
-                .connect_with_connector(turmoil_connector())
-                .await?;
-            let mut client = SiloClient::new(ch);
+            let mut client = connect_to_server("http://server:9903").await?;
 
             // Enqueue with retry policy
             tracing::trace!(job_id = "lease-test", "enqueue");
@@ -136,12 +129,9 @@ pub fn run() {
 
         // Worker 2 - should pick up expired lease
         sim.client("worker2", async move {
+            // Wait for worker1's lease to expire (default lease is 30s, we use shorter in test)
             tokio::time::sleep(Duration::from_millis(25000)).await;
-
-            let ch = Endpoint::new("http://server:9903")?
-                .connect_with_connector(turmoil_connector())
-                .await?;
-            let mut client = SiloClient::new(ch);
+            let mut client = connect_to_server("http://server:9903").await?;
 
             let sim_time = turmoil::sim_elapsed().map(|d| d.as_millis()).unwrap_or(0);
             tracing::trace!(worker = "worker2", sim_time_ms = sim_time, "start");
@@ -225,11 +215,7 @@ pub fn run() {
         sim.client("verifier", async move {
             // Wait for everything to complete
             tokio::time::sleep(Duration::from_secs(40)).await;
-
-            let ch = Endpoint::new("http://server:9903")?
-                .connect_with_connector(turmoil_connector())
-                .await?;
-            let mut client = SiloClient::new(ch);
+            let mut client = connect_to_server("http://server:9903").await?;
 
             // Verify job reached terminal state
             let job_resp = client

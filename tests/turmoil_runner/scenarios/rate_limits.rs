@@ -20,10 +20,10 @@
 
 use crate::helpers::{
     EnqueueRequest, GetJobRequest, HashMap, JobStatus, LeaseTasksRequest, Limit,
-    ReportOutcomeRequest, SerializedBytes, TEST_SHARD_ID, get_seed, limit, report_outcome_request,
-    run_scenario_impl, serialized_bytes, setup_server, turmoil_connector, verify_server_invariants,
+    ReportOutcomeRequest, SerializedBytes, SiloClient, TEST_SHARD_ID, connect_to_server, get_seed,
+    limit, report_outcome_request, run_scenario_impl, serialized_bytes, setup_server,
+    turmoil_connector, verify_server_invariants,
 };
-use silo::pb::silo_client::SiloClient;
 use silo::pb::{GubernatorAlgorithm, GubernatorRateLimit, RateLimitRetryPolicy};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -44,12 +44,7 @@ pub fn run() {
         // Producer: Enqueues jobs with rate limits
         let producer_enqueued = Arc::clone(&total_enqueued);
         sim.client("producer", async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-
-            let ch = Endpoint::new("http://server:9923")?
-                .connect_with_connector(turmoil_connector())
-                .await?;
-            let mut client = SiloClient::new(ch);
+            let mut client = connect_to_server("http://server:9923").await?;
 
             // Enqueue several jobs with rate limits
             // Using a generous limit so jobs can proceed

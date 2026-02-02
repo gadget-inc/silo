@@ -24,10 +24,10 @@
 
 use crate::helpers::{
     ConcurrencyLimit, EnqueueRequest, HashMap, LeaseTasksRequest, Limit, ReportOutcomeRequest,
-    SerializedBytes, TEST_SHARD_ID, check_holder_limits, get_seed, limit, report_outcome_request,
-    run_scenario_impl, serialized_bytes, setup_server, turmoil_connector, verify_server_invariants,
+    SerializedBytes, SiloClient, TEST_SHARD_ID, check_holder_limits, connect_to_server, get_seed,
+    limit, report_outcome_request, run_scenario_impl, serialized_bytes, setup_server,
+    turmoil_connector, verify_server_invariants,
 };
-use silo::pb::silo_client::SiloClient;
 use silo::pb::{CancelJobRequest, HeartbeatRequest};
 use std::collections::HashMap as StdHashMap;
 use std::sync::Arc;
@@ -56,12 +56,7 @@ pub fn run() {
 
         // Producer: Enqueues jobs A, B, C
         sim.client("producer", async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-
-            let ch = Endpoint::new("http://server:9921")?
-                .connect_with_connector(turmoil_connector())
-                .await?;
-            let mut client = SiloClient::new(ch);
+            let mut client = connect_to_server("http://server:9921").await?;
 
             // Enqueue job A - will be leased first and then cancelled
             tracing::trace!(job_id = "job-A", "enqueue");

@@ -23,14 +23,13 @@
 //! - No duplicate completions
 
 use crate::helpers::{
-    ConcurrencyLimit, EnqueueRequest, HashMap, InvariantTracker, LeaseTasksRequest, Limit,
-    ReportOutcomeRequest, RetryPolicy, SerializedBytes, TEST_SHARD_ID, Task, create_turmoil_client,
-    get_seed, limit, report_outcome_request, run_scenario_impl, serialized_bytes, setup_server,
-    turmoil,
+    ClientConfig, ConcurrencyLimit, EnqueueRequest, HashMap, InvariantTracker, LeaseTasksRequest,
+    Limit, ReportOutcomeRequest, RetryPolicy, SerializedBytes, TEST_SHARD_ID, Task,
+    connect_to_server, create_turmoil_client, get_seed, limit, report_outcome_request,
+    run_scenario_impl, serialized_bytes, setup_server, turmoil,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use silo::cluster_client::ClientConfig;
 use silo::pb::{CancelJobRequest, ExpediteJobRequest, RestartJobRequest};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -172,10 +171,9 @@ pub fn run() {
         let producer_num_jobs = num_jobs;
         let producer_config = client_config.clone();
         sim.client("producer", async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
             let mut rng = StdRng::seed_from_u64(producer_seed.wrapping_add(1));
-
-            let mut client = create_turmoil_client("http://server:9910", &producer_config).await?;
+            // Use connect_to_server for initial connection, then producer_config for reconnection
+            let mut client = connect_to_server("http://server:9910").await?;
             let mut consecutive_failures = 0u32;
 
             for i in 0..producer_num_jobs {
