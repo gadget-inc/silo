@@ -68,8 +68,7 @@ impl Write for DstWriter {
 /// - Thread names/IDs disabled (ordering could vary)
 /// - No file/line numbers (could change with code edits)
 ///
-/// Panics if called more than once in the same process - each DST scenario
-/// must run in its own process for true determinism.
+/// Panics if called more than once in the same process - each DST scenario must run in its own process for true determinism.
 fn init_deterministic_tracing() {
     use std::sync::atomic::{AtomicBool, Ordering};
     static INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -798,13 +797,6 @@ impl GlobalConcurrencyTracker {
                 );
             }
         }
-    }
-
-    /// Get the current holder count for a tenant+queue combination
-    pub fn holder_count(&self, tenant: &str, queue: &str) -> usize {
-        let holders = self.holders.lock().unwrap();
-        let composite_key = format!("{}|{}", tenant, queue);
-        holders.get(&composite_key).map(|s| s.len()).unwrap_or(0)
     }
 
     /// Get the total holder count for a queue across all tenants.

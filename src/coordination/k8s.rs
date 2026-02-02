@@ -1135,20 +1135,22 @@ impl<B: K8sBackend> Coordinator for K8sCoordinator<B> {
                 .collect()
         };
 
-        // Trigger shutdown on all guards first (in sorted order for determinism),
-        // then wait for all of them in parallel. This is much faster than sequential
-        // shutdown because shard close + lease release can happen concurrently.
-        for (_sid, guard) in &guards_sorted {
+        // Trigger shutdown on all guards in sorted order for determinism
+        for (sid, guard) in &guards_sorted {
+            tracing::trace!(shard_id = %sid, "triggering guard shutdown");
             guard.trigger_shutdown().await;
             guard.notify.notify_one();
+            tracing::trace!(shard_id = %sid, "guard shutdown triggered and notified");
         }
 
         // Wait for all guards to complete shutdown in parallel
+        tracing::trace!(guard_count = guards_sorted.len(), "waiting for all guards to complete shutdown");
         let wait_futures: Vec<_> = guards_sorted
             .iter()
             .map(|(_sid, guard)| guard.wait_shutdown(Duration::from_millis(5000)))
             .collect();
         futures::future::join_all(wait_futures).await;
+        tracing::trace!("all guards completed shutdown");
 
         // Signal shutdown to stop background tasks
         self.base.signal_shutdown();
@@ -1589,10 +1591,15 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                     }
                 }
                 ShardPhase::ShuttingDown => {
+                    // Debug: log entry into shutdown processing
+                    tracing::trace!(shard_id = %self.shard_id, "guard entering ShuttingDown processing");
+
                     // Close the shard before releasing the lease
+                    tracing::trace!(shard_id = %self.shard_id, "guard calling factory.close");
                     if let Err(e) = factory.close(&self.shard_id).await {
                         tracing::error!(shard_id = %self.shard_id, error = %e, "failed to close shard during shutdown");
                     }
+                    tracing::trace!(shard_id = %self.shard_id, "guard factory.close completed");
 
                     // Release our lease if we hold it
                     let has_rv = {
@@ -1601,7 +1608,9 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                     };
 
                     if has_rv {
+                        tracing::trace!(shard_id = %self.shard_id, "guard releasing lease");
                         let _ = self.release_lease_cas(&lease_name).await;
+                        tracing::trace!(shard_id = %self.shard_id, "guard lease released");
                     }
 
                     {
@@ -1616,6 +1625,7 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                         node_id: self.node_id.clone(),
                         shard_id: self.shard_id.to_string(),
                     });
+                    tracing::trace!(shard_id = %self.shard_id, "guard shutdown complete");
                     break;
                 }
                 ShardPhase::Idle | ShardPhase::Held => {
