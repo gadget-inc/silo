@@ -149,13 +149,23 @@ pub fn run() {
         let canceller_a_cancelled = Arc::clone(&job_a_cancelled_time);
         let canceller_b_cancelled = Arc::clone(&job_b_was_cancelled_while_waiting);
         sim.client("canceller", async move {
-            // Wait for job A to be leased
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            // Poll until job A is actually leased (with timeout)
+            // This also gives the server time to start up
+            for _ in 0..200 {
+                let a_leased = canceller_a_leased.load(Ordering::SeqCst);
+                if a_leased > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
 
             let ch = Endpoint::new("http://server:9921")?
                 .connect_with_connector(turmoil_connector())
                 .await?;
             let mut client = SiloClient::new(ch);
+
+            // Give a moment for job B and C to be enqueued and become visible
+            tokio::time::sleep(Duration::from_millis(300)).await;
 
             // First, cancel job B while it's waiting for the ticket
             // (A is currently holding it)
@@ -181,8 +191,6 @@ pub fn run() {
             }
 
             // Now cancel job A while it's running
-            tokio::time::sleep(Duration::from_millis(100)).await;
-
             tracing::trace!(job_id = "job-A", "cancelling_while_running");
             match client
                 .cancel_job(tonic::Request::new(CancelJobRequest {
@@ -229,8 +237,9 @@ pub fn run() {
 
             let mut jobs_processed = 0;
             let mut current_task: Option<(String, String)> = None; // (job_id, task_id)
+            let mut heartbeat_count = 0; // Track heartbeats per job
 
-            for _round in 0..80 {
+            for _round in 0..120 {
                 // If we have a current task, heartbeat to check for cancellation
                 if let Some((ref job_id, ref task_id)) = current_task {
                     let heartbeat = client
@@ -283,6 +292,7 @@ pub fn run() {
                                 }
 
                                 current_task = None;
+                                heartbeat_count = 0;
                                 continue;
                             }
                         }
@@ -291,11 +301,16 @@ pub fn run() {
                         }
                     }
 
-                    // Simulate some work
+                    heartbeat_count += 1;
+
+                    // Simulate some work - do multiple heartbeats for job A to give cancellation
+                    // time to arrive before completing. Other jobs complete faster.
+                    let min_heartbeats = if job_id == "job-A" { 10 } else { 2 };
+
                     tokio::time::sleep(Duration::from_millis(50)).await;
 
-                    // Complete the task (if not cancelled)
-                    if current_task.is_some() {
+                    // Complete the task after enough heartbeats
+                    if heartbeat_count >= min_heartbeats {
                         let (job_id, task_id) = current_task.take().unwrap();
 
                         match client
@@ -338,7 +353,13 @@ pub fn run() {
                                 tracing::trace!(job_id = %job_id, error = %e, "complete_failed");
                             }
                         }
+                        heartbeat_count = 0;
                     }
+                }
+
+                // Stop if job C has completed - the main success condition
+                if worker_c_complete.load(Ordering::SeqCst) > 0 {
+                    break;
                 }
 
                 // Try to lease a new task
@@ -380,11 +401,6 @@ pub fn run() {
 
                         current_task = Some((task.job_id.clone(), task.id.clone()));
                     }
-                }
-
-                // Stop if we've processed enough jobs (A cancelled, B cancelled/skipped, C completed)
-                if jobs_processed >= 2 || worker_c_complete.load(Ordering::SeqCst) > 0 {
-                    break;
                 }
 
                 tokio::time::sleep(Duration::from_millis(50)).await;

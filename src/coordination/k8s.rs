@@ -1144,7 +1144,10 @@ impl<B: K8sBackend> Coordinator for K8sCoordinator<B> {
         }
 
         // Wait for all guards to complete shutdown in parallel
-        tracing::trace!(guard_count = guards_sorted.len(), "waiting for all guards to complete shutdown");
+        tracing::trace!(
+            guard_count = guards_sorted.len(),
+            "waiting for all guards to complete shutdown"
+        );
         let wait_futures: Vec<_> = guards_sorted
             .iter()
             .map(|(_sid, guard)| guard.wait_shutdown(Duration::from_millis(5000)))
