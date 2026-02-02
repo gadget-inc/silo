@@ -48,7 +48,7 @@ async fn concurrency_immediate_grant_enqueues_task_and_writes_holder() {
     // Holder should exist for this attempt's task id (holder is per-attempt)
     let holder = shard
         .db()
-        .get(concurrency_holder_key("-", &queue, t.attempt().task_id()).as_bytes())
+        .get(&concurrency_holder_key("-", &queue, t.attempt().task_id()))
         .await
         .expect("get holder");
     assert!(
@@ -104,7 +104,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
         .await
         .expect("enqueue2");
     // No runnable RunAttempt should be visible yet (RequestTicket entries are expected)
-    let maybe = first_kv_with_prefix(shard.db(), "tasks/").await;
+    let maybe = first_task_kv(shard.db()).await;
     if let Some((_k, v)) = maybe {
         let task = decode_task(&v).expect("decode task");
         match task {
@@ -124,7 +124,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
         .expect("report1");
 
     // Now there should be a new task for the queued request
-    let some = first_kv_with_prefix(shard.db(), "tasks/").await;
+    let some = first_task_kv(shard.db()).await;
     assert!(some.is_some(), "task should be enqueued for next requester");
 }
 
@@ -188,7 +188,7 @@ async fn concurrency_held_queues_propagate_across_retries_and_release_on_finish(
         .expect("report2");
 
     // No holders should remain after success of follow-up attempt (released after each attempt)
-    assert_eq!(count_with_prefix(shard.db(), "holders/").await, 0);
+    assert_eq!(count_concurrency_holders(shard.db()).await, 0);
 }
 
 #[silo::test]
@@ -311,7 +311,7 @@ async fn concurrency_retry_releases_original_holder() {
 
     // BUG (current impl): holder created for attempt 1 task id remains. We assert no holders remain.
     assert_eq!(
-        count_with_prefix(shard.db(), "holders/").await,
+        count_concurrency_holders(shard.db()).await,
         0,
         "holders should be fully released after retries complete"
     );
@@ -395,7 +395,7 @@ async fn concurrency_no_overgrant_after_release() {
         .expect("enqueue c");
 
     // Count durable holders should never exceed 1
-    let holders = count_with_prefix(shard.db(), "holders/").await;
+    let holders = count_concurrency_holders(shard.db()).await;
     assert!(
         holders <= 1,
         "must not over-grant: holders={}, expected <= 1",
@@ -457,8 +457,8 @@ async fn stress_single_queue_no_double_grant() {
 
     assert_eq!(processed, total);
     // No remaining durable state for holders/requests
-    assert_eq!(count_with_prefix(shard.db(), "holders/").await, 0);
-    assert_eq!(count_with_prefix(shard.db(), "requests/").await, 0);
+    assert_eq!(count_concurrency_holders(shard.db()).await, 0);
+    assert_eq!(count_concurrency_requests(shard.db()).await, 0);
 }
 
 #[silo::test]
@@ -515,7 +515,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
             .expect("enqueue add");
     }
     // There should be no runnable RunAttempt until we release (RequestTicket may exist)
-    if let Some((_k, v)) = first_kv_with_prefix(shard.db(), "tasks/").await {
+    if let Some((_k, v)) = first_task_kv(shard.db()).await {
         let task = decode_task(&v).expect("decode task");
         match task {
             Task::RunAttempt { .. } => panic!("unexpected RunAttempt before release"),
@@ -530,7 +530,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
         .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report1");
-    let after = first_kv_with_prefix(shard.db(), "tasks/").await;
+    let after = first_task_kv(shard.db()).await;
     assert!(after.is_some(), "one task should be enqueued after release");
 }
 
@@ -570,9 +570,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
     let _leased_task_id = tasks[0].attempt().task_id().to_string();
 
     // Find the lease and rewrite expiry to the past
-    let (lease_key, lease_value) = first_kv_with_prefix(shard.db(), "lease/")
-        .await
-        .expect("lease present");
+    let (lease_key, lease_value) = first_lease_kv(shard.db()).await.expect("lease present");
     type ArchivedTask = <Task as Archive>::Archived;
     let decoded = decode_lease(&lease_value).expect("decode lease");
     let archived = decoded.archived();
@@ -609,7 +607,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
     let new_val = encode_lease(&new_record).unwrap();
     shard
         .db()
-        .put(lease_key.as_bytes(), &new_val)
+        .put(&lease_key, &new_val)
         .await
         .expect("put mutated lease");
     shard.db().flush().await.expect("flush mutated lease");
@@ -620,7 +618,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
     // Lease removed
     let lease = shard
         .db()
-        .get(lease_key.as_bytes())
+        .get(&lease_key)
         .await
         .expect("get lease after reap");
     assert!(lease.is_none(), "lease should be removed by reaper");
@@ -639,7 +637,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
     }
 
     // Attempt 2 should be scheduled due to retry policy
-    let (_k2, v2) = first_kv_with_prefix(shard.db(), "tasks/")
+    let (_k2, v2) = first_task_kv(shard.db())
         .await
         .expect("attempt2 task exists");
     let task2 = decode_task(&v2).expect("decode task");
@@ -677,19 +675,13 @@ async fn reap_ignores_unexpired_leases() {
     let _task_id = tasks[0].attempt().task_id().to_string();
 
     // Do not mutate the lease; it should not be reaped
-    let (lease_key, _lease_value) = first_kv_with_prefix(shard.db(), "lease/")
-        .await
-        .expect("lease present");
+    let (lease_key, _lease_value) = first_lease_kv(shard.db()).await.expect("lease present");
 
     let reaped = shard.reap_expired_leases("-").await.expect("reap");
     assert_eq!(reaped, 0);
 
     // Lease should still exist
-    let lease = shard
-        .db()
-        .get(lease_key.as_bytes())
-        .await
-        .expect("get lease");
+    let lease = shard.db().get(&lease_key).await.expect("get lease");
     assert!(lease.is_some(), "lease should remain when not expired");
 
     // Attempt state remains Running
@@ -741,11 +733,11 @@ async fn concurrency_multiple_holders_max_greater_than_one() {
     let t3 = tasks[2].attempt().task_id().to_string();
 
     // Should have exactly 3 holders now
-    let holders = count_with_prefix(shard.db(), "holders/").await;
+    let holders = count_concurrency_holders(shard.db()).await;
     assert_eq!(holders, 3, "should have 3 concurrent holders");
 
     // 4th and 5th should be queued as request records (start_at_ms is now)
-    let requests = count_with_prefix(shard.db(), "requests/").await;
+    let requests = count_concurrency_requests(shard.db()).await;
     assert_eq!(requests, 2, "remaining 2 jobs should be queued as requests");
 
     // Complete one task -> should grant next
@@ -755,7 +747,7 @@ async fn concurrency_multiple_holders_max_greater_than_one() {
         .expect("report1");
 
     // Still 3 holders (released 1, granted 1)
-    let holders_after = count_with_prefix(shard.db(), "holders/").await;
+    let holders_after = count_concurrency_holders(shard.db()).await;
     assert_eq!(holders_after, 3, "should maintain 3 concurrent holders");
 
     // Complete all
@@ -793,8 +785,8 @@ async fn concurrency_multiple_holders_max_greater_than_one() {
     }
 
     // All holders and requests should be cleaned up
-    assert_eq!(count_with_prefix(shard.db(), "holders/").await, 0);
-    assert_eq!(count_with_prefix(shard.db(), "requests/").await, 0);
+    assert_eq!(count_concurrency_holders(shard.db()).await, 0);
+    assert_eq!(count_concurrency_requests(shard.db()).await, 0);
 }
 
 #[silo::test]
@@ -837,7 +829,11 @@ async fn concurrency_multiple_queues_per_job() {
     // Should have holder for api queue only (first limit)
     let api_holder = shard
         .db()
-        .get(concurrency_holder_key("-", &q1, tasks[0].attempt().task_id()).as_bytes())
+        .get(&concurrency_holder_key(
+            "-",
+            &q1,
+            tasks[0].attempt().task_id(),
+        ))
         .await
         .expect("get api holder");
     assert!(api_holder.is_some(), "should have api holder");
@@ -845,7 +841,11 @@ async fn concurrency_multiple_queues_per_job() {
     // Should NOT have db holder yet (only first limit is gated)
     let db_holder = shard
         .db()
-        .get(concurrency_holder_key("-", &q2, tasks[0].attempt().task_id()).as_bytes())
+        .get(&concurrency_holder_key(
+            "-",
+            &q2,
+            tasks[0].attempt().task_id(),
+        ))
         .await
         .expect("get db holder");
     assert!(
@@ -863,7 +863,7 @@ async fn concurrency_multiple_queues_per_job() {
         .expect("report");
 
     // All holders released
-    assert_eq!(count_with_prefix(shard.db(), "holders/").await, 0);
+    assert_eq!(count_concurrency_holders(shard.db()).await, 0);
 }
 
 #[silo::test]
@@ -914,7 +914,7 @@ async fn concurrency_future_request_waits_until_ready() {
         .expect("enqueue2");
 
     // RequestTicket task should exist
-    let tasks_before = count_with_prefix(shard.db(), "tasks/").await;
+    let tasks_before = count_task_keys(shard.db()).await;
     assert_eq!(tasks_before, 1, "should have 1 RequestTicket task");
 
     // Complete job 1 BEFORE job 2 is ready -> should NOT grant yet
@@ -924,7 +924,7 @@ async fn concurrency_future_request_waits_until_ready() {
         .expect("report1");
 
     // RequestTicket task should still exist (not granted because start_time_ms > now)
-    let tasks_after = count_with_prefix(shard.db(), "tasks/").await;
+    let tasks_after = count_task_keys(shard.db()).await;
     assert_eq!(
         tasks_after, 1,
         "RequestTicket task should remain until start time reached"
@@ -939,7 +939,7 @@ async fn concurrency_future_request_waits_until_ready() {
     );
 
     // Holders should be 0 (released job1, not granted job2)
-    let holders_after = count_with_prefix(shard.db(), "holders/").await;
+    let holders_after = count_concurrency_holders(shard.db()).await;
     assert_eq!(
         holders_after, 0,
         "no holders when future request not granted"
@@ -1113,7 +1113,7 @@ async fn concurrency_permanent_failure_releases_holder() {
         .expect("report2");
 
     // All holders released
-    assert_eq!(count_with_prefix(shard.db(), "holders/").await, 0);
+    assert_eq!(count_concurrency_holders(shard.db()).await, 0);
 }
 
 #[silo::test]
@@ -1169,9 +1169,7 @@ async fn concurrency_reap_expired_lease_releases_holder() {
         .expect("enqueue2");
 
     // Expire the lease for job 1
-    let (lease_key, lease_value) = first_kv_with_prefix(shard.db(), "lease/")
-        .await
-        .expect("lease");
+    let (lease_key, lease_value) = first_lease_kv(shard.db()).await.expect("lease");
     type ArchivedTask = <Task as Archive>::Archived;
     let decoded = decode_lease(&lease_value).expect("decode lease");
     let archived = decoded.archived();
@@ -1205,7 +1203,7 @@ async fn concurrency_reap_expired_lease_releases_holder() {
     let expired_val = encode_lease(&expired_record).unwrap();
     shard
         .db()
-        .put(lease_key.as_bytes(), &expired_val)
+        .put(&lease_key, &expired_val)
         .await
         .expect("put expired");
     shard.db().flush().await.expect("flush");
@@ -1288,7 +1286,7 @@ async fn concurrency_future_request_granted_after_time_passes() {
 
     // Should have created a RequestTicket task scheduled at future time
     // (peek_tasks filters out future tasks, so check DB directly)
-    let tasks_in_db = count_with_prefix(shard.db(), "tasks/").await;
+    let tasks_in_db = count_task_keys(shard.db()).await;
     assert_eq!(
         tasks_in_db, 1,
         "should have 1 RequestTicket task in DB (future)"
@@ -1301,11 +1299,11 @@ async fn concurrency_future_request_granted_after_time_passes() {
         .expect("report1");
 
     // Holder should be released
-    let holders_after_release = count_with_prefix(shard.db(), "holders/").await;
+    let holders_after_release = count_concurrency_holders(shard.db()).await;
     assert_eq!(holders_after_release, 0, "holder released");
 
     // RequestTicket task should still be there (future)
-    let tasks_still_future = count_with_prefix(shard.db(), "tasks/").await;
+    let tasks_still_future = count_task_keys(shard.db()).await;
     assert_eq!(tasks_still_future, 1, "RequestTicket task still present");
 
     // Simulate time passing: wait for future time + broker scan delay
@@ -1377,7 +1375,7 @@ async fn cannot_delete_job_with_future_request_ticket() {
         .expect("enqueue2");
 
     // Verify RequestTicket task exists and job status is Scheduled
-    let tasks_before = count_with_prefix(shard.db(), "tasks/").await;
+    let tasks_before = count_task_keys(shard.db()).await;
     assert_eq!(tasks_before, 1, "should have 1 RequestTicket task");
 
     let status = shard
@@ -1460,7 +1458,7 @@ async fn cannot_delete_job_with_pending_request() {
         .expect("enqueue2");
 
     // Request should exist
-    let requests = count_with_prefix(shard.db(), "requests/").await;
+    let requests = count_concurrency_requests(shard.db()).await;
     assert_eq!(requests, 1, "should have 1 queued request");
 
     // Attempt to delete job 2 while it's scheduled (has pending request) - should fail

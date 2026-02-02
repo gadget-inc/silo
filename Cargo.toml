@@ -77,6 +77,8 @@ hostname = "0.4"
 pprof = { version = "0.15", features = ["prost-codec", "frame-pointer"] }
 flate2 = "1"
 urlencoding = "2"
+storekey = { version = "0.11", features = ["storekey-derive"] }
+hex = "0.4"
 
 [features]
 default = ["k8s"]

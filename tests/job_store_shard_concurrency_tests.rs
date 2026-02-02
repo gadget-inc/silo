@@ -215,8 +215,8 @@ async fn concurrency_queues_jobs_from_multiple_task_groups() {
     assert_eq!(processed, 3, "all 3 jobs should be processed");
 
     // No holders should remain
-    assert_eq!(count_with_prefix(shard.db(), "holders/").await, 0);
-    assert_eq!(count_with_prefix(shard.db(), "requests/").await, 0);
+    assert_eq!(count_concurrency_holders(shard.db()).await, 0);
+    assert_eq!(count_concurrency_requests(shard.db()).await, 0);
 }
 
 /// Tests that concurrency limits with higher max_concurrency work across task groups.
@@ -320,7 +320,7 @@ async fn concurrency_allows_multiple_slots_across_task_groups() {
     );
 
     // Should have exactly 2 holders
-    let holders = count_with_prefix(shard.db(), "holders/").await;
+    let holders = count_concurrency_holders(shard.db()).await;
     assert_eq!(holders, 2, "should have exactly 2 holders");
 }
 
@@ -419,8 +419,8 @@ async fn concurrent_dequeue_many_workers_no_duplicates() {
 
         assert_eq!(processed.load(Ordering::Relaxed), total_jobs);
         // No remaining tasks or leases
-        assert_eq!(count_with_prefix(shard.db(), "tasks/").await, 0);
-        assert_eq!(count_with_prefix(shard.db(), "lease/").await, 0);
+        assert_eq!(count_task_keys(shard.db()).await, 0);
+        assert_eq!(count_lease_keys(shard.db()).await, 0);
     });
 }
 
@@ -555,7 +555,7 @@ async fn concurrency_immediate_grant_enqueues_task_and_writes_holder() {
     // Holder should exist for this attempt's task id (holder is per-attempt)
     let holder = shard
         .db()
-        .get(concurrency_holder_key("-", &queue, t.attempt().task_id()).as_bytes())
+        .get(&concurrency_holder_key("-", &queue, t.attempt().task_id()))
         .await
         .expect("get holder");
     assert!(
@@ -611,7 +611,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
         .await
         .expect("enqueue2");
     // No runnable RunAttempt should be visible yet (RequestTicket entries are expected)
-    let maybe = first_kv_with_prefix(shard.db(), "tasks/").await;
+    let maybe = first_task_kv(shard.db()).await;
     if let Some((_k, v)) = maybe {
         let task = decode_task(&v).expect("decode task");
         match task {
@@ -631,7 +631,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
         .expect("report1");
 
     // Now there should be a new task for the queued request
-    let some = first_kv_with_prefix(shard.db(), "tasks/").await;
+    let some = first_task_kv(shard.db()).await;
     assert!(some.is_some(), "task should be enqueued for next requester");
 }
 
@@ -695,7 +695,7 @@ async fn concurrency_held_queues_propagate_across_retries_and_release_on_finish(
         .expect("report2");
 
     // No holders should remain after success of follow-up attempt (released after each attempt)
-    assert_eq!(count_with_prefix(shard.db(), "holders/").await, 0);
+    assert_eq!(count_concurrency_holders(shard.db()).await, 0);
 }
 
 #[silo::test]
@@ -757,7 +757,7 @@ async fn concurrency_retry_releases_original_holder() {
 
     // BUG (current impl): holder created for attempt 1 task id remains. We assert no holders remain.
     assert_eq!(
-        count_with_prefix(shard.db(), "holders/").await,
+        count_concurrency_holders(shard.db()).await,
         0,
         "holders should be fully released after retries complete"
     );
@@ -841,7 +841,7 @@ async fn concurrency_no_overgrant_after_release() {
         .expect("enqueue c");
 
     // Count durable holders should never exceed 1
-    let holders = count_with_prefix(shard.db(), "holders/").await;
+    let holders = count_concurrency_holders(shard.db()).await;
     assert!(
         holders <= 1,
         "must not over-grant: holders={}, expected <= 1",
@@ -903,8 +903,8 @@ async fn stress_single_queue_no_double_grant() {
 
     assert_eq!(processed, total);
     // No remaining durable state for holders/requests
-    assert_eq!(count_with_prefix(shard.db(), "holders/").await, 0);
-    assert_eq!(count_with_prefix(shard.db(), "requests/").await, 0);
+    assert_eq!(count_concurrency_holders(shard.db()).await, 0);
+    assert_eq!(count_concurrency_requests(shard.db()).await, 0);
 }
 
 #[silo::test]
@@ -961,7 +961,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
             .expect("enqueue add");
     }
     // There should be no runnable RunAttempt until we release (RequestTicket may exist)
-    if let Some((_k, v)) = first_kv_with_prefix(shard.db(), "tasks/").await {
+    if let Some((_k, v)) = first_task_kv(shard.db()).await {
         let task = decode_task(&v).expect("decode task");
         match task {
             Task::RunAttempt { .. } => panic!("unexpected RunAttempt before release"),
@@ -976,7 +976,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
         .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report1");
-    let after = first_kv_with_prefix(shard.db(), "tasks/").await;
+    let after = first_task_kv(shard.db()).await;
     assert!(after.is_some(), "one task should be enqueued after release");
 }
 
@@ -1034,7 +1034,7 @@ async fn retry_with_concurrency_must_reacquire_slot_not_claim_released_slot() {
     // Verify Job A has the holder
     let holder_a = shard
         .db()
-        .get(concurrency_holder_key("-", &queue, &task_a_id).as_bytes())
+        .get(&concurrency_holder_key("-", &queue, &task_a_id))
         .await
         .expect("get holder A");
     assert!(holder_a.is_some(), "Job A should have the holder");
@@ -1114,7 +1114,7 @@ async fn retry_with_concurrency_must_reacquire_slot_not_claim_released_slot() {
     );
 
     // Verify only one holder exists
-    let holder_count = count_with_prefix(shard.db(), "holders/").await;
+    let holder_count = count_concurrency_holders(shard.db()).await;
     assert_eq!(holder_count, 1, "Should have exactly 1 holder (for Job B)");
 
     // Complete Job B
@@ -1263,7 +1263,7 @@ async fn retry_must_wait_for_slot_when_another_job_was_granted() {
 
     // Verify at most 1 holder
     assert!(
-        count_with_prefix(shard.db(), "holders/").await <= 1,
+        count_concurrency_holders(shard.db()).await <= 1,
         "At most 1 holder should exist"
     );
 }

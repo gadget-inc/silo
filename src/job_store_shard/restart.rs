@@ -95,7 +95,7 @@ impl JobStoreShard {
 
         // [SILO-RESTART-1] Pre: job must exist
         let status_key = job_status_key(tenant, id);
-        let maybe_status_raw = txn.get(status_key.as_bytes()).await?;
+        let maybe_status_raw = txn.get(&status_key).await?;
         let Some(status_raw) = maybe_status_raw else {
             return Err(JobStoreShardError::JobNotFound(id.to_string()));
         };
@@ -104,7 +104,7 @@ impl JobStoreShard {
 
         // Check if job has a cancellation record
         let cancelled_key = job_cancelled_key(tenant, id);
-        let has_cancellation = txn.get(cancelled_key.as_bytes()).await?.is_some();
+        let has_cancellation = txn.get(&cancelled_key).await?.is_some();
 
         // [SILO-RESTART-1][SILO-RESTART-2] Pre: job must be in a restartable state
         // Only Cancelled or Failed jobs can be restarted
@@ -140,12 +140,12 @@ impl JobStoreShard {
 
         // [SILO-RESTART-4] Post: Clear cancellation record if present
         if has_cancellation {
-            txn.delete(cancelled_key.as_bytes())?;
+            txn.delete(&cancelled_key)?;
         }
 
         // Get the job info first to know the priority and compute start_at_ms
         let job_info_key = crate::keys::job_info_key(tenant, id);
-        let maybe_job_raw = txn.get(job_info_key.as_bytes()).await?;
+        let maybe_job_raw = txn.get(&job_info_key).await?;
         let Some(job_raw) = maybe_job_raw else {
             return Err(JobStoreShardError::JobNotFound(id.to_string()));
         };
@@ -156,12 +156,12 @@ impl JobStoreShard {
 
         // Delete old status index entry
         let old_time = idx_status_time_key(tenant, status.kind.as_str(), status.changed_at_ms, id);
-        txn.delete(old_time.as_bytes())?;
+        txn.delete(&old_time)?;
 
         // [SILO-RESTART-6] Post: Set status to Scheduled with next attempt time
         let new_status = JobStatus::scheduled(now_ms, start_at_ms);
         let status_value = encode_job_status(&new_status)?;
-        txn.put(status_key.as_bytes(), &status_value)?;
+        txn.put(&status_key, &status_value)?;
 
         // Insert new status index entry
         let new_time = idx_status_time_key(
@@ -170,28 +170,28 @@ impl JobStoreShard {
             new_status.changed_at_ms,
             id,
         );
-        txn.put(new_time.as_bytes(), [])?;
+        txn.put(&new_time, [])?;
 
         // Decrement completed jobs counter - job is going from terminal to scheduled
         self.decrement_completed_jobs_counter_txn(&txn)?;
 
         // Find the maximum attempt number from existing attempts
         // We scan the attempts prefix to find the highest attempt number
-        let prefix = attempt_prefix(tenant, id);
-        let start = prefix.as_bytes().to_vec();
-        let mut end = start.clone();
-        end.push(0xFF);
+        let start = attempt_prefix(tenant, id);
+        let end = crate::keys::end_bound(&start);
 
         let mut max_attempt_number: u32 = 0;
-        let mut iter = txn.scan::<Vec<u8>, _>(start..=end).await?;
+        let mut iter = txn.scan::<Vec<u8>, _>(start..end).await?;
         while let Some(kv) = iter.next().await? {
-            // Key format: attempts/<tenant>/<job-id>/<attempt-number>
-            // Extract the attempt number from the key
-            let key_str = String::from_utf8_lossy(&kv.key);
-            if let Some(attempt_str) = key_str.rsplit('/').next()
-                && let Ok(attempt_num) = attempt_str.parse::<u32>()
-            {
-                max_attempt_number = max_attempt_number.max(attempt_num);
+            // Attempt keys use storekey encoding: prefix + (tenant, job_id, attempt)
+            // The attempt number is the last field encoded as u32 big-endian
+            // For simplicity, decode the full key and extract attempt number
+            if kv.key.first() == Some(&0x07) {
+                // 0x07 is the ATTEMPT prefix
+                let decoded: Result<(String, String, u32), _> = storekey::decode(&kv.key[1..]);
+                if let Ok((_, _, attempt_num)) = decoded {
+                    max_attempt_number = max_attempt_number.max(attempt_num);
+                }
             }
         }
 
@@ -214,7 +214,7 @@ impl JobStoreShard {
         let task_value = crate::codec::encode_task(&new_task)?;
         let task_key =
             crate::keys::task_key(&task_group, start_at_ms, priority, id, next_attempt_number);
-        txn.put(task_key.as_bytes(), &task_value)?;
+        txn.put(&task_key, &task_value)?;
 
         // Commit the transaction
         txn.commit().await?;

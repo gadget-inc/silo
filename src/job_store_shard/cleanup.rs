@@ -7,33 +7,22 @@
 //! - Track cleanup progress and status for crash recovery
 
 use crate::coordination::SplitCleanupStatus;
-use crate::keys::{decode_tenant, tasks_prefix};
+use crate::keys::{
+    self, end_bound, parse_attempt_key, parse_concurrency_holder_key,
+    parse_concurrency_request_key, parse_floating_limit_key, parse_job_cancelled_key,
+    parse_job_info_key, parse_job_status_key, parse_metadata_index_key,
+    parse_status_time_index_key, tasks_prefix,
+};
 use crate::shard_range::ShardRange;
 use slatedb::WriteBatch;
 use tracing::{debug, info};
 
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 
-/// Key prefixes that contain tenant_id in their path structure.
-/// Format: {prefix}/{tenant}/...
-const TENANT_PREFIXED_KEYS: &[&str] = &[
-    "jobs/",
-    "job_status/",
-    "job_cancelled/",
-    "attempts/",
-    "requests/",
-    "holders/",
-    "floating_limits/",
-    "idx/status_ts/",
-    "idx/meta/",
-];
-
-use crate::keys;
-
 /// Progress tracking for cleanup operation.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct CleanupProgress {
-    /// Last key processed (for resumption after crash)
+    /// Last key processed (for resumption after crash) - stored as hex for binary keys
     pub last_key: Option<String>,
     /// Number of keys deleted so far
     pub keys_deleted: u64,
@@ -54,10 +43,28 @@ pub struct CleanupResult {
     pub complete: bool,
 }
 
+/// Namespace prefixes for different key types.
+/// These match the prefix bytes defined in keys.rs.
+mod prefix {
+    pub const JOB_INFO: u8 = 0x01;
+    pub const JOB_STATUS: u8 = 0x02;
+    pub const IDX_STATUS_TIME: u8 = 0x03;
+    pub const IDX_METADATA: u8 = 0x04;
+    // Note: TASK (0x05) cleanup is handled separately via tasks_prefix()
+    pub const LEASE: u8 = 0x06;
+    pub const ATTEMPT: u8 = 0x07;
+    pub const CONCURRENCY_REQUEST: u8 = 0x08;
+    pub const CONCURRENCY_HOLDER: u8 = 0x09;
+    pub const JOB_CANCELLED: u8 = 0x0A;
+    pub const FLOATING_LIMIT: u8 = 0x0B;
+}
+
 impl JobStoreShard {
     /// Delete keys outside this shard's tenant range.
     ///
-    /// After a split, child shards contain data from the parent shard that may not belong to them based on their tenant range. This method scans all keys and deletes those with tenant_ids outside the shard's range.
+    /// After a split, child shards contain data from the parent shard that may not belong to them
+    /// based on their tenant range. This method scans all keys and deletes those with tenant_ids
+    /// outside the shard's range.
     pub async fn after_split_cleanup_defunct_data(
         &self,
         range: &ShardRange,
@@ -91,11 +98,92 @@ impl JobStoreShard {
         );
 
         // Process each tenant-prefixed key family
-        for prefix in TENANT_PREFIXED_KEYS {
-            progress = self
-                .after_split_cleanup_prefix(prefix, range, batch_size, progress)
-                .await?;
-        }
+        // Job info keys (0x01)
+        progress = self
+            .cleanup_keys_by_tenant_prefix(prefix::JOB_INFO, range, batch_size, progress, |key| {
+                parse_job_info_key(key).map(|p| p.tenant)
+            })
+            .await?;
+
+        // Job status keys (0x02)
+        progress = self
+            .cleanup_keys_by_tenant_prefix(prefix::JOB_STATUS, range, batch_size, progress, |key| {
+                parse_job_status_key(key).map(|p| p.tenant)
+            })
+            .await?;
+
+        // Status/time index keys (0x03)
+        progress = self
+            .cleanup_keys_by_tenant_prefix(
+                prefix::IDX_STATUS_TIME,
+                range,
+                batch_size,
+                progress,
+                |key| parse_status_time_index_key(key).map(|p| p.tenant),
+            )
+            .await?;
+
+        // Metadata index keys (0x04)
+        progress = self
+            .cleanup_keys_by_tenant_prefix(
+                prefix::IDX_METADATA,
+                range,
+                batch_size,
+                progress,
+                |key| parse_metadata_index_key(key).map(|p| p.tenant),
+            )
+            .await?;
+
+        // Attempt keys (0x07)
+        progress = self
+            .cleanup_keys_by_tenant_prefix(prefix::ATTEMPT, range, batch_size, progress, |key| {
+                parse_attempt_key(key).map(|p| p.tenant)
+            })
+            .await?;
+
+        // Concurrency request keys (0x08)
+        progress = self
+            .cleanup_keys_by_tenant_prefix(
+                prefix::CONCURRENCY_REQUEST,
+                range,
+                batch_size,
+                progress,
+                |key| parse_concurrency_request_key(key).map(|p| p.tenant),
+            )
+            .await?;
+
+        // Concurrency holder keys (0x09)
+        progress = self
+            .cleanup_keys_by_tenant_prefix(
+                prefix::CONCURRENCY_HOLDER,
+                range,
+                batch_size,
+                progress,
+                |key| parse_concurrency_holder_key(key).map(|p| p.tenant),
+            )
+            .await?;
+
+        // Job cancelled keys (0x0A)
+        progress = self
+            .cleanup_keys_by_tenant_prefix(
+                prefix::JOB_CANCELLED,
+                range,
+                batch_size,
+                progress,
+                |key| parse_job_cancelled_key(key).map(|p| p.tenant),
+            )
+            .await?;
+
+        // Floating limit keys (0x0B)
+        progress = self
+            .cleanup_keys_by_tenant_prefix(
+                prefix::FLOATING_LIMIT,
+                range,
+                batch_size,
+                progress,
+                |key| parse_floating_limit_key(key).map(|p| p.tenant),
+            )
+            .await?;
 
         // Process task keys specially (they don't have tenant in the key, but reference jobs)
         progress = self
@@ -130,50 +218,40 @@ impl JobStoreShard {
         })
     }
 
-    /// Cleanup keys with a specific prefix that contains tenant_id.
-    async fn after_split_cleanup_prefix(
+    /// Cleanup keys with a specific prefix byte that contains tenant_id.
+    async fn cleanup_keys_by_tenant_prefix<F>(
         &self,
-        prefix: &str,
+        prefix_byte: u8,
         range: &ShardRange,
         batch_size: usize,
         mut progress: CleanupProgress,
-    ) -> Result<CleanupProgress, JobStoreShardError> {
-        // Start from the beginning of this prefix
-        // Note: We process each prefix fully even on resume. This is simpler than
-        // trying to track progress across multiple prefixes. Deletes are idempotent.
-        let start = prefix.as_bytes().to_vec();
-        let mut end = prefix.as_bytes().to_vec();
-        end.push(0xFF);
+        extract_tenant: F,
+    ) -> Result<CleanupProgress, JobStoreShardError>
+    where
+        F: Fn(&[u8]) -> Option<String>,
+    {
+        let start = vec![prefix_byte];
+        let end = end_bound(&start);
 
         let mut batch = WriteBatch::new();
         let mut batch_count = 0;
 
-        let mut iter = self.db.scan::<Vec<u8>, _>(start..=end).await?;
+        let mut iter = self.db.scan::<Vec<u8>, _>(start..end).await?;
 
         while let Some(kv) = iter.next().await? {
-            let key_str = match std::str::from_utf8(&kv.key) {
-                Ok(s) => s,
-                Err(_) => {
-                    // Skip non-UTF8 keys
-                    continue;
-                }
-            };
-
             progress.keys_scanned += 1;
 
-            // Extract tenant from key path
-            if let Some(tenant) = extract_tenant_from_key(key_str, prefix) {
-                let decoded_tenant = decode_tenant(&tenant);
-
+            // Extract tenant from key
+            if let Some(tenant) = extract_tenant(&kv.key) {
                 // Check if tenant is outside the shard's range
-                if !range.contains(&decoded_tenant) {
+                if !range.contains(&tenant) {
                     batch.delete(&kv.key);
                     batch_count += 1;
                     progress.keys_deleted += 1;
                 }
             }
 
-            progress.last_key = Some(key_str.to_string());
+            progress.last_key = Some(hex::encode(&kv.key));
 
             // Write batch and checkpoint progress
             if batch_count >= batch_size {
@@ -184,7 +262,7 @@ impl JobStoreShard {
 
                 debug!(
                     shard = %self.name,
-                    prefix,
+                    prefix_byte,
                     keys_scanned = progress.keys_scanned,
                     keys_deleted = progress.keys_deleted,
                     "cleanup progress checkpoint"
@@ -203,7 +281,7 @@ impl JobStoreShard {
 
     /// Cleanup task keys by checking if referenced job's tenant is in range.
     ///
-    /// Task keys have format: tasks/{task_group}/{time}/{priority}/{job_id}/{attempt}
+    /// Task keys encode task_group, timestamp, etc. but not tenant directly.
     /// The task value contains the tenant_id.
     async fn after_split_cleanup_task_keys(
         &self,
@@ -211,38 +289,30 @@ impl JobStoreShard {
         batch_size: usize,
         mut progress: CleanupProgress,
     ) -> Result<CleanupProgress, JobStoreShardError> {
-        let prefix = tasks_prefix();
-        let start = prefix.as_bytes().to_vec();
-        let mut end = prefix.as_bytes().to_vec();
-        end.push(0xFF);
+        let start = tasks_prefix();
+        let end = end_bound(&start);
 
         let mut batch = WriteBatch::new();
         let mut batch_count = 0;
 
-        let mut iter = self.db.scan::<Vec<u8>, _>(start..=end).await?;
+        let mut iter = self.db.scan::<Vec<u8>, _>(start..end).await?;
 
         while let Some(kv) = iter.next().await? {
-            let key_str = match std::str::from_utf8(&kv.key) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-
             progress.keys_scanned += 1;
 
             // Task stores tenant_id in the task value itself
             // Decode the task and check tenant
             if let Ok(task) = crate::codec::decode_task(&kv.value) {
                 let tenant = task.tenant();
-                let decoded_tenant = decode_tenant(tenant);
 
-                if !range.contains(&decoded_tenant) {
+                if !range.contains(tenant) {
                     batch.delete(&kv.key);
                     batch_count += 1;
                     progress.keys_deleted += 1;
                 }
             }
 
-            progress.last_key = Some(key_str.to_string());
+            progress.last_key = Some(hex::encode(&kv.key));
 
             if batch_count >= batch_size {
                 self.db.write(batch).await?;
@@ -262,36 +332,27 @@ impl JobStoreShard {
 
     /// Cleanup lease keys by checking if referenced task's tenant is in range.
     ///
-    /// Lease keys have format: lease/{task_id}
-    /// The lease value contains the tenant_id.
+    /// Lease keys encode task_id. The lease value contains the tenant_id.
     async fn after_split_cleanup_lease_keys(
         &self,
         range: &ShardRange,
         batch_size: usize,
         mut progress: CleanupProgress,
     ) -> Result<CleanupProgress, JobStoreShardError> {
-        let prefix = "lease/";
-        let start = prefix.as_bytes().to_vec();
-        let mut end = prefix.as_bytes().to_vec();
-        end.push(0xFF);
+        let start = vec![prefix::LEASE];
+        let end = end_bound(&start);
 
         let mut batch = WriteBatch::new();
         let mut batch_count = 0;
 
-        let mut iter = self.db.scan::<Vec<u8>, _>(start..=end).await?;
+        let mut iter = self.db.scan::<Vec<u8>, _>(start..end).await?;
 
         while let Some(kv) = iter.next().await? {
-            let key_str = match std::str::from_utf8(&kv.key) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-
             progress.keys_scanned += 1;
 
             // Decode the lease value to get tenant_id from the embedded task
             if let Ok(lease) = crate::codec::decode_lease(&kv.value) {
                 // The lease contains a Task which has the tenant_id
-                // We need to extract tenant from the archived task
                 let archived = lease.archived();
                 let tenant = match &archived.task {
                     rkyv::Archived::<crate::task::Task>::RunAttempt { tenant, .. } => {
@@ -307,16 +368,15 @@ impl JobStoreShard {
                         tenant, ..
                     } => tenant.as_str(),
                 };
-                let decoded_tenant = decode_tenant(tenant);
 
-                if !range.contains(&decoded_tenant) {
+                if !range.contains(tenant) {
                     batch.delete(&kv.key);
                     batch_count += 1;
                     progress.keys_deleted += 1;
                 }
             }
 
-            progress.last_key = Some(key_str.to_string());
+            progress.last_key = Some(hex::encode(&kv.key));
 
             if batch_count >= batch_size {
                 self.db.write(batch).await?;
@@ -336,7 +396,7 @@ impl JobStoreShard {
 
     /// Load cleanup progress from the database.
     async fn load_split_cleanup_progress(&self) -> Result<CleanupProgress, JobStoreShardError> {
-        match self.db.get(keys::cleanup_progress_key().as_bytes()).await? {
+        match self.db.get(&keys::cleanup_progress_key()).await? {
             Some(data) => {
                 let progress: CleanupProgress = serde_json::from_slice(&data)?;
                 Ok(progress)
@@ -351,17 +411,15 @@ impl JobStoreShard {
         progress: &CleanupProgress,
     ) -> Result<(), JobStoreShardError> {
         let data = serde_json::to_vec(progress)?;
-        self.db
-            .put(keys::cleanup_progress_key().as_bytes(), &data)
-            .await?;
+        self.db.put(&keys::cleanup_progress_key(), &data).await?;
         Ok(())
     }
 
     /// Clear cleanup progress markers (called after compaction completes).
     pub async fn clear_cleanup_progress(&self) -> Result<(), JobStoreShardError> {
         let mut batch = WriteBatch::new();
-        batch.delete(keys::cleanup_progress_key().as_bytes());
-        batch.delete(keys::cleanup_complete_key().as_bytes());
+        batch.delete(keys::cleanup_progress_key());
+        batch.delete(keys::cleanup_complete_key());
         self.db.write(batch).await?;
         Ok(())
     }
@@ -421,7 +479,7 @@ impl JobStoreShard {
     /// Returns `CompactionDone` if no status has been set (e.g., for shards that
     /// were not created by a split).
     pub async fn get_cleanup_status(&self) -> Result<SplitCleanupStatus, JobStoreShardError> {
-        match self.db.get(keys::cleanup_status_key().as_bytes()).await? {
+        match self.db.get(&keys::cleanup_status_key()).await? {
             Some(data) => {
                 let status: SplitCleanupStatus = serde_json::from_slice(&data)?;
                 Ok(status)
@@ -452,16 +510,14 @@ impl JobStoreShard {
         }
 
         let data = serde_json::to_vec(&status)?;
-        self.db
-            .put(keys::cleanup_status_key().as_bytes(), &data)
-            .await?;
+        self.db.put(&keys::cleanup_status_key(), &data).await?;
         Ok(())
     }
 
     /// Get the timestamp (ms) when this shard was first created/initialized.
     /// Returns None if not set (e.g., older shards without this metadata).
     pub async fn get_created_at_ms(&self) -> Result<Option<i64>, JobStoreShardError> {
-        match self.db.get(keys::shard_created_at_key().as_bytes()).await? {
+        match self.db.get(&keys::shard_created_at_key()).await? {
             Some(data) => {
                 let ts: i64 = serde_json::from_slice(&data)?;
                 Ok(Some(ts))
@@ -474,12 +530,7 @@ impl JobStoreShard {
     /// This should be called when the shard is first opened/created.
     pub async fn set_created_at_ms_if_unset(&self) -> Result<(), JobStoreShardError> {
         // Check if already set
-        if self
-            .db
-            .get(keys::shard_created_at_key().as_bytes())
-            .await?
-            .is_some()
-        {
+        if self.db.get(&keys::shard_created_at_key()).await?.is_some() {
             return Ok(());
         }
 
@@ -489,20 +540,14 @@ impl JobStoreShard {
             .as_millis() as i64;
 
         let data = serde_json::to_vec(&now_ms)?;
-        self.db
-            .put(keys::shard_created_at_key().as_bytes(), &data)
-            .await?;
+        self.db.put(&keys::shard_created_at_key(), &data).await?;
         Ok(())
     }
 
     /// Get the timestamp (ms) when cleanup completed for this shard.
     /// Returns None if cleanup hasn't completed or this isn't a split child.
     pub async fn get_cleanup_completed_at_ms(&self) -> Result<Option<i64>, JobStoreShardError> {
-        match self
-            .db
-            .get(keys::cleanup_completed_at_key().as_bytes())
-            .await?
-        {
+        match self.db.get(&keys::cleanup_completed_at_key()).await? {
             Some(data) => {
                 let ts: i64 = serde_json::from_slice(&data)?;
                 Ok(Some(ts))
@@ -521,30 +566,8 @@ impl JobStoreShard {
 
         let data = serde_json::to_vec(&now_ms)?;
         self.db
-            .put(keys::cleanup_completed_at_key().as_bytes(), &data)
+            .put(&keys::cleanup_completed_at_key(), &data)
             .await?;
         Ok(())
     }
-}
-
-/// Extract tenant_id from a key with the given prefix.
-///
-/// For keys like "jobs/{tenant}/{id}", this extracts {tenant}.
-/// For keys like "idx/status_ts/{tenant}/...", this extracts {tenant}.
-pub fn extract_tenant_from_key(key: &str, prefix: &str) -> Option<String> {
-    let remainder = key.strip_prefix(prefix)?;
-
-    // For idx/ prefixes, there's an extra level before tenant
-    // idx/status_ts/{tenant}/...
-    // idx/meta/{tenant}/...
-    let tenant_part = if prefix.starts_with("idx/") {
-        // Skip the idx type (status_ts or meta) which is already in the prefix
-        remainder
-    } else {
-        remainder
-    };
-
-    // Tenant is the first path segment
-    let end = tenant_part.find('/')?;
-    Some(tenant_part[..end].to_string())
 }

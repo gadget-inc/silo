@@ -32,12 +32,7 @@ impl JobStoreShard {
     ) -> Result<String, JobStoreShardError> {
         let job_id = id.unwrap_or_else(|| Uuid::new_v4().to_string());
         // [SILO-ENQ-1] If caller provided an id, ensure it doesn't already exist
-        if self
-            .db
-            .get(job_info_key(tenant, &job_id).as_bytes())
-            .await?
-            .is_some()
-        {
+        if self.db.get(&job_info_key(tenant, &job_id)).await?.is_some() {
             return Err(JobStoreShardError::JobAlreadyExists(job_id));
         }
 
@@ -67,11 +62,11 @@ impl JobStoreShard {
 
         // Atomically write job info, job status, and handle first limit
         let mut batch = WriteBatch::new();
-        batch.put(job_info_key(tenant, &job_id).as_bytes(), &job_value);
+        batch.put(job_info_key(tenant, &job_id), &job_value);
         // Maintain metadata secondary index (metadata is immutable post-enqueue)
         for (mk, mv) in &job.metadata {
             let mkey = idx_metadata_key(tenant, mk, mv, &job_id);
-            batch.put(mkey.as_bytes(), []);
+            batch.put(&mkey, []);
         }
         self.set_job_status_with_index(&mut batch, tenant, &job_id, job_status)
             .await?;
@@ -324,18 +319,18 @@ impl JobStoreShard {
             let old_kind = old.kind;
             let old_changed = old.changed_at_ms;
             let old_time = idx_status_time_key(tenant, old_kind.as_str(), old_changed, job_id);
-            batch.delete(old_time.as_bytes());
+            batch.delete(&old_time);
         }
 
         // Write new status value
         let job_status_value = encode_job_status(&new_status)?;
-        batch.put(job_status_key(tenant, job_id).as_bytes(), &job_status_value);
+        batch.put(job_status_key(tenant, job_id), &job_status_value);
 
         // Insert new index entries
         let new_kind = new_status.kind;
         let changed = new_status.changed_at_ms;
         let timek = idx_status_time_key(tenant, new_kind.as_str(), changed, job_id);
-        batch.put(timek.as_bytes(), []);
+        batch.put(&timek, []);
         Ok(())
     }
 }

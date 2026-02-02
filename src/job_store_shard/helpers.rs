@@ -34,7 +34,7 @@ pub(crate) fn put_task(
 ) -> Result<(), JobStoreShardError> {
     let task_value = encode_task(task)?;
     batch.put(
-        task_key(task_group, time_ms, priority, job_id, attempt).as_bytes(),
+        task_key(task_group, time_ms, priority, job_id, attempt),
         &task_value,
     );
     Ok(())

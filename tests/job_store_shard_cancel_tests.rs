@@ -80,7 +80,7 @@ async fn cancel_scheduled_job_sets_cancelled_and_removes_task() {
 
         // Task is still in DB queue (lazy cleanup), but will be cleaned up on dequeue
         // The broker buffer might have it, so dequeue will skip and delete it
-        let task_still_in_db = first_kv_with_prefix(shard.db(), "tasks/").await;
+        let task_still_in_db = first_task_kv(shard.db()).await;
         assert!(
             task_still_in_db.is_some(),
             "task should still be in DB (lazy cleanup)"
@@ -98,7 +98,7 @@ async fn cancel_scheduled_job_sets_cancelled_and_removes_task() {
         );
 
         // Now task should be removed from queue
-        let none_left = first_kv_with_prefix(shard.db(), "tasks/").await;
+        let none_left = first_task_kv(shard.db()).await;
         assert!(
             none_left.is_none(),
             "task should be removed from queue after dequeue"
@@ -298,7 +298,7 @@ async fn worker_reports_cancelled_outcome() {
         }
 
         // Verify lease is removed
-        let lease = first_kv_with_prefix(shard.db(), "lease/").await;
+        let lease = first_lease_kv(shard.db()).await;
         assert!(lease.is_none(), "lease should be removed");
     });
 }
@@ -328,9 +328,7 @@ async fn reap_expired_lease_cancelled_job_sets_cancelled_status() {
         shard.cancel_job("-", &job_id).await.expect("cancel_job");
 
         // Find the lease and rewrite expiry to the past (simulate worker crash)
-        let (lease_key, lease_value) = first_kv_with_prefix(shard.db(), "lease/")
-            .await
-            .expect("lease present");
+        let (lease_key, lease_value) = first_lease_kv(shard.db()).await.expect("lease present");
         type ArchivedTask = <Task as Archive>::Archived;
         let decoded = decode_lease(&lease_value).expect("decode lease");
         let archived = decoded.archived();
@@ -367,7 +365,7 @@ async fn reap_expired_lease_cancelled_job_sets_cancelled_status() {
         let new_val = encode_lease(&new_record).unwrap();
         shard
             .db()
-            .put(lease_key.as_bytes(), &new_val)
+            .put(&lease_key, &new_val)
             .await
             .expect("put mutated lease");
         shard.db().flush().await.expect("flush mutated lease");
@@ -866,13 +864,14 @@ async fn dequeue_skips_cancelled_run_attempt_tasks() {
 
         // j1's task should have been cleaned up from the DB
         // Check that no task keys contain j1's id
-        let task_for_j1 = first_kv_with_prefix(shard.db(), "tasks/").await;
+        let task_for_j1 = first_task_kv(shard.db()).await;
         // If there's a task, it shouldn't be for j1 (j2 was already dequeued so should be leased)
-        if let Some((key_str, _value)) = task_for_j1 {
+        if let Some((task_key, _value)) = task_for_j1 {
+            let parsed = silo::keys::parse_task_key(&task_key).expect("parse task key");
             assert!(
-                !key_str.contains(&j1),
-                "j1's task should be cleaned up, found: {}",
-                key_str
+                parsed.job_id != j1,
+                "j1's task should be cleaned up, found task for job: {}",
+                parsed.job_id
             );
         }
     });
@@ -1204,14 +1203,14 @@ async fn cancelled_requests_are_cleaned_up_on_grant() {
             .expect("enqueue j2");
 
         // Verify request exists
-        let requests_before = first_kv_with_prefix(shard.db(), "requests/").await;
+        let requests_before = first_concurrency_request_kv(shard.db()).await;
         assert!(requests_before.is_some(), "request should exist");
 
         // Cancel j2
         shard.cancel_job("-", &j2).await.expect("cancel j2");
 
         // Request still exists (lazy cleanup)
-        let requests_after_cancel = first_kv_with_prefix(shard.db(), "requests/").await;
+        let requests_after_cancel = first_concurrency_request_kv(shard.db()).await;
         assert!(
             requests_after_cancel.is_some(),
             "request should still exist before release"
@@ -1225,7 +1224,7 @@ async fn cancelled_requests_are_cleaned_up_on_grant() {
             .expect("report j1 success");
 
         // Now request should be cleaned up
-        let requests_after_release = first_kv_with_prefix(shard.db(), "requests/").await;
+        let requests_after_release = first_concurrency_request_kv(shard.db()).await;
         assert!(
             requests_after_release.is_none(),
             "cancelled request should be cleaned up after release"

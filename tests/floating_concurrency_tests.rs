@@ -141,10 +141,10 @@ async fn floating_limit_state_shared_across_task_groups() {
         .expect("enqueue alpha");
 
     // Check floating limit state was created
-    let state_key = format!("floating_limits/-/{}", queue);
+    let state_key = silo::keys::floating_limit_state_key("-", &queue);
     let state_raw = shard
         .db()
-        .get(state_key.as_bytes())
+        .get(&state_key)
         .await
         .expect("db get")
         .expect("state should exist");
@@ -178,7 +178,7 @@ async fn floating_limit_state_shared_across_task_groups() {
     // State should still have the same max_concurrency
     let state_raw = shard
         .db()
-        .get(state_key.as_bytes())
+        .get(&state_key)
         .await
         .expect("db get")
         .expect("state should exist");
@@ -277,10 +277,10 @@ async fn floating_limit_refresh_applies_to_all_task_groups() {
         .expect("report refresh success");
 
     // Verify the state was updated
-    let state_key = format!("floating_limits/-/{}", queue);
+    let state_key = silo::keys::floating_limit_state_key("-", &queue);
     let state_raw = shard
         .db()
-        .get(state_key.as_bytes())
+        .get(&state_key)
         .await
         .expect("db get")
         .expect("state should exist");
@@ -394,7 +394,7 @@ async fn floating_limit_queues_jobs_from_multiple_task_groups() {
     assert!(processed_jobs.contains(&j3));
 
     // No holders should remain
-    assert_eq!(count_with_prefix(shard.db(), "holders/").await, 0);
+    assert_eq!(count_concurrency_holders(shard.db()).await, 0);
 }
 
 #[silo::test]
@@ -429,10 +429,10 @@ async fn floating_concurrency_limit_creates_state_on_enqueue() {
         .expect("enqueue with floating limit");
 
     // Check that the floating limit state was created
-    let state_key = format!("floating_limits/-/{}", queue);
+    let state_key = silo::keys::floating_limit_state_key("-", &queue);
     let state_raw = shard
         .db()
-        .get(state_key.as_bytes())
+        .get(&state_key)
         .await
         .expect("db get")
         .expect("state should exist");
@@ -676,10 +676,10 @@ async fn floating_limit_refresh_success_updates_state() {
         .expect("report refresh success");
 
     // Check that the state was updated
-    let state_key = format!("floating_limits/-/{}", queue);
+    let state_key = silo::keys::floating_limit_state_key("-", &queue);
     let state_raw = shard
         .db()
-        .get(state_key.as_bytes())
+        .get(&state_key)
         .await
         .expect("db get")
         .expect("state should exist");
@@ -772,10 +772,10 @@ async fn floating_limit_refresh_failure_triggers_backoff() {
         .expect("report refresh failure");
 
     // Check that the state has backoff info
-    let state_key = format!("floating_limits/-/{}", queue);
+    let state_key = silo::keys::floating_limit_state_key("-", &queue);
     let state_raw = shard
         .db()
-        .get(state_key.as_bytes())
+        .get(&state_key)
         .await
         .expect("db get")
         .expect("state should exist");
@@ -802,7 +802,7 @@ async fn floating_limit_refresh_failure_triggers_backoff() {
 
     // Verify a task key exists with the floating_refresh prefix in the DB
     // (checking peek_tasks would require advancing time past backoff)
-    let has_retry_task = first_kv_with_prefix(shard.db(), "tasks/").await.is_some();
+    let has_retry_task = first_task_kv(shard.db()).await.is_some();
     assert!(has_retry_task, "retry task should exist in db");
 }
 
@@ -1115,10 +1115,10 @@ async fn floating_limit_multiple_retries_increase_backoff() {
         .expect("report failure 1");
 
     // Check retry count is 1
-    let state_key = format!("floating_limits/-/{}", queue);
+    let state_key = silo::keys::floating_limit_state_key("-", &queue);
     let state_raw = shard
         .db()
-        .get(state_key.as_bytes())
+        .get(&state_key)
         .await
         .expect("get")
         .expect("state");
@@ -1144,7 +1144,7 @@ async fn floating_limit_multiple_retries_increase_backoff() {
         // Check retry count is 2 and backoff increased
         let state_raw = shard
             .db()
-            .get(state_key.as_bytes())
+            .get(&state_key)
             .await
             .expect("get")
             .expect("state");
@@ -1227,10 +1227,10 @@ async fn floating_limit_successful_refresh_resets_backoff() {
         .await
         .expect("report failure");
 
-    let state_key = format!("floating_limits/-/{}", queue);
+    let state_key = silo::keys::floating_limit_state_key("-", &queue);
     let state_raw = shard
         .db()
-        .get(state_key.as_bytes())
+        .get(&state_key)
         .await
         .expect("get")
         .expect("state");
@@ -1254,7 +1254,7 @@ async fn floating_limit_successful_refresh_resets_backoff() {
         // Check retry_count is reset and new value is stored
         let state_raw = shard
             .db()
-            .get(state_key.as_bytes())
+            .get(&state_key)
             .await
             .expect("get")
             .expect("state");
@@ -1334,19 +1334,19 @@ async fn floating_limit_refresh_task_lease_expiry_allows_rescheduling() {
     let task_id = result.refresh_tasks[0].task_id.clone();
 
     // Verify the lease was created
-    let lease_key = format!("lease/{}", task_id);
+    let lease_key = silo::keys::leased_task_key(&task_id);
     let lease_raw = shard
         .db()
-        .get(lease_key.as_bytes())
+        .get(&lease_key)
         .await
         .expect("db get")
         .expect("lease should exist after dequeue");
 
     // Verify state shows refresh_task_scheduled = true
-    let state_key = format!("floating_limits/-/{}", queue);
+    let state_key = silo::keys::floating_limit_state_key("-", &queue);
     let state_raw = shard
         .db()
-        .get(state_key.as_bytes())
+        .get(&state_key)
         .await
         .expect("db get")
         .expect("state should exist");
@@ -1367,7 +1367,7 @@ async fn floating_limit_refresh_task_lease_expiry_allows_rescheduling() {
     let new_val = encode_lease(&new_record).expect("encode lease");
     shard
         .db()
-        .put(lease_key.as_bytes(), &new_val)
+        .put(&lease_key, &new_val)
         .await
         .expect("put mutated lease");
     shard.db().flush().await.expect("flush mutated lease");
@@ -1377,18 +1377,13 @@ async fn floating_limit_refresh_task_lease_expiry_allows_rescheduling() {
     assert_eq!(reaped, 1, "should have reaped exactly one lease");
 
     // Verify the lease was deleted
-    let lease_exists_after = shard
-        .db()
-        .get(lease_key.as_bytes())
-        .await
-        .expect("db get")
-        .is_some();
+    let lease_exists_after = shard.db().get(&lease_key).await.expect("db get").is_some();
     assert!(!lease_exists_after, "lease should be deleted after reaping");
 
     // Verify state was reset to allow new refresh scheduling
     let state_raw = shard
         .db()
-        .get(state_key.as_bytes())
+        .get(&state_key)
         .await
         .expect("db get")
         .expect("state should still exist");
@@ -1511,10 +1506,10 @@ async fn floating_limit_refresh_task_lease_expiry_preserves_state() {
     let task_id = result.refresh_tasks[0].task_id.clone();
 
     // Verify state shows refresh_task_scheduled = true
-    let state_key = format!("floating_limits/-/{}", queue);
+    let state_key = silo::keys::floating_limit_state_key("-", &queue);
     let state_raw = shard
         .db()
-        .get(state_key.as_bytes())
+        .get(&state_key)
         .await
         .expect("get")
         .expect("state");
@@ -1526,10 +1521,10 @@ async fn floating_limit_refresh_task_lease_expiry_preserves_state() {
     assert_eq!(decoded.archived().metadata.len(), 2);
 
     // Mutate the lease to be expired (simulating worker crash)
-    let lease_key = format!("lease/{}", task_id);
+    let lease_key = silo::keys::leased_task_key(&task_id);
     let lease_raw = shard
         .db()
-        .get(lease_key.as_bytes())
+        .get(&lease_key)
         .await
         .expect("db get")
         .expect("lease should exist");
@@ -1543,7 +1538,7 @@ async fn floating_limit_refresh_task_lease_expiry_preserves_state() {
     let new_val = encode_lease(&new_record).expect("encode lease");
     shard
         .db()
-        .put(lease_key.as_bytes(), &new_val)
+        .put(&lease_key, &new_val)
         .await
         .expect("put mutated lease");
     shard.db().flush().await.expect("flush mutated lease");
@@ -1555,7 +1550,7 @@ async fn floating_limit_refresh_task_lease_expiry_preserves_state() {
     // Verify all state fields were preserved except refresh_task_scheduled
     let state_raw = shard
         .db()
-        .get(state_key.as_bytes())
+        .get(&state_key)
         .await
         .expect("get")
         .expect("state");
@@ -1601,11 +1596,6 @@ async fn floating_limit_refresh_task_lease_expiry_preserves_state() {
     assert!(metadata.contains(&("env", "production")));
 
     // Verify the lease was deleted
-    let lease_exists = shard
-        .db()
-        .get(lease_key.as_bytes())
-        .await
-        .expect("db get")
-        .is_some();
+    let lease_exists = shard.db().get(&lease_key).await.expect("db get").is_some();
     assert!(!lease_exists, "lease should be deleted after reaping");
 }

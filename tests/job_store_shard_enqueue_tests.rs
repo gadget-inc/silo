@@ -297,8 +297,8 @@ async fn enqueue_fails_when_id_already_exists_and_db_unchanged() {
     assert_eq!(got_id, id);
 
     // Pre-duplicate snapshot
-    let jobs_before = count_with_prefix(shard.db(), "jobs/").await;
-    let tasks_before = count_with_prefix(shard.db(), "tasks/").await;
+    let jobs_before = count_job_info_keys(shard.db()).await;
+    let tasks_before = count_task_keys(shard.db()).await;
 
     // Attempt duplicate enqueue with different values to ensure no overwrite occurs
     let payload2 = serde_json::json!({"v": 2});
@@ -327,8 +327,8 @@ async fn enqueue_fails_when_id_already_exists_and_db_unchanged() {
     }
 
     // DB should be unchanged
-    let jobs_after = count_with_prefix(shard.db(), "jobs/").await;
-    let tasks_after = count_with_prefix(shard.db(), "tasks/").await;
+    let jobs_after = count_job_info_keys(shard.db()).await;
+    let tasks_after = count_task_keys(shard.db()).await;
     assert_eq!(jobs_after, jobs_before, "job count should be unchanged");
     assert_eq!(tasks_after, tasks_before, "task count should be unchanged");
 

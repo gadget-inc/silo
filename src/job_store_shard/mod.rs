@@ -12,7 +12,7 @@ mod rate_limit;
 mod restart;
 mod scan;
 
-pub use cleanup::{CleanupProgress, CleanupResult, extract_tenant_from_key};
+pub use cleanup::{CleanupProgress, CleanupResult};
 
 pub use counters::{ShardCounters, counter_merge_operator};
 pub use expedite::JobNotExpediteableError;
@@ -378,7 +378,7 @@ impl JobStoreShard {
         id: &str,
     ) -> Result<Option<JobView>, JobStoreShardError> {
         let key = job_info_key(tenant, id);
-        match self.db.get(key.as_bytes()).await? {
+        match self.db.get(&key).await? {
             Some(raw) => Ok(Some(JobView::new(raw)?)),
             None => Ok(None),
         }
@@ -399,7 +399,7 @@ impl JobStoreShard {
             let key = job_info_key(tenant, id);
             let id_clone = id.clone();
             let handle = tokio::spawn(async move {
-                let maybe_raw = db.get(key.as_bytes()).await?;
+                let maybe_raw = db.get(&key).await?;
                 if let Some(raw) = maybe_raw {
                     let view = JobView::new(raw)?;
                     Ok::<_, JobStoreShardError>(Some((id_clone, view)))
@@ -433,7 +433,7 @@ impl JobStoreShard {
         id: &str,
     ) -> Result<Option<JobStatus>, JobStoreShardError> {
         let key = job_status_key(tenant, id);
-        let maybe_raw = self.db.get(key.as_bytes()).await?;
+        let maybe_raw = self.db.get(&key).await?;
         let Some(raw) = maybe_raw else {
             return Ok(None);
         };
@@ -456,7 +456,7 @@ impl JobStoreShard {
             let key = job_status_key(tenant, id);
             let id_clone = id.clone();
             let handle = tokio::spawn(async move {
-                let maybe_raw = db.get(key.as_bytes()).await?;
+                let maybe_raw = db.get(&key).await?;
                 let Some(raw) = maybe_raw else {
                     return Ok::<_, JobStoreShardError>(None);
                 };
@@ -490,7 +490,7 @@ impl JobStoreShard {
         attempt_number: u32,
     ) -> Result<Option<JobAttemptView>, JobStoreShardError> {
         let key = attempt_key(tenant, job_id, attempt_number);
-        match self.db.get(key.as_bytes()).await? {
+        match self.db.get(&key).await? {
             Some(raw) => Ok(Some(JobAttemptView::new(raw)?)),
             None => Ok(None),
         }
@@ -505,12 +505,10 @@ impl JobStoreShard {
     ) -> Result<Vec<JobAttemptView>, JobStoreShardError> {
         use slatedb::DbIterator;
 
-        let prefix = crate::keys::attempt_prefix(tenant, job_id);
-        let start = prefix.as_bytes().to_vec();
-        let mut end = start.clone();
-        end.push(0xFF);
+        let start = crate::keys::attempt_prefix(tenant, job_id);
+        let end = crate::keys::end_bound(&start);
 
-        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..=end).await?;
+        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..end).await?;
         let mut attempts = Vec::new();
 
         while let Some(kv) = iter.next().await? {
@@ -549,18 +547,12 @@ impl JobStoreShard {
 
         // Check if job even exists (status.is_none() means job doesn't exist)
         // If job doesn't exist, just return Ok (idempotent delete)
-        if status.is_none()
-            && self
-                .db
-                .get(job_info_key(tenant, id).as_bytes())
-                .await?
-                .is_none()
-        {
+        let job_info_key_bytes = job_info_key(tenant, id);
+        if status.is_none() && self.db.get(&job_info_key_bytes).await?.is_none() {
             return Ok(());
         }
 
-        let job_info_key_str: String = job_info_key(tenant, id);
-        let job_status_key_str: String = job_status_key(tenant, id);
+        let job_status_key_bytes = job_status_key(tenant, id);
         let mut batch = WriteBatch::new();
         // Clean up secondary index entries if present
         if let Some(ref status) = status {
@@ -570,20 +562,20 @@ impl JobStoreShard {
                 status.changed_at_ms,
                 id,
             );
-            batch.delete(timek.as_bytes());
+            batch.delete(&timek);
         }
         // Clean up metadata index entries (load job info to enumerate metadata)
-        if let Some(raw) = self.db.get(job_info_key_str.as_bytes()).await? {
+        if let Some(raw) = self.db.get(&job_info_key_bytes).await? {
             let view = JobView::new(raw)?;
             for (mk, mv) in view.metadata().into_iter() {
                 let mkey = idx_metadata_key(tenant, &mk, &mv, id);
-                batch.delete(mkey.as_bytes());
+                batch.delete(&mkey);
             }
         }
-        batch.delete(job_info_key_str.as_bytes());
-        batch.delete(job_status_key_str.as_bytes());
+        batch.delete(&job_info_key_bytes);
+        batch.delete(&job_status_key_bytes);
         // Also delete cancellation record if present
-        batch.delete(crate::keys::job_cancelled_key(tenant, id).as_bytes());
+        batch.delete(crate::keys::job_cancelled_key(tenant, id));
 
         // Update counters: always decrement total, and if terminal also decrement completed
         self.decrement_total_jobs_counter(&mut batch);
