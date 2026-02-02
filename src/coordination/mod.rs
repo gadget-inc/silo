@@ -50,6 +50,10 @@ pub struct MemberInfo {
     /// Hostname of the machine running this node
     #[serde(default)]
     pub hostname: Option<String>,
+    /// Placement rings this node participates in.
+    /// Empty means the node participates in the default ring only.
+    #[serde(default)]
+    pub placement_rings: Vec<String>,
 }
 
 /// Get the hostname of the current machine
@@ -262,6 +266,9 @@ pub struct CoordinatorBase {
     pub factory: Arc<ShardFactory>,
     /// Unix timestamp in milliseconds when this node started
     pub startup_time_ms: Option<i64>,
+    /// Placement rings this node participates in.
+    /// Empty means the node participates in the default ring only.
+    pub placement_rings: Vec<String>,
 }
 
 impl CoordinatorBase {
@@ -271,6 +278,7 @@ impl CoordinatorBase {
         grpc_addr: impl Into<String>,
         shard_map: ShardMap,
         factory: Arc<ShardFactory>,
+        placement_rings: Vec<String>,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let startup_time_ms = std::time::SystemTime::now()
@@ -286,6 +294,7 @@ impl CoordinatorBase {
             shutdown_rx,
             factory,
             startup_time_ms,
+            placement_rings,
         }
     }
 
@@ -313,9 +322,10 @@ impl CoordinatorBase {
     }
 
     /// Compute shard owner map from members (shared by both backends).
+    ///
+    /// Uses ring-aware selection to determine shard ownership based on
+    /// each shard's placement ring and member ring participation.
     pub async fn compute_shard_owner_map(&self, members: &[MemberInfo]) -> ShardOwnerMap {
-        let member_ids: Vec<String> = members.iter().map(|m| m.node_id.clone()).collect();
-
         let addr_map: HashMap<String, String> = members
             .iter()
             .map(|m| (m.node_id.clone(), m.grpc_addr.clone()))
@@ -326,7 +336,9 @@ impl CoordinatorBase {
         let mut shard_to_node = HashMap::new();
 
         for shard_info in shard_map.shards() {
-            if let Some(owner_node) = select_owner_for_shard(&shard_info.id, &member_ids)
+            // Use ring-aware selection
+            if let Some(owner_node) =
+                select_owner_for_shard(&shard_info.id, shard_info.placement_ring(), members)
                 && let Some(addr) = addr_map.get(&owner_node)
             {
                 shard_to_addr.insert(shard_info.id, addr.clone());
@@ -343,32 +355,34 @@ impl CoordinatorBase {
 
     /// Wait for convergence (shared logic).
     ///
-    /// The `get_member_ids` closure is called to fetch the current member list,
+    /// The `get_members` closure is called to fetch the current member list,
     /// allowing backends to use their own membership fetching mechanism.
     ///
     /// Uses `tokio::time::Instant` for the timeout to ensure compatibility with
     /// turmoil's simulated time in deterministic simulation tests.
-    pub async fn wait_converged<F, Fut>(&self, timeout: Duration, get_member_ids: F) -> bool
+    pub async fn wait_converged<F, Fut>(&self, timeout: Duration, get_members: F) -> bool
     where
         F: Fn() -> Fut,
-        Fut: std::future::Future<Output = Result<Vec<String>, CoordinationError>>,
+        Fut: std::future::Future<Output = Result<Vec<MemberInfo>, CoordinationError>>,
     {
         let start = tokio::time::Instant::now();
         while start.elapsed() < timeout {
-            let member_ids = match get_member_ids().await {
+            let members = match get_members().await {
                 Ok(m) => m,
                 Err(_) => {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
             };
-            if member_ids.is_empty() {
+            if members.is_empty() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
-            let shard_ids = self.shard_ids().await;
+            let shard_map = self.shard_map.lock().await;
+            let shards: Vec<&crate::shard_range::ShardInfo> = shard_map.shards().iter().collect();
             let desired: HashSet<ShardId> =
-                compute_desired_shards_for_node(&shard_ids, &self.node_id, &member_ids);
+                compute_desired_shards_for_node(&shards, &self.node_id, &members);
+            drop(shard_map);
             let guard = self.owned.lock().await;
             if *guard == desired {
                 return true;
@@ -378,10 +392,12 @@ impl CoordinatorBase {
         }
 
         // Log diff on timeout
-        if let Ok(member_ids) = get_member_ids().await {
-            let shard_ids = self.shard_ids().await;
+        if let Ok(members) = get_members().await {
+            let shard_map = self.shard_map.lock().await;
+            let shards: Vec<&crate::shard_range::ShardInfo> = shard_map.shards().iter().collect();
             let desired: HashSet<ShardId> =
-                compute_desired_shards_for_node(&shard_ids, &self.node_id, &member_ids);
+                compute_desired_shards_for_node(&shards, &self.node_id, &members);
+            drop(shard_map);
             let owned_now: HashSet<ShardId> = {
                 let g = self.owned.lock().await;
                 g.clone()
@@ -401,11 +417,9 @@ impl CoordinatorBase {
 
 /// Trait for coordination backends.
 ///
-/// This trait abstracts over different coordination mechanisms (etcd, K8S Leases, etc.)
-/// to allow Silo to run in different environments.
+/// This trait abstracts over different coordination mechanisms (etcd, K8S Leases, etc.) to allow Silo to run in different environments.
 ///
-/// Implementations only need to provide `base()` and a few backend-specific methods.
-/// Common functionality is provided via default implementations that delegate to the base.
+/// Implementations only need to provide `base()` and a few backend-specific methods. Common functionality is provided via default implementations that delegate to the base.
 #[async_trait]
 pub trait Coordinator: SplitStorageBackend + Send + Sync {
     /// Get the coordinator base containing shared state.
@@ -415,8 +429,7 @@ pub trait Coordinator: SplitStorageBackend + Send + Sync {
     /// Gracefully shutdown the coordinator, releasing all owned shards.
     async fn shutdown(&self) -> Result<(), CoordinationError>;
 
-    /// Wait until this node's owned shards match the expected set based on
-    /// current cluster membership, or until timeout.
+    /// Wait until this node's owned shards match the expected set based on current cluster membership, or until timeout.
     /// Returns true if converged, false if timed out.
     async fn wait_converged(&self, timeout: Duration) -> bool;
 
@@ -463,15 +476,24 @@ pub trait Coordinator: SplitStorageBackend + Send + Sync {
             _ => false,
         }
     }
+
+    /// Update a shard's placement ring.
+    ///
+    /// This changes which placement ring the shard belongs to, which affects which nodes are eligible to own it. After changing the ring, the shard will be handed off to a node that participates in the new ring.
+    ///
+    /// Returns the previous and current placement ring values.
+    async fn update_shard_placement_ring(
+        &self,
+        shard_id: &ShardId,
+        ring: Option<&str>,
+    ) -> Result<(Option<String>, Option<String>), CoordinationError>;
 }
 
 /// Dynamically create a coordinator based on configuration.
 ///
-/// The coordinator will manage shard ownership and automatically open/close
-/// shards in the factory as ownership changes.
+/// The coordinator will manage shard ownership and automatically open/close shards in the factory as ownership changes.
 ///
-/// The `initial_shard_count` is only used when bootstrapping a new cluster.
-/// For existing clusters, the shard map is loaded from the coordination backend.
+/// The `initial_shard_count` is only used when bootstrapping a new cluster. For existing clusters, the shard map is loaded from the coordination backend.
 pub async fn create_coordinator(
     config: &crate::settings::CoordinationConfig,
     node_id: impl Into<String>,
@@ -484,8 +506,14 @@ pub async fn create_coordinator(
 
     match &config.backend {
         crate::settings::CoordinationBackend::None => {
-            let coord =
-                NoneCoordinator::new(node_id, grpc_addr, initial_shard_count, factory).await;
+            let coord = NoneCoordinator::new(
+                node_id,
+                grpc_addr,
+                initial_shard_count,
+                factory,
+                config.placement_rings.clone(),
+            )
+            .await;
             Ok((Arc::new(coord), None))
         }
         crate::settings::CoordinationBackend::Etcd => {
@@ -497,6 +525,7 @@ pub async fn create_coordinator(
                 initial_shard_count,
                 config.lease_ttl_secs,
                 factory,
+                config.placement_rings.clone(),
             )
             .await?;
             Ok((Arc::new(coord), Some(handle)))
@@ -510,6 +539,7 @@ pub async fn create_coordinator(
                 grpc_addr,
                 initial_shard_count,
                 lease_duration_secs: config.lease_ttl_secs,
+                placement_rings: config.placement_rings.clone(),
             };
             let (coord, handle) = K8sCoordinator::start(k8s_config, factory).await?;
             Ok((Arc::new(coord), Some(handle)))
@@ -521,16 +551,52 @@ pub async fn create_coordinator(
 
 // Helper functions for rendezvous hashing (shared across backends)
 
-/// Deterministically select the owner node for a shard using rendezvous hashing.
+/// Check if a member participates in a given placement ring.
 ///
-/// Uses the shard's UUID as input to the hash function, ensuring consistent
-/// distribution regardless of when shards were created.
-pub fn select_owner_for_shard(shard_id: &ShardId, member_ids: &[String]) -> Option<String> {
-    if member_ids.is_empty() {
+/// Rules:
+/// - If shard_ring is None (default ring), member participates if:
+///   - member.placement_rings is empty (default behavior), OR
+///   - member.placement_rings contains "default"
+/// - If shard_ring is Some(ring), member participates if:
+///   - member.placement_rings contains that ring
+pub fn member_in_ring(member: &MemberInfo, shard_ring: Option<&str>) -> bool {
+    match shard_ring {
+        None => {
+            // Default ring: members with empty rings or explicit "default"
+            member.placement_rings.is_empty()
+                || member.placement_rings.iter().any(|r| r == "default")
+        }
+        Some(ring) => {
+            // Named ring: must explicitly contain the ring
+            member.placement_rings.iter().any(|r| r == ring)
+        }
+    }
+}
+
+/// Deterministically select the owner node for a shard using rendezvous hashing, filtering by placement ring.
+///
+/// Uses the shard's UUID as input to the hash function, ensuring consistent distribution regardless of when shards were created.
+///
+/// Only members that participate in the shard's placement ring are considered.
+/// If no members participate in the ring, returns None.
+pub fn select_owner_for_shard(
+    shard_id: &ShardId,
+    shard_ring: Option<&str>,
+    members: &[MemberInfo],
+) -> Option<String> {
+    // Filter to members that participate in this ring
+    let eligible: Vec<&String> = members
+        .iter()
+        .filter(|m| member_in_ring(m, shard_ring))
+        .map(|m| &m.node_id)
+        .collect();
+
+    if eligible.is_empty() {
         return None;
     }
+
     let mut best: Option<(u64, &String)> = None;
-    for m in member_ids {
+    for m in &eligible {
         let member_hash = fnv1a64(m.as_bytes());
         // Use the UUID bytes for consistent hashing
         let shard_hash = fnv1a64(shard_id.as_uuid().as_bytes());
@@ -543,21 +609,25 @@ pub fn select_owner_for_shard(shard_id: &ShardId, member_ids: &[String]) -> Opti
             best = Some((score, m));
         }
     }
-    best.map(|(_, m)| m.clone())
+    best.map(|(_, m)| (*m).clone())
 }
 
-/// Compute the desired set of shard ids for a node given current membership.
+/// Compute the desired set of shard ids for a node given current membership and considering placement rings.
+///
+/// A shard is desired by a node if:
+/// 1. The node participates in the shard's placement ring
+/// 2. The node is selected as owner by rendezvous hashing among eligible members
 pub fn compute_desired_shards_for_node(
-    shard_ids: &[ShardId],
+    shards: &[&crate::shard_range::ShardInfo],
     node_id: &str,
-    member_ids: &[String],
+    members: &[MemberInfo],
 ) -> HashSet<ShardId> {
     let mut desired: HashSet<ShardId> = HashSet::new();
-    for shard_id in shard_ids {
-        if let Some(owner) = select_owner_for_shard(shard_id, member_ids)
+    for shard in shards {
+        if let Some(owner) = select_owner_for_shard(&shard.id, shard.placement_ring(), members)
             && owner == node_id
         {
-            desired.insert(*shard_id);
+            desired.insert(shard.id);
         }
     }
     desired

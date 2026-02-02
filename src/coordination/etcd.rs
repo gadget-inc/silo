@@ -36,6 +36,7 @@ impl EtcdCoordinator {
     /// The coordinator will manage shard ownership and automatically open/close shards in the factory as ownership changes.
     ///
     /// If the cluster doesn't have a shard map yet, one will be created with `initial_shard_count` shards. If the cluster already has a shard map,  the existing one is used and `initial_shard_count` is ignored.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start(
         endpoints: &[String],
         cluster_prefix: &str,
@@ -44,6 +45,7 @@ impl EtcdCoordinator {
         initial_shard_count: u32,
         ttl_secs: i64,
         factory: Arc<ShardFactory>,
+        placement_rings: Vec<String>,
     ) -> Result<(Self, tokio::task::JoinHandle<()>), CoordinationError> {
         let endpoints = if endpoints.is_empty() {
             vec!["http://127.0.0.1:2379".to_string()]
@@ -82,6 +84,7 @@ impl EtcdCoordinator {
             grpc_addr.clone(),
             shard_map,
             factory,
+            placement_rings.clone(),
         ));
 
         // Write membership key
@@ -91,6 +94,7 @@ impl EtcdCoordinator {
             grpc_addr: grpc_addr.clone(),
             startup_time_ms: base.startup_time_ms,
             hostname: get_hostname(),
+            placement_rings,
         };
         let member_value = serde_json::to_string(&member_info)
             .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
@@ -401,21 +405,28 @@ impl EtcdCoordinator {
         &self,
         _lock: &mut etcd_client::LockClient,
     ) -> Result<(), etcd_client::Error> {
-        let members = self.get_sorted_member_ids().await?;
-        debug!(node_id = %self.base.node_id, members = ?members, "reconcile: begin");
+        // Get full member info for ring-aware placement
+        let members = self
+            .get_members()
+            .await
+            .map_err(|e| etcd_client::Error::IoError(std::io::Error::other(e.to_string())))?;
+        let member_ids: Vec<String> = members.iter().map(|m| m.node_id.clone()).collect();
+        debug!(node_id = %self.base.node_id, members = ?member_ids, "reconcile: begin");
 
         // Safety check: if we don't see ourselves in the member list, our membership lease may have expired or there's a connectivity issue. Don't reconcile based on incomplete membership data - it would cause us to release all shards.
         if members.is_empty() {
             warn!(node_id = %self.base.node_id, "reconcile: no members found, skipping reconcile");
             return Ok(());
         }
-        if !members.contains(&self.base.node_id) {
-            warn!(node_id = %self.base.node_id, members = ?members, "reconcile: our node not in member list, skipping reconcile (membership may have expired)");
+        if !member_ids.contains(&self.base.node_id) {
+            warn!(node_id = %self.base.node_id, members = ?member_ids, "reconcile: our node not in member list, skipping reconcile (membership may have expired)");
             return Ok(());
         }
 
-        let shard_ids = self.base.shard_ids().await;
-        let desired = compute_desired_shards_for_node(&shard_ids, &self.base.node_id, &members);
+        let shard_map = self.base.shard_map.lock().await;
+        let shards: Vec<&crate::shard_range::ShardInfo> = shard_map.shards().iter().collect();
+        let desired = compute_desired_shards_for_node(&shards, &self.base.node_id, &members);
+        drop(shard_map);
 
         let current_locks: Vec<ShardId> = {
             let g = self.shard_guards.lock().await;
@@ -490,6 +501,7 @@ impl EtcdCoordinator {
         guard
     }
 
+    #[allow(dead_code)]
     async fn get_sorted_member_ids(&self) -> Result<Vec<String>, etcd_client::Error> {
         let resp = self
             .client
@@ -604,6 +616,74 @@ impl EtcdCoordinator {
         );
 
         Ok(())
+    }
+
+    /// CAS-based shard placement ring update.
+    async fn try_update_shard_placement_ring_cas(
+        &self,
+        shard_id: &crate::shard_range::ShardId,
+        new_ring: Option<String>,
+    ) -> Result<(Option<String>, Option<String>), CoordinationError> {
+        let shard_map_key = keys::shard_map_key(&self.cluster_prefix);
+
+        // Read current shard map from etcd
+        let resp = self
+            .client
+            .kv_client()
+            .get(shard_map_key.clone(), None)
+            .await
+            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+
+        let kv = resp.kvs().first().ok_or_else(|| {
+            CoordinationError::BackendError("shard map not found in etcd".to_string())
+        })?;
+
+        let current_version = kv.mod_revision();
+        let value = String::from_utf8_lossy(kv.value());
+        let mut shard_map: ShardMap = serde_json::from_str(&value)
+            .map_err(|e| CoordinationError::BackendError(format!("invalid shard map: {}", e)))?;
+
+        // Update the shard's placement ring
+        let shard = shard_map
+            .get_shard_mut(shard_id)
+            .ok_or(CoordinationError::ShardNotFound(*shard_id))?;
+
+        let previous = shard.placement_ring.clone();
+        shard.placement_ring = new_ring.clone();
+
+        let new_map_json = serde_json::to_string(&shard_map)
+            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+
+        // Use CAS to update atomically
+        let txn = etcd_client::Txn::new()
+            .when([etcd_client::Compare::mod_revision(
+                shard_map_key.clone(),
+                etcd_client::CompareOp::Equal,
+                current_version,
+            )])
+            .and_then([etcd_client::TxnOp::put(
+                shard_map_key.clone(),
+                new_map_json,
+                None,
+            )]);
+
+        let txn_resp = self
+            .client
+            .kv_client()
+            .txn(txn)
+            .await
+            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+
+        if !txn_resp.succeeded() {
+            return Err(CoordinationError::BackendError(
+                "shard map was modified concurrently".to_string(),
+            ));
+        }
+
+        // Update local shard map cache
+        *self.base.shard_map.lock().await = shard_map;
+
+        Ok((previous, new_ring))
     }
 }
 
@@ -760,11 +840,7 @@ impl Coordinator for EtcdCoordinator {
 
     async fn wait_converged(&self, timeout: Duration) -> bool {
         self.base
-            .wait_converged(timeout, || async {
-                self.get_sorted_member_ids()
-                    .await
-                    .map_err(|e| CoordinationError::BackendError(e.to_string()))
-            })
+            .wait_converged(timeout, || async { self.get_members().await })
             .await
     }
 
@@ -794,6 +870,47 @@ impl Coordinator for EtcdCoordinator {
     async fn get_shard_owner_map(&self) -> Result<ShardOwnerMap, CoordinationError> {
         let members = self.get_members().await?;
         Ok(self.base.compute_shard_owner_map(&members).await)
+    }
+
+    async fn update_shard_placement_ring(
+        &self,
+        shard_id: &crate::shard_range::ShardId,
+        ring: Option<&str>,
+    ) -> Result<(Option<String>, Option<String>), CoordinationError> {
+        let sid = *shard_id;
+        let new_ring = ring.map(|s| s.to_string());
+
+        // Use CAS-based update with retry to avoid race conditions with the watcher
+        let max_retries = 10;
+        let mut delay = Duration::from_millis(10);
+
+        for attempt in 0..max_retries {
+            match self
+                .try_update_shard_placement_ring_cas(&sid, new_ring.clone())
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(CoordinationError::BackendError(msg))
+                    if msg.contains("was modified concurrently") =>
+                {
+                    if attempt < max_retries - 1 {
+                        debug!(
+                            shard_id = %sid,
+                            attempt = attempt,
+                            "shard map update hit CAS conflict, retrying"
+                        );
+                        tokio::time::sleep(delay).await;
+                        delay = std::cmp::min(delay * 2, Duration::from_secs(1));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(CoordinationError::BackendError(format!(
+            "failed to update shard placement ring after {} retries",
+            max_retries
+        )))
     }
 }
 

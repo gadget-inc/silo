@@ -35,12 +35,19 @@ impl NoneCoordinator {
         grpc_addr: impl Into<String>,
         initial_shard_count: u32,
         factory: Arc<ShardFactory>,
+        placement_rings: Vec<String>,
     ) -> Self {
         // Create the shard map for single-node mode
         let shard_map = ShardMap::create_initial(initial_shard_count)
             .expect("failed to create initial shard map");
 
-        let base = CoordinatorBase::new(node_id, grpc_addr, shard_map, Arc::clone(&factory));
+        let base = CoordinatorBase::new(
+            node_id,
+            grpc_addr,
+            shard_map,
+            Arc::clone(&factory),
+            placement_rings,
+        );
 
         // In single-node mode, we own all shards immediately - open them all
         {
@@ -77,7 +84,13 @@ impl NoneCoordinator {
             .collect();
         let shard_map = ShardMap::from_shards(shard_infos);
 
-        let base = CoordinatorBase::new(node_id, grpc_addr, shard_map, Arc::clone(&factory));
+        let base = CoordinatorBase::new(
+            node_id,
+            grpc_addr,
+            shard_map,
+            Arc::clone(&factory),
+            Vec::new(),
+        );
 
         // Mark all existing shards as owned
         {
@@ -114,6 +127,7 @@ impl Coordinator for NoneCoordinator {
             grpc_addr: self.base.grpc_addr.clone(),
             startup_time_ms: self.base.startup_time_ms,
             hostname: get_hostname(),
+            placement_rings: self.base.placement_rings.clone(),
         }])
     }
 
@@ -134,6 +148,25 @@ impl Coordinator for NoneCoordinator {
             shard_to_addr,
             shard_to_node,
         })
+    }
+
+    async fn update_shard_placement_ring(
+        &self,
+        shard_id: &ShardId,
+        ring: Option<&str>,
+    ) -> Result<(Option<String>, Option<String>), CoordinationError> {
+        let mut shard_map = self.base.shard_map.lock().await;
+
+        // Find and update the shard
+        let shard = shard_map
+            .get_shard_mut(shard_id)
+            .ok_or(CoordinationError::ShardNotFound(*shard_id))?;
+
+        let previous = shard.placement_ring.clone();
+        let current = ring.map(|s| s.to_string());
+        shard.placement_ring = current.clone();
+
+        Ok((previous, current))
     }
 }
 

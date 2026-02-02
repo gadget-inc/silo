@@ -110,6 +110,14 @@ enum ShardAction {
         /// Parent shard ID (UUID) to check
         shard: String,
     },
+    /// Configure a shard's placement ring
+    Configure {
+        /// Shard ID (UUID) to configure
+        shard: String,
+        /// Placement ring name (omit to move to default ring)
+        #[arg(long)]
+        ring: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -190,6 +198,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
             } => siloctl::shard_split(&opts, &mut stdout, shard, at.clone(), *auto, *wait).await,
             ShardAction::SplitStatus { shard } => {
                 siloctl::shard_split_status(&opts, &mut stdout, shard).await
+            }
+            ShardAction::Configure { shard, ring } => {
+                siloctl::shard_configure(&opts, &mut stdout, shard, ring.clone()).await
             }
         },
         Command::Query { shard, sql } => siloctl::query(&opts, &mut stdout, shard, sql).await,

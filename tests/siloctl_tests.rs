@@ -841,3 +841,177 @@ async fn siloctl_profile_json_output() -> anyhow::Result<()> {
     .expect("test timed out")?;
     Ok(())
 }
+
+#[silo::test(flavor = "multi_thread")]
+async fn siloctl_shard_configure() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(30000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (_client, shutdown_tx, server, addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        // Test shard configure command - set a ring
+        let opts = opts_for_addr(&addr);
+        let mut output = Vec::new();
+        siloctl::shard_configure(
+            &opts,
+            &mut output,
+            crate::grpc_integration_helpers::TEST_SHARD_ID,
+            Some("gpu-ring".to_string()),
+        )
+        .await?;
+        let stdout = String::from_utf8(output)?;
+
+        assert!(
+            stdout.contains("configured"),
+            "output should confirm configuration: {}",
+            stdout
+        );
+        assert!(
+            stdout.contains("(default)") || stdout.contains("Previous ring:"),
+            "output should show previous ring: {}",
+            stdout
+        );
+        assert!(
+            stdout.contains("gpu-ring"),
+            "output should show new ring: {}",
+            stdout
+        );
+
+        // Now clear the ring (set to default)
+        let mut output2 = Vec::new();
+        siloctl::shard_configure(
+            &opts,
+            &mut output2,
+            crate::grpc_integration_helpers::TEST_SHARD_ID,
+            None,
+        )
+        .await?;
+        let stdout2 = String::from_utf8(output2)?;
+
+        assert!(
+            stdout2.contains("configured"),
+            "output should confirm configuration: {}",
+            stdout2
+        );
+        assert!(
+            stdout2.contains("gpu-ring"),
+            "output should show previous ring was gpu-ring: {}",
+            stdout2
+        );
+        assert!(
+            stdout2.contains("(default)"),
+            "output should show current ring is default: {}",
+            stdout2
+        );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn siloctl_shard_configure_json_output() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(30000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (_client, shutdown_tx, server, addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        // Test shard configure command with JSON output - set a ring
+        let opts = opts_for_addr_json(&addr);
+        let mut output = Vec::new();
+        siloctl::shard_configure(
+            &opts,
+            &mut output,
+            crate::grpc_integration_helpers::TEST_SHARD_ID,
+            Some("high-memory".to_string()),
+        )
+        .await?;
+        let stdout = String::from_utf8(output)?;
+
+        let parsed: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|_| panic!("Failed to parse JSON output: {}", stdout));
+
+        assert_eq!(
+            parsed["shard_id"],
+            crate::grpc_integration_helpers::TEST_SHARD_ID,
+            "JSON should have correct shard_id"
+        );
+        assert!(
+            parsed.get("previous_ring").is_some(),
+            "JSON should have previous_ring"
+        );
+        assert_eq!(
+            parsed["current_ring"], "high-memory",
+            "JSON should show current ring"
+        );
+
+        // Configure again to verify previous_ring is populated correctly
+        let mut output2 = Vec::new();
+        siloctl::shard_configure(
+            &opts,
+            &mut output2,
+            crate::grpc_integration_helpers::TEST_SHARD_ID,
+            Some("gpu-ring".to_string()),
+        )
+        .await?;
+        let stdout2 = String::from_utf8(output2)?;
+
+        let parsed2: serde_json::Value = serde_json::from_str(&stdout2)
+            .unwrap_or_else(|_| panic!("Failed to parse JSON output: {}", stdout2));
+
+        assert_eq!(
+            parsed2["previous_ring"], "high-memory",
+            "previous_ring should be the last configured ring"
+        );
+        assert_eq!(
+            parsed2["current_ring"], "gpu-ring",
+            "current_ring should be the new ring"
+        );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn siloctl_shard_configure_invalid_shard() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(30000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (_client, shutdown_tx, server, addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        // Test shard configure command with non-existent shard
+        let opts = opts_for_addr(&addr);
+        let mut output = Vec::new();
+        let result = siloctl::shard_configure(
+            &opts,
+            &mut output,
+            "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            Some("test-ring".to_string()),
+        )
+        .await;
+
+        assert!(result.is_err(), "should fail for non-existent shard");
+        let err = result.unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("not found")
+                || err_str.contains("NotFound")
+                || err_str.contains("ShardNotFound"),
+            "error should mention shard not found: {}",
+            err_str
+        );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}

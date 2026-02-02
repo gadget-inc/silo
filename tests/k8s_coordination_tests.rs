@@ -92,6 +92,7 @@ fn make_coordinator_config(
         grpc_addr: grpc_addr.to_string(),
         initial_shard_count: num_shards,
         lease_duration_secs: lease_ttl,
+        placement_rings: Vec::new(),
     }
 }
 
@@ -801,9 +802,14 @@ async fn make_k8s_guard(
     shard_map_inner.add_shard(ShardInfo::new(shard_id, ShardRange::full()));
     let shard_map = Arc::new(Mutex::new(shard_map_inner));
     // Create a NoneCoordinator as a placeholder for split recovery (these tests don't involve splits)
-    let none_coord =
-        silo::coordination::NoneCoordinator::new(node_id, "http://127.0.0.1:0", 1, factory.clone())
-            .await;
+    let none_coord = silo::coordination::NoneCoordinator::new(
+        node_id,
+        "http://127.0.0.1:0",
+        1,
+        factory.clone(),
+        Vec::new(),
+    )
+    .await;
     let coordinator: Arc<dyn Coordinator> = Arc::new(none_coord);
     let handle = tokio::spawn(async move {
         runner.run(owned_arc, factory, shard_map, coordinator).await;
@@ -3586,4 +3592,520 @@ async fn k8s_crash_recovery_late_phase_resumes_split() {
 
     c2.shutdown().await.unwrap();
     h2.abort();
+}
+
+/// Helper to create K8sCoordinatorConfig with placement rings
+fn make_coordinator_config_with_rings(
+    namespace: &str,
+    prefix: &str,
+    node_id: &str,
+    grpc_addr: &str,
+    num_shards: u32,
+    lease_ttl: i64,
+    placement_rings: Vec<String>,
+) -> K8sCoordinatorConfig {
+    K8sCoordinatorConfig {
+        namespace: namespace.to_string(),
+        cluster_prefix: prefix.to_string(),
+        node_id: node_id.to_string(),
+        grpc_addr: grpc_addr.to_string(),
+        initial_shard_count: num_shards,
+        lease_duration_secs: lease_ttl,
+        placement_rings,
+    }
+}
+
+/// Test that a single node with default ring owns all default shards.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_single_node_default_ring_owns_all_shards() {
+    let prefix = unique_prefix();
+    let num_shards: u32 = 4;
+    let namespace = get_namespace();
+
+    // Node with empty placement_rings participates in default ring
+    let (coord, handle) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "default-node",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+
+    assert!(
+        coord.wait_converged(Duration::from_secs(10)).await,
+        "coordinator should converge"
+    );
+
+    // All shards default to no ring, so default node should own all
+    let owned = coord.owned_shards().await;
+    assert_eq!(
+        owned.len(),
+        num_shards as usize,
+        "default node should own all shards"
+    );
+
+    coord.shutdown().await.unwrap();
+    handle.abort();
+}
+
+/// Test that nodes with different rings get different shards based on ring assignment.
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k8s_multi_ring_shard_assignment() {
+    let prefix = unique_prefix();
+    let num_shards: u32 = 8;
+    let namespace = get_namespace();
+
+    // Start a default node (empty placement_rings = default ring)
+    let (c_default, h_default) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "default-node",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+    let c_default: Arc<dyn Coordinator> = Arc::new(c_default);
+
+    assert!(
+        c_default.wait_converged(Duration::from_secs(15)).await,
+        "default node should converge"
+    );
+
+    // All shards start in default ring, so default node owns all
+    let owned_default_before = c_default.owned_shards().await;
+    assert_eq!(
+        owned_default_before.len(),
+        num_shards as usize,
+        "default node should own all shards initially"
+    );
+
+    // Start a GPU node that only participates in the "gpu" ring
+    let (c_gpu, h_gpu) = K8sCoordinator::start(
+        make_coordinator_config_with_rings(
+            &namespace,
+            &prefix,
+            "gpu-node",
+            "http://127.0.0.1:50052",
+            num_shards,
+            10,
+            vec!["gpu".to_string()],
+        ),
+        make_test_factory("gpu-node"),
+    )
+    .await
+    .expect("start gpu node");
+    let c_gpu: Arc<dyn Coordinator> = Arc::new(c_gpu);
+
+    // Wait for both to converge
+    assert!(
+        c_default.wait_converged(Duration::from_secs(15)).await,
+        "default node should converge"
+    );
+    assert!(
+        c_gpu.wait_converged(Duration::from_secs(15)).await,
+        "gpu node should converge"
+    );
+
+    // GPU node should own no shards (all shards are in default ring, not gpu ring)
+    let owned_gpu = c_gpu.owned_shards().await;
+    assert_eq!(
+        owned_gpu.len(),
+        0,
+        "gpu node should own no shards (no shards in gpu ring)"
+    );
+
+    // Default node should still own all shards
+    let owned_default_after = c_default.owned_shards().await;
+    assert_eq!(
+        owned_default_after.len(),
+        num_shards as usize,
+        "default node should still own all shards"
+    );
+
+    // Now move one shard to the gpu ring
+    let shard_to_move = owned_default_after[0];
+    let (prev, curr) = c_default
+        .update_shard_placement_ring(&shard_to_move, Some("gpu"))
+        .await
+        .expect("update placement ring");
+    assert!(prev.is_none(), "previous ring should be None (default)");
+    assert_eq!(curr, Some("gpu".to_string()), "current ring should be gpu");
+
+    // Wait for GPU node to acquire the shard - this involves:
+    // 1. shard_map update propagating to gpu-node
+    // 2. gpu-node reconciling and seeing shard_to_move as desired
+    // 3. default-node releasing the shard lease
+    // 4. gpu-node acquiring the shard lease
+    // Use wait_until helper to poll for this condition
+    let shard_to_move_clone = shard_to_move;
+    let c_gpu_clone = c_gpu.clone();
+    let acquired = wait_until(Duration::from_secs(30), || {
+        let c = c_gpu_clone.clone();
+        let s = shard_to_move_clone;
+        async move { c.owned_shards().await.contains(&s) }
+    })
+    .await;
+    assert!(acquired, "gpu node should acquire the moved shard");
+
+    // Wait for default node to release the shard
+    let c_default_clone = c_default.clone();
+    let released = wait_until(Duration::from_secs(15), || {
+        let c = c_default_clone.clone();
+        let s = shard_to_move_clone;
+        async move { !c.owned_shards().await.contains(&s) }
+    })
+    .await;
+    assert!(released, "default node should release the moved shard");
+
+    // GPU node should now own the moved shard
+    let owned_gpu_after = c_gpu.owned_shards().await;
+    assert_eq!(owned_gpu_after.len(), 1, "gpu node should own 1 shard");
+    assert_eq!(
+        owned_gpu_after[0], shard_to_move,
+        "gpu node should own the moved shard"
+    );
+
+    // Default node should own one less shard
+    let owned_default_final = c_default.owned_shards().await;
+    assert_eq!(
+        owned_default_final.len(),
+        (num_shards - 1) as usize,
+        "default node should own one less shard"
+    );
+    assert!(
+        !owned_default_final.contains(&shard_to_move),
+        "default node should not own the moved shard"
+    );
+
+    // Cleanup
+    c_gpu.shutdown().await.unwrap();
+    h_gpu.abort();
+    c_default.shutdown().await.unwrap();
+    h_default.abort();
+}
+
+/// Test ConfigureShard RPC moving shard between rings.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_configure_shard_ring_changes() {
+    let prefix = unique_prefix();
+    let num_shards: u32 = 2;
+    let namespace = get_namespace();
+
+    let (coord, handle) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "test-node",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+    let coord: Arc<dyn Coordinator> = Arc::new(coord);
+
+    assert!(
+        coord.wait_converged(Duration::from_secs(10)).await,
+        "coordinator should converge"
+    );
+
+    let owned = coord.owned_shards().await;
+    let shard_id = owned[0];
+
+    // Initially shard has no ring (default)
+    let shard_map = coord.get_shard_map().await.unwrap();
+    assert!(
+        shard_map
+            .get_shard(&shard_id)
+            .unwrap()
+            .placement_ring
+            .is_none(),
+        "shard should start with no ring"
+    );
+
+    // Configure shard to a specific ring
+    let (prev, curr) = coord
+        .update_shard_placement_ring(&shard_id, Some("tenant-a"))
+        .await
+        .expect("set ring");
+    assert!(prev.is_none(), "previous should be None");
+    assert_eq!(curr, Some("tenant-a".to_string()));
+
+    // Verify in shard map
+    let shard_map = coord.get_shard_map().await.unwrap();
+    assert_eq!(
+        shard_map.get_shard(&shard_id).unwrap().placement_ring,
+        Some("tenant-a".to_string())
+    );
+
+    // Change to different ring
+    let (prev, curr) = coord
+        .update_shard_placement_ring(&shard_id, Some("tenant-b"))
+        .await
+        .expect("change ring");
+    assert_eq!(prev, Some("tenant-a".to_string()));
+    assert_eq!(curr, Some("tenant-b".to_string()));
+
+    // Clear ring back to default
+    let (prev, curr) = coord
+        .update_shard_placement_ring(&shard_id, None)
+        .await
+        .expect("clear ring");
+    assert_eq!(prev, Some("tenant-b".to_string()));
+    assert!(curr.is_none(), "current should be None (default)");
+
+    // Verify cleared
+    let shard_map = coord.get_shard_map().await.unwrap();
+    assert!(
+        shard_map
+            .get_shard(&shard_id)
+            .unwrap()
+            .placement_ring
+            .is_none(),
+        "shard ring should be cleared"
+    );
+
+    coord.shutdown().await.unwrap();
+    handle.abort();
+}
+
+/// Test that MemberInfo correctly reports placement rings.
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k8s_member_info_reports_rings() {
+    let prefix = unique_prefix();
+    let num_shards: u32 = 4;
+    let namespace = get_namespace();
+
+    // Start a default node
+    let (c1, h1) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "node-default",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Start a node with multiple rings
+    let (c2, h2) = K8sCoordinator::start(
+        make_coordinator_config_with_rings(
+            &namespace,
+            &prefix,
+            "node-multi",
+            "http://127.0.0.1:50052",
+            num_shards,
+            10,
+            vec!["gpu".to_string(), "high-memory".to_string()],
+        ),
+        make_test_factory("node-multi"),
+    )
+    .await
+    .expect("start node-multi");
+
+    // Wait for both to be visible
+    assert!(c1.wait_converged(Duration::from_secs(15)).await);
+    assert!(c2.wait_converged(Duration::from_secs(15)).await);
+
+    // Get members from c1's perspective
+    let members = c1.get_members().await.expect("get members");
+    assert_eq!(members.len(), 2, "should see 2 members");
+
+    // Find each node
+    let default_member = members.iter().find(|m| m.node_id == "node-default");
+    let multi_member = members.iter().find(|m| m.node_id == "node-multi");
+
+    assert!(default_member.is_some(), "should find default node");
+    assert!(multi_member.is_some(), "should find multi node");
+
+    // Check rings
+    let default_rings = &default_member.unwrap().placement_rings;
+    let multi_rings = &multi_member.unwrap().placement_rings;
+
+    assert!(
+        default_rings.is_empty(),
+        "default node should have empty rings"
+    );
+    assert_eq!(multi_rings.len(), 2, "multi node should have 2 rings");
+    assert!(
+        multi_rings.contains(&"gpu".to_string()),
+        "multi node should have gpu ring"
+    );
+    assert!(
+        multi_rings.contains(&"high-memory".to_string()),
+        "multi node should have high-memory ring"
+    );
+
+    // Cleanup
+    c1.shutdown().await.unwrap();
+    h1.abort();
+    c2.shutdown().await.unwrap();
+    h2.abort();
+}
+
+/// Test that ring change triggers shard handoff between nodes.
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k8s_ring_change_triggers_handoff() {
+    let prefix = unique_prefix();
+    let num_shards: u32 = 4;
+    let namespace = get_namespace();
+
+    // Start default node
+    let (c_default, h_default) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "default-node",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+    let c_default: Arc<dyn Coordinator> = Arc::new(c_default);
+
+    assert!(c_default.wait_converged(Duration::from_secs(15)).await);
+
+    // Capture initial ownership
+    let initial_owned = c_default.owned_shards().await;
+    assert_eq!(initial_owned.len(), num_shards as usize);
+
+    // Start a dedicated tenant node
+    let (c_tenant, h_tenant) = K8sCoordinator::start(
+        make_coordinator_config_with_rings(
+            &namespace,
+            &prefix,
+            "tenant-node",
+            "http://127.0.0.1:50052",
+            num_shards,
+            10,
+            vec!["tenant-acme".to_string()],
+        ),
+        make_test_factory("tenant-node"),
+    )
+    .await
+    .expect("start tenant node");
+    let c_tenant: Arc<dyn Coordinator> = Arc::new(c_tenant);
+
+    // Wait for tenant node to be ready
+    assert!(c_tenant.wait_converged(Duration::from_secs(15)).await);
+
+    // Tenant node should own no shards yet
+    let tenant_owned_before = c_tenant.owned_shards().await;
+    assert_eq!(
+        tenant_owned_before.len(),
+        0,
+        "tenant node should own no shards initially"
+    );
+
+    // Move two shards to tenant ring
+    let shard_1 = initial_owned[0];
+    let shard_2 = initial_owned[1];
+
+    c_default
+        .update_shard_placement_ring(&shard_1, Some("tenant-acme"))
+        .await
+        .expect("move shard 1");
+    c_default
+        .update_shard_placement_ring(&shard_2, Some("tenant-acme"))
+        .await
+        .expect("move shard 2");
+
+    // Wait for convergence
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        c_default.wait_converged(Duration::from_secs(15)).await,
+        "default node should converge"
+    );
+    assert!(
+        c_tenant.wait_converged(Duration::from_secs(15)).await,
+        "tenant node should converge"
+    );
+
+    // Verify tenant node now owns the moved shards
+    let tenant_owned_after: HashSet<ShardId> = c_tenant.owned_shards().await.into_iter().collect();
+    assert_eq!(tenant_owned_after.len(), 2, "tenant should own 2 shards");
+    assert!(tenant_owned_after.contains(&shard_1));
+    assert!(tenant_owned_after.contains(&shard_2));
+
+    // Verify default node no longer owns those shards
+    let default_owned_after: HashSet<ShardId> =
+        c_default.owned_shards().await.into_iter().collect();
+    assert_eq!(
+        default_owned_after.len(),
+        (num_shards - 2) as usize,
+        "default should own 2 fewer shards"
+    );
+    assert!(!default_owned_after.contains(&shard_1));
+    assert!(!default_owned_after.contains(&shard_2));
+
+    // Cleanup
+    c_tenant.shutdown().await.unwrap();
+    h_tenant.abort();
+    c_default.shutdown().await.unwrap();
+    h_default.abort();
+}
+
+/// Test that orphaned shards (no eligible node) remain unowned.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_orphaned_ring_shard_remains_unowned() {
+    let prefix = unique_prefix();
+    let num_shards: u32 = 2;
+    let namespace = get_namespace();
+
+    // Start only a default node
+    let (coord, handle) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "default-node",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+    let coord: Arc<dyn Coordinator> = Arc::new(coord);
+
+    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+
+    let owned_before = coord.owned_shards().await;
+    assert_eq!(owned_before.len(), num_shards as usize);
+
+    // Move a shard to a ring with no nodes
+    let shard_to_orphan = owned_before[0];
+    coord
+        .update_shard_placement_ring(&shard_to_orphan, Some("nonexistent-ring"))
+        .await
+        .expect("move to nonexistent ring");
+
+    // Wait for convergence
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+
+    // The orphaned shard should no longer be owned
+    let owned_after: HashSet<ShardId> = coord.owned_shards().await.into_iter().collect();
+    assert_eq!(
+        owned_after.len(),
+        (num_shards - 1) as usize,
+        "should own one less shard"
+    );
+    assert!(
+        !owned_after.contains(&shard_to_orphan),
+        "orphaned shard should not be owned"
+    );
+
+    // The shard owner map should reflect this
+    let owner_map = coord.get_shard_owner_map().await.unwrap();
+    assert!(
+        owner_map.get_node(&shard_to_orphan).is_none(),
+        "orphaned shard should have no owner in map"
+    );
+
+    // Move it back to default ring
+    coord
+        .update_shard_placement_ring(&shard_to_orphan, None)
+        .await
+        .expect("move back to default");
+
+    // Wait and verify it's owned again
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+
+    let owned_final = coord.owned_shards().await;
+    assert_eq!(owned_final.len(), num_shards as usize);
+    assert!(
+        owned_final.contains(&shard_to_orphan),
+        "shard should be owned again after moving to default"
+    );
+
+    coord.shutdown().await.unwrap();
+    handle.abort();
 }

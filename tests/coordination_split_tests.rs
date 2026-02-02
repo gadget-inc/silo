@@ -76,6 +76,7 @@ async fn request_split_creates_split_record() {
         num_shards,
         10,
         make_test_factory(&prefix, "n1"),
+        Vec::new(),
     )
     .await
     .expect("start coordinator");
@@ -135,6 +136,7 @@ async fn request_split_fails_if_not_owner() {
         num_shards,
         10,
         make_test_factory(&prefix, "n1"),
+        Vec::new(),
     )
     .await
     .expect("start coordinator");
@@ -147,6 +149,7 @@ async fn request_split_fails_if_not_owner() {
         num_shards,
         10,
         make_test_factory(&prefix, "n2"),
+        Vec::new(),
     )
     .await
     .expect("start coordinator 2");
@@ -198,6 +201,7 @@ async fn request_split_fails_if_already_in_progress() {
         num_shards,
         10,
         make_test_factory(&prefix, "n1"),
+        Vec::new(),
     )
     .await
     .expect("start coordinator");
@@ -242,6 +246,7 @@ async fn request_split_fails_for_invalid_split_point() {
         num_shards,
         10,
         make_test_factory(&prefix, "n1"),
+        Vec::new(),
     )
     .await
     .expect("start coordinator");
@@ -296,6 +301,7 @@ async fn is_shard_paused_returns_correct_values() {
         num_shards,
         10,
         make_test_factory(&prefix, "n1"),
+        Vec::new(),
     )
     .await
     .expect("start coordinator");
@@ -344,6 +350,7 @@ async fn split_state_persists_across_restart() {
         num_shards,
         10,
         make_test_factory(&prefix, "n1"),
+        Vec::new(),
     )
     .await
     .expect("start coordinator");
@@ -381,6 +388,7 @@ async fn split_state_persists_across_restart() {
         num_shards,
         10,
         make_test_factory(&prefix, "n1-restart"),
+        Vec::new(),
     )
     .await
     .expect("start coordinator 2");
@@ -423,6 +431,7 @@ async fn get_split_status_returns_none_for_nonexistent() {
         num_shards,
         10,
         make_test_factory(&prefix, "n1"),
+        Vec::new(),
     )
     .await
     .expect("start coordinator");
@@ -466,6 +475,7 @@ async fn execute_split_completes_full_cycle() {
         num_shards,
         10,
         make_test_factory(&prefix, "n1"),
+        Vec::new(),
     )
     .await
     .expect("start coordinator");
@@ -554,6 +564,7 @@ async fn shard_paused_during_split_execution() {
         num_shards,
         10,
         make_test_factory(&prefix, "n1"),
+        Vec::new(),
     )
     .await
     .expect("start coordinator");
@@ -631,6 +642,7 @@ async fn execute_split_fails_without_request() {
         num_shards,
         10,
         make_test_factory(&prefix, "n1"),
+        Vec::new(),
     )
     .await
     .expect("start coordinator");
@@ -671,6 +683,7 @@ async fn execute_split_resumes_from_partial_state() {
         num_shards,
         10,
         make_test_factory(&prefix, "n1"),
+        Vec::new(),
     )
     .await
     .expect("start coordinator");
@@ -738,6 +751,7 @@ async fn sequential_splits_work_correctly() {
         num_shards,
         10,
         make_test_factory(&prefix, "n1"),
+        Vec::new(),
     )
     .await
     .expect("start coordinator");
@@ -811,6 +825,7 @@ async fn split_in_multi_node_cluster() {
         num_shards,
         10,
         make_test_factory(&prefix, "n1"),
+        Vec::new(),
     )
     .await
     .expect("start coordinator 1");
@@ -823,6 +838,7 @@ async fn split_in_multi_node_cluster() {
         num_shards,
         10,
         make_test_factory(&prefix, "n2"),
+        Vec::new(),
     )
     .await
     .expect("start coordinator 2");
@@ -914,6 +930,7 @@ async fn crash_recovery_early_phase_abandons_split() {
         num_shards,
         10,
         make_test_factory(&prefix, "n1"),
+        Vec::new(),
     )
     .await
     .expect("start coordinator 1");
@@ -950,6 +967,7 @@ async fn crash_recovery_early_phase_abandons_split() {
         num_shards,
         10,
         make_test_factory(&prefix, "n1-restart"),
+        Vec::new(),
     )
     .await
     .expect("start coordinator 2");
@@ -1003,6 +1021,7 @@ async fn crash_recovery_late_phase_resumes_split() {
         num_shards,
         10,
         make_test_factory(&prefix, "n1"),
+        Vec::new(),
     )
     .await
     .expect("start coordinator 1");
@@ -1043,6 +1062,7 @@ async fn crash_recovery_late_phase_resumes_split() {
         num_shards,
         10,
         make_test_factory(&prefix, "n1-restart"),
+        Vec::new(),
     )
     .await
     .expect("start coordinator 2");
@@ -1120,6 +1140,7 @@ mod splitter_unit_tests {
                 shutdown_rx,
                 factory,
                 startup_time_ms: None,
+                placement_rings: Vec::new(),
             };
             Self {
                 base,
@@ -1153,6 +1174,21 @@ mod splitter_unit_tests {
                 shard_to_node: HashMap::new(),
                 shard_to_addr: HashMap::new(),
             })
+        }
+
+        async fn update_shard_placement_ring(
+            &self,
+            shard_id: &ShardId,
+            ring: Option<&str>,
+        ) -> Result<(Option<String>, Option<String>), CoordinationError> {
+            let mut shard_map = self.base.shard_map.lock().await;
+            let shard = shard_map
+                .get_shard_mut(shard_id)
+                .ok_or_else(|| CoordinationError::ShardNotFound(*shard_id))?;
+            let previous = shard.placement_ring.clone();
+            let current = ring.map(|s| s.to_string());
+            shard.placement_ring = current.clone();
+            Ok((previous, current))
         }
     }
 

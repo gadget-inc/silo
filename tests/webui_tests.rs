@@ -34,8 +34,16 @@ async fn setup_test_state() -> (tempfile::TempDir, AppState, ShardMap) {
     ));
 
     // Use NoneCoordinator which creates a single-shard map and opens all shards
-    let coordinator: Arc<dyn Coordinator> =
-        Arc::new(NoneCoordinator::new("test-node", "127.0.0.1:50051", 1, factory.clone()).await);
+    let coordinator: Arc<dyn Coordinator> = Arc::new(
+        NoneCoordinator::new(
+            "test-node",
+            "127.0.0.1:50051",
+            1,
+            factory.clone(),
+            Vec::new(),
+        )
+        .await,
+    );
 
     // Get the shard map from the coordinator
     let shard_map = coordinator.get_shard_map().await.expect("get shard map");
@@ -404,6 +412,7 @@ async fn setup_multi_shard_state(num_shards: usize) -> (tempfile::TempDir, AppSt
             "127.0.0.1:50051",
             num_shards as u32,
             factory.clone(),
+            Vec::new(),
         )
         .await,
     );

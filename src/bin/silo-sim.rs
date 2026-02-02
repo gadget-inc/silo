@@ -116,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
         num_shards,
         10,
         factory1,
+        Vec::new(),
     )
     .await?;
     let (c2, h2) = EtcdCoordinator::start(
@@ -126,6 +127,7 @@ async fn main() -> anyhow::Result<()> {
         num_shards,
         10,
         factory2,
+        Vec::new(),
     )
     .await?;
 
@@ -326,6 +328,7 @@ async fn main() -> anyhow::Result<()> {
         num_shards,
         10,
         factory3,
+        Vec::new(),
     )
     .await?;
 

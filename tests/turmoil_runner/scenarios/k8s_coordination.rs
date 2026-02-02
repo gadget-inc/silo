@@ -167,6 +167,7 @@ async fn setup_node_server(
             grpc_addr: format!("http://{}:{}", node_id, port),
             initial_shard_count: NUM_SHARDS,
             lease_duration_secs,
+            placement_rings: Vec::new(),
         },
         Arc::clone(&factory),
     )

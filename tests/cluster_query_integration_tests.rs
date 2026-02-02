@@ -174,6 +174,7 @@ async fn cluster_two_nodes_basic_query() {
         NUM_SHARDS,
         10,
         factory1.clone(),
+        Vec::new(),
     )
     .await
     .expect("start coordinator 1");
@@ -188,6 +189,7 @@ async fn cluster_two_nodes_basic_query() {
         NUM_SHARDS,
         10,
         factory2.clone(),
+        Vec::new(),
     )
     .await
     .expect("start coordinator 2");
@@ -298,6 +300,7 @@ async fn cluster_two_nodes_status_filter_query() {
         NUM_SHARDS,
         10,
         factory1.clone(),
+        Vec::new(),
     )
     .await
     .expect("start coordinator 1");
@@ -311,6 +314,7 @@ async fn cluster_two_nodes_status_filter_query() {
         NUM_SHARDS,
         10,
         factory2.clone(),
+        Vec::new(),
     )
     .await
     .expect("start coordinator 2");
@@ -421,6 +425,7 @@ async fn cluster_two_nodes_count_across_shards() {
         NUM_SHARDS,
         10,
         factory1.clone(),
+        Vec::new(),
     )
     .await
     .expect("start coordinator 1");
@@ -434,6 +439,7 @@ async fn cluster_two_nodes_count_across_shards() {
         NUM_SHARDS,
         10,
         factory2.clone(),
+        Vec::new(),
     )
     .await
     .expect("start coordinator 2");
@@ -542,6 +548,7 @@ async fn cluster_two_nodes_queues_table() {
         NUM_SHARDS,
         10,
         factory1.clone(),
+        Vec::new(),
     )
     .await
     .expect("start coordinator 1");
@@ -555,6 +562,7 @@ async fn cluster_two_nodes_queues_table() {
         NUM_SHARDS,
         10,
         factory2.clone(),
+        Vec::new(),
     )
     .await
     .expect("start coordinator 2");
@@ -639,6 +647,7 @@ async fn cluster_two_nodes_projection_remote_shards() {
         NUM_SHARDS,
         10,
         factory1.clone(),
+        Vec::new(),
     )
     .await
     .expect("start coordinator 1");
@@ -652,6 +661,7 @@ async fn cluster_two_nodes_projection_remote_shards() {
         NUM_SHARDS,
         10,
         factory2.clone(),
+        Vec::new(),
     )
     .await
     .expect("start coordinator 2");

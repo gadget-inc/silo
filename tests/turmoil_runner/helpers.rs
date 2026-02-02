@@ -361,6 +361,7 @@ pub async fn setup_server(port: u16) -> turmoil::Result<()> {
             format!("http://0.0.0.0:{}", port),
             1,
             factory.clone(),
+            Vec::new(),
         )
         .await,
     );

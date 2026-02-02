@@ -66,6 +66,7 @@ macro_rules! start_etcd_coordinator {
             $num_shards,
             10, // lease TTL
             factory,
+            Vec::new(),
         )
         .await
         .expect("Failed to connect to etcd - ensure etcd is running")
@@ -109,6 +110,7 @@ async fn make_guard(
         "http://127.0.0.1:0",
         1,
         factory.clone(),
+        Vec::new(),
     )
     .await;
     let coordinator: Arc<dyn Coordinator> = Arc::new(none_coord);
@@ -669,6 +671,7 @@ async fn etcd_multiple_nodes_partition_shards() {
         num_shards,
         10,
         make_test_factory("test-node-2"),
+        Vec::new(),
     )
     .await
     .expect("start c2");
@@ -740,6 +743,7 @@ async fn etcd_rebalances_on_membership_change() {
         num_shards,
         10,
         make_test_factory("test-node-2"),
+        Vec::new(),
     )
     .await
     .expect("start c2");
@@ -788,6 +792,7 @@ async fn etcd_three_nodes_even_distribution() {
         num_shards,
         10,
         make_test_factory("node-2"),
+        Vec::new(),
     )
     .await
     .expect("start c2");
@@ -799,6 +804,7 @@ async fn etcd_three_nodes_even_distribution() {
         num_shards,
         10,
         make_test_factory("node-3"),
+        Vec::new(),
     )
     .await
     .expect("start c3");
@@ -882,6 +888,7 @@ async fn etcd_removing_node_rebalances() {
         num_shards,
         10,
         make_test_factory("node-2"),
+        Vec::new(),
     )
     .await
     .expect("start c2");
@@ -893,6 +900,7 @@ async fn etcd_removing_node_rebalances() {
         num_shards,
         10,
         make_test_factory("node-3"),
+        Vec::new(),
     )
     .await
     .expect("start c3");
@@ -959,6 +967,7 @@ async fn etcd_ownership_stability_during_steady_state() {
         num_shards,
         10,
         make_test_factory("stable-2"),
+        Vec::new(),
     )
     .await
     .expect("c2");
@@ -1010,6 +1019,7 @@ async fn etcd_no_split_brain_during_transitions() {
         num_shards,
         10,
         make_test_factory("brain-2"),
+        Vec::new(),
     )
     .await
     .expect("c2");
@@ -1079,6 +1089,7 @@ async fn etcd_graceful_shutdown_releases_shards_promptly() {
         num_shards,
         short_ttl,
         make_test_factory("graceful-1"),
+        Vec::new(),
     )
     .await
     {
@@ -1096,6 +1107,7 @@ async fn etcd_graceful_shutdown_releases_shards_promptly() {
         num_shards,
         short_ttl,
         make_test_factory("graceful-2"),
+        Vec::new(),
     )
     .await
     .expect("c2");
@@ -1220,6 +1232,7 @@ async fn etcd_request_split_fails_if_not_owner() {
         num_shards,
         10,
         make_test_factory("split-owner-2"),
+        Vec::new(),
     )
     .await
     .expect("start c2");
@@ -1384,6 +1397,7 @@ async fn etcd_split_state_persists_across_restart() {
         num_shards,
         10,
         make_test_factory("persist-test-1-restart"),
+        Vec::new(),
     )
     .await
     .expect("restart coordinator");
@@ -1648,6 +1662,7 @@ async fn etcd_split_in_multi_node_cluster() {
         num_shards,
         10,
         make_test_factory("split-multi-2"),
+        Vec::new(),
     )
     .await
     .expect("start c2");
@@ -1781,6 +1796,7 @@ async fn etcd_crash_recovery_early_phase_abandons_split() {
         num_shards,
         10,
         make_test_factory("crash-early-1-restart"),
+        Vec::new(),
     )
     .await
     .expect("restart coordinator");
@@ -1865,6 +1881,7 @@ async fn etcd_crash_recovery_late_phase_resumes_split() {
         num_shards,
         10,
         make_test_factory("crash-late-1-restart"),
+        Vec::new(),
     )
     .await
     .expect("restart coordinator");
@@ -2027,6 +2044,485 @@ async fn etcd_grpc_request_split_executes_to_completion() {
     // Cleanup
     let _ = shutdown_tx.send(());
     let _ = server.await;
+    coord.shutdown().await.unwrap();
+    handle.abort();
+}
+
+// =============================================================================
+// Placement Ring Tests
+// =============================================================================
+
+/// Test that a single node with default ring owns all default shards.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn etcd_single_node_default_ring_owns_all_shards() {
+    let prefix = unique_prefix();
+    let num_shards: u32 = 4;
+
+    // Node with empty placement_rings participates in default ring
+    let (coord, handle) = start_etcd_coordinator!(
+        &prefix,
+        "default-node",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+
+    assert!(
+        coord.wait_converged(Duration::from_secs(10)).await,
+        "coordinator should converge"
+    );
+
+    // All shards default to no ring, so default node should own all
+    let owned = coord.owned_shards().await;
+    assert_eq!(
+        owned.len(),
+        num_shards as usize,
+        "default node should own all shards"
+    );
+
+    coord.shutdown().await.unwrap();
+    handle.abort();
+}
+
+/// Test that nodes with different rings get different shards based on ring assignment.
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn etcd_multi_ring_shard_assignment() {
+    let prefix = unique_prefix();
+    let num_shards: u32 = 8;
+
+    // Start a default node (empty placement_rings = default ring)
+    let (c_default, h_default) = start_etcd_coordinator!(
+        &prefix,
+        "default-node",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+    let c_default: Arc<dyn Coordinator> = Arc::new(c_default);
+
+    assert!(
+        c_default.wait_converged(Duration::from_secs(15)).await,
+        "default node should converge"
+    );
+
+    // All shards start in default ring, so default node owns all
+    let owned_default_before = c_default.owned_shards().await;
+    assert_eq!(
+        owned_default_before.len(),
+        num_shards as usize,
+        "default node should own all shards initially"
+    );
+
+    // Start a GPU node that only participates in the "gpu" ring
+    let endpoints = get_etcd_endpoints();
+    let (c_gpu, h_gpu) = EtcdCoordinator::start(
+        &endpoints,
+        &prefix,
+        "gpu-node",
+        "http://127.0.0.1:50052",
+        num_shards,
+        10,
+        make_test_factory("gpu-node"),
+        vec!["gpu".to_string()],
+    )
+    .await
+    .expect("start gpu node");
+    let c_gpu: Arc<dyn Coordinator> = Arc::new(c_gpu);
+
+    // Wait for both to converge
+    assert!(
+        c_default.wait_converged(Duration::from_secs(15)).await,
+        "default node should converge"
+    );
+    assert!(
+        c_gpu.wait_converged(Duration::from_secs(15)).await,
+        "gpu node should converge"
+    );
+
+    // GPU node should own no shards (all shards are in default ring, not gpu ring)
+    let owned_gpu = c_gpu.owned_shards().await;
+    assert_eq!(
+        owned_gpu.len(),
+        0,
+        "gpu node should own no shards (no shards in gpu ring)"
+    );
+
+    // Default node should still own all shards
+    let owned_default_after = c_default.owned_shards().await;
+    assert_eq!(
+        owned_default_after.len(),
+        num_shards as usize,
+        "default node should still own all shards"
+    );
+
+    // Now move one shard to the gpu ring
+    let shard_to_move = owned_default_after[0];
+    let (prev, curr) = c_default
+        .update_shard_placement_ring(&shard_to_move, Some("gpu"))
+        .await
+        .expect("update placement ring");
+    assert!(prev.is_none(), "previous ring should be None (default)");
+    assert_eq!(curr, Some("gpu".to_string()), "current ring should be gpu");
+
+    // Wait for GPU node to acquire the shard - this involves:
+    // 1. shard_map update propagating to gpu-node
+    // 2. gpu-node reconciling and seeing shard_to_move as desired
+    // 3. default-node releasing the shard lease
+    // 4. gpu-node acquiring the shard lease
+    let shard_to_move_clone = shard_to_move;
+    let c_gpu_clone = c_gpu.clone();
+    let acquired = wait_until(Duration::from_secs(30), || {
+        let c = c_gpu_clone.clone();
+        let s = shard_to_move_clone;
+        async move { c.owned_shards().await.contains(&s) }
+    })
+    .await;
+    assert!(acquired, "gpu node should acquire the moved shard");
+
+    // Wait for default node to release the shard
+    let c_default_clone = c_default.clone();
+    let released = wait_until(Duration::from_secs(15), || {
+        let c = c_default_clone.clone();
+        let s = shard_to_move_clone;
+        async move { !c.owned_shards().await.contains(&s) }
+    })
+    .await;
+    assert!(released, "default node should release the moved shard");
+
+    // GPU node should now own the moved shard
+    let owned_gpu_after = c_gpu.owned_shards().await;
+    assert_eq!(owned_gpu_after.len(), 1, "gpu node should own 1 shard");
+    assert_eq!(
+        owned_gpu_after[0], shard_to_move,
+        "gpu node should own the moved shard"
+    );
+
+    // Default node should own one less shard
+    let owned_default_final = c_default.owned_shards().await;
+    assert_eq!(
+        owned_default_final.len(),
+        (num_shards - 1) as usize,
+        "default node should own one less shard"
+    );
+    assert!(
+        !owned_default_final.contains(&shard_to_move),
+        "default node should not own the moved shard"
+    );
+
+    // Cleanup
+    c_gpu.shutdown().await.unwrap();
+    h_gpu.abort();
+    c_default.shutdown().await.unwrap();
+    h_default.abort();
+}
+
+/// Test ConfigureShard RPC moving shard between rings.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn etcd_configure_shard_ring_changes() {
+    let prefix = unique_prefix();
+    let num_shards: u32 = 2;
+
+    let (coord, handle) =
+        start_etcd_coordinator!(&prefix, "test-node", "http://127.0.0.1:50051", num_shards);
+    let coord: Arc<dyn Coordinator> = Arc::new(coord);
+
+    assert!(
+        coord.wait_converged(Duration::from_secs(10)).await,
+        "coordinator should converge"
+    );
+
+    let owned = coord.owned_shards().await;
+    let shard_id = owned[0];
+
+    // Initially shard has no ring (default)
+    let shard_map = coord.get_shard_map().await.unwrap();
+    assert!(
+        shard_map
+            .get_shard(&shard_id)
+            .unwrap()
+            .placement_ring
+            .is_none(),
+        "shard should start with no ring"
+    );
+
+    // Configure shard to a specific ring
+    let (prev, curr) = coord
+        .update_shard_placement_ring(&shard_id, Some("tenant-a"))
+        .await
+        .expect("set ring");
+    assert!(prev.is_none(), "previous should be None");
+    assert_eq!(curr, Some("tenant-a".to_string()));
+
+    // Verify in shard map
+    let shard_map = coord.get_shard_map().await.unwrap();
+    assert_eq!(
+        shard_map.get_shard(&shard_id).unwrap().placement_ring,
+        Some("tenant-a".to_string())
+    );
+
+    // Change to different ring
+    let (prev, curr) = coord
+        .update_shard_placement_ring(&shard_id, Some("tenant-b"))
+        .await
+        .expect("change ring");
+    assert_eq!(prev, Some("tenant-a".to_string()));
+    assert_eq!(curr, Some("tenant-b".to_string()));
+
+    // Clear ring back to default
+    let (prev, curr) = coord
+        .update_shard_placement_ring(&shard_id, None)
+        .await
+        .expect("clear ring");
+    assert_eq!(prev, Some("tenant-b".to_string()));
+    assert!(curr.is_none(), "current should be None (default)");
+
+    // Verify cleared
+    let shard_map = coord.get_shard_map().await.unwrap();
+    assert!(
+        shard_map
+            .get_shard(&shard_id)
+            .unwrap()
+            .placement_ring
+            .is_none(),
+        "shard ring should be cleared"
+    );
+
+    coord.shutdown().await.unwrap();
+    handle.abort();
+}
+
+/// Test that MemberInfo correctly reports placement rings.
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn etcd_member_info_reports_rings() {
+    let prefix = unique_prefix();
+    let num_shards: u32 = 4;
+
+    // Start a default node
+    let (c1, h1) = start_etcd_coordinator!(
+        &prefix,
+        "node-default",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Start a node with multiple rings
+    let endpoints = get_etcd_endpoints();
+    let (c2, h2) = EtcdCoordinator::start(
+        &endpoints,
+        &prefix,
+        "node-multi",
+        "http://127.0.0.1:50052",
+        num_shards,
+        10,
+        make_test_factory("node-multi"),
+        vec!["gpu".to_string(), "high-memory".to_string()],
+    )
+    .await
+    .expect("start node-multi");
+
+    // Wait for both to be visible
+    assert!(c1.wait_converged(Duration::from_secs(15)).await);
+    assert!(c2.wait_converged(Duration::from_secs(15)).await);
+
+    // Get members from c1's perspective
+    let members = c1.get_members().await.expect("get members");
+    assert_eq!(members.len(), 2, "should see 2 members");
+
+    // Find each node
+    let default_member = members.iter().find(|m| m.node_id == "node-default");
+    let multi_member = members.iter().find(|m| m.node_id == "node-multi");
+
+    assert!(default_member.is_some(), "should find default node");
+    assert!(multi_member.is_some(), "should find multi node");
+
+    // Check rings
+    let default_rings = &default_member.unwrap().placement_rings;
+    let multi_rings = &multi_member.unwrap().placement_rings;
+
+    assert!(
+        default_rings.is_empty(),
+        "default node should have empty rings"
+    );
+    assert_eq!(multi_rings.len(), 2, "multi node should have 2 rings");
+    assert!(
+        multi_rings.contains(&"gpu".to_string()),
+        "multi node should have gpu ring"
+    );
+    assert!(
+        multi_rings.contains(&"high-memory".to_string()),
+        "multi node should have high-memory ring"
+    );
+
+    // Cleanup
+    c1.shutdown().await.unwrap();
+    h1.abort();
+    c2.shutdown().await.unwrap();
+    h2.abort();
+}
+
+/// Test that ring change triggers shard handoff between nodes.
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn etcd_ring_change_triggers_handoff() {
+    let prefix = unique_prefix();
+    let num_shards: u32 = 4;
+
+    // Start default node
+    let (c_default, h_default) = start_etcd_coordinator!(
+        &prefix,
+        "default-node",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+    let c_default: Arc<dyn Coordinator> = Arc::new(c_default);
+
+    assert!(c_default.wait_converged(Duration::from_secs(15)).await);
+
+    // Capture initial ownership
+    let initial_owned = c_default.owned_shards().await;
+    assert_eq!(initial_owned.len(), num_shards as usize);
+
+    // Start a dedicated tenant node
+    let endpoints = get_etcd_endpoints();
+    let (c_tenant, h_tenant) = EtcdCoordinator::start(
+        &endpoints,
+        &prefix,
+        "tenant-node",
+        "http://127.0.0.1:50052",
+        num_shards,
+        10,
+        make_test_factory("tenant-node"),
+        vec!["tenant-acme".to_string()],
+    )
+    .await
+    .expect("start tenant node");
+    let c_tenant: Arc<dyn Coordinator> = Arc::new(c_tenant);
+
+    // Wait for tenant node to be ready
+    assert!(c_tenant.wait_converged(Duration::from_secs(15)).await);
+
+    // Tenant node should own no shards yet
+    let tenant_owned_before = c_tenant.owned_shards().await;
+    assert_eq!(
+        tenant_owned_before.len(),
+        0,
+        "tenant node should own no shards initially"
+    );
+
+    // Move two shards to tenant ring
+    let shard_1 = initial_owned[0];
+    let shard_2 = initial_owned[1];
+
+    c_default
+        .update_shard_placement_ring(&shard_1, Some("tenant-acme"))
+        .await
+        .expect("move shard 1");
+    c_default
+        .update_shard_placement_ring(&shard_2, Some("tenant-acme"))
+        .await
+        .expect("move shard 2");
+
+    // Wait for convergence
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        c_default.wait_converged(Duration::from_secs(15)).await,
+        "default node should converge"
+    );
+    assert!(
+        c_tenant.wait_converged(Duration::from_secs(15)).await,
+        "tenant node should converge"
+    );
+
+    // Verify tenant node now owns the moved shards
+    let tenant_owned_after: HashSet<ShardId> = c_tenant.owned_shards().await.into_iter().collect();
+    assert_eq!(tenant_owned_after.len(), 2, "tenant should own 2 shards");
+    assert!(tenant_owned_after.contains(&shard_1));
+    assert!(tenant_owned_after.contains(&shard_2));
+
+    // Verify default node no longer owns those shards
+    let default_owned_after: HashSet<ShardId> =
+        c_default.owned_shards().await.into_iter().collect();
+    assert_eq!(
+        default_owned_after.len(),
+        (num_shards - 2) as usize,
+        "default should own 2 fewer shards"
+    );
+    assert!(!default_owned_after.contains(&shard_1));
+    assert!(!default_owned_after.contains(&shard_2));
+
+    // Cleanup
+    c_tenant.shutdown().await.unwrap();
+    h_tenant.abort();
+    c_default.shutdown().await.unwrap();
+    h_default.abort();
+}
+
+/// Test that orphaned shards (no eligible node) remain unowned.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn etcd_orphaned_ring_shard_remains_unowned() {
+    let prefix = unique_prefix();
+    let num_shards: u32 = 2;
+
+    // Start only a default node
+    let (coord, handle) = start_etcd_coordinator!(
+        &prefix,
+        "default-node",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+    let coord: Arc<dyn Coordinator> = Arc::new(coord);
+
+    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+
+    let owned_before = coord.owned_shards().await;
+    assert_eq!(owned_before.len(), num_shards as usize);
+
+    // Move a shard to a ring with no nodes
+    let shard_to_orphan = owned_before[0];
+    coord
+        .update_shard_placement_ring(&shard_to_orphan, Some("nonexistent-ring"))
+        .await
+        .expect("move to nonexistent ring");
+
+    // Wait for convergence
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+
+    // The orphaned shard should no longer be owned
+    let owned_after: HashSet<ShardId> = coord.owned_shards().await.into_iter().collect();
+    assert_eq!(
+        owned_after.len(),
+        (num_shards - 1) as usize,
+        "should own one less shard"
+    );
+    assert!(
+        !owned_after.contains(&shard_to_orphan),
+        "orphaned shard should not be owned"
+    );
+
+    // The shard owner map should reflect this
+    let owner_map = coord.get_shard_owner_map().await.unwrap();
+    assert!(
+        owner_map.get_node(&shard_to_orphan).is_none(),
+        "orphaned shard should have no owner in map"
+    );
+
+    // Move it back to default ring
+    coord
+        .update_shard_placement_ring(&shard_to_orphan, None)
+        .await
+        .expect("move back to default");
+
+    // Wait and verify it's owned again
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+
+    let owned_final = coord.owned_shards().await;
+    assert_eq!(owned_final.len(), num_shards as usize);
+    assert!(
+        owned_final.contains(&shard_to_orphan),
+        "shard should be owned again after moving to default"
+    );
+
     coord.shutdown().await.unwrap();
     handle.abort();
 }
