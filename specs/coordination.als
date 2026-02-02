@@ -198,7 +198,7 @@ pred hasFlapped[n: Node, t: Time] {
 }
 
 /**
- * [SILO-MEMBER-JOIN-1] Node joins the cluster by registering membership.
+ * Node joins the cluster by registering membership.
  * 
  * Preconditions:
  * - Node is not already a member
@@ -227,7 +227,7 @@ pred nodeJoin[n: Node, addr: Addr, t: Time, tnext: Time] {
 }
 
 /**
- * [SILO-MEMBER-LEAVE-1] Node gracefully leaves the cluster.
+ * Node gracefully leaves the cluster.
  * 
  * Preconditions:
  * - Node is currently a member
@@ -256,7 +256,7 @@ pred nodeLeave[n: Node, t: Time, tnext: Time] {
 }
 
 /**
- * [SILO-MEMBER-FLAP-1] Node loses connectivity to coordination backend.
+ * Node loses connectivity to coordination backend.
  * 
  * This models the dangerous partial failure case where a node's lease
  * has expired in etcd but the node doesn't know it yet. The node still
@@ -288,7 +288,7 @@ pred nodeFlap[n: Node, t: Time, tnext: Time] {
 }
 
 /**
- * [SILO-MEMBER-RECOVER-1] Flapped node detects its lease expired and stops serving.
+ * Flapped node detects its lease expired and stops serving.
  * 
  * This models the recovery path where a flapped node realizes it has lost
  * its leases and stops trying to serve traffic.
@@ -380,7 +380,7 @@ fun shardSplitCleanupStatus[s: Shard, t: Time]: set CleanupStatus {
 }
 
 /**
- * [SILO-RANGE-1] Check if a shard's range contains a given tenant ID.
+ * Check if a shard's range contains a given tenant ID.
  * 
  * A range [start, end) contains tenant if:
  * - start <= tenant < end
@@ -452,7 +452,7 @@ pred hasLeaseHolder[s: Shard, t: Time] {
 }
 
 /**
- * [SILO-LEASE-SAFE-1] Check if a node can safely serve a shard.
+ * Check if a node can safely serve a shard.
  * 
  * A node can serve a shard only if:
  * - It holds the lease for the shard
@@ -466,7 +466,7 @@ pred canServe[n: Node, s: Shard, t: Time] {
 }
 
 /**
- * [SILO-LEASE-ACQ-1] Node acquires lease on a shard.
+ * Node acquires lease on a shard.
  * 
  * In the implementation, this is an etcd Lock operation on the shard's owner key.
  * The lock is tied to the node's liveness lease.
@@ -501,7 +501,7 @@ pred leaseAcquire[n: Node, s: Shard, t: Time, tnext: Time] {
 }
 
 /**
- * [SILO-LEASE-REL-1] Node releases lease on a shard.
+ * Node releases lease on a shard.
  * 
  * In the implementation, this is an etcd Unlock operation.
  * 
@@ -523,7 +523,7 @@ pred leaseRelease[n: Node, s: Shard, t: Time, tnext: Time] {
 }
 
 /**
- * [SILO-LEASE-EXPIRE-1] Lease expires when node flaps.
+ * Lease expires when node flaps.
  * 
  * When a node's membership lease expires in etcd, its shard leases
  * also expire because they are tied to the same liveness lease.
@@ -576,7 +576,7 @@ pred splitCompleted[s: Shard, t: Time] {
 }
 
 /**
- * [SILO-SPLIT-REQ-1] Initiate a shard split.
+ * Initiate a shard split.
  * 
  * This is called via an RPC to the node holding the shard's lease.
  * The split creates two new shards from one parent, dividing the keyspace
@@ -628,7 +628,7 @@ pred splitRequest[n: Node, s: Shard, sp: SplitPoint, leftChild: Shard, rightChil
 }
 
 /**
- * [SILO-SPLIT-PAUSE-1] Pause traffic to the shard being split.
+ * Pause traffic to the shard being split.
  * 
  * Traffic is paused by having the shard return retryable errors.
  * This ensures no new work starts on the parent shard during split.
@@ -663,7 +663,7 @@ pred splitPauseTraffic[n: Node, s: Shard, t: Time, tnext: Time] {
 }
 
 /**
- * [SILO-SPLIT-CLONE-1] Execute the SlateDB clone operation.
+ * Execute the SlateDB clone operation.
  * 
  * This creates two SlateDB clones from the parent database.
  * Each clone becomes the backing store for one of the child shards.
@@ -699,7 +699,7 @@ pred splitCloneDb[n: Node, s: Shard, t: Time, tnext: Time] {
 }
 
 /**
- * [SILO-SPLIT-MAP-1] Update the shard map atomically.
+ * Update the shard map atomically.
  * 
  * This atomically replaces the parent shard with the two child shards
  * in the shard map. The parent shard is removed, children are added.
@@ -778,10 +778,10 @@ pred splitUpdateMap[n: Node, s: Shard, t: Time, tnext: Time] {
 }
 
 /**
- * [SILO-SPLIT-COMPLETE-1] Complete the split and cleanup.
+ * Delete the split record after completion.
  * 
- * The split record is deleted after completion. This is just cleanup
- * of the split record - the actual work was done in splitUpdateMap.
+ * The split record is deleted after the shard map update. This is just cleanup
+ * of the split record - the actual commit was done in splitUpdateMap.
  * 
  * Preconditions:
  * - Split is in SplitComplete phase
@@ -825,7 +825,7 @@ pred workerGotRetryable[w: Worker, t: Time] {
 }
 
 /**
- * [SILO-ROUTE-1] Worker sends a request for a tenant.
+ * Worker sends a request for a tenant.
  * 
  * The worker uses its cached topology to route the request to the
  * shard it believes owns the tenant.
@@ -861,7 +861,7 @@ pred workerSendRequest[w: Worker, tenant: TenantId, t: Time, tnext: Time] {
 }
 
 /**
- * [SILO-ROUTE-SUCCESS-1] Worker request succeeds.
+ * Worker request succeeds.
  * 
  * The request was routed to the correct shard and processed.
  * 
@@ -898,7 +898,7 @@ pred workerRequestSuccess[w: Worker, tenant: TenantId, t: Time, tnext: Time] {
 }
 
 /**
- * [SILO-ROUTE-PAUSED-1] Worker request fails with retryable error (shard paused).
+ * Worker request fails with retryable error (shard paused).
  * 
  * The request was sent to a shard that is mid-split and paused.
  * Worker receives a retryable error and should retry after backoff.
@@ -932,7 +932,7 @@ pred workerRequestPaused[w: Worker, tenant: TenantId, t: Time, tnext: Time] {
 }
 
 /**
- * [SILO-ROUTE-REDIRECT-1] Worker request fails with wrong-shard error.
+ * Worker request fails with wrong-shard error.
  * 
  * The request was sent to a shard that doesn't own the tenant anymore
  * (e.g., after a split). Worker receives a redirect error and updates cache.
@@ -966,7 +966,7 @@ pred workerRequestWrongShard[w: Worker, tenant: TenantId, t: Time, tnext: Time] 
 }
 
 /**
- * [SILO-ROUTE-REFRESH-1] Worker refreshes its topology cache.
+ * Worker refreshes its topology cache.
  * 
  * Worker calls GetClusterInfo to get the latest shard map and
  * updates its cached routes.
@@ -992,7 +992,7 @@ pred workerRefreshTopology[w: Worker, tenant: TenantId, t: Time, tnext: Time] {
 }
 
 /**
- * [SILO-ROUTE-CACHE-INIT-1] Worker initializes cache for a tenant.
+ * Worker initializes cache for a tenant.
  * 
  * Worker learns about a shard when it first needs to route to a tenant.
  * Typically via a redirect or explicit topology refresh.
@@ -1041,7 +1041,7 @@ pred splitCompactionDoneFor[s: Shard, t: Time] {
 }
 
 /**
- * [SILO-SPLIT-CLEANUP-START-1] Start cleanup process for a shard.
+ * Start cleanup process for a shard.
  * 
  * After a split, the child shards contain defunct data (keys outside their range).
  * This starts the background process to delete that data.
@@ -1082,7 +1082,7 @@ pred splitCleanupStart[n: Node, s: Shard, t: Time, tnext: Time] {
 }
 
 /**
- * [SILO-SPLIT-CLEANUP-1] Complete cleanup of defunct data.
+ * Complete cleanup of defunct data.
  * 
  * The background process has finished deleting keys that are outside
  * this shard's tenant_id range.
@@ -1123,7 +1123,7 @@ pred splitCleanupComplete[n: Node, s: Shard, t: Time, tnext: Time] {
 }
 
 /**
- * [SILO-SPLIT-COMPACT-1] Run full compaction on a cleaned shard.
+ * Run full compaction on a cleaned shard.
  * 
  * After cleanup, we run a full compaction using SlateDB's Admin API
  * to reclaim storage space from deleted keys.
@@ -1164,7 +1164,7 @@ pred compactShard[n: Node, s: Shard, t: Time, tnext: Time] {
 }
 
 /**
- * [SILO-SPLIT-CLEANUP-RESTART-1] Restart cleanup on a new node.
+ * Restart cleanup on a new node.
  * 
  * If a node takes over a shard mid-cleanup (e.g., after node failure),
  * it must restart the cleanup process from the beginning.
@@ -1219,19 +1219,19 @@ fact wellFormed {
     -- A node has at most one flapped record per time
     all n: Node, t: Time | lone f: NodeFlapped | f.flapped_node = n and f.flapped_time = t
     
-    -- [SILO-COORD-INV-18] A node cannot be both a member and flapped at the same time
+    -- A node cannot be both a member and flapped at the same time
     all n: Node, t: Time | not (isMember[n, t] and hasFlapped[n, t])
     
-    -- [SILO-COORD-INV-10] A shard has at most one map entry per time
+    -- A shard has at most one map entry per time
     all s: Shard, t: Time | lone sme: ShardMapEntry | sme.sme_shard = s and sme.sme_time = t
     
-    -- [SILO-COORD-INV-11] Shard ranges must be valid (start < end or both special)
+    -- Shard ranges must be valid (start < end or both special)
     all sme: ShardMapEntry | {
         sme.sme_rangeStart = TenantMin or sme.sme_rangeEnd = TenantMax or
         tenantLt[sme.sme_rangeStart, sme.sme_rangeEnd]
     }
     
-    -- [SILO-COORD-INV-2] Keyspace coverage: if shards exist, they cover the full keyspace
+    -- Keyspace coverage: if shards exist, they cover the full keyspace
     -- First shard must start at TenantMin
     all t: Time | some shardsAt[t] implies 
         some s: shardsAt[t] | shardRangeStart[s, t] = TenantMin
@@ -1250,12 +1250,12 @@ fact wellFormed {
     all t: Time, s1, s2: shardsAt[t] | s1 != s2 implies
         shardRangeStart[s1, t] != shardRangeStart[s2, t]
     
-    -- [SILO-COORD-INV-19] Parent shard must have existed if set
+    -- Parent shard must have existed if set
     all sme: ShardMapEntry | some sme.sme_parentShard implies
         (some t2: Time | shardExists[sme.sme_parentShard, t2]) or
         (some sp: SplitInProgress | sp.split_parent = sme.sme_parentShard)
     
-    -- [SILO-COORD-INV-1] At most one lease holder per shard at each time (no split-brain)
+    -- At most one lease holder per shard at each time (no split-brain)
     all s: Shard, t: Time | lone l: ShardLease | l.lease_shard = s and l.lease_time = t
     
     -- A lease can only exist for a shard that exists
@@ -1271,15 +1271,15 @@ fact wellFormed {
     all sp: SplitInProgress | sp.split_leftChild != sp.split_rightChild
     all sp: SplitInProgress | sp.split_leftChild != sp.split_parent and sp.split_rightChild != sp.split_parent
     
-    -- [SILO-COORD-INV-15] Split point must not be TenantMin or TenantMax
+    -- Split point must not be TenantMin or TenantMax
     all sp: SplitInProgress | sp.split_point.tenant != TenantMin and sp.split_point.tenant != TenantMax
     
-    -- [SILO-COORD-INV-3] Split children have contiguous ranges when both exist
+    -- Split children have contiguous ranges when both exist
     all sp: SplitInProgress, t: Time |
         (shardExists[sp.split_leftChild, t] and shardExists[sp.split_rightChild, t]) implies
             shardRangeEnd[sp.split_leftChild, t] = shardRangeStart[sp.split_rightChild, t]
     
-    -- [SILO-COORD-INV-9] Split parent exists (unless in SplitComplete where it's been removed)
+    -- Split parent exists (unless in SplitComplete where it's been removed)
     all sp: SplitInProgress |
         shardExists[sp.split_parent, sp.split_time] or 
         sp.split_phase = SplitComplete
@@ -1502,7 +1502,7 @@ pred nodeFlapStep[n: Node, t: Time, tnext: Time] {
     -- All leases held by this node expire
     all s: Shard | holdsLease[n, s, t] implies not hasLeaseHolder[s, tnext]
     
-    -- [SILO-SPLIT-CRASH-1] All incomplete splits are abandoned when the node crashes.
+    -- All incomplete splits are abandoned when the node crashes.
     -- The shard map update is the commit point - if children don't exist in the shard map,
     -- the split never completed and is safe to abandon. Orphaned clone databases may exist
     -- but don't affect correctness.
@@ -1833,7 +1833,7 @@ pred splitResumeStep_UNUSED[n: Node, s: Shard, t: Time, tnext: Time] {
 }
 
 /**
- * [SILO-SPLIT-RESTART-1] A new node restarts a split from scratch.
+ * A new node restarts a split from scratch.
  * 
  * When a node crashes before splitUpdateMap, the split is abandoned.
  * A new node that acquires the lease on the parent can start a new split.
@@ -2039,10 +2039,7 @@ assert leaseRequiresMembership {
 }
 
 /**
- * Cleanup status is consistent.
- * 
- * The cleanup status follows a progression: Pending -> Running -> Done -> CompactionDone.
- * This verifies the CleanupStatus values are valid
+ * Cleanup status values are valid (structural constraint, not a safety invariant).
  */
 assert cleanupStatusIsValid {
     all sme: ShardMapEntry | 
@@ -2050,19 +2047,10 @@ assert cleanupStatusIsValid {
 }
 
 /**
- * [SILO-COORD-INV-8] Lease holder count is at most one.
+ * [SILO-COORD-INV-7] Split operations reference existing parent.
  * 
- * This verifies the core split-brain prevention: at any time, each shard
- * has at most one lease holder. (Redundant with noSplitBrain but explicit.)
- */
-assert leaseHolderCountAtMostOne {
-    all s: Shard, t: Time | #{n: Node | holdsLease[n, s, t]} <= 1
-}
-
-/**
- * [SILO-COORD-INV-9] Split operations reference existing parent.
- * 
- * A split operation must reference a parent shard that exists.
+ * A split operation must reference a parent shard that exists
+ * (unless in SplitComplete phase where the parent has been removed).
  */
 assert splitParentExists {
     all sp: SplitInProgress | shardExists[sp.split_parent, sp.split_time] or
@@ -2070,7 +2058,7 @@ assert splitParentExists {
 }
 
 /**
- * [SILO-COORD-INV-16] Cleanup status only progresses forward.
+ * [SILO-COORD-INV-8] Cleanup status only progresses forward.
  * 
  * Once cleanup transitions to a later state, it cannot go backwards.
  * Progression: CleanupPending -> CleanupRunning -> CleanupDone -> CompactionDone
@@ -2088,7 +2076,7 @@ assert cleanupStatusMonotonic {
 }
 
 /**
- * [SILO-COORD-INV-17] Split phases only progress forward.
+ * [SILO-COORD-INV-9] Split phases only progress forward.
  * 
  * Once a split transitions to a later phase, it cannot go backwards.
  * Progression: SplitRequested -> SplitPausing -> SplitCloning -> SplitComplete
@@ -2106,7 +2094,7 @@ assert splitPhaseMonotonic {
 }
 
 /**
- * [SILO-COORD-INV-18] Node cannot be both member and flapped simultaneously.
+ * [SILO-COORD-INV-10] Node cannot be both member and flapped simultaneously.
  * 
  * A node is either a member (active in the cluster) or flapped (lost connectivity
  * but thinks it's still active), never both.
@@ -2116,19 +2104,7 @@ assert memberAndFlappedMutuallyExclusive {
 }
 
 /**
- * [SILO-COORD-INV-19] Parent shard reference must be valid.
- * 
- * If a shard has a parent shard set, that parent must have existed at some point
- * or be part of an in-progress split.
- */
-assert parentShardReferenceValid {
-    all sme: ShardMapEntry | some sme.sme_parentShard implies
-        (some t2: Time | shardExists[sme.sme_parentShard, t2]) or
-        (some sp: SplitInProgress | sp.split_parent = sme.sme_parentShard)
-}
-
-/**
- * [SILO-COORD-INV-20] Early split crash preserves parent shard.
+ * [SILO-COORD-INV-11] Early split crash preserves parent shard.
  * 
  * If a split crashes during an early phase (before UpdateMap), the parent
  * shard must remain available. This ensures no data is lost.
@@ -2145,15 +2121,11 @@ assert earlySplitCrashPreservesParent {
 }
 
 /**
- * [SILO-COORD-INV-21] Split children persist once created.
+ * [SILO-COORD-INV-12] Split children persist once created.
  * 
  * If the split's children exist at some time, they continue to exist
  * at all later times (no shard deletion). This ensures that the children
  * remain available once the split commits.
- * 
- * Note: The splitUpdateMapStep transition creates children atomically
- * with the phase change to SplitComplete (commit point). This assertion
- * verifies that children, once created, are never deleted.
  */
 assert splitChildrenPersist {
     all sp: SplitInProgress, t1, t2: Time |
@@ -2165,12 +2137,11 @@ assert splitChildrenPersist {
 }
 
 /**
- * [SILO-COORD-INV-22] Committed splits preserve their state.
+ * [SILO-COORD-INV-13] Committed splits preserve their state.
  * 
  * If a split reaches SplitComplete phase (committed), the split state
- * can be cleaned up. Before SplitComplete, any crash abandons the split.
- * This simplification means there's no "resume" logic - all incomplete
- * splits are abandoned and the shard map is the source of truth.
+ * can be cleaned up but not regressed. Before SplitComplete, any crash
+ * abandons the split. This ensures the shard map is the source of truth.
  */
 assert committedSplitStatePreserved {
     all s: Shard, t1, t2: Time |
@@ -2596,13 +2567,6 @@ check cleanupStatusIsValid for 3 but
     6 SplitInProgress, 0 WorkerRouteCache, 0 WorkerRequest, 0 WorkerRetryableError,
     6 TenantOrder
 
--- Lease holder count
-check leaseHolderCountAtMostOne for 3 but 
-    2 Node, 2 Shard, 2 Addr, 3 TenantId, 6 Time, 1 SplitPoint, 0 Worker,
-    6 NodeMembership, 6 NodeFlapped, 6 ShardMapEntry, 6 ShardLease,
-    6 SplitInProgress, 0 WorkerRouteCache, 0 WorkerRequest, 0 WorkerRetryableError,
-    6 TenantOrder
-
 -- Split parent exists
 check splitParentExists for 3 but 
     2 Node, 3 Shard, 2 Addr, 4 TenantId, 6 Time, 1 SplitPoint, 0 Worker,
@@ -2630,13 +2594,6 @@ check memberAndFlappedMutuallyExclusive for 3 but
     6 NodeMembership, 6 NodeFlapped, 6 ShardMapEntry, 6 ShardLease,
     6 SplitInProgress, 0 WorkerRouteCache, 0 WorkerRequest, 0 WorkerRetryableError,
     6 TenantOrder
-
--- Parent shard reference valid
-check parentShardReferenceValid for 3 but 
-    2 Node, 3 Shard, 2 Addr, 4 TenantId, 6 Time, 1 SplitPoint, 0 Worker,
-    6 NodeMembership, 6 NodeFlapped, 12 ShardMapEntry, 6 ShardLease,
-    6 SplitInProgress, 0 WorkerRouteCache, 0 WorkerRequest, 0 WorkerRetryableError,
-    8 TenantOrder
 
 -- Early split crash preserves parent shard
 check earlySplitCrashPreservesParent for 3 but 
