@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,15 +24,6 @@ struct Args {
     /// path to a TOML config file
     #[arg(short = 'c', long = "config", global = true)]
     config: Option<PathBuf>,
-
-    #[command(subcommand)]
-    command: Option<Command>,
-}
-
-#[derive(Subcommand, Debug)]
-enum Command {
-    /// Validate a config file and exit
-    ValidateConfig,
 }
 
 #[tokio::main]
@@ -47,12 +38,6 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(1);
         }
     };
-
-    // Handle validate-config command
-    if let Some(Command::ValidateConfig) = args.command {
-        println!("Config is valid");
-        std::process::exit(0);
-    }
 
     // Initialize tracing with configured log format
     silo::trace::init(cfg.logging.format)?;

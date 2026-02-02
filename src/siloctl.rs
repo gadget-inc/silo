@@ -3,9 +3,8 @@
 //! This module provides the core functionality for `siloctl`, allowing both
 //! the CLI binary and tests to use the same code.
 
-use std::io::Write;
-
 use std::fs::File;
+use std::io::Write;
 use std::path::Path;
 
 use crate::pb::silo_client::SiloClient;
@@ -764,6 +763,41 @@ pub async fn shard_configure<W: Write>(
     }
 
     Ok(())
+}
+
+/// Validate a Silo configuration file
+pub async fn validate_config<W: Write>(
+    opts: &GlobalOptions,
+    out: &mut W,
+    config_path: &Path,
+) -> anyhow::Result<()> {
+    match crate::settings::AppConfig::load(Some(config_path)) {
+        Ok(_cfg) => {
+            if opts.json {
+                writeln!(
+                    out,
+                    r#"{{"status": "valid", "config_path": "{}"}}"#,
+                    config_path.display()
+                )?;
+            } else {
+                writeln!(out, "Config is valid: {}", config_path.display())?;
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if opts.json {
+                let json_output = serde_json::json!({
+                    "status": "invalid",
+                    "config_path": config_path.display().to_string(),
+                    "error": e.to_string(),
+                });
+                writeln!(out, "{}", serde_json::to_string_pretty(&json_output)?)?;
+            } else {
+                writeln!(out, "Config error: {}", e)?;
+            }
+            Err(anyhow::anyhow!("Config validation failed: {}", e))
+        }
+    }
 }
 
 /// Compute the lexicographic midpoint of two strings

@@ -1015,3 +1015,51 @@ async fn siloctl_shard_configure_invalid_shard() -> anyhow::Result<()> {
     .expect("test timed out")?;
     Ok(())
 }
+
+#[silo::test]
+async fn siloctl_validate_config() -> anyhow::Result<()> {
+    use std::path::Path;
+
+    let opts = GlobalOptions::default();
+
+    // Test with a valid config file
+    let valid_config_path = Path::new("example_configs/local-dev.toml");
+    let mut output = Vec::new();
+    let result = siloctl::validate_config(&opts, &mut output, valid_config_path).await;
+    assert!(result.is_ok(), "should succeed for valid config");
+
+    let stdout = String::from_utf8(output)?;
+    assert!(
+        stdout.contains("Config is valid"),
+        "output should confirm validity: {}",
+        stdout
+    );
+
+    // Test JSON output for valid config
+    let opts_json = GlobalOptions {
+        json: true,
+        ..Default::default()
+    };
+    let mut json_output = Vec::new();
+    siloctl::validate_config(&opts_json, &mut json_output, valid_config_path).await?;
+    let json_stdout = String::from_utf8(json_output)?;
+
+    let parsed: serde_json::Value = serde_json::from_str(&json_stdout)
+        .unwrap_or_else(|_| panic!("Failed to parse JSON output: {}", json_stdout));
+    assert_eq!(parsed["status"], "valid", "JSON status should be valid");
+
+    // Test with non-existent config file
+    let invalid_path = Path::new("nonexistent-config.toml");
+    let mut error_output = Vec::new();
+    let result = siloctl::validate_config(&opts, &mut error_output, invalid_path).await;
+    assert!(result.is_err(), "should fail for nonexistent config");
+
+    let error_stdout = String::from_utf8(error_output)?;
+    assert!(
+        error_stdout.contains("Config error"),
+        "output should show error: {}",
+        error_stdout
+    );
+
+    Ok(())
+}

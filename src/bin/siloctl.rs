@@ -4,6 +4,7 @@
 //! Silo clusters, including cluster inspection, job management, and SQL querying.
 
 use std::io;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -80,6 +81,12 @@ enum Command {
         /// Output file path (default: profile-{timestamp}.pb.gz)
         #[arg(long, short = 'o')]
         output: Option<String>,
+    },
+    /// Validate a config file and exit
+    ValidateConfig {
+        /// Path to the TOML config file to validate
+        #[arg(short = 'c', long = "config")]
+        config: PathBuf,
     },
 }
 
@@ -209,6 +216,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
             frequency,
             output,
         } => siloctl::profile(&opts, &mut stdout, *duration, *frequency, output.clone()).await,
+        Command::ValidateConfig { config } => {
+            siloctl::validate_config(&opts, &mut stdout, config).await
+        }
     }
 }
 
