@@ -20,8 +20,12 @@ Silo makes no distinction between workflows and activities, and there's no heavy
 
 Silo doesn't use an external visibility service. Instead, jobs can be searched for via some very simple predicates using Silo's built-in operator-facing SQL query capabilities.
 
+Silo has built-in primitives for rate limiting and concurrency limiting, which are not available out of the box in Temporal. In Temporal, you can implement concurrency throttling using signals or an external service, but this tends to be more expensive than Silo's built-in, low-overhead primitives.
+
+To scale, Silo requires that jobs be divided up into a series of tenants. Tenants are isolated from each other and there can be a gazillion of them, but each individual tenant is processed by a single shard and thus a single SlateDB writer thread, so any one tenant can't be too big. We target a max jobs-per-second-per-tenant of about 4000. If you have a problem that needs more than 4k jobs per second that participate in the same concurrency queues, Silo won't work great for you. But, if you need a huge number of jobs that can be partitioned into many different tenants, Silo will work great for you! In comparison, Temporal spreads all workflows evenly throughout its shard space, with no data locality. This doesn't impose on your data distribution, but does require more expensive inter-node communication for global coordination like concurrency queues.
+
 Silo is built to be much cheaper to run -- data is stored in object storage via [slatedb](https://slatedb.io) rather than another datastore, there's no independent microservices that increase RPC overhead, and key functionality like rate limiting is built right in to minimize extra roundtrips to workers.
 
-Silo isn't in production at Uber etc.
+Silo isn't in production at Uber etc. Temporal is mega battle tested.
 
 Silo is built to be autoscaled, with frequent cluster membership changes being just fine, and compute/storage separation baked in deeply.
