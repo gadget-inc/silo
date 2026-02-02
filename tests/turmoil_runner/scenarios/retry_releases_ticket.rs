@@ -19,11 +19,10 @@
 
 use crate::helpers::{
     ConcurrencyLimit, EnqueueRequest, HashMap, LeaseTasksRequest, Limit, ReportOutcomeRequest,
-    RetryPolicy, SerializedBytes, TEST_SHARD_ID, check_holder_limits, get_seed, limit,
-    report_outcome_request, run_scenario_impl, serialized_bytes, setup_server, turmoil_connector,
-    verify_server_invariants,
+    RetryPolicy, SerializedBytes, SiloClient, TEST_SHARD_ID, check_holder_limits,
+    connect_to_server, get_seed, limit, report_outcome_request, run_scenario_impl,
+    serialized_bytes, setup_server, turmoil_connector, verify_server_invariants,
 };
-use silo::pb::silo_client::SiloClient;
 use std::collections::HashMap as StdHashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -53,12 +52,7 @@ pub fn run() {
         // Producer: Enqueues job A with retry policy, then job B
         let producer_fail_time = Arc::clone(&job_a_first_fail_time);
         sim.client("producer", async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-
-            let ch = Endpoint::new("http://server:9920")?
-                .connect_with_connector(turmoil_connector())
-                .await?;
-            let mut client = SiloClient::new(ch);
+            let mut client = connect_to_server("http://server:9920").await?;
 
             // Enqueue job A with retry policy and concurrency limit
             tracing::trace!(job_id = "job-A", "enqueue_with_retry");

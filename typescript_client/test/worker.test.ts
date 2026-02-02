@@ -12,7 +12,7 @@ function createMockClient(options?: {
     workerId: string,
     taskId: string,
     shard: number,
-    tenant?: string
+    tenant?: string,
   ) => Promise<{ cancelled: boolean }>;
 }): SiloGRPCClient {
   return {
@@ -32,14 +32,21 @@ function tasksResult(tasks: Task[]): LeaseTasksResult {
   return { tasks, refreshTasks: [] };
 }
 
-function createTask(id: string, jobId: string, shard: string = "00000000-0000-0000-0000-000000000001"): Task {
+function createTask(
+  id: string,
+  jobId: string,
+  shard: string = "00000000-0000-0000-0000-000000000001",
+): Task {
   return {
     id,
     jobId,
     attemptNumber: 1,
     leaseMs: 30000n,
     payload: {
-      encoding: { oneofKind: "msgpack", msgpack: encodeBytes({ test: "data" }) },
+      encoding: {
+        oneofKind: "msgpack",
+        msgpack: encodeBytes({ test: "data" }),
+      },
     },
     priority: 10,
     shard,
@@ -155,7 +162,7 @@ describe("SiloWorker", () => {
           maxTasks: expect.any(Number),
           taskGroup: "default",
         },
-        expect.any(Number) // serverIndex for per-worker round-robin
+        expect.any(Number), // serverIndex for per-worker round-robin
       );
     });
 
@@ -233,7 +240,7 @@ describe("SiloWorker", () => {
             jobId: task.jobId,
             payload: { test: "data" }, // Decoded payload
           }),
-        })
+        }),
       );
 
       expect(reportOutcome).toHaveBeenCalledWith({
@@ -447,7 +454,11 @@ describe("SiloWorker", () => {
 
       // Should have sent multiple heartbeats
       // heartbeat(workerId, taskId, shard)
-      expect(heartbeat).toHaveBeenCalledWith("test-worker", "task-hb", "00000000-0000-0000-0000-000000000001");
+      expect(heartbeat).toHaveBeenCalledWith(
+        "test-worker",
+        "task-hb",
+        "00000000-0000-0000-0000-000000000001",
+      );
       expect(heartbeat.mock.calls.length).toBeGreaterThanOrEqual(2);
     });
 
@@ -519,7 +530,7 @@ describe("SiloWorker", () => {
       await worker.stop();
 
       expect(onError).toHaveBeenCalledWith(
-        expect.objectContaining({ message: "Connection failed" })
+        expect.objectContaining({ message: "Connection failed" }),
       );
     });
 
@@ -557,7 +568,7 @@ describe("SiloWorker", () => {
 
       expect(onError).toHaveBeenCalledWith(
         expect.objectContaining({ message: "Heartbeat failed" }),
-        expect.objectContaining({ taskId: "task-err" })
+        expect.objectContaining({ taskId: "task-err" }),
       );
     });
 

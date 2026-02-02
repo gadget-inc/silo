@@ -9,8 +9,9 @@
 
 use crate::helpers::{
     ClientConfig, EnqueueRequest, HashMap, InvariantTracker, LeaseTasksRequest,
-    ReportOutcomeRequest, RetryPolicy, SerializedBytes, TEST_SHARD_ID, create_turmoil_client,
-    get_seed, report_outcome_request, run_scenario_impl, serialized_bytes, setup_server,
+    ReportOutcomeRequest, RetryPolicy, SerializedBytes, TEST_SHARD_ID, connect_to_server,
+    create_turmoil_client, get_seed, report_outcome_request, run_scenario_impl, serialized_bytes,
+    setup_server,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -36,9 +37,8 @@ pub fn run() {
         let producer_enqueued = Arc::clone(&total_enqueued);
         let producer_config = client_config.clone();
         sim.client("producer", async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-
-            let mut client = create_turmoil_client("http://server:9904", &producer_config).await?;
+            // Use connect_to_server for initial connection, then producer_config for reconnection
+            let mut client = connect_to_server("http://server:9904").await?;
             let mut consecutive_failures = 0u32;
 
             let mut enqueued = 0;
@@ -104,9 +104,9 @@ pub fn run() {
         let worker_done_flag = Arc::clone(&scenario_done);
         let worker_config = client_config.clone();
         sim.client("worker", async move {
+            // Small delay so producer can start enqueuing
             tokio::time::sleep(Duration::from_millis(200)).await;
-
-            let mut client = create_turmoil_client("http://server:9904", &worker_config).await?;
+            let mut client = connect_to_server("http://server:9904").await?;
             let mut consecutive_failures = 0u32;
 
             let mut completed = 0;

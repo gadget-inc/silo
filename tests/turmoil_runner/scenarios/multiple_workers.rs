@@ -7,14 +7,12 @@
 
 use crate::helpers::{
     AttemptStatus, EnqueueRequest, GetJobRequest, HashMap, InvariantTracker, JobStatus,
-    LeaseTasksRequest, ReportOutcomeRequest, SerializedBytes, TEST_SHARD_ID, get_seed,
-    report_outcome_request, run_scenario_impl, serialized_bytes, setup_server, turmoil_connector,
+    LeaseTasksRequest, ReportOutcomeRequest, SerializedBytes, TEST_SHARD_ID, connect_to_server,
+    get_seed, report_outcome_request, run_scenario_impl, serialized_bytes, setup_server,
 };
-use silo::pb::silo_client::SiloClient;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tonic::transport::Endpoint;
 
 pub fn run() {
     let seed = get_seed();
@@ -33,12 +31,7 @@ pub fn run() {
 
         // Enqueue jobs from producer
         sim.client("producer", async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-
-            let ch = Endpoint::new("http://server:9902")?
-                .connect_with_connector(turmoil_connector())
-                .await?;
-            let mut client = SiloClient::new(ch);
+            let mut client = connect_to_server("http://server:9902").await?;
 
             for i in 0..10 {
                 let job_id = format!("job-{}", i);
@@ -71,12 +64,9 @@ pub fn run() {
         // Worker 1
         let w1_completed = Arc::clone(&total_completed);
         sim.client("worker1", async move {
+            // Small delay to ensure producer has started enqueuing jobs
             tokio::time::sleep(Duration::from_millis(100)).await;
-
-            let ch = Endpoint::new("http://server:9902")?
-                .connect_with_connector(turmoil_connector())
-                .await?;
-            let mut client = SiloClient::new(ch);
+            let mut client = connect_to_server("http://server:9902").await?;
 
             let mut completed = 0;
             for _ in 0..10 {
@@ -128,12 +118,9 @@ pub fn run() {
         // Worker 2
         let w2_completed = Arc::clone(&total_completed);
         sim.client("worker2", async move {
+            // Small delay to ensure producer has started enqueuing jobs
             tokio::time::sleep(Duration::from_millis(120)).await;
-
-            let ch = Endpoint::new("http://server:9902")?
-                .connect_with_connector(turmoil_connector())
-                .await?;
-            let mut client = SiloClient::new(ch);
+            let mut client = connect_to_server("http://server:9902").await?;
 
             let mut completed = 0;
             for _ in 0..10 {
@@ -194,10 +181,7 @@ pub fn run() {
             // Process all DST events from server-side instrumentation
             verify_tracker.process_dst_events();
 
-            let ch = Endpoint::new("http://server:9902")?
-                .connect_with_connector(turmoil_connector())
-                .await?;
-            let mut client = SiloClient::new(ch);
+            let mut client = connect_to_server("http://server:9902").await?;
 
             let enqueued = verify_jobs.lock().unwrap().clone();
             let completed = verify_completed.load(Ordering::SeqCst);

@@ -17,7 +17,10 @@ export type CancellationReason = "server" | "client" | "worker_shutdown";
  * @typeParam T The type of the decoded payload. Defaults to `unknown`.
  */
 
-export interface Task<Payload = unknown, Metadata extends Record<string, string> = Record<string, string>> {
+export interface Task<
+  Payload = unknown,
+  Metadata extends Record<string, string> = Record<string, string>,
+> {
   /** Unique task ID (different from job ID) */
   id: string;
   /** ID of the job this task belongs to */
@@ -44,7 +47,10 @@ export interface Task<Payload = unknown, Metadata extends Record<string, string>
 /**
  * Transform a raw protobuf Task into a userland Task with decoded payload.
  */
-export function transformTask<Payload = unknown, Metadata extends Record<string, string> = Record<string, string>>(protoTask: ProtoTask): Task<Payload, Metadata> {
+export function transformTask<
+  Payload = unknown,
+  Metadata extends Record<string, string> = Record<string, string>,
+>(protoTask: ProtoTask): Task<Payload, Metadata> {
   return {
     id: protoTask.id,
     jobId: protoTask.jobId,
@@ -54,7 +60,7 @@ export function transformTask<Payload = unknown, Metadata extends Record<string,
       protoTask.payload?.encoding.oneofKind === "msgpack"
         ? protoTask.payload.encoding.msgpack
         : undefined,
-      "payload"
+      "payload",
     ),
     priority: protoTask.priority,
     shard: protoTask.shard,
@@ -71,7 +77,10 @@ export function transformTask<Payload = unknown, Metadata extends Record<string,
  * to coordinate cancellation from various sources.
  * @internal
  */
-export class TaskExecution<Payload = unknown, Metadata extends Record<string, string> = Record<string, string>> {
+export class TaskExecution<
+  Payload = unknown,
+  Metadata extends Record<string, string> = Record<string, string>,
+> {
   /** The task being executed (raw proto format) */
   public readonly task: Task<Payload, Metadata>;
   /** The worker ID */
@@ -94,7 +103,7 @@ export class TaskExecution<Payload = unknown, Metadata extends Record<string, st
     task: Task<Payload, Metadata>,
     workerId: string,
     workerAbortSignal: AbortSignal,
-    client: SiloGRPCClient
+    client: SiloGRPCClient,
   ) {
     this.task = task;
     this.workerId = workerId;
@@ -105,7 +114,7 @@ export class TaskExecution<Payload = unknown, Metadata extends Record<string, st
     // Create a combined signal that aborts when EITHER the task or worker is aborted
     this._combinedSignal = combineAbortSignals(
       workerAbortSignal,
-      this._taskAbortController.signal
+      this._taskAbortController.signal,
     );
 
     // Track when worker shutdown causes abort
@@ -117,7 +126,7 @@ export class TaskExecution<Payload = unknown, Metadata extends Record<string, st
           this._cancellationReason = "worker_shutdown";
         }
       },
-      { once: true }
+      { once: true },
     );
   }
 
@@ -180,6 +189,3 @@ export class TaskExecution<Payload = unknown, Metadata extends Record<string, st
     await this._cancelPromise;
   }
 }
-
-
-

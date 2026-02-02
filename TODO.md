@@ -62,3 +62,4 @@
   - [ ] validate all sigils present
   - [ ] add split DST scenarios
   - [ ] ensure that cleanup is aborted cleanly when a shard is closed mid-cleanup
+- [ ] asynchronously hydrate concurrency queue counts to make startup faster
