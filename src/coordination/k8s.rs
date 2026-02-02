@@ -823,8 +823,6 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         guard
     }
 
-
-
     /// Reload the shard map from ConfigMap into local cache.
     async fn reload_shard_map(&self) -> Result<(), CoordinationError> {
         let configmap_name = format!("{}-shard-map", self.cluster_prefix);

@@ -617,6 +617,74 @@ impl EtcdCoordinator {
 
         Ok(())
     }
+
+    /// CAS-based shard placement ring update.
+    async fn try_update_shard_placement_ring_cas(
+        &self,
+        shard_id: &crate::shard_range::ShardId,
+        new_ring: Option<String>,
+    ) -> Result<(Option<String>, Option<String>), CoordinationError> {
+        let shard_map_key = keys::shard_map_key(&self.cluster_prefix);
+
+        // Read current shard map from etcd
+        let resp = self
+            .client
+            .kv_client()
+            .get(shard_map_key.clone(), None)
+            .await
+            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+
+        let kv = resp.kvs().first().ok_or_else(|| {
+            CoordinationError::BackendError("shard map not found in etcd".to_string())
+        })?;
+
+        let current_version = kv.mod_revision();
+        let value = String::from_utf8_lossy(kv.value());
+        let mut shard_map: ShardMap = serde_json::from_str(&value)
+            .map_err(|e| CoordinationError::BackendError(format!("invalid shard map: {}", e)))?;
+
+        // Update the shard's placement ring
+        let shard = shard_map
+            .get_shard_mut(shard_id)
+            .ok_or(CoordinationError::ShardNotFound(*shard_id))?;
+
+        let previous = shard.placement_ring.clone();
+        shard.placement_ring = new_ring.clone();
+
+        let new_map_json = serde_json::to_string(&shard_map)
+            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+
+        // Use CAS to update atomically
+        let txn = etcd_client::Txn::new()
+            .when([etcd_client::Compare::mod_revision(
+                shard_map_key.clone(),
+                etcd_client::CompareOp::Equal,
+                current_version,
+            )])
+            .and_then([etcd_client::TxnOp::put(
+                shard_map_key.clone(),
+                new_map_json,
+                None,
+            )]);
+
+        let txn_resp = self
+            .client
+            .kv_client()
+            .txn(txn)
+            .await
+            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+
+        if !txn_resp.succeeded() {
+            return Err(CoordinationError::BackendError(
+                "shard map was modified concurrently".to_string(),
+            ));
+        }
+
+        // Update local shard map cache
+        *self.base.shard_map.lock().await = shard_map;
+
+        Ok((previous, new_ring))
+    }
 }
 
 #[async_trait]
@@ -809,33 +877,40 @@ impl Coordinator for EtcdCoordinator {
         shard_id: &crate::shard_range::ShardId,
         ring: Option<&str>,
     ) -> Result<(Option<String>, Option<String>), CoordinationError> {
-        // Update the shard's placement ring in the local shard map
-        let (previous, current) = {
-            let mut shard_map = self.base.shard_map.lock().await;
-            let shard = shard_map
-                .get_shard_mut(shard_id)
-                .ok_or(CoordinationError::ShardNotFound(*shard_id))?;
+        let sid = *shard_id;
+        let new_ring = ring.map(|s| s.to_string());
 
-            let previous = shard.placement_ring.clone();
-            let current = ring.map(|s| s.to_string());
-            shard.placement_ring = current.clone();
-            (previous, current)
-        };
+        // Use CAS-based update with retry to avoid race conditions with the watcher
+        let max_retries = 10;
+        let mut delay = Duration::from_millis(10);
 
-        // Persist the updated shard map to etcd
-        let shard_map = self.base.shard_map.lock().await;
-        let shard_map_json = serde_json::to_string(&*shard_map)
-            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
-        drop(shard_map);
+        for attempt in 0..max_retries {
+            match self
+                .try_update_shard_placement_ring_cas(&sid, new_ring.clone())
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(CoordinationError::BackendError(msg))
+                    if msg.contains("was modified concurrently") =>
+                {
+                    if attempt < max_retries - 1 {
+                        debug!(
+                            shard_id = %sid,
+                            attempt = attempt,
+                            "shard map update hit CAS conflict, retrying"
+                        );
+                        tokio::time::sleep(delay).await;
+                        delay = std::cmp::min(delay * 2, Duration::from_secs(1));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
 
-        let shard_map_key = keys::shard_map_key(&self.cluster_prefix);
-        self.client
-            .kv_client()
-            .put(shard_map_key, shard_map_json, None)
-            .await
-            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
-
-        Ok((previous, current))
+        Err(CoordinationError::BackendError(format!(
+            "failed to update shard placement ring after {} retries",
+            max_retries
+        )))
     }
 }
 

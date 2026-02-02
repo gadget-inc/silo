@@ -2058,8 +2058,12 @@ async fn etcd_single_node_default_ring_owns_all_shards() {
     let num_shards: u32 = 4;
 
     // Node with empty placement_rings participates in default ring
-    let (coord, handle) =
-        start_etcd_coordinator!(&prefix, "default-node", "http://127.0.0.1:50051", num_shards);
+    let (coord, handle) = start_etcd_coordinator!(
+        &prefix,
+        "default-node",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
 
     assert!(
         coord.wait_converged(Duration::from_secs(10)).await,
@@ -2085,8 +2089,12 @@ async fn etcd_multi_ring_shard_assignment() {
     let num_shards: u32 = 8;
 
     // Start a default node (empty placement_rings = default ring)
-    let (c_default, h_default) =
-        start_etcd_coordinator!(&prefix, "default-node", "http://127.0.0.1:50051", num_shards);
+    let (c_default, h_default) = start_etcd_coordinator!(
+        &prefix,
+        "default-node",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
     let c_default: Arc<dyn Coordinator> = Arc::new(c_default);
 
     assert!(
@@ -2287,8 +2295,12 @@ async fn etcd_member_info_reports_rings() {
     let num_shards: u32 = 4;
 
     // Start a default node
-    let (c1, h1) =
-        start_etcd_coordinator!(&prefix, "node-default", "http://127.0.0.1:50051", num_shards);
+    let (c1, h1) = start_etcd_coordinator!(
+        &prefix,
+        "node-default",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -2354,8 +2366,12 @@ async fn etcd_ring_change_triggers_handoff() {
     let num_shards: u32 = 4;
 
     // Start default node
-    let (c_default, h_default) =
-        start_etcd_coordinator!(&prefix, "default-node", "http://127.0.0.1:50051", num_shards);
+    let (c_default, h_default) = start_etcd_coordinator!(
+        &prefix,
+        "default-node",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
     let c_default: Arc<dyn Coordinator> = Arc::new(c_default);
 
     assert!(c_default.wait_converged(Duration::from_secs(15)).await);
@@ -2446,8 +2462,12 @@ async fn etcd_orphaned_ring_shard_remains_unowned() {
     let num_shards: u32 = 2;
 
     // Start only a default node
-    let (coord, handle) =
-        start_etcd_coordinator!(&prefix, "default-node", "http://127.0.0.1:50051", num_shards);
+    let (coord, handle) = start_etcd_coordinator!(
+        &prefix,
+        "default-node",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
 
     assert!(coord.wait_converged(Duration::from_secs(15)).await);
