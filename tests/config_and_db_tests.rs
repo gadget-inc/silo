@@ -554,6 +554,78 @@ path = "/tmp/silo-%shard%"
 }
 
 #[silo::test]
+fn parse_toml_with_partial_slatedb_settings_merges_with_defaults() {
+    // Regression test: when only some slatedb settings are specified,
+    // unspecified fields should use slatedb defaults instead of failing.
+    // This matches the behavior users expect from slatedb's own config loaders.
+    let toml_str = r#"
+[database]
+backend = "fs"
+path = "/tmp/silo-%shard%"
+
+[database.slatedb]
+# Only specify flush_interval - other fields should use defaults
+flush_interval = "1ms"
+
+[database.slatedb.object_store_cache_options]
+# Only specify cache options we care about
+root_folder = "/var/cache"
+cache_puts = true
+"#;
+
+    let cfg: AppConfig = toml::from_str(toml_str).expect("parse TOML with partial slatedb config");
+
+    let slatedb_settings = cfg
+        .database
+        .slatedb
+        .expect("slatedb settings should be present");
+
+    // Verify user-specified values are used
+    assert_eq!(
+        slatedb_settings.flush_interval,
+        Some(std::time::Duration::from_millis(1)),
+        "flush_interval should use user-specified value"
+    );
+    assert_eq!(
+        slatedb_settings
+            .object_store_cache_options
+            .root_folder
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string()),
+        Some("/var/cache".to_string()),
+        "root_folder should use user-specified value"
+    );
+    assert!(
+        slatedb_settings.object_store_cache_options.cache_puts,
+        "cache_puts should use user-specified value"
+    );
+
+    // Verify unspecified fields use slatedb defaults
+    let defaults = slatedb::config::Settings::default();
+    assert_eq!(
+        slatedb_settings.manifest_poll_interval, defaults.manifest_poll_interval,
+        "manifest_poll_interval should use default"
+    );
+    assert_eq!(
+        slatedb_settings.l0_sst_size_bytes, defaults.l0_sst_size_bytes,
+        "l0_sst_size_bytes should use default"
+    );
+    assert_eq!(
+        slatedb_settings.l0_max_ssts, defaults.l0_max_ssts,
+        "l0_max_ssts should use default"
+    );
+    assert_eq!(
+        slatedb_settings.filter_bits_per_key, defaults.filter_bits_per_key,
+        "filter_bits_per_key should use default"
+    );
+    assert_eq!(
+        slatedb_settings.object_store_cache_options.part_size_bytes,
+        defaults.object_store_cache_options.part_size_bytes,
+        "part_size_bytes should use default"
+    );
+}
+
+#[silo::test]
 async fn factory_passes_slatedb_settings_to_shards() {
     // Test that ShardFactory passes slatedb settings from template to opened shards
     let tmp = tempfile::tempdir().unwrap();

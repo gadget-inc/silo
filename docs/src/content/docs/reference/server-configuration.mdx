@@ -182,6 +182,21 @@ Most SlateDB options use sensible defaults tuned for general workloads. Only adj
 If the `[database.slatedb]` section is omitted entirely, Silo uses SlateDB's sensible defaults. This is the recommended approach for most deployments. Only add this section if you need to tune specific storage engine parameters.
 </Aside>
 
+#### Partial Configuration
+
+You can specify only the SlateDB options you want to customize—unspecified options will use SlateDB's defaults. For example, to only configure the flush interval and object store cache:
+
+```toml
+[database.slatedb]
+flush_interval = "1ms"
+
+[database.slatedb.object_store_cache_options]
+root_folder = "/var/silo-cache"
+cache_puts = true
+```
+
+All other SlateDB settings (like `l0_sst_size_bytes`, `manifest_poll_interval`, etc.) will automatically use their default values. This allows you to tune specific parameters without needing to specify the entire configuration.
+
 ---
 
 ## Coordination Configuration

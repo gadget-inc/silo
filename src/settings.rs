@@ -1,7 +1,57 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::borrow::Cow;
 use std::fs;
 use std::path::Path;
+
+/// Custom deserializer for slatedb::config::Settings that merges user-provided
+/// values with defaults. This is necessary because slatedb's Settings struct
+/// doesn't use #[serde(default)] on its fields, so serde requires all non-Option
+/// fields to be present when any field is specified.
+fn deserialize_slatedb_settings<'de, D>(
+    deserializer: D,
+) -> Result<Option<slatedb::config::Settings>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    // Deserialize as an optional TOML table
+    let user_config: Option<toml::Table> = Option::deserialize(deserializer)?;
+
+    match user_config {
+        None => Ok(None),
+        Some(user_table) => {
+            // Serialize defaults to TOML
+            let defaults = slatedb::config::Settings::default();
+            let default_str = toml::to_string(&defaults).map_err(serde::de::Error::custom)?;
+            let mut merged: toml::Table =
+                toml::from_str(&default_str).map_err(serde::de::Error::custom)?;
+
+            // Deep merge user config into defaults
+            deep_merge_toml(&mut merged, user_table);
+
+            // Deserialize merged config back to Settings
+            let settings: slatedb::config::Settings =
+                merged.try_into().map_err(serde::de::Error::custom)?;
+
+            Ok(Some(settings))
+        }
+    }
+}
+
+/// Recursively merge overlay table into base table. Values in overlay take precedence.
+fn deep_merge_toml(base: &mut toml::Table, overlay: toml::Table) {
+    for (key, value) in overlay {
+        match (base.get_mut(&key), value) {
+            // Both are tables: recursively merge
+            (Some(toml::Value::Table(base_table)), toml::Value::Table(overlay_table)) => {
+                deep_merge_toml(base_table, overlay_table);
+            }
+            // Otherwise: overlay value replaces base
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AppConfig {
@@ -129,9 +179,10 @@ pub struct DatabaseTemplate {
     #[serde(default = "default_apply_wal_on_close")]
     pub apply_wal_on_close: bool,
     /// Optional SlateDB-specific settings for tuning database performance.
-    /// If not specified, SlateDB defaults are used.
+    /// If not specified, SlateDB defaults are used. When partially specified,
+    /// unspecified fields use SlateDB defaults.
     /// See <https://docs.rs/slatedb/latest/slatedb/config/struct.Settings.html> for all options.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_slatedb_settings")]
     pub slatedb: Option<slatedb::config::Settings>,
 }
 
@@ -315,9 +366,10 @@ pub struct DatabaseConfig {
     #[serde(default = "default_apply_wal_on_close")]
     pub apply_wal_on_close: bool,
     /// Optional SlateDB-specific settings for tuning database performance.
-    /// If not specified, SlateDB defaults are used.
+    /// If not specified, SlateDB defaults are used. When partially specified,
+    /// unspecified fields use SlateDB defaults.
     /// See <https://docs.rs/slatedb/latest/slatedb/config/struct.Settings.html> for all options.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_slatedb_settings")]
     pub slatedb: Option<slatedb::config::Settings>,
 }
 
