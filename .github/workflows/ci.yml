@@ -8,7 +8,7 @@ on:
 jobs:
   fmt:
     name: Rust formatting
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -20,7 +20,7 @@ jobs:
 
   test:
     name: Rust tests
-    runs-on: ubuntu-latest-l
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-test-env
@@ -38,7 +38,7 @@ jobs:
 
   benchmark:
     name: Run benchmarks
-    runs-on: ubuntu-latest-l
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-test-env
@@ -51,7 +51,7 @@ jobs:
 
   test-k8s:
     name: K8S coordination tests
-    runs-on: ubuntu-latest-l
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-test-env
@@ -72,7 +72,7 @@ jobs:
 
   alloy-changes:
     name: Detect Alloy changes
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: read
       pull-requests: read
@@ -98,7 +98,7 @@ jobs:
     name: Alloy verification (job_shard)
     needs: alloy-changes
     if: needs.alloy-changes.outputs.job-shard == 'true'
-    runs-on: ubuntu-latest-l
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-test-env
@@ -115,7 +115,7 @@ jobs:
     name: Alloy verification (coordination)
     needs: alloy-changes
     if: needs.alloy-changes.outputs.coordination == 'true'
-    runs-on: ubuntu-latest-l
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-test-env
@@ -127,7 +127,7 @@ jobs:
 
   typescript-client-lint:
     name: TypeScript lints
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-test-env
@@ -149,7 +149,7 @@ jobs:
 
   typescript-client-tests:
     name: TypeScript tests
-    runs-on: ubuntu-latest-l
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-test-env
