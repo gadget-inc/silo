@@ -1050,17 +1050,19 @@ async fn grpc_lease_tasks_includes_floating_concurrency_limit() -> anyhow::Resul
 
         // Create a floating concurrency limit
         let floating_limit = Limit {
-            limit: Some(limit::Limit::FloatingConcurrency(FloatingConcurrencyLimit {
-                key: "test-floating-key".to_string(),
-                default_max_concurrency: 10,
-                refresh_interval_ms: 30_000,
-                metadata: [
-                    ("org_id".to_string(), "org-123".to_string()),
-                    ("tier".to_string(), "premium".to_string()),
-                ]
-                .into_iter()
-                .collect(),
-            })),
+            limit: Some(limit::Limit::FloatingConcurrency(
+                FloatingConcurrencyLimit {
+                    key: "test-floating-key".to_string(),
+                    default_max_concurrency: 10,
+                    refresh_interval_ms: 30_000,
+                    metadata: [
+                        ("org_id".to_string(), "org-123".to_string()),
+                        ("tier".to_string(), "premium".to_string()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+            )),
         };
 
         // Enqueue a job with the floating limit

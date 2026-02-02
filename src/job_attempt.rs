@@ -51,7 +51,10 @@ pub enum AttemptStatus {
 #[archive(check_bytes)]
 pub struct JobAttempt {
     pub job_id: String,
+    /// Total attempt number (monotonically increasing, 1-based)
     pub attempt_number: u32,
+    /// Attempt number within current run (resets to 1 on job restart)
+    pub relative_attempt_number: u32,
     pub task_id: String,
     pub status: AttemptStatus,
 }
@@ -88,6 +91,9 @@ impl JobAttemptView {
     }
     pub fn attempt_number(&self) -> u32 {
         self.archived().attempt_number
+    }
+    pub fn relative_attempt_number(&self) -> u32 {
+        self.archived().relative_attempt_number
     }
     pub fn task_id(&self) -> &str {
         self.archived().task_id.as_str()

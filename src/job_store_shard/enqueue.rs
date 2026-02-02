@@ -87,7 +87,8 @@ impl JobStoreShard {
                 tenant,
                 &first_task_id,
                 &job_id,
-                1, // attempt number
+                1, // attempt number (total)
+                1, // relative attempt number (within run)
                 0, // start from first limit
                 &limits,
                 priority,
@@ -157,6 +158,7 @@ impl JobStoreShard {
         task_id: &str,
         job_id: &str,
         attempt_number: u32,
+        relative_attempt_number: u32,
         limit_index: usize,
         limits: &[Limit],
         priority: u8,
@@ -178,6 +180,7 @@ impl JobStoreShard {
                     tenant: tenant.to_string(),
                     job_id: job_id.to_string(),
                     attempt_number,
+                    relative_attempt_number,
                     held_queues: current_held_queues,
                     task_group: task_group.to_string(),
                 };
@@ -209,6 +212,7 @@ impl JobStoreShard {
                             std::slice::from_ref(cl),
                             task_group,
                             attempt_number,
+                            relative_attempt_number,
                         )
                         .map_err(JobStoreShardError::Rkyv)?;
 
@@ -256,6 +260,7 @@ impl JobStoreShard {
                             std::slice::from_ref(&temp_cl),
                             task_group,
                             attempt_number,
+                            relative_attempt_number,
                         )
                         .map_err(JobStoreShardError::Rkyv)?;
 
@@ -282,6 +287,7 @@ impl JobStoreShard {
                         tenant: tenant.to_string(),
                         job_id: job_id.to_string(),
                         attempt_number,
+                        relative_attempt_number,
                         limit_index: current_index as u32,
                         rate_limit: GubernatorRateLimitData::from(rl),
                         retry_count: 0,

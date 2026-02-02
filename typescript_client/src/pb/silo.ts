@@ -617,47 +617,51 @@ export interface Task {
      */
     jobId: string; // ID of the job this task belongs to.
     /**
-     * @generated from protobuf field: uint32 attempt_number = 3
-     */
-    attemptNumber: number; // Which attempt this is (1 = first attempt).
-    /**
-     * @generated from protobuf field: int64 lease_ms = 4
-     */
-    leaseMs: bigint; // How long the lease lasts. Heartbeat before this expires.
-    /**
-     * @generated from protobuf field: silo.v1.SerializedBytes payload = 5
-     */
-    payload?: SerializedBytes; // The job's payload for the worker to process.
-    /**
-     * @generated from protobuf field: uint32 priority = 6
-     */
-    priority: number; // Job priority (for informational purposes).
-    /**
-     * @generated from protobuf field: string shard = 7
-     */
-    shard: string; // Shard ID (UUID) this task came from (needed for reporting outcome).
-    /**
-     * @generated from protobuf field: string task_group = 8
-     */
-    taskGroup: string; // Task group this task belongs to.
-    /**
-     * @generated from protobuf field: optional string tenant_id = 9
+     * @generated from protobuf field: optional string tenant_id = 3
      */
     tenantId?: string; // Tenant ID if multi-tenancy is enabled.
     /**
-     * @generated from protobuf field: bool is_last_attempt = 10
+     * @generated from protobuf field: uint32 attempt_number = 4
      */
-    isLastAttempt: boolean; // True if this is the final attempt (no more retries after this).
+    attemptNumber: number; // Which attempt this is (1 = first attempt). Monotonically increasing across restarts.
     /**
-     * @generated from protobuf field: map<string, string> metadata = 11
+     * @generated from protobuf field: uint32 relative_attempt_number = 5
+     */
+    relativeAttemptNumber: number; // Attempt within current run (1 = first attempt since last restart). Resets on restart.
+    /**
+     * @generated from protobuf field: bool is_last_attempt = 6
+     */
+    isLastAttempt: boolean; // True if this is the final attempt (no more retries after this run).
+    /**
+     * @generated from protobuf field: map<string, string> metadata = 7
      */
     metadata: {
         [key: string]: string;
     }; // Metadata key/value pairs from the job.
     /**
-     * @generated from protobuf field: repeated silo.v1.Limit limits = 12
+     * @generated from protobuf field: repeated silo.v1.Limit limits = 8
      */
     limits: Limit[]; // Limits declared on this job (concurrency, rate, floating).
+    /**
+     * @generated from protobuf field: silo.v1.SerializedBytes payload = 9
+     */
+    payload?: SerializedBytes; // The job's payload for the worker to process.
+    /**
+     * @generated from protobuf field: uint32 priority = 10
+     */
+    priority: number; // Job priority (for informational purposes).
+    /**
+     * @generated from protobuf field: string shard = 11
+     */
+    shard: string; // Shard ID (UUID) this task came from (needed for reporting outcome).
+    /**
+     * @generated from protobuf field: string task_group = 12
+     */
+    taskGroup: string; // Task group this task belongs to.
+    /**
+     * @generated from protobuf field: int64 lease_ms = 13
+     */
+    leaseMs: bigint; // How long the lease lasts. Heartbeat before this expires.
 }
 /**
  * Task for refreshing a floating concurrency limit.
@@ -3103,16 +3107,17 @@ class Task$Type extends MessageType<Task> {
         super("silo.v1.Task", [
             { no: 1, name: "id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
             { no: 2, name: "job_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
-            { no: 3, name: "attempt_number", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
-            { no: 4, name: "lease_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
-            { no: 5, name: "payload", kind: "message", T: () => SerializedBytes },
-            { no: 6, name: "priority", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
-            { no: 7, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
-            { no: 8, name: "task_group", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
-            { no: 9, name: "tenant_id", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
-            { no: 10, name: "is_last_attempt", kind: "scalar", T: 8 /*ScalarType.BOOL*/ },
-            { no: 11, name: "metadata", kind: "map", K: 9 /*ScalarType.STRING*/, V: { kind: "scalar", T: 9 /*ScalarType.STRING*/ } },
-            { no: 12, name: "limits", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => Limit }
+            { no: 3, name: "tenant_id", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
+            { no: 4, name: "attempt_number", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
+            { no: 5, name: "relative_attempt_number", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
+            { no: 6, name: "is_last_attempt", kind: "scalar", T: 8 /*ScalarType.BOOL*/ },
+            { no: 7, name: "metadata", kind: "map", K: 9 /*ScalarType.STRING*/, V: { kind: "scalar", T: 9 /*ScalarType.STRING*/ } },
+            { no: 8, name: "limits", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => Limit },
+            { no: 9, name: "payload", kind: "message", T: () => SerializedBytes },
+            { no: 10, name: "priority", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
+            { no: 11, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 12, name: "task_group", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 13, name: "lease_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ }
         ]);
     }
     create(value?: PartialMessage<Task>): Task {
@@ -3120,13 +3125,14 @@ class Task$Type extends MessageType<Task> {
         message.id = "";
         message.jobId = "";
         message.attemptNumber = 0;
-        message.leaseMs = 0n;
-        message.priority = 0;
-        message.shard = "";
-        message.taskGroup = "";
+        message.relativeAttemptNumber = 0;
         message.isLastAttempt = false;
         message.metadata = {};
         message.limits = [];
+        message.priority = 0;
+        message.shard = "";
+        message.taskGroup = "";
+        message.leaseMs = 0n;
         if (value !== undefined)
             reflectionMergePartial<Task>(this, message, value);
         return message;
@@ -3142,35 +3148,38 @@ class Task$Type extends MessageType<Task> {
                 case /* string job_id */ 2:
                     message.jobId = reader.string();
                     break;
-                case /* uint32 attempt_number */ 3:
-                    message.attemptNumber = reader.uint32();
-                    break;
-                case /* int64 lease_ms */ 4:
-                    message.leaseMs = reader.int64().toBigInt();
-                    break;
-                case /* silo.v1.SerializedBytes payload */ 5:
-                    message.payload = SerializedBytes.internalBinaryRead(reader, reader.uint32(), options, message.payload);
-                    break;
-                case /* uint32 priority */ 6:
-                    message.priority = reader.uint32();
-                    break;
-                case /* string shard */ 7:
-                    message.shard = reader.string();
-                    break;
-                case /* string task_group */ 8:
-                    message.taskGroup = reader.string();
-                    break;
-                case /* optional string tenant_id */ 9:
+                case /* optional string tenant_id */ 3:
                     message.tenantId = reader.string();
                     break;
-                case /* bool is_last_attempt */ 10:
+                case /* uint32 attempt_number */ 4:
+                    message.attemptNumber = reader.uint32();
+                    break;
+                case /* uint32 relative_attempt_number */ 5:
+                    message.relativeAttemptNumber = reader.uint32();
+                    break;
+                case /* bool is_last_attempt */ 6:
                     message.isLastAttempt = reader.bool();
                     break;
-                case /* map<string, string> metadata */ 11:
-                    this.binaryReadMap11(message.metadata, reader, options);
+                case /* map<string, string> metadata */ 7:
+                    this.binaryReadMap7(message.metadata, reader, options);
                     break;
-                case /* repeated silo.v1.Limit limits */ 12:
+                case /* repeated silo.v1.Limit limits */ 8:
                     message.limits.push(Limit.internalBinaryRead(reader, reader.uint32(), options));
+                    break;
+                case /* silo.v1.SerializedBytes payload */ 9:
+                    message.payload = SerializedBytes.internalBinaryRead(reader, reader.uint32(), options, message.payload);
+                    break;
+                case /* uint32 priority */ 10:
+                    message.priority = reader.uint32();
+                    break;
+                case /* string shard */ 11:
+                    message.shard = reader.string();
+                    break;
+                case /* string task_group */ 12:
+                    message.taskGroup = reader.string();
+                    break;
+                case /* int64 lease_ms */ 13:
+                    message.leaseMs = reader.int64().toBigInt();
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -3183,7 +3192,7 @@ class Task$Type extends MessageType<Task> {
         }
         return message;
     }
-    private binaryReadMap11(map: Task["metadata"], reader: IBinaryReader, options: BinaryReadOptions): void {
+    private binaryReadMap7(map: Task["metadata"], reader: IBinaryReader, options: BinaryReadOptions): void {
         let len = reader.uint32(), end = reader.pos + len, key: keyof Task["metadata"] | undefined, val: Task["metadata"][any] | undefined;
         while (reader.pos < end) {
             let [fieldNo, wireType] = reader.tag();
@@ -3206,36 +3215,39 @@ class Task$Type extends MessageType<Task> {
         /* string job_id = 2; */
         if (message.jobId !== "")
             writer.tag(2, WireType.LengthDelimited).string(message.jobId);
-        /* uint32 attempt_number = 3; */
-        if (message.attemptNumber !== 0)
-            writer.tag(3, WireType.Varint).uint32(message.attemptNumber);
-        /* int64 lease_ms = 4; */
-        if (message.leaseMs !== 0n)
-            writer.tag(4, WireType.Varint).int64(message.leaseMs);
-        /* silo.v1.SerializedBytes payload = 5; */
-        if (message.payload)
-            SerializedBytes.internalBinaryWrite(message.payload, writer.tag(5, WireType.LengthDelimited).fork(), options).join();
-        /* uint32 priority = 6; */
-        if (message.priority !== 0)
-            writer.tag(6, WireType.Varint).uint32(message.priority);
-        /* string shard = 7; */
-        if (message.shard !== "")
-            writer.tag(7, WireType.LengthDelimited).string(message.shard);
-        /* string task_group = 8; */
-        if (message.taskGroup !== "")
-            writer.tag(8, WireType.LengthDelimited).string(message.taskGroup);
-        /* optional string tenant_id = 9; */
+        /* optional string tenant_id = 3; */
         if (message.tenantId !== undefined)
-            writer.tag(9, WireType.LengthDelimited).string(message.tenantId);
-        /* bool is_last_attempt = 10; */
+            writer.tag(3, WireType.LengthDelimited).string(message.tenantId);
+        /* uint32 attempt_number = 4; */
+        if (message.attemptNumber !== 0)
+            writer.tag(4, WireType.Varint).uint32(message.attemptNumber);
+        /* uint32 relative_attempt_number = 5; */
+        if (message.relativeAttemptNumber !== 0)
+            writer.tag(5, WireType.Varint).uint32(message.relativeAttemptNumber);
+        /* bool is_last_attempt = 6; */
         if (message.isLastAttempt !== false)
-            writer.tag(10, WireType.Varint).bool(message.isLastAttempt);
-        /* map<string, string> metadata = 11; */
+            writer.tag(6, WireType.Varint).bool(message.isLastAttempt);
+        /* map<string, string> metadata = 7; */
         for (let k of globalThis.Object.keys(message.metadata))
-            writer.tag(11, WireType.LengthDelimited).fork().tag(1, WireType.LengthDelimited).string(k).tag(2, WireType.LengthDelimited).string(message.metadata[k]).join();
-        /* repeated silo.v1.Limit limits = 12; */
+            writer.tag(7, WireType.LengthDelimited).fork().tag(1, WireType.LengthDelimited).string(k).tag(2, WireType.LengthDelimited).string(message.metadata[k]).join();
+        /* repeated silo.v1.Limit limits = 8; */
         for (let i = 0; i < message.limits.length; i++)
-            Limit.internalBinaryWrite(message.limits[i], writer.tag(12, WireType.LengthDelimited).fork(), options).join();
+            Limit.internalBinaryWrite(message.limits[i], writer.tag(8, WireType.LengthDelimited).fork(), options).join();
+        /* silo.v1.SerializedBytes payload = 9; */
+        if (message.payload)
+            SerializedBytes.internalBinaryWrite(message.payload, writer.tag(9, WireType.LengthDelimited).fork(), options).join();
+        /* uint32 priority = 10; */
+        if (message.priority !== 0)
+            writer.tag(10, WireType.Varint).uint32(message.priority);
+        /* string shard = 11; */
+        if (message.shard !== "")
+            writer.tag(11, WireType.LengthDelimited).string(message.shard);
+        /* string task_group = 12; */
+        if (message.taskGroup !== "")
+            writer.tag(12, WireType.LengthDelimited).string(message.taskGroup);
+        /* int64 lease_ms = 13; */
+        if (message.leaseMs !== 0n)
+            writer.tag(13, WireType.Varint).int64(message.leaseMs);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);

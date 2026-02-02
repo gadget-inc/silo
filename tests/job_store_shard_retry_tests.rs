@@ -1032,6 +1032,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
             tenant,
             job_id,
             attempt_number,
+            relative_attempt_number,
             held_queues: _,
             ..
         } => Task::RunAttempt {
@@ -1039,6 +1040,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
             tenant: tenant.as_str().to_string(),
             job_id: job_id.as_str().to_string(),
             attempt_number: *attempt_number,
+            relative_attempt_number: *relative_attempt_number,
             held_queues: Vec::new(),
             task_group: "default".to_string(),
         },

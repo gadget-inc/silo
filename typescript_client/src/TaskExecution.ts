@@ -31,8 +31,10 @@ export interface Task<
   id: string;
   /** ID of the job this task belongs to */
   jobId: string;
-  /** Which attempt this is (1 = first attempt) */
+  /** Which attempt this is (1 = first attempt). Monotonically increasing across restarts. */
   attemptNumber: number;
+  /** Attempt number within the current run (1 = first attempt since last restart). Resets on restart. */
+  relativeAttemptNumber: number;
   /** How long the lease lasts in milliseconds. Heartbeat before this expires. */
   leaseMs: bigint;
   /** The decoded job payload */
@@ -45,7 +47,7 @@ export interface Task<
   taskGroup: string;
   /** Tenant ID if multi-tenancy is enabled */
   tenantId?: string;
-  /** True if this is the final attempt (no more retries after this) */
+  /** True if this is the final attempt within the current run (no more retries after this unless restarted) */
   isLastAttempt: boolean;
   /** Metadata key/value pairs from the job */
   metadata: Metadata;
@@ -63,6 +65,7 @@ export function transformTask<
     id: protoTask.id,
     jobId: protoTask.jobId,
     attemptNumber: protoTask.attemptNumber,
+    relativeAttemptNumber: protoTask.relativeAttemptNumber,
     leaseMs: protoTask.leaseMs,
     payload: decodeBytes<Payload>(
       protoTask.payload?.encoding.oneofKind === "msgpack"

@@ -41,6 +41,7 @@ function createTask(
     id,
     jobId,
     attemptNumber: 1,
+    relativeAttemptNumber: 1,
     leaseMs: 30000n,
     payload: {
       encoding: {
@@ -256,6 +257,7 @@ describe("SiloWorker", () => {
         id: "task-limits-1",
         jobId: "job-limits-1",
         attemptNumber: 1,
+        relativeAttemptNumber: 1,
         leaseMs: 30000n,
         payload: {
           encoding: {
@@ -331,15 +333,23 @@ describe("SiloWorker", () => {
 
       // Check concurrency limit
       const concurrencyLimit = receivedLimits[0] as {
-        limit: { oneofKind: string; concurrency: { key: string; maxConcurrency: number } };
+        limit: {
+          oneofKind: string;
+          concurrency: { key: string; maxConcurrency: number };
+        };
       };
       expect(concurrencyLimit.limit.oneofKind).toBe("concurrency");
-      expect(concurrencyLimit.limit.concurrency.key).toBe("test-concurrency-key");
+      expect(concurrencyLimit.limit.concurrency.key).toBe(
+        "test-concurrency-key",
+      );
       expect(concurrencyLimit.limit.concurrency.maxConcurrency).toBe(5);
 
       // Check rate limit
       const rateLimit = receivedLimits[1] as {
-        limit: { oneofKind: string; rateLimit: { name: string; uniqueKey: string } };
+        limit: {
+          oneofKind: string;
+          rateLimit: { name: string; uniqueKey: string };
+        };
       };
       expect(rateLimit.limit.oneofKind).toBe("rateLimit");
       expect(rateLimit.limit.rateLimit.name).toBe("test-rate-limit");

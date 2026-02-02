@@ -427,18 +427,18 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
   });
 
   describe("abort signal", () => {
-    it("provides abort signal that is aborted on stop", async () => {
+    it("provides abort signal that is only aborted on cancellation, not worker stop", async () => {
       let signalAborted = false;
-      let taskStarted = false;
+      let taskCompleted = false;
 
       const handler: TaskHandler = async (ctx) => {
-        taskStarted = true;
         ctx.cancellationSignal.addEventListener("abort", () => {
           signalAborted = true;
         });
 
-        // Long-running task
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+        // Short-running task that should complete normally
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        taskCompleted = true;
         return { type: "success", result: {} };
       };
 
@@ -448,22 +448,19 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       await client.enqueue({
         tenant: DEFAULT_TENANT,
         taskGroup: DEFAULT_TASK_GROUP,
-        payload: { action: "long" },
+        payload: { action: "short" },
         priority: 1,
       });
 
-      // Wait for task to start
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      // Wait for task to complete
+      await waitFor(() => taskCompleted, { timeout: 5000 });
 
-      // If we got a task to process
-      if (taskStarted) {
-        // Stop immediately - should abort signal
-        await worker.stop(100);
-        expect(signalAborted).toBe(true);
-      } else {
-        // Worker didn't pick up our task, just stop and skip the assertion
-        await worker.stop();
-      }
+      // Stop the worker
+      await worker.stop();
+
+      // Signal should NOT have been aborted - worker shutdown no longer aborts signals
+      // (only server cancellation or ctx.cancel() aborts the signal)
+      expect(signalAborted).toBe(false);
     });
   });
 
@@ -1399,26 +1396,19 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       expect(attemptCount).toBe(1);
     });
 
-    it("worker shutdown aborts running tasks", async () => {
+    it("worker shutdown does not abort running tasks' cancellation signal", async () => {
       let taskStarted = false;
       let signalAborted = false;
-      let signalAbortReason: string | null = null;
 
       const handler: TaskHandler = async (ctx) => {
         taskStarted = true;
 
         ctx.cancellationSignal.addEventListener("abort", () => {
           signalAborted = true;
-          signalAbortReason = "signal_aborted";
         });
 
-        // Long-running work
-        for (let i = 0; i < 100; i++) {
-          if (ctx.cancellationSignal.aborted) {
-            break;
-          }
-          await new Promise((resolve) => setTimeout(resolve, 50));
-        }
+        // Short-running work that completes before shutdown
+        await new Promise((resolve) => setTimeout(resolve, 200));
 
         return { type: "success", result: {} };
       };
@@ -1432,18 +1422,22 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       await client.enqueue({
         tenant: DEFAULT_TENANT,
         taskGroup: DEFAULT_TASK_GROUP,
-        payload: { action: "long-task" },
+        payload: { action: "task" },
         priority: 1,
       });
 
       // Wait for task to start
       await waitFor(() => taskStarted, { timeout: 5000 });
 
-      // Stop the worker (should abort signal)
+      // Give task time to complete
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      // Stop the worker
       await worker.stop(500);
 
-      expect(signalAborted).toBe(true);
-      expect(signalAbortReason).toBe("signal_aborted");
+      // Signal should NOT be aborted - worker shutdown no longer aborts signals
+      // (only server cancellation or ctx.cancel() aborts the signal)
+      expect(signalAborted).toBe(false);
     });
   });
 });

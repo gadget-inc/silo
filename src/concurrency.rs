@@ -322,6 +322,7 @@ impl ConcurrencyManager {
         limits: &[ConcurrencyLimit],
         task_group: &str,
         attempt_number: u32,
+        relative_attempt_number: u32,
     ) -> Result<Option<RequestTicketOutcome>, String> {
         // Only gate on the first limit (if any)
         let Some(limit) = limits.first() else {
@@ -349,6 +350,7 @@ impl ConcurrencyManager {
                 priority,
                 job_id,
                 attempt_number,
+                relative_attempt_number,
                 task_group,
             )?;
             Ok(Some(RequestTicketOutcome::GrantedImmediately {
@@ -368,6 +370,7 @@ impl ConcurrencyManager {
                 priority,
                 job_id,
                 attempt_number,
+                relative_attempt_number,
                 task_group,
             )?;
             Ok(Some(RequestTicketOutcome::TicketRequested {
@@ -383,6 +386,7 @@ impl ConcurrencyManager {
                 tenant: tenant.to_string(),
                 job_id: job_id.to_string(),
                 attempt_number,
+                relative_attempt_number,
                 request_id: request_id.clone(),
                 task_group: task_group.to_string(),
             };
@@ -508,6 +512,7 @@ impl ConcurrencyManager {
                         priority,
                         job_id,
                         attempt_number,
+                        relative_attempt_number,
                         task_group,
                     } => {
                         let job_id_str = job_id.as_str();
@@ -558,6 +563,7 @@ impl ConcurrencyManager {
                             tenant: tenant.to_string(),
                             job_id: job_id_str.to_string(),
                             attempt_number: *attempt_number,
+                            relative_attempt_number: *relative_attempt_number,
                             held_queues: vec![queue.clone()],
                             task_group: task_group_str.to_string(),
                         };
@@ -645,6 +651,7 @@ fn append_grant_edits(
     priority: u8,
     job_id: &str,
     attempt_number: u32,
+    relative_attempt_number: u32,
     task_group: &str,
 ) -> Result<(), String> {
     let holder = HolderRecord {
@@ -661,6 +668,7 @@ fn append_grant_edits(
         tenant: tenant.to_string(),
         job_id: job_id.to_string(),
         attempt_number,
+        relative_attempt_number,
         held_queues: vec![queue.to_string()],
         task_group: task_group.to_string(),
     };
@@ -683,6 +691,7 @@ fn append_request_edits(
     priority: u8,
     job_id: &str,
     attempt_number: u32,
+    relative_attempt_number: u32,
     task_group: &str,
 ) -> Result<(), String> {
     let action = ConcurrencyAction::EnqueueTask {
@@ -690,6 +699,7 @@ fn append_request_edits(
         priority,
         job_id: job_id.to_string(),
         attempt_number,
+        relative_attempt_number,
         task_group: task_group.to_string(),
     };
     let action_val = encode_concurrency_action(&action)?;

@@ -108,6 +108,7 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
             tenant,
             job_id,
             attempt_number,
+            relative_attempt_number,
             held_queues,
             task_group,
         } => Task::RunAttempt {
@@ -115,6 +116,7 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
             tenant: tenant.as_str().to_string(),
             job_id: job_id.as_str().to_string(),
             attempt_number: *attempt_number,
+            relative_attempt_number: *relative_attempt_number,
             held_queues: held_queues
                 .iter()
                 .map(|s| s.as_str().to_string())
@@ -128,6 +130,7 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
             tenant,
             job_id,
             attempt_number,
+            relative_attempt_number,
             request_id,
             task_group,
         } => Task::RequestTicket {
@@ -137,6 +140,7 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
             tenant: tenant.as_str().to_string(),
             job_id: job_id.as_str().to_string(),
             attempt_number: *attempt_number,
+            relative_attempt_number: *relative_attempt_number,
             request_id: request_id.as_str().to_string(),
             task_group: task_group.as_str().to_string(),
         },
@@ -145,6 +149,7 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
             tenant,
             job_id,
             attempt_number,
+            relative_attempt_number,
             limit_index,
             rate_limit,
             retry_count,
@@ -157,6 +162,7 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
             tenant: tenant.as_str().to_string(),
             job_id: job_id.as_str().to_string(),
             attempt_number: *attempt_number,
+            relative_attempt_number: *relative_attempt_number,
             limit_index: *limit_index,
             rate_limit: GubernatorRateLimitData {
                 name: rate_limit.name.as_str().to_string(),
@@ -287,6 +293,25 @@ impl DecodedLease {
         }
     }
 
+    /// Extract relative_attempt_number from the leased task (zero-copy). Returns 0 for RefreshFloatingLimit.
+    pub fn relative_attempt_number(&self) -> u32 {
+        match self.archived_task() {
+            ArchivedTask::RunAttempt {
+                relative_attempt_number,
+                ..
+            } => *relative_attempt_number,
+            ArchivedTask::RequestTicket {
+                relative_attempt_number,
+                ..
+            } => *relative_attempt_number,
+            ArchivedTask::CheckRateLimit {
+                relative_attempt_number,
+                ..
+            } => *relative_attempt_number,
+            ArchivedTask::RefreshFloatingLimit { .. } => 0,
+        }
+    }
+
     /// Extract held_queues from the leased task as owned strings (allocation required)
     pub fn held_queues(&self) -> Vec<String> {
         match self.archived_task() {
@@ -320,6 +345,7 @@ impl DecodedLease {
                 tenant,
                 job_id,
                 attempt_number,
+                relative_attempt_number,
                 held_queues,
                 task_group,
             } => Task::RunAttempt {
@@ -327,6 +353,7 @@ impl DecodedLease {
                 tenant: tenant.as_str().to_string(),
                 job_id: job_id.as_str().to_string(),
                 attempt_number: *attempt_number,
+                relative_attempt_number: *relative_attempt_number,
                 held_queues: held_queues.iter().map(|s| s.as_str().to_string()).collect(),
                 task_group: task_group.as_str().to_string(),
             },
@@ -337,6 +364,7 @@ impl DecodedLease {
                 tenant,
                 job_id,
                 attempt_number,
+                relative_attempt_number,
                 request_id,
                 task_group,
             } => Task::RequestTicket {
@@ -346,6 +374,7 @@ impl DecodedLease {
                 tenant: tenant.as_str().to_string(),
                 job_id: job_id.as_str().to_string(),
                 attempt_number: *attempt_number,
+                relative_attempt_number: *relative_attempt_number,
                 request_id: request_id.as_str().to_string(),
                 task_group: task_group.as_str().to_string(),
             },
@@ -354,6 +383,7 @@ impl DecodedLease {
                 tenant,
                 job_id,
                 attempt_number,
+                relative_attempt_number,
                 limit_index,
                 rate_limit,
                 retry_count,
@@ -366,6 +396,7 @@ impl DecodedLease {
                 tenant: tenant.as_str().to_string(),
                 job_id: job_id.as_str().to_string(),
                 attempt_number: *attempt_number,
+                relative_attempt_number: *relative_attempt_number,
                 limit_index: *limit_index,
                 rate_limit: GubernatorRateLimitData {
                     name: rate_limit.name.as_str().to_string(),

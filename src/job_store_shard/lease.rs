@@ -96,6 +96,7 @@ impl JobStoreShard {
         let tenant = decoded.tenant().to_string();
         let job_id = decoded.job_id().to_string();
         let attempt_number = decoded.attempt_number();
+        let relative_attempt_number = decoded.relative_attempt_number();
         let held_queues_local = decoded.held_queues(); // Only allocation needed
         let task_group = decoded.task_group().to_string();
 
@@ -122,6 +123,7 @@ impl JobStoreShard {
         let attempt = JobAttempt {
             job_id: job_id.clone(),
             attempt_number,
+            relative_attempt_number,
             task_id: task_id.to_string(),
             status: attempt_status,
         };
@@ -173,7 +175,9 @@ impl JobStoreShard {
                     let priority = view.priority();
                     let task_group = view.task_group();
                     let limits = view.limits();
-                    let failures_so_far = attempt_number;
+                    // Use relative_attempt_number for retry delay calculation
+                    // This ensures retry schedule resets after a job restart
+                    let failures_so_far = relative_attempt_number;
                     if let Some(policy_rt) = view.retry_policy()
                         && let Some(next_time) =
                             crate::retry::next_retry_time_ms(now_ms, failures_so_far, &policy_rt)
@@ -184,6 +188,7 @@ impl JobStoreShard {
                         // the current task's tickets below, this allows other jobs to run during
                         // the retry backoff period.
                         let next_attempt_number = attempt_number + 1;
+                        let next_relative_attempt_number = relative_attempt_number + 1;
                         let next_task_id = Uuid::new_v4().to_string();
 
                         // Track any immediate grants for rollback if DB write fails
@@ -194,6 +199,7 @@ impl JobStoreShard {
                                 &next_task_id,
                                 &job_id,
                                 next_attempt_number,
+                                next_relative_attempt_number,
                                 0, // start from first limit
                                 &limits,
                                 priority,
