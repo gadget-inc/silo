@@ -32,3 +32,7 @@ Run tests as often as you like. When running tests, don't run them within the sa
 # Deterministic simulation tests
 
 We use turmoil and mad-turmoil for DST tests. See CONTRIBUTING.md for more details.
+
+# Kubernetes tests
+
+Assume the developer has a k8s cluster running locally in orbstack which can be used for executing k8s tests.

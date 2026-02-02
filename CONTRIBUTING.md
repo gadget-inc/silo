@@ -12,6 +12,14 @@ You can run silo locally to make requests to a test instance. Running locally re
 dev
 ```
 
+## Formatting code
+
+You can autoformat all the Rust code with
+
+```shell
+just fmt
+```
+
 ## Running tests
 
 ### Rust tests

@@ -1,0 +1,1 @@
+Use the `gh` CLI to retrieve the latest Github Actions runs for this branch, and if the most recent one has failed, then retrieve the failing logs, and debug and fix the issues. You may need to run tests locally, fix formatting, etc. Don't commit and push any changes, just summarize what needed fixing. 

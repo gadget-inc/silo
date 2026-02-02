@@ -10,3 +10,11 @@ alwaysApply: true
 - Skip global state via `lazy_static!`, `Once`, or similar; prefer passing explicit context structs for any shared state. If existing code is already doing this, don't change it.
 - Prefer strong types over strings, use enums and newtypes when the domain is closed or needs validation.
 - Put rust tests in files in the `tests/` folder -- not inline in files within `src/`
+
+# Formatting
+
+You can format all the rust code in the project with:
+
+```shell
+just fmt
+```
