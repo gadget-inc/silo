@@ -68,6 +68,7 @@ async fn grpc_server_lease_tasks_multi_shard() -> anyhow::Result<()> {
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
             wal: None,
             apply_wal_on_close: true,
+            slatedb: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let factory = ShardFactory::new(template, rate_limiter, None);

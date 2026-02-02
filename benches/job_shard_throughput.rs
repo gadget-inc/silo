@@ -3,19 +3,20 @@ use silo::job_store_shard::JobStoreShard;
 use silo::settings::{Backend, DatabaseConfig};
 use silo::shard_range::ShardRange;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-async fn open_temp_shard(
-    flush_interval_ms: Option<u64>,
-) -> (tempfile::TempDir, Arc<JobStoreShard>) {
+async fn open_temp_shard(flush_interval_ms: u64) -> (tempfile::TempDir, Arc<JobStoreShard>) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cfg = DatabaseConfig {
         name: "bench-shard".to_string(),
         backend: Backend::Fs,
         path: tmp.path().to_string_lossy().to_string(),
-        flush_interval_ms,
         wal: None,
         apply_wal_on_close: true,
+        slatedb: Some(slatedb::config::Settings {
+            flush_interval: Some(Duration::from_millis(flush_interval_ms)),
+            ..Default::default()
+        }),
     };
     let shard = JobStoreShard::open(&cfg, NullGubernatorClient::new(), None, ShardRange::full())
         .await
@@ -36,7 +37,7 @@ async fn measure_enqueue_throughput(
     num_producers: usize,
     jobs_per_producer: usize,
 ) -> f64 {
-    let (_tmp, shard) = open_temp_shard(Some(flush_ms)).await;
+    let (_tmp, shard) = open_temp_shard(flush_ms).await;
     let now_ms = now_ms();
 
     let start = Instant::now();
@@ -79,7 +80,7 @@ async fn measure_dequeue_throughput(
     total_jobs: usize,
     batch: usize,
 ) -> f64 {
-    let (_tmp, shard) = open_temp_shard(Some(flush_ms)).await;
+    let (_tmp, shard) = open_temp_shard(flush_ms).await;
     let now_ms = now_ms();
 
     // Seed tasks

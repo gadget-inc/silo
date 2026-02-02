@@ -55,8 +55,9 @@ pub struct OpenShardOptions {
     pub wal_store: Option<Arc<dyn slatedb::object_store::ObjectStore>>,
     /// Optional WAL cleanup configuration for local storage
     pub wal_close_config: Option<WalCloseConfig>,
-    /// Optional custom flush interval
-    pub flush_interval: Option<std::time::Duration>,
+    /// Optional SlateDB settings for tuning database performance.
+    /// The `merge_operator` field will be overridden with Silo's counter merge operator.
+    pub slatedb_settings: Option<slatedb::config::Settings>,
     /// Rate limiter client for this shard
     pub rate_limiter: Arc<dyn RateLimitClient>,
     /// Optional metrics collector
@@ -158,8 +159,8 @@ impl JobStoreShard {
             (None, None)
         };
 
-        // Convert flush interval to Duration if specified
-        let flush_interval = cfg.flush_interval_ms.map(std::time::Duration::from_millis);
+        // Use SlateDB settings if configured
+        let slatedb_settings = cfg.slatedb.clone();
 
         Self::open_with_resolved_store(
             cfg.name.clone(),
@@ -168,7 +169,7 @@ impl JobStoreShard {
                 store: resolved.store,
                 wal_store,
                 wal_close_config,
-                flush_interval,
+                slatedb_settings,
                 rate_limiter,
                 metrics,
             },
@@ -202,7 +203,7 @@ impl JobStoreShard {
             store,
             wal_store,
             wal_close_config,
-            flush_interval,
+            slatedb_settings,
             rate_limiter,
             metrics,
         } = options;
@@ -215,12 +216,10 @@ impl JobStoreShard {
             db_builder = db_builder.with_wal_object_store(wal);
         }
 
-        // Apply custom flush interval if specified
-        if let Some(interval) = flush_interval {
-            let settings = slatedb::config::Settings {
-                flush_interval: Some(interval),
-                ..Default::default()
-            };
+        // Apply custom SlateDB settings if specified
+        // Note: The merge_operator field in settings is ignored because we already
+        // set it above via with_merge_operator() for counter support
+        if let Some(settings) = slatedb_settings {
             db_builder = db_builder.with_settings(settings);
         }
 

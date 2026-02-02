@@ -128,6 +128,11 @@ pub struct DatabaseTemplate {
     /// Defaults to true.
     #[serde(default = "default_apply_wal_on_close")]
     pub apply_wal_on_close: bool,
+    /// Optional SlateDB-specific settings for tuning database performance.
+    /// If not specified, SlateDB defaults are used.
+    /// See <https://docs.rs/slatedb/latest/slatedb/config/struct.Settings.html> for all options.
+    #[serde(default)]
+    pub slatedb: Option<slatedb::config::Settings>,
 }
 
 /// Configuration for a separate WAL object store
@@ -288,9 +293,6 @@ pub struct DatabaseConfig {
     pub name: String,
     pub backend: Backend,
     pub path: String,
-    /// Optional flush interval for SlateDB. If None, uses SlateDB's default.
-    #[serde(default)]
-    pub flush_interval_ms: Option<u64>,
     /// Optional separate WAL storage configuration.
     /// If not set, WAL uses the same backend/path as the main store.
     #[serde(default)]
@@ -305,6 +307,11 @@ pub struct DatabaseConfig {
     /// Defaults to true when WAL is configured.
     #[serde(default = "default_apply_wal_on_close")]
     pub apply_wal_on_close: bool,
+    /// Optional SlateDB-specific settings for tuning database performance.
+    /// If not specified, SlateDB defaults are used.
+    /// See <https://docs.rs/slatedb/latest/slatedb/config/struct.Settings.html> for all options.
+    #[serde(default)]
+    pub slatedb: Option<slatedb::config::Settings>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -404,6 +411,7 @@ impl AppConfig {
                 path: "/tmp/silo-%shard%".to_string(),
                 wal: None,
                 apply_wal_on_close: true,
+                slatedb: None,
             },
         };
 

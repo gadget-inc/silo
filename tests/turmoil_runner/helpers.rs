@@ -219,6 +219,7 @@ pub async fn setup_server(port: u16) -> turmoil::Result<()> {
             path: "mem://shard-{shard}".to_string(),
             wal: None,
             apply_wal_on_close: true,
+            slatedb: None,
         },
     };
 

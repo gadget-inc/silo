@@ -81,6 +81,7 @@ impl ShardFactory {
                 path: "/noop/%shard%".to_string(),
                 wal: None,
                 apply_wal_on_close: false,
+                slatedb: None,
             },
             rate_limiter: NullGubernatorClient::new(),
             metrics: None,
@@ -167,7 +168,7 @@ impl ShardFactory {
                         store: resolved.store,
                         wal_store,
                         wal_close_config,
-                        flush_interval: None, // No custom flush interval from factory
+                        slatedb_settings: template.slatedb.clone(),
                         rate_limiter,
                         metrics,
                     },

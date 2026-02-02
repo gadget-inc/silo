@@ -138,6 +138,7 @@ fn make_shard_factory(storage_root: &std::path::Path) -> Arc<ShardFactory> {
             path,
             wal: None,
             apply_wal_on_close: true,
+            slatedb: None,
         },
         MockGubernatorClient::new_arc(),
         None,
@@ -203,6 +204,7 @@ async fn setup_node_server(
             path: format!("mem://shard-{{shard}}-{}", node_id),
             wal: None,
             apply_wal_on_close: true,
+            slatedb: None,
         },
     };
 

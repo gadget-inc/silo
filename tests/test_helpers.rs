@@ -6,6 +6,15 @@ use silo::settings::{Backend, DatabaseConfig};
 use silo::shard_range::ShardRange;
 use slatedb::{Db, DbIterator};
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Create SlateDB settings with a fast flush interval for tests
+pub fn fast_flush_slatedb_settings() -> slatedb::config::Settings {
+    slatedb::config::Settings {
+        flush_interval: Some(Duration::from_millis(10)),
+        ..Default::default()
+    }
+}
 
 // Helper: enforce a tight timeout for async tests likely to hang
 #[macro_export]
@@ -48,9 +57,9 @@ pub async fn open_temp_shard_with_range(
         name: "test".to_string(),
         backend: Backend::Fs,
         path: tmp.path().to_string_lossy().to_string(),
-        flush_interval_ms: Some(10),
         wal: None,
         apply_wal_on_close: true,
+        slatedb: Some(fast_flush_slatedb_settings()),
     };
     let shard = JobStoreShard::open(&cfg, rate_limiter, None, range)
         .await
@@ -67,10 +76,10 @@ pub async fn open_temp_shard_with_rate_limiter(
         name: "test".to_string(),
         backend: Backend::Fs,
         path: tmp.path().to_string_lossy().to_string(),
-        // Use fast flush interval for tests to speed them up
-        flush_interval_ms: Some(10),
         wal: None,
         apply_wal_on_close: true,
+        // Use fast flush interval for tests to speed them up
+        slatedb: Some(fast_flush_slatedb_settings()),
     };
     let shard = JobStoreShard::open(&cfg, rate_limiter, None, ShardRange::full())
         .await
@@ -107,12 +116,12 @@ pub async fn open_temp_shard_with_local_wal_and_rate_limiter(
         name: "test".to_string(),
         backend: Backend::Fs, // Main data backend - simulates object storage (could be s3 in prod)
         path: data_dir.path().to_string_lossy().to_string(),
-        flush_interval_ms: Some(10),
         wal: Some(WalConfig {
             backend: Backend::Fs, // Local WAL
             path: wal_dir.path().to_string_lossy().to_string(),
         }),
         apply_wal_on_close: flush_on_close,
+        slatedb: Some(fast_flush_slatedb_settings()),
     };
 
     let shard = JobStoreShard::open(&cfg, rate_limiter, None, ShardRange::full())

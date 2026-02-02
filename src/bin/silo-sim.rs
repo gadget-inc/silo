@@ -87,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
                 .to_string(),
             wal: None,
             apply_wal_on_close: true,
+            slatedb: None,
         },
         rate_limiter.clone(),
         None,
@@ -101,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
                 .to_string(),
             wal: None,
             apply_wal_on_close: true,
+            slatedb: None,
         },
         rate_limiter.clone(),
         None,
@@ -146,9 +148,13 @@ async fn main() -> anyhow::Result<()> {
                 .join(shard_id.to_string())
                 .to_string_lossy()
                 .to_string(),
-            flush_interval_ms: Some(10), // Fast flushes for simulation
             wal: None,
             apply_wal_on_close: true,
+            // Fast flushes for simulation
+            slatedb: Some(slatedb::config::Settings {
+                flush_interval: Some(Duration::from_millis(10)),
+                ..Default::default()
+            }),
         };
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, range).await?;
         shards.insert(*shard_id, shard);
@@ -307,6 +313,7 @@ async fn main() -> anyhow::Result<()> {
                 .to_string(),
             wal: None,
             apply_wal_on_close: true,
+            slatedb: None,
         },
         rate_limiter.clone(),
         None,
