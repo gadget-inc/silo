@@ -2456,6 +2456,252 @@ async fn etcd_ring_change_triggers_handoff() {
     h_default.abort();
 }
 
+/// Test rapid membership churn (node restart) converges correctly.
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn etcd_rapid_membership_churn_converges() {
+    let prefix = unique_prefix();
+    let num_shards: u32 = 16;
+
+    // Start first node, then quickly add/remove others to simulate churn
+    let (c1, h1) = start_etcd_coordinator!(&prefix, "n1", "http://127.0.0.1:50051", num_shards);
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let endpoints = get_etcd_endpoints();
+    let (c2, h2) = EtcdCoordinator::start(
+        &endpoints,
+        &prefix,
+        "n2",
+        "http://127.0.0.1:50052",
+        num_shards,
+        10,
+        make_test_factory("n2"),
+        Vec::new(),
+    )
+    .await
+    .expect("start c2");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (c3, h3) = EtcdCoordinator::start(
+        &endpoints,
+        &prefix,
+        "n3",
+        "http://127.0.0.1:50053",
+        num_shards,
+        10,
+        make_test_factory("n3"),
+        Vec::new(),
+    )
+    .await
+    .expect("start c3");
+
+    // Brief churn: stop and restart n2 quickly
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    c2.shutdown().await.unwrap();
+    let _ = h2.abort();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (c2b, h2b) = EtcdCoordinator::start(
+        &endpoints,
+        &prefix,
+        "n2",
+        "http://127.0.0.1:50052",
+        num_shards,
+        10,
+        make_test_factory("n2b"),
+        Vec::new(),
+    )
+    .await
+    .expect("restart c2");
+
+    // Wait for all to converge post-churn
+    let deadline = Duration::from_secs(20);
+    assert!(c1.wait_converged(deadline).await);
+    assert!(c2b.wait_converged(deadline).await);
+    assert!(c3.wait_converged(deadline).await);
+
+    // Validate ownership covers all shards and is disjoint
+    let s1: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    let s2: HashSet<ShardId> = c2b.owned_shards().await.into_iter().collect();
+    let s3: HashSet<ShardId> = c3.owned_shards().await.into_iter().collect();
+    let all: HashSet<ShardId> = s1
+        .iter()
+        .copied()
+        .chain(s2.iter().copied())
+        .chain(s3.iter().copied())
+        .collect();
+    let expected: HashSet<ShardId> = c1
+        .get_shard_map()
+        .await
+        .unwrap()
+        .shard_ids()
+        .into_iter()
+        .collect();
+    assert_eq!(all, expected, "all shards should be owned after churn");
+    assert!(s1.is_disjoint(&s2), "s1 and s2 should be disjoint");
+    assert!(s1.is_disjoint(&s3), "s1 and s3 should be disjoint");
+    assert!(s2.is_disjoint(&s3), "s2 and s3 should be disjoint");
+
+    // Cleanup
+    c1.shutdown().await.unwrap();
+    c2b.shutdown().await.unwrap();
+    c3.shutdown().await.unwrap();
+    let _ = h1.abort();
+    let _ = h2b.abort();
+    let _ = h3.abort();
+}
+
+/// Verifies that membership persists beyond the lease TTL.
+/// This catches bugs where keepalive requests aren't being sent.
+/// Uses a short TTL (2s) to keep test fast while still validating keepalives.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn etcd_membership_persists_beyond_lease_ttl() {
+    let prefix = unique_prefix();
+    let num_shards: u32 = 8; // Small for fast convergence
+    let lease_ttl_secs: i64 = 2; // Short TTL to speed up test
+
+    let cfg = silo::settings::AppConfig::load(None).expect("load default config");
+    let coord = EtcdConnection::connect(&cfg.coordination)
+        .await
+        .expect("connect etcd");
+
+    let endpoints = get_etcd_endpoints();
+    let (c1, h1) = EtcdCoordinator::start(
+        &endpoints,
+        &prefix,
+        "n1",
+        "http://127.0.0.1:50051",
+        num_shards,
+        lease_ttl_secs,
+        make_test_factory("n1"),
+        Vec::new(),
+    )
+    .await
+    .expect("start coordinator");
+
+    assert!(
+        c1.wait_converged(Duration::from_secs(10)).await,
+        "should converge"
+    );
+    let initial_shards = c1.owned_shards().await;
+    assert_eq!(
+        initial_shards.len(),
+        num_shards as usize,
+        "single node should own all shards"
+    );
+
+    // Verify membership key exists in etcd
+    let mut kv = coord.client().kv_client();
+    let members_prefix = silo::coordination::keys::members_prefix(&prefix);
+    let resp = kv
+        .get(
+            members_prefix.clone(),
+            Some(etcd_client::GetOptions::new().with_prefix()),
+        )
+        .await
+        .expect("get members");
+    assert_eq!(resp.kvs().len(), 1, "should have 1 member initially");
+
+    // Wait for 2.5x the lease TTL - if keepalives aren't working, lease will expire
+    let wait_duration = Duration::from_millis((lease_ttl_secs as u64) * 2500);
+    tokio::time::sleep(wait_duration).await;
+
+    // Verify membership still exists (would FAIL if keepalives are broken!)
+    let resp = kv
+        .get(
+            members_prefix.clone(),
+            Some(etcd_client::GetOptions::new().with_prefix()),
+        )
+        .await
+        .expect("get members after wait");
+    assert_eq!(
+        resp.kvs().len(),
+        1,
+        "member should still exist after 2.5x TTL - keepalives must be working"
+    );
+
+    // Verify owned shards didn't change (no spurious rebalancing)
+    let final_shards = c1.owned_shards().await;
+    assert_eq!(
+        initial_shards, final_shards,
+        "owned shards should be stable over time"
+    );
+
+    c1.shutdown().await.unwrap();
+    h1.abort();
+}
+
+/// Verifies that get_shard_owner_map reflects actual ownership accurately.
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn etcd_shard_owner_map_matches_actual_ownership() {
+    let prefix = unique_prefix();
+    let num_shards: u32 = 8;
+    let lease_ttl_secs: i64 = 3;
+
+    let endpoints = get_etcd_endpoints();
+    let (c1, h1) = EtcdCoordinator::start(
+        &endpoints,
+        &prefix,
+        "n1",
+        "http://127.0.0.1:50061",
+        num_shards,
+        lease_ttl_secs,
+        make_test_factory("n1"),
+        Vec::new(),
+    )
+    .await
+    .expect("start c1");
+
+    let (c2, h2) = EtcdCoordinator::start(
+        &endpoints,
+        &prefix,
+        "n2",
+        "http://127.0.0.1:50062",
+        num_shards,
+        lease_ttl_secs,
+        make_test_factory("n2"),
+        Vec::new(),
+    )
+    .await
+    .expect("start c2");
+
+    assert!(c1.wait_converged(Duration::from_secs(15)).await);
+    assert!(c2.wait_converged(Duration::from_secs(15)).await);
+
+    // Get the shard owner map from c1's perspective
+    let owner_map = c1.get_shard_owner_map().await.expect("get owner map");
+
+    // Verify all shards have owners
+    assert_eq!(
+        owner_map.shard_to_addr.len(),
+        num_shards as usize,
+        "all shards should have owners in map"
+    );
+
+    // Verify owner map is consistent with actual ownership
+    let s1: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    let s2: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
+
+    for (shard_id, addr) in &owner_map.shard_to_addr {
+        if s1.contains(shard_id) {
+            assert_eq!(
+                addr, "http://127.0.0.1:50061",
+                "shard {shard_id} owned by c1 should map to c1's addr"
+            );
+        } else if s2.contains(shard_id) {
+            assert_eq!(
+                addr, "http://127.0.0.1:50062",
+                "shard {shard_id} owned by c2 should map to c2's addr"
+            );
+        } else {
+            panic!("shard {shard_id} not owned by any node");
+        }
+    }
+
+    c1.shutdown().await.unwrap();
+    c2.shutdown().await.unwrap();
+    h1.abort();
+    h2.abort();
+}
+
 /// Test that orphaned shards (no eligible node) remain unowned.
 #[silo::test(flavor = "multi_thread", worker_threads = 2)]
 async fn etcd_orphaned_ring_shard_remains_unowned() {

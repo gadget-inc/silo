@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use silo::coordination::SplitPhase;
 use silo::coordination::{Coordinator, EtcdCoordinator, ShardSplitter};
@@ -7,22 +7,6 @@ use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::settings::{Backend, DatabaseTemplate};
 use silo::shard_range::ShardId;
-
-/// Wait until a condition becomes true or timeout is reached.
-async fn wait_until<F, Fut>(timeout: Duration, mut f: F) -> bool
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if f().await {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    false
-}
 
 // Global mutex to serialize coordination tests
 // Note: If a test panics, this mutex becomes poisoned. Use lock().unwrap_or_else()

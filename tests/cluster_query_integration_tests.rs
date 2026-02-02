@@ -55,33 +55,54 @@ async fn get_client(addr: &str) -> SiloClient<Channel> {
     SiloClient::new(channel)
 }
 
-/// Enqueue a job via gRPC to a specific shard
+/// Enqueue a job via gRPC to a specific shard.
+/// Retries on "shard not ready" errors which can happen during shard acquisition.
 async fn enqueue_job(
     client: &mut SiloClient<Channel>,
     shard: &str,
     job_id: &str,
     tenant: Option<&str>,
 ) {
-    let request = EnqueueRequest {
-        shard: shard.to_string(),
-        id: job_id.to_string(),
-        priority: 5,
-        start_at_ms: 0,
-        retry_policy: None,
-        payload: Some(SerializedBytes {
-            encoding: Some(serialized_bytes::Encoding::Msgpack(
-                rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
-            )),
-        }),
-        limits: vec![],
-        tenant: tenant.map(|s| s.to_string()),
-        metadata: HashMap::new(),
-        task_group: "default".to_string(),
-    };
-    client
-        .enqueue(request)
-        .await
-        .expect("failed to enqueue job");
+    let max_retries = 10;
+    let mut last_error = None;
+
+    for attempt in 0..max_retries {
+        let request = EnqueueRequest {
+            shard: shard.to_string(),
+            id: job_id.to_string(),
+            priority: 5,
+            start_at_ms: 0,
+            retry_policy: None,
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                    rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                )),
+            }),
+            limits: vec![],
+            tenant: tenant.map(|s| s.to_string()),
+            metadata: HashMap::new(),
+            task_group: "default".to_string(),
+        };
+
+        match client.enqueue(request).await {
+            Ok(_) => return,
+            Err(e) => {
+                let msg = e.message();
+                // Retry on transient "shard not ready" errors during acquisition
+                if msg.contains("shard not ready") || msg.contains("acquisition in progress") {
+                    last_error = Some(e);
+                    tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
+                    continue;
+                }
+                panic!("failed to enqueue job: {}", e);
+            }
+        }
+    }
+
+    panic!(
+        "failed to enqueue job after {} retries: {:?}",
+        max_retries, last_error
+    );
 }
 
 /// Helper struct to manage routing to correct nodes based on shard ownership
