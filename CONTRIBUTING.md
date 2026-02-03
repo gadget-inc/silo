@@ -12,6 +12,19 @@ You can run silo locally to make requests to a test instance. Running locally re
 dev
 ```
 
+## Setting up for agentic development
+
+Silo uses `lnai` to link all the configs for various agent development tools locally.
+
+Run
+
+```shell
+pnpm install -g lnai
+lnai sync
+```
+
+to setup the repo's rules and commands for your local editor.
+
 ## Formatting code
 
 You can autoformat all the Rust code with

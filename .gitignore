@@ -13,3 +13,9 @@
 /docs/src/content/docs/reference/rpc-reference.mdx
 /docs/dist
 /docs/node_modules
+# lnai-generated
+.claude/CLAUDE.md
+.claude/settings.json
+.cursor/cli.json
+AGENTS.md
+# end lnai-generated
