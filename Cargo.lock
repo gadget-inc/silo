@@ -5216,6 +5216,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "toml",
  "tonic 0.12.3",
  "tonic-build 0.12.3",

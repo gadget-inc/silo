@@ -57,9 +57,9 @@
 - [ ] benchmarks in CI, codspeed or similar regression tracker
 - [ ] make sure failure data is also stored using msgpack
 - [ ] shard splitting
-  - [ ] wire up re-cleanup on re-aquire
-  - [ ] add tests for actually processing jobs before cleanup has happened
-  - [ ] validate all sigils present
-  - [ ] add split DST scenarios
-  - [ ] ensure that cleanup is aborted cleanly when a shard is closed mid-cleanup
+  - [x] wire up re-cleanup on re-aquire
+  - [x] add tests for actually processing jobs before cleanup has happened
+  - [x] validate all sigils present
+  - [x] add split DST scenarios
+  - [x] ensure that cleanup is aborted cleanly when a shard is closed mid-cleanup
 - [ ] asynchronously hydrate concurrency queue counts to make startup faster

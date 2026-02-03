@@ -1144,7 +1144,7 @@ impl EtcdShardGuard {
                                         }
                                     };
                                     // Open the shard BEFORE marking as Held - if open fails, we should release the lock and not claim ownership.
-                                    let _shard = match factory.open(&self.shard_id, &range).await {
+                                    let shard = match factory.open(&self.shard_id, &range).await {
                                         Ok(shard) => shard,
                                         Err(e) => {
                                             // Failed to open - release the lock and retry
@@ -1158,6 +1158,10 @@ impl EtcdShardGuard {
                                             continue;
                                         }
                                     };
+
+                                    // Spawn background cleanup if this shard has pending cleanup work
+                                    // (e.g., it's a split child or was re-acquired after a crash)
+                                    shard.maybe_spawn_background_cleanup(range.clone());
 
                                     {
                                         let mut st = self.state.lock().await;
