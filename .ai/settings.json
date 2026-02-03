@@ -27,7 +27,16 @@
       "Bash(gh api:*)",
       "Read",
       "Write",
-      "Edit"
+      "Edit",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:crates.io)",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:rust-lang.org)",
+      "WebFetch(domain:rust-lang.github.io)",
+      "WebFetch(domain:slatedb.io)",
+      "WebFetch(domain:flatbuffers.dev)",
+      "WebFetch(domain:grpc.io)"
     ],
     "deny": ["Read(.envrc.local)"]
   }

@@ -10,10 +10,13 @@
 /typescript_client/node_modules
 
 .ai/.lnai-manifest.json
+.claude/settings.local.json
+
 # Auto-generated docs (built from proto files)
 /docs/src/content/docs/reference/rpc-reference.mdx
 /docs/dist
 /docs/node_modules
+
 # lnai-generated
 .claude/CLAUDE.md
 .claude/settings.json
