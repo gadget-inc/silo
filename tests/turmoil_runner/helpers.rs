@@ -209,10 +209,12 @@ pub async fn connect_to_server(
     const INITIAL_BACKOFF_MS: u64 = 25;
     const MAX_BACKOFF_MS: u64 = 500;
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+    const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
     let endpoint = tonic::transport::Endpoint::new(uri.to_string())
         .map_err(|e| e.to_string())?
-        .connect_timeout(CONNECT_TIMEOUT);
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT);
 
     let mut last_error = None;
     let mut backoff_ms = INITIAL_BACKOFF_MS;

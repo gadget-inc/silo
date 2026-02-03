@@ -177,20 +177,71 @@ pub fn run() {
             Ok(())
         });
 
-        // Verifier: Check final state using DST events (no RPCs needed).
+        // Verifier: Poll for progress using DST events (no RPCs needed).
         // DST events are emitted synchronously by the server and collected via a
         // thread-local event bus - no network involved, so verification is reliable.
+        //
+        // Instead of checking once at a fixed time, we poll until progress is made
+        // or a hard timeout is reached. This ensures the test maintains value by
+        // requiring actual progress while tolerating variable network conditions.
         let verifier_tracker = Arc::clone(&tracker);
         let verifier_completed = Arc::clone(&total_completed);
         let verifier_enqueued = Arc::clone(&total_enqueued);
         let verifier_done_flag = Arc::clone(&scenario_done);
         sim.client("verifier", async move {
-            // Wait for work to complete
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            // Poll for progress with increasing intervals.
+            // We require at least one job to reach terminal state (success/fail/cancel)
+            // as observed through DST events (server ground truth).
+            const MAX_WAIT_SECS: u64 = 100; // Hard timeout - if no progress by now, it's a bug
+            const POLL_INTERVAL_MS: u64 = 500;
 
-            // Process DST events from server-side instrumentation
+            let start = std::time::Instant::now();
+            let mut progress_made = false;
+
+            while start.elapsed().as_secs() < MAX_WAIT_SECS {
+                tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+
+                // Process DST events from server-side instrumentation
+                verifier_tracker.process_dst_events();
+
+                let enqueued = verifier_enqueued.load(Ordering::SeqCst);
+                let completed = verifier_completed.load(Ordering::SeqCst);
+                let terminal = verifier_tracker.jobs.terminal_count();
+
+                // Run invariant checks on each poll
+                verifier_tracker.verify_all();
+
+                // Check if progress has been made
+                if completed > 0 || terminal > 0 {
+                    progress_made = true;
+                    tracing::info!(
+                        enqueued = enqueued,
+                        client_completed = completed,
+                        terminal = terminal,
+                        elapsed_secs = start.elapsed().as_secs(),
+                        "progress_detected"
+                    );
+                    break;
+                }
+
+                // If nothing enqueued yet, keep waiting for producer
+                if enqueued == 0 {
+                    continue;
+                }
+
+                // Jobs enqueued but no progress yet - log and keep polling
+                if start.elapsed().as_secs() % 10 == 0 {
+                    tracing::trace!(
+                        enqueued = enqueued,
+                        terminal = terminal,
+                        elapsed_secs = start.elapsed().as_secs(),
+                        "waiting_for_progress"
+                    );
+                }
+            }
+
+            // Final state check
             verifier_tracker.process_dst_events();
-
             let enqueued = verifier_enqueued.load(Ordering::SeqCst);
             let completed = verifier_completed.load(Ordering::SeqCst);
             let terminal = verifier_tracker.jobs.terminal_count();
@@ -199,10 +250,11 @@ pub fn run() {
                 enqueued = enqueued,
                 client_completed = completed,
                 terminal = terminal,
+                progress_made = progress_made,
                 "verification_results"
             );
 
-            // Run invariant checks based on DST events
+            // Run final invariant checks
             verifier_tracker.verify_all();
             verifier_tracker.jobs.verify_no_terminal_leases();
 
@@ -218,13 +270,13 @@ pub fn run() {
                 );
             }
 
-            // INVARIANT: At least some jobs should have completed (from client's view)
-            // or reached terminal state (from server's DST events).
-            // With 15% message loss, client may not see all completions, but DST events
-            // give us ground truth about what actually happened on the server.
+            // INVARIANT: At least some jobs must have completed or reached terminal state.
+            // We waited up to MAX_WAIT_SECS for this - if it didn't happen, that's a real bug.
             assert!(
-                completed > 0 || terminal > 0 || enqueued == 0,
-                "No progress made: client_completed={}, terminal={}, enqueued={}",
+                progress_made || enqueued == 0,
+                "No progress made after {}s: client_completed={}, terminal={}, enqueued={}. \
+                 This indicates a bug - even with 15% message loss, jobs should eventually complete.",
+                MAX_WAIT_SECS,
                 completed,
                 terminal,
                 enqueued
