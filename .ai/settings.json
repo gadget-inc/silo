@@ -23,7 +23,12 @@
       "Bash(git branch)",
       "Bash(gh run:*)",
       "Bash(gh workflow:*)",
-      "Bash(gh cache:*)"
-    ]
+      "Bash(gh cache:*)",
+      "Bash(gh api:*)",
+      "Read",
+      "Write",
+      "Edit"
+    ],
+    "deny": ["Read(.envrc.local)"]
   }
 }
