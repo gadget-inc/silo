@@ -18,9 +18,10 @@ runs:
       uses: nix-community/cache-nix-action@v6
       with:
         # Include Cargo.lock since Nix builds depend on Rust dependencies
+        # Include runner.arch to separate x86 and ARM64 caches (they have different store paths)
         # Include github.run_id to ensure new caches are always saved (GH caches are immutable)
-        primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock', '**/Cargo.lock') }}-${{ github.run_id }}
-        restore-prefixes-first-match: nix-${{ runner.os }}-
+        primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/*.nix', '**/flake.lock', '**/Cargo.lock') }}-${{ github.run_id }}
+        restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
         # Garbage collect to keep cache size manageable
         gc-max-store-size-linux: 4294967296
         # Save cache even if job fails (to cache partial builds)

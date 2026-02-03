@@ -260,6 +260,12 @@ jobs:
           nix build .#packages.${{ matrix.nix_system }}.silo-docker -L
           docker load < result
 
+      - name: Push to Cachix
+        if: github.ref == 'refs/heads/main'
+        run: |
+          # Push the silo binary and its dependencies to Cachix for future builds
+          cachix push silo result
+
       - name: Authenticate gcloud
         if: github.ref == 'refs/heads/main'
         id: auth
