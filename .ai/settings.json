@@ -19,7 +19,11 @@
       "Bash(cut:*)",
       "Bash(paste:*)",
       "Bash(join:*)",
-      "Bash(split:*)"
+      "Bash(split:*)",
+      "Bash(git branch)",
+      "Bash(gh run:*)",
+      "Bash(gh workflow:*)",
+      "Bash(gh cache:*)"
     ]
   }
 }
