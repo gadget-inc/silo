@@ -1,6 +1,6 @@
 //! Floating concurrency limit operations.
 
-use slatedb::WriteBatch;
+use slatedb::{DbIterator, WriteBatch};
 use uuid::Uuid;
 
 use crate::codec::{
@@ -10,10 +10,47 @@ use crate::codec::{
 use crate::job::{FloatingConcurrencyLimit, FloatingLimitState};
 use crate::job_store_shard::helpers::now_epoch_ms;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
-use crate::keys::{floating_limit_state_key, leased_task_key};
+use crate::keys::{
+    concurrency_request_prefix, end_bound, floating_limit_state_key, leased_task_key,
+};
 use crate::task::Task;
 
 impl JobStoreShard {
+    pub(crate) fn floating_limit_refresh_ready(
+        state: &DecodedFloatingLimitState,
+        now_ms: i64,
+    ) -> bool {
+        let archived = state.archived();
+
+        if archived.refresh_task_scheduled {
+            return false;
+        }
+
+        let next_refresh_due = archived.last_refreshed_at_ms + archived.refresh_interval_ms;
+        if now_ms < next_refresh_due {
+            return false;
+        }
+
+        let in_backoff = archived
+            .next_retry_at_ms
+            .as_ref()
+            .map(|&t| now_ms < t)
+            .unwrap_or(false);
+
+        !in_backoff
+    }
+
+    pub(crate) async fn has_waiting_concurrency_requests(
+        &self,
+        tenant: &str,
+        queue_key: &str,
+    ) -> Result<bool, JobStoreShardError> {
+        let start = concurrency_request_prefix(tenant, queue_key);
+        let end = end_bound(&start);
+        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..end).await?;
+        Ok(iter.next().await?.is_some())
+    }
+
     /// Get or create the floating limit state for a given queue key.
     /// Returns a zero-copy decoded view. For the rare "just created" case,
     /// we encode then decode to return the same type (extra decode is fine for cold path).
@@ -59,6 +96,7 @@ impl JobStoreShard {
         state: &DecodedFloatingLimitState,
         now_ms: i64,
         task_group: &str,
+        has_waiters: bool,
     ) -> Result<(), JobStoreShardError> {
         let archived = state.archived();
 
@@ -78,7 +116,7 @@ impl JobStoreShard {
             .map(|&t| now_ms < t)
             .unwrap_or(false);
 
-        if !should_refresh || in_backoff {
+        if !should_refresh || in_backoff || !has_waiters {
             return Ok(());
         }
 
@@ -278,33 +316,15 @@ impl JobStoreShard {
         let capped_backoff_ms = backoff_ms.min(MAX_BACKOFF_MS);
         let next_retry_at = now_ms + capped_backoff_ms;
 
-        // Schedule a new refresh task
-        let new_task_id = Uuid::new_v4().to_string();
-        let refresh_task = Task::RefreshFloatingLimit {
-            task_id: new_task_id.clone(),
-            tenant: tenant.clone(),
-            queue_key: queue_key.clone(),
-            current_max_concurrency,
-            last_refreshed_at_ms,
-            metadata,
-            task_group: task_group.clone(),
-        };
-
-        let task_value = encode_task(&refresh_task)?;
-        let synthetic_job_id = format!("floating_refresh:{}", queue_key);
-        let task_key_bytes = crate::keys::task_key(
-            &task_group,
-            next_retry_at,
-            0, // highest priority
-            &synthetic_job_id,
-            0, // attempt not used for refresh tasks
-        );
+        let has_waiters = self
+            .has_waiting_concurrency_requests(&tenant, &queue_key)
+            .await?;
 
         // Construct new state directly - avoids intermediate owned allocation
         let new_state = FloatingLimitState {
             retry_count: new_retry_count,
             next_retry_at_ms: Some(next_retry_at),
-            refresh_task_scheduled: true,
+            refresh_task_scheduled: has_waiters,
             // Preserve unchanged fields from archived view
             current_max_concurrency: archived.current_max_concurrency,
             last_refreshed_at_ms: archived.last_refreshed_at_ms,
@@ -320,20 +340,54 @@ impl JobStoreShard {
         let mut batch = WriteBatch::new();
         let state_value = encode_floating_limit_state(&new_state)?;
         batch.put(&state_key, &state_value);
-        batch.put(&task_key_bytes, &task_value);
+        if has_waiters {
+            // Schedule a new refresh task
+            let new_task_id = Uuid::new_v4().to_string();
+            let refresh_task = Task::RefreshFloatingLimit {
+                task_id: new_task_id.clone(),
+                tenant: tenant.clone(),
+                queue_key: queue_key.clone(),
+                current_max_concurrency,
+                last_refreshed_at_ms,
+                metadata,
+                task_group: task_group.clone(),
+            };
+
+            let task_value = encode_task(&refresh_task)?;
+            let synthetic_job_id = format!("floating_refresh:{}", queue_key);
+            let task_key_bytes = crate::keys::task_key(
+                &task_group,
+                next_retry_at,
+                0, // highest priority
+                &synthetic_job_id,
+                0, // attempt not used for refresh tasks
+            );
+            batch.put(&task_key_bytes, &task_value);
+        }
         batch.delete(&lease_key);
 
         self.db.write(batch).await?;
         self.db.flush().await?;
 
-        tracing::warn!(
-            queue_key = %queue_key,
-            error_code = %error_code,
-            error_message = %error_message,
-            retry_count = new_retry_count,
-            next_retry_at_ms = next_retry_at,
-            "floating limit refresh failed, scheduled retry"
-        );
+        if has_waiters {
+            tracing::warn!(
+                queue_key = %queue_key,
+                error_code = %error_code,
+                error_message = %error_message,
+                retry_count = new_retry_count,
+                next_retry_at_ms = next_retry_at,
+                "floating limit refresh failed, scheduled retry"
+            );
+        } else {
+            tracing::warn!(
+                queue_key = %queue_key,
+                error_code = %error_code,
+                error_message = %error_message,
+                retry_count = new_retry_count,
+                next_retry_at_ms = next_retry_at,
+                "floating limit refresh failed, no waiters; skipping retry"
+            );
+        }
 
         Ok(())
     }

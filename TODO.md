@@ -13,7 +13,7 @@
   - [ ] figure out how to avoid having to scan for all future tasks and delete performance issue
 - [x] get job info api
 - [x] get job with attempts api
-- [ ] performant, clear storage for job payload, result, and error data
+- [x] performant, clear storage for job payload, result, and error data
 - [x] list jobs api
 - [x] job query api
   - [ ] unhappy path tests

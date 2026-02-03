@@ -671,10 +671,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         return 15;
       };
 
-      const worker = createWorkerWithRefresh(handler, refreshHandler);
-      worker.start();
-
-      // Enqueue job with floating limit and very short refresh interval
+      // Enqueue first job to create the limit state
       await client.enqueue({
         tenant: DEFAULT_TENANT,
         taskGroup: DEFAULT_TASK_GROUP,
@@ -683,20 +680,17 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
           {
             type: "floatingConcurrency",
             key: queueKey,
-            defaultMaxConcurrency: 5,
+            defaultMaxConcurrency: 1, // Use 1 so second job becomes a waiter
             refreshIntervalMs: 1n, // Very short interval
             metadata: { testId: "refresh-test" },
           },
         ],
       });
 
-      // Wait for job to be processed
-      await waitFor(() => processedJobs.length >= 1);
+      // Small delay for limit to become stale
+      await new Promise((r) => setTimeout(r, 50));
 
-      // Small delay to allow refresh task to be processed
-      await new Promise((r) => setTimeout(r, 200));
-
-      // Trigger refresh by enqueueing another job
+      // Enqueue second job - this will be a waiter and trigger refresh scheduling
       await client.enqueue({
         tenant: DEFAULT_TENANT,
         taskGroup: DEFAULT_TASK_GROUP,
@@ -705,12 +699,16 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
           {
             type: "floatingConcurrency",
             key: queueKey,
-            defaultMaxConcurrency: 5,
+            defaultMaxConcurrency: 1,
             refreshIntervalMs: 1n,
             metadata: { testId: "refresh-test" },
           },
         ],
       });
+
+      // Now start the worker - it will process the refresh task and jobs
+      const worker = createWorkerWithRefresh(handler, refreshHandler);
+      worker.start();
 
       // Wait for refresh handler to be called
       await waitFor(() => refreshedQueues.includes(queueKey), {
@@ -747,10 +745,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         return 20;
       };
 
-      const worker = createWorkerWithRefresh(handler, refreshHandler);
-      worker.start();
-
-      // Enqueue first job to create the limit
+      // Enqueue first job to create the limit state
       await client.enqueue({
         tenant: DEFAULT_TENANT,
         taskGroup: DEFAULT_TASK_GROUP,
@@ -759,16 +754,17 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
           {
             type: "floatingConcurrency",
             key: queueKey,
-            defaultMaxConcurrency: 10,
+            defaultMaxConcurrency: 1, // Use 1 so second job becomes a waiter
             refreshIntervalMs: 1n,
             metadata: testMetadata,
           },
         ],
       });
 
-      // Wait and trigger refresh
-      await new Promise((r) => setTimeout(r, 100));
+      // Small delay for limit to become stale
+      await new Promise((r) => setTimeout(r, 50));
 
+      // Enqueue second job - this will be a waiter and trigger refresh scheduling
       await client.enqueue({
         tenant: DEFAULT_TENANT,
         taskGroup: DEFAULT_TASK_GROUP,
@@ -777,19 +773,23 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
           {
             type: "floatingConcurrency",
             key: queueKey,
-            defaultMaxConcurrency: 10,
+            defaultMaxConcurrency: 1,
             refreshIntervalMs: 1n,
             metadata: testMetadata,
           },
         ],
       });
 
+      // Now start the worker
+      const worker = createWorkerWithRefresh(handler, refreshHandler);
+      worker.start();
+
       // Wait for refresh handler to receive context
       await waitFor(() => receivedContext !== null, { timeout: 5000 });
 
       expect(receivedContext).not.toBeNull();
       expect(receivedContext!.queueKey).toBe(queueKey);
-      expect(receivedContext!.currentMax).toBe(10);
+      expect(receivedContext!.currentMax).toBe(1);
       expect(receivedContext!.metadata).toEqual(testMetadata);
       expect(typeof receivedContext!.shard).toBe("string");
       expect(receivedContext!.shard.length).toBeGreaterThan(0);
@@ -810,12 +810,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         throw new Error("Simulated API failure");
       };
 
-      const worker = createWorkerWithRefresh(handler, refreshHandler, {
-        onError: (err) => errors.push(err),
-      });
-      worker.start();
-
-      // Enqueue jobs to trigger refresh
+      // Enqueue first job to create the limit state
       await client.enqueue({
         tenant: DEFAULT_TENANT,
         taskGroup: DEFAULT_TASK_GROUP,
@@ -824,15 +819,17 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
           {
             type: "floatingConcurrency",
             key: queueKey,
-            defaultMaxConcurrency: 5,
+            defaultMaxConcurrency: 1, // Use 1 so second job becomes a waiter
             refreshIntervalMs: 1n,
             metadata: {},
           },
         ],
       });
 
-      await new Promise((r) => setTimeout(r, 100));
+      // Small delay for limit to become stale
+      await new Promise((r) => setTimeout(r, 50));
 
+      // Enqueue second job - this will be a waiter and trigger refresh scheduling
       await client.enqueue({
         tenant: DEFAULT_TENANT,
         taskGroup: DEFAULT_TASK_GROUP,
@@ -841,12 +838,18 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
           {
             type: "floatingConcurrency",
             key: queueKey,
-            defaultMaxConcurrency: 5,
+            defaultMaxConcurrency: 1,
             refreshIntervalMs: 1n,
             metadata: {},
           },
         ],
       });
+
+      // Now start the worker
+      const worker = createWorkerWithRefresh(handler, refreshHandler, {
+        onError: (err) => errors.push(err),
+      });
+      worker.start();
 
       // Wait for refresh handler to throw
       await waitFor(() => errorThrown, { timeout: 5000 });
@@ -916,6 +919,41 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         return { type: "success", result: {} };
       };
 
+      // Enqueue first job to create the limit state
+      await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
+        payload: { job: 1 },
+        limits: [
+          {
+            type: "floatingConcurrency",
+            key: queueKey,
+            defaultMaxConcurrency: 1, // Use 1 so second job becomes a waiter
+            refreshIntervalMs: 1n,
+            metadata: {},
+          },
+        ],
+      });
+
+      // Small delay for limit to become stale
+      await new Promise((r) => setTimeout(r, 50));
+
+      // Enqueue second job - this will be a waiter and trigger refresh scheduling
+      await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
+        payload: { job: 2 },
+        limits: [
+          {
+            type: "floatingConcurrency",
+            key: queueKey,
+            defaultMaxConcurrency: 1,
+            refreshIntervalMs: 1n,
+            metadata: {},
+          },
+        ],
+      });
+
       // Create worker WITHOUT refresh handler but WITH error handler to capture the error
       const worker = new SiloWorker({
         client,
@@ -928,40 +966,6 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       });
       activeWorkers.push(worker);
       worker.start();
-
-      // Enqueue jobs with floating limit
-      await client.enqueue({
-        tenant: DEFAULT_TENANT,
-        taskGroup: DEFAULT_TASK_GROUP,
-        payload: { job: 1 },
-        limits: [
-          {
-            type: "floatingConcurrency",
-            key: queueKey,
-            defaultMaxConcurrency: 5,
-            refreshIntervalMs: 1n,
-            metadata: {},
-          },
-        ],
-      });
-
-      await new Promise((r) => setTimeout(r, 100));
-
-      // Enqueue another to trigger refresh task (limit is stale)
-      await client.enqueue({
-        tenant: DEFAULT_TENANT,
-        taskGroup: DEFAULT_TASK_GROUP,
-        payload: { job: 2 },
-        limits: [
-          {
-            type: "floatingConcurrency",
-            key: queueKey,
-            defaultMaxConcurrency: 5,
-            refreshIntervalMs: 1n,
-            metadata: {},
-          },
-        ],
-      });
 
       // Wait for worker to encounter the refresh task
       await waitFor(() => errors.length > 0, { timeout: 5000 });

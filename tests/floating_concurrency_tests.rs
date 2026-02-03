@@ -475,7 +475,7 @@ async fn floating_concurrency_limit_schedules_refresh_when_stale() {
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
-                    default_max_concurrency: 5,
+                    default_max_concurrency: 1,
                     refresh_interval_ms,
                     metadata: vec![],
                 },
@@ -502,7 +502,7 @@ async fn floating_concurrency_limit_schedules_refresh_when_stale() {
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
-                    default_max_concurrency: 5,
+                    default_max_concurrency: 1,
                     refresh_interval_ms,
                     metadata: vec![],
                 },
@@ -525,6 +525,223 @@ async fn floating_concurrency_limit_schedules_refresh_when_stale() {
 }
 
 #[silo::test]
+async fn floating_concurrency_limit_schedules_refresh_when_stale_with_waiters_above_one() {
+    tokio::time::pause();
+    let now = now_ms();
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "fl-refresh-waiters-gt1-q".to_string();
+    let refresh_interval_ms = 100i64;
+    let default_max = 3u32;
+
+    // Fill the available slots (no waiters yet)
+    for i in 1..=default_max {
+        let _ = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now,
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({"j": i})),
+                vec![silo::job::Limit::FloatingConcurrency(
+                    silo::job::FloatingConcurrencyLimit {
+                        key: queue.clone(),
+                        default_max_concurrency: default_max,
+                        refresh_interval_ms,
+                        metadata: vec![],
+                    },
+                )],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+    }
+
+    tokio::time::advance(std::time::Duration::from_millis(200)).await;
+
+    // Enqueue one more to create a waiter and trigger refresh scheduling
+    let _j4 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": "waiter"})),
+            vec![silo::job::Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: queue.clone(),
+                    default_max_concurrency: default_max,
+                    refresh_interval_ms,
+                    metadata: vec![],
+                },
+            )],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue waiter");
+
+    assert!(
+        first_concurrency_request_kv(shard.db()).await.is_some(),
+        "expected a waiting request after exceeding max"
+    );
+
+    let tasks = shard.peek_tasks("default", 50).await.expect("peek tasks");
+    let has_refresh_task = tasks.iter().any(|t| {
+        matches!(
+            t,
+            Task::RefreshFloatingLimit { queue_key, .. } if queue_key == &queue
+        )
+    });
+    assert!(
+        has_refresh_task,
+        "refresh task should be scheduled when waiters exist"
+    );
+}
+
+#[silo::test]
+async fn floating_concurrency_limit_skips_refresh_without_waiters() {
+    tokio::time::pause();
+    let now = now_ms();
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "fl-no-waiters-refresh-q".to_string();
+    let refresh_interval_ms = 100i64; // 100ms
+
+    // Enqueue first job - should be granted immediately
+    let _j1 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            vec![silo::job::Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: queue.clone(),
+                    default_max_concurrency: 5,
+                    refresh_interval_ms,
+                    metadata: vec![],
+                },
+            )],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue j1");
+
+    // Advance time past the refresh interval
+    tokio::time::advance(std::time::Duration::from_millis(200)).await;
+
+    // Enqueue another job - still no waiters (max=5)
+    let _j2 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+            vec![silo::job::Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: queue.clone(),
+                    default_max_concurrency: 5,
+                    refresh_interval_ms,
+                    metadata: vec![],
+                },
+            )],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue j2");
+
+    assert!(
+        first_concurrency_request_kv(shard.db()).await.is_none(),
+        "no waiting requests expected"
+    );
+
+    let tasks = shard.peek_tasks("default", 50).await.expect("peek tasks");
+    let has_refresh_task = tasks.iter().any(|t| {
+        matches!(
+            t,
+            Task::RefreshFloatingLimit { queue_key, .. } if queue_key == &queue
+        )
+    });
+    assert!(
+        !has_refresh_task,
+        "refresh task should not be scheduled without waiters"
+    );
+}
+
+#[silo::test]
+async fn floating_limit_allows_multiple_concurrent_grants() {
+    tokio::time::pause();
+    let now = now_ms();
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "fl-multi-grant-q".to_string();
+    let refresh_interval_ms = 60_000i64;
+
+    let j1 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            vec![silo::job::Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: queue.clone(),
+                    default_max_concurrency: 2,
+                    refresh_interval_ms,
+                    metadata: vec![],
+                },
+            )],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue j1");
+
+    let j2 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+            vec![silo::job::Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: queue.clone(),
+                    default_max_concurrency: 2,
+                    refresh_interval_ms,
+                    metadata: vec![],
+                },
+            )],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue j2");
+
+    assert!(
+        first_concurrency_request_kv(shard.db()).await.is_none(),
+        "no waiters expected at max=2"
+    );
+
+    let tasks = shard.peek_tasks("default", 10).await.expect("peek tasks");
+    let run_count = tasks
+        .iter()
+        .filter(|t| matches!(t, Task::RunAttempt { job_id, .. } if job_id == &j1 || job_id == &j2))
+        .count();
+    assert_eq!(run_count, 2, "both jobs should be runnable");
+}
+
+#[silo::test]
 async fn floating_concurrency_limit_dequeue_returns_refresh_tasks() {
     tokio::time::pause();
     let now = now_ms();
@@ -544,7 +761,7 @@ async fn floating_concurrency_limit_dequeue_returns_refresh_tasks() {
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
-                    default_max_concurrency: 2,
+                    default_max_concurrency: 1,
                     refresh_interval_ms,
                     metadata: vec![("key".to_string(), "value".to_string())],
                 },
@@ -570,7 +787,7 @@ async fn floating_concurrency_limit_dequeue_returns_refresh_tasks() {
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
-                    default_max_concurrency: 2,
+                    default_max_concurrency: 1,
                     refresh_interval_ms,
                     metadata: vec![("key".to_string(), "value".to_string())],
                 },
@@ -595,7 +812,7 @@ async fn floating_concurrency_limit_dequeue_returns_refresh_tasks() {
 
     let refresh = &result.refresh_tasks[0];
     assert_eq!(refresh.queue_key, queue);
-    assert_eq!(refresh.current_max_concurrency, 2);
+    assert_eq!(refresh.current_max_concurrency, 1);
     assert_eq!(refresh.metadata.len(), 1);
     assert_eq!(
         refresh.metadata[0],
@@ -623,7 +840,7 @@ async fn floating_limit_refresh_success_updates_state() {
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
-                    default_max_concurrency: 2,
+                    default_max_concurrency: 1,
                     refresh_interval_ms,
                     metadata: vec![],
                 },
@@ -649,7 +866,7 @@ async fn floating_limit_refresh_success_updates_state() {
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
-                    default_max_concurrency: 2,
+                    default_max_concurrency: 1,
                     refresh_interval_ms,
                     metadata: vec![],
                 },
@@ -720,7 +937,7 @@ async fn floating_limit_refresh_failure_triggers_backoff() {
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
-                    default_max_concurrency: 5,
+                    default_max_concurrency: 1,
                     refresh_interval_ms,
                     metadata: vec![],
                 },
@@ -746,7 +963,7 @@ async fn floating_limit_refresh_failure_triggers_backoff() {
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
-                    default_max_concurrency: 5,
+                    default_max_concurrency: 1,
                     refresh_interval_ms,
                     metadata: vec![],
                 },
@@ -784,7 +1001,7 @@ async fn floating_limit_refresh_failure_triggers_backoff() {
     let archived = decoded.archived();
 
     // Should still have old concurrency value
-    assert_eq!(archived.current_max_concurrency, 5);
+    assert_eq!(archived.current_max_concurrency, 1);
     // Retry count should be incremented
     assert_eq!(archived.retry_count, 1);
     // Next retry time should be set (with backoff)
@@ -807,6 +1024,108 @@ async fn floating_limit_refresh_failure_triggers_backoff() {
 }
 
 #[silo::test]
+async fn floating_limit_refresh_failure_skips_retry_without_waiters() {
+    tokio::time::pause();
+    let now = now_ms();
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "fl-failure-no-waiters-q".to_string();
+    let refresh_interval_ms = 100i64;
+
+    // Enqueue first job to take the only slot
+    let _j1 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            vec![silo::job::Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: queue.clone(),
+                    default_max_concurrency: 1,
+                    refresh_interval_ms,
+                    metadata: vec![],
+                },
+            )],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue j1");
+
+    // Make limit stale, enqueue another to create a waiter and schedule refresh
+    tokio::time::advance(std::time::Duration::from_millis(200)).await;
+    let _j2 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+            vec![silo::job::Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: queue.clone(),
+                    default_max_concurrency: 1,
+                    refresh_interval_ms,
+                    metadata: vec![],
+                },
+            )],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue j2");
+
+    let result = shard
+        .dequeue("worker-1", "default", 10)
+        .await
+        .expect("dequeue");
+    assert!(
+        !result.refresh_tasks.is_empty(),
+        "refresh task should be leased"
+    );
+    assert!(!result.tasks.is_empty(), "run task should be leased");
+
+    let refresh_task_id = result.refresh_tasks[0].task_id.clone();
+    let run_task_id = result.tasks[0].attempt().task_id().to_string();
+
+    // Complete the run task to clear waiting requests
+    shard
+        .report_attempt_outcome(&run_task_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report success");
+    assert!(
+        first_concurrency_request_kv(shard.db()).await.is_none(),
+        "waiting requests should be cleared"
+    );
+
+    // Report failed refresh - no retry should be scheduled without waiters
+    shard
+        .report_refresh_failure(&refresh_task_id, "test_error", "simulated failure")
+        .await
+        .expect("report refresh failure");
+
+    let state_key = silo::keys::floating_limit_state_key("-", &queue);
+    let state_raw = shard
+        .db()
+        .get(&state_key)
+        .await
+        .expect("db get")
+        .expect("state should exist");
+    let decoded = silo::codec::decode_floating_limit_state(&state_raw).expect("decode state");
+    let archived = decoded.archived();
+
+    assert!(
+        !archived.refresh_task_scheduled,
+        "retry should not be scheduled without waiters"
+    );
+    assert_eq!(archived.retry_count, 1);
+    assert!(archived.next_retry_at_ms.is_some());
+}
+
+#[silo::test]
 async fn floating_limit_concurrent_enqueues_no_duplicate_refresh() {
     tokio::time::pause();
     let now = now_ms();
@@ -826,7 +1145,7 @@ async fn floating_limit_concurrent_enqueues_no_duplicate_refresh() {
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
-                    default_max_concurrency: 5,
+                    default_max_concurrency: 1,
                     refresh_interval_ms,
                     metadata: vec![],
                 },
@@ -855,7 +1174,7 @@ async fn floating_limit_concurrent_enqueues_no_duplicate_refresh() {
                 vec![silo::job::Limit::FloatingConcurrency(
                     silo::job::FloatingConcurrencyLimit {
                         key: queue.clone(),
-                        default_max_concurrency: 5,
+                        default_max_concurrency: 1,
                         refresh_interval_ms,
                         metadata: vec![],
                     },
@@ -1064,7 +1383,7 @@ async fn floating_limit_multiple_retries_increase_backoff() {
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
-                    default_max_concurrency: 5,
+                    default_max_concurrency: 1,
                     refresh_interval_ms,
                     metadata: vec![],
                 },
@@ -1090,7 +1409,7 @@ async fn floating_limit_multiple_retries_increase_backoff() {
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
-                    default_max_concurrency: 5,
+                    default_max_concurrency: 1,
                     refresh_interval_ms,
                     metadata: vec![],
                 },
@@ -1179,7 +1498,7 @@ async fn floating_limit_successful_refresh_resets_backoff() {
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
-                    default_max_concurrency: 5,
+                    default_max_concurrency: 1,
                     refresh_interval_ms,
                     metadata: vec![],
                 },
@@ -1205,7 +1524,7 @@ async fn floating_limit_successful_refresh_resets_backoff() {
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
-                    default_max_concurrency: 5,
+                    default_max_concurrency: 1,
                     refresh_interval_ms,
                     metadata: vec![],
                 },
@@ -1285,7 +1604,7 @@ async fn floating_limit_refresh_task_lease_expiry_allows_rescheduling() {
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
-                    default_max_concurrency: 5,
+                    default_max_concurrency: 1,
                     refresh_interval_ms,
                     metadata: vec![],
                 },
@@ -1311,7 +1630,7 @@ async fn floating_limit_refresh_task_lease_expiry_allows_rescheduling() {
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
-                    default_max_concurrency: 5,
+                    default_max_concurrency: 1,
                     refresh_interval_ms,
                     metadata: vec![],
                 },
@@ -1406,7 +1725,7 @@ async fn floating_limit_refresh_task_lease_expiry_allows_rescheduling() {
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
-                    default_max_concurrency: 5,
+                    default_max_concurrency: 1,
                     refresh_interval_ms,
                     metadata: vec![],
                 },
@@ -1454,7 +1773,7 @@ async fn floating_limit_refresh_task_lease_expiry_preserves_state() {
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
-                    default_max_concurrency: 42, // specific value
+                    default_max_concurrency: 1, // specific value
                     refresh_interval_ms,
                     metadata: vec![
                         ("org".to_string(), "test-org".to_string()),
@@ -1483,7 +1802,7 @@ async fn floating_limit_refresh_task_lease_expiry_preserves_state() {
             vec![silo::job::Limit::FloatingConcurrency(
                 silo::job::FloatingConcurrencyLimit {
                     key: queue.clone(),
-                    default_max_concurrency: 42,
+                    default_max_concurrency: 1,
                     refresh_interval_ms,
                     metadata: vec![
                         ("org".to_string(), "test-org".to_string()),
@@ -1515,8 +1834,8 @@ async fn floating_limit_refresh_task_lease_expiry_preserves_state() {
         .expect("state");
     let decoded = silo::codec::decode_floating_limit_state(&state_raw).expect("decode");
     assert!(decoded.archived().refresh_task_scheduled);
-    assert_eq!(decoded.archived().current_max_concurrency, 42);
-    assert_eq!(decoded.archived().default_max_concurrency, 42);
+    assert_eq!(decoded.archived().current_max_concurrency, 1);
+    assert_eq!(decoded.archived().default_max_concurrency, 1);
     assert_eq!(decoded.archived().refresh_interval_ms, refresh_interval_ms);
     assert_eq!(decoded.archived().metadata.len(), 2);
 
@@ -1562,12 +1881,12 @@ async fn floating_limit_refresh_task_lease_expiry_preserves_state() {
     );
     assert_eq!(
         decoded.archived().current_max_concurrency,
-        42,
+        1,
         "current_max_concurrency should be preserved"
     );
     assert_eq!(
         decoded.archived().default_max_concurrency,
-        42,
+        1,
         "default_max_concurrency should be preserved"
     );
     assert_eq!(

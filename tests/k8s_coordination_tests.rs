@@ -2728,8 +2728,8 @@ async fn k8s_split_state_persists_across_restart() {
     c1.shutdown().await.unwrap();
     h1.abort();
 
-    // Small delay
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Wait for K8s resources to be cleaned up before restarting
+    tokio::time::sleep(Duration::from_millis(1000)).await;
 
     // Start new coordinator with same prefix (simulates restart)
     let (c2, h2) = K8sCoordinator::start(
