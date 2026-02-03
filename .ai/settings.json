@@ -3,6 +3,7 @@
     "allow": [
       "Bash(grep:*)",
       "Bash(ls:*)",
+      "Bash(rg:*)",
       "Bash(cargo:*)",
       "Bash(pnpm run:*)",
       "Bash(pnpm test:*)",
@@ -21,6 +22,7 @@
       "Bash(paste:*)",
       "Bash(join:*)",
       "Bash(split:*)",
+      "Bash(unzip:*)",
       "Bash(git branch)",
       "Bash(git log:*)",
       "Bash(git diff:*)",
@@ -31,6 +33,7 @@
       "Bash(gh cache:*)",
       "Bash(gh api:*)",
       "Bash(gh pr view:*)",
+      "Bash(gh pr diff:*)",
       "Bash(gh search:*)",
       "Bash(gh issue view:*)",
       "Bash(scripts/*)",
