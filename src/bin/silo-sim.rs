@@ -45,7 +45,7 @@ async fn count_with_prefix(db: &slatedb::Db, prefix: &str) -> usize {
     let start: Vec<u8> = prefix.as_bytes().to_vec();
     let mut end: Vec<u8> = prefix.as_bytes().to_vec();
     end.push(0xFF);
-    let mut iter = db.scan::<Vec<u8>, _>(start..=end).await.expect("scan");
+    let mut iter = db.scan::<Vec<u8>, _>(start..end).await.expect("scan");
     let mut n = 0usize;
     loop {
         let maybe = iter.next().await.expect("next");

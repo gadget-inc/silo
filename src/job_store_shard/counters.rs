@@ -95,12 +95,12 @@ impl JobStoreShard {
         let total_key = shard_total_jobs_counter_key();
         let completed_key = shard_completed_jobs_counter_key();
 
-        let total_jobs = match self.db.get(total_key.as_bytes()).await? {
+        let total_jobs = match self.db.get(&total_key).await? {
             Some(bytes) => decode_counter(&bytes),
             None => 0,
         };
 
-        let completed_jobs = match self.db.get(completed_key.as_bytes()).await? {
+        let completed_jobs = match self.db.get(&completed_key).await? {
             Some(bytes) => decode_counter(&bytes),
             None => 0,
         };
@@ -115,28 +115,28 @@ impl JobStoreShard {
     /// Call this when a new job is enqueued.
     pub(crate) fn increment_total_jobs_counter(&self, batch: &mut WriteBatch) {
         let key = shard_total_jobs_counter_key();
-        batch.merge(key.as_bytes(), encode_counter(1));
+        batch.merge(&key, encode_counter(1));
     }
 
     /// Decrement the total jobs counter in a write batch using merge.
     /// Call this when a job is deleted.
     pub(crate) fn decrement_total_jobs_counter(&self, batch: &mut WriteBatch) {
         let key = shard_total_jobs_counter_key();
-        batch.merge(key.as_bytes(), encode_counter(-1));
+        batch.merge(&key, encode_counter(-1));
     }
 
     /// Increment the completed jobs counter in a write batch using merge.
     /// Call this when a job transitions to a terminal state (Succeeded, Failed, Cancelled).
     pub(crate) fn increment_completed_jobs_counter(&self, batch: &mut WriteBatch) {
         let key = shard_completed_jobs_counter_key();
-        batch.merge(key.as_bytes(), encode_counter(1));
+        batch.merge(&key, encode_counter(1));
     }
 
     /// Decrement the completed jobs counter in a write batch using merge.
     /// Call this when a terminal job is restarted or deleted.
     pub(crate) fn decrement_completed_jobs_counter(&self, batch: &mut WriteBatch) {
         let key = shard_completed_jobs_counter_key();
-        batch.merge(key.as_bytes(), encode_counter(-1));
+        batch.merge(&key, encode_counter(-1));
     }
 
     /// Increment the completed jobs counter within a transaction using merge.
@@ -146,7 +146,7 @@ impl JobStoreShard {
         txn: &DbTransaction,
     ) -> Result<(), JobStoreShardError> {
         let key = shard_completed_jobs_counter_key();
-        txn.merge(key.as_bytes(), encode_counter(1))?;
+        txn.merge(&key, encode_counter(1))?;
         Ok(())
     }
 
@@ -157,7 +157,7 @@ impl JobStoreShard {
         txn: &DbTransaction,
     ) -> Result<(), JobStoreShardError> {
         let key = shard_completed_jobs_counter_key();
-        txn.merge(key.as_bytes(), encode_counter(-1))?;
+        txn.merge(&key, encode_counter(-1))?;
         Ok(())
     }
 }

@@ -28,14 +28,35 @@ All of Silo is built to house job data for multiple tenants, if necessary. All d
 
 ## Key/value layout
 
-- `jobs/<tenant-id>/<job-id>` - stores job payloads
-- `attempts/<tenant-id>/<job-id>/<attempt-number>` - stores attempt details
-- `tasks/<start-time>/<priority>/<job-id>/<attempt-number>` - stores the work items that need accomplishing in task order. Each stored task has a system-generated UUID.
-- `lease/<task-id>` - during leasing, dequeued tasks are written here keyed by task id. The value stores a LeaseRecord `{ worker_id, task, expiry_ms }`. Workers must heartbeat/complete before expiry to retain ownership. Expired lease detection scans this prefix and inspects `expiry_ms`.
+Silo uses the [storekey](https://crates.io/crates/storekey) crate for binary key encoding. This provides lexicographically-sortable binary keys that maintain correct ordering when compared as byte strings. Each key type has a unique single-byte prefix to ensure namespace isolation.
 
-Secondary indexes are also mapped as ordered keys in the k/v store:
+### Key types and their prefixes
 
-- `idx/status_ts/<tenant>/<status>/<inv_ts:020>/<job-id>` stores a secondary index for all jobs, by status, ordered by the time of the last transition
+| Prefix | Name | Description |
+|--------|------|-------------|
+| 0x01 | Job info | Stores job payloads: `(tenant, job_id)` |
+| 0x02 | Job status | Stores job status: `(tenant, job_id)` |
+| 0x03 | Status/time index | Secondary index for jobs by status, newest-first: `(tenant, status, inverted_timestamp, job_id)` |
+| 0x04 | Metadata index | Secondary index for jobs by metadata key/value: `(tenant, key, value, job_id)` |
+| 0x05 | Task | Work items in task order: `(task_group, start_time_ms, priority, job_id, attempt)` |
+| 0x06 | Lease | Leased tasks: `(task_id)` |
+| 0x07 | Attempt | Attempt records: `(tenant, job_id, attempt_number)` |
+| 0x08 | Concurrency request | Jobs waiting for concurrency slots: `(tenant, queue, start_time_ms, priority, request_id)` |
+| 0x09 | Concurrency holder | Tasks holding concurrency slots: `(tenant, queue, task_id)` |
+| 0x0A | Job cancelled | Cancellation flags: `(tenant, job_id)` |
+| 0x0B | Floating limit | Dynamic concurrency limit state: `(tenant, queue_key)` |
+| 0xF0-0xFF | System | Internal counters, cleanup state, and metadata |
+
+### Encoding details
+
+- Strings use null-terminated escape encoding (embedded nulls are escaped)
+- Integers use big-endian encoding for correct lexicographic ordering
+- Tuples encode each field sequentially
+- The inverted timestamp in status/time index uses `u64::MAX - timestamp` for newest-first ordering
+
+The lease record value stores `{ worker_id, task, expiry_ms }`. Workers must heartbeat or complete before expiry to retain ownership. Expired lease detection scans the lease prefix and inspects `expiry_ms`.
+
+See `src/keys.rs` for the full implementation and parsing utilities.
 
 ## Clustering approach
 

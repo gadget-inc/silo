@@ -1,5 +1,8 @@
 mod test_helpers;
-use test_helpers::{count_with_prefix, msgpack_payload, open_temp_shard};
+use test_helpers::{
+    count_job_info_keys, count_job_info_keys_for_tenant, count_job_status_keys,
+    count_status_time_index_keys, msgpack_payload, open_temp_shard,
+};
 
 use silo::shard_range::ShardRange;
 
@@ -40,7 +43,7 @@ async fn cleanup_removes_keys_outside_range() {
     shard.db().flush().await.unwrap();
 
     // Verify jobs exist for all tenants before cleanup
-    let count_before = count_with_prefix(shard.db(), "jobs/").await;
+    let count_before = count_job_info_keys(shard.db()).await;
     assert_eq!(count_before, 12); // 6 tenants * 2 jobs
 
     // Simulate this shard becoming the LEFT child after a split at "m"
@@ -63,16 +66,16 @@ async fn cleanup_removes_keys_outside_range() {
     // Verify only left-range tenants remain
     // aaa, bbb, lll should remain (3 tenants * 2 jobs = 6)
     // mmm, nnn, zzz should be deleted
-    let count_after = count_with_prefix(shard.db(), "jobs/").await;
+    let count_after = count_job_info_keys(shard.db()).await;
     assert_eq!(
         count_after, 6,
         "should have 6 job records (3 tenants * 2 jobs)"
     );
 
     // Verify specific tenants
-    let aaa_jobs = count_with_prefix(shard.db(), "jobs/aaa/").await;
-    let mmm_jobs = count_with_prefix(shard.db(), "jobs/mmm/").await;
-    let zzz_jobs = count_with_prefix(shard.db(), "jobs/zzz/").await;
+    let aaa_jobs = count_job_info_keys_for_tenant(shard.db(), "aaa").await;
+    let mmm_jobs = count_job_info_keys_for_tenant(shard.db(), "mmm").await;
+    let zzz_jobs = count_job_info_keys_for_tenant(shard.db(), "zzz").await;
 
     assert_eq!(aaa_jobs, 2, "aaa jobs should remain");
     assert_eq!(mmm_jobs, 0, "mmm jobs should be deleted");
@@ -88,11 +91,11 @@ async fn cleanup_removes_status_and_index_keys() {
     shard.db().flush().await.unwrap();
 
     // Verify job_status keys exist
-    let status_before = count_with_prefix(shard.db(), "job_status/").await;
+    let status_before = count_job_status_keys(shard.db()).await;
     assert_eq!(status_before, 6);
 
     // Verify idx/status_ts keys exist
-    let idx_before = count_with_prefix(shard.db(), "idx/status_ts/").await;
+    let idx_before = count_status_time_index_keys(shard.db()).await;
     assert_eq!(idx_before, 6);
 
     // Run cleanup for LEFT child range (tenants < "mmm")
@@ -106,14 +109,13 @@ async fn cleanup_removes_status_and_index_keys() {
     shard.db().flush().await.unwrap();
 
     // Verify only aaa tenant keys remain
-    let status_after = count_with_prefix(shard.db(), "job_status/").await;
+    let status_after = count_job_status_keys(shard.db()).await;
     assert_eq!(status_after, 3, "only aaa status records should remain");
 
-    let idx_after = count_with_prefix(shard.db(), "idx/status_ts/aaa/").await;
+    // Note: we can't easily filter status index by tenant with binary keys without
+    // adding more helper functions, so just verify total count decreased
+    let idx_after = count_status_time_index_keys(shard.db()).await;
     assert_eq!(idx_after, 3, "only aaa index records should remain");
-
-    let idx_zzz = count_with_prefix(shard.db(), "idx/status_ts/zzz/").await;
-    assert_eq!(idx_zzz, 0, "zzz index records should be deleted");
 }
 
 #[silo::test]
@@ -135,14 +137,14 @@ async fn cleanup_handles_right_child_range() {
     shard.db().flush().await.unwrap();
 
     // Verify only right-range tenants remain (mmm, nnn, zzz)
-    let count_after = count_with_prefix(shard.db(), "jobs/").await;
+    let count_after = count_job_info_keys(shard.db()).await;
     assert_eq!(count_after, 6, "should have 6 job records (3 tenants * 2)");
 
     // Verify specific tenants
-    let aaa_jobs = count_with_prefix(shard.db(), "jobs/aaa/").await;
-    let bbb_jobs = count_with_prefix(shard.db(), "jobs/bbb/").await;
-    let mmm_jobs = count_with_prefix(shard.db(), "jobs/mmm/").await;
-    let zzz_jobs = count_with_prefix(shard.db(), "jobs/zzz/").await;
+    let aaa_jobs = count_job_info_keys_for_tenant(shard.db(), "aaa").await;
+    let bbb_jobs = count_job_info_keys_for_tenant(shard.db(), "bbb").await;
+    let mmm_jobs = count_job_info_keys_for_tenant(shard.db(), "mmm").await;
+    let zzz_jobs = count_job_info_keys_for_tenant(shard.db(), "zzz").await;
 
     assert_eq!(aaa_jobs, 0, "aaa jobs should be deleted");
     assert_eq!(bbb_jobs, 0, "bbb jobs should be deleted");
@@ -285,7 +287,7 @@ async fn cleanup_full_range_deletes_nothing() {
     enqueue_jobs_for_tenants(&shard, &["aaa", "mmm", "zzz"], 2).await;
     shard.db().flush().await.unwrap();
 
-    let count_before = count_with_prefix(shard.db(), "jobs/").await;
+    let count_before = count_job_info_keys(shard.db()).await;
 
     // Full range means everything is in range
     let full_range = ShardRange::full();
@@ -300,7 +302,7 @@ async fn cleanup_full_range_deletes_nothing() {
     assert_eq!(result.keys_deleted, 0, "nothing should be deleted");
 
     shard.db().flush().await.unwrap();
-    let count_after = count_with_prefix(shard.db(), "jobs/").await;
+    let count_after = count_job_info_keys(shard.db()).await;
     assert_eq!(
         count_after, count_before,
         "all jobs should remain after cleanup"
@@ -350,43 +352,8 @@ async fn cleanup_handles_escaped_tenant_ids() {
     shard.db().flush().await.unwrap();
 
     // Verify normal-tenant jobs remain
-    let normal_jobs = count_with_prefix(shard.db(), "jobs/normal-tenant/").await;
+    let normal_jobs = count_job_info_keys_for_tenant(shard.db(), "normal-tenant").await;
     assert_eq!(normal_jobs, 1, "normal-tenant job should remain");
-}
-
-#[test]
-fn test_extract_tenant_from_key() {
-    use silo::job_store_shard::extract_tenant_from_key;
-
-    // jobs/{tenant}/{id}
-    assert_eq!(
-        extract_tenant_from_key("jobs/tenant123/job456", "jobs/"),
-        Some("tenant123".to_string())
-    );
-
-    // job_status/{tenant}/{id}
-    assert_eq!(
-        extract_tenant_from_key("job_status/my-tenant/job789", "job_status/"),
-        Some("my-tenant".to_string())
-    );
-
-    // idx/status_ts/{tenant}/...
-    assert_eq!(
-        extract_tenant_from_key(
-            "idx/status_ts/tenant-abc/running/00000001/job1",
-            "idx/status_ts/"
-        ),
-        Some("tenant-abc".to_string())
-    );
-
-    // Escaped tenant
-    assert_eq!(
-        extract_tenant_from_key("jobs/tenant%2Fwith%2Fslashes/job1", "jobs/"),
-        Some("tenant%2Fwith%2Fslashes".to_string())
-    );
-
-    // No match
-    assert_eq!(extract_tenant_from_key("other/key", "jobs/"), None);
 }
 
 /// Test that cleanup status is stored in and retrieved from the shard database

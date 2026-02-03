@@ -9,7 +9,7 @@ use crate::job::{JobStatus, JobView};
 use crate::job_attempt::{AttemptStatus, JobAttempt};
 use crate::job_store_shard::helpers::now_epoch_ms;
 use crate::job_store_shard::{DequeueResult, JobStoreShard, JobStoreShardError};
-use crate::keys::{attempt_key, decode_tenant, job_info_key, leased_task_key};
+use crate::keys::{attempt_key, job_info_key, leased_task_key};
 use crate::task::{DEFAULT_LEASE_MS, LeaseRecord, LeasedRefreshTask, LeasedTask, Task};
 use crate::task_broker::BrokerTask;
 
@@ -69,7 +69,7 @@ impl JobStoreShard {
             let now_ms = now_epoch_ms();
             let expiry_ms = now_ms + DEFAULT_LEASE_MS;
             let mut batch = WriteBatch::new();
-            let mut ack_keys: Vec<String> = Vec::with_capacity(claimed.len());
+            let mut ack_keys: Vec<Vec<u8>> = Vec::with_capacity(claimed.len());
             let mut processed_internal = false;
 
             // Get the shard range for split-aware filtering
@@ -81,15 +81,13 @@ impl JobStoreShard {
                 // Check if task's tenant is within shard range
                 // Tasks for tenants outside the range are defunct (from before a split)
                 let task_tenant = task.tenant();
-                let decoded_tenant = decode_tenant(task_tenant);
 
-                if !shard_range.contains(&decoded_tenant) {
+                if !shard_range.contains(task_tenant) {
                     // Task is for a tenant outside our range - delete and skip
-                    batch.delete(entry.key.as_bytes());
+                    batch.delete(&entry.key);
                     ack_keys.push(entry.key.clone());
                     tracing::debug!(
-                        key = %entry.key,
-                        tenant = %decoded_tenant,
+                        tenant = %task_tenant,
                         range = %shard_range,
                         "dequeue: skipping defunct task (tenant outside shard range)"
                     );
@@ -115,7 +113,7 @@ impl JobStoreShard {
 
                         // [SILO-DEQ-CXL] Check if job is cancelled - if so, skip and clean up task
                         if self.is_job_cancelled(&tenant, job_id).await? {
-                            batch.delete(entry.key.as_bytes());
+                            batch.delete(&entry.key);
                             ack_keys.push(entry.key.clone());
                             tracing::debug!(job_id = %job_id, "dequeue: skipping cancelled job RequestTicket");
                             continue;
@@ -123,7 +121,7 @@ impl JobStoreShard {
 
                         // Load job info
                         let job_key = job_info_key(&tenant, job_id);
-                        let maybe_job = self.db.get(job_key.as_bytes()).await?;
+                        let maybe_job = self.db.get(&job_key).await?;
                         let job_view = maybe_job
                             .as_ref()
                             .and_then(|bytes| JobView::new(bytes.clone()).ok());
@@ -171,7 +169,7 @@ impl JobStoreShard {
                                     expiry_ms,
                                 };
                                 let leased_value = encode_lease(&record)?;
-                                batch.put(lease_key.as_bytes(), &leased_value);
+                                batch.put(&lease_key, &leased_value);
 
                                 // Mark job as running
                                 let job_status = JobStatus::running(now_ms);
@@ -192,7 +190,7 @@ impl JobStoreShard {
                                 };
                                 let attempt_val = encode_attempt(&attempt)?;
                                 let akey = attempt_key(&tenant, job_id, *attempt_number);
-                                batch.put(akey.as_bytes(), &attempt_val);
+                                batch.put(&akey, &attempt_val);
 
                                 // Track for response
                                 let view = job_view.unwrap();
@@ -243,12 +241,12 @@ impl JobStoreShard {
                         // Process rate limit check internally
                         processed_internal = true;
                         let tenant = tenant.to_string();
-                        batch.delete(entry.key.as_bytes());
+                        batch.delete(&entry.key);
                         ack_keys.push(entry.key.clone());
 
                         // Load job info to get the full limits list
                         let job_key = job_info_key(&tenant, job_id);
-                        let maybe_job = self.db.get(job_key.as_bytes()).await?;
+                        let maybe_job = self.db.get(&job_key).await?;
                         let job_view = match maybe_job {
                             Some(bytes) => match JobView::new(bytes) {
                                 Ok(v) => v,
@@ -359,8 +357,8 @@ impl JobStoreShard {
                             expiry_ms,
                         };
                         let leased_value = encode_lease(&record)?;
-                        batch.put(lease_key.as_bytes(), &leased_value);
-                        batch.delete(entry.key.as_bytes());
+                        batch.put(&lease_key, &leased_value);
+                        batch.delete(&entry.key);
 
                         refresh_out.push(LeasedRefreshTask {
                             task_id: task_id.clone(),
@@ -399,11 +397,11 @@ impl JobStoreShard {
 
                 // [SILO-DEQ-2] Look up job info; if missing, delete the task and skip
                 let job_key = job_info_key(&tenant, &job_id);
-                let maybe_job = self.db.get(job_key.as_bytes()).await?;
+                let maybe_job = self.db.get(&job_key).await?;
                 if let Some(job_bytes) = maybe_job {
                     // [SILO-DEQ-CXL] Check if job is cancelled - if so, skip and clean up task
                     if self.is_job_cancelled(&tenant, &job_id).await? {
-                        batch.delete(entry.key.as_bytes());
+                        batch.delete(&entry.key);
                         ack_keys.push(entry.key.clone());
 
                         // [SILO-DEQ-CXL-REL] Release any held concurrency tickets
@@ -453,9 +451,9 @@ impl JobStoreShard {
                     };
                     let leased_value = encode_lease(&record)?;
 
-                    batch.put(lease_key.as_bytes(), &leased_value);
+                    batch.put(&lease_key, &leased_value);
                     // [SILO-DEQ-3] Delete task from task queue
-                    batch.delete(entry.key.as_bytes());
+                    batch.delete(&entry.key);
 
                     // [SILO-DEQ-6] Mark job as running (pure write, no status read)
                     let job_status = JobStatus::running(now_ms);
@@ -474,7 +472,7 @@ impl JobStoreShard {
                     };
                     let attempt_val = encode_attempt(&attempt)?;
                     let akey = attempt_key(&tenant, &job_id, attempt_number);
-                    batch.put(akey.as_bytes(), &attempt_val);
+                    batch.put(&akey, &attempt_val);
 
                     // Defer constructing AttemptView; fetch from DB after batch is written
                     pending_attempts.push((
@@ -490,7 +488,7 @@ impl JobStoreShard {
                     leased_tasks_for_dst.push((tenant.clone(), job_id.clone(), task_id.clone()));
                 } else {
                     // If job missing, delete task key to clean up
-                    batch.delete(entry.key.as_bytes());
+                    batch.delete(&entry.key);
                     ack_keys.push(entry.key.clone());
                 }
             }
@@ -603,12 +601,10 @@ impl JobStoreShard {
             return Ok((Vec::new(), Vec::new()));
         }
 
-        // Scan tasks under tasks/{task_group}/
-        let prefix = crate::keys::task_group_prefix(task_group);
-        let start: Vec<u8> = prefix.as_bytes().to_vec();
-        let mut end: Vec<u8> = start.clone();
-        end.push(0xFF);
-        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..=end).await?;
+        // Scan tasks under tasks/{task_group}/ using binary storekey encoding
+        let start = crate::keys::task_group_prefix(task_group);
+        let end = crate::keys::end_bound(&start);
+        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..end).await?;
 
         let mut tasks: Vec<Task> = Vec::with_capacity(max_tasks);
         let mut keys: Vec<Vec<u8>> = Vec::with_capacity(max_tasks);
@@ -619,27 +615,13 @@ impl JobStoreShard {
                 break;
             };
 
-            // Only process task keys: tasks/{task_group}/...
-            let key_str = String::from_utf8_lossy(&kv.key);
+            // Parse task key to extract timestamp for time cutoff
+            let Some(parsed_key) = crate::keys::parse_task_key(&kv.key) else {
+                continue;
+            };
 
             // Enforce time cutoff: only keys with ts <= now_ms
-            // Format: tasks/<task_group>/<ts>/...
-            let mut parts = key_str.split('/');
-            if parts.next() != Some("tasks") {
-                continue;
-            }
-            // Skip task_group part
-            if parts.next().is_none() {
-                continue;
-            }
-            // Get timestamp part
-            let ts_part = match parts.next() {
-                Some(v) => v,
-                None => continue,
-            };
-            if let Ok(ts) = ts_part.parse::<u64>()
-                && ts > now_ms as u64
-            {
+            if parsed_key.start_time_ms > now_ms as u64 {
                 continue;
             }
 

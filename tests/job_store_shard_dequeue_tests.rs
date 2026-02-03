@@ -57,12 +57,9 @@ async fn dequeue_moves_tasks_to_leased_with_uuid() {
         };
 
         // Verify a leased entry exists, and includes worker id
-        let first = first_kv_with_prefix(shard.db(), "lease/")
-            .await
-            .expect("scan leased");
-        let key_str = first.0;
-        let kv_value = first.1;
-        assert!(key_str.starts_with("lease/"));
+        let (lease_key, kv_value) = first_lease_kv(shard.db()).await.expect("scan leased");
+        // Binary keys start with prefix 0x06 for leases
+        assert_eq!(lease_key[0], 0x06, "lease key should have lease prefix");
 
         type ArchivedTask = <Task as Archive>::Archived;
         let decoded = decode_lease(&kv_value).expect("decode lease");
@@ -87,7 +84,7 @@ async fn dequeue_moves_tasks_to_leased_with_uuid() {
         }
 
         // Ensure original task queue is empty now
-        let none_left = first_kv_with_prefix(shard.db(), "tasks/").await;
+        let none_left = first_task_kv(shard.db()).await;
         assert!(none_left.is_none(), "no tasks should remain after dequeue");
     });
 }
@@ -125,12 +122,10 @@ async fn heartbeat_renews_lease_when_worker_matches() {
         let task_id = tasks[0].attempt().task_id().to_string();
 
         // Read current lease key and expiry
-        let first = first_kv_with_prefix(shard.db(), "lease/")
-            .await
-            .expect("scan lease");
-        let old_key = first.0;
-        assert!(old_key.ends_with(&task_id));
-        let decoded_first = decode_lease(&first.1).expect("decode lease");
+        let (old_key, old_value) = first_lease_kv(shard.db()).await.expect("scan lease");
+        let parsed_old = silo::keys::parse_lease_key(&old_key).expect("parse lease key");
+        assert_eq!(parsed_old.task_id, task_id);
+        let decoded_first = decode_lease(&old_value).expect("decode lease");
         let old_expiry = decoded_first.archived().expiry_ms as u64;
 
         // Heartbeat to renew
@@ -140,12 +135,10 @@ async fn heartbeat_renews_lease_when_worker_matches() {
             .expect("heartbeat ok");
 
         // Scan again, expect one lease for task with a higher expiry
-        let second = first_kv_with_prefix(shard.db(), "lease/")
-            .await
-            .expect("scan lease 2");
-        let new_key = second.0;
-        assert!(new_key.ends_with(&task_id));
-        let decoded_second = decode_lease(&second.1).expect("decode lease 2");
+        let (new_key, new_value) = first_lease_kv(shard.db()).await.expect("scan lease 2");
+        let parsed_new = silo::keys::parse_lease_key(&new_key).expect("parse lease key 2");
+        assert_eq!(parsed_new.task_id, task_id);
+        let decoded_second = decode_lease(&new_value).expect("decode lease 2");
         let new_expiry = decoded_second.archived().expiry_ms as u64;
         assert!(new_expiry > old_expiry, "new expiry should be greater");
 
@@ -272,19 +265,13 @@ async fn reap_ignores_unexpired_leases() {
     let _task_id = tasks[0].attempt().task_id().to_string();
 
     // Do not mutate the lease; it should not be reaped
-    let (lease_key, _lease_value) = first_kv_with_prefix(shard.db(), "lease/")
-        .await
-        .expect("lease present");
+    let (lease_key, _lease_value) = first_lease_kv(shard.db()).await.expect("lease present");
 
     let reaped = shard.reap_expired_leases("-").await.expect("reap");
     assert_eq!(reaped, 0);
 
     // Lease should still exist
-    let lease = shard
-        .db()
-        .get(lease_key.as_bytes())
-        .await
-        .expect("get lease");
+    let lease = shard.db().get(&lease_key).await.expect("get lease");
     assert!(lease.is_some(), "lease should remain when not expired");
 
     // Attempt state remains Running
@@ -387,7 +374,7 @@ async fn dequeue_gracefully_handles_missing_job_info() {
     let job_info_key = silo::keys::job_info_key("-", &job_id);
     shard
         .db()
-        .delete(job_info_key.as_bytes())
+        .delete(&job_info_key)
         .await
         .expect("manual delete job_info");
     shard.db().flush().await.expect("flush");
@@ -410,14 +397,14 @@ async fn dequeue_gracefully_handles_missing_job_info() {
 
     // Ensure original task key was deleted (cleaned up during dequeue)
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-    let none_left = first_kv_with_prefix(shard.db(), "tasks/").await;
+    let none_left = first_task_kv(shard.db()).await;
     assert!(
         none_left.is_none(),
         "orphaned task should be cleaned up when job missing"
     );
 
     // Ensure no lease was created
-    let lease_any = first_kv_with_prefix(shard.db(), "lease/").await;
+    let lease_any = first_lease_kv(shard.db()).await;
     assert!(
         lease_any.is_none(),
         "no lease should be created for orphaned task"

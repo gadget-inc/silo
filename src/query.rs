@@ -859,108 +859,86 @@ impl Scan for QueuesScanner {
             let db = shard.db();
             let mut entries: Vec<QueueEntry> = Vec::new();
 
-            // Scan holders: holders/<tenant>/<queue>/<task-id>
-            // When no tenant filter, scan all: holders/
-            let holders_prefix = match (&tenant_filter, &queue_filter) {
-                (Some(t), Some(q)) => format!("holders/{}/{}/", t, q),
-                (Some(t), None) => format!("holders/{}/", t),
-                (None, _) => "holders/".to_string(), // Scan all tenants
+            // Scan holders using binary storekey prefix
+            let holders_start = match (&tenant_filter, &queue_filter) {
+                (Some(t), Some(q)) => crate::keys::concurrency_holders_queue_prefix(t, q),
+                (Some(t), None) => crate::keys::concurrency_holders_tenant_prefix(t),
+                (None, _) => crate::keys::concurrency_holders_prefix(),
             };
-            let holders_start: Vec<u8> = holders_prefix.as_bytes().to_vec();
-            let mut holders_end: Vec<u8> = holders_start.clone();
-            holders_end.push(0xFF);
+            let holders_end = crate::keys::end_bound(&holders_start);
 
             if let Ok(mut iter) = db.scan::<Vec<u8>, _>(holders_start..=holders_end).await {
                 while let Ok(Some(kv)) = iter.next().await {
                     if entries.len() >= hard_limit {
                         break;
                     }
-                    if let Ok(key_str) = std::str::from_utf8(&kv.key) {
-                        let parts: Vec<&str> = key_str.split('/').collect();
-                        // holders/<tenant>/<queue>/<task-id>
-                        if parts.len() >= 4 && parts[0] == "holders" {
-                            let tenant = crate::keys::decode_tenant(parts[1]);
-                            // Filter by queue if specified
-                            if let Some(ref q) = queue_filter
-                                && parts[2] != q.as_str()
-                            {
-                                continue;
-                            }
-                            let queue_name = parts[2].to_string();
-                            let task_id = parts[3].to_string();
-                            let timestamp_ms =
-                                if let Ok(holder) = crate::codec::decode_holder(&kv.value) {
-                                    holder.granted_at_ms()
-                                } else {
-                                    0
-                                };
-                            entries.push(QueueEntry {
-                                tenant,
-                                queue_name,
-                                entry_type: "holder".to_string(),
-                                task_id,
-                                job_id: None,
-                                priority: None,
-                                timestamp_ms,
-                            });
+                    if let Some(parsed) = crate::keys::parse_concurrency_holder_key(&kv.key) {
+                        // Filter by queue if specified
+                        if let Some(ref q) = queue_filter
+                            && parsed.queue != *q
+                        {
+                            continue;
                         }
+                        let timestamp_ms =
+                            if let Ok(holder) = crate::codec::decode_holder(&kv.value) {
+                                holder.granted_at_ms()
+                            } else {
+                                0
+                            };
+                        entries.push(QueueEntry {
+                            tenant: parsed.tenant,
+                            queue_name: parsed.queue,
+                            entry_type: "holder".to_string(),
+                            task_id: parsed.task_id,
+                            job_id: None,
+                            priority: None,
+                            timestamp_ms,
+                        });
                     }
                 }
             }
 
-            // Scan requests: requests/<tenant>/<queue>/<start_time_ms>/<priority>/<request_id>
-            // When no tenant filter, scan all: requests/
-            let requests_prefix = match (&tenant_filter, &queue_filter) {
-                (Some(t), Some(q)) => format!("requests/{}/{}/", t, q),
-                (Some(t), None) => format!("requests/{}/", t),
-                (None, _) => "requests/".to_string(), // Scan all tenants
+            // Scan requests using binary storekey prefix
+            let requests_start = match (&tenant_filter, &queue_filter) {
+                (Some(t), Some(q)) => crate::keys::concurrency_request_prefix(t, q),
+                (Some(t), None) => crate::keys::concurrency_request_tenant_prefix(t),
+                (None, _) => crate::keys::concurrency_requests_prefix(),
             };
-            let requests_start: Vec<u8> = requests_prefix.as_bytes().to_vec();
-            let mut requests_end: Vec<u8> = requests_start.clone();
-            requests_end.push(0xFF);
+            let requests_end = crate::keys::end_bound(&requests_start);
 
             if let Ok(mut iter) = db.scan::<Vec<u8>, _>(requests_start..=requests_end).await {
                 while let Ok(Some(kv)) = iter.next().await {
                     if entries.len() >= hard_limit {
                         break;
                     }
-                    if let Ok(key_str) = std::str::from_utf8(&kv.key) {
-                        let parts: Vec<&str> = key_str.split('/').collect();
-                        // requests/<tenant>/<queue>/<start_time_ms>/<priority>/<request_id>
-                        if parts.len() >= 6 && parts[0] == "requests" {
-                            let tenant = crate::keys::decode_tenant(parts[1]);
-                            // Filter by queue if specified
-                            if let Some(ref q) = queue_filter
-                                && parts[2] != q.as_str()
-                            {
-                                continue;
-                            }
-                            let queue_name = parts[2].to_string();
-                            let start_time_ms: i64 = parts[3].parse().unwrap_or(0);
-                            let priority: u8 = parts[4].parse().unwrap_or(50);
-                            let request_id = parts[5].to_string();
-                            let job_id = if let Ok(action) =
-                                crate::codec::decode_concurrency_action(&kv.value)
-                            {
-                                match action.archived() {
-                                    crate::task::ArchivedConcurrencyAction::EnqueueTask {
-                                        job_id,
-                                        ..
-                                    } => Some(job_id.as_str().to_string()),
-                                }
-                            } else {
-                                None
-                            };
-                            entries.push(QueueEntry {
-                                tenant,
-                                queue_name,
-                                entry_type: "requester".to_string(),
-                                task_id: request_id,
-                                job_id,
-                                priority: Some(priority),
-                                timestamp_ms: start_time_ms,
-                            });
+                    if let Some(parsed) = crate::keys::parse_concurrency_request_key(&kv.key) {
+                        // Filter by queue if specified
+                        if let Some(ref q) = queue_filter
+                            && parsed.queue != *q
+                        {
+                            continue;
                         }
+                        let job_id = if let Ok(action) =
+                            crate::codec::decode_concurrency_action(&kv.value)
+                        {
+                            match action.archived() {
+                                crate::task::ArchivedConcurrencyAction::EnqueueTask {
+                                    job_id,
+                                    ..
+                                } => Some(job_id.as_str().to_string()),
+                            }
+                        } else {
+                            None
+                        };
+                        entries.push(QueueEntry {
+                            tenant: parsed.tenant,
+                            queue_name: parsed.queue,
+                            entry_type: "requester".to_string(),
+                            task_id: parsed.request_id,
+                            job_id,
+                            priority: Some(parsed.priority),
+                            timestamp_ms: parsed.start_time_ms as i64,
+                        });
                     }
                 }
             }

@@ -12,9 +12,7 @@ use crate::job::{FloatingLimitState, JobStatus, JobView};
 use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt};
 use crate::job_store_shard::helpers::now_epoch_ms;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
-use crate::keys::{
-    attempt_key, decode_tenant, floating_limit_state_key, job_info_key, leased_task_key,
-};
+use crate::keys::{attempt_key, floating_limit_state_key, job_info_key, leased_task_key};
 use crate::task::{DEFAULT_LEASE_MS, HeartbeatResult, LeaseRecord};
 use tracing::{debug, info_span};
 
@@ -31,7 +29,7 @@ impl JobStoreShard {
     ) -> Result<HeartbeatResult, JobStoreShardError> {
         // [SILO-HB-2] Directly read the lease for this task id
         let key = leased_task_key(task_id);
-        let maybe_raw = self.db.get(key.as_bytes()).await?;
+        let maybe_raw = self.db.get(&key).await?;
         let Some(value_bytes) = maybe_raw else {
             return Err(JobStoreShardError::LeaseNotFound(task_id.to_string()));
         };
@@ -62,7 +60,7 @@ impl JobStoreShard {
         let value = encode_lease(&record)?;
 
         let mut batch = WriteBatch::new();
-        batch.put(key.as_bytes(), &value);
+        batch.put(&key, &value);
         self.db.write(batch).await?;
         self.db.flush().await?;
 
@@ -85,7 +83,7 @@ impl JobStoreShard {
     ) -> Result<(), JobStoreShardError> {
         // [SILO-SUCC-1][SILO-FAIL-1][SILO-RETRY-1] Load lease; must exist
         let leased_task_key = leased_task_key(task_id);
-        let maybe_raw = self.db.get(leased_task_key.as_bytes()).await?;
+        let maybe_raw = self.db.get(&leased_task_key).await?;
         let Some(value_bytes) = maybe_raw else {
             return Err(JobStoreShardError::LeaseNotFound(task_id.to_string()));
         };
@@ -133,9 +131,9 @@ impl JobStoreShard {
         // Atomically update attempt and remove lease
         let mut batch = WriteBatch::new();
         // [SILO-SUCC-4][SILO-FAIL-4][SILO-RETRY-4] Update attempt status
-        batch.put(attempt_key.as_bytes(), &attempt_val);
+        batch.put(&attempt_key, &attempt_val);
         // [SILO-SUCC-2][SILO-FAIL-2][SILO-RETRY-2] Release lease
-        batch.delete(leased_task_key.as_bytes());
+        batch.delete(&leased_task_key);
 
         let mut job_missing_error: Option<JobStoreShardError> = None;
         let mut followup_next_time: Option<i64> = None;
@@ -169,7 +167,7 @@ impl JobStoreShard {
 
                 // Load job info to get priority and retry policy
                 let job_info_key = job_info_key(&tenant, &job_id);
-                let maybe_job = self.db.get(job_info_key.as_bytes()).await?;
+                let maybe_job = self.db.get(&job_info_key).await?;
                 if let Some(jbytes) = maybe_job {
                     let view = JobView::new(jbytes)?;
                     let priority = view.priority();
@@ -314,11 +312,10 @@ impl JobStoreShard {
     /// Skips and deletes leases for tenants outside the shard's range.
     /// Returns the number of expired leases reaped.
     pub async fn reap_expired_leases(&self, tenant: &str) -> Result<usize, JobStoreShardError> {
-        // Scan leases under lease/
-        let start: Vec<u8> = b"lease/".to_vec();
-        let mut end: Vec<u8> = b"lease/".to_vec();
-        end.push(0xFF);
-        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..=end).await?;
+        // Scan all lease keys using the binary prefix
+        let start = crate::keys::leases_prefix();
+        let end = crate::keys::end_bound(&start);
+        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..end).await?;
 
         let now_ms = now_epoch_ms();
         let mut reaped: usize = 0;
@@ -330,11 +327,6 @@ impl JobStoreShard {
         let mut defunct_keys: Vec<Vec<u8>> = Vec::new();
 
         while let Some(kv) = iter.next().await? {
-            let key_str = String::from_utf8_lossy(&kv.key);
-            if !key_str.starts_with("lease/") {
-                continue;
-            }
-
             let decoded = match decode_lease(&kv.value) {
                 Ok(l) => l,
                 Err(_) => continue,
@@ -342,13 +334,12 @@ impl JobStoreShard {
 
             // Check if lease's tenant is within shard range
             let lease_tenant = decoded.tenant();
-            let decoded_tenant = decode_tenant(lease_tenant);
 
-            if !shard_range.contains(&decoded_tenant) {
+            if !shard_range.contains(lease_tenant) {
                 // Lease is for a tenant outside our range - mark for deletion
                 debug!(
-                    key = %key_str,
-                    tenant = %decoded_tenant,
+                    key = ?kv.key,
+                    tenant = %lease_tenant,
                     range = %shard_range,
                     "deleting defunct lease (tenant outside shard range)"
                 );
@@ -441,7 +432,7 @@ impl JobStoreShard {
         let state_key = floating_limit_state_key(tenant, queue_key);
 
         // Load the floating limit state
-        let maybe_state = self.db.get(state_key.as_bytes()).await?;
+        let maybe_state = self.db.get(&state_key).await?;
         let Some(raw) = maybe_state else {
             // State doesn't exist, just delete the orphaned lease
             tracing::warn!(
@@ -451,7 +442,7 @@ impl JobStoreShard {
                 "refresh task lease expired but floating limit state not found, deleting orphaned lease"
             );
             let mut batch = WriteBatch::new();
-            batch.delete(lease_key.as_bytes());
+            batch.delete(&lease_key);
             self.db.write(batch).await?;
             self.db.flush().await?;
             return Ok(());
@@ -480,8 +471,8 @@ impl JobStoreShard {
 
         let mut batch = WriteBatch::new();
         let state_value = encode_floating_limit_state(&new_state)?;
-        batch.put(state_key.as_bytes(), &state_value);
-        batch.delete(lease_key.as_bytes());
+        batch.put(&state_key, &state_value);
+        batch.delete(&lease_key);
 
         self.db.write(batch).await?;
         self.db.flush().await?;

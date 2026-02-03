@@ -11,7 +11,9 @@ use crate::codec::{decode_task, encode_task};
 use crate::job::JobStatusKind;
 use crate::job_store_shard::helpers::{decode_job_status_owned, now_epoch_ms};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
-use crate::keys::{job_cancelled_key, job_status_key, task_key};
+use crate::keys::{
+    end_bound, job_cancelled_key, job_status_key, parse_task_key, task_key, tasks_prefix,
+};
 use crate::task::Task;
 use tracing::debug;
 
@@ -84,7 +86,7 @@ impl JobStoreShard {
 
         // [SILO-EXP-1] Pre: job must exist
         let status_key = job_status_key(tenant, id);
-        let maybe_status_raw = txn.get(status_key.as_bytes()).await?;
+        let maybe_status_raw = txn.get(&status_key).await?;
         let Some(status_raw) = maybe_status_raw else {
             return Err(JobStoreShardError::JobNotFound(id.to_string()));
         };
@@ -104,7 +106,7 @@ impl JobStoreShard {
 
         // [SILO-EXP-3] Pre: job must NOT be cancelled
         let cancelled_key = job_cancelled_key(tenant, id);
-        if txn.get(cancelled_key.as_bytes()).await?.is_some() {
+        if txn.get(&cancelled_key).await?.is_some() {
             return Err(JobStoreShardError::JobNotExpediteable(
                 JobNotExpediteableError {
                     job_id: id.to_string(),
@@ -128,7 +130,7 @@ impl JobStoreShard {
 
         // [SILO-EXP-4] Pre: task exists in DB queue for this job
         // Find the task for this job by scanning tasks/ namespace
-        let (task_key_str, task, original_time_ms) =
+        let (old_task_key, task, original_time_ms) =
             self.find_task_for_job_id(id).await?.ok_or_else(|| {
                 // No task found - job has no pending task
                 JobStoreShardError::JobNotExpediteable(JobNotExpediteableError {
@@ -159,7 +161,7 @@ impl JobStoreShard {
             } => {
                 // Get priority from job info
                 let job_info_key = crate::keys::job_info_key(tenant, id);
-                let maybe_job_raw = txn.get(job_info_key.as_bytes()).await?;
+                let maybe_job_raw = txn.get(&job_info_key).await?;
                 let Some(job_raw) = maybe_job_raw else {
                     return Err(JobStoreShardError::JobNotFound(id.to_string()));
                 };
@@ -179,12 +181,12 @@ impl JobStoreShard {
         };
 
         // Delete the old task key
-        txn.delete(task_key_str.as_bytes())?;
+        txn.delete(&old_task_key)?;
 
         // Create new task key with current timestamp
         let new_task_key = task_key(&task_group, now_ms, priority, id, attempt_number);
         let task_value = encode_task(&task)?;
-        txn.put(new_task_key.as_bytes(), &task_value)?;
+        txn.put(&new_task_key, &task_value)?;
 
         // Commit the transaction
         txn.commit().await?;
@@ -200,46 +202,28 @@ impl JobStoreShard {
     async fn find_task_for_job_id(
         &self,
         job_id: &str,
-    ) -> Result<Option<(String, Task, i64)>, JobStoreShardError> {
+    ) -> Result<Option<(Vec<u8>, Task, i64)>, JobStoreShardError> {
         // Scan all tasks looking for one that belongs to this job
-        // Task keys are: tasks/<task_group>/<timestamp>/<priority>/<job_id>/<attempt>
-        let start: Vec<u8> = b"tasks/".to_vec();
-        let mut end: Vec<u8> = b"tasks/".to_vec();
-        end.push(0xFF);
+        let start = tasks_prefix();
+        let end = end_bound(&start);
 
-        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..=end).await?;
+        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..end).await?;
 
         while let Some(kv) = iter.next().await? {
-            let key_str = match std::str::from_utf8(&kv.key) {
-                Ok(s) => s.to_string(),
-                Err(_) => continue,
+            // Parse task key to extract job_id and timestamp
+            let Some(parsed) = parse_task_key(&kv.key) else {
+                continue;
             };
 
-            // Parse task key: tasks/<task_group>/<timestamp>/<priority>/<job_id>/<attempt>
-            let parts: Vec<&str> = key_str.split('/').collect();
-            if parts.len() < 6 || parts[0] != "tasks" {
-                continue;
-            }
-
-            // parts[0] = "tasks"
-            // parts[1] = task_group
-            // parts[2] = timestamp
-            // parts[3] = priority
-            // parts[4] = job_id
-            // parts[5] = attempt
-            let ts_str = parts[2];
-            let task_job_id = parts[4];
-
-            if task_job_id != job_id {
+            if parsed.job_id != job_id {
                 continue;
             }
 
             // Found a task for this job
-            // Parse timestamp explicitly as u64 to avoid i32 overflow, then convert to i64
-            let timestamp_ms: i64 = ts_str.parse::<u64>().unwrap_or(0) as i64;
+            let timestamp_ms = parsed.start_time_ms as i64;
             let task = decode_task(&kv.value)?;
 
-            return Ok(Some((key_str, task, timestamp_ms)));
+            return Ok(Some((kv.key.to_vec(), task, timestamp_ms)));
         }
 
         Ok(None)

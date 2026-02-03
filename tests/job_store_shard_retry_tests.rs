@@ -54,11 +54,7 @@ async fn reporting_attempt_outcome_updates_attempt_and_deletes_lease() {
 
         // Lease should be gone
         let lease_key = format!("lease/{}", task_id);
-        let lease = shard
-            .db()
-            .get(lease_key.as_bytes())
-            .await
-            .expect("get lease");
+        let lease = shard.db().get(&lease_key).await.expect("get lease");
         assert!(lease.is_none(), "lease should be deleted");
 
         // Attempt state should be updated
@@ -125,7 +121,7 @@ async fn error_with_no_retries_does_not_enqueue_next_attempt() {
             .expect("report");
 
         // No new tasks should be present
-        let none_left = first_kv_with_prefix(shard.db(), "tasks/").await;
+        let none_left = first_task_kv(shard.db()).await;
         assert!(none_left.is_none(), "no follow-up task should be enqueued");
     });
 }
@@ -181,9 +177,7 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
             .expect("report");
 
         // One new task should exist (attempt 2)
-        let (_k2, v2) = first_kv_with_prefix(shard.db(), "tasks/")
-            .await
-            .expect("task2");
+        let (_k2, v2) = first_task_kv(shard.db()).await.expect("task2");
         let task2 = decode_task(&v2).expect("decode task");
         let attempt = match task2 {
             Task::RunAttempt { attempt_number, .. } => attempt_number,
@@ -218,9 +212,7 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
             .expect("report2");
 
         // One new task should exist (attempt 3), but no more beyond that after another error
-        let (_k3, v3) = first_kv_with_prefix(shard.db(), "tasks/")
-            .await
-            .expect("task3");
+        let (_k3, v3) = first_task_kv(shard.db()).await.expect("task3");
         let task3 = decode_task(&v3).expect("decode task");
         let attempt3 = match task3 {
             Task::RunAttempt { attempt_number, .. } => attempt_number,
@@ -253,7 +245,7 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
             )
             .await
             .expect("report3");
-        let none_left = first_kv_with_prefix(shard.db(), "tasks/").await;
+        let none_left = first_task_kv(shard.db()).await;
         assert!(none_left.is_none(), "no attempt 4 should be enqueued");
     });
 }
@@ -318,11 +310,7 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_success() {
 
         // Lease should remain gone
         let lease_key = format!("lease/{}", task_id);
-        let lease = shard
-            .db()
-            .get(lease_key.as_bytes())
-            .await
-            .expect("get lease");
+        let lease = shard.db().get(&lease_key).await.expect("get lease");
         assert!(lease.is_none(), "lease should be deleted");
 
         // Attempt state should be succeeded
@@ -337,7 +325,7 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_success() {
         }
 
         // No additional tasks should be enqueued
-        let none_left = first_kv_with_prefix(shard.db(), "tasks/").await;
+        let none_left = first_task_kv(shard.db()).await;
         assert!(none_left.is_none(), "no follow-up task should be enqueued");
     });
 }
@@ -413,7 +401,7 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_error() {
         }
 
         // No tasks should be enqueued
-        let none_left = first_kv_with_prefix(shard.db(), "tasks/").await;
+        let none_left = first_task_kv(shard.db()).await;
         assert!(none_left.is_none(), "no follow-up task should be enqueued");
     });
 }
@@ -466,9 +454,7 @@ async fn retry_count_one_boundary_enqueues_attempt2_then_stops_on_second_error()
         .expect("report1");
 
     // Verify attempt 2 task exists
-    let (_k2, v2) = first_kv_with_prefix(shard.db(), "tasks/")
-        .await
-        .expect("task2");
+    let (_k2, v2) = first_task_kv(shard.db()).await.expect("task2");
     let task2 = decode_task(&v2).expect("decode task");
     let attempt2 = match task2 {
         Task::RunAttempt { attempt_number, .. } => attempt_number,
@@ -500,7 +486,7 @@ async fn retry_count_one_boundary_enqueues_attempt2_then_stops_on_second_error()
         .await
         .expect("report2");
 
-    let none_left = first_kv_with_prefix(shard.db(), "tasks/").await;
+    let none_left = first_task_kv(shard.db()).await;
     assert!(none_left.is_none(), "no attempt 3 should be enqueued");
 
     // Attempt 2 state should be Failed
@@ -571,10 +557,8 @@ async fn next_retry_time_matches_scheduled_time_smoke() {
             AttemptStatus::Failed { finished_at_ms, .. } => finished_at_ms,
             _ => panic!("expected Failed"),
         };
-        let (k2, _v2) = first_kv_with_prefix(shard.db(), "tasks/")
-            .await
-            .expect("task2");
-        let scheduled_ms = parse_time_from_task_key(&k2).expect("parse time");
+        let (k2, _v2) = first_task_kv(shard.db()).await.expect("task2");
+        let scheduled_ms = parse_time_from_binary_task_key(&k2).expect("parse time");
         let expected = next_retry_time_ms(finished_at, 1, &policy).unwrap() as u64;
         assert_eq!(
             scheduled_ms, expected,
@@ -646,7 +630,7 @@ async fn duplicate_reporting_error_then_error_is_rejected_and_no_extra_tasks() {
         }
 
         // Only one follow-up task exists
-        let count = count_with_prefix(shard.db(), "tasks/").await;
+        let count = count_task_keys(shard.db()).await;
         assert_eq!(count, 1);
     });
 }
@@ -760,9 +744,7 @@ async fn attempt_records_exist_across_retries_and_task_ids_distinct() {
             )
             .await
             .expect("report1");
-        let (_k2, _v2) = first_kv_with_prefix(shard.db(), "tasks/")
-            .await
-            .expect("task2");
+        let (_k2, _v2) = first_task_kv(shard.db()).await.expect("task2");
         let tasks2 = shard
             .dequeue("w", "default", 1)
             .await
@@ -1020,9 +1002,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
     let _leased_task_id = tasks[0].attempt().task_id().to_string();
 
     // Find the lease and rewrite expiry to the past
-    let (lease_key, lease_value) = first_kv_with_prefix(shard.db(), "lease/")
-        .await
-        .expect("lease present");
+    let (lease_key, lease_value) = first_lease_kv(shard.db()).await.expect("lease present");
     type ArchivedTask = <Task as Archive>::Archived;
     let decoded = decode_lease(&lease_value).expect("decode lease");
     let archived = decoded.archived();
@@ -1059,7 +1039,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
     let new_val = encode_lease(&new_record).unwrap();
     shard
         .db()
-        .put(lease_key.as_bytes(), &new_val)
+        .put(&lease_key, &new_val)
         .await
         .expect("put mutated lease");
     shard.db().flush().await.expect("flush mutated lease");
@@ -1070,7 +1050,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
     // Lease removed
     let lease = shard
         .db()
-        .get(lease_key.as_bytes())
+        .get(&lease_key)
         .await
         .expect("get lease after reap");
     assert!(lease.is_none(), "lease should be removed by reaper");
@@ -1089,7 +1069,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
     }
 
     // Attempt 2 should be scheduled due to retry policy
-    let (_k2, v2) = first_kv_with_prefix(shard.db(), "tasks/")
+    let (_k2, v2) = first_task_kv(shard.db())
         .await
         .expect("attempt2 task exists");
     let task2 = decode_task(&v2).expect("decode task");

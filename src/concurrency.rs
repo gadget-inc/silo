@@ -40,7 +40,9 @@ use crate::codec::{
 };
 use crate::job::{ConcurrencyLimit, JobView};
 use crate::keys::{
-    concurrency_holder_key, concurrency_request_key, decode_tenant, job_cancelled_key, task_key,
+    concurrency_holder_key, concurrency_holders_prefix, concurrency_request_key,
+    concurrency_request_prefix, end_bound, job_cancelled_key, parse_concurrency_holder_key,
+    parse_concurrency_request_key, task_key,
 };
 use crate::task::{ConcurrencyAction, HolderRecord, Task};
 
@@ -107,51 +109,35 @@ impl ConcurrencyCounts {
         db: &Db,
         range: &crate::shard_range::ShardRange,
     ) -> Result<(), slatedb::Error> {
-        // Scan holders under holders/<tenant>/<queue>/<task-id>
-        let start: Vec<u8> = b"holders/".to_vec();
-        let mut end: Vec<u8> = b"holders/".to_vec();
-        end.push(0xFF);
-        let mut iter: DbIterator = db.scan::<Vec<u8>, _>(start..=end).await?;
+        // Scan all holders using binary storekey prefix
+        let start = concurrency_holders_prefix();
+        let end = end_bound(&start);
+        let mut iter: DbIterator = db.scan::<Vec<u8>, _>(start..end).await?;
         loop {
             let maybe = iter.next().await?;
             let Some(kv) = maybe else { break };
-            if let Ok(s) = std::str::from_utf8(&kv.key) {
-                // Expect: holders/<tenant>/<queue>/<task-id>
-                let mut parts = s.split('/');
-                if parts.next() != Some("holders") {
-                    continue;
-                }
-                let tenant = match parts.next() {
-                    Some(t) => t,
-                    None => continue,
-                };
-                let queue = match parts.next() {
-                    Some(q) => q,
-                    None => continue,
-                };
-                let task = match parts.next() {
-                    Some(x) => x,
-                    None => continue,
-                };
 
-                // Filter by shard range - only hydrate holders for tenants in this shard
-                let decoded_tenant = decode_tenant(tenant);
-                if !range.contains(&decoded_tenant) {
-                    tracing::debug!(
-                        tenant = %decoded_tenant,
-                        queue = %queue,
-                        task = %task,
-                        range = %range,
-                        "skipping holder outside shard range during hydration"
-                    );
-                    continue;
-                }
+            // Parse holder key to extract tenant, queue, task_id
+            let Some(parsed) = parse_concurrency_holder_key(&kv.key) else {
+                continue;
+            };
 
-                let key = format!("{}|{}", tenant, queue);
-                let mut h = self.holders.lock().unwrap();
-                let set = h.entry(key).or_default();
-                set.insert(task.to_string());
+            // Filter by shard range - only hydrate holders for tenants in this shard
+            if !range.contains(&parsed.tenant) {
+                tracing::debug!(
+                    tenant = %parsed.tenant,
+                    queue = %parsed.queue,
+                    task = %parsed.task_id,
+                    range = %range,
+                    "skipping holder outside shard range during hydration"
+                );
+                continue;
             }
+
+            let key = format!("{}|{}", parsed.tenant, parsed.queue);
+            let mut h = self.holders.lock().unwrap();
+            let set = h.entry(key).or_default();
+            set.insert(parsed.task_id);
         }
         Ok(())
     }
@@ -392,7 +378,7 @@ impl ConcurrencyManager {
             };
             let ticket_value = encode_task(&ticket)?;
             batch.put(
-                task_key(task_group, start_at_ms, priority, job_id, attempt_number).as_bytes(),
+                task_key(task_group, start_at_ms, priority, job_id, attempt_number),
                 &ticket_value,
             );
             Ok(Some(RequestTicketOutcome::FutureRequestTaskWritten {
@@ -417,7 +403,7 @@ impl ConcurrencyManager {
     pub fn process_ticket_request_task(
         &self,
         batch: &mut WriteBatch,
-        task_key: &str,
+        task_key: &[u8],
         tenant: &str,
         queue: &str,
         request_id: &str,
@@ -428,7 +414,7 @@ impl ConcurrencyManager {
     ) -> Result<RequestTicketTaskOutcome, String> {
         // Check if job exists
         let Some(view) = job_view else {
-            batch.delete(task_key.as_bytes());
+            batch.delete(task_key);
             return Ok(RequestTicketTaskOutcome::JobMissing);
         };
 
@@ -454,11 +440,8 @@ impl ConcurrencyManager {
             granted_at_ms: now_ms,
         };
         let hval = encode_holder(&holder)?;
-        batch.put(
-            concurrency_holder_key(tenant, queue, request_id).as_bytes(),
-            &hval,
-        );
-        batch.delete(task_key.as_bytes());
+        batch.put(concurrency_holder_key(tenant, queue, request_id), &hval);
+        batch.delete(task_key);
 
         Ok(RequestTicketTaskOutcome::Granted {
             request_id: request_id.to_string(),
@@ -487,15 +470,14 @@ impl ConcurrencyManager {
 
         for queue in queues {
             // [SILO-REL-1] Remove holder for this task/queue from DB
-            batch.delete(concurrency_holder_key(tenant, queue, finished_task_id).as_bytes());
+            batch.delete(concurrency_holder_key(tenant, queue, finished_task_id));
 
             // [SILO-GRANT-1] Queue now has capacity (we just released)
-            // [SILO-GRANT-2] Find pending requests for this queue
-            let start = format!("requests/{}/{}/", tenant, queue).into_bytes();
-            let mut end: Vec<u8> = format!("requests/{}/{}/", tenant, queue).into_bytes();
-            end.push(0xFF);
+            // [SILO-GRANT-2] Find pending requests for this queue using binary storekey prefix
+            let start = concurrency_request_prefix(tenant, queue);
+            let end = end_bound(&start);
             let mut iter: DbIterator = db
-                .scan::<Vec<u8>, _>(start..=end)
+                .scan::<Vec<u8>, _>(start..end)
                 .await
                 .map_err(|e| e.to_string())?;
 
@@ -521,7 +503,7 @@ impl ConcurrencyManager {
                         // [SILO-GRANT-CXL] Check if job is cancelled - if so, delete request and continue
                         let cancelled_key = job_cancelled_key(tenant, job_id_str);
                         let is_cancelled = db
-                            .get(cancelled_key.as_bytes())
+                            .get(&cancelled_key)
                             .await
                             .map_err(|e| e.to_string())?
                             .is_some();
@@ -537,9 +519,11 @@ impl ConcurrencyManager {
                             continue;
                         }
 
-                        let req_key_str = String::from_utf8_lossy(&kv.key).to_string();
-                        let request_id =
-                            req_key_str.split('/').next_back().unwrap_or("").to_string();
+                        // Parse request key to extract request_id
+                        let Some(parsed_req) = parse_concurrency_request_key(&kv.key) else {
+                            continue;
+                        };
+                        let request_id = parsed_req.request_id;
 
                         if *start_time_ms > now_ms {
                             // Not ready yet; leave request for later and stop searching
@@ -553,7 +537,7 @@ impl ConcurrencyManager {
                         };
                         let holder_val = encode_holder(&holder)?;
                         batch.put(
-                            concurrency_holder_key(tenant, queue, &request_id).as_bytes(),
+                            concurrency_holder_key(tenant, queue, &request_id),
                             &holder_val,
                         );
 
@@ -575,8 +559,7 @@ impl ConcurrencyManager {
                                 *priority,
                                 job_id_str,
                                 *attempt_number,
-                            )
-                            .as_bytes(),
+                            ),
                             &tval,
                         );
                         batch.delete(&kv.key);
@@ -658,10 +641,7 @@ fn append_grant_edits(
         granted_at_ms: now_ms,
     };
     let holder_val = encode_holder(&holder)?;
-    batch.put(
-        concurrency_holder_key(tenant, queue, task_id).as_bytes(),
-        &holder_val,
-    );
+    batch.put(concurrency_holder_key(tenant, queue, task_id), &holder_val);
 
     let task = Task::RunAttempt {
         id: task_id.to_string(),
@@ -674,7 +654,7 @@ fn append_grant_edits(
     };
     let task_value = encode_task(&task)?;
     batch.put(
-        task_key(task_group, start_time_ms, priority, job_id, attempt_number).as_bytes(),
+        task_key(task_group, start_time_ms, priority, job_id, attempt_number),
         &task_value,
     );
 
@@ -710,6 +690,6 @@ fn append_request_edits(
         priority,
         &uuid::Uuid::new_v4().to_string(),
     );
-    batch.put(req_key.as_bytes(), &action_val);
+    batch.put(&req_key, &action_val);
     Ok(())
 }

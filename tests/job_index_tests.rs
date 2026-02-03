@@ -240,9 +240,7 @@ async fn reaper_without_retries_marks_failed_in_index() {
         .task_id()
         .to_string();
     // Make lease expired
-    let (lease_key, lease_value) = first_kv_with_prefix(shard.db(), "lease/")
-        .await
-        .expect("lease present");
+    let (lease_key, lease_value) = first_lease_kv(shard.db()).await.expect("lease present");
     type ArchivedTask = <Task as Archive>::Archived;
     let decoded = decode_lease(&lease_value).expect("decode lease");
     let archived = decoded.archived();
@@ -271,11 +269,7 @@ async fn reaper_without_retries_marks_failed_in_index() {
         expiry_ms: now_ms() - 1,
     };
     let new_val = encode_lease(&expired).unwrap();
-    shard
-        .db()
-        .put(lease_key.as_bytes(), &new_val)
-        .await
-        .unwrap();
+    shard.db().put(&lease_key, &new_val).await.unwrap();
     shard.db().flush().await.unwrap();
     // Reap
     let _ = shard.reap_expired_leases("-").await.unwrap();
@@ -317,9 +311,7 @@ async fn reaper_with_retries_moves_to_scheduled_in_index() {
         .attempt()
         .task_id()
         .to_string();
-    let (lease_key, lease_value) = first_kv_with_prefix(shard.db(), "lease/")
-        .await
-        .expect("lease present");
+    let (lease_key, lease_value) = first_lease_kv(shard.db()).await.expect("lease present");
     type ArchivedTask = <Task as Archive>::Archived;
     let decoded = decode_lease(&lease_value).expect("decode lease");
     let archived = decoded.archived();
@@ -348,11 +340,7 @@ async fn reaper_with_retries_moves_to_scheduled_in_index() {
         expiry_ms: now_ms() - 1,
     };
     let new_val = encode_lease(&expired).unwrap();
-    shard
-        .db()
-        .put(lease_key.as_bytes(), &new_val)
-        .await
-        .unwrap();
+    shard.db().put(&lease_key, &new_val).await.unwrap();
     shard.db().flush().await.unwrap();
     // Reap
     let _ = shard.reap_expired_leases("-").await.unwrap();

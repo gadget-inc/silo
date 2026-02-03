@@ -533,6 +533,15 @@ async fn cluster_query_multi_shard_filter_pushdown() {
     let (_temps, factory, shard_map) = create_multi_shard_factory(2).await;
     let now = now_ms();
 
+    // Verify factory has both shards before we start
+    let instances = factory.instances();
+    assert_eq!(
+        instances.len(),
+        2,
+        "factory should have 2 shards at start, found: {:?}",
+        instances.keys().collect::<Vec<_>>()
+    );
+
     // Enqueue jobs with different statuses
     let shard0 = get_shard(&factory, &shard_map, 0);
     shard0
@@ -548,7 +557,7 @@ async fn cluster_query_multi_shard_filter_pushdown() {
             "default",
         )
         .await
-        .expect("enqueue");
+        .expect("enqueue to shard0");
 
     let shard1 = get_shard(&factory, &shard_map, 1);
     shard1
@@ -564,13 +573,33 @@ async fn cluster_query_multi_shard_filter_pushdown() {
             "default",
         )
         .await
-        .expect("enqueue");
+        .expect("enqueue to shard1");
+
+    // Verify the job is in shard1's database before we proceed
+    let shard1_scheduled = shard1
+        .scan_jobs_by_status("-", silo::job::JobStatusKind::Scheduled, 100)
+        .await
+        .expect("scan shard1");
+    assert!(
+        shard1_scheduled.contains(&"s1_scheduled".to_string()),
+        "s1_scheduled should be in shard1's Scheduled index, found: {:?}",
+        shard1_scheduled
+    );
 
     // Make one job running
     shard0
         .dequeue("worker", "default", 1)
         .await
-        .expect("dequeue");
+        .expect("dequeue from shard0");
+
+    // Verify factory still has both shards after all operations
+    let instances_after = factory.instances();
+    assert_eq!(
+        instances_after.len(),
+        2,
+        "factory should still have 2 shards after operations, found: {:?}",
+        instances_after.keys().collect::<Vec<_>>()
+    );
 
     let engine = ClusterQueryEngine::new(factory.clone(), None)
         .await
@@ -585,7 +614,13 @@ async fn cluster_query_multi_shard_filter_pushdown() {
     let ids = extract_string_column(&batches, 0);
 
     // Should only get the scheduled job from shard 1
-    assert_eq!(ids.len(), 1);
+    assert_eq!(
+        ids.len(),
+        1,
+        "expected 1 scheduled job but got {}: {:?}",
+        ids.len(),
+        ids
+    );
     assert!(ids.contains(&"s1_scheduled".to_string()));
 }
 

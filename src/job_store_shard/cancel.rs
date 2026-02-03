@@ -70,7 +70,7 @@ impl JobStoreShard {
         // [SILO-CXL-1] Pre: job must exist and not already be cancelled
         // Read status within transaction to detect concurrent modifications
         let status_key = job_status_key(tenant, id);
-        let maybe_status_raw = txn.get(status_key.as_bytes()).await?;
+        let maybe_status_raw = txn.get(&status_key).await?;
         let Some(status_raw) = maybe_status_raw else {
             // No status means job doesn't exist
             return Err(JobStoreShardError::JobNotFound(id.to_string()));
@@ -80,7 +80,7 @@ impl JobStoreShard {
 
         // Check if already cancelled within transaction
         let cancelled_key = job_cancelled_key(tenant, id);
-        let maybe_cancelled = txn.get(cancelled_key.as_bytes()).await?;
+        let maybe_cancelled = txn.get(&cancelled_key).await?;
         if maybe_cancelled.is_some() {
             return Err(JobStoreShardError::JobAlreadyCancelled(id.to_string()));
         }
@@ -98,7 +98,7 @@ impl JobStoreShard {
             cancelled_at_ms: now_ms,
         };
         let cancellation_value = encode_job_cancellation(&cancellation)?;
-        txn.put(cancelled_key.as_bytes(), &cancellation_value)?;
+        txn.put(&cancelled_key, &cancellation_value)?;
 
         // [SILO-CXL-3] For Scheduled jobs, update status to Cancelled immediately
         // Tasks/requests are NOT deleted here - they will be cleaned up lazily:
@@ -109,12 +109,12 @@ impl JobStoreShard {
             // Delete old status index entry
             let old_time =
                 idx_status_time_key(tenant, status.kind.as_str(), status.changed_at_ms, id);
-            txn.delete(old_time.as_bytes())?;
+            txn.delete(&old_time)?;
 
             // Set status to Cancelled immediately since job never started
             let cancelled_status = JobStatus::cancelled(now_ms);
             let status_value = encode_job_status(&cancelled_status)?;
-            txn.put(status_key.as_bytes(), &status_value)?;
+            txn.put(&status_key, &status_value)?;
 
             // Insert new status index entry
             let new_time = idx_status_time_key(
@@ -123,7 +123,7 @@ impl JobStoreShard {
                 cancelled_status.changed_at_ms,
                 id,
             );
-            txn.put(new_time.as_bytes(), [])?;
+            txn.put(&new_time, [])?;
 
             // Increment completed jobs counter - job reached terminal state immediately
             self.increment_completed_jobs_counter_txn(&txn)?;
@@ -143,7 +143,7 @@ impl JobStoreShard {
         id: &str,
     ) -> Result<bool, JobStoreShardError> {
         let key = job_cancelled_key(tenant, id);
-        let maybe_raw = self.db.get(key.as_bytes()).await?;
+        let maybe_raw = self.db.get(&key).await?;
         Ok(maybe_raw.is_some())
     }
 
@@ -155,7 +155,7 @@ impl JobStoreShard {
         id: &str,
     ) -> Result<Option<i64>, JobStoreShardError> {
         let key = job_cancelled_key(tenant, id);
-        let Some(raw) = self.db.get(key.as_bytes()).await? else {
+        let Some(raw) = self.db.get(&key).await? else {
             return Ok(None);
         };
         let decoded = decode_job_cancellation(&raw)?;

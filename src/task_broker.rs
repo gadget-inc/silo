@@ -11,7 +11,7 @@ use slatedb::{Db, WriteBatch};
 use tokio::sync::Notify;
 
 use crate::codec::decode_task;
-use crate::keys::decode_tenant;
+use crate::keys::{end_bound, parse_task_key, tasks_prefix};
 use crate::metrics::Metrics;
 use crate::shard_range::ShardRange;
 use crate::task::Task;
@@ -20,22 +20,22 @@ use tracing::debug;
 /// A task entry stored in the in-memory broker buffer
 #[derive(Debug, Clone)]
 pub struct BrokerTask {
-    pub key: String,
+    pub key: Vec<u8>,
     pub task: Task,
 }
 
 /// Lock-free in-memory task broker backed by SlateDB.
 ///
-/// - Maintains a sorted buffer of ready tasks using a skiplist keyed by the task key string.
+/// - Maintains a sorted buffer of ready tasks using a skiplist keyed by the task key bytes.
 /// - Populates from SlateDB in the background with exponential backoff when no work is found.
 /// - Ensures tasks claimed but not yet durably leased are tracked as in-flight and not reinserted.
 pub struct TaskBroker {
     // The SlateDB database to read tasks from
     db: Arc<Db>,
     // The buffer of tasks read out of the DB and ready to be claimed by a dequeue-ing worker
-    buffer: Arc<SkipMap<String, BrokerTask>>,
+    buffer: Arc<SkipMap<Vec<u8>, BrokerTask>>,
     // The set of tasks already read out of the DB and claimed by a worker but not yet durably leased. Required so that the scanner doesn't re-add tasks that are in the middle of being dequeued to the buffer.
-    inflight: Arc<Mutex<HashSet<String>>>,
+    inflight: Arc<Mutex<HashSet<Vec<u8>>>>,
     // Whether the background scanner is running
     running: Arc<AtomicBool>,
     // A notify object to wake up the background scanner when a task is claimed
@@ -91,12 +91,11 @@ impl TaskBroker {
 
     /// Scan tasks from DB and insert into buffer, skipping future tasks and inflight ones.
     async fn scan_tasks(&self, now_ms: i64) -> usize {
-        // [SILO-SCAN-1] Tasks live under tasks/<task_group>/<ts>/<pri>/<job_id>/<attempt>
-        let start: Vec<u8> = b"tasks/".to_vec();
-        let mut end: Vec<u8> = b"tasks/".to_vec();
-        end.push(0xFF);
+        // [SILO-SCAN-1] Tasks use binary storekey encoding with prefix byte
+        let start = tasks_prefix();
+        let end = end_bound(&start);
 
-        let Ok(mut iter) = self.db.scan::<Vec<u8>, _>(start..=end).await else {
+        let Ok(mut iter) = self.db.scan::<Vec<u8>, _>(start..end).await else {
             return 0;
         };
 
@@ -109,33 +108,18 @@ impl TaskBroker {
                 break;
             };
 
-            let Ok(key_str) = str::from_utf8(&kv.key) else {
+            // Parse the task key to extract timestamp
+            let Some(parsed_key) = parse_task_key(&kv.key) else {
                 continue;
             };
 
-            // Filter out future tasks by parsing timestamp from key
-            // Format: tasks/<task_group>/<ts>/<pri>/<job_id>/<attempt>
-            let mut parts = key_str.split('/');
-            if parts.next() != Some("tasks") {
-                continue;
-            }
-            // Skip task_group part
-            if parts.next().is_none() {
-                continue;
-            }
-            // Get timestamp part
-            let ts_part = match parts.next() {
-                Some(x) => x,
-                None => continue,
-            };
-            if let Ok(ts_val) = ts_part.parse::<u64>()
-                && ts_val > now_ms as u64
-            {
+            // Filter out future tasks
+            if parsed_key.start_time_ms > now_ms as u64 {
                 continue;
             }
 
             // [SILO-SCAN-3] Skip inflight tasks
-            if self.inflight.lock().unwrap().contains(key_str) {
+            if self.inflight.lock().unwrap().contains(&kv.key.to_vec()) {
                 continue;
             }
 
@@ -146,28 +130,29 @@ impl TaskBroker {
 
             // Check if task's tenant is within shard range
             let task_tenant = task.tenant();
-            let decoded_tenant = decode_tenant(task_tenant);
 
-            if !self.range.contains(&decoded_tenant) {
+            if !self.range.contains(task_tenant) {
                 // Task is for a tenant outside our range - mark for deletion
                 defunct_keys.push(kv.key.to_vec());
                 debug!(
-                    key = %key_str,
-                    tenant = %decoded_tenant,
+                    task_group = %parsed_key.task_group,
+                    job_id = %parsed_key.job_id,
+                    tenant = %task_tenant,
                     range = %self.range,
                     "skipping defunct task (tenant outside shard range)"
                 );
                 continue;
             }
 
+            let key_bytes = kv.key.to_vec();
             let entry = BrokerTask {
-                key: key_str.to_string(),
+                key: key_bytes.clone(),
                 task,
             };
 
             // [SILO-SCAN-2] Insert into buffer if not already present
-            if self.buffer.get(&entry.key).is_none() {
-                self.buffer.insert(entry.key.clone(), entry);
+            if self.buffer.get(&key_bytes).is_none() {
+                self.buffer.insert(key_bytes, entry);
                 inserted += 1;
 
                 // Yield periodically to avoid starving other tasks
@@ -269,8 +254,9 @@ impl TaskBroker {
 
     /// Claim up to `max` ready tasks from the head of the buffer for a specific task_group.
     pub fn claim_ready(&self, task_group: &str, max: usize) -> Vec<BrokerTask> {
+        use crate::keys::task_group_prefix;
         let mut claimed = Vec::with_capacity(max);
-        let task_group_prefix = format!("tasks/{}/", task_group);
+        let prefix = task_group_prefix(task_group);
 
         while claimed.len() < max {
             // Find the first claimable entry for this task_group
@@ -278,7 +264,7 @@ impl TaskBroker {
                 let key = entry.key();
 
                 // Skip if not in the requested task_group
-                if !key.starts_with(&task_group_prefix) {
+                if !key.starts_with(&prefix) {
                     return None;
                 }
 
@@ -352,7 +338,7 @@ impl TaskBroker {
     }
 
     /// Acknowledge that these tasks are durably leased and can be removed from in-flight tracking.
-    pub fn ack_durable(&self, keys: &[String]) {
+    pub fn ack_durable(&self, keys: &[Vec<u8>]) {
         let mut inflight = self.inflight.lock().unwrap();
         for k in keys {
             inflight.remove(k);
@@ -360,7 +346,7 @@ impl TaskBroker {
     }
 
     /// Remove any buffered entries that match the provided keys.
-    pub fn evict_keys(&self, keys: &[String]) {
+    pub fn evict_keys(&self, keys: &[Vec<u8>]) {
         for k in keys {
             self.buffer.remove(k);
         }

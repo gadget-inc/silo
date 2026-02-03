@@ -9,7 +9,8 @@
 
 mod test_helpers;
 use test_helpers::{
-    count_with_prefix, msgpack_payload, open_temp_shard, open_temp_shard_with_range,
+    count_job_info_keys, count_lease_keys, count_task_keys, msgpack_payload, open_temp_shard,
+    open_temp_shard_with_range,
 };
 
 use silo::shard_range::ShardRange;
@@ -56,7 +57,7 @@ async fn cleanup_removes_tasks_outside_range() {
     shard.db().flush().await.unwrap();
 
     // Verify tasks exist for all tenants
-    let task_count_before = count_with_prefix(shard.db(), "tasks/").await;
+    let task_count_before = count_task_keys(shard.db()).await;
     assert_eq!(task_count_before, 6); // 3 tenants * 2 jobs
 
     // Run cleanup with range that only includes tenants < "mmm"
@@ -69,7 +70,7 @@ async fn cleanup_removes_tasks_outside_range() {
     shard.db().flush().await.unwrap();
 
     // Tasks for mmm and zzz should be deleted
-    let task_count_after = count_with_prefix(shard.db(), "tasks/").await;
+    let task_count_after = count_task_keys(shard.db()).await;
     assert_eq!(
         task_count_after, 2,
         "only aaa tasks should remain (2 tasks)"
@@ -96,7 +97,7 @@ async fn cleanup_preserves_tasks_within_range() {
     shard.db().flush().await.unwrap();
 
     // All tasks should be preserved since they're within range
-    let task_count = count_with_prefix(shard.db(), "tasks/").await;
+    let task_count = count_task_keys(shard.db()).await;
     assert_eq!(task_count, 6);
     assert_eq!(result.keys_deleted, 0, "should not have deleted any keys");
 }
@@ -158,7 +159,7 @@ async fn cleanup_removes_leases_outside_range() {
     shard.db().flush().await.unwrap();
 
     // Verify leases exist
-    let lease_count_before = count_with_prefix(shard.db(), "lease/").await;
+    let lease_count_before = count_lease_keys(shard.db()).await;
     assert_eq!(lease_count_before, 2, "should have 2 leases");
 
     // Run cleanup with range that only includes aaa
@@ -170,7 +171,7 @@ async fn cleanup_removes_leases_outside_range() {
     shard.db().flush().await.unwrap();
 
     // The zzz lease should be deleted
-    let lease_count_after = count_with_prefix(shard.db(), "lease/").await;
+    let lease_count_after = count_lease_keys(shard.db()).await;
     assert_eq!(
         lease_count_after, 1,
         "should have 1 lease remaining (aaa only)"
@@ -193,7 +194,7 @@ async fn post_split_cleanup_left_child() {
     shard.db().flush().await.unwrap();
 
     // Verify all jobs exist
-    let job_count = count_with_prefix(shard.db(), "jobs/").await;
+    let job_count = count_job_info_keys(shard.db()).await;
     assert_eq!(job_count, 10); // 5 tenants * 2 jobs
 
     // Run cleanup as if this is the LEFT child after split at "delta"
@@ -208,14 +209,14 @@ async fn post_split_cleanup_left_child() {
     shard.db().flush().await.unwrap();
 
     // Jobs for delta, epsilon, gamma should be deleted
-    let job_count_after = count_with_prefix(shard.db(), "jobs/").await;
+    let job_count_after = count_job_info_keys(shard.db()).await;
     assert_eq!(
         job_count_after, 4,
         "should have 4 jobs remaining (alpha=2, beta=2)"
     );
 
     // Tasks for delta, epsilon, gamma should also be deleted
-    let task_count_after = count_with_prefix(shard.db(), "tasks/").await;
+    let task_count_after = count_task_keys(shard.db()).await;
     assert_eq!(
         task_count_after, 4,
         "should have 4 tasks remaining (alpha=2, beta=2)"
@@ -242,14 +243,14 @@ async fn post_split_cleanup_right_child() {
     shard.db().flush().await.unwrap();
 
     // Jobs for aaa, bbb should be deleted
-    let job_count_after = count_with_prefix(shard.db(), "jobs/").await;
+    let job_count_after = count_job_info_keys(shard.db()).await;
     assert_eq!(
         job_count_after, 6,
         "should have 6 jobs remaining (mmm=2, nnn=2, zzz=2)"
     );
 
     // Tasks for aaa, bbb should also be deleted
-    let task_count_after = count_with_prefix(shard.db(), "tasks/").await;
+    let task_count_after = count_task_keys(shard.db()).await;
     assert_eq!(
         task_count_after, 6,
         "should have 6 tasks remaining (mmm=2, nnn=2, zzz=2)"
@@ -273,7 +274,7 @@ async fn cleanup_is_idempotent() {
         .expect("first cleanup should succeed");
     shard.db().flush().await.unwrap();
 
-    let task_count_after_first = count_with_prefix(shard.db(), "tasks/").await;
+    let task_count_after_first = count_task_keys(shard.db()).await;
     assert_eq!(task_count_after_first, 2);
 
     // Second cleanup should be a no-op
@@ -283,7 +284,7 @@ async fn cleanup_is_idempotent() {
         .expect("second cleanup should succeed");
     shard.db().flush().await.unwrap();
 
-    let task_count_after_second = count_with_prefix(shard.db(), "tasks/").await;
+    let task_count_after_second = count_task_keys(shard.db()).await;
     assert_eq!(task_count_after_second, 2, "count should be unchanged");
 
     // Second cleanup should report complete with no additional deletions
