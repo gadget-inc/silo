@@ -2466,20 +2466,25 @@ async fn k8s_request_split_creates_split_record() {
 async fn k8s_request_split_fails_if_not_owner() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
-    let num_shards: u32 = 8;
+    // Use 32 shards to reduce the probability of one coordinator getting all shards
+    // With rendezvous hashing, each shard independently goes to a node, so with 2 nodes
+    // the probability of all 32 going to one is (0.5)^32 ≈ 0, effectively eliminating
+    // the flaky failure we saw with 8 shards.
+    let num_shards: u32 = 32;
 
-    let (c1, h1) = start_coordinator!(
+    let (c1_raw, h1) = start_coordinator!(
         &namespace,
         &prefix,
         "split-owner-1",
         "http://127.0.0.1:50051",
         num_shards
     );
+    let c1: Arc<dyn Coordinator> = Arc::new(c1_raw);
 
     // Small delay to let c1 start acquiring shards before c2 joins
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let (c2, h2) = K8sCoordinator::start(
+    let (c2_raw, h2) = K8sCoordinator::start(
         make_coordinator_config(
             &namespace,
             &prefix,
@@ -2492,7 +2497,7 @@ async fn k8s_request_split_fails_if_not_owner() {
     )
     .await
     .expect("start c2");
-    let c2: Arc<dyn Coordinator> = Arc::new(c2);
+    let c2: Arc<dyn Coordinator> = Arc::new(c2_raw);
 
     assert!(
         c1.wait_converged(Duration::from_secs(30)).await,
@@ -2503,7 +2508,7 @@ async fn k8s_request_split_fails_if_not_owner() {
         "c2 should converge"
     );
 
-    // Find a shard owned by c1
+    // Find a shard owned by one coordinator but not the other
     let c1_owned: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
     let c2_owned: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
     assert!(
@@ -2511,16 +2516,26 @@ async fn k8s_request_split_fails_if_not_owner() {
         "ownership should be disjoint"
     );
 
-    let c1_shard = *c1_owned
-        .iter()
-        .next()
-        .expect("c1 should own at least one shard");
+    // Find a shard where one coordinator can try to split a shard owned by the other
+    // This handles both cases: c1 owns shards (c2 tries to split), or c2 owns shards (c1 tries to split)
+    let (non_owner_splitter, target_shard): (ShardSplitter, ShardId) = if !c1_owned.is_empty() {
+        // c1 owns shards, c2 tries to split one of c1's shards
+        let shard = *c1_owned.iter().next().unwrap();
+        (ShardSplitter::new(c2.clone()), shard)
+    } else if !c2_owned.is_empty() {
+        // c1 owns no shards, c2 owns all - have c1 try to split one of c2's shards
+        let shard = *c2_owned.iter().next().unwrap();
+        (ShardSplitter::new(c1.clone()), shard)
+    } else {
+        panic!(
+            "both coordinators own 0 shards, which should be impossible with {} shards",
+            num_shards
+        );
+    };
 
-    // Create splitter for c2 and try to split a shard owned by c1
-
-    let splitter2 = ShardSplitter::new(c2.clone());
-
-    let result = splitter2.request_split(c1_shard, "mmmmm".to_string()).await;
+    let result = non_owner_splitter
+        .request_split(target_shard, "mmmmm".to_string())
+        .await;
     assert!(
         matches!(result, Err(CoordinationError::NotShardOwner(_))),
         "should fail with NotShardOwner, got: {:?}",

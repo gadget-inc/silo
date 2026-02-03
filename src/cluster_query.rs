@@ -125,7 +125,8 @@ impl ClusterQueryEngine {
                 (local_ids, HashMap::new())
             };
 
-        let mut configs = Vec::with_capacity(shard_ids.len());
+        let shard_ids_count = shard_ids.len();
+        let mut configs = Vec::with_capacity(shard_ids_count);
 
         for shard_id in shard_ids {
             if let Some(local_shard) = factory.get(&shard_id) {
@@ -143,6 +144,16 @@ impl ClusterQueryEngine {
                     "shard not available locally or remotely, skipping"
                 );
             }
+        }
+
+        // Log if we ended up with no shards - this is unexpected and helps debug flaky tests
+        if configs.is_empty() && shard_ids_count > 0 {
+            warn!(
+                shard_ids_count = shard_ids_count,
+                "build_shard_configs: discovered shard IDs but no configs built - shards may have closed"
+            );
+        } else if configs.is_empty() {
+            debug!("build_shard_configs: no shards discovered");
         }
 
         configs
@@ -297,11 +308,24 @@ impl ClusterExecutionPlan {
         limit: Option<usize>,
         projection: Option<Vec<usize>>,
     ) -> Self {
-        let num_partitions = shard_configs.len().max(1);
+        // Use actual shard count for partitions. If no shards, DataFusion
+        // will create an empty result set, which is the correct behavior.
+        // We previously used .max(1) which caused issues when shard_configs
+        // was empty: we'd tell DataFusion there's 1 partition, but then
+        // return an empty stream for partition 0 because there were no shards.
+        let num_partitions = shard_configs.len();
+
+        if num_partitions == 0 {
+            tracing::debug!(
+                table_kind = ?table_kind,
+                "ClusterExecutionPlan created with 0 shards - query will return empty results"
+            );
+        }
+
         let eq = EquivalenceProperties::new(schema.clone());
         let props = PlanProperties::new(
             eq,
-            Partitioning::UnknownPartitioning(num_partitions),
+            Partitioning::UnknownPartitioning(num_partitions.max(1)),
             EmissionType::Incremental,
             Boundedness::Bounded,
         )
@@ -357,8 +381,25 @@ impl ExecutionPlan for ClusterExecutionPlan {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
+        // Handle edge case: if there are no shards, return empty for any partition.
+        // This shouldn't happen in normal operation but guards against bugs.
+        if self.shard_configs.is_empty() {
+            tracing::warn!(
+                partition = partition,
+                table_kind = ?self.table_kind,
+                "execute called with no shard configs - returning empty stream"
+            );
+            let schema = self.schema.clone();
+            let (tx, rx) = mpsc::channel::<DfResult<RecordBatch>>(1);
+            drop(tx); // Close immediately to signal empty
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                ReceiverStream::new(rx),
+            )));
+        }
+
         if partition >= self.shard_configs.len() {
-            // Return empty stream for invalid partition
+            // Return empty stream for invalid partition index
             let schema = self.schema.clone();
             let (tx, rx) = mpsc::channel::<DfResult<RecordBatch>>(1);
             drop(tx); // Close immediately to signal empty
