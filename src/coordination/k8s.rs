@@ -1432,6 +1432,7 @@ impl<B: K8sBackend> K8sShardGuard<B> {
             match phase {
                 ShardPhase::ShutDown => break,
                 ShardPhase::Acquiring => {
+                    debug!(shard_id = %self.shard_id, "k8s shard: starting acquisition");
                     let mut attempt: u32 = 0;
                     let initial_jitter_ms =
                         (self.shard_id.as_uuid().as_u64_pair().0.wrapping_mul(13)) % 80;
@@ -1635,10 +1636,15 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                     break;
                 }
                 ShardPhase::Idle | ShardPhase::Held => {
+                    debug!(shard_id = %self.shard_id, phase = ?phase, "k8s shard: waiting for state change");
                     let mut shutdown_rx = self.shutdown.clone();
                     tokio::select! {
-                        _ = self.notify.notified() => {}
-                        _ = shutdown_rx.changed() => {}
+                        _ = self.notify.notified() => {
+                            debug!(shard_id = %self.shard_id, "k8s shard: received notification");
+                        }
+                        _ = shutdown_rx.changed() => {
+                            debug!(shard_id = %self.shard_id, "k8s shard: received shutdown");
+                        }
                     }
                 }
             }

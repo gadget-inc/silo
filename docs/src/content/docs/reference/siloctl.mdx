@@ -371,6 +371,55 @@ Profiling uses sampling and has low overhead (~1-2%). The default 100Hz frequenc
 
 ---
 
+### validate-config
+
+Validate a Silo configuration file without starting the server. This is useful for checking configuration syntax and semantics before deployment.
+
+```bash
+siloctl validate-config --config <path>
+```
+
+| Option | Description |
+|--------|-------------|
+| `-c`, `--config <PATH>` | Path to the TOML configuration file to validate |
+
+**Example:**
+
+```bash
+siloctl validate-config --config /etc/silo/config.toml
+```
+
+```
+Config is valid: /etc/silo/config.toml
+```
+
+**JSON output:**
+
+```bash
+siloctl --json validate-config --config /etc/silo/config.toml
+```
+
+```json
+{"status": "valid", "config_path": "/etc/silo/config.toml"}
+```
+
+**Error example:**
+
+```bash
+siloctl validate-config --config invalid-config.toml
+```
+
+```
+Config error: missing field `database`
+Error: Config validation failed: missing field `database`
+```
+
+<Aside type="tip">
+This command doesn't require a running Silo server. Use it in CI/CD pipelines to validate configuration changes before deploying.
+</Aside>
+
+---
+
 ## Common Workflows
 
 ### Debugging a Stuck Job

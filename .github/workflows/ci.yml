@@ -32,14 +32,25 @@ jobs:
       - name: Run background processes
         shell: bash
         run: |
-          process-compose up --tui=false gubernator etcd &
+          process-compose up --tui=false gubernator etcd > process-compose.log 2>&1 &
           sleep 2
       - name: Run cargo test
         shell: bash
-        run: cargo test -- --skip k8s_
+        # Debug logs written to file via SILO_DEBUG_LOG_FILE, console uses RUST_LOG level
+        env:
+          SILO_DEBUG_LOG_FILE: test-debug.log
+        run: cargo test -- --skip k8s_ --skip etcd_coordination --skip coordination_split_tests
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: |
+            test-debug.log
+            process-compose.log
 
-  benchmark:
-    name: Run benchmarks
+  test-etcd:
+    name: etcd coordination tests
     runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
@@ -47,9 +58,27 @@ jobs:
         with:
           cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - uses: Swatinem/rust-cache@v2
-      - name: Run throughput benchmark
+      - name: Run background processes
         shell: bash
-        run: cargo bench --bench job_shard_throughput
+        run: |
+          process-compose up --tui=false gubernator etcd > process-compose.log 2>&1 &
+          sleep 2
+      - name: Run etcd coordination tests
+        shell: bash
+        # Debug logs written to file via SILO_DEBUG_LOG_FILE, console uses RUST_LOG level
+        env:
+          SILO_DEBUG_LOG_FILE: etcd-test-debug.log
+        run: |
+          cargo test --test etcd_coordination_tests -- --test-threads=1
+          cargo test --test coordination_split_tests -- --test-threads=1
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: etcd-test-logs
+          path: |
+            etcd-test-debug.log
+            process-compose.log
 
   test-k8s:
     name: K8S coordination tests
@@ -70,7 +99,29 @@ jobs:
         shell: bash
         # Run only the k8s_coordination_tests binary which requires a real k8s cluster
         # Other tests with k8s_ in the name (like mock_k8s_* and turmoil DST tests) use mocks
+        # Debug logs written to file via SILO_DEBUG_LOG_FILE for diagnosing flaky test failures
+        env:
+          SILO_DEBUG_LOG_FILE: k8s-test-debug.log
         run: cargo test --test k8s_coordination_tests -- --test-threads=1
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k8s-test-logs
+          path: k8s-test-debug.log
+
+  benchmark:
+    name: Run benchmarks
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-test-env
+        with:
+          cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Run throughput benchmark
+        shell: bash
+        run: cargo bench --bench job_shard_throughput
 
   alloy-changes:
     name: Detect Alloy changes

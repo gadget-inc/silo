@@ -1,9 +1,10 @@
-use std::sync::{Mutex, Once};
+use std::sync::{Arc, Mutex, Once};
 
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{Resource, runtime, trace as sdktrace};
+use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::{EnvFilter, filter::LevelFilter, prelude::*};
 
 use crate::settings::LogFormat;
@@ -14,7 +15,32 @@ fn build_env_filter() -> EnvFilter {
     EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
 }
 
+/// A thread-safe file writer for the debug log layer.
+#[derive(Clone)]
+struct DebugFileWriter {
+    file: Arc<Mutex<std::fs::File>>,
+}
+
+impl std::io::Write for DebugFileWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file.lock().unwrap().write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.lock().unwrap().flush()
+    }
+}
+
+impl<'a> MakeWriter<'a> for DebugFileWriter {
+    type Writer = DebugFileWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
 /// Initialize tracing once based on config and environment:
+/// - If `SILO_DEBUG_LOG_FILE` is set, also write debug logs to that file
 /// - If `SILO_PERFETTO` is set, enable Perfetto export to that file
 /// - else if `OTEL_EXPORTER_OTLP_ENDPOINT` is set, export OTLP traces
 /// - otherwise install only the fmt layer
@@ -27,22 +53,54 @@ pub fn init(log_format: LogFormat) -> anyhow::Result<()> {
         let result = {
             let env_filter = build_env_filter();
 
-            match log_format {
-                LogFormat::Text => {
+            // Check if debug file logging is requested
+            let debug_file = std::env::var("SILO_DEBUG_LOG_FILE").ok().and_then(|path| {
+                match std::fs::File::create(&path) {
+                    Ok(file) => {
+                        eprintln!("Debug logs will be written to: {}", path);
+                        Some(DebugFileWriter {
+                            file: Arc::new(Mutex::new(file)),
+                        })
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to create debug log file {}: {}", path, e);
+                        None
+                    }
+                }
+            });
+
+            match (log_format, debug_file) {
+                (LogFormat::Text, Some(file_writer)) => {
                     let fmt_layer = tracing_subscriber::fmt::layer()
                         .with_target(true)
                         .with_level(true)
                         .compact()
                         .with_filter(env_filter);
-                    init_with_fmt_layer(fmt_layer)
+                    init_with_debug_file(fmt_layer, file_writer)
                 }
-                LogFormat::Json => {
+                (LogFormat::Text, None) => {
+                    let fmt_layer = tracing_subscriber::fmt::layer()
+                        .with_target(true)
+                        .with_level(true)
+                        .compact()
+                        .with_filter(env_filter);
+                    init_fmt_only(fmt_layer)
+                }
+                (LogFormat::Json, Some(file_writer)) => {
                     let fmt_layer = tracing_subscriber::fmt::layer()
                         .with_target(true)
                         .with_level(true)
                         .json()
                         .with_filter(env_filter);
-                    init_with_fmt_layer(fmt_layer)
+                    init_with_debug_file(fmt_layer, file_writer)
+                }
+                (LogFormat::Json, None) => {
+                    let fmt_layer = tracing_subscriber::fmt::layer()
+                        .with_target(true)
+                        .with_level(true)
+                        .json()
+                        .with_filter(env_filter);
+                    init_fmt_only(fmt_layer)
                 }
             }
         };
@@ -55,7 +113,7 @@ pub fn init(log_format: LogFormat) -> anyhow::Result<()> {
     }
 }
 
-fn init_with_fmt_layer<L>(fmt_layer: L) -> anyhow::Result<()>
+fn init_fmt_only<L>(fmt_layer: L) -> anyhow::Result<()>
 where
     L: tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync + 'static,
 {
@@ -93,6 +151,28 @@ where
     } else {
         base.init();
     }
+    Ok(())
+}
+
+fn init_with_debug_file<L>(fmt_layer: L, file_writer: DebugFileWriter) -> anyhow::Result<()>
+where
+    L: tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync + 'static,
+{
+    // The file layer writes debug+ logs for silo crate
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_target(true)
+        .with_level(true)
+        .with_ansi(false)
+        .with_writer(file_writer)
+        .with_filter(EnvFilter::new("silo=debug,info"));
+
+    let base = tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(file_layer);
+
+    // Note: Perfetto and OTEL are not supported when using debug file logging
+    // to keep the type system manageable. This is fine for CI debugging use case.
+    base.init();
     Ok(())
 }
 

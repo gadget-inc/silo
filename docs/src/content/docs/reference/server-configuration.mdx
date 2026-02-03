@@ -20,13 +20,15 @@ If no configuration file is specified, Silo uses sensible defaults suitable for 
 | `-c`, `--config <path>` | Path to a TOML configuration file |
 | `-v` | Enable verbose output |
 
-## Validating your config
+## Validating Your Config
 
-Validate your configuration without starting the server using the `validate-config` subcommand:
+Validate your configuration without starting the server using `siloctl validate-config`:
 
 ```bash
-silo validate-config -c config.toml 
+siloctl validate-config --config config.toml
 ```
+
+This command parses the configuration file and reports any errors. 
 
 ## Server Configuration
 
