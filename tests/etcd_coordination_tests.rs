@@ -2700,6 +2700,102 @@ async fn etcd_shard_owner_map_matches_actual_ownership() {
     h2.abort();
 }
 
+/// Test that wait_converged refreshes the shard map before computing convergence.
+/// This prevents flaky tests where the watch hasn't caught up with shard map changes.
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn etcd_wait_converged_refreshes_shard_map() {
+    let prefix = unique_prefix();
+    let num_shards: u32 = 4;
+
+    // Start a default node
+    let (c_default, h_default) = start_etcd_coordinator!(
+        &prefix,
+        "default-node",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+    let c_default: Arc<dyn Coordinator> = Arc::new(c_default);
+
+    assert!(
+        c_default.wait_converged(Duration::from_secs(15)).await,
+        "default node should converge"
+    );
+
+    // Verify default node owns all shards
+    let owned_before = c_default.owned_shards().await;
+    assert_eq!(owned_before.len(), num_shards as usize);
+
+    // Start a GPU node that participates in "gpu" ring
+    let endpoints = get_etcd_endpoints();
+    let (c_gpu, h_gpu) = EtcdCoordinator::start(
+        &endpoints,
+        &prefix,
+        "gpu-node",
+        "http://127.0.0.1:50052",
+        num_shards,
+        10,
+        make_test_factory("gpu-node"),
+        vec!["gpu".to_string()],
+    )
+    .await
+    .expect("start gpu node");
+    let c_gpu: Arc<dyn Coordinator> = Arc::new(c_gpu);
+
+    // Wait for GPU node to converge (it should own nothing since no shards are in GPU ring)
+    assert!(
+        c_gpu.wait_converged(Duration::from_secs(15)).await,
+        "gpu node should converge"
+    );
+    assert_eq!(
+        c_gpu.owned_shards().await.len(),
+        0,
+        "gpu node should own no shards initially"
+    );
+
+    // Move a shard to the GPU ring using the default coordinator
+    let shard_to_move = owned_before[0];
+    c_default
+        .update_shard_placement_ring(&shard_to_move, Some("gpu"))
+        .await
+        .expect("update placement ring");
+
+    // Immediately call wait_converged on the GPU node.
+    // Without the shard map refresh fix, this could see stale data where the shard
+    // is still in the default ring, and incorrectly report convergence with 0 shards.
+    // With the fix, wait_converged refreshes the shard map first and sees the shard
+    // should now be owned by the GPU node.
+    //
+    // We use a longer timeout to allow for the actual shard acquisition to complete.
+    assert!(
+        c_gpu.wait_converged(Duration::from_secs(30)).await,
+        "gpu node should converge after shard map change"
+    );
+
+    // Verify GPU node now owns the shard
+    let gpu_owned = c_gpu.owned_shards().await;
+    assert!(
+        gpu_owned.contains(&shard_to_move),
+        "gpu node should own the moved shard after wait_converged returns"
+    );
+
+    // Verify default node no longer owns it
+    assert!(
+        c_default.wait_converged(Duration::from_secs(15)).await,
+        "default node should converge"
+    );
+    let default_owned = c_default.owned_shards().await;
+    assert!(
+        !default_owned.contains(&shard_to_move),
+        "default node should not own the moved shard"
+    );
+
+    // Cleanup
+    c_gpu.shutdown().await.unwrap();
+    h_gpu.abort();
+    c_default.shutdown().await.unwrap();
+    h_default.abort();
+}
+
 /// Test that orphaned shards (no eligible node) remain unowned.
 #[silo::test(flavor = "multi_thread", worker_threads = 2)]
 async fn etcd_orphaned_ring_shard_remains_unowned() {
