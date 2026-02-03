@@ -839,6 +839,14 @@ impl Coordinator for EtcdCoordinator {
     }
 
     async fn wait_converged(&self, timeout: Duration) -> bool {
+        // Refresh shard map before waiting to avoid converging on stale placement data.
+        if let Err(e) = self.reload_shard_map().await {
+            debug!(
+                node_id = %self.base.node_id,
+                error = %e,
+                "wait_converged: failed to reload shard map"
+            );
+        }
         self.base
             .wait_converged(timeout, || async { self.get_members().await })
             .await
