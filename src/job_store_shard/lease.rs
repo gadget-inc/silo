@@ -209,7 +209,8 @@ impl JobStoreShard {
                             .await?;
 
                         // [SILO-RETRY-3] Set job status to Scheduled with next attempt time
-                        let job_status = JobStatus::scheduled(now_ms, next_time);
+                        let job_status =
+                            JobStatus::scheduled(now_ms, next_time, next_attempt_number);
                         self.set_job_status_with_index(&mut batch, &tenant, &job_id, job_status)
                             .await?;
                         scheduled_followup = true;

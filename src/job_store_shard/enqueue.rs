@@ -59,7 +59,8 @@ impl JobStoreShard {
         };
 
         // [SILO-ENQ-2] Create job with status Scheduled, with next attempt time
-        let job_status = JobStatus::scheduled(now_ms, effective_start_at_ms);
+        // First attempt is always 1
+        let job_status = JobStatus::scheduled(now_ms, effective_start_at_ms, 1);
 
         // Atomically write job info, job status, and handle first limit
         let mut batch = WriteBatch::new();
