@@ -54,10 +54,15 @@ impl NoneCoordinator {
             let shard_map = base.shard_map.lock().await;
             let mut owned = base.owned.lock().await;
             for shard_info in shard_map.shards() {
-                if let Err(e) = factory.open(&shard_info.id, &shard_info.range).await {
-                    tracing::error!(shard_id = %shard_info.id, error = %e, "failed to open shard");
-                } else {
-                    owned.insert(shard_info.id);
+                match factory.open(&shard_info.id, &shard_info.range).await {
+                    Ok(shard) => {
+                        // Spawn background cleanup if this shard has pending cleanup work
+                        shard.maybe_spawn_background_cleanup(shard_info.range.clone());
+                        owned.insert(shard_info.id);
+                    }
+                    Err(e) => {
+                        tracing::error!(shard_id = %shard_info.id, error = %e, "failed to open shard");
+                    }
                 }
             }
         }

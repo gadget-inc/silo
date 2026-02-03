@@ -41,6 +41,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-perfetto = "0.1"
 silo-macros = { path = "silo-macros" }
 tokio-stream = "0.1"
+tokio-util = "0.7"
 etcd-client = { version = "0.13", default-features = false, features = ["tls"] }
 kube = { version = "0.98", features = [
     "runtime",

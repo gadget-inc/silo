@@ -23,6 +23,7 @@ pub use helpers::now_epoch_ms;
 use slatedb::Db;
 use std::sync::{Arc, OnceLock};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 use crate::codec::CodecError;
 use crate::concurrency::ConcurrencyManager;
@@ -83,6 +84,9 @@ pub struct JobStoreShard {
     wal_close_config: Option<WalCloseConfig>,
     /// Optional metrics for recording shard-level stats
     pub(crate) metrics: Option<Metrics>,
+    /// Cancellation token for background tasks like cleanup.
+    /// Signaled when the shard is closing.
+    cancellation: CancellationToken,
 }
 
 #[derive(Debug, Error)]
@@ -249,6 +253,7 @@ impl JobStoreShard {
             rate_limiter,
             wal_close_config,
             metrics,
+            cancellation: CancellationToken::new(),
         });
 
         // Set the shard creation timestamp if this is the first time opening
@@ -277,6 +282,9 @@ impl JobStoreShard {
     /// This ensures all data is durably stored in object storage before closing,
     /// allowing the shard to be safely reopened elsewhere (e.g., on a different node).
     pub async fn close(&self) -> Result<(), JobStoreShardError> {
+        tracing::trace!(shard = %self.name, "shard.close: signaling cancellation for background tasks");
+        self.cancellation.cancel();
+
         tracing::trace!(shard = %self.name, "shard.close: stopping broker");
         self.broker.stop();
 

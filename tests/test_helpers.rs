@@ -277,6 +277,11 @@ pub async fn count_concurrency_holders(db: &Db) -> usize {
     count_with_binary_prefix(db, &silo::keys::concurrency_holders_prefix()).await
 }
 
+/// Count concurrency holder keys for a specific tenant.
+pub async fn count_concurrency_holders_for_tenant(db: &Db, tenant: &str) -> usize {
+    count_with_binary_prefix(db, &silo::keys::concurrency_holders_tenant_prefix(tenant)).await
+}
+
 /// Encode a JSON value as MessagePack bytes for use as a job payload.
 /// This is a helper for tests to create MessagePack-encoded payloads.
 pub fn msgpack_payload(value: &serde_json::Value) -> Vec<u8> {

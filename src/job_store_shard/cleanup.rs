@@ -41,6 +41,8 @@ pub struct CleanupResult {
     pub keys_scanned: u64,
     /// Whether cleanup completed fully
     pub complete: bool,
+    /// Whether cleanup was cancelled (shard closing)
+    pub cancelled: bool,
 }
 
 /// Namespace prefixes for different key types.
@@ -60,11 +62,35 @@ mod prefix {
 }
 
 impl JobStoreShard {
+    /// Check if cleanup has been cancelled and return a result if so.
+    /// Returns `Some(CleanupResult)` if cancelled, `None` otherwise.
+    fn cancelled_result(&self, progress: &CleanupProgress) -> Option<CleanupResult> {
+        if self.cancellation.is_cancelled() {
+            info!(
+                shard = %self.name,
+                keys_deleted = progress.keys_deleted,
+                keys_scanned = progress.keys_scanned,
+                "cleanup cancelled"
+            );
+            Some(CleanupResult {
+                keys_deleted: progress.keys_deleted,
+                keys_scanned: progress.keys_scanned,
+                complete: false,
+                cancelled: true,
+            })
+        } else {
+            None
+        }
+    }
+
     /// Delete keys outside this shard's tenant range.
     ///
     /// After a split, child shards contain data from the parent shard that may not belong to them
     /// based on their tenant range. This method scans all keys and deletes those with tenant_ids
     /// outside the shard's range.
+    ///
+    /// This method respects the shard's cancellation token. If the shard is being closed,
+    /// cleanup will stop gracefully at the next batch boundary, saving progress for later resumption.
     pub async fn after_split_cleanup_defunct_data(
         &self,
         range: &ShardRange,
@@ -83,7 +109,13 @@ impl JobStoreShard {
                 keys_deleted: progress.keys_deleted,
                 keys_scanned: progress.keys_scanned,
                 complete: true,
+                cancelled: false,
             });
+        }
+
+        // Check for cancellation before starting
+        if let Some(result) = self.cancelled_result(&progress) {
+            return Ok(result);
         }
 
         // Update status to CleanupRunning when starting
@@ -105,12 +137,20 @@ impl JobStoreShard {
             })
             .await?;
 
+        if let Some(result) = self.cancelled_result(&progress) {
+            return Ok(result);
+        }
+
         // Job status keys (0x02)
         progress = self
             .cleanup_keys_by_tenant_prefix(prefix::JOB_STATUS, range, batch_size, progress, |key| {
                 parse_job_status_key(key).map(|p| p.tenant)
             })
             .await?;
+
+        if let Some(result) = self.cancelled_result(&progress) {
+            return Ok(result);
+        }
 
         // Status/time index keys (0x03)
         progress = self
@@ -123,6 +163,10 @@ impl JobStoreShard {
             )
             .await?;
 
+        if let Some(result) = self.cancelled_result(&progress) {
+            return Ok(result);
+        }
+
         // Metadata index keys (0x04)
         progress = self
             .cleanup_keys_by_tenant_prefix(
@@ -134,12 +178,20 @@ impl JobStoreShard {
             )
             .await?;
 
+        if let Some(result) = self.cancelled_result(&progress) {
+            return Ok(result);
+        }
+
         // Attempt keys (0x07)
         progress = self
             .cleanup_keys_by_tenant_prefix(prefix::ATTEMPT, range, batch_size, progress, |key| {
                 parse_attempt_key(key).map(|p| p.tenant)
             })
             .await?;
+
+        if let Some(result) = self.cancelled_result(&progress) {
+            return Ok(result);
+        }
 
         // Concurrency request keys (0x08)
         progress = self
@@ -152,6 +204,10 @@ impl JobStoreShard {
             )
             .await?;
 
+        if let Some(result) = self.cancelled_result(&progress) {
+            return Ok(result);
+        }
+
         // Concurrency holder keys (0x09)
         progress = self
             .cleanup_keys_by_tenant_prefix(
@@ -162,6 +218,10 @@ impl JobStoreShard {
                 |key| parse_concurrency_holder_key(key).map(|p| p.tenant),
             )
             .await?;
+
+        if let Some(result) = self.cancelled_result(&progress) {
+            return Ok(result);
+        }
 
         // Job cancelled keys (0x0A)
         progress = self
@@ -174,6 +234,10 @@ impl JobStoreShard {
             )
             .await?;
 
+        if let Some(result) = self.cancelled_result(&progress) {
+            return Ok(result);
+        }
+
         // Floating limit keys (0x0B)
         progress = self
             .cleanup_keys_by_tenant_prefix(
@@ -185,10 +249,18 @@ impl JobStoreShard {
             )
             .await?;
 
+        if let Some(result) = self.cancelled_result(&progress) {
+            return Ok(result);
+        }
+
         // Process task keys specially (they don't have tenant in the key, but reference jobs)
         progress = self
             .after_split_cleanup_task_keys(range, batch_size, progress)
             .await?;
+
+        if let Some(result) = self.cancelled_result(&progress) {
+            return Ok(result);
+        }
 
         // Process lease keys
         progress = self
@@ -215,6 +287,7 @@ impl JobStoreShard {
             keys_deleted: progress.keys_deleted,
             keys_scanned: progress.keys_scanned,
             complete: true,
+            cancelled: false,
         })
     }
 
@@ -569,5 +642,87 @@ impl JobStoreShard {
             .put(&keys::cleanup_completed_at_key(), &data)
             .await?;
         Ok(())
+    }
+
+    /// Check if this shard needs cleanup and spawn a background task if so.
+    ///
+    /// This should be called after acquiring a shard that might be a split child
+    /// or was re-acquired after a crash during cleanup. The cleanup task runs
+    /// in the background and respects the shard's cancellation token.
+    ///
+    /// # Arguments
+    /// * `range` - The tenant range for this shard (used for cleanup filtering)
+    pub fn maybe_spawn_background_cleanup(self: &std::sync::Arc<Self>, range: ShardRange) {
+        let shard = std::sync::Arc::clone(self);
+        let shard_name = self.name.clone();
+
+        tokio::spawn(async move {
+            // Check if cleanup is needed
+            let status = match shard.get_cleanup_status().await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(
+                        shard = %shard_name,
+                        error = %e,
+                        "failed to check cleanup status"
+                    );
+                    return;
+                }
+            };
+
+            // Only run cleanup if it's pending or was interrupted
+            if !status.needs_work() {
+                tracing::debug!(
+                    shard = %shard_name,
+                    status = %status,
+                    "no cleanup work needed"
+                );
+                return;
+            }
+
+            info!(
+                shard = %shard_name,
+                status = %status,
+                "starting background cleanup for re-acquired shard"
+            );
+
+            // Run cleanup
+            match shard.after_split_cleanup_defunct_data(&range, 1000).await {
+                Ok(result) => {
+                    if result.cancelled {
+                        info!(
+                            shard = %shard_name,
+                            keys_deleted = result.keys_deleted,
+                            keys_scanned = result.keys_scanned,
+                            "background cleanup cancelled (shard closing)"
+                        );
+                        return;
+                    }
+
+                    info!(
+                        shard = %shard_name,
+                        keys_deleted = result.keys_deleted,
+                        keys_scanned = result.keys_scanned,
+                        "background cleanup completed"
+                    );
+
+                    // Run compaction after cleanup completes
+                    if let Err(e) = shard.run_full_compaction().await {
+                        tracing::error!(
+                            shard = %shard_name,
+                            error = %e,
+                            "failed to run compaction after cleanup"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        shard = %shard_name,
+                        error = %e,
+                        "background cleanup failed"
+                    );
+                }
+            }
+        });
     }
 }
