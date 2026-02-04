@@ -175,21 +175,21 @@ impl JobStoreShard {
             return Err(e.into());
         }
 
-        // Increment total jobs counter for this shard.
-        // This is done outside the transaction to avoid conflicts - see counters.rs for details.
-        // TODO(slatedb#1254): Move back inside transaction once SlateDB supports key exclusion.
-        self.increment_total_jobs_counter().await?;
-
-        // Emit DST event immediately after successful commit, BEFORE flush.
-        // This is critical for DST: the flush() yields to the scheduler, which could
-        // allow a dequeue to run and lease this job's task before we emit JobEnqueued.
-        // By emitting before flush, we ensure events are in the correct order.
+        // Emit DST event IMMEDIATELY after successful commit, before any other async
+        // operations. This is critical for DST: any async operation (including
+        // increment_total_jobs_counter) yields to the scheduler, which could allow
+        // a dequeue to run and lease this job's task before we emit JobEnqueued.
         // Note: We only emit JobEnqueued, not JobStatusChanged(Scheduled), because
         // job_enqueued() already records the Scheduled status.
         dst_events::emit(DstEvent::JobEnqueued {
             tenant: tenant.to_string(),
             job_id: job_id.to_string(),
         });
+
+        // Increment total jobs counter for this shard.
+        // This is done outside the transaction to avoid conflicts - see counters.rs for details.
+        // TODO(slatedb#1254): Move back inside transaction once SlateDB supports key exclusion.
+        self.increment_total_jobs_counter().await?;
 
         if let Err(e) = self.db.flush().await {
             // Note: commit succeeded but flush failed - the grants are committed,
