@@ -130,6 +130,8 @@ impl JobStoreShard {
                         let outcome = self
                             .concurrency
                             .process_ticket_request_task(
+                                &self.db,
+                                &shard_range,
                                 &mut batch,
                                 &entry.key,
                                 &tenant,
@@ -140,7 +142,7 @@ impl JobStoreShard {
                                 now_ms,
                                 job_view.as_ref(),
                             )
-                            .map_err(JobStoreShardError::Rkyv)?;
+                            .await?;
 
                         match outcome {
                             RequestTicketTaskOutcome::Granted { request_id, queue } => {

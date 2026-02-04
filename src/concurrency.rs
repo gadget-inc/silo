@@ -33,19 +33,62 @@ use std::sync::Mutex;
 
 use slatedb::{Db, DbIterator, WriteBatch};
 
-use crate::dst_events::{self, DstEvent};
 use crate::job_store_shard::WriteBatcher;
 
 use crate::codec::{
     decode_concurrency_action, encode_concurrency_action, encode_holder, encode_task,
 };
+use crate::dst_events::{self, DstEvent};
 use crate::job::{ConcurrencyLimit, JobView};
 use crate::keys::{
-    concurrency_holder_key, concurrency_holders_prefix, concurrency_request_key,
+    concurrency_holder_key, concurrency_holders_queue_prefix, concurrency_request_key,
     concurrency_request_prefix, end_bound, job_cancelled_key, parse_concurrency_holder_key,
     parse_concurrency_request_key, task_key,
 };
+use crate::shard_range::ShardRange;
 use crate::task::{ConcurrencyAction, HolderRecord, Task};
+
+/// Error type for concurrency operations that can fail due to storage errors.
+#[derive(Debug, thiserror::Error)]
+pub enum HandleEnqueueError {
+    #[error(transparent)]
+    Slate(#[from] slatedb::Error),
+    #[error("encoding error: {0}")]
+    Encoding(String),
+}
+
+impl From<String> for HandleEnqueueError {
+    fn from(s: String) -> Self {
+        HandleEnqueueError::Encoding(s)
+    }
+}
+
+impl From<crate::codec::CodecError> for HandleEnqueueError {
+    fn from(e: crate::codec::CodecError) -> Self {
+        HandleEnqueueError::Encoding(e.to_string())
+    }
+}
+
+/// Error type for process ticket operations.
+#[derive(Debug, thiserror::Error)]
+pub enum ProcessTicketError {
+    #[error(transparent)]
+    Slate(#[from] slatedb::Error),
+    #[error("encoding error: {0}")]
+    Encoding(String),
+}
+
+impl From<String> for ProcessTicketError {
+    fn from(s: String) -> Self {
+        ProcessTicketError::Encoding(s)
+    }
+}
+
+impl From<crate::codec::CodecError> for ProcessTicketError {
+    fn from(e: crate::codec::CodecError) -> Self {
+        ProcessTicketError::Encoding(e.to_string())
+    }
+}
 
 /// Information needed to rollback a release_and_grant operation if DB write fails.
 #[derive(Debug, Clone)]
@@ -84,6 +127,8 @@ pub enum RequestTicketTaskOutcome {
 pub struct ConcurrencyCounts {
     // Composite key: "<tenant>|<queue>" -> set of task ids holding tickets
     holders: Mutex<HashMap<String, HashSet<String>>>,
+    // Track which "tenant|queue" keys have been hydrated from durable storage
+    hydrated_queues: Mutex<HashSet<String>>,
 }
 
 impl Default for ConcurrencyCounts {
@@ -96,24 +141,33 @@ impl ConcurrencyCounts {
     pub fn new() -> Self {
         Self {
             holders: Mutex::new(HashMap::new()),
+            hydrated_queues: Mutex::new(HashSet::new()),
         }
     }
 
-    /// Hydrate concurrency holder state from durable storage.
+    /// Hydrate a specific queue's concurrency holder state from durable storage.
+    ///
+    /// Uses the per-queue prefix for efficient scanning of only the relevant holders.
     ///
     /// The `range` parameter filters holders to only load those for tenants within
     /// the shard's range. This is critical after shard splits - both child shards
     /// clone the same holder records, and without filtering, both would think they
     /// own the same concurrency tickets, leading to limit violations.
-    pub async fn hydrate(
+    pub async fn hydrate_queue(
         &self,
         db: &Db,
-        range: &crate::shard_range::ShardRange,
+        range: &ShardRange,
+        tenant: &str,
+        queue: &str,
     ) -> Result<(), slatedb::Error> {
-        // Scan all holders using binary storekey prefix
-        let start = concurrency_holders_prefix();
+        let key = format!("{}|{}", tenant, queue);
+
+        // Scan holders for this specific tenant/queue using the queue prefix
+        let start = concurrency_holders_queue_prefix(tenant, queue);
         let end = end_bound(&start);
         let mut iter: DbIterator = db.scan::<Vec<u8>, _>(start..end).await?;
+
+        let mut task_ids = Vec::new();
         loop {
             let maybe = iter.next().await?;
             let Some(kv) = maybe else { break };
@@ -130,24 +184,82 @@ impl ConcurrencyCounts {
                     queue = %parsed.queue,
                     task = %parsed.task_id,
                     range = %range,
-                    "skipping holder outside shard range during hydration"
+                    "skipping holder outside shard range during queue hydration"
                 );
                 continue;
             }
 
-            let key = format!("{}|{}", parsed.tenant, parsed.queue);
-            let mut h = self.holders.lock().unwrap();
-            let set = h.entry(key).or_default();
-            set.insert(parsed.task_id);
+            task_ids.push(parsed.task_id);
         }
+
+        // Update holders map
+        {
+            let mut h = self.holders.lock().unwrap();
+            let set = h.entry(key.clone()).or_default();
+            for task_id in task_ids {
+                set.insert(task_id);
+            }
+        }
+
+        // Mark queue as hydrated
+        {
+            let mut hydrated = self.hydrated_queues.lock().unwrap();
+            hydrated.insert(key);
+        }
+
         Ok(())
+    }
+
+    /// Ensure a queue is hydrated before checking capacity.
+    /// Called by try_reserve on first access to each queue.
+    /// Fast path: if already hydrated, return immediately.
+    pub async fn ensure_hydrated(
+        &self,
+        db: &Db,
+        range: &ShardRange,
+        tenant: &str,
+        queue: &str,
+    ) -> Result<(), slatedb::Error> {
+        let key = format!("{}|{}", tenant, queue);
+
+        // Fast path: check if already hydrated
+        {
+            let hydrated = self.hydrated_queues.lock().unwrap();
+            if hydrated.contains(&key) {
+                return Ok(());
+            }
+        }
+
+        // Slow path: hydrate the queue
+        self.hydrate_queue(db, range, tenant, queue).await
     }
 
     /// Atomically try to reserve a concurrency slot.
     /// Returns true if the slot was reserved, false if at capacity.
     /// This MUST be called before writing to the DB to prevent TOCTOU races.
     /// If the DB write fails, call `release_reservation` to roll back.
-    pub fn try_reserve(
+    ///
+    /// This method lazily hydrates the queue from durable storage on first access.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn try_reserve(
+        &self,
+        db: &Db,
+        range: &ShardRange,
+        tenant: &str,
+        queue: &str,
+        task_id: &str,
+        limit: usize,
+        job_id: &str,
+    ) -> Result<bool, slatedb::Error> {
+        // Ensure the queue is hydrated before checking capacity
+        self.ensure_hydrated(db, range, tenant, queue).await?;
+
+        Ok(self.try_reserve_internal(tenant, queue, task_id, limit, job_id))
+    }
+
+    /// Internal method that performs the atomic reservation without hydration check.
+    /// Used by try_reserve after hydration, and for testing the in-memory logic.
+    fn try_reserve_internal(
         &self,
         tenant: &str,
         queue: &str,
@@ -176,6 +288,32 @@ impl ConcurrencyCounts {
         });
 
         true
+    }
+
+    /// Mark a queue as hydrated without actually scanning storage.
+    /// Useful for tests that want to use try_reserve_internal directly.
+    #[doc(hidden)]
+    pub fn mark_hydrated(&self, tenant: &str, queue: &str) {
+        let key = format!("{}|{}", tenant, queue);
+        let mut hydrated = self.hydrated_queues.lock().unwrap();
+        hydrated.insert(key);
+    }
+
+    /// Synchronous try_reserve for testing when the queue is known to be hydrated
+    /// or when testing in-memory reservation logic without DB.
+    ///
+    /// This method is exposed for testing purposes only. Production code should
+    /// use `try_reserve` which performs lazy hydration.
+    #[doc(hidden)]
+    pub fn try_reserve_sync(
+        &self,
+        tenant: &str,
+        queue: &str,
+        task_id: &str,
+        limit: usize,
+        job_id: &str,
+    ) -> bool {
+        self.try_reserve_internal(tenant, queue, task_id, limit, job_id)
     }
 
     /// Release a reservation made by `try_reserve` if the DB write fails.
@@ -297,8 +435,10 @@ impl ConcurrencyManager {
     /// If the DB write fails after calling this, you MUST call `rollback_grant` to release
     /// the reservation.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn handle_enqueue<W: WriteBatcher>(
+    pub(crate) async fn handle_enqueue<W: WriteBatcher>(
         &self,
+        db: &Db,
+        range: &ShardRange,
         writer: &mut W,
         tenant: &str,
         task_id: &str,
@@ -310,7 +450,7 @@ impl ConcurrencyManager {
         task_group: &str,
         attempt_number: u32,
         relative_attempt_number: u32,
-    ) -> Result<Option<RequestTicketOutcome>, String> {
+    ) -> Result<Option<RequestTicketOutcome>, HandleEnqueueError> {
         // Only gate on the first limit (if any)
         let Some(limit) = limits.first() else {
             return Ok(None); // No limits
@@ -323,7 +463,8 @@ impl ConcurrencyManager {
         // This prevents TOCTOU races by reserving the slot before writing to DB
         if self
             .counts
-            .try_reserve(tenant, queue, task_id, max_allowed, job_id)
+            .try_reserve(db, range, tenant, queue, task_id, max_allowed, job_id)
+            .await?
         {
             // Grant immediately: [SILO-ENQ-CONC-2] create holder, [SILO-ENQ-CONC-3] create task
             // Note: in-memory slot is already reserved by try_reserve
@@ -403,8 +544,10 @@ impl ConcurrencyManager {
     /// If the DB write fails after calling this with a Granted outcome, you MUST call
     /// `rollback_grant` to release the reservation.
     #[allow(clippy::too_many_arguments)]
-    pub fn process_ticket_request_task(
+    pub async fn process_ticket_request_task(
         &self,
+        db: &Db,
+        range: &ShardRange,
         batch: &mut WriteBatch,
         task_key: &[u8],
         tenant: &str,
@@ -414,7 +557,7 @@ impl ConcurrencyManager {
         _attempt_number: u32,
         now_ms: i64,
         job_view: Option<&JobView>,
-    ) -> Result<RequestTicketTaskOutcome, String> {
+    ) -> Result<RequestTicketTaskOutcome, ProcessTicketError> {
         // Check if job exists
         let Some(view) = job_view else {
             batch.delete(task_key);
@@ -433,7 +576,8 @@ impl ConcurrencyManager {
         // Atomically check and reserve the slot to prevent TOCTOU races
         if !self
             .counts
-            .try_reserve(tenant, queue, request_id, max_allowed, job_id)
+            .try_reserve(db, range, tenant, queue, request_id, max_allowed, job_id)
+            .await?
         {
             return Ok(RequestTicketTaskOutcome::Requested);
         }

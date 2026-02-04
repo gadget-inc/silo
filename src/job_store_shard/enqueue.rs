@@ -275,6 +275,8 @@ impl JobStoreShard {
                     let outcome = self
                         .concurrency
                         .handle_enqueue(
+                            &self.db,
+                            &self.broker.get_range(),
                             writer,
                             tenant,
                             &current_task_id,
@@ -287,7 +289,7 @@ impl JobStoreShard {
                             attempt_number,
                             relative_attempt_number,
                         )
-                        .map_err(JobStoreShardError::Rkyv)?;
+                        .await?;
 
                     match outcome {
                         None => {
@@ -321,6 +323,8 @@ impl JobStoreShard {
                     let outcome = self
                         .concurrency
                         .handle_enqueue(
+                            &self.db,
+                            &self.broker.get_range(),
                             writer,
                             tenant,
                             &current_task_id,
@@ -333,7 +337,7 @@ impl JobStoreShard {
                             attempt_number,
                             relative_attempt_number,
                         )
-                        .map_err(JobStoreShardError::Rkyv)?;
+                        .await?;
 
                     let mut has_waiters =
                         matches!(outcome, Some(RequestTicketOutcome::TicketRequested { .. }));
