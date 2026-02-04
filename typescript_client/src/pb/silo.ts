@@ -1014,6 +1014,29 @@ export interface ShardOwner {
      * @generated from protobuf field: string range_end = 5
      */
     rangeEnd: string; // Exclusive end of the tenant_id range owned by this shard.
+    /**
+     * @generated from protobuf field: optional string placement_ring = 6
+     */
+    placementRing?: string; // Placement ring this shard belongs to (empty = default ring).
+}
+/**
+ * Information about a cluster member node.
+ *
+ * @generated from protobuf message silo.v1.ClusterMember
+ */
+export interface ClusterMember {
+    /**
+     * @generated from protobuf field: string node_id = 1
+     */
+    nodeId: string; // Unique identifier of this node.
+    /**
+     * @generated from protobuf field: string grpc_addr = 2
+     */
+    grpcAddr: string; // gRPC address of this node.
+    /**
+     * @generated from protobuf field: repeated string placement_rings = 3
+     */
+    placementRings: string[]; // Placement rings this node participates in.
 }
 /**
  * Cluster topology information.
@@ -1037,6 +1060,10 @@ export interface GetClusterInfoResponse {
      * @generated from protobuf field: string this_grpc_addr = 4
      */
     thisGrpcAddr: string; // gRPC address of the server responding.
+    /**
+     * @generated from protobuf field: repeated silo.v1.ClusterMember members = 5
+     */
+    members: ClusterMember[]; // All cluster members with their ring participation.
 }
 /**
  * Request to reset all shards owned by this server.
@@ -1226,6 +1253,44 @@ export interface GetNodeInfoResponse {
      * @generated from protobuf field: repeated silo.v1.OwnedShardInfo owned_shards = 2
      */
     ownedShards: OwnedShardInfo[]; // Information for each shard owned by this node.
+    /**
+     * @generated from protobuf field: repeated string placement_rings = 3
+     */
+    placementRings: string[]; // Placement rings this node participates in.
+}
+/**
+ * Request to configure a shard's placement ring.
+ *
+ * @generated from protobuf message silo.v1.ConfigureShardRequest
+ */
+export interface ConfigureShardRequest {
+    /**
+     * @generated from protobuf field: string shard = 1
+     */
+    shard: string; // The shard ID (UUID) to configure.
+    /**
+     * @generated from protobuf field: optional string placement_ring = 2
+     */
+    placementRing?: string; // The placement ring to assign (empty/null = default ring).
+    /**
+     * @generated from protobuf field: optional string tenant = 100
+     */
+    tenant?: string; // Optional tenant ID (for multi-tenant mode).
+}
+/**
+ * Response after configuring a shard's placement ring.
+ *
+ * @generated from protobuf message silo.v1.ConfigureShardResponse
+ */
+export interface ConfigureShardResponse {
+    /**
+     * @generated from protobuf field: string previous_ring = 1
+     */
+    previousRing: string; // The placement ring before the change (empty = default ring).
+    /**
+     * @generated from protobuf field: string current_ring = 2
+     */
+    currentRing: string; // The placement ring after the change (empty = default ring).
 }
 /**
  * Rate limiting algorithm for Gubernator-based limits.
@@ -4323,7 +4388,8 @@ class ShardOwner$Type extends MessageType<ShardOwner> {
             { no: 2, name: "grpc_addr", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
             { no: 3, name: "node_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
             { no: 4, name: "range_start", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
-            { no: 5, name: "range_end", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+            { no: 5, name: "range_end", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 6, name: "placement_ring", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ }
         ]);
     }
     create(value?: PartialMessage<ShardOwner>): ShardOwner {
@@ -4357,6 +4423,9 @@ class ShardOwner$Type extends MessageType<ShardOwner> {
                 case /* string range_end */ 5:
                     message.rangeEnd = reader.string();
                     break;
+                case /* optional string placement_ring */ 6:
+                    message.placementRing = reader.string();
+                    break;
                 default:
                     let u = options.readUnknownField;
                     if (u === "throw")
@@ -4384,6 +4453,9 @@ class ShardOwner$Type extends MessageType<ShardOwner> {
         /* string range_end = 5; */
         if (message.rangeEnd !== "")
             writer.tag(5, WireType.LengthDelimited).string(message.rangeEnd);
+        /* optional string placement_ring = 6; */
+        if (message.placementRing !== undefined)
+            writer.tag(6, WireType.LengthDelimited).string(message.placementRing);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -4395,13 +4467,77 @@ class ShardOwner$Type extends MessageType<ShardOwner> {
  */
 export const ShardOwner = new ShardOwner$Type();
 // @generated message type with reflection information, may provide speed optimized methods
+class ClusterMember$Type extends MessageType<ClusterMember> {
+    constructor() {
+        super("silo.v1.ClusterMember", [
+            { no: 1, name: "node_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "grpc_addr", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 3, name: "placement_rings", kind: "scalar", repeat: 2 /*RepeatType.UNPACKED*/, T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value?: PartialMessage<ClusterMember>): ClusterMember {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.nodeId = "";
+        message.grpcAddr = "";
+        message.placementRings = [];
+        if (value !== undefined)
+            reflectionMergePartial<ClusterMember>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: ClusterMember): ClusterMember {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string node_id */ 1:
+                    message.nodeId = reader.string();
+                    break;
+                case /* string grpc_addr */ 2:
+                    message.grpcAddr = reader.string();
+                    break;
+                case /* repeated string placement_rings */ 3:
+                    message.placementRings.push(reader.string());
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: ClusterMember, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string node_id = 1; */
+        if (message.nodeId !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.nodeId);
+        /* string grpc_addr = 2; */
+        if (message.grpcAddr !== "")
+            writer.tag(2, WireType.LengthDelimited).string(message.grpcAddr);
+        /* repeated string placement_rings = 3; */
+        for (let i = 0; i < message.placementRings.length; i++)
+            writer.tag(3, WireType.LengthDelimited).string(message.placementRings[i]);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.ClusterMember
+ */
+export const ClusterMember = new ClusterMember$Type();
+// @generated message type with reflection information, may provide speed optimized methods
 class GetClusterInfoResponse$Type extends MessageType<GetClusterInfoResponse> {
     constructor() {
         super("silo.v1.GetClusterInfoResponse", [
             { no: 1, name: "num_shards", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
             { no: 2, name: "shard_owners", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => ShardOwner },
             { no: 3, name: "this_node_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
-            { no: 4, name: "this_grpc_addr", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+            { no: 4, name: "this_grpc_addr", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 5, name: "members", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => ClusterMember }
         ]);
     }
     create(value?: PartialMessage<GetClusterInfoResponse>): GetClusterInfoResponse {
@@ -4410,6 +4546,7 @@ class GetClusterInfoResponse$Type extends MessageType<GetClusterInfoResponse> {
         message.shardOwners = [];
         message.thisNodeId = "";
         message.thisGrpcAddr = "";
+        message.members = [];
         if (value !== undefined)
             reflectionMergePartial<GetClusterInfoResponse>(this, message, value);
         return message;
@@ -4430,6 +4567,9 @@ class GetClusterInfoResponse$Type extends MessageType<GetClusterInfoResponse> {
                     break;
                 case /* string this_grpc_addr */ 4:
                     message.thisGrpcAddr = reader.string();
+                    break;
+                case /* repeated silo.v1.ClusterMember members */ 5:
+                    message.members.push(ClusterMember.internalBinaryRead(reader, reader.uint32(), options));
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -4455,6 +4595,9 @@ class GetClusterInfoResponse$Type extends MessageType<GetClusterInfoResponse> {
         /* string this_grpc_addr = 4; */
         if (message.thisGrpcAddr !== "")
             writer.tag(4, WireType.LengthDelimited).string(message.thisGrpcAddr);
+        /* repeated silo.v1.ClusterMember members = 5; */
+        for (let i = 0; i < message.members.length; i++)
+            ClusterMember.internalBinaryWrite(message.members[i], writer.tag(5, WireType.LengthDelimited).fork(), options).join();
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -5058,13 +5201,15 @@ class GetNodeInfoResponse$Type extends MessageType<GetNodeInfoResponse> {
     constructor() {
         super("silo.v1.GetNodeInfoResponse", [
             { no: 1, name: "node_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
-            { no: 2, name: "owned_shards", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => OwnedShardInfo }
+            { no: 2, name: "owned_shards", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => OwnedShardInfo },
+            { no: 3, name: "placement_rings", kind: "scalar", repeat: 2 /*RepeatType.UNPACKED*/, T: 9 /*ScalarType.STRING*/ }
         ]);
     }
     create(value?: PartialMessage<GetNodeInfoResponse>): GetNodeInfoResponse {
         const message = globalThis.Object.create((this.messagePrototype!));
         message.nodeId = "";
         message.ownedShards = [];
+        message.placementRings = [];
         if (value !== undefined)
             reflectionMergePartial<GetNodeInfoResponse>(this, message, value);
         return message;
@@ -5079,6 +5224,9 @@ class GetNodeInfoResponse$Type extends MessageType<GetNodeInfoResponse> {
                     break;
                 case /* repeated silo.v1.OwnedShardInfo owned_shards */ 2:
                     message.ownedShards.push(OwnedShardInfo.internalBinaryRead(reader, reader.uint32(), options));
+                    break;
+                case /* repeated string placement_rings */ 3:
+                    message.placementRings.push(reader.string());
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -5098,6 +5246,9 @@ class GetNodeInfoResponse$Type extends MessageType<GetNodeInfoResponse> {
         /* repeated silo.v1.OwnedShardInfo owned_shards = 2; */
         for (let i = 0; i < message.ownedShards.length; i++)
             OwnedShardInfo.internalBinaryWrite(message.ownedShards[i], writer.tag(2, WireType.LengthDelimited).fork(), options).join();
+        /* repeated string placement_rings = 3; */
+        for (let i = 0; i < message.placementRings.length; i++)
+            writer.tag(3, WireType.LengthDelimited).string(message.placementRings[i]);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -5108,6 +5259,122 @@ class GetNodeInfoResponse$Type extends MessageType<GetNodeInfoResponse> {
  * @generated MessageType for protobuf message silo.v1.GetNodeInfoResponse
  */
 export const GetNodeInfoResponse = new GetNodeInfoResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class ConfigureShardRequest$Type extends MessageType<ConfigureShardRequest> {
+    constructor() {
+        super("silo.v1.ConfigureShardRequest", [
+            { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "placement_ring", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
+            { no: 100, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value?: PartialMessage<ConfigureShardRequest>): ConfigureShardRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.shard = "";
+        if (value !== undefined)
+            reflectionMergePartial<ConfigureShardRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: ConfigureShardRequest): ConfigureShardRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string shard */ 1:
+                    message.shard = reader.string();
+                    break;
+                case /* optional string placement_ring */ 2:
+                    message.placementRing = reader.string();
+                    break;
+                case /* optional string tenant */ 100:
+                    message.tenant = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: ConfigureShardRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string shard = 1; */
+        if (message.shard !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.shard);
+        /* optional string placement_ring = 2; */
+        if (message.placementRing !== undefined)
+            writer.tag(2, WireType.LengthDelimited).string(message.placementRing);
+        /* optional string tenant = 100; */
+        if (message.tenant !== undefined)
+            writer.tag(100, WireType.LengthDelimited).string(message.tenant);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.ConfigureShardRequest
+ */
+export const ConfigureShardRequest = new ConfigureShardRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class ConfigureShardResponse$Type extends MessageType<ConfigureShardResponse> {
+    constructor() {
+        super("silo.v1.ConfigureShardResponse", [
+            { no: 1, name: "previous_ring", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "current_ring", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value?: PartialMessage<ConfigureShardResponse>): ConfigureShardResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.previousRing = "";
+        message.currentRing = "";
+        if (value !== undefined)
+            reflectionMergePartial<ConfigureShardResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: ConfigureShardResponse): ConfigureShardResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string previous_ring */ 1:
+                    message.previousRing = reader.string();
+                    break;
+                case /* string current_ring */ 2:
+                    message.currentRing = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: ConfigureShardResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string previous_ring = 1; */
+        if (message.previousRing !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.previousRing);
+        /* string current_ring = 2; */
+        if (message.currentRing !== "")
+            writer.tag(2, WireType.LengthDelimited).string(message.currentRing);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.ConfigureShardResponse
+ */
+export const ConfigureShardResponse = new ConfigureShardResponse$Type();
 /**
  * @generated ServiceType for protobuf service silo.v1.Silo
  */
@@ -5130,5 +5397,6 @@ export const Silo = new ServiceType("silo.v1.Silo", [
     { name: "CpuProfile", options: {}, I: CpuProfileRequest, O: CpuProfileResponse },
     { name: "RequestSplit", options: {}, I: RequestSplitRequest, O: RequestSplitResponse },
     { name: "GetSplitStatus", options: {}, I: GetSplitStatusRequest, O: GetSplitStatusResponse },
+    { name: "ConfigureShard", options: {}, I: ConfigureShardRequest, O: ConfigureShardResponse },
     { name: "ResetShards", options: {}, I: ResetShardsRequest, O: ResetShardsResponse }
 ]);

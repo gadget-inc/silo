@@ -196,6 +196,9 @@ jobs:
         shell: bash
         working-directory: typescript_client
         run: pnpm run typecheck
+      - name: Validate proto files up to date
+        shell: bash
+        run: node scripts/validate-typescript-proto.js
 
   typescript-client-tests:
     name: TypeScript tests

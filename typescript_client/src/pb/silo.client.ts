@@ -6,6 +6,8 @@ import type { ServiceInfo } from "@protobuf-ts/runtime-rpc";
 import { Silo } from "./silo";
 import type { ResetShardsResponse } from "./silo";
 import type { ResetShardsRequest } from "./silo";
+import type { ConfigureShardResponse } from "./silo";
+import type { ConfigureShardRequest } from "./silo";
 import type { GetSplitStatusResponse } from "./silo";
 import type { GetSplitStatusRequest } from "./silo";
 import type { RequestSplitResponse } from "./silo";
@@ -189,6 +191,15 @@ export interface ISiloClient {
      * @generated from protobuf rpc: GetSplitStatus
      */
     getSplitStatus(input: GetSplitStatusRequest, options?: RpcOptions): UnaryCall<GetSplitStatusRequest, GetSplitStatusResponse>;
+    /**
+     * Configure a shard's placement ring.
+     * Changes which placement ring the shard belongs to, affecting which nodes can own it.
+     * The shard will be handed off to a node that participates in the new ring.
+     * Returns the previous and current ring assignments.
+     *
+     * @generated from protobuf rpc: ConfigureShard
+     */
+    configureShard(input: ConfigureShardRequest, options?: RpcOptions): UnaryCall<ConfigureShardRequest, ConfigureShardResponse>;
     /**
      * Reset all shards owned by this server.
      * WARNING: Destructive operation. Only available in dev mode.
@@ -401,6 +412,18 @@ export class SiloClient implements ISiloClient, ServiceInfo {
         return stackIntercept<GetSplitStatusRequest, GetSplitStatusResponse>("unary", this._transport, method, opt, input);
     }
     /**
+     * Configure a shard's placement ring.
+     * Changes which placement ring the shard belongs to, affecting which nodes can own it.
+     * The shard will be handed off to a node that participates in the new ring.
+     * Returns the previous and current ring assignments.
+     *
+     * @generated from protobuf rpc: ConfigureShard
+     */
+    configureShard(input: ConfigureShardRequest, options?: RpcOptions): UnaryCall<ConfigureShardRequest, ConfigureShardResponse> {
+        const method = this.methods[18], opt = this._transport.mergeOptions(options);
+        return stackIntercept<ConfigureShardRequest, ConfigureShardResponse>("unary", this._transport, method, opt, input);
+    }
+    /**
      * Reset all shards owned by this server.
      * WARNING: Destructive operation. Only available in dev mode.
      * Clears all jobs, tasks, queues, and other data.
@@ -408,7 +431,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: ResetShards
      */
     resetShards(input: ResetShardsRequest, options?: RpcOptions): UnaryCall<ResetShardsRequest, ResetShardsResponse> {
-        const method = this.methods[18], opt = this._transport.mergeOptions(options);
+        const method = this.methods[19], opt = this._transport.mergeOptions(options);
         return stackIntercept<ResetShardsRequest, ResetShardsResponse>("unary", this._transport, method, opt, input);
     }
 }
