@@ -1110,21 +1110,24 @@ impl EtcdShardGuard {
                                         // Keep the attempt lease alive until shutdown
                                         let ka_result = client_clone.lease_keep_alive(attempt_lease).await;
                                         if let Ok((mut keeper, mut stream)) = ka_result {
+                                            // Use an interval to enforce minimum 1 second between keepalives.
+                                            let mut keepalive_interval = tokio::time::interval(Duration::from_secs(1));
                                             loop {
-                                                if *shutdown_rx.borrow() {
-                                                    break;
-                                                }
-                                                if keeper.keep_alive().await.is_err() {
-                                                    break;
-                                                }
-                                                // Wait for response or timeout
                                                 tokio::select! {
+                                                    _ = keepalive_interval.tick() => {
+                                                        if *shutdown_rx.borrow() {
+                                                            break;
+                                                        }
+                                                        if keeper.keep_alive().await.is_err() {
+                                                            break;
+                                                        }
+                                                    }
                                                     resp = stream.message() => {
+                                                        // Process keepalive responses; break if stream closes
                                                         if resp.is_err() || resp.unwrap().is_none() {
                                                             break;
                                                         }
                                                     }
-                                                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                                                 }
                                             }
                                         }
