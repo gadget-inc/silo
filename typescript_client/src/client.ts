@@ -8,10 +8,11 @@ import { SiloClient } from "./pb/silo.client";
 import type {
   Limit,
   SerializedBytes,
-  QueryResponse,
+  QueryResponse as ProtoQueryResponse,
   RetryPolicy,
   Task,
   ShardOwner,
+  ColumnInfo,
 } from "./pb/silo";
 import {
   GubernatorAlgorithm,
@@ -21,8 +22,31 @@ import {
 } from "./pb/silo";
 import type { JobAttempt as ProtoJobAttempt } from "./pb/silo";
 import { JobHandle } from "./JobHandle";
-export type { QueryResponse, RetryPolicy, ShardOwner };
+export type { RetryPolicy, ShardOwner };
 export { GubernatorAlgorithm, GubernatorBehavior };
+
+/**
+ * Column information from a query result.
+ */
+export interface QueryColumn {
+  /** Column name */
+  name: string;
+  /** Arrow/DataFusion type as string (e.g., "Utf8", "Int64") */
+  dataType: string;
+}
+
+/**
+ * Result of a SQL query with decoded rows.
+ * Each row is a JavaScript object with column names as keys.
+ */
+export interface QueryResult<Row = Record<string, unknown>> {
+  /** Schema information for the result columns */
+  columns: QueryColumn[];
+  /** Decoded rows as JavaScript objects */
+  rows: Row[];
+  /** Total number of rows returned */
+  rowCount: number;
+}
 
 /**
  * Error thrown when a job is not found.
@@ -1659,9 +1683,12 @@ export class SiloGRPCClient {
    * Execute a SQL query against the shard data.
    * @param sql    The SQL query to execute.
    * @param tenant Tenant ID for routing to the correct shard. Uses default tenant if not provided.
-   * @returns The query results.
+   * @returns The query results with decoded rows.
    */
-  public async query(sql: string, tenant?: string): Promise<QueryResponse> {
+  public async query<Row = Record<string, unknown>>(
+    sql: string,
+    tenant?: string
+  ): Promise<QueryResult<Row>> {
     return this._withWrongShardRetry(tenant, async (client, shard) => {
       const call = client.query(
         {
@@ -1672,7 +1699,26 @@ export class SiloGRPCClient {
         this._rpcOptions()
       );
 
-      return await call.response;
+      const response = await call.response;
+
+      // Decode each row from msgpack
+      const decodedRows: Row[] = response.rows.map((serialized, index) => {
+        if (serialized.encoding.oneofKind !== "msgpack") {
+          throw new Error(
+            `Unexpected encoding for row ${index}: expected msgpack, got ${serialized.encoding.oneofKind}`
+          );
+        }
+        return unpack(serialized.encoding.msgpack) as Row;
+      });
+
+      return {
+        columns: response.columns.map((col) => ({
+          name: col.name,
+          dataType: col.dataType,
+        })),
+        rows: decodedRows,
+        rowCount: response.rowCount,
+      };
     });
   }
 

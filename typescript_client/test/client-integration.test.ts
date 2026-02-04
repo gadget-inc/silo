@@ -674,20 +674,14 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         payload: { test: true },
       });
 
-      const result = await client.query(
+      const result = await client.query<{ count: number }>(
         "SELECT COUNT(*) as count FROM jobs",
         tenant
       );
       expect(result.rowCount).toBe(1);
       expect(result.columns.some((c) => c.name === "count")).toBe(true);
 
-      const row = decodeBytes<{ count: number }>(
-        result.rows[0]?.encoding.oneofKind === "msgpack"
-          ? result.rows[0].encoding.msgpack
-          : undefined,
-        "row"
-      );
-      expect(typeof row?.count).toBe("number");
+      expect(typeof result.rows[0]?.count).toBe("number");
     });
   });
 

@@ -36,6 +36,8 @@ export {
   type ShardRoutingConfig,
   type ShardOwner,
   type ShardInfoWithRange,
+  type QueryResult,
+  type QueryColumn,
 } from "./client";
 export {
   SiloWorker,
