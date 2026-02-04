@@ -983,7 +983,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
           {
             type: "floatingConcurrency",
             key: queueKey,
-            defaultMaxConcurrency: 2,
+            defaultMaxConcurrency: 1, // Use 1 so second job becomes a waiter, triggering refresh
             refreshIntervalMs: 1n, // 1ms - will be stale immediately
             metadata: { testKey: "testValue" },
           },
@@ -1003,7 +1003,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
           {
             type: "floatingConcurrency",
             key: queueKey,
-            defaultMaxConcurrency: 2,
+            defaultMaxConcurrency: 1, // Use 1 so second job becomes a waiter, triggering refresh
             refreshIntervalMs: 1n,
             metadata: { testKey: "testValue" },
           },
@@ -1029,7 +1029,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       expect(refreshTask).toBeDefined();
       expect(refreshTask!.id).toBeTruthy();
       expect(refreshTask!.queueKey).toBe(queueKey);
-      expect(refreshTask!.currentMaxConcurrency).toBe(2);
+      expect(refreshTask!.currentMaxConcurrency).toBe(1);
       expect(refreshTask!.metadata).toEqual({ testKey: "testValue" });
       expect(refreshTask!.shard).toBe(shard);
 
@@ -1066,7 +1066,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
           {
             type: "floatingConcurrency",
             key: queueKey,
-            defaultMaxConcurrency: 3,
+            defaultMaxConcurrency: 1, // Use 1 so second job becomes a waiter, triggering refresh
             refreshIntervalMs: 1n,
             metadata: { apiEndpoint: "https://api.example.com" },
           },
@@ -1086,7 +1086,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
           {
             type: "floatingConcurrency",
             key: queueKey,
-            defaultMaxConcurrency: 3,
+            defaultMaxConcurrency: 1, // Use 1 so second job becomes a waiter, triggering refresh
             refreshIntervalMs: 1n,
             metadata: { apiEndpoint: "https://api.example.com" },
           },

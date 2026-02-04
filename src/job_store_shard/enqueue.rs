@@ -4,6 +4,7 @@ use slatedb::WriteBatch;
 use uuid::Uuid;
 
 use crate::codec::{encode_job_info, encode_job_status};
+use crate::concurrency::RequestTicketOutcome;
 use crate::dst_events::{self, DstEvent};
 use crate::job::{JobInfo, JobStatus, Limit};
 use crate::job_store_shard::JobStoreShard;
@@ -232,9 +233,7 @@ impl JobStoreShard {
                     let state = self
                         .get_or_create_floating_limit_state(batch, tenant, fl)
                         .await?;
-                    self.maybe_schedule_floating_limit_refresh(
-                        batch, tenant, fl, &state, now_ms, task_group,
-                    )?;
+                    let refresh_ready = JobStoreShard::floating_limit_refresh_ready(&state, now_ms);
 
                     // Try immediate grant using current max concurrency
                     let temp_cl = crate::job::ConcurrencyLimit {
@@ -258,6 +257,25 @@ impl JobStoreShard {
                             relative_attempt_number,
                         )
                         .map_err(JobStoreShardError::Rkyv)?;
+
+                    let mut has_waiters =
+                        matches!(outcome, Some(RequestTicketOutcome::TicketRequested { .. }));
+                    if refresh_ready && !has_waiters {
+                        has_waiters = self
+                            .has_waiting_concurrency_requests(tenant, &fl.key)
+                            .await?;
+                    }
+                    if refresh_ready {
+                        self.maybe_schedule_floating_limit_refresh(
+                            batch,
+                            tenant,
+                            fl,
+                            &state,
+                            now_ms,
+                            task_group,
+                            has_waiters,
+                        )?;
+                    }
 
                     match outcome {
                         None => {
