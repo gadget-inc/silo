@@ -2,6 +2,7 @@
   "permissions": {
     "allow": [
       "Bash(grep:*)",
+      "Bash(ls:*)",
       "Bash(cargo:*)",
       "Bash(pnpm run:*)",
       "Bash(pnpm test:*)",
@@ -21,6 +22,10 @@
       "Bash(join:*)",
       "Bash(split:*)",
       "Bash(git branch)",
+      "Bash(git log:*)",
+      "Bash(git diff:*)",
+      "Bash(git status:*)",
+      "Bash(git blame:*)",
       "Bash(gh run:*)",
       "Bash(gh workflow:*)",
       "Bash(gh cache:*)",
