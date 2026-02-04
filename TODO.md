@@ -27,11 +27,11 @@
   - [ ] add new coordination mode for persistent disk wal storage and k8s restarts
     - if using persistent disk for the wal, the wal only exists there, and we dont have full compute/storage separation. instead, let's expect any crashed nodes to come back, and rely on cloud provider persistent disk implementations to make that disk available elsewhere. the lease must thusly _not_ expire when a pod goes away, and instead must be explicitly released when it is ready to release it.
   - [x] figure out how to balance shards, placement engine?
-- [ ] floating concurrency limits
+- [x] floating concurrency limits
   - [x] basics
   - [x] typescript client implementation
-  - [ ] failure to refresh handling
-  - [ ] performance optimization to not refresh if no jobs currently enqueued with limit
+  - [x] failure to refresh handling
+  - [x] performance optimization to not refresh if no jobs currently enqueued with limit
 - [ ] review what happened with the check-if-cancelled-on-dequeue thing happened, if alloy model matches rust impl
 - [x] webui / operator tooling
   - [ ] use / refine
