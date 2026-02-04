@@ -103,6 +103,7 @@ impl ClientConfig {
                 .timeout(self.request_timeout)
                 .http2_keep_alive_interval(self.keepalive_interval)
                 .keep_alive_timeout(self.keepalive_timeout)
+                .keep_alive_while_idle(true)
         })
     }
 
