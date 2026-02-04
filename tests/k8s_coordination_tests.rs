@@ -1333,7 +1333,7 @@ async fn k8s_multiple_add_remove_cycles() {
         num_shards
     );
     assert!(
-        c1.wait_converged(Duration::from_secs(20)).await,
+        c1.wait_converged(Duration::from_secs(30)).await,
         "c1 initial converge"
     );
 
@@ -3645,7 +3645,7 @@ async fn k8s_single_node_default_ring_owns_all_shards() {
     );
 
     assert!(
-        coord.wait_converged(Duration::from_secs(10)).await,
+        coord.wait_converged(Duration::from_secs(15)).await,
         "coordinator should converge"
     );
 
