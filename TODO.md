@@ -10,7 +10,7 @@
 - [x] cancel api
   - [x] restart cancelled api
 - [x] run next attempt now RPC (expedite)
-  - [ ] figure out how to avoid having to scan for all future tasks and delete performance issue
+  - [x] figure out how to avoid having to scan for all future tasks and delete performance issue
 - [x] get job info api
 - [x] get job with attempts api
 - [x] performant, clear storage for job payload, result, and error data
@@ -26,7 +26,7 @@
   - [ ] think through if failing open when control plane is down is ok with write fencing
   - [ ] add new coordination mode for persistent disk wal storage and k8s restarts
     - if using persistent disk for the wal, the wal only exists there, and we dont have full compute/storage separation. instead, let's expect any crashed nodes to come back, and rely on cloud provider persistent disk implementations to make that disk available elsewhere. the lease must thusly _not_ expire when a pod goes away, and instead must be explicitly released when it is ready to release it.
-  - [ ] figure out how to balance shards, placement engine?
+  - [x] figure out how to balance shards, placement engine?
 - [ ] floating concurrency limits
   - [x] basics
   - [x] typescript client implementation
@@ -46,16 +46,16 @@
     - [x] optional filter on job state
     - [x] optional filter on new metadata key/values
     - [x] fancy sql api
-- [ ] once transaction support, make enqueue idempotency not a read-then-write but some sort of conditional write
+- [x] once transaction support, make enqueue idempotency not a read-then-write but some sort of conditional write
 - [ ] validate that concurrency queues can reach 0
 - [ ] validate GRPC typescript client retry configuration with toxiproxy
 - [ ] waiting state? that matches the gadget ui, but we dont have it modeled because it changes in time without anything else changing
   - [ ] do we need to be able to query for it in the SQL layer? probably
 - [ ] worker <=> server GRPC auth
-- [ ] much more simulation testing
-- [ ] rust best practices review
-- [ ] benchmarks in CI, codspeed or similar regression tracker
-- [ ] make sure failure data is also stored using msgpack
+- [x] much more simulation testing
+- [x] rust best practices review
+- [x] benchmarks in CI, codspeed or similar regression tracker
+- [x] make sure failure data is also stored using msgpack
 - [ ] shard splitting
   - [x] wire up re-cleanup on re-aquire
   - [x] add tests for actually processing jobs before cleanup has happened

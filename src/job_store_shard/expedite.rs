@@ -3,7 +3,6 @@
 //! Allows future-scheduled jobs to be expedited to run immediately,
 //! skipping the scheduled start time or retry backoff delay.
 
-use slatedb::DbIterator;
 use slatedb::ErrorKind as SlateErrorKind;
 use slatedb::IsolationLevel;
 
@@ -11,9 +10,7 @@ use crate::codec::{decode_task, encode_task};
 use crate::job::JobStatusKind;
 use crate::job_store_shard::helpers::{decode_job_status_owned, now_epoch_ms};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
-use crate::keys::{
-    end_bound, job_cancelled_key, job_status_key, parse_task_key, task_key, tasks_prefix,
-};
+use crate::keys::{job_cancelled_key, job_status_key, task_key};
 use crate::task::Task;
 use tracing::debug;
 
@@ -128,21 +125,49 @@ impl JobStoreShard {
             ));
         }
 
+        // Load job info to get task_group and priority
+        let job_info_key = crate::keys::job_info_key(tenant, id);
+        let maybe_job_raw = txn.get(&job_info_key).await?;
+        let Some(job_raw) = maybe_job_raw else {
+            return Err(JobStoreShardError::JobNotFound(id.to_string()));
+        };
+        let job_view = crate::job::JobView::new(job_raw)?;
+        let priority = job_view.priority();
+        let task_group = job_view.task_group().to_string();
+
         // [SILO-EXP-4] Pre: task exists in DB queue for this job
-        // Find the task for this job by scanning tasks/ namespace
-        let (old_task_key, task, original_time_ms) =
-            self.find_task_for_job_id(id).await?.ok_or_else(|| {
-                // No task found - job has no pending task
-                JobStoreShardError::JobNotExpediteable(JobNotExpediteableError {
+        // O(1) direct key lookup using stored attempt info from JobStatus
+        let attempt_number = status.current_attempt.ok_or_else(|| {
+            JobStoreShardError::JobNotExpediteable(JobNotExpediteableError {
+                job_id: id.to_string(),
+                status: status.kind,
+                reason: "job has no pending task to expedite".to_string(),
+            })
+        })?;
+        let start_time_ms = status.next_attempt_starts_after_ms.ok_or_else(|| {
+            JobStoreShardError::JobNotExpediteable(JobNotExpediteableError {
+                job_id: id.to_string(),
+                status: status.kind,
+                reason: "job has no pending task to expedite".to_string(),
+            })
+        })?;
+
+        let old_task_key = task_key(&task_group, start_time_ms, priority, id, attempt_number);
+        let maybe_task_raw = txn.get(&old_task_key).await?;
+        let Some(task_raw) = maybe_task_raw else {
+            return Err(JobStoreShardError::JobNotExpediteable(
+                JobNotExpediteableError {
                     job_id: id.to_string(),
                     status: status.kind,
                     reason: "job has no pending task to expedite".to_string(),
-                })
-            })?;
+                },
+            ));
+        };
+        let task = decode_task(&task_raw)?;
 
         // [SILO-EXP-5] Check if task is future-scheduled (timestamp > now)
         // If task timestamp <= now, it's already ready to run (may be in buffer)
-        if original_time_ms <= now_ms {
+        if start_time_ms <= now_ms {
             return Err(JobStoreShardError::JobNotExpediteable(
                 JobNotExpediteableError {
                     job_id: id.to_string(),
@@ -152,33 +177,16 @@ impl JobStoreShard {
             ));
         }
 
-        // Extract task details to create new key
-        let (priority, attempt_number, task_group) = match &task {
-            Task::RunAttempt {
-                attempt_number,
-                task_group,
-                ..
-            } => {
-                // Get priority from job info
-                let job_info_key = crate::keys::job_info_key(tenant, id);
-                let maybe_job_raw = txn.get(&job_info_key).await?;
-                let Some(job_raw) = maybe_job_raw else {
-                    return Err(JobStoreShardError::JobNotFound(id.to_string()));
-                };
-                let job_view = crate::job::JobView::new(job_raw)?;
-                (job_view.priority(), *attempt_number, task_group.clone())
-            }
-            _ => {
-                // Not a RunAttempt task - this shouldn't happen for normal jobs
-                return Err(JobStoreShardError::JobNotExpediteable(
-                    JobNotExpediteableError {
-                        job_id: id.to_string(),
-                        status: status.kind,
-                        reason: "task is not a RunAttempt task".to_string(),
-                    },
-                ));
-            }
-        };
+        // RefreshFloatingLimit tasks cannot be expedited (they're internal system tasks)
+        if matches!(task, Task::RefreshFloatingLimit { .. }) {
+            return Err(JobStoreShardError::JobNotExpediteable(
+                JobNotExpediteableError {
+                    job_id: id.to_string(),
+                    status: status.kind,
+                    reason: "cannot expedite internal refresh task".to_string(),
+                },
+            ));
+        }
 
         // Delete the old task key
         txn.delete(&old_task_key)?;
@@ -188,6 +196,27 @@ impl JobStoreShard {
         let task_value = encode_task(&task)?;
         txn.put(&new_task_key, &task_value)?;
 
+        // Update job status with new start time (keeping same attempt number)
+        let new_status = crate::job::JobStatus::scheduled(now_ms, now_ms, attempt_number);
+        let new_status_value = crate::codec::encode_job_status(&new_status)?;
+        txn.put(&status_key, &new_status_value)?;
+
+        // Update status/time index
+        let old_time_key = crate::keys::idx_status_time_key(
+            tenant,
+            status.kind.as_str(),
+            status.changed_at_ms,
+            id,
+        );
+        txn.delete(&old_time_key)?;
+        let new_time_key = crate::keys::idx_status_time_key(
+            tenant,
+            new_status.kind.as_str(),
+            new_status.changed_at_ms,
+            id,
+        );
+        txn.put(&new_time_key, [])?;
+
         // Commit the transaction
         txn.commit().await?;
 
@@ -195,37 +224,5 @@ impl JobStoreShard {
         self.broker.wakeup();
 
         Ok(())
-    }
-
-    /// Find a task for the given job_id in the tasks/ namespace.
-    /// Returns (task_key, task, timestamp_ms) if found, None otherwise.
-    async fn find_task_for_job_id(
-        &self,
-        job_id: &str,
-    ) -> Result<Option<(Vec<u8>, Task, i64)>, JobStoreShardError> {
-        // Scan all tasks looking for one that belongs to this job
-        let start = tasks_prefix();
-        let end = end_bound(&start);
-
-        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..end).await?;
-
-        while let Some(kv) = iter.next().await? {
-            // Parse task key to extract job_id and timestamp
-            let Some(parsed) = parse_task_key(&kv.key) else {
-                continue;
-            };
-
-            if parsed.job_id != job_id {
-                continue;
-            }
-
-            // Found a task for this job
-            let timestamp_ms = parsed.start_time_ms as i64;
-            let task = decode_task(&kv.value)?;
-
-            return Ok(Some((kv.key.to_vec(), task, timestamp_ms)));
-        }
-
-        Ok(None)
     }
 }

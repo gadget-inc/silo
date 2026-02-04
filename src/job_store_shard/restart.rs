@@ -154,29 +154,9 @@ impl JobStoreShard {
         let priority = job_view.priority();
         let start_at_ms = job_view.enqueue_time_ms().max(now_ms);
 
-        // Delete old status index entry
-        let old_time = idx_status_time_key(tenant, status.kind.as_str(), status.changed_at_ms, id);
-        txn.delete(&old_time)?;
-
-        // [SILO-RESTART-6] Post: Set status to Scheduled with next attempt time
-        let new_status = JobStatus::scheduled(now_ms, start_at_ms);
-        let status_value = encode_job_status(&new_status)?;
-        txn.put(&status_key, &status_value)?;
-
-        // Insert new status index entry
-        let new_time = idx_status_time_key(
-            tenant,
-            new_status.kind.as_str(),
-            new_status.changed_at_ms,
-            id,
-        );
-        txn.put(&new_time, [])?;
-
-        // Decrement completed jobs counter - job is going from terminal to scheduled
-        self.decrement_completed_jobs_counter_txn(&txn)?;
-
         // Find the maximum attempt number from existing attempts
         // We scan the attempts prefix to find the highest attempt number
+        // This must happen before we set the status so we know the attempt number
         let start = attempt_prefix(tenant, id);
         let end = crate::keys::end_bound(&start);
 
@@ -195,9 +175,31 @@ impl JobStoreShard {
             }
         }
 
-        // [SILO-RESTART-5] Post: Create new task in DB queue with next attempt number
-        // Attempt numbers are monotonically increasing; relative attempts reset to 1 on restart
+        // [SILO-RESTART-5] Attempt numbers are monotonically increasing; relative attempts reset to 1 on restart
         let next_attempt_number = max_attempt_number + 1;
+
+        // Delete old status index entry
+        let old_time = idx_status_time_key(tenant, status.kind.as_str(), status.changed_at_ms, id);
+        txn.delete(&old_time)?;
+
+        // [SILO-RESTART-6] Post: Set status to Scheduled with next attempt time and attempt number
+        let new_status = JobStatus::scheduled(now_ms, start_at_ms, next_attempt_number);
+        let status_value = encode_job_status(&new_status)?;
+        txn.put(&status_key, &status_value)?;
+
+        // Insert new status index entry
+        let new_time = idx_status_time_key(
+            tenant,
+            new_status.kind.as_str(),
+            new_status.changed_at_ms,
+            id,
+        );
+        txn.put(&new_time, [])?;
+
+        // Decrement completed jobs counter - job is going from terminal to scheduled
+        self.decrement_completed_jobs_counter_txn(&txn)?;
+
+        // [SILO-RESTART-5] Post: Create new task in DB queue with next attempt number
         let new_task_id = Uuid::new_v4().to_string();
         let task_group = job_view.task_group().to_string();
         let new_task = Task::RunAttempt {

@@ -194,6 +194,11 @@ pub struct JobStatus {
     /// Unix timestamp (ms) when the next attempt will start.
     /// Present for scheduled jobs (initial or retry), absent for running or terminal jobs.
     pub next_attempt_starts_after_ms: Option<i64>,
+    /// The current attempt number for this job's pending task.
+    /// Present when a task exists in the task queue (Scheduled status),
+    /// absent when the job is running (task became a lease) or terminal.
+    /// Used for O(1) task key reconstruction in expedite operations.
+    pub current_attempt: Option<u32>,
 }
 
 impl JobStatus {
@@ -201,37 +206,44 @@ impl JobStatus {
         kind: JobStatusKind,
         changed_at_ms: i64,
         next_attempt_starts_after_ms: Option<i64>,
+        current_attempt: Option<u32>,
     ) -> Self {
         Self {
             kind,
             changed_at_ms,
             next_attempt_starts_after_ms,
+            current_attempt,
         }
     }
 
-    /// Create a Scheduled status with the next attempt start time.
-    pub fn scheduled(changed_at_ms: i64, next_attempt_starts_after_ms: i64) -> Self {
+    /// Create a Scheduled status with the next attempt start time and attempt number.
+    pub fn scheduled(
+        changed_at_ms: i64,
+        next_attempt_starts_after_ms: i64,
+        attempt_number: u32,
+    ) -> Self {
         Self::new(
             JobStatusKind::Scheduled,
             changed_at_ms,
             Some(next_attempt_starts_after_ms),
+            Some(attempt_number),
         )
     }
 
     pub fn running(changed_at_ms: i64) -> Self {
-        Self::new(JobStatusKind::Running, changed_at_ms, None)
+        Self::new(JobStatusKind::Running, changed_at_ms, None, None)
     }
 
     pub fn failed(changed_at_ms: i64) -> Self {
-        Self::new(JobStatusKind::Failed, changed_at_ms, None)
+        Self::new(JobStatusKind::Failed, changed_at_ms, None, None)
     }
 
     pub fn cancelled(changed_at_ms: i64) -> Self {
-        Self::new(JobStatusKind::Cancelled, changed_at_ms, None)
+        Self::new(JobStatusKind::Cancelled, changed_at_ms, None, None)
     }
 
     pub fn succeeded(changed_at_ms: i64) -> Self {
-        Self::new(JobStatusKind::Succeeded, changed_at_ms, None)
+        Self::new(JobStatusKind::Succeeded, changed_at_ms, None, None)
     }
 
     pub fn is_terminal(&self) -> bool {
