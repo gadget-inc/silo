@@ -7,6 +7,7 @@ use silo::job_attempt::{AttemptOutcome, AttemptStatus};
 use silo::keys::concurrency_holder_key;
 use silo::retry::RetryPolicy;
 use silo::task::{LeaseRecord, Task};
+use slatedb::DbIterator;
 
 use test_helpers::*;
 
@@ -1520,4 +1521,265 @@ async fn cannot_delete_job_with_pending_request() {
     // Job should be gone
     let job2_final = shard.get_job("-", &j2).await.expect("get job2");
     assert!(job2_final.is_none(), "job 2 should be deleted");
+}
+
+/// Test that lazy hydration correctly loads holders from storage on first access to a queue.
+/// This verifies that after shard restart, the concurrency counts are correctly loaded.
+#[silo::test]
+async fn concurrency_lazy_hydration_on_shard_reopen() {
+    use silo::gubernator::MockGubernatorClient;
+    use silo::settings::{Backend, DatabaseConfig};
+    use silo::shard_range::ShardRange;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = DatabaseConfig {
+        name: "test".to_string(),
+        backend: Backend::Fs,
+        path: tmp.path().to_string_lossy().to_string(),
+        wal: None,
+        apply_wal_on_close: true,
+        slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
+    };
+    let rate_limiter = MockGubernatorClient::new_arc();
+    let queue = "lazy_q".to_string();
+
+    // Phase 1: Open shard, enqueue a job that holds a concurrency slot
+    let shard1 = silo::job_store_shard::JobStoreShard::open(
+        &cfg,
+        rate_limiter.clone(),
+        None,
+        ShardRange::full(),
+    )
+    .await
+    .expect("open shard1");
+
+    let now = now_ms();
+    let _j1 = shard1
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"lazy": 1})),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue1");
+
+    // Dequeue to lease the job (creates holder record)
+    let tasks1 = shard1
+        .dequeue("w1", "default", 1)
+        .await
+        .expect("deq1")
+        .tasks;
+    assert_eq!(tasks1.len(), 1);
+    let task_id = tasks1[0].attempt().task_id().to_string();
+
+    // Verify holder exists in DB
+    let holder = shard1
+        .db()
+        .get(&silo::keys::concurrency_holder_key("-", &queue, &task_id))
+        .await
+        .expect("get holder");
+    assert!(holder.is_some(), "holder should exist after dequeue");
+
+    // Close the shard
+    shard1.close().await.expect("close shard1");
+
+    // Phase 2: Reopen shard (lazy hydration should kick in on first access)
+    let shard2 = silo::job_store_shard::JobStoreShard::open(
+        &cfg,
+        rate_limiter.clone(),
+        None,
+        ShardRange::full(),
+    )
+    .await
+    .expect("open shard2");
+
+    // Try to enqueue a second job on the same queue
+    // With lazy hydration, it should recognize the slot is full
+    let j2 = shard2
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"lazy": 2})),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue2");
+
+    // The second job should NOT get a task immediately (queue is full)
+    // Peek tasks - should not see j2 as a RunAttempt
+    let peeked = shard2.peek_tasks("default", 10).await.expect("peek");
+
+    // Count RunAttempt tasks for j2
+    let j2_run_attempts = peeked
+        .iter()
+        .filter(|t| {
+            if let Task::RunAttempt { job_id, .. } = t {
+                job_id == &j2
+            } else {
+                false
+            }
+        })
+        .count();
+
+    assert_eq!(
+        j2_run_attempts, 0,
+        "j2 should not have a RunAttempt task - slot is occupied by j1"
+    );
+
+    // Verify j1's holder still exists
+    let holder2 = shard2
+        .db()
+        .get(&silo::keys::concurrency_holder_key("-", &queue, &task_id))
+        .await
+        .expect("get holder after reopen");
+    assert!(
+        holder2.is_some(),
+        "holder should persist across shard restart"
+    );
+
+    shard2.close().await.expect("close shard2");
+}
+
+/// Test that no overgrant occurs after shard restart when holders exist in storage.
+/// This is a critical correctness test for lazy hydration.
+#[silo::test]
+async fn concurrency_no_overgrant_with_lazy_hydration() {
+    use silo::gubernator::MockGubernatorClient;
+    use silo::settings::{Backend, DatabaseConfig};
+    use silo::shard_range::ShardRange;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = DatabaseConfig {
+        name: "test".to_string(),
+        backend: Backend::Fs,
+        path: tmp.path().to_string_lossy().to_string(),
+        wal: None,
+        apply_wal_on_close: true,
+        slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
+    };
+    let rate_limiter = MockGubernatorClient::new_arc();
+    let queue = "overgrant_q".to_string();
+
+    // Phase 1: Open shard, fill concurrency limit with max_concurrency=2
+    let shard1 = silo::job_store_shard::JobStoreShard::open(
+        &cfg,
+        rate_limiter.clone(),
+        None,
+        ShardRange::full(),
+    )
+    .await
+    .expect("open shard1");
+
+    let now = now_ms();
+
+    // Enqueue 2 jobs to fill the limit
+    for i in 1..=2 {
+        let _ = shard1
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now,
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({"job": i})),
+                vec![Limit::Concurrency(ConcurrencyLimit {
+                    key: queue.clone(),
+                    max_concurrency: 2,
+                })],
+                None,
+                "default",
+            )
+            .await
+            .expect(&format!("enqueue job {}", i));
+    }
+
+    // Dequeue both jobs
+    let tasks1 = shard1.dequeue("w1", "default", 2).await.expect("deq").tasks;
+    assert_eq!(tasks1.len(), 2, "should get 2 tasks");
+
+    // Close shard without completing jobs (holders remain in DB)
+    shard1.close().await.expect("close shard1");
+
+    // Phase 2: Reopen shard
+    let shard2 = silo::job_store_shard::JobStoreShard::open(
+        &cfg,
+        rate_limiter.clone(),
+        None,
+        ShardRange::full(),
+    )
+    .await
+    .expect("open shard2");
+
+    // Enqueue a third job - should queue as a request since limit is 2 and 2 holders exist
+    let j3 = shard2
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"job": 3})),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 2,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue3");
+
+    // Peek all tasks - should not see j3 as a RunAttempt
+    let peeked = shard2.peek_tasks("default", 10).await.expect("peek");
+    let j3_run_attempts = peeked
+        .iter()
+        .filter(|t| {
+            if let Task::RunAttempt { job_id, .. } = t {
+                job_id == &j3
+            } else {
+                false
+            }
+        })
+        .count();
+
+    assert_eq!(
+        j3_run_attempts, 0,
+        "j3 should NOT have RunAttempt - would indicate overgrant bug"
+    );
+
+    // Verify we have 2 holders in DB (the original ones)
+    let start = silo::keys::concurrency_holders_queue_prefix("-", &queue);
+    let end = silo::keys::end_bound(&start);
+    let mut iter: DbIterator = shard2
+        .db()
+        .scan::<Vec<u8>, _>(start..end)
+        .await
+        .expect("scan");
+    let mut holder_count = 0;
+    while let Some(_kv) = iter.next().await.expect("iter") {
+        holder_count += 1;
+    }
+    assert_eq!(
+        holder_count, 2,
+        "should have exactly 2 holders from original jobs"
+    );
+
+    shard2.close().await.expect("close shard2");
 }

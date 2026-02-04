@@ -132,6 +132,24 @@ impl From<CodecError> for JobStoreShardError {
     }
 }
 
+impl From<crate::concurrency::HandleEnqueueError> for JobStoreShardError {
+    fn from(e: crate::concurrency::HandleEnqueueError) -> Self {
+        match e {
+            crate::concurrency::HandleEnqueueError::Slate(e) => JobStoreShardError::Slate(e),
+            crate::concurrency::HandleEnqueueError::Encoding(s) => JobStoreShardError::Rkyv(s),
+        }
+    }
+}
+
+impl From<crate::concurrency::ProcessTicketError> for JobStoreShardError {
+    fn from(e: crate::concurrency::ProcessTicketError) -> Self {
+        match e {
+            crate::concurrency::ProcessTicketError::Slate(e) => JobStoreShardError::Slate(e),
+            crate::concurrency::ProcessTicketError::Encoding(s) => JobStoreShardError::Rkyv(s),
+        }
+    }
+}
+
 impl JobStoreShard {
     /// Open a shard with a rate limit client, range, and optional metrics.
     ///
@@ -232,15 +250,8 @@ impl JobStoreShard {
         let db = Arc::new(db);
         let concurrency = Arc::new(ConcurrencyManager::new());
 
-        // Hydrate concurrency counts from durable state BEFORE starting the broker.
-        // This is critical for correctness: without this, try_reserve() calls during
-        // early requests would see count=0 and allow more grants than the limit.
-        // The hydration must complete synchronously before the shard is considered ready.
-        concurrency
-            .counts()
-            .hydrate(&db, &range)
-            .await
-            .map_err(JobStoreShardError::Slate)?;
+        // Note: concurrency counts are hydrated lazily on first access to each queue.
+        // This avoids blocking shard startup while scanning potentially large holder sets.
 
         let broker = TaskBroker::new(Arc::clone(&db), name.clone(), metrics.clone(), range);
         broker.start();

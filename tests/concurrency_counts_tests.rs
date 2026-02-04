@@ -2,6 +2,10 @@
 //!
 //! These tests verify the atomic reservation and rollback mechanisms that prevent
 //! TOCTOU (Time-Of-Check-Time-Of-Use) races in concurrency slot management.
+//!
+//! Note: These tests use try_reserve_sync which tests the in-memory reservation
+//! logic without requiring a database. The full try_reserve method adds lazy
+//! hydration from storage before calling this same internal logic.
 
 use silo::concurrency::ConcurrencyCounts;
 
@@ -10,11 +14,11 @@ fn try_reserve_success() {
     let counts = ConcurrencyCounts::new();
 
     // Should succeed when under limit
-    assert!(counts.try_reserve("tenant1", "queue1", "task1", 2, "job1"));
+    assert!(counts.try_reserve_sync("tenant1", "queue1", "task1", 2, "job1"));
     assert_eq!(counts.holder_count("tenant1", "queue1"), 1);
 
     // Should succeed for second slot
-    assert!(counts.try_reserve("tenant1", "queue1", "task2", 2, "job1"));
+    assert!(counts.try_reserve_sync("tenant1", "queue1", "task2", 2, "job1"));
     assert_eq!(counts.holder_count("tenant1", "queue1"), 2);
 }
 
@@ -23,10 +27,10 @@ fn try_reserve_at_capacity() {
     let counts = ConcurrencyCounts::new();
 
     // Fill to capacity
-    assert!(counts.try_reserve("tenant1", "queue1", "task1", 1, "job1"));
+    assert!(counts.try_reserve_sync("tenant1", "queue1", "task1", 1, "job1"));
 
     // Should fail when at capacity
-    assert!(!counts.try_reserve("tenant1", "queue1", "task2", 1, "job2"));
+    assert!(!counts.try_reserve_sync("tenant1", "queue1", "task2", 1, "job2"));
     assert_eq!(counts.holder_count("tenant1", "queue1"), 1);
 }
 
@@ -35,8 +39,8 @@ fn try_reserve_idempotent() {
     let counts = ConcurrencyCounts::new();
 
     // Reserve same task twice (HashSet semantics)
-    assert!(counts.try_reserve("tenant1", "queue1", "task1", 2, "job1"));
-    assert!(counts.try_reserve("tenant1", "queue1", "task1", 2, "job1"));
+    assert!(counts.try_reserve_sync("tenant1", "queue1", "task1", 2, "job1"));
+    assert!(counts.try_reserve_sync("tenant1", "queue1", "task1", 2, "job1"));
 
     // Should still only count as one holder
     assert_eq!(counts.holder_count("tenant1", "queue1"), 1);
@@ -47,8 +51,8 @@ fn try_reserve_different_queues() {
     let counts = ConcurrencyCounts::new();
 
     // Different queues are independent
-    assert!(counts.try_reserve("tenant1", "queue1", "task1", 1, "job1"));
-    assert!(counts.try_reserve("tenant1", "queue2", "task2", 1, "job2"));
+    assert!(counts.try_reserve_sync("tenant1", "queue1", "task1", 1, "job1"));
+    assert!(counts.try_reserve_sync("tenant1", "queue2", "task2", 1, "job2"));
 
     assert_eq!(counts.holder_count("tenant1", "queue1"), 1);
     assert_eq!(counts.holder_count("tenant1", "queue2"), 1);
@@ -59,8 +63,8 @@ fn try_reserve_different_tenants() {
     let counts = ConcurrencyCounts::new();
 
     // Different tenants are independent
-    assert!(counts.try_reserve("tenant1", "queue1", "task1", 1, "job1"));
-    assert!(counts.try_reserve("tenant2", "queue1", "task2", 1, "job2"));
+    assert!(counts.try_reserve_sync("tenant1", "queue1", "task1", 1, "job1"));
+    assert!(counts.try_reserve_sync("tenant2", "queue1", "task2", 1, "job2"));
 
     assert_eq!(counts.holder_count("tenant1", "queue1"), 1);
     assert_eq!(counts.holder_count("tenant2", "queue1"), 1);
@@ -71,14 +75,14 @@ fn release_reservation() {
     let counts = ConcurrencyCounts::new();
 
     // Reserve and then release
-    assert!(counts.try_reserve("tenant1", "queue1", "task1", 1, "job1"));
+    assert!(counts.try_reserve_sync("tenant1", "queue1", "task1", 1, "job1"));
     assert_eq!(counts.holder_count("tenant1", "queue1"), 1);
 
     counts.release_reservation("tenant1", "queue1", "task1");
     assert_eq!(counts.holder_count("tenant1", "queue1"), 0);
 
     // Should be able to reserve again
-    assert!(counts.try_reserve("tenant1", "queue1", "task2", 1, "job2"));
+    assert!(counts.try_reserve_sync("tenant1", "queue1", "task2", 1, "job2"));
     assert_eq!(counts.holder_count("tenant1", "queue1"), 1);
 }
 
@@ -96,7 +100,7 @@ fn atomic_release_and_reserve() {
     let counts = ConcurrencyCounts::new();
 
     // Setup: reserve task1
-    assert!(counts.try_reserve("tenant1", "queue1", "task1", 1, "job1"));
+    assert!(counts.try_reserve_sync("tenant1", "queue1", "task1", 1, "job1"));
     assert_eq!(counts.holder_count("tenant1", "queue1"), 1);
 
     // Atomic swap: release task1, reserve task2
@@ -105,7 +109,7 @@ fn atomic_release_and_reserve() {
 
     // task1 should be gone, task2 should be there
     // We can verify by trying to reserve - should fail since task2 is there
-    assert!(!counts.try_reserve("tenant1", "queue1", "task3", 1, "job3"));
+    assert!(!counts.try_reserve_sync("tenant1", "queue1", "task3", 1, "job3"));
 }
 
 #[silo::test]
@@ -113,14 +117,14 @@ fn atomic_release() {
     let counts = ConcurrencyCounts::new();
 
     // Setup: reserve task1
-    assert!(counts.try_reserve("tenant1", "queue1", "task1", 1, "job1"));
+    assert!(counts.try_reserve_sync("tenant1", "queue1", "task1", 1, "job1"));
 
     // Atomic release without grant
     counts.atomic_release("tenant1", "queue1", "task1");
     assert_eq!(counts.holder_count("tenant1", "queue1"), 0);
 
     // Should be able to reserve again
-    assert!(counts.try_reserve("tenant1", "queue1", "task2", 1, "job2"));
+    assert!(counts.try_reserve_sync("tenant1", "queue1", "task2", 1, "job2"));
 }
 
 #[silo::test]
@@ -137,7 +141,7 @@ fn rollback_release_and_reserve() {
     let counts = ConcurrencyCounts::new();
 
     // Setup: reserve task1
-    assert!(counts.try_reserve("tenant1", "queue1", "task1", 1, "job1"));
+    assert!(counts.try_reserve_sync("tenant1", "queue1", "task1", 1, "job1"));
 
     // Do atomic release and reserve
     counts.atomic_release_and_reserve("tenant1", "queue1", "task1", "task2", "job2");
@@ -148,7 +152,7 @@ fn rollback_release_and_reserve() {
     assert_eq!(counts.holder_count("tenant1", "queue1"), 1);
 
     // Verify task1 is back by checking we're still at capacity
-    assert!(!counts.try_reserve("tenant1", "queue1", "task3", 1, "job3"));
+    assert!(!counts.try_reserve_sync("tenant1", "queue1", "task3", 1, "job3"));
 }
 
 #[silo::test]
@@ -156,7 +160,7 @@ fn rollback_release() {
     let counts = ConcurrencyCounts::new();
 
     // Setup: reserve task1
-    assert!(counts.try_reserve("tenant1", "queue1", "task1", 1, "job1"));
+    assert!(counts.try_reserve_sync("tenant1", "queue1", "task1", 1, "job1"));
 
     // Release it
     counts.atomic_release("tenant1", "queue1", "task1");
@@ -167,7 +171,7 @@ fn rollback_release() {
     assert_eq!(counts.holder_count("tenant1", "queue1"), 1);
 
     // Should be at capacity again
-    assert!(!counts.try_reserve("tenant1", "queue1", "task2", 1, "job2"));
+    assert!(!counts.try_reserve_sync("tenant1", "queue1", "task2", 1, "job2"));
 }
 
 #[silo::test]
@@ -180,10 +184,10 @@ fn toctou_prevention_scenario() {
     // With try_reserve, only one can succeed
 
     // Thread 1: try to reserve
-    let success1 = counts.try_reserve("tenant1", "queue1", "task1", 1, "job1");
+    let success1 = counts.try_reserve_sync("tenant1", "queue1", "task1", 1, "job1");
 
     // Thread 2: try to reserve (simulating concurrent access)
-    let success2 = counts.try_reserve("tenant1", "queue1", "task2", 1, "job2");
+    let success2 = counts.try_reserve_sync("tenant1", "queue1", "task2", 1, "job2");
 
     // Only one should succeed
     assert!(success1);
@@ -197,7 +201,7 @@ fn rollback_after_failed_db_write_scenario() {
     let counts = ConcurrencyCounts::new();
 
     // Reserve a slot (simulating successful try_reserve)
-    assert!(counts.try_reserve("tenant1", "queue1", "task1", 1, "job1"));
+    assert!(counts.try_reserve_sync("tenant1", "queue1", "task1", 1, "job1"));
     assert_eq!(counts.holder_count("tenant1", "queue1"), 1);
 
     // Simulate DB write failure - need to rollback
@@ -205,7 +209,7 @@ fn rollback_after_failed_db_write_scenario() {
     assert_eq!(counts.holder_count("tenant1", "queue1"), 0);
 
     // The slot should now be available for another attempt
-    assert!(counts.try_reserve("tenant1", "queue1", "task2", 1, "job2"));
+    assert!(counts.try_reserve_sync("tenant1", "queue1", "task2", 1, "job2"));
     assert_eq!(counts.holder_count("tenant1", "queue1"), 1);
 }
 
@@ -215,12 +219,12 @@ fn concurrent_reserve_limit_enforcement() {
     let counts = ConcurrencyCounts::new();
 
     // With limit=3, should be able to reserve 3 tasks
-    assert!(counts.try_reserve("t", "q", "task1", 3, "job1"));
-    assert!(counts.try_reserve("t", "q", "task2", 3, "job2"));
-    assert!(counts.try_reserve("t", "q", "task3", 3, "job3"));
+    assert!(counts.try_reserve_sync("t", "q", "task1", 3, "job1"));
+    assert!(counts.try_reserve_sync("t", "q", "task2", 3, "job2"));
+    assert!(counts.try_reserve_sync("t", "q", "task3", 3, "job3"));
 
     // 4th should fail
-    assert!(!counts.try_reserve("t", "q", "task4", 3, "job4"));
+    assert!(!counts.try_reserve_sync("t", "q", "task4", 3, "job4"));
 
     assert_eq!(counts.holder_count("t", "q"), 3);
 }
@@ -231,8 +235,8 @@ fn release_and_reserve_maintains_count() {
     let counts = ConcurrencyCounts::new();
 
     // Setup: fill to capacity
-    assert!(counts.try_reserve("t", "q", "task1", 2, "job1"));
-    assert!(counts.try_reserve("t", "q", "task2", 2, "job2"));
+    assert!(counts.try_reserve_sync("t", "q", "task1", 2, "job1"));
+    assert!(counts.try_reserve_sync("t", "q", "task2", 2, "job2"));
     assert_eq!(counts.holder_count("t", "q"), 2);
 
     // Atomic swap shouldn't change count
@@ -240,7 +244,7 @@ fn release_and_reserve_maintains_count() {
     assert_eq!(counts.holder_count("t", "q"), 2);
 
     // Still at capacity
-    assert!(!counts.try_reserve("t", "q", "task4", 2, "job4"));
+    assert!(!counts.try_reserve_sync("t", "q", "task4", 2, "job4"));
 }
 
 #[silo::test]
@@ -249,8 +253,8 @@ fn multiple_rollbacks_in_sequence() {
     let counts = ConcurrencyCounts::new();
 
     // Setup initial state
-    assert!(counts.try_reserve("t", "q1", "task1", 1, "job1"));
-    assert!(counts.try_reserve("t", "q2", "task2", 1, "job2"));
+    assert!(counts.try_reserve_sync("t", "q1", "task1", 1, "job1"));
+    assert!(counts.try_reserve_sync("t", "q2", "task2", 1, "job2"));
 
     // Perform operations on both queues
     counts.atomic_release_and_reserve("t", "q1", "task1", "task3", "job3");
@@ -288,7 +292,7 @@ fn retry_scheduling_with_immediate_grant_rollback() {
     let counts = ConcurrencyCounts::new();
 
     // Initial state: Job A running with task1 (1/2 slots used)
-    assert!(counts.try_reserve("t", "q", "task1", 2, "jobA"));
+    assert!(counts.try_reserve_sync("t", "q", "task1", 2, "jobA"));
     assert_eq!(counts.holder_count("t", "q"), 1);
 
     // There's also a waiting job B that will get granted when A releases
@@ -297,7 +301,7 @@ fn retry_scheduling_with_immediate_grant_rollback() {
     // Step 1: Retry scheduling - task2 gets immediate grant (now 2/2)
     // This simulates what happens in lease.rs when enqueue_limit_task_at_index
     // is called for retry scheduling with available capacity
-    assert!(counts.try_reserve("t", "q", "task2", 2, "jobA"));
+    assert!(counts.try_reserve_sync("t", "q", "task2", 2, "jobA"));
     assert_eq!(counts.holder_count("t", "q"), 2);
 
     // Step 2: Release A's slot and grant to waiting B (task3)
@@ -317,7 +321,7 @@ fn retry_scheduling_with_immediate_grant_rollback() {
     assert_eq!(counts.holder_count("t", "q"), 1);
 
     // Verify task1 is the holder (can't add another at limit=1)
-    assert!(!counts.try_reserve("t", "q", "task_check", 1, "jobX"));
+    assert!(!counts.try_reserve_sync("t", "q", "task_check", 1, "jobX"));
 }
 
 /// Test that WITHOUT proper rollback of retry immediate grants, we leak slots.
@@ -327,11 +331,11 @@ fn retry_immediate_grant_leak_without_rollback() {
     let counts = ConcurrencyCounts::new();
 
     // Initial state: Job A running with task1 (1/2 slots used)
-    assert!(counts.try_reserve("t", "q", "task1", 2, "jobA"));
+    assert!(counts.try_reserve_sync("t", "q", "task1", 2, "jobA"));
     assert_eq!(counts.holder_count("t", "q"), 1);
 
     // Retry scheduling - task2 gets immediate grant (now 2/2)
-    assert!(counts.try_reserve("t", "q", "task2", 2, "jobA"));
+    assert!(counts.try_reserve_sync("t", "q", "task2", 2, "jobA"));
     assert_eq!(counts.holder_count("t", "q"), 2);
 
     // Release A's slot and grant to waiting B (task3)
@@ -352,7 +356,7 @@ fn retry_immediate_grant_leak_without_rollback() {
     // We can't acquire more slots even though task1 should be the only holder
     // and max=2 should allow one more
     assert!(
-        !counts.try_reserve("t", "q", "new_task", 2, "jobX"),
+        !counts.try_reserve_sync("t", "q", "new_task", 2, "jobX"),
         "Leaked slot prevents new reservations"
     );
 }
