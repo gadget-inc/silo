@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::codec::encode_job_status;
 use crate::dst_events::{self, DstEvent};
 use crate::job::{JobStatus, JobStatusKind};
-use crate::job_store_shard::helpers::{decode_job_status_owned, now_epoch_ms};
+use crate::job_store_shard::helpers::{TxnWriter, decode_job_status_owned, now_epoch_ms};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{attempt_prefix, idx_status_time_key, job_cancelled_key, job_status_key};
 use crate::task::Task;
@@ -197,7 +197,7 @@ impl JobStoreShard {
         txn.put(&new_time, [])?;
 
         // Decrement completed jobs counter - job is going from terminal to scheduled
-        self.decrement_completed_jobs_counter_txn(&txn)?;
+        self.decrement_completed_jobs_counter(&mut TxnWriter(&txn))?;
 
         // [SILO-RESTART-5] Post: Create new task in DB queue with next attempt number
         let new_task_id = Uuid::new_v4().to_string();

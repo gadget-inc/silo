@@ -18,6 +18,7 @@ pub use counters::{ShardCounters, counter_merge_operator};
 pub use expedite::JobNotExpediteableError;
 pub use restart::JobNotRestartableError;
 
+pub(crate) use helpers::WriteBatcher;
 pub use helpers::now_epoch_ms;
 
 use slatedb::Db;
@@ -586,10 +587,16 @@ impl JobStoreShard {
         batch.delete(crate::keys::job_cancelled_key(tenant, id));
 
         // Update counters: always decrement total, and if terminal also decrement completed
-        self.decrement_total_jobs_counter(&mut batch);
+        self.decrement_total_jobs_counter(&mut helpers::DbWriteBatcher {
+            db: &self.db,
+            batch: &mut batch,
+        })?;
         if status.is_some() {
             // Job was in terminal state (we already checked it's terminal above)
-            self.decrement_completed_jobs_counter(&mut batch);
+            self.decrement_completed_jobs_counter(&mut helpers::DbWriteBatcher {
+                db: &self.db,
+                batch: &mut batch,
+            })?;
         }
 
         self.db.write(batch).await?;

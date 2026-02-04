@@ -8,7 +8,7 @@ use crate::codec::{
     encode_floating_limit_state, encode_task,
 };
 use crate::job::{FloatingConcurrencyLimit, FloatingLimitState};
-use crate::job_store_shard::helpers::now_epoch_ms;
+use crate::job_store_shard::helpers::{WriteBatcher, now_epoch_ms};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{
     concurrency_request_prefix, end_bound, floating_limit_state_key, leased_task_key,
@@ -54,15 +54,15 @@ impl JobStoreShard {
     /// Get or create the floating limit state for a given queue key.
     /// Returns a zero-copy decoded view. For the rare "just created" case,
     /// we encode then decode to return the same type (extra decode is fine for cold path).
-    pub(crate) async fn get_or_create_floating_limit_state(
+    pub(crate) async fn get_or_create_floating_limit_state<W: WriteBatcher>(
         &self,
-        batch: &mut WriteBatch,
+        writer: &mut W,
         tenant: &str,
         fl: &FloatingConcurrencyLimit,
     ) -> Result<DecodedFloatingLimitState, JobStoreShardError> {
         let state_key = floating_limit_state_key(tenant, &fl.key);
 
-        if let Some(raw) = self.db.get(&state_key).await? {
+        if let Some(raw) = writer.get(&state_key).await? {
             // Hot path: state exists, return zero-copy decoded view
             return Ok(decode_floating_limit_state(&raw)?);
         }
@@ -80,7 +80,7 @@ impl JobStoreShard {
         };
 
         let state_bytes = encode_floating_limit_state(&state)?;
-        batch.put(&state_key, &state_bytes);
+        writer.put(&state_key, &state_bytes)?;
 
         // Decode what we just encoded so we return the same type
         Ok(decode_floating_limit_state(&state_bytes)?)
@@ -88,9 +88,10 @@ impl JobStoreShard {
 
     /// Check if a floating limit refresh is needed and schedule it if so.
     /// This method is called during enqueue and dequeue operations to lazily trigger refreshes.
-    pub(crate) fn maybe_schedule_floating_limit_refresh(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn maybe_schedule_floating_limit_refresh<W: WriteBatcher>(
         &self,
-        batch: &mut WriteBatch,
+        writer: &mut W,
         tenant: &str,
         fl: &FloatingConcurrencyLimit,
         state: &DecodedFloatingLimitState,
@@ -146,7 +147,7 @@ impl JobStoreShard {
             &synthetic_job_id,
             0, // attempt not used for refresh tasks
         );
-        batch.put(&task_key_bytes, &task_value);
+        writer.put(&task_key_bytes, &task_value)?;
 
         // Update state to mark refresh as scheduled - construct new state directly
         let new_state = FloatingLimitState {
@@ -165,7 +166,7 @@ impl JobStoreShard {
         };
         let state_key = floating_limit_state_key(tenant, &fl.key);
         let state_value = encode_floating_limit_state(&new_state)?;
-        batch.put(&state_key, &state_value);
+        writer.put(&state_key, &state_value)?;
 
         tracing::debug!(
             queue_key = %fl.key,

@@ -7,7 +7,7 @@ use crate::concurrency::{ReleaseGrantRollback, RequestTicketTaskOutcome};
 use crate::dst_events::{self, DstEvent};
 use crate::job::{JobStatus, JobView};
 use crate::job_attempt::{AttemptStatus, JobAttempt};
-use crate::job_store_shard::helpers::now_epoch_ms;
+use crate::job_store_shard::helpers::{DbWriteBatcher, now_epoch_ms};
 use crate::job_store_shard::{DequeueResult, JobStoreShard, JobStoreShardError};
 use crate::keys::{attempt_key, job_info_key, leased_task_key};
 use crate::task::{DEFAULT_LEASE_MS, LeaseRecord, LeasedRefreshTask, LeasedTask, Task};
@@ -174,7 +174,13 @@ impl JobStoreShard {
                                 // Mark job as running
                                 let job_status = JobStatus::running(now_ms);
                                 self.set_job_status_with_index(
-                                    &mut batch, &tenant, job_id, job_status,
+                                    &mut DbWriteBatcher {
+                                        db: &self.db,
+                                        batch: &mut batch,
+                                    },
+                                    &tenant,
+                                    job_id,
+                                    job_status,
                                 )
                                 .await?;
 
@@ -263,7 +269,10 @@ impl JobStoreShard {
                                 // Rate limit passed! Proceed to next limit or RunAttempt
                                 let grants = self
                                     .enqueue_limit_task_at_index(
-                                        &mut batch,
+                                        &mut DbWriteBatcher {
+                                            db: &self.db,
+                                            batch: &mut batch,
+                                        },
                                         &tenant,
                                         check_task_id,
                                         job_id,
@@ -303,7 +312,10 @@ impl JobStoreShard {
                                     now_ms,
                                 );
                                 self.schedule_rate_limit_retry(
-                                    &mut batch,
+                                    &mut DbWriteBatcher {
+                                        db: &self.db,
+                                        batch: &mut batch,
+                                    },
                                     &tenant,
                                     job_id,
                                     *attempt_number,
@@ -322,7 +334,10 @@ impl JobStoreShard {
                                 tracing::warn!(job_id = %job_id, error = %e, "gubernator rate limit check failed, will retry");
                                 let retry_backoff = now_ms + rate_limit.retry_initial_backoff_ms;
                                 self.schedule_rate_limit_retry(
-                                    &mut batch,
+                                    &mut DbWriteBatcher {
+                                        db: &self.db,
+                                        batch: &mut batch,
+                                    },
                                     &tenant,
                                     job_id,
                                     *attempt_number,
@@ -457,8 +472,16 @@ impl JobStoreShard {
 
                     // [SILO-DEQ-6] Mark job as running (pure write, no status read)
                     let job_status = JobStatus::running(now_ms);
-                    self.set_job_status_with_index(&mut batch, &tenant, &job_id, job_status)
-                        .await?;
+                    self.set_job_status_with_index(
+                        &mut DbWriteBatcher {
+                            db: &self.db,
+                            batch: &mut batch,
+                        },
+                        &tenant,
+                        &job_id,
+                        job_status,
+                    )
+                    .await?;
 
                     // [SILO-DEQ-5] Also mark attempt as running
                     let attempt = JobAttempt {

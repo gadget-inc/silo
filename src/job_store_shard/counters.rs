@@ -10,8 +10,9 @@
 use std::sync::Arc;
 
 use slatedb::bytes::Bytes;
-use slatedb::{DbTransaction, MergeOperator, MergeOperatorError, WriteBatch};
+use slatedb::{MergeOperator, MergeOperatorError};
 
+use crate::job_store_shard::helpers::WriteBatcher;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{shard_completed_jobs_counter_key, shard_total_jobs_counter_key};
 
@@ -111,53 +112,47 @@ impl JobStoreShard {
         })
     }
 
-    /// Increment the total jobs counter in a write batch using merge.
+    /// Increment the total jobs counter using merge.
     /// Call this when a new job is enqueued.
-    pub(crate) fn increment_total_jobs_counter(&self, batch: &mut WriteBatch) {
-        let key = shard_total_jobs_counter_key();
-        batch.merge(&key, encode_counter(1));
-    }
-
-    /// Decrement the total jobs counter in a write batch using merge.
-    /// Call this when a job is deleted.
-    pub(crate) fn decrement_total_jobs_counter(&self, batch: &mut WriteBatch) {
-        let key = shard_total_jobs_counter_key();
-        batch.merge(&key, encode_counter(-1));
-    }
-
-    /// Increment the completed jobs counter in a write batch using merge.
-    /// Call this when a job transitions to a terminal state (Succeeded, Failed, Cancelled).
-    pub(crate) fn increment_completed_jobs_counter(&self, batch: &mut WriteBatch) {
-        let key = shard_completed_jobs_counter_key();
-        batch.merge(&key, encode_counter(1));
-    }
-
-    /// Decrement the completed jobs counter in a write batch using merge.
-    /// Call this when a terminal job is restarted or deleted.
-    pub(crate) fn decrement_completed_jobs_counter(&self, batch: &mut WriteBatch) {
-        let key = shard_completed_jobs_counter_key();
-        batch.merge(&key, encode_counter(-1));
-    }
-
-    /// Increment the completed jobs counter within a transaction using merge.
-    /// Call this when a scheduled job is cancelled (immediately becomes terminal).
-    pub(crate) fn increment_completed_jobs_counter_txn(
+    pub(crate) fn increment_total_jobs_counter<W: WriteBatcher>(
         &self,
-        txn: &DbTransaction,
+        writer: &mut W,
     ) -> Result<(), JobStoreShardError> {
-        let key = shard_completed_jobs_counter_key();
-        txn.merge(&key, encode_counter(1))?;
+        let key = shard_total_jobs_counter_key();
+        writer.merge(&key, encode_counter(1))?;
         Ok(())
     }
 
-    /// Decrement the completed jobs counter within a transaction using merge.
-    /// Call this when a terminal job is restarted.
-    pub(crate) fn decrement_completed_jobs_counter_txn(
+    /// Decrement the total jobs counter using merge.
+    /// Call this when a job is deleted.
+    pub(crate) fn decrement_total_jobs_counter<W: WriteBatcher>(
         &self,
-        txn: &DbTransaction,
+        writer: &mut W,
+    ) -> Result<(), JobStoreShardError> {
+        let key = shard_total_jobs_counter_key();
+        writer.merge(&key, encode_counter(-1))?;
+        Ok(())
+    }
+
+    /// Increment the completed jobs counter using merge.
+    /// Call this when a job transitions to a terminal state (Succeeded, Failed, Cancelled).
+    pub(crate) fn increment_completed_jobs_counter<W: WriteBatcher>(
+        &self,
+        writer: &mut W,
     ) -> Result<(), JobStoreShardError> {
         let key = shard_completed_jobs_counter_key();
-        txn.merge(&key, encode_counter(-1))?;
+        writer.merge(&key, encode_counter(1))?;
+        Ok(())
+    }
+
+    /// Decrement the completed jobs counter using merge.
+    /// Call this when a terminal job is restarted or deleted.
+    pub(crate) fn decrement_completed_jobs_counter<W: WriteBatcher>(
+        &self,
+        writer: &mut W,
+    ) -> Result<(), JobStoreShardError> {
+        let key = shard_completed_jobs_counter_key();
+        writer.merge(&key, encode_counter(-1))?;
         Ok(())
     }
 }
