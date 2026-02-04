@@ -10,11 +10,17 @@ use crate::codec::{
 use crate::dst_events::{self, DstEvent};
 use crate::job::{FloatingLimitState, JobStatus, JobView};
 use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt};
-use crate::job_store_shard::helpers::now_epoch_ms;
+use crate::job_store_shard::helpers::{DbWriteBatcher, now_epoch_ms};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{attempt_key, floating_limit_state_key, job_info_key, leased_task_key};
 use crate::task::{DEFAULT_LEASE_MS, HeartbeatResult, LeaseRecord};
 use tracing::{debug, info_span};
+
+/// Tracks which counter operations need to happen after successful DB write.
+#[derive(Default)]
+struct PendingCounterOps {
+    increment_completed: bool,
+}
 
 impl JobStoreShard {
     /// Heartbeat a lease to renew it if the worker id matches. Bumps expiry by DEFAULT_LEASE_MS.
@@ -141,24 +147,44 @@ impl JobStoreShard {
         let mut retry_grants: Vec<(String, String)> = Vec::new();
         // Track the new job status for DST event emission
         let mut new_job_status_for_dst: Option<String> = None;
+        // Track counter operations to perform after successful DB write.
+        // Counter ops are done outside the batch to avoid conflicts - see counters.rs for details.
+        // TODO(slatedb#1254): Move back inside batch once SlateDB supports key exclusion.
+        let mut pending_counters = PendingCounterOps::default();
 
         match &outcome {
             // [SILO-SUCC-3] If success: mark job succeeded now (pure write)
             AttemptOutcome::Success { .. } => {
                 let job_status = JobStatus::succeeded(now_ms);
-                self.set_job_status_with_index(&mut batch, &tenant, &job_id, job_status)
-                    .await?;
-                // Increment completed jobs counter - job reached terminal state
-                self.increment_completed_jobs_counter(&mut batch);
+                self.set_job_status_with_index(
+                    &mut DbWriteBatcher {
+                        db: &self.db,
+                        batch: &mut batch,
+                    },
+                    &tenant,
+                    &job_id,
+                    job_status,
+                )
+                .await?;
+                // Mark for increment after batch write - job reached terminal state
+                pending_counters.increment_completed = true;
                 new_job_status_for_dst = Some("Succeeded".to_string());
             }
             // Worker acknowledges cancellation - set job status to Cancelled
             AttemptOutcome::Cancelled => {
                 let job_status = JobStatus::cancelled(now_ms);
-                self.set_job_status_with_index(&mut batch, &tenant, &job_id, job_status)
-                    .await?;
-                // Increment completed jobs counter - job reached terminal state
-                self.increment_completed_jobs_counter(&mut batch);
+                self.set_job_status_with_index(
+                    &mut DbWriteBatcher {
+                        db: &self.db,
+                        batch: &mut batch,
+                    },
+                    &tenant,
+                    &job_id,
+                    job_status,
+                )
+                .await?;
+                // Mark for increment after batch write - job reached terminal state
+                pending_counters.increment_completed = true;
                 new_job_status_for_dst = Some("Cancelled".to_string());
             }
             // Error: maybe enqueue next attempt; otherwise mark job failed
@@ -192,7 +218,10 @@ impl JobStoreShard {
                         // Track any immediate grants for rollback if DB write fails
                         retry_grants = self
                             .enqueue_limit_task_at_index(
-                                &mut batch,
+                                &mut DbWriteBatcher {
+                                    db: &self.db,
+                                    batch: &mut batch,
+                                },
                                 &tenant,
                                 &next_task_id,
                                 &job_id,
@@ -211,8 +240,16 @@ impl JobStoreShard {
                         // [SILO-RETRY-3] Set job status to Scheduled with next attempt time
                         let job_status =
                             JobStatus::scheduled(now_ms, next_time, next_attempt_number);
-                        self.set_job_status_with_index(&mut batch, &tenant, &job_id, job_status)
-                            .await?;
+                        self.set_job_status_with_index(
+                            &mut DbWriteBatcher {
+                                db: &self.db,
+                                batch: &mut batch,
+                            },
+                            &tenant,
+                            &job_id,
+                            job_status,
+                        )
+                        .await?;
                         scheduled_followup = true;
                         followup_next_time = Some(next_time);
                         new_job_status_for_dst = Some("Scheduled".to_string());
@@ -220,10 +257,18 @@ impl JobStoreShard {
                     // [SILO-FAIL-3] If no follow-up scheduled, mark job as failed (pure write)
                     if !scheduled_followup {
                         let job_status = JobStatus::failed(now_ms);
-                        self.set_job_status_with_index(&mut batch, &tenant, &job_id, job_status)
-                            .await?;
-                        // Increment completed jobs counter - job reached terminal state (failed permanently)
-                        self.increment_completed_jobs_counter(&mut batch);
+                        self.set_job_status_with_index(
+                            &mut DbWriteBatcher {
+                                db: &self.db,
+                                batch: &mut batch,
+                            },
+                            &tenant,
+                            &job_id,
+                            job_status,
+                        )
+                        .await?;
+                        // Mark for increment after batch write - job reached terminal state (failed permanently)
+                        pending_counters.increment_completed = true;
                         new_job_status_for_dst = Some("Failed".to_string());
                     }
                 } else {
@@ -263,6 +308,12 @@ impl JobStoreShard {
         if let Err(e) = self.db.flush().await {
             // Write succeeded but flush failed - in-memory is correct, don't rollback
             return Err(e.into());
+        }
+
+        // Execute pending counter operations after successful DB write.
+        // These are done separately to avoid conflicts - see counters.rs for details.
+        if pending_counters.increment_completed {
+            self.increment_completed_jobs_counter().await?;
         }
 
         // Emit DST events after successful commit

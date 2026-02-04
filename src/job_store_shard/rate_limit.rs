@@ -1,19 +1,18 @@
 //! Rate limit checking operations via Gubernator.
 
-use slatedb::WriteBatch;
 use uuid::Uuid;
 
 use crate::gubernator::{GubernatorError, RateLimitResult};
-use crate::job_store_shard::helpers::put_task;
+use crate::job_store_shard::helpers::{WriteBatcher, put_task};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::task::{GubernatorRateLimitData, Task};
 
 impl JobStoreShard {
     /// Schedule a rate limit check retry task
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn schedule_rate_limit_retry(
+    pub(crate) fn schedule_rate_limit_retry<W: WriteBatcher>(
         &self,
-        batch: &mut WriteBatch,
+        writer: &mut W,
         tenant: &str,
         job_id: &str,
         attempt_number: u32,
@@ -42,7 +41,7 @@ impl JobStoreShard {
             task_group: task_group.to_string(),
         };
         put_task(
-            batch,
+            writer,
             task_group,
             retry_at_ms,
             priority,

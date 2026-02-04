@@ -100,12 +100,15 @@ impl JobStoreShard {
         let cancellation_value = encode_job_cancellation(&cancellation)?;
         txn.put(&cancelled_key, &cancellation_value)?;
 
+        // Track whether we're transitioning a scheduled job to terminal state
+        let was_scheduled = status.kind == JobStatusKind::Scheduled;
+
         // [SILO-CXL-3] For Scheduled jobs, update status to Cancelled immediately
         // Tasks/requests are NOT deleted here - they will be cleaned up lazily:
         // - On dequeue: cancelled tasks are skipped and deleted
         // - On grant: cancelled requests are skipped and deleted
         // For Running jobs, status stays Running - worker discovers on heartbeat
-        if status.kind == JobStatusKind::Scheduled {
+        if was_scheduled {
             // Delete old status index entry
             let old_time =
                 idx_status_time_key(tenant, status.kind.as_str(), status.changed_at_ms, id);
@@ -124,13 +127,16 @@ impl JobStoreShard {
                 id,
             );
             txn.put(&new_time, [])?;
-
-            // Increment completed jobs counter - job reached terminal state immediately
-            self.increment_completed_jobs_counter_txn(&txn)?;
         }
 
         // Commit the transaction - this will detect conflicts with concurrent modifications
         txn.commit().await?;
+
+        // Increment completed jobs counter outside the transaction to avoid conflicts.
+        // TODO(slatedb#1254): Move back inside transaction once SlateDB supports key exclusion.
+        if was_scheduled {
+            self.increment_completed_jobs_counter().await?;
+        }
 
         Ok(())
     }

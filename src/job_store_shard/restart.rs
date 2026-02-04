@@ -196,9 +196,6 @@ impl JobStoreShard {
         );
         txn.put(&new_time, [])?;
 
-        // Decrement completed jobs counter - job is going from terminal to scheduled
-        self.decrement_completed_jobs_counter_txn(&txn)?;
-
         // [SILO-RESTART-5] Post: Create new task in DB queue with next attempt number
         let new_task_id = Uuid::new_v4().to_string();
         let task_group = job_view.task_group().to_string();
@@ -220,6 +217,11 @@ impl JobStoreShard {
 
         // Commit the transaction
         txn.commit().await?;
+
+        // Decrement completed jobs counter - job is going from terminal to scheduled.
+        // This is done outside the transaction to avoid conflicts - see counters.rs for details.
+        // TODO(slatedb#1254): Move back inside transaction once SlateDB supports key exclusion.
+        self.decrement_completed_jobs_counter().await?;
 
         // Emit DST event after successful commit - job is now back to Scheduled
         dst_events::emit(DstEvent::JobStatusChanged {

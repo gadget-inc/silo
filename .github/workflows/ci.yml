@@ -39,7 +39,7 @@ jobs:
         # Debug logs written to file via SILO_DEBUG_LOG_FILE, console uses RUST_LOG level
         env:
           SILO_DEBUG_LOG_FILE: test-debug.log
-        run: cargo test -- --skip k8s_ --skip etcd_coordination --skip coordination_split_tests
+        run: cargo test -- --skip k8s_ --skip etcd_ --skip coordination_split_tests
       - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@v4

@@ -34,6 +34,7 @@ use std::sync::Mutex;
 use slatedb::{Db, DbIterator, WriteBatch};
 
 use crate::dst_events::{self, DstEvent};
+use crate::job_store_shard::WriteBatcher;
 
 use crate::codec::{
     decode_concurrency_action, encode_concurrency_action, encode_holder, encode_task,
@@ -296,9 +297,9 @@ impl ConcurrencyManager {
     /// If the DB write fails after calling this, you MUST call `rollback_grant` to release
     /// the reservation.
     #[allow(clippy::too_many_arguments)]
-    pub fn handle_enqueue(
+    pub(crate) fn handle_enqueue<W: WriteBatcher>(
         &self,
-        batch: &mut WriteBatch,
+        writer: &mut W,
         tenant: &str,
         task_id: &str,
         job_id: &str,
@@ -327,7 +328,7 @@ impl ConcurrencyManager {
             // Grant immediately: [SILO-ENQ-CONC-2] create holder, [SILO-ENQ-CONC-3] create task
             // Note: in-memory slot is already reserved by try_reserve
             append_grant_edits(
-                batch,
+                writer,
                 now_ms,
                 tenant,
                 queue,
@@ -348,7 +349,7 @@ impl ConcurrencyManager {
             // [SILO-ENQ-CONC-5] No task in DB queue
             // [SILO-ENQ-CONC-6] Create request record instead
             append_request_edits(
-                batch,
+                writer,
                 tenant,
                 queue,
                 now_ms,
@@ -377,10 +378,12 @@ impl ConcurrencyManager {
                 task_group: task_group.to_string(),
             };
             let ticket_value = encode_task(&ticket)?;
-            batch.put(
-                task_key(task_group, start_at_ms, priority, job_id, attempt_number),
-                &ticket_value,
-            );
+            writer
+                .put(
+                    task_key(task_group, start_at_ms, priority, job_id, attempt_number),
+                    &ticket_value,
+                )
+                .map_err(|e| e.to_string())?;
             Ok(Some(RequestTicketOutcome::FutureRequestTaskWritten {
                 queue: queue.clone(),
                 task_id: request_id,
@@ -624,8 +627,8 @@ impl ConcurrencyManager {
 /// Append DB edits to grant a concurrency slot: creates holder record and RunAttempt task.
 /// Note: In-memory reservation should already be done via try_reserve before calling this.
 #[allow(clippy::too_many_arguments)]
-fn append_grant_edits(
-    batch: &mut WriteBatch,
+fn append_grant_edits<W: WriteBatcher>(
+    writer: &mut W,
     now_ms: i64,
     tenant: &str,
     queue: &str,
@@ -641,7 +644,9 @@ fn append_grant_edits(
         granted_at_ms: now_ms,
     };
     let holder_val = encode_holder(&holder)?;
-    batch.put(concurrency_holder_key(tenant, queue, task_id), &holder_val);
+    writer
+        .put(concurrency_holder_key(tenant, queue, task_id), &holder_val)
+        .map_err(|e| e.to_string())?;
 
     let task = Task::RunAttempt {
         id: task_id.to_string(),
@@ -653,17 +658,19 @@ fn append_grant_edits(
         task_group: task_group.to_string(),
     };
     let task_value = encode_task(&task)?;
-    batch.put(
-        task_key(task_group, start_time_ms, priority, job_id, attempt_number),
-        &task_value,
-    );
+    writer
+        .put(
+            task_key(task_group, start_time_ms, priority, job_id, attempt_number),
+            &task_value,
+        )
+        .map_err(|e| e.to_string())?;
 
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn append_request_edits(
-    batch: &mut WriteBatch,
+fn append_request_edits<W: WriteBatcher>(
+    writer: &mut W,
     tenant: &str,
     queue: &str,
     _now_ms: i64,
@@ -690,6 +697,8 @@ fn append_request_edits(
         priority,
         &uuid::Uuid::new_v4().to_string(),
     );
-    batch.put(&req_key, &action_val);
+    writer
+        .put(&req_key, &action_val)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }

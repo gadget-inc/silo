@@ -1,5 +1,7 @@
 mod test_helpers;
 
+use std::sync::Arc;
+
 use silo::job::JobStatusKind;
 use silo::job_attempt::AttemptOutcome;
 use silo::job_store_shard::JobStoreShardError;
@@ -519,5 +521,157 @@ async fn priority_ordering_when_start_times_equal() {
         assert_eq!(t2.job().id(), job_lo);
         assert_eq!(t1.attempt().attempt_number(), 1);
         assert_eq!(t2.attempt().attempt_number(), 1);
+    });
+}
+
+#[silo::test]
+async fn concurrent_enqueue_with_same_id_only_one_succeeds() {
+    with_timeout!(30000, {
+        let (_tmp, shard) = open_temp_shard().await;
+        let shard = Arc::new(shard);
+
+        let job_id = "concurrent-dup-job".to_string();
+        let num_concurrent = 10;
+
+        // Spawn multiple concurrent enqueue operations with the same job ID
+        let mut handles = Vec::with_capacity(num_concurrent);
+        for i in 0..num_concurrent {
+            let shard_clone = Arc::clone(&shard);
+            let job_id_clone = job_id.clone();
+            let payload = serde_json::json!({"attempt": i});
+            let payload_bytes = test_helpers::msgpack_payload(&payload);
+
+            handles.push(tokio::spawn(async move {
+                shard_clone
+                    .enqueue(
+                        "-",
+                        Some(job_id_clone),
+                        10u8,
+                        now_ms(),
+                        None,
+                        payload_bytes,
+                        vec![],
+                        None,
+                        "default",
+                    )
+                    .await
+            }));
+        }
+
+        // Collect all results
+        let mut successes = 0;
+        let mut already_exists_errors = 0;
+
+        for handle in handles {
+            match handle.await.expect("task should not panic") {
+                Ok(id) => {
+                    assert_eq!(id, job_id);
+                    successes += 1;
+                }
+                Err(JobStoreShardError::JobAlreadyExists(id)) => {
+                    assert_eq!(id, job_id);
+                    already_exists_errors += 1;
+                }
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+
+        // Exactly one should succeed, all others should fail with JobAlreadyExists
+        assert_eq!(successes, 1, "exactly one enqueue should succeed");
+        assert_eq!(
+            already_exists_errors,
+            num_concurrent - 1,
+            "all other enqueues should fail with JobAlreadyExists"
+        );
+
+        // Verify only one job exists in the database
+        let counters = shard.get_counters().await.expect("get_counters");
+        assert_eq!(counters.total_jobs, 1, "only one job should exist");
+
+        // Verify the job is accessible
+        let job = shard
+            .get_job("-", &job_id)
+            .await
+            .expect("get_job")
+            .expect("job should exist");
+        assert_eq!(job.id(), job_id);
+
+        // Verify only one task was created
+        let tasks = shard.peek_tasks("default", 20).await.expect("peek_tasks");
+        assert_eq!(tasks.len(), 1, "only one task should be created");
+    });
+}
+
+#[silo::test]
+async fn high_concurrency_enqueue_with_different_ids_all_succeed() {
+    // This test verifies that many concurrent enqueues with different job IDs
+    // all succeed without transaction conflicts. Previously, this would fail
+    // because the counter increment was inside the transaction, causing all
+    // concurrent enqueues to conflict on the single counter key.
+    with_timeout!(60000, {
+        let (_tmp, shard) = open_temp_shard().await;
+        let shard = Arc::new(shard);
+
+        let num_concurrent = 20; // Matches the TypeScript worker-integration test
+
+        // Spawn concurrent enqueues with unique job IDs
+        let mut handles = Vec::with_capacity(num_concurrent);
+        for i in 0..num_concurrent {
+            let shard_clone = Arc::clone(&shard);
+            let payload = serde_json::json!({"index": i});
+            let payload_bytes = test_helpers::msgpack_payload(&payload);
+
+            handles.push(tokio::spawn(async move {
+                shard_clone
+                    .enqueue(
+                        "-",
+                        None, // Generate unique UUID for each
+                        10u8,
+                        now_ms(),
+                        None,
+                        payload_bytes,
+                        vec![],
+                        None,
+                        "default",
+                    )
+                    .await
+            }));
+        }
+
+        // All should succeed
+        let mut job_ids = Vec::with_capacity(num_concurrent);
+        for handle in handles {
+            let result = handle.await.expect("task should not panic");
+            let job_id = result.expect("all enqueues should succeed");
+            job_ids.push(job_id);
+        }
+
+        assert_eq!(job_ids.len(), num_concurrent);
+
+        // Verify all unique job IDs
+        let unique_ids: std::collections::HashSet<_> = job_ids.iter().collect();
+        assert_eq!(
+            unique_ids.len(),
+            num_concurrent,
+            "all job IDs should be unique"
+        );
+
+        // Verify counter is correct
+        let counters = shard.get_counters().await.expect("get_counters");
+        assert_eq!(
+            counters.total_jobs, num_concurrent as i64,
+            "counter should reflect all enqueued jobs"
+        );
+
+        // Verify all jobs exist and all tasks were created
+        let tasks = shard
+            .peek_tasks("default", num_concurrent + 10)
+            .await
+            .expect("peek_tasks");
+        assert_eq!(
+            tasks.len(),
+            num_concurrent,
+            "one task should be created per job"
+        );
     });
 }
