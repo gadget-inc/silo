@@ -147,9 +147,6 @@ impl JobStoreShard {
         self.set_job_status_with_index(&mut TxnWriter(&txn), tenant, job_id, job_status)
             .await?;
 
-        // Increment total jobs counter for this shard
-        self.increment_total_jobs_counter(&mut TxnWriter(&txn))?;
-
         // Process limits starting from index 0. For concurrency limits, we try immediate
         // grant as an optimization. Returns all grants made for potential rollback.
         let grants = self
@@ -177,6 +174,11 @@ impl JobStoreShard {
             }
             return Err(e.into());
         }
+
+        // Increment total jobs counter for this shard.
+        // This is done outside the transaction to avoid conflicts - see counters.rs for details.
+        // TODO(slatedb#1254): Move back inside transaction once SlateDB supports key exclusion.
+        self.increment_total_jobs_counter().await?;
 
         // Emit DST event immediately after successful commit, BEFORE flush.
         // This is critical for DST: the flush() yields to the scheduler, which could

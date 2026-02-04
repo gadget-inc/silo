@@ -586,21 +586,21 @@ impl JobStoreShard {
         // Also delete cancellation record if present
         batch.delete(crate::keys::job_cancelled_key(tenant, id));
 
-        // Update counters: always decrement total, and if terminal also decrement completed
-        self.decrement_total_jobs_counter(&mut helpers::DbWriteBatcher {
-            db: &self.db,
-            batch: &mut batch,
-        })?;
-        if status.is_some() {
-            // Job was in terminal state (we already checked it's terminal above)
-            self.decrement_completed_jobs_counter(&mut helpers::DbWriteBatcher {
-                db: &self.db,
-                batch: &mut batch,
-            })?;
-        }
+        // Track whether job was in terminal state for counter update
+        let was_terminal = status.is_some();
 
         self.db.write(batch).await?;
         self.db.flush().await?;
+
+        // Update counters after successful DB write to avoid conflicts.
+        // See counters.rs for details on why counters are done separately.
+        // TODO(slatedb#1254): Move back inside batch once SlateDB supports key exclusion.
+        self.decrement_total_jobs_counter().await?;
+        if was_terminal {
+            // Job was in terminal state (we already checked it's terminal above)
+            self.decrement_completed_jobs_counter().await?;
+        }
+
         Ok(())
     }
 }

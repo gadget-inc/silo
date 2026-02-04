@@ -5,14 +5,34 @@
 //! - `completed_jobs`: Count of jobs that have reached a terminal state
 //!   (Succeeded, Failed, or Cancelled)
 //!
-//! Counters use SlateDB's MergeOperator to avoid read-modify-write cycles. Instead of reading the current value, modifying it, and writing it back, we write a delta (+1 or -1) that gets merged at read time.
+//! Counters use SlateDB's MergeOperator to avoid read-modify-write cycles. Instead of reading
+//! the current value, modifying it, and writing it back, we write a delta (+1 or -1) that gets
+//! merged at read time.
+//!
+//! ## Why counter operations are non-transactional
+//!
+//! Counter modifications are done as separate non-transactional writes rather than being included
+//! in the main operation's transaction. This is because:
+//!
+//! 1. SlateDB's SerializableSnapshot transactions track all keys that are read or written
+//! 2. Counter keys are global shard-level keys (single key per counter)
+//! 3. If counters were in transactions, ALL concurrent operations would conflict on these keys
+//! 4. This would cause excessive transaction retries under load (e.g., 20 concurrent enqueues)
+//!
+//! The counters don't need transactional guarantees because:
+//! - They're monotonic operations (increment/decrement)
+//! - They happen after the main transaction commits successfully
+//! - Eventual consistency is acceptable for counter values
+//!
+//! TODO: Once SlateDB supports excluding specific keys from conflict detection
+//! (https://github.com/slatedb/slatedb/issues/1254), we can move counter operations back
+//! inside transactions for better atomicity guarantees.
 
 use std::sync::Arc;
 
 use slatedb::bytes::Bytes;
-use slatedb::{MergeOperator, MergeOperatorError};
+use slatedb::{MergeOperator, MergeOperatorError, WriteBatch};
 
-use crate::job_store_shard::helpers::WriteBatcher;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{shard_completed_jobs_counter_key, shard_total_jobs_counter_key};
 
@@ -112,47 +132,51 @@ impl JobStoreShard {
         })
     }
 
-    /// Increment the total jobs counter using merge.
+    // ==================== Direct Counter Operations ====================
+    //
+    // These operations write directly to the database outside of any transaction.
+    // See module-level documentation for why this is necessary.
+    //
+    // TODO(slatedb#1254): Once SlateDB supports excluding keys from conflict detection,
+    // consider moving these back to transactional operations for better atomicity.
+
+    /// Increment the total jobs counter.
     /// Call this when a new job is enqueued.
-    pub(crate) fn increment_total_jobs_counter<W: WriteBatcher>(
-        &self,
-        writer: &mut W,
-    ) -> Result<(), JobStoreShardError> {
+    pub(crate) async fn increment_total_jobs_counter(&self) -> Result<(), JobStoreShardError> {
         let key = shard_total_jobs_counter_key();
-        writer.merge(&key, encode_counter(1))?;
+        let mut batch = WriteBatch::new();
+        batch.merge(&key, encode_counter(1));
+        self.db.write(batch).await?;
         Ok(())
     }
 
-    /// Decrement the total jobs counter using merge.
+    /// Decrement the total jobs counter.
     /// Call this when a job is deleted.
-    pub(crate) fn decrement_total_jobs_counter<W: WriteBatcher>(
-        &self,
-        writer: &mut W,
-    ) -> Result<(), JobStoreShardError> {
+    pub(crate) async fn decrement_total_jobs_counter(&self) -> Result<(), JobStoreShardError> {
         let key = shard_total_jobs_counter_key();
-        writer.merge(&key, encode_counter(-1))?;
+        let mut batch = WriteBatch::new();
+        batch.merge(&key, encode_counter(-1));
+        self.db.write(batch).await?;
         Ok(())
     }
 
-    /// Increment the completed jobs counter using merge.
+    /// Increment the completed jobs counter.
     /// Call this when a job transitions to a terminal state (Succeeded, Failed, Cancelled).
-    pub(crate) fn increment_completed_jobs_counter<W: WriteBatcher>(
-        &self,
-        writer: &mut W,
-    ) -> Result<(), JobStoreShardError> {
+    pub(crate) async fn increment_completed_jobs_counter(&self) -> Result<(), JobStoreShardError> {
         let key = shard_completed_jobs_counter_key();
-        writer.merge(&key, encode_counter(1))?;
+        let mut batch = WriteBatch::new();
+        batch.merge(&key, encode_counter(1));
+        self.db.write(batch).await?;
         Ok(())
     }
 
-    /// Decrement the completed jobs counter using merge.
+    /// Decrement the completed jobs counter.
     /// Call this when a terminal job is restarted or deleted.
-    pub(crate) fn decrement_completed_jobs_counter<W: WriteBatcher>(
-        &self,
-        writer: &mut W,
-    ) -> Result<(), JobStoreShardError> {
+    pub(crate) async fn decrement_completed_jobs_counter(&self) -> Result<(), JobStoreShardError> {
         let key = shard_completed_jobs_counter_key();
-        writer.merge(&key, encode_counter(-1))?;
+        let mut batch = WriteBatch::new();
+        batch.merge(&key, encode_counter(-1));
+        self.db.write(batch).await?;
         Ok(())
     }
 }
