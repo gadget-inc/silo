@@ -143,6 +143,15 @@ fn floating_concurrency() {
 }
 
 #[test]
+fn high_latency() {
+    if is_subprocess() || is_fuzz_mode() {
+        scenarios::high_latency::run();
+    } else {
+        verify_determinism("high_latency", get_seed());
+    }
+}
+
+#[test]
 #[cfg(feature = "k8s")]
 fn k8s_coordination() {
     if is_subprocess() || is_fuzz_mode() {
