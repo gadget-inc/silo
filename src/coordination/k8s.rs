@@ -1452,8 +1452,26 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                             }
                         }
 
-                        // Try to acquire the lease with CAS semantics
-                        match self.try_acquire_lease_cas(&lease_name).await {
+                        // Try to acquire the lease with CAS semantics.
+                        // Use a timeout to prevent a hung K8s API call from blocking
+                        // the guard indefinitely. If the API call hangs (e.g., due to
+                        // K8s API server overload), we retry after a short wait.
+                        let acquire_timeout = Duration::from_secs(5);
+                        let acquire_result = tokio::time::timeout(
+                            acquire_timeout,
+                            self.try_acquire_lease_cas(&lease_name),
+                        )
+                        .await;
+                        let acquire_result = match acquire_result {
+                            Ok(result) => result,
+                            Err(_) => {
+                                warn!(shard_id = %self.shard_id, "timed out acquiring shard lease (K8s API may be slow)");
+                                Err(CoordinationError::BackendError(
+                                    "timed out acquiring shard lease".into(),
+                                ))
+                            }
+                        };
+                        match acquire_result {
                             Ok((rv, uid)) => {
                                 // Look up the shard's range from the shard map
                                 let range = {
@@ -1604,16 +1622,25 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                         };
 
                         if has_rv {
-                            match self.release_lease_cas(&lease_name).await {
-                                Ok(_) => {
+                            let release_timeout = Duration::from_secs(5);
+                            match tokio::time::timeout(
+                                release_timeout,
+                                self.release_lease_cas(&lease_name),
+                            )
+                            .await
+                            {
+                                Ok(Ok(_)) => {
                                     debug!(
                                         shard_id = %self.shard_id,
                                         "k8s shard: released with CAS"
                                     );
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     // This is okay - we may have already lost the lease
                                     debug!(shard_id = %self.shard_id, error = %e, "k8s shard: release CAS failed (may have lost lease)");
+                                }
+                                Err(_) => {
+                                    warn!(shard_id = %self.shard_id, "timed out releasing shard lease (K8s API may be slow)");
                                 }
                             }
                         }
@@ -1652,8 +1679,20 @@ impl<B: K8sBackend> K8sShardGuard<B> {
 
                     if has_rv {
                         tracing::trace!(shard_id = %self.shard_id, "guard releasing lease");
-                        let _ = self.release_lease_cas(&lease_name).await;
-                        tracing::trace!(shard_id = %self.shard_id, "guard lease released");
+                        let release_timeout = Duration::from_secs(5);
+                        match tokio::time::timeout(
+                            release_timeout,
+                            self.release_lease_cas(&lease_name),
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                tracing::trace!(shard_id = %self.shard_id, "guard lease released");
+                            }
+                            Err(_) => {
+                                warn!(shard_id = %self.shard_id, "timed out releasing shard lease during shutdown");
+                            }
+                        }
                     }
 
                     {
@@ -1944,7 +1983,22 @@ impl<B: K8sBackend> K8sShardGuard<B> {
             // If renewal fails (CAS conflict), we've lost ownership - this prevents
             // a "flapped" node (one that lost connectivity) from continuing to serve
             // requests after another node has acquired the shard.
-            match self.renew_lease_cas(lease_name).await {
+            let renew_timeout = Duration::from_secs(5);
+            let renew_result = match tokio::time::timeout(
+                renew_timeout,
+                self.renew_lease_cas(lease_name),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    warn!(shard_id = %self.shard_id, "timed out renewing shard lease (K8s API may be slow)");
+                    // Treat timeout as a transient error - we'll retry on the next interval.
+                    // Don't treat it as lost ownership since we may still hold the lease.
+                    continue;
+                }
+            };
+            match renew_result {
                 Ok(new_rv) => {
                     // Update our fencing token
                     let mut st = self.state.lock().await;
