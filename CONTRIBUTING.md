@@ -69,6 +69,55 @@ cd typescript_client
 RUN_INTEGRATION=true pnpm test
 ```
 
+## Code coverage
+
+Coverage uses [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov). It will be installed automatically if missing.
+
+### Quick coverage (main tests only)
+
+Runs all tests except etcd, k8s, and DST tests. No background services required beyond what normal tests need.
+
+```shell
+# HTML report at target/coverage/html/index.html
+just coverage
+
+# HTML report, then open in browser
+just coverage-open
+
+# Summary printed to terminal
+just coverage-summary
+```
+
+### Full coverage (all test groups)
+
+Runs main tests, etcd coordination tests, coordination split tests, and k8s coordination tests with merged coverage. Requires etcd running and a k8s cluster available (e.g. orbstack). DST tests are excluded (they require `--features dst` and are focused on determinism verification, not coverage).
+
+```shell
+# Run all test groups and generate HTML report
+just coverage-full
+
+# After running coverage-full, print summary to terminal
+just coverage-full-summary
+```
+
+The `coverage-full` target handles the multi-step process automatically:
+1. Cleans previous coverage data
+2. Runs main tests (skipping etcd/k8s tests)
+3. Runs etcd coordination tests single-threaded
+4. Runs coordination split tests single-threaded
+5. Runs k8s coordination tests single-threaded
+6. Generates a merged HTML report
+
+### Other formats
+
+```shell
+# LCOV format (for IDE integration)
+just coverage-lcov
+
+# JSON format (for programmatic analysis)
+just coverage-json
+```
+
 ## Running a local instance
 
 You can run a local server instance by using cargo to build and run the `silo` binary:

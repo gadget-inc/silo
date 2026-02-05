@@ -1063,3 +1063,44 @@ async fn siloctl_validate_config() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// Unit tests for compute_midpoint
+
+#[silo::test]
+fn test_compute_midpoint_normal() {
+    let mid = siloctl::compute_midpoint("a", "z").unwrap();
+    assert!(mid.as_str() > "a", "midpoint should be > start");
+    assert!(mid.as_str() < "z", "midpoint should be < end");
+}
+
+#[silo::test]
+fn test_compute_midpoint_equal_strings() {
+    assert!(siloctl::compute_midpoint("abc", "abc").is_none());
+}
+
+#[silo::test]
+fn test_compute_midpoint_start_greater_than_end() {
+    assert!(siloctl::compute_midpoint("z", "a").is_none());
+}
+
+#[silo::test]
+fn test_compute_midpoint_prefix_case() {
+    let mid = siloctl::compute_midpoint("abc", "abcdef").unwrap();
+    assert!(mid.as_str() > "abc", "midpoint should be > start");
+    assert!(mid.as_str() < "abcdef", "midpoint should be < end");
+}
+
+#[silo::test]
+fn test_compute_midpoint_adjacent_chars() {
+    // 'a' and 'b' are adjacent, so midpoint extends with '~'
+    let mid = siloctl::compute_midpoint("a", "b").unwrap();
+    assert!(mid.as_str() > "a", "midpoint should be > start");
+    assert!(mid.as_str() < "b", "midpoint should be < end");
+}
+
+#[silo::test]
+fn test_compute_midpoint_same_prefix() {
+    let mid = siloctl::compute_midpoint("hello", "world").unwrap();
+    assert!(mid.as_str() > "hello", "midpoint should be > start");
+    assert!(mid.as_str() < "world", "midpoint should be < end");
+}
