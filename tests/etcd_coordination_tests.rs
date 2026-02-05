@@ -112,7 +112,8 @@ async fn make_guard(
         factory.clone(),
         Vec::new(),
     )
-    .await;
+    .await
+    .unwrap();
     let coordinator: Arc<dyn Coordinator> = Arc::new(none_coord);
     let handle = tokio::spawn(async move {
         runner.run(owned_arc, factory, shard_map, coordinator).await;

@@ -29,7 +29,8 @@ async fn none_coordinator_owns_all_shards() {
         make_test_factory(),
         Vec::new(),
     )
-    .await;
+    .await
+    .unwrap();
 
     let owned = coord.owned_shards().await;
     assert_eq!(owned.len(), 16);
@@ -47,7 +48,8 @@ async fn none_coordinator_always_converged() {
         make_test_factory(),
         Vec::new(),
     )
-    .await;
+    .await
+    .unwrap();
 
     assert!(coord.wait_converged(Duration::from_millis(1)).await);
 }
@@ -61,7 +63,8 @@ async fn none_coordinator_single_member() {
         make_test_factory(),
         Vec::new(),
     )
-    .await;
+    .await
+    .unwrap();
 
     let members = coord.get_members().await.unwrap();
     assert_eq!(members.len(), 1);
@@ -77,7 +80,8 @@ async fn none_coordinator_shard_map() {
         make_test_factory(),
         Vec::new(),
     )
-    .await;
+    .await
+    .unwrap();
 
     let map = coord.get_shard_owner_map().await.unwrap();
     assert_eq!(map.num_shards(), 4);

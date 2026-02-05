@@ -30,13 +30,16 @@ impl NoneCoordinator {
     ///
     /// Creates a shard map with the given number of shards and opens all shards
     /// immediately since this node owns everything.
+    ///
+    /// Returns an error if any shard fails to open, since in single-node mode
+    /// all shards must be available for the server to function correctly.
     pub async fn new(
         node_id: impl Into<String>,
         grpc_addr: impl Into<String>,
         initial_shard_count: u32,
         factory: Arc<ShardFactory>,
         placement_rings: Vec<String>,
-    ) -> Self {
+    ) -> Result<Self, CoordinationError> {
         // Create the shard map for single-node mode
         let shard_map = ShardMap::create_initial(initial_shard_count)
             .expect("failed to create initial shard map");
@@ -54,20 +57,22 @@ impl NoneCoordinator {
             let shard_map = base.shard_map.lock().await;
             let mut owned = base.owned.lock().await;
             for shard_info in shard_map.shards() {
-                match factory.open(&shard_info.id, &shard_info.range).await {
-                    Ok(shard) => {
-                        // Spawn background cleanup if this shard has pending cleanup work
-                        shard.maybe_spawn_background_cleanup(shard_info.range.clone());
-                        owned.insert(shard_info.id);
-                    }
-                    Err(e) => {
-                        tracing::error!(shard_id = %shard_info.id, error = %e, "failed to open shard");
-                    }
-                }
+                let shard = factory
+                    .open(&shard_info.id, &shard_info.range)
+                    .await
+                    .map_err(|e| {
+                        CoordinationError::BackendError(format!(
+                            "failed to open shard {} during single-node startup: {}",
+                            shard_info.id, e
+                        ))
+                    })?;
+                // Spawn background cleanup if this shard has pending cleanup work
+                shard.maybe_spawn_background_cleanup(shard_info.range.clone());
+                owned.insert(shard_info.id);
             }
         }
 
-        Self { base }
+        Ok(Self { base })
     }
 
     /// Create a single-node coordinator using shards that are already open in the factory.
