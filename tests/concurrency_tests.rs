@@ -1240,9 +1240,10 @@ async fn concurrency_reap_expired_lease_releases_holder() {
 #[silo::test]
 async fn concurrency_future_request_granted_after_time_passes() {
     let (_tmp, shard) = open_temp_shard().await;
-    let now = now_ms();
-    let future = now + 100; // 100ms in future (short enough for test)
+    // Capture time just before second enqueue to ensure future is actually in the future.
+    // Using a larger margin (500ms) to avoid flakiness in CI where operations can be slow.
     let queue = "time-q".to_string();
+    let now = now_ms();
 
     // Job 1 takes the slot immediately
     let _j1 = shard
@@ -1267,6 +1268,8 @@ async fn concurrency_future_request_granted_after_time_passes() {
     let t1 = t1_vec[0].attempt().task_id().to_string();
 
     // Job 2 scheduled for future while slot is held -> creates RequestTicket task
+    // Calculate the future timestamp right before enqueue to avoid timing issues in CI
+    let future = now_ms() + 500; // 500ms margin to ensure it's truly in the future
     let _j2 = shard
         .enqueue(
             "-",
@@ -1308,7 +1311,7 @@ async fn concurrency_future_request_granted_after_time_passes() {
     assert_eq!(tasks_still_future, 1, "RequestTicket task still present");
 
     // Simulate time passing: wait for future time + broker scan delay
-    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(600)).await;
 
     // Now worker polls - should process RequestTicket and grant Job 2
     // The RequestTicket should be picked up by broker (it's now ready based on timestamp)
