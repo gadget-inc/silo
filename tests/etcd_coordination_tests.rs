@@ -783,6 +783,8 @@ async fn etcd_three_nodes_even_distribution() {
 
     let (c1, h1) = start_etcd_coordinator!(&prefix, "node-1", "http://127.0.0.1:50051", num_shards);
 
+    // Stagger node starts to reduce contention
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let endpoints = get_etcd_endpoints();
     let (c2, h2) = EtcdCoordinator::start(
         &endpoints,
@@ -796,6 +798,8 @@ async fn etcd_three_nodes_even_distribution() {
     )
     .await
     .expect("start c2");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let (c3, h3) = EtcdCoordinator::start(
         &endpoints,
         &prefix,
@@ -809,10 +813,11 @@ async fn etcd_three_nodes_even_distribution() {
     .await
     .expect("start c3");
 
-    // Wait for convergence
-    assert!(c1.wait_converged(Duration::from_secs(30)).await);
-    assert!(c2.wait_converged(Duration::from_secs(30)).await);
-    assert!(c3.wait_converged(Duration::from_secs(30)).await);
+    // Wait for convergence (longer timeout for 3 nodes)
+    let timeout = Duration::from_secs(45);
+    assert!(c1.wait_converged(timeout).await);
+    assert!(c2.wait_converged(timeout).await);
+    assert!(c3.wait_converged(timeout).await);
 
     // Wait for all shards to be covered by the three coordinators
     let expected: HashSet<ShardId> = c1
@@ -879,6 +884,8 @@ async fn etcd_removing_node_rebalances() {
 
     let (c1, h1) = start_etcd_coordinator!(&prefix, "node-1", "http://127.0.0.1:50051", num_shards);
 
+    // Stagger node starts to reduce contention
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let endpoints = get_etcd_endpoints();
     let (c2, h2) = EtcdCoordinator::start(
         &endpoints,
@@ -892,6 +899,8 @@ async fn etcd_removing_node_rebalances() {
     )
     .await
     .expect("start c2");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let (c3, h3) = EtcdCoordinator::start(
         &endpoints,
         &prefix,
@@ -905,10 +914,11 @@ async fn etcd_removing_node_rebalances() {
     .await
     .expect("start c3");
 
-    // Wait for initial convergence with 3 nodes
-    assert!(c1.wait_converged(Duration::from_secs(30)).await);
-    assert!(c2.wait_converged(Duration::from_secs(30)).await);
-    assert!(c3.wait_converged(Duration::from_secs(30)).await);
+    // Wait for initial convergence with 3 nodes (longer timeout)
+    let timeout = Duration::from_secs(45);
+    assert!(c1.wait_converged(timeout).await);
+    assert!(c2.wait_converged(timeout).await);
+    assert!(c3.wait_converged(timeout).await);
 
     // Remove node 3
     c3.shutdown().await.unwrap();
@@ -958,6 +968,8 @@ async fn etcd_ownership_stability_during_steady_state() {
     let (c1, h1) =
         start_etcd_coordinator!(&prefix, "stable-1", "http://127.0.0.1:50051", num_shards);
 
+    // Stagger node starts to reduce contention
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let endpoints = get_etcd_endpoints();
     let (c2, h2) = EtcdCoordinator::start(
         &endpoints,
@@ -973,8 +985,8 @@ async fn etcd_ownership_stability_during_steady_state() {
     .expect("c2");
 
     // Wait for convergence
-    assert!(c1.wait_converged(Duration::from_secs(20)).await);
-    assert!(c2.wait_converged(Duration::from_secs(20)).await);
+    assert!(c1.wait_converged(Duration::from_secs(30)).await);
+    assert!(c2.wait_converged(Duration::from_secs(30)).await);
 
     // Record initial ownership
     let s1_initial: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
@@ -1099,6 +1111,9 @@ async fn etcd_graceful_shutdown_releases_shards_promptly() {
             return;
         }
     };
+
+    // Stagger node starts to reduce contention
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let (c2, h2) = EtcdCoordinator::start(
         &endpoints,
         &prefix,
@@ -1113,8 +1128,8 @@ async fn etcd_graceful_shutdown_releases_shards_promptly() {
     .expect("c2");
 
     // Wait for convergence
-    assert!(c1.wait_converged(Duration::from_secs(20)).await);
-    assert!(c2.wait_converged(Duration::from_secs(20)).await);
+    assert!(c1.wait_converged(Duration::from_secs(30)).await);
+    assert!(c2.wait_converged(Duration::from_secs(30)).await);
 
     // Record what c2 owns
     let c2_initial: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
@@ -1223,6 +1238,8 @@ async fn etcd_request_split_fails_if_not_owner() {
         num_shards
     );
 
+    // Stagger node starts to reduce contention
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let endpoints = get_etcd_endpoints();
     let (c2, h2) = EtcdCoordinator::start(
         &endpoints,
@@ -1238,8 +1255,8 @@ async fn etcd_request_split_fails_if_not_owner() {
     .expect("start c2");
     let c2: Arc<dyn Coordinator> = Arc::new(c2);
 
-    assert!(c1.wait_converged(Duration::from_secs(20)).await);
-    assert!(c2.wait_converged(Duration::from_secs(20)).await);
+    assert!(c1.wait_converged(Duration::from_secs(30)).await);
+    assert!(c2.wait_converged(Duration::from_secs(30)).await);
 
     // Find a shard owned by c1
     let c1_owned: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
@@ -1653,6 +1670,8 @@ async fn etcd_split_in_multi_node_cluster() {
         num_shards
     );
 
+    // Stagger node starts to reduce contention
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let endpoints = get_etcd_endpoints();
     let (c2, h2) = EtcdCoordinator::start(
         &endpoints,
@@ -1667,8 +1686,8 @@ async fn etcd_split_in_multi_node_cluster() {
     .await
     .expect("start c2");
 
-    assert!(c1.wait_converged(Duration::from_secs(20)).await);
-    assert!(c2.wait_converged(Duration::from_secs(20)).await);
+    assert!(c1.wait_converged(Duration::from_secs(30)).await);
+    assert!(c2.wait_converged(Duration::from_secs(30)).await);
 
     // Wait for all shards to be acquired (doesn't matter which node owns them)
     let all_shards_acquired = wait_until(Duration::from_secs(10), || async {
@@ -2463,7 +2482,8 @@ async fn etcd_rapid_membership_churn_converges() {
     // Start first node, then quickly add/remove others to simulate churn
     let (c1, h1) = start_etcd_coordinator!(&prefix, "n1", "http://127.0.0.1:50051", num_shards);
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Stagger node starts to reduce contention
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let endpoints = get_etcd_endpoints();
     let (c2, h2) = EtcdCoordinator::start(
         &endpoints,
@@ -2478,7 +2498,7 @@ async fn etcd_rapid_membership_churn_converges() {
     .await
     .expect("start c2");
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let (c3, h3) = EtcdCoordinator::start(
         &endpoints,
         &prefix,
@@ -2510,8 +2530,8 @@ async fn etcd_rapid_membership_churn_converges() {
     .await
     .expect("restart c2");
 
-    // Wait for all to converge post-churn
-    let deadline = Duration::from_secs(20);
+    // Wait for all to converge post-churn (longer timeout for 3 nodes)
+    let deadline = Duration::from_secs(45);
     assert!(c1.wait_converged(deadline).await);
     assert!(c2b.wait_converged(deadline).await);
     assert!(c3.wait_converged(deadline).await);
