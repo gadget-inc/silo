@@ -352,8 +352,9 @@ impl SiloService {
                 Ok(t.to_string())
             }
             (true, None) => Err(Status::invalid_argument("tenant id required")),
-            // When tenancy is disabled, accept but ignore any provided tenant
-            (false, Some(_)) => Ok("-".to_string()),
+            (false, Some(_)) => Err(Status::failed_precondition(
+                "tenant must not be provided when tenancy is disabled on the server",
+            )),
             (false, None) => Ok("-".to_string()),
         }
     }

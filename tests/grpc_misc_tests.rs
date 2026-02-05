@@ -285,6 +285,57 @@ async fn grpc_server_tenant_validation_when_enabled() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// When tenancy is disabled on the server and the client sends a tenant,
+/// the server should reject the request with a clear error rather than
+/// silently storing the task with the wrong tenant (which would cause the
+/// broker to delete it as "defunct" because "-" is not in the shard's range).
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_enqueue_rejects_tenant_when_tenancy_disabled() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+
+        let mut config = AppConfig::load(None).unwrap();
+        config.tenancy.enabled = false;
+
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), config).await?;
+
+        let payload_bytes = rmp_serde::to_vec(&serde_json::json!({ "hello": "world" })).unwrap();
+        let enq = EnqueueRequest {
+            shard: "00000000-0000-0000-0000-000000000000".to_string(),
+            id: "test-job-routing".to_string(),
+            priority: 1,
+            start_at_ms: 0,
+            retry_policy: None,
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(payload_bytes)),
+            }),
+            limits: vec![],
+            tenant: Some("test-tenant-1".to_string()),
+            metadata: std::collections::HashMap::new(),
+            task_group: "default".to_string(),
+        };
+
+        let err = client
+            .enqueue(enq)
+            .await
+            .expect_err("enqueue should fail when tenant is sent with tenancy disabled");
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("tenancy is disabled"),
+            "error should mention tenancy: {}",
+            err.message()
+        );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_server_reset_shards_requires_dev_mode() -> anyhow::Result<()> {
     let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
