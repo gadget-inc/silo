@@ -1484,6 +1484,35 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                                 // (e.g., it's a split child or was re-acquired after a crash)
                                 shard.maybe_spawn_background_cleanup(range.clone());
 
+                                // Check for shutdown BEFORE marking as Held. If shutdown was
+                                // triggered during the shard open, we should not claim ownership.
+                                // This prevents split-brain where ShardAcquired is emitted after
+                                // a shutdown signal while another node might be acquiring the shard.
+                                {
+                                    let st = self.state.lock().await;
+                                    if matches!(
+                                        st.phase,
+                                        ShardPhase::ShuttingDown | ShardPhase::ShutDown
+                                    ) {
+                                        drop(st);
+                                        debug!(
+                                            shard_id = %self.shard_id,
+                                            "shutdown requested during shard open, releasing lease"
+                                        );
+                                        // Close the shard we just opened
+                                        if let Err(e) = factory.close(&self.shard_id).await {
+                                            tracing::error!(
+                                                shard_id = %self.shard_id,
+                                                error = %e,
+                                                "failed to close shard after shutdown during acquisition"
+                                            );
+                                        }
+                                        // Release the lease
+                                        let _ = self.release_lease_cas(&lease_name).await;
+                                        break;
+                                    }
+                                }
+
                                 {
                                     let mut st = self.state.lock().await;
                                     st.resource_version = Some(rv.clone());
