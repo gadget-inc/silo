@@ -102,7 +102,7 @@ Common causes of test flakes to be aware of:
 
 # Deterministic Simulation Tests
 
-We use turmoil and mad-turmoil for DST tests. See CONTRIBUTING.md for more details.
+We use turmoil and mad-turmoil for DST tests. See CONTRIBUTING.md for more details on how to run DST tests, both to verify the determinism or reproduce a failure for a given seed.
 
 # Kubernetes Tests
 
