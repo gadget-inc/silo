@@ -58,13 +58,13 @@ The `[database]` section configures how Silo stores job data. Silo uses [SlateDB
 ```toml
 [database]
 backend = "gcs"
-path = "gs://my-bucket/silo/data-%shard%"
+path = "gs://my-bucket/silo/%shard%"
 apply_wal_on_close = true
 
 # Optional: separate WAL storage
 [database.wal]
 backend = "fs"
-path = "/var/lib/silo/wal-%shard%"
+path = "/var/lib/silo/wal/%shard%"
 ```
 
 ### Database Options
@@ -72,16 +72,23 @@ path = "/var/lib/silo/wal-%shard%"
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `backend` | string | `"fs"` | Storage backend type (see below) |
-| `path` | string | `"/tmp/silo-%shard%"` | Path or URL for data storage. Use `%shard%` as a placeholder for the shard number. |
+| `path` | string | `"/tmp/silo/%shard%"` | Path or URL for data storage. Use `%shard%` as a placeholder for the shard number. |
 | `apply_wal_on_close` | bool | `true` | Flush WAL to object storage before closing shards (recommended for durability) |
+
+<Aside type="caution">
+The `%shard%` placeholder must be an independent directory segment—it cannot have a prefix or suffix within the same path component.
+
+- **Valid**: `foo/bar/%shard%`
+- **Invalid**: `foo/bar/something-%shard%`
+</Aside>
 
 ### Storage Backends
 
 | Backend | Description | Path Format |
 |---------|-------------|-------------|
-| `fs` | Local filesystem | `/var/lib/silo/data-%shard%` |
-| `s3` | Amazon S3 | `s3://bucket-name/prefix-%shard%` |
-| `gcs` | Google Cloud Storage | `gs://bucket-name/prefix-%shard%` |
+| `fs` | Local filesystem | `/var/lib/silo/%shard%` |
+| `s3` | Amazon S3 | `s3://bucket-name/prefix/%shard%` |
+| `gcs` | Google Cloud Storage | `gs://bucket-name/prefix/%shard%` |
 | `memory` | In-memory (testing only) | Any string |
 | `url` | Generic URL-based object store | URL understood by SlateDB |
 
@@ -99,11 +106,11 @@ By default, the Write-Ahead Log (WAL) uses the same backend and location as the 
 ```toml
 [database]
 backend = "gcs"
-path = "gs://my-bucket/silo/data-%shard%"
+path = "gs://my-bucket/silo/%shard%"
 
 [database.wal]
 backend = "fs"
-path = "/var/lib/silo/wal-%shard%"
+path = "/var/lib/silo/wal/%shard%"
 ```
 
 | Option | Type | Description |

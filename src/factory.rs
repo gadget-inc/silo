@@ -1,4 +1,7 @@
 use dashmap::DashMap;
+use futures::TryStreamExt;
+use slatedb::object_store::ObjectStore;
+use slatedb::object_store::path::Path as ObjectPath;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -182,11 +185,48 @@ impl ShardFactory {
             .await
     }
 
+    /// Validate that the template path has the shard placeholder at a directory boundary.
+    ///
+    /// The placeholder (`%shard%` or `{shard}`) must be preceded by `/` (or be at the start)
+    /// so that the shard ID forms a complete directory name, not a suffix of another name.
+    /// This is required for clone/split operations and for consistent path handling.
+    ///
+    /// Returns the position of the placeholder if valid.
+    fn validate_template_path(template_path: &str) -> Result<usize, JobStoreShardError> {
+        let placeholder_pos = template_path
+            .find("%shard%")
+            .or_else(|| template_path.find("{shard}"));
+
+        let pos = placeholder_pos.ok_or_else(|| {
+            JobStoreShardError::Rkyv(format!(
+                "database template path must contain a shard placeholder (%shard% or {{shard}}), got: {}",
+                template_path
+            ))
+        })?;
+
+        // Validate that the placeholder is at a path boundary (preceded by / or at start of path)
+        if pos > 0 {
+            let char_before = template_path.chars().nth(pos - 1);
+            if char_before != Some('/') {
+                return Err(JobStoreShardError::Rkyv(format!(
+                    "shard placeholder in database template path must be preceded by '/' for correct path handling. \
+                     Got: '{}'. Change to something like '/data/%shard%' where the shard ID is a directory name.",
+                    template_path
+                )));
+            }
+        }
+
+        Ok(pos)
+    }
+
     /// Resolve the object store at the storage root level.
     ///
     /// For Backend::Fs, this extracts the root path before the placeholder and
     /// returns the shard name as the db_path. For cloud backends, this works
     /// the same as before since the object store is already at bucket level.
+    ///
+    /// The returned `ResolvedStore.root_path` combined with `db_path` gives the
+    /// full path where shard data is stored.
     fn resolve_at_root(
         backend: &crate::settings::Backend,
         template_path: &str,
@@ -196,22 +236,16 @@ impl ShardFactory {
 
         match backend {
             Backend::Fs => {
-                // Extract root path from template (everything before the placeholder)
-                let placeholder_pos = template_path
-                    .find("%shard%")
-                    .or_else(|| template_path.find("{shard}"));
+                // Validate and get placeholder position
+                let pos = Self::validate_template_path(template_path)?;
 
-                let root_path = match placeholder_pos {
-                    Some(pos) => {
-                        let root = &template_path[..pos];
-                        let root_trimmed = root.trim_end_matches('/');
-                        if root_trimmed.is_empty() {
-                            "/"
-                        } else {
-                            root_trimmed
-                        }
-                    }
-                    None => template_path, // No placeholder, use as-is
+                // Extract root path from template (everything before the placeholder)
+                let root = &template_path[..pos];
+                let root_trimmed = root.trim_end_matches('/');
+                let root_path = if root_trimmed.is_empty() {
+                    "/"
+                } else {
+                    root_trimmed
                 };
 
                 let resolved = resolve_object_store(backend, root_path)?;
@@ -239,21 +273,15 @@ impl ShardFactory {
             #[cfg(feature = "dst")]
             Backend::TurmoilFs => {
                 // TurmoilFs backend: same as Fs but uses turmoil's simulated filesystem
-                let placeholder_pos = template_path
-                    .find("%shard%")
-                    .or_else(|| template_path.find("{shard}"));
+                // Validate and get placeholder position
+                let pos = Self::validate_template_path(template_path)?;
 
-                let root_path = match placeholder_pos {
-                    Some(pos) => {
-                        let root = &template_path[..pos];
-                        let root_trimmed = root.trim_end_matches('/');
-                        if root_trimmed.is_empty() {
-                            "/"
-                        } else {
-                            root_trimmed
-                        }
-                    }
-                    None => template_path, // No placeholder, use as-is
+                let root = &template_path[..pos];
+                let root_trimmed = root.trim_end_matches('/');
+                let root_path = if root_trimmed.is_empty() {
+                    "/"
+                } else {
+                    root_trimmed
                 };
 
                 let resolved = resolve_object_store(backend, root_path)?;
@@ -261,6 +289,19 @@ impl ShardFactory {
                 Ok((resolved, shard_name.to_string()))
             }
         }
+    }
+
+    /// Get the filesystem path where a shard's data is stored.
+    /// This is only valid for local filesystem backends (Fs, TurmoilFs).
+    fn get_shard_data_path(
+        &self,
+        shard_name: &str,
+    ) -> Result<std::path::PathBuf, JobStoreShardError> {
+        let (resolved, db_path) =
+            Self::resolve_at_root(&self.template.backend, &self.template.path, shard_name)?;
+        // For Fs backends, root_path is the canonical filesystem root and db_path is the shard name
+        // For other backends, root_path might be a URL path component
+        Ok(std::path::Path::new(&resolved.root_path).join(&db_path))
     }
 
     /// Close a specific shard and remove it from the factory.
@@ -295,41 +336,138 @@ impl ShardFactory {
             tracing::info!(shard_id = %shard_id, "closed shard for reset");
         }
 
-        // 2. Delete the data directory
-        let path = self
-            .template
-            .path
-            .replace("%shard%", &name)
-            .replace("{shard}", &name);
-
-        // Delete the main data path
-        if let Err(e) = tokio::fs::remove_dir_all(&path).await {
-            // Ignore "not found" errors - the directory might not exist yet
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(shard_id = %shard_id, path = %path, error = %e, "failed to delete shard data directory");
-            }
-        } else {
-            tracing::info!(shard_id = %shard_id, path = %path, "deleted shard data directory");
-        }
+        // 2. Delete the data using the appropriate method for the backend
+        self.delete_shard_data(&name).await?;
 
         // Delete WAL directory if configured separately
         if let Some(wal_cfg) = &self.template.wal {
-            let wal_path = wal_cfg
-                .path
-                .replace("%shard%", &name)
-                .replace("{shard}", &name);
-            if let Err(e) = tokio::fs::remove_dir_all(&wal_path).await {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(shard_id = %shard_id, path = %wal_path, error = %e, "failed to delete shard WAL directory");
-                }
-            } else {
-                tracing::debug!(shard_id = %shard_id, path = %wal_path, "deleted shard WAL directory");
-            }
+            self.delete_wal_data(&name, wal_cfg).await?;
         }
 
         // 3. Reopen the shard fresh
         tracing::info!(shard_id = %shard_id, "reopening shard after reset");
         self.open(shard_id, range).await
+    }
+
+    /// Delete all data for a shard from storage.
+    /// Uses the same path resolution as opening to ensure we delete the correct directory.
+    async fn delete_shard_data(&self, shard_name: &str) -> Result<(), JobStoreShardError> {
+        use crate::settings::Backend;
+
+        match &self.template.backend {
+            Backend::Fs => {
+                // Use unified path resolution to get the correct data path
+                let data_path = self.get_shard_data_path(shard_name)?;
+                let path_str = data_path.to_string_lossy();
+
+                if let Err(e) = tokio::fs::remove_dir_all(&data_path).await {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(shard_name = %shard_name, path = %path_str, error = %e, "failed to delete shard data directory");
+                    }
+                } else {
+                    tracing::info!(shard_name = %shard_name, path = %path_str, "deleted shard data directory");
+                }
+            }
+            #[cfg(feature = "dst")]
+            Backend::TurmoilFs => {
+                // Use unified path resolution to get the correct data path
+                let data_path = self.get_shard_data_path(shard_name)?;
+                let path_str = data_path.to_string_lossy();
+
+                if let Err(e) = tokio::fs::remove_dir_all(&data_path).await {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(shard_name = %shard_name, path = %path_str, error = %e, "failed to delete shard data directory");
+                    }
+                } else {
+                    tracing::info!(shard_name = %shard_name, path = %path_str, "deleted shard data directory");
+                }
+            }
+            Backend::Memory | Backend::S3 | Backend::Gcs | Backend::Url => {
+                // For object store backends, use the object store API to delete all objects
+                let (resolved, db_path) =
+                    Self::resolve_at_root(&self.template.backend, &self.template.path, shard_name)?;
+
+                // List and delete all objects under the shard's path
+                let prefix = ObjectPath::from(db_path.as_str());
+                let objects: Vec<_> = resolved
+                    .store
+                    .list(Some(&prefix))
+                    .try_collect()
+                    .await
+                    .map_err(|e| {
+                        JobStoreShardError::Rkyv(format!(
+                            "failed to list objects for deletion: {}",
+                            e
+                        ))
+                    })?;
+
+                let count = objects.len();
+                for obj in objects {
+                    if let Err(e) = resolved.store.delete(&obj.location).await {
+                        tracing::warn!(
+                            shard_name = %shard_name,
+                            path = %obj.location,
+                            error = %e,
+                            "failed to delete object"
+                        );
+                    }
+                }
+                tracing::info!(shard_name = %shard_name, objects_deleted = count, "deleted shard data from object store");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Delete WAL data for a shard.
+    async fn delete_wal_data(
+        &self,
+        shard_name: &str,
+        wal_cfg: &crate::settings::WalConfig,
+    ) -> Result<(), JobStoreShardError> {
+        let wal_path = wal_cfg
+            .path
+            .replace("%shard%", shard_name)
+            .replace("{shard}", shard_name);
+
+        if wal_cfg.is_local_storage() {
+            // Local WAL - use filesystem deletion
+            if let Err(e) = tokio::fs::remove_dir_all(&wal_path).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(shard_name = %shard_name, path = %wal_path, error = %e, "failed to delete shard WAL directory");
+                }
+            } else {
+                tracing::debug!(shard_name = %shard_name, path = %wal_path, "deleted shard WAL directory");
+            }
+        } else {
+            // Object store WAL - use object store API
+            let resolved = resolve_object_store(&wal_cfg.backend, &wal_path)?;
+            let prefix = ObjectPath::from(resolved.canonical_path.as_str());
+            let objects: Vec<_> = resolved
+                .store
+                .list(Some(&prefix))
+                .try_collect()
+                .await
+                .map_err(|e| {
+                    JobStoreShardError::Rkyv(format!(
+                        "failed to list WAL objects for deletion: {}",
+                        e
+                    ))
+                })?;
+
+            for obj in objects {
+                if let Err(e) = resolved.store.delete(&obj.location).await {
+                    tracing::warn!(
+                        shard_name = %shard_name,
+                        path = %obj.location,
+                        error = %e,
+                        "failed to delete WAL object"
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Check if this factory owns a shard by its ID.
