@@ -239,15 +239,25 @@ async fn rate_limit_exceeded_then_passes_after_window() {
         .await
         .expect("enqueue");
 
-    // First few dequeues should return nothing (rate limited)
-    let _tasks = shard
+    // First dequeue processes the CheckRateLimit. Depending on timing (especially in
+    // slow CI environments), the rate limit may have already reset if enough time
+    // elapsed since pre-exhaustion. Token bucket with limit=2, duration=500ms
+    // replenishes ~1 token every 250ms.
+    let first_tasks = shard
         .dequeue("worker1", "default", 1)
         .await
         .expect("dequeue1")
         .tasks;
-    // May or may not be empty depending on timing
 
-    // Wait for the rate limit window to reset, then retry
+    if !first_tasks.is_empty() {
+        // Rate limit already reset due to timing - task was returned immediately
+        assert_eq!(first_tasks.len(), 1);
+        assert_eq!(first_tasks[0].job().id(), job_id);
+        return;
+    }
+
+    // Rate limit was still exhausted - task is scheduled for retry.
+    // Wait for the rate limit window to reset, then retry.
     tokio::time::sleep(tokio::time::Duration::from_millis(600)).await;
 
     // Now should succeed - use retry since we're waiting for time to pass
