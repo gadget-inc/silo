@@ -69,7 +69,15 @@ pub fn run() {
             let mut client = connect_to_server("http://server:9902").await?;
 
             let mut completed = 0;
-            for _ in 0..10 {
+            let mut consecutive_empty = 0;
+            // Continue until we've processed our share and seen some empty leases
+            // after all jobs should be done
+            for _ in 0..50 {
+                // Stop if we've seen enough empty leases after reaching expected completion
+                if w1_completed.load(Ordering::SeqCst) >= 10 && consecutive_empty >= 3 {
+                    break;
+                }
+
                 let lease = client
                     .lease_tasks(tonic::Request::new(LeaseTasksRequest {
                         shard: Some(TEST_SHARD_ID.to_string()),
@@ -108,7 +116,10 @@ pub fn run() {
                 }
 
                 if lease.tasks.is_empty() {
+                    consecutive_empty += 1;
                     tokio::time::sleep(Duration::from_millis(50)).await;
+                } else {
+                    consecutive_empty = 0;
                 }
             }
             tracing::trace!(worker = "worker1", completed = completed, "worker_done");
@@ -123,7 +134,15 @@ pub fn run() {
             let mut client = connect_to_server("http://server:9902").await?;
 
             let mut completed = 0;
-            for _ in 0..10 {
+            let mut consecutive_empty = 0;
+            // Continue until we've processed our share and seen some empty leases
+            // after all jobs should be done
+            for _ in 0..50 {
+                // Stop if we've seen enough empty leases after reaching expected completion
+                if w2_completed.load(Ordering::SeqCst) >= 10 && consecutive_empty >= 3 {
+                    break;
+                }
+
                 let lease = client
                     .lease_tasks(tonic::Request::new(LeaseTasksRequest {
                         shard: Some(TEST_SHARD_ID.to_string()),
@@ -162,7 +181,10 @@ pub fn run() {
                 }
 
                 if lease.tasks.is_empty() {
+                    consecutive_empty += 1;
                     tokio::time::sleep(Duration::from_millis(50)).await;
+                } else {
+                    consecutive_empty = 0;
                 }
             }
             tracing::trace!(worker = "worker2", completed = completed, "worker_done");
