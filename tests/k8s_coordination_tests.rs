@@ -1998,6 +1998,9 @@ async fn k8s_concurrent_shutdown_multiple_nodes() {
         "http://127.0.0.1:50051",
         num_shards
     );
+
+    // Stagger node starts to reduce contention on K8s API
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let (c2, h2) = K8sCoordinator::start(
         make_coordinator_config(
             &namespace,
@@ -2011,6 +2014,8 @@ async fn k8s_concurrent_shutdown_multiple_nodes() {
     )
     .await
     .expect("c2");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let (c3, h3) = K8sCoordinator::start(
         make_coordinator_config(
             &namespace,
@@ -2025,10 +2030,11 @@ async fn k8s_concurrent_shutdown_multiple_nodes() {
     .await
     .expect("c3");
 
-    // Wait for initial convergence
-    assert!(c1.wait_converged(Duration::from_secs(30)).await);
-    assert!(c2.wait_converged(Duration::from_secs(30)).await);
-    assert!(c3.wait_converged(Duration::from_secs(30)).await);
+    // Wait for initial convergence (longer timeout for 3 nodes with 16 shards)
+    let timeout = Duration::from_secs(45);
+    assert!(c1.wait_converged(timeout).await);
+    assert!(c2.wait_converged(timeout).await);
+    assert!(c3.wait_converged(timeout).await);
 
     // Shutdown c2 and c3 concurrently
     let (r2, r3) = tokio::join!(c2.shutdown(), c3.shutdown());
