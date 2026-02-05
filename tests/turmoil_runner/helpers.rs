@@ -397,7 +397,8 @@ pub async fn setup_server(port: u16) -> turmoil::Result<()> {
             factory.clone(),
             Vec::new(),
         )
-        .await,
+        .await
+        .unwrap(),
     );
     tracing::trace!("setup_server: coordinator created");
 

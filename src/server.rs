@@ -1167,18 +1167,29 @@ impl Silo for SiloService {
             ));
         }
 
-        // Get all local shard IDs
-        let shard_ids: Vec<crate::shard_range::ShardId> =
-            self.factory.instances().keys().copied().collect();
+        // Use the coordinator's shard map as the source of truth for which shards
+        // should exist, not just what's currently in the factory. This catches cases
+        // where shards failed to open during startup (e.g., due to path configuration
+        // errors) but are still listed in the shard map.
+        let shard_map = self
+            .coordinator
+            .get_shard_map()
+            .await
+            .map_err(|e| Status::internal(format!("failed to get shard map: {}", e)))?;
 
         let mut reset_count = 0u32;
-        for shard_id in shard_ids {
-            // Get the shard's current range before resetting
+        for shard_info in shard_map.shards() {
+            let shard_id = shard_info.id;
             let range = match self.factory.get(&shard_id) {
                 Some(shard) => shard.get_range(),
                 None => {
-                    tracing::warn!(shard = %shard_id, "shard not found for reset, skipping");
-                    continue;
+                    // Shard is in the shard map but not in the factory - this means it
+                    // failed to open during startup. Try to open it now.
+                    tracing::warn!(
+                        shard = %shard_id,
+                        "shard not found in factory during reset, attempting to open it"
+                    );
+                    shard_info.range.clone()
                 }
             };
             match self.factory.reset(&shard_id, &range).await {
@@ -1193,6 +1204,26 @@ impl Silo for SiloService {
                         shard_id, e
                     )));
                 }
+            }
+        }
+
+        // Re-register all reset shards as owned by the coordinator.
+        // This ensures the coordinator's owned set is accurate after reset,
+        // which improves diagnostic logging in shard_with_redirect().
+        {
+            let mut owned = self.coordinator.base().owned.lock().await;
+            for shard_info in shard_map.shards() {
+                owned.insert(shard_info.id);
+            }
+        }
+
+        // Verify all shards are accessible after reset
+        for shard_info in shard_map.shards() {
+            if self.factory.get(&shard_info.id).is_none() {
+                return Err(Status::internal(format!(
+                    "shard {} not accessible after reset - this is a bug",
+                    shard_info.id
+                )));
             }
         }
 

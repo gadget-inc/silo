@@ -527,7 +527,7 @@ pub async fn create_coordinator(
                 factory,
                 config.placement_rings.clone(),
             )
-            .await;
+            .await?;
             Ok((Arc::new(coord), None))
         }
         crate::settings::CoordinationBackend::Etcd => {

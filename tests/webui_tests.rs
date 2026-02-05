@@ -42,7 +42,8 @@ async fn setup_test_state() -> (tempfile::TempDir, AppState, ShardMap) {
             factory.clone(),
             Vec::new(),
         )
-        .await,
+        .await
+        .unwrap(),
     );
 
     // Get the shard map from the coordinator
@@ -414,7 +415,8 @@ async fn setup_multi_shard_state(num_shards: usize) -> (tempfile::TempDir, AppSt
             factory.clone(),
             Vec::new(),
         )
-        .await,
+        .await
+        .unwrap(),
     );
 
     // Get the shard map from the coordinator

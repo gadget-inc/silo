@@ -1,13 +1,18 @@
 mod grpc_integration_helpers;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use grpc_integration_helpers::{create_test_factory, setup_test_server, shutdown_server};
+use silo::coordination::NoneCoordinator;
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
+use silo::pb::silo_client::SiloClient;
 use silo::pb::*;
+use silo::server::run_server;
 use silo::settings::{AppConfig, Backend, DatabaseTemplate};
 use silo::shard_range::{ShardMap, ShardRange};
+use tokio::net::TcpListener;
 use tonic_health::pb::HealthCheckRequest;
 use tonic_health::pb::health_client::HealthClient;
 
@@ -959,7 +964,11 @@ async fn grpc_server_reset_shards_with_relative_path() -> anyhow::Result<()> {
             })
             .await?
             .into_inner();
-        assert_eq!(lease_resp.tasks.len(), 0, "should have 0 tasks after reset");
+        assert_eq!(
+            lease_resp.tasks.len(),
+            0,
+            "should have 0 tasks after reset (relative path test)"
+        );
 
         shutdown_server(shutdown_tx, server).await?;
         Ok::<(), anyhow::Error>(())
@@ -1069,7 +1078,355 @@ async fn grpc_server_reset_shards_clears_memory_backend_data() -> anyhow::Result
             })
             .await?
             .into_inner();
-        assert_eq!(lease_resp.tasks.len(), 0, "should have 0 tasks after reset");
+        assert_eq!(
+            lease_resp.tasks.len(),
+            0,
+            "should have 0 tasks after reset (memory backend)"
+        );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// Helper to set up a test server using NoneCoordinator::new() (the production code path)
+/// instead of NoneCoordinator::from_factory(). This matches how real servers are created
+/// via `create_coordinator()` with backend="none".
+async fn setup_test_server_production_path(
+    initial_shard_count: u32,
+    config: AppConfig,
+) -> anyhow::Result<(
+    SiloClient<tonic::transport::Channel>,
+    tokio::sync::broadcast::Sender<()>,
+    tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    SocketAddr,
+    Arc<ShardFactory>,
+    tempfile::TempDir,
+)> {
+    let tmp = tempfile::tempdir()?;
+    let template = DatabaseTemplate {
+        backend: Backend::Fs,
+        path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+        wal: None,
+        apply_wal_on_close: true,
+        slatedb: None,
+    };
+    let rate_limiter = MockGubernatorClient::new_arc();
+    let factory = Arc::new(ShardFactory::new(template, rate_limiter, None));
+
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+    let addr = listener.local_addr()?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
+    // Use NoneCoordinator::new() - the production code path
+    // This creates the shard map and opens shards in the factory
+    let coordinator = Arc::new(
+        NoneCoordinator::new(
+            "test-node",
+            format!("http://{}", addr),
+            initial_shard_count,
+            factory.clone(),
+            Vec::new(),
+        )
+        .await
+        .unwrap(),
+    );
+
+    let server = tokio::spawn(run_server(
+        listener,
+        factory.clone(),
+        coordinator,
+        config,
+        None,
+        shutdown_rx,
+    ));
+
+    let endpoint = format!("http://{}", addr);
+    let channel = tonic::transport::Endpoint::new(endpoint)?.connect().await?;
+    let client = SiloClient::new(channel);
+
+    Ok((client, shutdown_tx, server, addr, factory, tmp))
+}
+
+/// Test that shards are immediately available after reset when using the production
+/// code path (NoneCoordinator::new()). This reproduces a reported issue where shards
+/// return "shard not ready: acquisition in progress" after reset_shards succeeds.
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_reset_shards_immediately_available_production_path() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
+        let mut cfg = AppConfig::load(None).unwrap();
+        cfg.server.dev_mode = true;
+
+        let (mut client, shutdown_tx, server, _addr, _factory, _tmp) =
+            setup_test_server_production_path(1, cfg).await?;
+
+        // Get cluster info to discover shard IDs (like a real client would)
+        let cluster_info = client
+            .get_cluster_info(GetClusterInfoRequest {})
+            .await?
+            .into_inner();
+        let shard_id = cluster_info.shard_owners[0].shard_id.clone();
+
+        // Enqueue a job
+        let _ = client
+            .enqueue(EnqueueRequest {
+                shard: shard_id.clone(),
+                id: "job-before-reset".to_string(),
+                priority: 5,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                    )),
+                }),
+                limits: vec![],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
+            })
+            .await?;
+
+        // Reset shards
+        let res = client.reset_shards(ResetShardsRequest {}).await?;
+        assert_eq!(res.into_inner().shards_reset, 1, "should reset 1 shard");
+
+        // Immediately enqueue another job - this should succeed without retries
+        let enq_result = client
+            .enqueue(EnqueueRequest {
+                shard: shard_id.clone(),
+                id: "job-after-reset".to_string(),
+                priority: 5,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                    )),
+                }),
+                limits: vec![],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
+            })
+            .await;
+
+        assert!(
+            enq_result.is_ok(),
+            "enqueue should succeed immediately after reset, got: {:?}",
+            enq_result.err()
+        );
+
+        // Verify the old data is gone and only the new job exists
+        let query_resp = client
+            .query(QueryRequest {
+                shard: shard_id.clone(),
+                sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+        let count_row: serde_json::Value =
+            rmp_serde::from_slice(match &query_resp.rows[0].encoding {
+                Some(serialized_bytes::Encoding::Msgpack(d)) => d,
+                None => panic!("expected msgpack encoding"),
+            })?;
+        assert_eq!(count_row["count"], 1, "should have only the post-reset job");
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// Test that shards are immediately available after multiple consecutive resets.
+/// This verifies that repeated reset cycles don't degrade shard availability.
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_reset_shards_multiple_resets_immediately_available() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(15000), async {
+        let mut cfg = AppConfig::load(None).unwrap();
+        cfg.server.dev_mode = true;
+
+        let (mut client, shutdown_tx, server, _addr, _factory, _tmp) =
+            setup_test_server_production_path(1, cfg).await?;
+
+        // Get cluster info to discover shard IDs
+        let cluster_info = client
+            .get_cluster_info(GetClusterInfoRequest {})
+            .await?
+            .into_inner();
+        let shard_id = cluster_info.shard_owners[0].shard_id.clone();
+
+        // Do 5 reset cycles, each time enqueuing immediately after reset
+        for i in 0..5 {
+            // Enqueue a job
+            let _ = client
+                .enqueue(EnqueueRequest {
+                    shard: shard_id.clone(),
+                    id: format!("job-cycle-{}", i),
+                    priority: 5,
+                    start_at_ms: 0,
+                    retry_policy: None,
+                    payload: Some(SerializedBytes {
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(
+                            rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                        )),
+                    }),
+                    limits: vec![],
+                    tenant: None,
+                    metadata: std::collections::HashMap::new(),
+                    task_group: "default".to_string(),
+                })
+                .await
+                .unwrap_or_else(|e| panic!("enqueue should succeed in cycle {}: {:?}", i, e));
+
+            // Reset
+            let res = client.reset_shards(ResetShardsRequest {}).await?;
+            assert_eq!(res.into_inner().shards_reset, 1);
+
+            // Immediately verify shard is available by enqueuing
+            let enq_result = client
+                .enqueue(EnqueueRequest {
+                    shard: shard_id.clone(),
+                    id: format!("job-after-reset-{}", i),
+                    priority: 5,
+                    start_at_ms: 0,
+                    retry_policy: None,
+                    payload: Some(SerializedBytes {
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(
+                            rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                        )),
+                    }),
+                    limits: vec![],
+                    tenant: None,
+                    metadata: std::collections::HashMap::new(),
+                    task_group: "default".to_string(),
+                })
+                .await;
+
+            assert!(
+                enq_result.is_ok(),
+                "enqueue should succeed immediately after reset cycle {}, got: {:?}",
+                i,
+                enq_result.err()
+            );
+
+            // Verify only the post-reset job exists
+            let query_resp = client
+                .query(QueryRequest {
+                    shard: shard_id.clone(),
+                    sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
+                    tenant: None,
+                })
+                .await?
+                .into_inner();
+            let count_row: serde_json::Value =
+                rmp_serde::from_slice(match &query_resp.rows[0].encoding {
+                    Some(serialized_bytes::Encoding::Msgpack(d)) => d,
+                    None => panic!("expected msgpack encoding"),
+                })?;
+            assert_eq!(
+                count_row["count"], 1,
+                "should have exactly 1 job after reset cycle {}",
+                i
+            );
+        }
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// Test with 8 shards (the default production config) to verify all shards
+/// are immediately available after reset.
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_reset_shards_eight_shards_immediately_available() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(15000), async {
+        let mut cfg = AppConfig::load(None).unwrap();
+        cfg.server.dev_mode = true;
+
+        let (mut client, shutdown_tx, server, _addr, _factory, _tmp) =
+            setup_test_server_production_path(8, cfg).await?;
+
+        // Get cluster info to discover all shard IDs
+        let cluster_info = client
+            .get_cluster_info(GetClusterInfoRequest {})
+            .await?
+            .into_inner();
+        assert_eq!(cluster_info.shard_owners.len(), 8, "should have 8 shards");
+
+        let shard_ids: Vec<String> = cluster_info
+            .shard_owners
+            .iter()
+            .map(|s| s.shard_id.clone())
+            .collect();
+
+        // Enqueue a job to each shard
+        for (i, shard_id) in shard_ids.iter().enumerate() {
+            let _ = client
+                .enqueue(EnqueueRequest {
+                    shard: shard_id.clone(),
+                    id: format!("job-pre-reset-{}", i),
+                    priority: 5,
+                    start_at_ms: 0,
+                    retry_policy: None,
+                    payload: Some(SerializedBytes {
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(
+                            rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                        )),
+                    }),
+                    limits: vec![],
+                    tenant: None,
+                    metadata: std::collections::HashMap::new(),
+                    task_group: "default".to_string(),
+                })
+                .await?;
+        }
+
+        // Reset all shards
+        let res = client.reset_shards(ResetShardsRequest {}).await?;
+        assert_eq!(
+            res.into_inner().shards_reset,
+            8,
+            "should reset all 8 shards"
+        );
+
+        // Immediately try to use every shard - all should be available
+        for (i, shard_id) in shard_ids.iter().enumerate() {
+            let enq_result = client
+                .enqueue(EnqueueRequest {
+                    shard: shard_id.clone(),
+                    id: format!("job-post-reset-{}", i),
+                    priority: 5,
+                    start_at_ms: 0,
+                    retry_policy: None,
+                    payload: Some(SerializedBytes {
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(
+                            rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                        )),
+                    }),
+                    limits: vec![],
+                    tenant: None,
+                    metadata: std::collections::HashMap::new(),
+                    task_group: "default".to_string(),
+                })
+                .await;
+
+            assert!(
+                enq_result.is_ok(),
+                "enqueue to shard {} should succeed immediately after reset, got: {:?}",
+                shard_id,
+                enq_result.err()
+            );
+        }
 
         shutdown_server(shutdown_tx, server).await?;
         Ok::<(), anyhow::Error>(())
