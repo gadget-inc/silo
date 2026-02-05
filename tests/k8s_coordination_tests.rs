@@ -644,9 +644,9 @@ async fn k8s_get_members_returns_correct_info() {
     .await
     .expect("start c2");
 
-    // Wait for convergence
-    assert!(c1.wait_converged(Duration::from_secs(30)).await);
-    assert!(c2.wait_converged(Duration::from_secs(30)).await);
+    // Wait for convergence - use longer timeout due to K8s API latency in CI
+    assert!(c1.wait_converged(Duration::from_secs(45)).await);
+    assert!(c2.wait_converged(Duration::from_secs(45)).await);
 
     // Get members from both coordinators
     let members_from_c1 = c1.get_members().await.expect("get_members from c1");
