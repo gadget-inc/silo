@@ -1,6 +1,6 @@
 ---
-paths: 
-  - **/*.als
+paths:
+  - "**/*.als"
 ---
 
 Silo uses Alloy for software modelling. Alloy models go in `.als` files in the `specs/` directory. Run verification commands of Alloy models with:

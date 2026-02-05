@@ -23,7 +23,7 @@ pnpm install -g lnai
 lnai sync
 ```
 
-to setup the repo's rules and commands for your local editor.
+to setup the repo's rules and commands for your local editor
 
 ## Formatting code
 

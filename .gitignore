@@ -18,7 +18,11 @@
 /docs/node_modules
 # lnai-generated
 .claude/CLAUDE.md
+.claude/rules
 .claude/settings.json
 .cursor/cli.json
+.cursor/rules/alloy.mdc
+.cursor/rules/dst.mdc
 AGENTS.md
+tests/turmoil/AGENTS.md
 # end lnai-generated

@@ -1249,7 +1249,11 @@ async fn k8s_no_split_brain_during_transitions() {
 async fn k8s_prompt_acquisition_after_node_departure() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
-    let num_shards: u32 = 8;
+    // Use 32 shards to reduce the probability of one coordinator getting all shards.
+    // With rendezvous hashing, each shard independently goes to a node, so with 2 nodes
+    // the probability of all 32 going to one is (0.5)^32 ≈ 0, effectively eliminating
+    // flaky failures.
+    let num_shards: u32 = 32;
 
     let (c1, h1) = start_coordinator!(
         &namespace,
@@ -2327,7 +2331,11 @@ async fn k8s_coordinator_zero_shards() {
 async fn k8s_graceful_shutdown_releases_shards_promptly() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
-    let num_shards: u32 = 8;
+    // Use 32 shards to reduce the probability of one coordinator getting all shards.
+    // With rendezvous hashing, each shard independently goes to a node, so with 2 nodes
+    // the probability of all 32 going to one is (0.5)^32 ≈ 0, effectively eliminating
+    // flaky failures we saw with 8 shards.
+    let num_shards: u32 = 32;
     let short_ttl: i64 = 5; // 5 seconds for faster test
 
     // Start two nodes with short TTL
