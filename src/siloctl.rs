@@ -801,7 +801,7 @@ pub async fn validate_config<W: Write>(
 }
 
 /// Compute the lexicographic midpoint of two strings
-fn compute_midpoint(start: &str, end: &str) -> Option<String> {
+pub fn compute_midpoint(start: &str, end: &str) -> Option<String> {
     if start >= end {
         return None;
     }

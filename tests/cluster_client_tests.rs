@@ -2,12 +2,13 @@
 
 mod test_helpers;
 
-use silo::cluster_client::ClusterClient;
+use silo::cluster_client::{ClientConfig, ClusterClient};
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::settings::{Backend, DatabaseTemplate};
 use silo::shard_range::{ShardMap, ShardRange};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Create a test factory with memory backend and a ShardMap
 fn make_test_factory_with_shards(num_shards: u32) -> (Arc<ShardFactory>, ShardMap) {
@@ -612,4 +613,53 @@ async fn cluster_client_query_all_local_shards_with_mixed_results() {
     // Total should be 2 jobs
     let total_rows: i32 = results.iter().map(|r| r.row_count).sum();
     assert_eq!(total_rows, 2, "should have 2 jobs total");
+}
+
+#[silo::test]
+fn test_client_config_default() {
+    let config = ClientConfig::default();
+    assert_eq!(config.connect_timeout, Duration::from_secs(5));
+    assert_eq!(config.request_timeout, Duration::from_secs(30));
+    assert_eq!(config.keepalive_interval, Duration::from_secs(10));
+    assert_eq!(config.keepalive_timeout, Duration::from_secs(5));
+    assert_eq!(config.max_retries, 3);
+    assert_eq!(config.retry_backoff_base, Duration::from_millis(50));
+}
+
+#[silo::test]
+fn test_client_config_unreliable_network() {
+    let config = ClientConfig::for_unreliable_network();
+    assert_eq!(config.request_timeout, Duration::from_secs(10));
+    assert_eq!(config.keepalive_interval, Duration::from_secs(5));
+    assert_eq!(config.keepalive_timeout, Duration::from_secs(3));
+    assert_eq!(config.max_retries, 10);
+}
+
+#[silo::test]
+fn test_client_config_dst() {
+    let config = ClientConfig::for_dst();
+    assert_eq!(config.connect_timeout, Duration::from_secs(2));
+    assert_eq!(config.request_timeout, Duration::from_secs(2));
+    assert_eq!(config.keepalive_interval, Duration::from_secs(1));
+    assert_eq!(config.keepalive_timeout, Duration::from_secs(1));
+}
+
+#[silo::test]
+fn test_backoff_for_attempt() {
+    let config = ClientConfig::default();
+    let base = Duration::from_millis(50);
+
+    // attempt 0: base * 2^0 = base * 1
+    assert_eq!(config.backoff_for_attempt(0), base * 1);
+    // attempt 1: base * 2^1 = base * 2
+    assert_eq!(config.backoff_for_attempt(1), base * 2);
+    // attempt 2: base * 2^2 = base * 4
+    assert_eq!(config.backoff_for_attempt(2), base * 4);
+    // attempt 3: base * 2^3 = base * 8
+    assert_eq!(config.backoff_for_attempt(3), base * 8);
+    // attempt 4: base * 2^4 = base * 16 (cap)
+    assert_eq!(config.backoff_for_attempt(4), base * 16);
+    // attempt 5+: capped at 2^4 = 16
+    assert_eq!(config.backoff_for_attempt(5), base * 16);
+    assert_eq!(config.backoff_for_attempt(100), base * 16);
 }
