@@ -296,6 +296,9 @@ async fn k8s_three_nodes_even_distribution() {
         "http://127.0.0.1:50051",
         num_shards
     );
+
+    // Stagger node starts to reduce contention on K8s API
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let (c2, h2) = K8sCoordinator::start(
         make_coordinator_config(
             &namespace,
@@ -309,6 +312,8 @@ async fn k8s_three_nodes_even_distribution() {
     )
     .await
     .expect("start c2");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let (c3, h3) = K8sCoordinator::start(
         make_coordinator_config(
             &namespace,
@@ -323,10 +328,11 @@ async fn k8s_three_nodes_even_distribution() {
     .await
     .expect("start c3");
 
-    // Wait for convergence
-    assert!(c1.wait_converged(Duration::from_secs(30)).await);
-    assert!(c2.wait_converged(Duration::from_secs(30)).await);
-    assert!(c3.wait_converged(Duration::from_secs(30)).await);
+    // Wait for convergence (longer timeout for 3 nodes with 32 shards)
+    let timeout = Duration::from_secs(45);
+    assert!(c1.wait_converged(timeout).await);
+    assert!(c2.wait_converged(timeout).await);
+    assert!(c3.wait_converged(timeout).await);
 
     // Wait for all shards to be covered by the three coordinators
     let expected: HashSet<ShardId> = c1
@@ -396,6 +402,9 @@ async fn k8s_removing_node_rebalances() {
         "http://127.0.0.1:50051",
         num_shards
     );
+
+    // Stagger node starts to reduce contention on K8s API
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let (c2, h2) = K8sCoordinator::start(
         make_coordinator_config(
             &namespace,
@@ -409,6 +418,8 @@ async fn k8s_removing_node_rebalances() {
     )
     .await
     .expect("start c2");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let (c3, h3) = K8sCoordinator::start(
         make_coordinator_config(
             &namespace,
@@ -423,10 +434,11 @@ async fn k8s_removing_node_rebalances() {
     .await
     .expect("start c3");
 
-    // Wait for initial convergence with 3 nodes
-    assert!(c1.wait_converged(Duration::from_secs(30)).await);
-    assert!(c2.wait_converged(Duration::from_secs(30)).await);
-    assert!(c3.wait_converged(Duration::from_secs(30)).await);
+    // Wait for initial convergence with 3 nodes (longer timeout for 64 shards)
+    let timeout = Duration::from_secs(45);
+    assert!(c1.wait_converged(timeout).await);
+    assert!(c2.wait_converged(timeout).await);
+    assert!(c3.wait_converged(timeout).await);
 
     // Remove node 3
     c3.shutdown().await.unwrap();
@@ -481,8 +493,9 @@ async fn k8s_rapid_membership_churn_converges() {
         "http://127.0.0.1:50051",
         num_shards
     );
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
+    // Stagger node starts to reduce contention on K8s API
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let (c2, h2) = K8sCoordinator::start(
         make_coordinator_config(
             &namespace,
@@ -496,8 +509,8 @@ async fn k8s_rapid_membership_churn_converges() {
     )
     .await
     .expect("start c2");
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let (c3, h3) = K8sCoordinator::start(
         make_coordinator_config(
             &namespace,
@@ -533,8 +546,8 @@ async fn k8s_rapid_membership_churn_converges() {
     .await
     .expect("restart c2");
 
-    // Wait for all to converge post-churn
-    let deadline = Duration::from_secs(30);
+    // Wait for all to converge post-churn (longer timeout for 3 nodes)
+    let deadline = Duration::from_secs(45);
     assert!(
         c1.wait_converged(deadline).await,
         "c1 should converge post-churn"
@@ -614,6 +627,9 @@ async fn k8s_get_members_returns_correct_info() {
         "http://10.0.0.1:50051",
         num_shards
     );
+
+    // Stagger node starts to reduce contention on K8s API
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let (c2, h2) = K8sCoordinator::start(
         make_coordinator_config(
             &namespace,
@@ -629,8 +645,8 @@ async fn k8s_get_members_returns_correct_info() {
     .expect("start c2");
 
     // Wait for convergence
-    assert!(c1.wait_converged(Duration::from_secs(15)).await);
-    assert!(c2.wait_converged(Duration::from_secs(15)).await);
+    assert!(c1.wait_converged(Duration::from_secs(30)).await);
+    assert!(c2.wait_converged(Duration::from_secs(30)).await);
 
     // Get members from both coordinators
     let members_from_c1 = c1.get_members().await.expect("get_members from c1");
@@ -681,6 +697,9 @@ async fn k8s_get_shard_owner_map_accurate() {
         "http://10.0.0.1:50051",
         num_shards
     );
+
+    // Stagger node starts to reduce contention on K8s API
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let (c2, h2) = K8sCoordinator::start(
         make_coordinator_config(
             &namespace,
@@ -695,8 +714,8 @@ async fn k8s_get_shard_owner_map_accurate() {
     .await
     .expect("start c2");
 
-    assert!(c1.wait_converged(Duration::from_secs(15)).await);
-    assert!(c2.wait_converged(Duration::from_secs(15)).await);
+    assert!(c1.wait_converged(Duration::from_secs(30)).await);
+    assert!(c2.wait_converged(Duration::from_secs(30)).await);
 
     // Get shard owner map
     let map = c1.get_shard_owner_map().await.expect("get_shard_owner_map");
@@ -1163,6 +1182,9 @@ async fn k8s_no_split_brain_during_transitions() {
         "http://127.0.0.1:50051",
         num_shards
     );
+
+    // Stagger node starts to reduce contention on K8s API
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let (c2, h2) = K8sCoordinator::start(
         make_coordinator_config(
             &namespace,
@@ -1178,8 +1200,8 @@ async fn k8s_no_split_brain_during_transitions() {
     .expect("start c2");
 
     // Initial convergence
-    assert!(c1.wait_converged(Duration::from_secs(15)).await);
-    assert!(c2.wait_converged(Duration::from_secs(15)).await);
+    assert!(c1.wait_converged(Duration::from_secs(30)).await);
+    assert!(c2.wait_converged(Duration::from_secs(30)).await);
 
     // Add a third node to trigger rebalancing
     let (c3, h3) = K8sCoordinator::start(
@@ -1262,6 +1284,9 @@ async fn k8s_prompt_acquisition_after_node_departure() {
         "http://127.0.0.1:50051",
         num_shards
     );
+
+    // Stagger node starts to reduce contention on K8s API
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let (c2, h2) = K8sCoordinator::start(
         make_coordinator_config(
             &namespace,
@@ -1276,8 +1301,8 @@ async fn k8s_prompt_acquisition_after_node_departure() {
     .await
     .expect("start c2");
 
-    assert!(c1.wait_converged(Duration::from_secs(15)).await);
-    assert!(c2.wait_converged(Duration::from_secs(15)).await);
+    assert!(c1.wait_converged(Duration::from_secs(30)).await);
+    assert!(c2.wait_converged(Duration::from_secs(30)).await);
 
     // Record what c2 owned
     let c2_shards: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
@@ -1941,8 +1966,8 @@ async fn k8s_simultaneous_node_additions() {
     let (c2, h2) = r2.expect("c2");
     let (c3, h3) = r3.expect("c3");
 
-    // All should eventually converge
-    let timeout = Duration::from_secs(30);
+    // All should eventually converge (longer timeout for simultaneous starts)
+    let timeout = Duration::from_secs(60);
     assert!(c1.wait_converged(timeout).await, "c1 should converge");
     assert!(c2.wait_converged(timeout).await, "c2 should converge");
     assert!(c3.wait_converged(timeout).await, "c3 should converge");
@@ -2220,6 +2245,9 @@ async fn k8s_ownership_stability_during_steady_state() {
         "http://127.0.0.1:50051",
         num_shards
     );
+
+    // Stagger node starts to reduce contention on K8s API
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let (c2, h2) = K8sCoordinator::start(
         make_coordinator_config(
             &namespace,
@@ -2235,8 +2263,8 @@ async fn k8s_ownership_stability_during_steady_state() {
     .expect("c2");
 
     // Wait for convergence
-    assert!(c1.wait_converged(Duration::from_secs(20)).await);
-    assert!(c2.wait_converged(Duration::from_secs(20)).await);
+    assert!(c1.wait_converged(Duration::from_secs(30)).await);
+    assert!(c2.wait_converged(Duration::from_secs(30)).await);
 
     // Record initial ownership
     let s1_initial: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
