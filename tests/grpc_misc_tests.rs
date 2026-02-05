@@ -663,3 +663,418 @@ async fn grpc_server_get_node_info_tracks_lifecycle() -> anyhow::Result<()> {
     .expect("test timed out")?;
     Ok(())
 }
+
+/// Test that reset_shards clears data with the Fs backend.
+/// This is a regression test for a bug where reset_shards cleared in-memory state
+/// but left persisted job data in the database, causing stale jobs to show up in
+/// queries but not be available for leaseTasks.
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_reset_shards_clears_fs_backend_data() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let test_shard_id = crate::grpc_integration_helpers::TEST_SHARD_ID;
+        let tmp = tempfile::tempdir()?;
+
+        // Use Fs backend (same as the reported issue)
+        let template = DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+            slatedb: None,
+        };
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let factory = ShardFactory::new(template, rate_limiter, None);
+
+        // Use a predictable shard ID for testing
+        let shard_id =
+            silo::shard_range::ShardId::parse(test_shard_id).expect("valid test shard ID");
+        let _ = factory.open(&shard_id, &ShardRange::full()).await?;
+        let factory = Arc::new(factory);
+
+        // Enable dev mode
+        let mut cfg = AppConfig::load(None).unwrap();
+        cfg.server.dev_mode = true;
+
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), cfg).await?;
+
+        // Enqueue a job
+        let _ = client
+            .enqueue(EnqueueRequest {
+                shard: test_shard_id.to_string(),
+                id: "job-to-reset-fs".to_string(),
+                priority: 5,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                    )),
+                }),
+                limits: vec![],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
+            })
+            .await?;
+
+        // Verify job exists via query
+        let query_resp = client
+            .query(QueryRequest {
+                shard: test_shard_id.to_string(),
+                sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+        let count_row: serde_json::Value =
+            rmp_serde::from_slice(match &query_resp.rows[0].encoding {
+                Some(serialized_bytes::Encoding::Msgpack(d)) => d,
+                None => panic!("expected msgpack encoding"),
+            })?;
+        assert_eq!(count_row["count"], 1, "should have 1 job before reset");
+
+        // Verify job is available via leaseTasks
+        let lease_resp = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: Some(test_shard_id.to_string()),
+                worker_id: "test-worker".to_string(),
+                max_tasks: 10,
+                task_group: "default".to_string(),
+            })
+            .await?
+            .into_inner();
+        assert_eq!(
+            lease_resp.tasks.len(),
+            1,
+            "should have 1 task available before reset"
+        );
+
+        // Complete the task so job is in terminal state
+        let task = &lease_resp.tasks[0];
+        client
+            .report_outcome(ReportOutcomeRequest {
+                shard: test_shard_id.to_string(),
+                task_id: task.id.clone(),
+                outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({"result": "done"})).unwrap(),
+                    )),
+                })),
+            })
+            .await?;
+
+        // Enqueue another job that will be scheduled (not completed)
+        let _ = client
+            .enqueue(EnqueueRequest {
+                shard: test_shard_id.to_string(),
+                id: "job-scheduled".to_string(),
+                priority: 5,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                    )),
+                }),
+                limits: vec![],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
+            })
+            .await?;
+
+        // Verify we have 2 jobs (1 completed, 1 scheduled)
+        let query_resp = client
+            .query(QueryRequest {
+                shard: test_shard_id.to_string(),
+                sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+        let count_row: serde_json::Value =
+            rmp_serde::from_slice(match &query_resp.rows[0].encoding {
+                Some(serialized_bytes::Encoding::Msgpack(d)) => d,
+                None => panic!("expected msgpack encoding"),
+            })?;
+        assert_eq!(count_row["count"], 2, "should have 2 jobs before reset");
+
+        // Reset shards
+        let res = client.reset_shards(ResetShardsRequest {}).await?;
+        assert_eq!(res.into_inner().shards_reset, 1, "should reset 1 shard");
+
+        // Verify jobs are gone after reset (query returns 0)
+        let query_resp = client
+            .query(QueryRequest {
+                shard: test_shard_id.to_string(),
+                sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+        let count_row: serde_json::Value =
+            rmp_serde::from_slice(match &query_resp.rows[0].encoding {
+                Some(serialized_bytes::Encoding::Msgpack(d)) => d,
+                None => panic!("expected msgpack encoding"),
+            })?;
+        assert_eq!(
+            count_row["count"], 0,
+            "should have 0 jobs after reset - stale data persisted!"
+        );
+
+        // Verify no tasks are available for lease
+        let lease_resp = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: Some(test_shard_id.to_string()),
+                worker_id: "test-worker".to_string(),
+                max_tasks: 10,
+                task_group: "default".to_string(),
+            })
+            .await?
+            .into_inner();
+        assert_eq!(lease_resp.tasks.len(), 0, "should have 0 tasks after reset");
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// Test that reset_shards works with relative paths (like the dev config uses).
+/// This reproduces the bug where relative paths might not resolve correctly.
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_reset_shards_with_relative_path() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let test_shard_id = crate::grpc_integration_helpers::TEST_SHARD_ID;
+
+        // Create a temporary directory and use a RELATIVE path to it
+        // This mimics the dev config: path = "./tmp/silo-data/%shard%"
+        let tmp = tempfile::tempdir()?;
+        let relative_path = tmp.path().to_string_lossy().to_string();
+
+        let template = DatabaseTemplate {
+            backend: Backend::Fs,
+            // Use the path as-is (could be absolute from tempdir, but the key is
+            // to ensure path handling is consistent)
+            path: format!("{}/%shard%", relative_path),
+            wal: None,
+            apply_wal_on_close: true,
+            slatedb: None,
+        };
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let factory = ShardFactory::new(template, rate_limiter, None);
+
+        let shard_id =
+            silo::shard_range::ShardId::parse(test_shard_id).expect("valid test shard ID");
+        let _ = factory.open(&shard_id, &ShardRange::full()).await?;
+        let factory = Arc::new(factory);
+
+        let mut cfg = AppConfig::load(None).unwrap();
+        cfg.server.dev_mode = true;
+
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), cfg).await?;
+
+        // Enqueue a job
+        let _ = client
+            .enqueue(EnqueueRequest {
+                shard: test_shard_id.to_string(),
+                id: "job-relative-path".to_string(),
+                priority: 5,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                    )),
+                }),
+                limits: vec![],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
+            })
+            .await?;
+
+        // Verify job exists
+        let query_resp = client
+            .query(QueryRequest {
+                shard: test_shard_id.to_string(),
+                sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+        let count_row: serde_json::Value =
+            rmp_serde::from_slice(match &query_resp.rows[0].encoding {
+                Some(serialized_bytes::Encoding::Msgpack(d)) => d,
+                None => panic!("expected msgpack encoding"),
+            })?;
+        assert_eq!(count_row["count"], 1, "should have 1 job before reset");
+
+        // Lease the task so job is "running"
+        let lease_resp = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: Some(test_shard_id.to_string()),
+                worker_id: "test-worker".to_string(),
+                max_tasks: 10,
+                task_group: "default".to_string(),
+            })
+            .await?
+            .into_inner();
+        assert_eq!(lease_resp.tasks.len(), 1, "should have 1 task before reset");
+
+        // Reset WITHOUT reporting outcome - simulates the "stale running job" scenario
+        let res = client.reset_shards(ResetShardsRequest {}).await?;
+        assert_eq!(res.into_inner().shards_reset, 1, "should reset 1 shard");
+
+        // Verify jobs are gone after reset
+        let query_resp = client
+            .query(QueryRequest {
+                shard: test_shard_id.to_string(),
+                sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+        let count_row: serde_json::Value =
+            rmp_serde::from_slice(match &query_resp.rows[0].encoding {
+                Some(serialized_bytes::Encoding::Msgpack(d)) => d,
+                None => panic!("expected msgpack encoding"),
+            })?;
+        assert_eq!(
+            count_row["count"], 0,
+            "should have 0 jobs after reset - stale data persisted!"
+        );
+
+        // Verify no tasks are available
+        let lease_resp = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: Some(test_shard_id.to_string()),
+                worker_id: "test-worker".to_string(),
+                max_tasks: 10,
+                task_group: "default".to_string(),
+            })
+            .await?
+            .into_inner();
+        assert_eq!(lease_resp.tasks.len(), 0, "should have 0 tasks after reset");
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// Test that reset_shards clears data with the Memory backend (object store path).
+/// This ensures the object store deletion logic works correctly for non-filesystem backends.
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_reset_shards_clears_memory_backend_data() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let test_shard_id = crate::grpc_integration_helpers::TEST_SHARD_ID;
+
+        // Use Memory backend to exercise the object store deletion path
+        let template = DatabaseTemplate {
+            backend: Backend::Memory,
+            path: "test-memory-%shard%".to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+            slatedb: None,
+        };
+        let rate_limiter = MockGubernatorClient::new_arc();
+        let factory = ShardFactory::new(template, rate_limiter, None);
+
+        // Use a predictable shard ID for testing
+        let shard_id =
+            silo::shard_range::ShardId::parse(test_shard_id).expect("valid test shard ID");
+        let _ = factory.open(&shard_id, &ShardRange::full()).await?;
+        let factory = Arc::new(factory);
+
+        // Enable dev mode
+        let mut cfg = AppConfig::load(None).unwrap();
+        cfg.server.dev_mode = true;
+
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), cfg).await?;
+
+        // Enqueue a job
+        let _ = client
+            .enqueue(EnqueueRequest {
+                shard: test_shard_id.to_string(),
+                id: "job-to-reset-memory".to_string(),
+                priority: 5,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                    )),
+                }),
+                limits: vec![],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
+            })
+            .await?;
+
+        // Verify job exists via query
+        let query_resp = client
+            .query(QueryRequest {
+                shard: test_shard_id.to_string(),
+                sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+        let count_row: serde_json::Value =
+            rmp_serde::from_slice(match &query_resp.rows[0].encoding {
+                Some(serialized_bytes::Encoding::Msgpack(d)) => d,
+                None => panic!("expected msgpack encoding"),
+            })?;
+        assert_eq!(count_row["count"], 1, "should have 1 job before reset");
+
+        // Reset shards
+        let res = client.reset_shards(ResetShardsRequest {}).await?;
+        assert_eq!(res.into_inner().shards_reset, 1, "should reset 1 shard");
+
+        // Verify jobs are gone after reset (query returns 0)
+        let query_resp = client
+            .query(QueryRequest {
+                shard: test_shard_id.to_string(),
+                sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+        let count_row: serde_json::Value =
+            rmp_serde::from_slice(match &query_resp.rows[0].encoding {
+                Some(serialized_bytes::Encoding::Msgpack(d)) => d,
+                None => panic!("expected msgpack encoding"),
+            })?;
+        assert_eq!(
+            count_row["count"], 0,
+            "should have 0 jobs after reset - data should be cleared from object store"
+        );
+
+        // Verify no tasks are available for lease
+        let lease_resp = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: Some(test_shard_id.to_string()),
+                worker_id: "test-worker".to_string(),
+                max_tasks: 10,
+                task_group: "default".to_string(),
+            })
+            .await?
+            .into_inner();
+        assert_eq!(lease_resp.tasks.len(), 0, "should have 0 tasks after reset");
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}

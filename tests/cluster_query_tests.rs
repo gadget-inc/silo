@@ -27,7 +27,7 @@ async fn create_multi_shard_factory(
 
     let template = DatabaseTemplate {
         backend: Backend::Fs,
-        path: format!("{}/shard_%shard%", base_path),
+        path: format!("{}/%shard%", base_path),
         wal: None,
         apply_wal_on_close: true,
         slatedb: None,
