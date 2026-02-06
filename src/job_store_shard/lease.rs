@@ -294,8 +294,31 @@ impl JobStoreShard {
             .await
             .map_err(JobStoreShardError::Rkyv)?;
 
+        // Two-phase DST events: emit before write for correct causal ordering,
+        // confirm after write succeeds, cancel if write fails.
+        let write_op = dst_events::next_write_op();
+        dst_events::emit_pending(
+            DstEvent::TaskReleased {
+                tenant: tenant.to_string(),
+                job_id: job_id.clone(),
+                task_id: task_id.to_string(),
+            },
+            write_op,
+        );
+        if let Some(new_status) = new_job_status_for_dst {
+            dst_events::emit_pending(
+                DstEvent::JobStatusChanged {
+                    tenant: tenant.to_string(),
+                    job_id: job_id.clone(),
+                    new_status,
+                },
+                write_op,
+            );
+        }
+
         // Write to DB - if this fails, rollback the in-memory changes
         if let Err(e) = self.db.write(batch).await {
+            dst_events::cancel_write(write_op);
             // Rollback any grants made during retry scheduling
             for (queue, grant_task_id) in &retry_grants {
                 self.concurrency
@@ -305,6 +328,8 @@ impl JobStoreShard {
             self.concurrency.rollback_release_grants(&release_rollbacks);
             return Err(e.into());
         }
+        dst_events::confirm_write(write_op);
+
         if let Err(e) = self.db.flush().await {
             // Write succeeded but flush failed - in-memory is correct, don't rollback
             return Err(e.into());
@@ -314,20 +339,6 @@ impl JobStoreShard {
         // These are done separately to avoid conflicts - see counters.rs for details.
         if pending_counters.increment_completed {
             self.increment_completed_jobs_counter().await?;
-        }
-
-        // Emit DST events after successful commit
-        dst_events::emit(DstEvent::TaskReleased {
-            tenant: tenant.to_string(),
-            job_id: job_id.clone(),
-            task_id: task_id.to_string(),
-        });
-        if let Some(new_status) = new_job_status_for_dst {
-            dst_events::emit(DstEvent::JobStatusChanged {
-                tenant: tenant.to_string(),
-                job_id: job_id.clone(),
-                new_status,
-            });
         }
 
         // Log and wake broker for any releases/grants

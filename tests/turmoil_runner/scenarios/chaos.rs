@@ -716,35 +716,17 @@ pub fn run() {
             // Wait for work to start
             tokio::time::sleep(Duration::from_millis(500)).await;
 
-            // Periodically verify invariants using DST events (no RPCs needed).
-            for check in 0..8 {
+            // Wait for work to proceed (invariant validation happens at the end)
+            for _check in 0..8 {
                 tokio::time::sleep(Duration::from_millis(500)).await;
-
-                // Process DST events from server-side instrumentation
-                verifier_tracker.process_dst_events();
-
-                // Run invariant checks based on server events
-                verifier_tracker.verify_all();
-
-                let enqueued = verifier_enqueued.load(Ordering::SeqCst);
-                let completed = verifier_completed.load(Ordering::SeqCst);
-
-                tracing::trace!(
-                    check = check,
-                    enqueued = enqueued,
-                    completed = completed,
-                    "invariant_check_passed"
-                );
             }
 
             // Wait for work to complete
             tokio::time::sleep(Duration::from_secs(40)).await;
             verifier_done_flag.store(true, Ordering::SeqCst);
 
-            // Process final DST events
-            verifier_tracker.process_dst_events();
-
-            // Final invariant verification
+            // Process all confirmed DST events and validate invariants
+            verifier_tracker.process_and_validate();
             verifier_tracker.verify_all();
             verifier_tracker.jobs.verify_no_terminal_leases();
 

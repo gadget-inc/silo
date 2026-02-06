@@ -513,40 +513,21 @@ pub fn run() {
 
             let mut check = 0u32;
 
-            // Phase 1: Run invariant checks while work is in progress
-            // Continue until all jobs are enqueued and all have reached terminal state
+            // Phase 1: Wait for all jobs to reach terminal state.
+            // Use the terminal event counter as a convergence heuristic (includes pending events).
             loop {
                 tokio::time::sleep(Duration::from_millis(invariant_check_interval_ms)).await;
 
-                // Process DST events from server-side instrumentation
-                verifier_tracker.process_dst_events();
-
-                // Run all invariant checks
-                verifier_tracker.verify_all();
-
                 let enqueued = verifier_enqueued.load(Ordering::SeqCst);
-                let terminal = verifier_tracker.jobs.terminal_count();
+                let terminal = silo::dst_events::terminal_event_count();
                 let enqueueing_complete = verifier_enqueueing_done.load(Ordering::SeqCst);
-
-                // Log concurrency holder counts for each limit
-                for (key, _max_conc) in CONCURRENCY_LIMITS {
-                    let holder_count = verifier_tracker.concurrency.total_holder_count_for_queue(key);
-                    if holder_count > 0 {
-                        tracing::trace!(
-                            check = check,
-                            queue = key,
-                            holders = holder_count,
-                            "concurrency_holders"
-                        );
-                    }
-                }
 
                 tracing::trace!(
                     check = check,
                     enqueued = enqueued,
                     terminal = terminal,
                     enqueueing_complete = enqueueing_complete,
-                    "invariant_check_passed"
+                    "convergence_check"
                 );
 
                 check += 1;
@@ -577,10 +558,8 @@ pub fn run() {
             // Signal workers to stop
             verifier_done_flag.store(true, Ordering::SeqCst);
 
-            // Final event processing
-            verifier_tracker.process_dst_events();
-
-            // Final comprehensive invariant verification
+            // Process all confirmed DST events and validate invariants
+            verifier_tracker.process_and_validate();
             verifier_tracker.verify_all();
             verifier_tracker.jobs.verify_no_terminal_leases();
 

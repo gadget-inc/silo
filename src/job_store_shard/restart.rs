@@ -215,20 +215,31 @@ impl JobStoreShard {
             crate::keys::task_key(&task_group, start_at_ms, priority, id, next_attempt_number);
         txn.put(&task_key, &task_value)?;
 
+        // Two-phase DST event: emit before commit for correct causal ordering,
+        // confirm after commit succeeds.
+        let write_op = dst_events::next_write_op();
+        dst_events::emit_pending(
+            DstEvent::JobStatusChanged {
+                tenant: tenant.to_string(),
+                job_id: id.to_string(),
+                new_status: "Scheduled".to_string(),
+            },
+            write_op,
+        );
+
         // Commit the transaction
-        txn.commit().await?;
+        match txn.commit().await {
+            Ok(()) => dst_events::confirm_write(write_op),
+            Err(e) => {
+                dst_events::cancel_write(write_op);
+                return Err(e.into());
+            }
+        }
 
         // Decrement completed jobs counter - job is going from terminal to scheduled.
         // This is done outside the transaction to avoid conflicts - see counters.rs for details.
         // TODO(slatedb#1254): Move back inside transaction once SlateDB supports key exclusion.
         self.decrement_completed_jobs_counter().await?;
-
-        // Emit DST event after successful commit - job is now back to Scheduled
-        dst_events::emit(DstEvent::JobStatusChanged {
-            tenant: tenant.to_string(),
-            job_id: id.to_string(),
-            new_status: "Scheduled".to_string(),
-        });
 
         // Wake the broker to pick up the new task promptly
         if start_at_ms <= now_epoch_ms() {

@@ -167,24 +167,26 @@ impl JobStoreShard {
             )
             .await?;
 
+        // Two-phase DST event: emit before commit for correct causal ordering,
+        // confirm after commit succeeds, cancel if commit fails.
+        let write_op = dst_events::next_write_op();
+        dst_events::emit_pending(
+            DstEvent::JobEnqueued {
+                tenant: tenant.to_string(),
+                job_id: job_id.to_string(),
+            },
+            write_op,
+        );
+
         // Commit the transaction - if this fails, we need to rollback all in-memory grants
         if let Err(e) = txn.commit().await {
+            dst_events::cancel_write(write_op);
             for (queue, task_id) in &grants {
                 self.concurrency.rollback_grant(tenant, queue, task_id);
             }
             return Err(e.into());
         }
-
-        // Emit DST event IMMEDIATELY after successful commit, before any other async
-        // operations. This is critical for DST: any async operation (including
-        // increment_total_jobs_counter) yields to the scheduler, which could allow
-        // a dequeue to run and lease this job's task before we emit JobEnqueued.
-        // Note: We only emit JobEnqueued, not JobStatusChanged(Scheduled), because
-        // job_enqueued() already records the Scheduled status.
-        dst_events::emit(DstEvent::JobEnqueued {
-            tenant: tenant.to_string(),
-            job_id: job_id.to_string(),
-        });
+        dst_events::confirm_write(write_op);
 
         // Increment total jobs counter for this shard.
         // This is done outside the transaction to avoid conflicts - see counters.rs for details.

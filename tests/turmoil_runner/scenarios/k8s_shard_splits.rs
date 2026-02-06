@@ -1275,24 +1275,9 @@ pub fn run() {
         sim.client("verifier", async move {
             tokio::time::sleep(Duration::from_millis(1000)).await;
 
-            // Phase 1: Verify invariants while splits are happening
+            // Phase 1: Wait for splits to complete
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
-
-                verifier_tracker.process_dst_events();
-                verifier_tracker.verify_all();
-
-                let enqueued = verifier_enqueued.load(Ordering::SeqCst);
-                let completed = verifier_completed.load(Ordering::SeqCst);
-                let current_shards = verifier_current_shards.load(Ordering::SeqCst);
-
-                tracing::trace!(
-                    enqueued = enqueued,
-                    completed = completed,
-                    current_shards = current_shards,
-                    splits_done = verifier_splits_done.load(Ordering::SeqCst),
-                    "invariant_check_passed"
-                );
 
                 if verifier_splits_done.load(Ordering::SeqCst) {
                     tracing::info!("splits done, entering convergence phase");
@@ -1308,9 +1293,6 @@ pub fn run() {
 
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-
-                verifier_tracker.process_dst_events();
-                verifier_tracker.verify_all();
 
                 let enqueued = verifier_enqueued.load(Ordering::SeqCst);
                 let completed = verifier_completed.load(Ordering::SeqCst);
@@ -1370,8 +1352,8 @@ pub fn run() {
 
             tokio::time::sleep(Duration::from_secs(2)).await;
 
-            // Final verification
-            verifier_tracker.process_dst_events();
+            // Final verification - process all confirmed DST events
+            verifier_tracker.process_and_validate();
             verifier_tracker.verify_all();
             verifier_tracker.jobs.verify_no_terminal_leases();
 

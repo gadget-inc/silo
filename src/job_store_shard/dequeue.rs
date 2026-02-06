@@ -518,8 +518,32 @@ impl JobStoreShard {
                 }
             }
 
+            // Two-phase DST events: emit before write for correct causal ordering,
+            // confirm after write succeeds, cancel if write fails.
+            let write_op = dst_events::next_write_op();
+            for (tenant, job_id, task_id) in leased_tasks_for_dst.drain(..) {
+                dst_events::emit_pending(
+                    DstEvent::TaskLeased {
+                        tenant: tenant.clone(),
+                        job_id: job_id.clone(),
+                        task_id,
+                        worker_id: worker_id.to_string(),
+                    },
+                    write_op,
+                );
+                dst_events::emit_pending(
+                    DstEvent::JobStatusChanged {
+                        tenant,
+                        job_id,
+                        new_status: "Running".to_string(),
+                    },
+                    write_op,
+                );
+            }
+
             // Try to commit durable state. On failure, rollback grants and requeue tasks.
             if let Err(e) = self.db.write(batch).await {
+                dst_events::cancel_write(write_op);
                 // Rollback all grants made during this iteration
                 for (tenant, queue, task_id) in &grants_to_rollback {
                     self.concurrency.rollback_grant(tenant, queue, task_id);
@@ -531,6 +555,8 @@ impl JobStoreShard {
                 self.broker.requeue(claimed);
                 return Err(JobStoreShardError::Slate(e));
             }
+            dst_events::confirm_write(write_op);
+
             if let Err(e) = self.db.flush().await {
                 // Write succeeded but flush failed - in-memory is correct, don't rollback
                 self.broker.requeue(claimed);
@@ -545,21 +571,6 @@ impl JobStoreShard {
             // DB write succeeded - clear rollback lists for next iteration
             grants_to_rollback.clear();
             release_grants_to_rollback.clear();
-
-            // Emit DST events for leased tasks after successful commit
-            for (tenant, job_id, task_id) in leased_tasks_for_dst.drain(..) {
-                dst_events::emit(DstEvent::TaskLeased {
-                    tenant: tenant.clone(),
-                    job_id: job_id.clone(),
-                    task_id,
-                    worker_id: worker_id.to_string(),
-                });
-                dst_events::emit(DstEvent::JobStatusChanged {
-                    tenant,
-                    job_id,
-                    new_status: "Running".to_string(),
-                });
-            }
 
             // [SILO-DEQ-3] Ack durable and evict from buffer; we no longer use TTL tombstones.
             self.broker.ack_durable(&ack_keys);

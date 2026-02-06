@@ -201,15 +201,9 @@ pub fn run() {
             while start.elapsed().as_secs() < MAX_WAIT_SECS {
                 tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
 
-                // Process DST events from server-side instrumentation
-                verifier_tracker.process_dst_events();
-
                 let enqueued = verifier_enqueued.load(Ordering::SeqCst);
                 let completed = verifier_completed.load(Ordering::SeqCst);
-                let terminal = verifier_tracker.jobs.terminal_count();
-
-                // Run invariant checks on each poll
-                verifier_tracker.verify_all();
+                let terminal = silo::dst_events::terminal_event_count();
 
                 // Check if progress has been made
                 if completed > 0 || terminal > 0 {
@@ -240,8 +234,8 @@ pub fn run() {
                 }
             }
 
-            // Final state check
-            verifier_tracker.process_dst_events();
+            // Process all confirmed DST events and validate invariants
+            verifier_tracker.process_and_validate();
             let enqueued = verifier_enqueued.load(Ordering::SeqCst);
             let completed = verifier_completed.load(Ordering::SeqCst);
             let terminal = verifier_tracker.jobs.terminal_count();
@@ -254,7 +248,6 @@ pub fn run() {
                 "verification_results"
             );
 
-            // Run final invariant checks
             verifier_tracker.verify_all();
             verifier_tracker.jobs.verify_no_terminal_leases();
 
