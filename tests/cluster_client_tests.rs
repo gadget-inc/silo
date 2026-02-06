@@ -1,12 +1,17 @@
 //! Unit tests for ClusterClient
 
+mod grpc_integration_helpers;
 mod test_helpers;
 
-use silo::cluster_client::{ClientConfig, ClusterClient};
+use silo::cluster_client::{ClientConfig, ClusterClient, ClusterNodeInfo, NodeInfo, ShardNodeInfo};
+use silo::coordination::NoneCoordinator;
+use silo::coordination::split::SplitCleanupStatus;
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
-use silo::settings::{Backend, DatabaseTemplate};
-use silo::shard_range::{ShardMap, ShardRange};
+use silo::settings::{
+    AppConfig, Backend, DatabaseTemplate, GubernatorSettings, LoggingConfig, WebUiConfig,
+};
+use silo::shard_range::{ShardId, ShardMap, ShardRange};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -662,4 +667,456 @@ fn test_backoff_for_attempt() {
     // attempt 5+: capped at 2^4 = 16
     assert_eq!(config.backoff_for_attempt(5), base * 16);
     assert_eq!(config.backoff_for_attempt(100), base * 16);
+}
+
+// === ClusterNodeInfo in-memory tests ===
+
+#[silo::test]
+fn cluster_node_info_get_shard_info() {
+    let shard_id_1 = ShardId::new();
+    let shard_id_2 = ShardId::new();
+    let unknown_id = ShardId::new();
+
+    let info = ClusterNodeInfo {
+        nodes: vec![NodeInfo {
+            node_id: "node-a".to_string(),
+            shards: vec![
+                ShardNodeInfo {
+                    shard_id: shard_id_1,
+                    total_jobs: 100,
+                    completed_jobs: 50,
+                    cleanup_status: SplitCleanupStatus::CompactionDone,
+                    created_at_ms: 1000,
+                    cleanup_completed_at_ms: 0,
+                },
+                ShardNodeInfo {
+                    shard_id: shard_id_2,
+                    total_jobs: 200,
+                    completed_jobs: 75,
+                    cleanup_status: SplitCleanupStatus::CompactionDone,
+                    created_at_ms: 2000,
+                    cleanup_completed_at_ms: 0,
+                },
+            ],
+        }],
+    };
+
+    // Found cases
+    let found = info.get_shard_info(&shard_id_1);
+    assert!(found.is_some());
+    assert_eq!(found.unwrap().total_jobs, 100);
+
+    let found2 = info.get_shard_info(&shard_id_2);
+    assert!(found2.is_some());
+    assert_eq!(found2.unwrap().total_jobs, 200);
+
+    // Not found
+    assert!(info.get_shard_info(&unknown_id).is_none());
+}
+
+#[silo::test]
+fn cluster_node_info_shard_info_map() {
+    let shard_id_1 = ShardId::new();
+    let shard_id_2 = ShardId::new();
+    let shard_id_3 = ShardId::new();
+
+    let info = ClusterNodeInfo {
+        nodes: vec![
+            NodeInfo {
+                node_id: "node-a".to_string(),
+                shards: vec![ShardNodeInfo {
+                    shard_id: shard_id_1,
+                    total_jobs: 10,
+                    completed_jobs: 5,
+                    cleanup_status: SplitCleanupStatus::CompactionDone,
+                    created_at_ms: 1000,
+                    cleanup_completed_at_ms: 0,
+                }],
+            },
+            NodeInfo {
+                node_id: "node-b".to_string(),
+                shards: vec![
+                    ShardNodeInfo {
+                        shard_id: shard_id_2,
+                        total_jobs: 20,
+                        completed_jobs: 10,
+                        cleanup_status: SplitCleanupStatus::CompactionDone,
+                        created_at_ms: 2000,
+                        cleanup_completed_at_ms: 0,
+                    },
+                    ShardNodeInfo {
+                        shard_id: shard_id_3,
+                        total_jobs: 30,
+                        completed_jobs: 15,
+                        cleanup_status: SplitCleanupStatus::CompactionDone,
+                        created_at_ms: 3000,
+                        cleanup_completed_at_ms: 0,
+                    },
+                ],
+            },
+        ],
+    };
+
+    let map = info.shard_info_map();
+    assert_eq!(map.len(), 3);
+    assert_eq!(map.get(&shard_id_1).unwrap().total_jobs, 10);
+    assert_eq!(map.get(&shard_id_2).unwrap().total_jobs, 20);
+    assert_eq!(map.get(&shard_id_3).unwrap().total_jobs, 30);
+}
+
+// === Helper for creating a test AppConfig ===
+
+fn make_test_app_config(tmp: &tempfile::TempDir) -> AppConfig {
+    AppConfig {
+        server: Default::default(),
+        coordination: Default::default(),
+        tenancy: silo::settings::TenancyConfig { enabled: true },
+        gubernator: GubernatorSettings::default(),
+        webui: WebUiConfig::default(),
+        logging: LoggingConfig::default(),
+        metrics: silo::settings::MetricsConfig::default(),
+        database: DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+            slatedb: None,
+        },
+    }
+}
+
+// === Remote gRPC tests ===
+
+#[silo::test(flavor = "multi_thread")]
+async fn cluster_client_remote_query_shard() {
+    let (server_factory, _tmp) = grpc_integration_helpers::create_test_factory()
+        .await
+        .unwrap();
+    let server_tmp = tempfile::tempdir().unwrap();
+    let config = make_test_app_config(&server_tmp);
+    let (_, shutdown_tx, server_task, server_addr) =
+        grpc_integration_helpers::setup_test_server(server_factory.clone(), config)
+            .await
+            .unwrap();
+
+    let shard_id = ShardId::parse(grpc_integration_helpers::TEST_SHARD_ID).unwrap();
+
+    // Enqueue a job on the server
+    let shard = server_factory.get(&shard_id).unwrap();
+    shard
+        .enqueue(
+            "test-tenant",
+            Some("remote-query-job".to_string()),
+            5,
+            test_helpers::now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"remote": true})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .unwrap();
+
+    // Create a coordinator that knows the shard lives at the server's address
+    let coordinator = Arc::new(
+        NoneCoordinator::from_factory(
+            "test-node",
+            format!("http://{}", server_addr),
+            server_factory.clone(),
+        )
+        .await,
+    );
+
+    // Create a cluster client with an empty local factory but the coordinator
+    // that knows shards belong to the server
+    let empty_factory = Arc::new(ShardFactory::new_noop());
+    let client = ClusterClient::new(empty_factory, Some(coordinator));
+
+    // Query should go remote since our factory doesn't have the shard
+    let result = client
+        .query_shard(&shard_id, "SELECT id FROM jobs")
+        .await
+        .expect("remote query should succeed");
+
+    assert_eq!(result.shard_id, shard_id);
+    assert_eq!(result.row_count, 1);
+
+    grpc_integration_helpers::shutdown_server(shutdown_tx, server_task)
+        .await
+        .unwrap();
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn cluster_client_remote_get_job() {
+    let (server_factory, _tmp) = grpc_integration_helpers::create_test_factory()
+        .await
+        .unwrap();
+    let server_tmp = tempfile::tempdir().unwrap();
+    let config = make_test_app_config(&server_tmp);
+    let (_, shutdown_tx, server_task, server_addr) =
+        grpc_integration_helpers::setup_test_server(server_factory.clone(), config)
+            .await
+            .unwrap();
+
+    let shard_id = ShardId::parse(grpc_integration_helpers::TEST_SHARD_ID).unwrap();
+
+    // Enqueue a job on the server
+    let shard = server_factory.get(&shard_id).unwrap();
+    shard
+        .enqueue(
+            "test-tenant",
+            Some("remote-get-job".to_string()),
+            7,
+            test_helpers::now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"data": "hello"})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .unwrap();
+
+    let coordinator = Arc::new(
+        NoneCoordinator::from_factory(
+            "test-node",
+            format!("http://{}", server_addr),
+            server_factory.clone(),
+        )
+        .await,
+    );
+    let empty_factory = Arc::new(ShardFactory::new_noop());
+    let client = ClusterClient::new(empty_factory, Some(coordinator));
+
+    let response = client
+        .get_job(&shard_id, "test-tenant", "remote-get-job", false)
+        .await
+        .expect("remote get_job should succeed");
+
+    assert_eq!(response.id, "remote-get-job");
+    assert_eq!(response.priority, 7);
+
+    grpc_integration_helpers::shutdown_server(shutdown_tx, server_task)
+        .await
+        .unwrap();
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn cluster_client_remote_get_job_not_found() {
+    let (server_factory, _tmp) = grpc_integration_helpers::create_test_factory()
+        .await
+        .unwrap();
+    let server_tmp = tempfile::tempdir().unwrap();
+    let config = make_test_app_config(&server_tmp);
+    let (_, shutdown_tx, server_task, server_addr) =
+        grpc_integration_helpers::setup_test_server(server_factory.clone(), config)
+            .await
+            .unwrap();
+
+    let shard_id = ShardId::parse(grpc_integration_helpers::TEST_SHARD_ID).unwrap();
+
+    let coordinator = Arc::new(
+        NoneCoordinator::from_factory(
+            "test-node",
+            format!("http://{}", server_addr),
+            server_factory.clone(),
+        )
+        .await,
+    );
+    let empty_factory = Arc::new(ShardFactory::new_noop());
+    let client = ClusterClient::new(empty_factory, Some(coordinator));
+
+    let result = client
+        .get_job(&shard_id, "test-tenant", "nonexistent", false)
+        .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, silo::cluster_client::ClusterClientError::JobNotFound),
+        "expected JobNotFound, got {:?}",
+        err
+    );
+
+    grpc_integration_helpers::shutdown_server(shutdown_tx, server_task)
+        .await
+        .unwrap();
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn cluster_client_remote_cancel_job() {
+    let (server_factory, _tmp) = grpc_integration_helpers::create_test_factory()
+        .await
+        .unwrap();
+    let server_tmp = tempfile::tempdir().unwrap();
+    let config = make_test_app_config(&server_tmp);
+    let (_, shutdown_tx, server_task, server_addr) =
+        grpc_integration_helpers::setup_test_server(server_factory.clone(), config)
+            .await
+            .unwrap();
+
+    let shard_id = ShardId::parse(grpc_integration_helpers::TEST_SHARD_ID).unwrap();
+
+    // Enqueue a future job so it can be cancelled
+    let shard = server_factory.get(&shard_id).unwrap();
+    shard
+        .enqueue(
+            "test-tenant",
+            Some("remote-cancel-job".to_string()),
+            5,
+            test_helpers::now_ms() + 60_000,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .unwrap();
+
+    let coordinator = Arc::new(
+        NoneCoordinator::from_factory(
+            "test-node",
+            format!("http://{}", server_addr),
+            server_factory.clone(),
+        )
+        .await,
+    );
+    let empty_factory = Arc::new(ShardFactory::new_noop());
+    let client = ClusterClient::new(empty_factory, Some(coordinator));
+
+    client
+        .cancel_job(&shard_id, "test-tenant", "remote-cancel-job")
+        .await
+        .expect("remote cancel should succeed");
+
+    grpc_integration_helpers::shutdown_server(shutdown_tx, server_task)
+        .await
+        .unwrap();
+}
+
+// === get_all_node_info tests ===
+
+#[silo::test(flavor = "multi_thread")]
+async fn cluster_client_get_all_node_info_local() {
+    let (server_factory, _tmp) = grpc_integration_helpers::create_test_factory()
+        .await
+        .unwrap();
+    let shard_id = ShardId::parse(grpc_integration_helpers::TEST_SHARD_ID).unwrap();
+
+    let coordinator = Arc::new(
+        NoneCoordinator::from_factory("test-node", "http://127.0.0.1:0", server_factory.clone())
+            .await,
+    );
+
+    let client = ClusterClient::new(server_factory.clone(), Some(coordinator));
+
+    let cluster_info = client
+        .get_all_node_info()
+        .await
+        .expect("get_all_node_info should succeed");
+
+    assert_eq!(cluster_info.nodes.len(), 1);
+    assert_eq!(cluster_info.nodes[0].node_id, "test-node");
+    assert_eq!(cluster_info.nodes[0].shards.len(), 1);
+    assert_eq!(cluster_info.nodes[0].shards[0].shard_id, shard_id);
+}
+
+#[silo::test]
+async fn cluster_client_get_all_node_info_no_coordinator() {
+    let factory = Arc::new(ShardFactory::new_noop());
+    let client = ClusterClient::new(factory, None);
+
+    let result = client.get_all_node_info().await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, silo::cluster_client::ClusterClientError::NoCoordinator),
+        "expected NoCoordinator, got {:?}",
+        err
+    );
+}
+
+// === Connection caching tests ===
+
+#[silo::test(flavor = "multi_thread")]
+async fn cluster_client_connection_caching() {
+    let (server_factory, _tmp) = grpc_integration_helpers::create_test_factory()
+        .await
+        .unwrap();
+    let server_tmp = tempfile::tempdir().unwrap();
+    let config = make_test_app_config(&server_tmp);
+    let (_, shutdown_tx, server_task, server_addr) =
+        grpc_integration_helpers::setup_test_server(server_factory.clone(), config)
+            .await
+            .unwrap();
+
+    let shard_id = ShardId::parse(grpc_integration_helpers::TEST_SHARD_ID).unwrap();
+
+    let coordinator = Arc::new(
+        NoneCoordinator::from_factory(
+            "test-node",
+            format!("http://{}", server_addr),
+            server_factory.clone(),
+        )
+        .await,
+    );
+    let empty_factory = Arc::new(ShardFactory::new_noop());
+    let client = ClusterClient::new(empty_factory, Some(coordinator));
+
+    // First query - creates connection
+    let result1 = client
+        .query_shard(&shard_id, "SELECT id FROM jobs")
+        .await
+        .expect("first query should succeed");
+    assert_eq!(result1.row_count, 0);
+
+    // Second query - should reuse cached connection
+    let result2 = client
+        .query_shard(&shard_id, "SELECT id FROM jobs")
+        .await
+        .expect("second query should succeed");
+    assert_eq!(result2.row_count, 0);
+
+    // Invalidate connection
+    client.invalidate_connection(&format!("http://{}", server_addr));
+
+    // Third query - should reconnect
+    let result3 = client
+        .query_shard(&shard_id, "SELECT id FROM jobs")
+        .await
+        .expect("third query after invalidation should succeed");
+    assert_eq!(result3.row_count, 0);
+
+    grpc_integration_helpers::shutdown_server(shutdown_tx, server_task)
+        .await
+        .unwrap();
+}
+
+// === create_silo_client connection failure ===
+
+#[silo::test(flavor = "multi_thread")]
+async fn create_silo_client_connection_failure() {
+    let config = ClientConfig {
+        connect_timeout: Duration::from_millis(100),
+        request_timeout: Duration::from_millis(100),
+        keepalive_interval: Duration::from_secs(1),
+        keepalive_timeout: Duration::from_secs(1),
+        max_retries: 1,
+        retry_backoff_base: Duration::from_millis(10),
+    };
+
+    // Try to connect to a port that nothing is listening on
+    let result = silo::cluster_client::create_silo_client("http://127.0.0.1:1", &config).await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            silo::cluster_client::ClusterClientError::ConnectionFailed(_, _)
+        ),
+        "expected ConnectionFailed, got {:?}",
+        err
+    );
 }
