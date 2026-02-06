@@ -255,42 +255,37 @@ impl TaskBroker {
     /// Claim up to `max` ready tasks from the head of the buffer for a specific task_group.
     pub fn claim_ready(&self, task_group: &str, max: usize) -> Vec<BrokerTask> {
         use crate::keys::task_group_prefix;
-        let mut claimed = Vec::with_capacity(max);
         let prefix = task_group_prefix(task_group);
 
-        while claimed.len() < max {
-            // Find the first claimable entry for this task_group
-            let candidate_key = self.buffer.iter().find_map(|entry| {
+        // Collect candidate keys in a single scan while holding the inflight lock once.
+        // This avoids O(N*M) repeated full scans from the beginning and reduces mutex acquisitions.
+        let candidate_keys: Vec<Vec<u8>> = {
+            let mut inflight = self.inflight.lock().unwrap();
+            let mut keys = Vec::with_capacity(max);
+            for entry in self.buffer.iter() {
+                if keys.len() >= max {
+                    break;
+                }
                 let key = entry.key();
-
-                // Skip if not in the requested task_group
                 if !key.starts_with(&prefix) {
-                    return None;
+                    continue;
                 }
-
-                // Skip if inflight
-                if self.inflight.lock().unwrap().contains(key) {
-                    return None;
+                if inflight.contains(key) {
+                    continue;
                 }
-
-                // Let RequestTickets through to dequeue where max_concurrency will be checked properly
-                // (we can't check here because we don't know the max_concurrency without loading the job)
-
-                Some(key.clone())
-            });
-
-            let Some(key) = candidate_key else { break };
-
-            // Reserve as inflight
-            if !self.inflight.lock().unwrap().insert(key.clone()) {
-                continue; // Lost race, try again
+                inflight.insert(key.clone());
+                keys.push(key.clone());
             }
+            keys
+        };
 
-            // Remove from buffer
+        // Remove claimed entries from buffer
+        let mut claimed = Vec::with_capacity(candidate_keys.len());
+        for key in candidate_keys {
             if let Some(entry) = self.buffer.remove(&key) {
                 claimed.push(entry.value().clone());
             } else {
-                // Removal failed, clear inflight reservation
+                // Entry was removed between scan and removal, undo inflight reservation
                 self.inflight.lock().unwrap().remove(&key);
             }
         }
