@@ -410,3 +410,181 @@ async fn dequeue_gracefully_handles_missing_job_info() {
         "no lease should be created for orphaned task"
     );
 }
+
+/// Reproducer: enqueue with start_at_ms=0 should be immediately leasable.
+/// The proto says "0 = run immediately", and the server converts this to now_ms
+/// for the job status, but the task key still uses 0. The broker scanner should
+/// still pick up tasks with start_time_ms=0 since 0 <= now_ms.
+#[silo::test]
+async fn enqueue_with_start_at_ms_zero_is_immediately_leasable() {
+    with_timeout!(10000, {
+        let (_tmp, shard) = open_temp_shard().await;
+        let payload = msgpack_payload(&serde_json::json!({"hello": "world"}));
+
+        // Enqueue with start_at_ms = 0 (proto default, means "run immediately")
+        let job_id = shard
+            .enqueue(
+                "-",
+                Some("test-job-zero".to_string()),
+                1,
+                0,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue should succeed");
+
+        assert_eq!(job_id, "test-job-zero");
+
+        // Verify job status is Scheduled
+        let status = shard
+            .get_job_status("-", &job_id)
+            .await
+            .expect("get status")
+            .expect("status exists");
+        assert_eq!(status.kind, JobStatusKind::Scheduled);
+
+        // Try to dequeue - should return the task
+        let result = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue should succeed");
+
+        assert_eq!(
+            result.tasks.len(),
+            1,
+            "expected 1 task from dequeue, got {} (job with start_at_ms=0 was not brokered)",
+            result.tasks.len()
+        );
+
+        let task = &result.tasks[0];
+        assert_eq!(task.job().id(), "test-job-zero");
+
+        // Verify status transitioned to Running
+        let status = shard
+            .get_job_status("-", &job_id)
+            .await
+            .expect("get status")
+            .expect("status exists");
+        assert_eq!(status.kind, JobStatusKind::Running);
+    });
+}
+
+/// Test that enqueue with a specific tenant and start_at_ms=0 is leasable
+/// (matches the external integration test scenario).
+#[silo::test]
+async fn enqueue_with_tenant_and_start_at_ms_zero_is_leasable() {
+    with_timeout!(10000, {
+        let (_tmp, shard) = open_temp_shard().await;
+        let payload = msgpack_payload(&serde_json::json!({"hello": "world"}));
+
+        // Use a specific tenant like the external test
+        let tenant = "test-tenant-1";
+        let task_group = "test-task-group";
+
+        let job_id = shard
+            .enqueue(
+                tenant,
+                Some("test-job-tenant".to_string()),
+                1,
+                0,
+                None,
+                payload,
+                vec![],
+                None,
+                task_group,
+            )
+            .await
+            .expect("enqueue should succeed");
+
+        // Verify job status
+        let status = shard
+            .get_job_status(tenant, &job_id)
+            .await
+            .expect("get status")
+            .expect("status exists");
+        assert_eq!(status.kind, JobStatusKind::Scheduled);
+
+        // Verify task exists in the database
+        let task_count = count_task_keys(shard.db()).await;
+        assert_eq!(task_count, 1, "expected 1 task in database");
+
+        // Dequeue with the matching task group
+        let result = shard
+            .dequeue("worker-1", task_group, 1)
+            .await
+            .expect("dequeue should succeed");
+
+        assert_eq!(
+            result.tasks.len(),
+            1,
+            "expected 1 task from dequeue with tenant={} task_group={}, got {}",
+            tenant,
+            task_group,
+            result.tasks.len()
+        );
+    });
+}
+
+/// Test that peek_tasks also finds tasks with start_at_ms=0
+#[silo::test]
+async fn peek_tasks_finds_start_at_ms_zero() {
+    with_timeout!(10000, {
+        let (_tmp, shard) = open_temp_shard().await;
+        let payload = msgpack_payload(&serde_json::json!({"test": true}));
+
+        shard
+            .enqueue("-", None, 1, 0, None, payload, vec![], None, "default")
+            .await
+            .expect("enqueue should succeed");
+
+        // peek_tasks reads directly from the DB (not the broker buffer)
+        let tasks = shard
+            .peek_tasks("default", 10)
+            .await
+            .expect("peek should succeed");
+
+        assert_eq!(
+            tasks.len(),
+            1,
+            "peek_tasks should find task with start_at_ms=0, got {}",
+            tasks.len()
+        );
+    });
+}
+
+/// Verify enqueue with start_at_ms=now works (control test - this already works)
+#[silo::test]
+async fn enqueue_with_start_at_ms_now_is_leasable() {
+    with_timeout!(10000, {
+        let (_tmp, shard) = open_temp_shard().await;
+        let payload = msgpack_payload(&serde_json::json!({"hello": "world"}));
+        let now = now_ms();
+
+        shard
+            .enqueue(
+                "-",
+                Some("test-job-now".to_string()),
+                1,
+                now,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue should succeed");
+
+        let result = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue should succeed");
+
+        assert_eq!(result.tasks.len(), 1);
+        assert_eq!(result.tasks[0].job().id(), "test-job-now");
+    });
+}

@@ -2887,3 +2887,101 @@ async fn etcd_orphaned_ring_shard_remains_unowned() {
     coord.shutdown().await.unwrap();
     handle.abort();
 }
+
+/// Test that in-flight shard acquisitions are cancelled during reconciliation.
+///
+/// Scenario: node-1 and node-2 converge with 12 shards split between them.
+/// node-2 departs, so node-1 begins acquiring node-2's former shards. Before
+/// node-1 finishes, node-3 joins. node-1 must cancel in-flight acquisitions
+/// for shards that now belong to node-3 and converge quickly.
+///
+/// Without the fix (cancelling Acquiring-phase guards), node-1's guards would
+/// keep competing for locks they no longer need, causing convergence to hang.
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn etcd_reconciliation_cancels_in_flight_acquisitions() {
+    let prefix = unique_prefix();
+    let num_shards: u32 = 12;
+    let endpoints = get_etcd_endpoints();
+
+    // Start two nodes and converge
+    let (c1, h1) = start_etcd_coordinator!(&prefix, "node-1", "http://127.0.0.1:50051", num_shards);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (c2, h2) = EtcdCoordinator::start(
+        &endpoints,
+        &prefix,
+        "node-2",
+        "http://127.0.0.1:50052",
+        num_shards,
+        10,
+        make_test_factory("node-2"),
+        Vec::new(),
+    )
+    .await
+    .expect("start c2");
+
+    assert!(
+        c1.wait_converged(Duration::from_secs(30)).await,
+        "initial c1 converge"
+    );
+    assert!(
+        c2.wait_converged(Duration::from_secs(30)).await,
+        "initial c2 converge"
+    );
+
+    let c1_initial = c1.owned_shards().await.len();
+    let c2_initial = c2.owned_shards().await.len();
+    assert_eq!(c1_initial + c2_initial, num_shards as usize);
+
+    // Shut down node-2. node-1 will start acquiring node-2's former shards.
+    c2.shutdown().await.unwrap();
+    h2.abort();
+
+    // Immediately start node-3 before node-1 finishes acquiring all of node-2's shards.
+    // This forces node-1 to cancel in-flight acquisitions for shards that should go to node-3.
+    let (c3, h3) = EtcdCoordinator::start(
+        &endpoints,
+        &prefix,
+        "node-3",
+        "http://127.0.0.1:50053",
+        num_shards,
+        10,
+        make_test_factory("node-3"),
+        Vec::new(),
+    )
+    .await
+    .expect("start c3");
+
+    // Both nodes should converge within a reasonable time.
+    // Without the in-flight cancellation fix, this would hang because node-1's
+    // guards would be stuck in the Acquiring phase competing for locks that
+    // node-3 now needs.
+    let timeout = Duration::from_secs(30);
+    assert!(
+        c1.wait_converged(timeout).await,
+        "c1 should converge after node-3 joins (in-flight acquisitions should be cancelled)"
+    );
+    assert!(
+        c3.wait_converged(timeout).await,
+        "c3 should converge after joining"
+    );
+
+    // Validate ownership: all shards covered, no overlap
+    let s1: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    let s3: HashSet<ShardId> = c3.owned_shards().await.into_iter().collect();
+    let all: HashSet<ShardId> = s1.union(&s3).copied().collect();
+    let expected: HashSet<ShardId> = c1
+        .get_shard_map()
+        .await
+        .unwrap()
+        .shard_ids()
+        .into_iter()
+        .collect();
+    assert_eq!(all, expected, "all shards should be covered");
+    assert!(s1.is_disjoint(&s3), "ownership should be disjoint");
+
+    // Cleanup
+    c1.shutdown().await.unwrap();
+    c3.shutdown().await.unwrap();
+    h1.abort();
+    h3.abort();
+}
