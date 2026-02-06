@@ -1,5 +1,6 @@
 //! Lease management: heartbeat, outcome reporting, and expired lease reaping.
 
+use slatedb::config::WriteOptions;
 use slatedb::{DbIterator, WriteBatch};
 use uuid::Uuid;
 
@@ -67,8 +68,14 @@ impl JobStoreShard {
 
         let mut batch = WriteBatch::new();
         batch.put(&key, &value);
-        self.db.write(batch).await?;
-        self.db.flush().await?;
+        self.db
+            .write_with_options(
+                batch,
+                &WriteOptions {
+                    await_durable: true,
+                },
+            )
+            .await?;
 
         // Check cancellation status to return in response
         // Worker discovers cancellation via heartbeat response per Alloy spec
@@ -316,8 +323,18 @@ impl JobStoreShard {
             );
         }
 
-        // Write to DB - if this fails, rollback the in-memory changes
-        if let Err(e) = self.db.write(batch).await {
+        // Commit durable state — write_with_options with await_durable:true blocks
+        // until the WAL is flushed to object storage, so no separate flush is needed.
+        if let Err(e) = self
+            .db
+            .write_with_options(
+                batch,
+                &WriteOptions {
+                    await_durable: true,
+                },
+            )
+            .await
+        {
             dst_events::cancel_write(write_op);
             // Rollback any grants made during retry scheduling
             for (queue, grant_task_id) in &retry_grants {
@@ -329,11 +346,6 @@ impl JobStoreShard {
             return Err(e.into());
         }
         dst_events::confirm_write(write_op);
-
-        if let Err(e) = self.db.flush().await {
-            // Write succeeded but flush failed - in-memory is correct, don't rollback
-            return Err(e.into());
-        }
 
         // Execute pending counter operations after successful DB write.
         // These are done separately to avoid conflicts - see counters.rs for details.

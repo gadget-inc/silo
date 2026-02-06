@@ -1,5 +1,6 @@
 //! Task dequeue and processing operations.
 
+use slatedb::config::WriteOptions;
 use slatedb::{DbIterator, WriteBatch};
 
 use crate::codec::{decode_task, encode_attempt, encode_lease};
@@ -530,8 +531,18 @@ impl JobStoreShard {
                 );
             }
 
-            // Try to commit durable state. On failure, rollback grants and requeue tasks.
-            if let Err(e) = self.db.write(batch).await {
+            // Commit durable state — write_with_options with await_durable:true blocks
+            // until the WAL is flushed to object storage, so no separate flush is needed.
+            if let Err(e) = self
+                .db
+                .write_with_options(
+                    batch,
+                    &WriteOptions {
+                        await_durable: true,
+                    },
+                )
+                .await
+            {
                 dst_events::cancel_write(write_op);
                 // Rollback all grants made during this iteration
                 for (tenant, queue, task_id) in &grants_to_rollback {
@@ -545,12 +556,6 @@ impl JobStoreShard {
                 return Err(JobStoreShardError::Slate(e));
             }
             dst_events::confirm_write(write_op);
-
-            if let Err(e) = self.db.flush().await {
-                // Write succeeded but flush failed - in-memory is correct, don't rollback
-                self.broker.requeue(claimed);
-                return Err(JobStoreShardError::Slate(e));
-            }
 
             // Wake broker for any release-grants that happened (before clearing)
             if !release_grants_to_rollback.is_empty() {

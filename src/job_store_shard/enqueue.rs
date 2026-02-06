@@ -2,6 +2,7 @@
 
 use slatedb::ErrorKind as SlateErrorKind;
 use slatedb::IsolationLevel;
+use slatedb::config::WriteOptions;
 use tracing::{debug, info_span};
 use uuid::Uuid;
 
@@ -177,8 +178,14 @@ impl JobStoreShard {
             write_op,
         );
 
-        // Commit the transaction - if this fails, we need to rollback all in-memory grants
-        if let Err(e) = txn.commit().await {
+        // Commit durable state — commit_with_options with await_durable:true blocks
+        // until the WAL is flushed to object storage, so no separate flush is needed.
+        if let Err(e) = txn
+            .commit_with_options(&WriteOptions {
+                await_durable: true,
+            })
+            .await
+        {
             dst_events::cancel_write(write_op);
             for (queue, task_id) in &grants {
                 self.concurrency.rollback_grant(tenant, queue, task_id);
@@ -191,12 +198,6 @@ impl JobStoreShard {
         // This is done outside the transaction to avoid conflicts - see counters.rs for details.
         // TODO(slatedb#1254): Move back inside transaction once SlateDB supports key exclusion.
         self.increment_total_jobs_counter().await?;
-
-        if let Err(e) = self.db.flush().await {
-            // Note: commit succeeded but flush failed - the grants are committed,
-            // so we don't rollback here
-            return Err(e.into());
-        }
 
         // Log grants after durable commit
         for (queue, task_id) in &grants {
