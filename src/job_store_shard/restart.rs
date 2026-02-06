@@ -215,21 +215,26 @@ impl JobStoreShard {
             crate::keys::task_key(&task_group, start_at_ms, priority, id, next_attempt_number);
         txn.put(&task_key, &task_value)?;
 
-        // Emit DST event BEFORE commit because txn.commit().await has an internal
-        // yield point where committed data becomes visible before the Future resolves.
-        // During this yield, the broker can discover and dequeue the restarted task,
-        // which would cause the invariant tracker to see a TaskLeased before the
-        // JobStatusChanged(Scheduled) event. If commit fails (transaction conflict),
-        // the spurious event is handled gracefully: the retry loop will emit another
-        // Scheduled event (Scheduled->Scheduled is a valid transition).
-        dst_events::emit(DstEvent::JobStatusChanged {
-            tenant: tenant.to_string(),
-            job_id: id.to_string(),
-            new_status: "Scheduled".to_string(),
-        });
+        // Two-phase DST event: emit before commit for correct causal ordering,
+        // confirm after commit succeeds.
+        let write_op = dst_events::next_write_op();
+        dst_events::emit_pending(
+            DstEvent::JobStatusChanged {
+                tenant: tenant.to_string(),
+                job_id: id.to_string(),
+                new_status: "Scheduled".to_string(),
+            },
+            write_op,
+        );
 
         // Commit the transaction
-        txn.commit().await?;
+        match txn.commit().await {
+            Ok(()) => dst_events::confirm_write(write_op),
+            Err(e) => {
+                dst_events::cancel_write(write_op);
+                return Err(e.into());
+            }
+        }
 
         // Decrement completed jobs counter - job is going from terminal to scheduled.
         // This is done outside the transaction to avoid conflicts - see counters.rs for details.

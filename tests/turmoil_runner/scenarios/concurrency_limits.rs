@@ -516,8 +516,8 @@ pub fn run() {
             // Wait for producers and workers to do their work
             tokio::time::sleep(Duration::from_secs(90)).await;
 
-            // Process all DST events from server-side instrumentation
-            verify_tracker.process_dst_events();
+            // Process all confirmed DST events and validate invariants
+            verify_tracker.process_and_validate();
 
             let enqueued = verify_enqueued.load(Ordering::SeqCst);
             let completed = verify_completed.load(Ordering::SeqCst);

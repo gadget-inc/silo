@@ -294,29 +294,31 @@ impl JobStoreShard {
             .await
             .map_err(JobStoreShardError::Rkyv)?;
 
-        // Emit DST events BEFORE the write because self.db.write(batch).await
-        // has an internal yield point where committed data becomes visible before
-        // the Future resolves. During this yield, a retry task or grant_next task
-        // in the batch can be discovered by the broker and dequeued, emitting a new
-        // TaskLeased before we emit TaskReleased - causing the invariant tracker to
-        // see two active leases for the same job (oneLeasePerJob violation). If write
-        // fails, spurious events are harmless in DST since the rollback restores
-        // in-memory state and no subsequent events will reference the released task.
-        dst_events::emit(DstEvent::TaskReleased {
-            tenant: tenant.to_string(),
-            job_id: job_id.clone(),
-            task_id: task_id.to_string(),
-        });
-        if let Some(new_status) = new_job_status_for_dst {
-            dst_events::emit(DstEvent::JobStatusChanged {
+        // Two-phase DST events: emit before write for correct causal ordering,
+        // confirm after write succeeds, cancel if write fails.
+        let write_op = dst_events::next_write_op();
+        dst_events::emit_pending(
+            DstEvent::TaskReleased {
                 tenant: tenant.to_string(),
                 job_id: job_id.clone(),
-                new_status,
-            });
+                task_id: task_id.to_string(),
+            },
+            write_op,
+        );
+        if let Some(new_status) = new_job_status_for_dst {
+            dst_events::emit_pending(
+                DstEvent::JobStatusChanged {
+                    tenant: tenant.to_string(),
+                    job_id: job_id.clone(),
+                    new_status,
+                },
+                write_op,
+            );
         }
 
         // Write to DB - if this fails, rollback the in-memory changes
         if let Err(e) = self.db.write(batch).await {
+            dst_events::cancel_write(write_op);
             // Rollback any grants made during retry scheduling
             for (queue, grant_task_id) in &retry_grants {
                 self.concurrency
@@ -326,6 +328,7 @@ impl JobStoreShard {
             self.concurrency.rollback_release_grants(&release_rollbacks);
             return Err(e.into());
         }
+        dst_events::confirm_write(write_op);
 
         if let Err(e) = self.db.flush().await {
             // Write succeeded but flush failed - in-memory is correct, don't rollback

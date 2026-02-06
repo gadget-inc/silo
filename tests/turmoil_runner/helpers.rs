@@ -1367,16 +1367,16 @@ impl InvariantTracker {
         self.shards.verify_no_split_brain();
     }
 
-    /// Process all pending DST events from the server-side instrumentation.
+    /// Process all confirmed DST events and validate invariants.
     ///
-    /// This should be called periodically to consume events emitted by the
-    /// server during test execution. It updates the tracker state based on
-    /// the server's ground-truth events, ensuring accurate tracking without
-    /// race conditions from client-side event tracking.
-    pub fn process_dst_events(&self) {
-        use silo::dst_events::{DstEvent, drain_events};
+    /// This should be called once at the end of the simulation. It takes all
+    /// confirmed events (from two-phase emission) in their original causal
+    /// order and validates invariants against them. Unconfirmed events (from
+    /// failed writes) are automatically excluded.
+    pub fn process_and_validate(&self) {
+        use silo::dst_events::{DstEvent, take_all_confirmed};
 
-        let events = drain_events();
+        let events = take_all_confirmed();
         for event in events {
             match event {
                 DstEvent::JobEnqueued {

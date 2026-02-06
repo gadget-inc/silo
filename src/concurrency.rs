@@ -676,13 +676,11 @@ impl ConcurrencyManager {
                         // a job succeeds via one attempt while a pending concurrency request from
                         // a restart or retry is still in the DB.
                         let status_key = job_status_key(tenant, job_id_str);
-                        if let Some(status_raw) = db
-                            .get(&status_key)
-                            .await
-                            .map_err(|e| e.to_string())?
+                        if let Some(status_raw) =
+                            db.get(&status_key).await.map_err(|e| e.to_string())?
                         {
-                            let status = decode_job_status_owned(&status_raw)
-                                .map_err(|e| e.to_string())?;
+                            let status =
+                                decode_job_status_owned(&status_raw).map_err(|e| e.to_string())?;
                             if status.is_terminal() {
                                 batch.delete(&kv.key);
                                 tracing::debug!(

@@ -1120,27 +1120,10 @@ pub fn run() {
             // Wait for work to start
             tokio::time::sleep(Duration::from_millis(1000)).await;
 
-            // Phase 1: Periodically verify invariants while membership changes are happening
+            // Phase 1: Wait for membership changes to complete
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
 
-                // Process DST events
-                verifier_tracker.process_dst_events();
-
-                // Verify invariants
-                verifier_tracker.verify_all();
-
-                let enqueued = verifier_enqueued.load(Ordering::SeqCst);
-                let completed = verifier_completed.load(Ordering::SeqCst);
-
-                tracing::trace!(
-                    enqueued = enqueued,
-                    completed = completed,
-                    membership_done = verifier_membership_done.load(Ordering::SeqCst),
-                    "invariant_check_passed"
-                );
-
-                // Exit periodic checking when membership changes are done
                 if verifier_membership_done.load(Ordering::SeqCst) {
                     tracing::info!("membership changes done, entering convergence phase");
                     break;
@@ -1148,18 +1131,13 @@ pub fn run() {
             }
 
             // Phase 2: Wait for convergence - all enqueued jobs should complete
-            // This tests that the system eventually reaches a stable state
-            let convergence_timeout_secs = 60; // Max time to wait for convergence
+            let convergence_timeout_secs = 60;
             let convergence_start = turmoil::sim_elapsed().unwrap_or_default();
             let mut last_completed = 0u32;
             let mut stall_count = 0u32;
 
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-
-                // Process DST events
-                verifier_tracker.process_dst_events();
-                verifier_tracker.verify_all();
 
                 let enqueued = verifier_enqueued.load(Ordering::SeqCst);
                 let completed = verifier_completed.load(Ordering::SeqCst);
@@ -1170,7 +1148,6 @@ pub fn run() {
                     "convergence_check"
                 );
 
-                // Check if all jobs are complete
                 if completed >= enqueued && enqueued > 0 {
                     tracing::info!(
                         enqueued = enqueued,
@@ -1180,7 +1157,6 @@ pub fn run() {
                     break;
                 }
 
-                // Check for progress stall (no new completions for a while)
                 if completed == last_completed {
                     stall_count += 1;
                 } else {
@@ -1188,8 +1164,6 @@ pub fn run() {
                     last_completed = completed;
                 }
 
-                // If stalled for too long, check if we should give up
-                // (10 seconds of no progress might indicate lost jobs)
                 if stall_count >= 10 && completed > 0 {
                     tracing::warn!(
                         enqueued = enqueued,
@@ -1197,10 +1171,8 @@ pub fn run() {
                         stall_count = stall_count,
                         "progress stalled, checking if jobs are recoverable"
                     );
-                    // Give it more time but log the stall
                 }
 
-                // Check timeout
                 let elapsed = turmoil::sim_elapsed().unwrap_or_default();
                 let convergence_duration = elapsed.saturating_sub(convergence_start);
                 if convergence_duration.as_secs() >= convergence_timeout_secs {
@@ -1231,8 +1203,8 @@ pub fn run() {
             // Give nodes time to shut down gracefully
             tokio::time::sleep(Duration::from_secs(2)).await;
 
-            // Final verification
-            verifier_tracker.process_dst_events();
+            // Final verification - process all confirmed DST events
+            verifier_tracker.process_and_validate();
             verifier_tracker.verify_all();
             verifier_tracker.jobs.verify_no_terminal_leases();
 
