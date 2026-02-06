@@ -294,29 +294,14 @@ impl JobStoreShard {
             .await
             .map_err(JobStoreShardError::Rkyv)?;
 
-        // Write to DB - if this fails, rollback the in-memory changes
-        if let Err(e) = self.db.write(batch).await {
-            // Rollback any grants made during retry scheduling
-            for (queue, grant_task_id) in &retry_grants {
-                self.concurrency
-                    .rollback_grant(&tenant, queue, grant_task_id);
-            }
-            // Rollback release-and-grant operations
-            self.concurrency.rollback_release_grants(&release_rollbacks);
-            return Err(e.into());
-        }
-        if let Err(e) = self.db.flush().await {
-            // Write succeeded but flush failed - in-memory is correct, don't rollback
-            return Err(e.into());
-        }
-
-        // Execute pending counter operations after successful DB write.
-        // These are done separately to avoid conflicts - see counters.rs for details.
-        if pending_counters.increment_completed {
-            self.increment_completed_jobs_counter().await?;
-        }
-
-        // Emit DST events after successful commit
+        // Emit DST events BEFORE the write because self.db.write(batch).await
+        // has an internal yield point where committed data becomes visible before
+        // the Future resolves. During this yield, a retry task or grant_next task
+        // in the batch can be discovered by the broker and dequeued, emitting a new
+        // TaskLeased before we emit TaskReleased - causing the invariant tracker to
+        // see two active leases for the same job (oneLeasePerJob violation). If write
+        // fails, spurious events are harmless in DST since the rollback restores
+        // in-memory state and no subsequent events will reference the released task.
         dst_events::emit(DstEvent::TaskReleased {
             tenant: tenant.to_string(),
             job_id: job_id.clone(),
@@ -328,6 +313,29 @@ impl JobStoreShard {
                 job_id: job_id.clone(),
                 new_status,
             });
+        }
+
+        // Write to DB - if this fails, rollback the in-memory changes
+        if let Err(e) = self.db.write(batch).await {
+            // Rollback any grants made during retry scheduling
+            for (queue, grant_task_id) in &retry_grants {
+                self.concurrency
+                    .rollback_grant(&tenant, queue, grant_task_id);
+            }
+            // Rollback release-and-grant operations
+            self.concurrency.rollback_release_grants(&release_rollbacks);
+            return Err(e.into());
+        }
+
+        if let Err(e) = self.db.flush().await {
+            // Write succeeded but flush failed - in-memory is correct, don't rollback
+            return Err(e.into());
+        }
+
+        // Execute pending counter operations after successful DB write.
+        // These are done separately to avoid conflicts - see counters.rs for details.
+        if pending_counters.increment_completed {
+            self.increment_completed_jobs_counter().await?;
         }
 
         // Log and wake broker for any releases/grants

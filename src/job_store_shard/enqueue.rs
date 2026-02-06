@@ -167,6 +167,18 @@ impl JobStoreShard {
             )
             .await?;
 
+        // Emit DST event BEFORE commit because txn.commit().await has an internal
+        // yield point where committed data becomes visible before the Future resolves.
+        // During this yield, the broker can discover and dequeue the task, which would
+        // cause the invariant tracker to see a TaskLeased before the JobEnqueued event.
+        // If commit fails, the spurious event is harmless: the tracker will have a
+        // phantom Scheduled entry that no subsequent events reference, and on retry
+        // a duplicate JobEnqueued produces a valid Scheduled->Scheduled transition.
+        dst_events::emit(DstEvent::JobEnqueued {
+            tenant: tenant.to_string(),
+            job_id: job_id.to_string(),
+        });
+
         // Commit the transaction - if this fails, we need to rollback all in-memory grants
         if let Err(e) = txn.commit().await {
             for (queue, task_id) in &grants {
@@ -174,17 +186,6 @@ impl JobStoreShard {
             }
             return Err(e.into());
         }
-
-        // Emit DST event IMMEDIATELY after successful commit, before any other async
-        // operations. This is critical for DST: any async operation (including
-        // increment_total_jobs_counter) yields to the scheduler, which could allow
-        // a dequeue to run and lease this job's task before we emit JobEnqueued.
-        // Note: We only emit JobEnqueued, not JobStatusChanged(Scheduled), because
-        // job_enqueued() already records the Scheduled status.
-        dst_events::emit(DstEvent::JobEnqueued {
-            tenant: tenant.to_string(),
-            job_id: job_id.to_string(),
-        });
 
         // Increment total jobs counter for this shard.
         // This is done outside the transaction to avoid conflicts - see counters.rs for details.

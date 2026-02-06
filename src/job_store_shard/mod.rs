@@ -6,7 +6,7 @@ mod dequeue;
 mod enqueue;
 mod expedite;
 mod floating;
-mod helpers;
+pub(crate) mod helpers;
 mod lease;
 mod rate_limit;
 mod restart;

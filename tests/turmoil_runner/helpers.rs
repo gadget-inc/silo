@@ -1114,10 +1114,19 @@ impl JobStateTracker {
         // Check if this is a valid transition from the previous state
         if let Some(&(prev_status, _)) = entry.last() {
             if !is_valid_status_transition(prev_status, new_status) {
+                let history_str: Vec<String> = entry
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (s, _))| format!("  [{}] {}", i, status_name(*s)))
+                    .collect();
                 panic!(
-                    "INVARIANT VIOLATION (validTransitions): Job '{}' invalid transition {:?} -> {:?}",
+                    "INVARIANT VIOLATION (validTransitions): Job '{}' invalid transition {:?} -> {:?}\n\
+                     Full transition history:\n{}\n  [{}] {} (attempted)",
                     job_id,
                     status_name(prev_status),
+                    status_name(new_status),
+                    history_str.join("\n"),
+                    entry.len(),
                     status_name(new_status)
                 );
             }
@@ -1367,7 +1376,8 @@ impl InvariantTracker {
     pub fn process_dst_events(&self) {
         use silo::dst_events::{DstEvent, drain_events};
 
-        for event in drain_events() {
+        let events = drain_events();
+        for event in events {
             match event {
                 DstEvent::JobEnqueued {
                     tenant: _,

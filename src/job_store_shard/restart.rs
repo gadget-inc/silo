@@ -215,6 +215,19 @@ impl JobStoreShard {
             crate::keys::task_key(&task_group, start_at_ms, priority, id, next_attempt_number);
         txn.put(&task_key, &task_value)?;
 
+        // Emit DST event BEFORE commit because txn.commit().await has an internal
+        // yield point where committed data becomes visible before the Future resolves.
+        // During this yield, the broker can discover and dequeue the restarted task,
+        // which would cause the invariant tracker to see a TaskLeased before the
+        // JobStatusChanged(Scheduled) event. If commit fails (transaction conflict),
+        // the spurious event is handled gracefully: the retry loop will emit another
+        // Scheduled event (Scheduled->Scheduled is a valid transition).
+        dst_events::emit(DstEvent::JobStatusChanged {
+            tenant: tenant.to_string(),
+            job_id: id.to_string(),
+            new_status: "Scheduled".to_string(),
+        });
+
         // Commit the transaction
         txn.commit().await?;
 
@@ -222,13 +235,6 @@ impl JobStoreShard {
         // This is done outside the transaction to avoid conflicts - see counters.rs for details.
         // TODO(slatedb#1254): Move back inside transaction once SlateDB supports key exclusion.
         self.decrement_completed_jobs_counter().await?;
-
-        // Emit DST event after successful commit - job is now back to Scheduled
-        dst_events::emit(DstEvent::JobStatusChanged {
-            tenant: tenant.to_string(),
-            job_id: id.to_string(),
-            new_status: "Scheduled".to_string(),
-        });
 
         // Wake the broker to pick up the new task promptly
         if start_at_ms <= now_epoch_ms() {

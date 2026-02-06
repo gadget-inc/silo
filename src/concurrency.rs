@@ -25,6 +25,10 @@
 //!   When release_and_grant_next scans for the next request to grant, it checks if the job
 //!   is cancelled and deletes the request without granting.
 //!
+//! - Requests for terminal jobs (Succeeded/Failed/Cancelled) are also skipped during grant_next.
+//!   This handles the case where a job succeeds via one attempt while a pending concurrency
+//!   request from a restart or retry is still in the DB.
+//!
 //! - [SILO-DEQ-CXL-REL] Holders for cancelled tasks are released at dequeue cleanup.
 //!   When dequeue encounters a cancelled job's task, it releases any held tickets.
 
@@ -40,10 +44,11 @@ use crate::codec::{
 };
 use crate::dst_events::{self, DstEvent};
 use crate::job::{ConcurrencyLimit, JobView};
+use crate::job_store_shard::helpers::decode_job_status_owned;
 use crate::keys::{
     concurrency_holder_key, concurrency_holders_queue_prefix, concurrency_request_key,
-    concurrency_request_prefix, end_bound, job_cancelled_key, parse_concurrency_holder_key,
-    parse_concurrency_request_key, task_key,
+    concurrency_request_prefix, end_bound, job_cancelled_key, job_status_key,
+    parse_concurrency_holder_key, parse_concurrency_request_key, task_key,
 };
 use crate::shard_range::ShardRange;
 use crate::task::{ConcurrencyAction, HolderRecord, Task};
@@ -664,6 +669,30 @@ impl ConcurrencyManager {
                                 "grant_next: skipping cancelled job request"
                             );
                             continue;
+                        }
+
+                        // Check if job has already reached a terminal state (Succeeded/Failed) -
+                        // if so, delete the stale request without granting. This can happen when
+                        // a job succeeds via one attempt while a pending concurrency request from
+                        // a restart or retry is still in the DB.
+                        let status_key = job_status_key(tenant, job_id_str);
+                        if let Some(status_raw) = db
+                            .get(&status_key)
+                            .await
+                            .map_err(|e| e.to_string())?
+                        {
+                            let status = decode_job_status_owned(&status_raw)
+                                .map_err(|e| e.to_string())?;
+                            if status.is_terminal() {
+                                batch.delete(&kv.key);
+                                tracing::debug!(
+                                    job_id = %job_id_str,
+                                    queue = %queue,
+                                    status = ?status.kind,
+                                    "grant_next: skipping request for terminal job"
+                                );
+                                continue;
+                            }
                         }
 
                         // Parse request key to extract request_id
