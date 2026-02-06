@@ -144,8 +144,7 @@ impl JobStoreShard {
             txn.put(&mkey, [])?;
         }
 
-        self.set_job_status_with_index(&mut TxnWriter(&txn), tenant, job_id, job_status)
-            .await?;
+        Self::write_new_job_status_with_index(&mut TxnWriter(&txn), tenant, job_id, job_status)?;
 
         // Process limits starting from index 0. For concurrency limits, we try immediate
         // grant as an optimization. Returns all grants made for potential rollback.
@@ -416,7 +415,6 @@ impl JobStoreShard {
         new_status: JobStatus,
     ) -> Result<(), JobStoreShardError> {
         // Delete old index entries if present
-        // For new jobs, this check will find nothing
         if let Some(old_raw) = writer.get(&job_status_key(tenant, job_id)).await? {
             let old = decode_job_status_owned(&old_raw)?;
             let old_kind = old.kind;
@@ -425,6 +423,27 @@ impl JobStoreShard {
             writer.delete(&old_time)?;
         }
 
+        Self::write_job_status_with_index(writer, tenant, job_id, new_status)
+    }
+
+    /// Write a new job status + index entry (no old status to clean up).
+    /// Use for brand-new jobs where there is no previous status.
+    pub(crate) fn write_new_job_status_with_index<W: WriteBatcher>(
+        writer: &mut W,
+        tenant: &str,
+        job_id: &str,
+        new_status: JobStatus,
+    ) -> Result<(), JobStoreShardError> {
+        Self::write_job_status_with_index(writer, tenant, job_id, new_status)
+    }
+
+    /// Shared helper: write status value and index entry.
+    fn write_job_status_with_index<W: WriteBatcher>(
+        writer: &mut W,
+        tenant: &str,
+        job_id: &str,
+        new_status: JobStatus,
+    ) -> Result<(), JobStoreShardError> {
         // Write new status value
         let job_status_value = encode_job_status(&new_status)?;
         writer.put(job_status_key(tenant, job_id), &job_status_value)?;
