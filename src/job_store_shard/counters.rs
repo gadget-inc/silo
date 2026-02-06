@@ -132,16 +132,51 @@ impl JobStoreShard {
         })
     }
 
-    // ==================== Direct Counter Operations ====================
+    // ==================== Batch Counter Operations ====================
     //
-    // These operations write directly to the database outside of any transaction.
-    // See module-level documentation for why this is necessary.
+    // These add counter merges to an existing WriteBatch, avoiding the overhead
+    // of a separate database write. Use these when the caller already has a
+    // WriteBatch that will be written atomically.
+    //
+    // IMPORTANT: Do NOT use these inside DbTransaction paths — counter keys are
+    // global shard-level keys and will cause transaction conflicts under
+    // concurrent load. Use the standalone (non-batch) variants below instead.
+
+    /// Increment the total jobs counter within an existing WriteBatch.
+    pub(crate) fn increment_total_jobs_counter_batch(&self, batch: &mut WriteBatch) {
+        let key = shard_total_jobs_counter_key();
+        batch.merge(&key, encode_counter(1));
+    }
+
+    /// Decrement the total jobs counter within an existing WriteBatch.
+    pub(crate) fn decrement_total_jobs_counter_batch(&self, batch: &mut WriteBatch) {
+        let key = shard_total_jobs_counter_key();
+        batch.merge(&key, encode_counter(-1));
+    }
+
+    /// Increment the completed jobs counter within an existing WriteBatch.
+    pub(crate) fn increment_completed_jobs_counter_batch(&self, batch: &mut WriteBatch) {
+        let key = shard_completed_jobs_counter_key();
+        batch.merge(&key, encode_counter(1));
+    }
+
+    /// Decrement the completed jobs counter within an existing WriteBatch.
+    pub(crate) fn decrement_completed_jobs_counter_batch(&self, batch: &mut WriteBatch) {
+        let key = shard_completed_jobs_counter_key();
+        batch.merge(&key, encode_counter(-1));
+    }
+
+    // ==================== Standalone Counter Operations ====================
+    //
+    // These create their own WriteBatch and write directly to the database.
+    // Use these after transaction commits where counters cannot be included
+    // in the transaction due to conflict concerns.
     //
     // TODO(slatedb#1254): Once SlateDB supports excluding keys from conflict detection,
     // consider moving these back to transactional operations for better atomicity.
 
-    /// Increment the total jobs counter.
-    /// Call this when a new job is enqueued.
+    /// Increment the total jobs counter as a standalone write.
+    /// Use after transaction-based operations where the counter can't be in the transaction.
     pub(crate) async fn increment_total_jobs_counter(&self) -> Result<(), JobStoreShardError> {
         let key = shard_total_jobs_counter_key();
         let mut batch = WriteBatch::new();
@@ -150,18 +185,7 @@ impl JobStoreShard {
         Ok(())
     }
 
-    /// Decrement the total jobs counter.
-    /// Call this when a job is deleted.
-    pub(crate) async fn decrement_total_jobs_counter(&self) -> Result<(), JobStoreShardError> {
-        let key = shard_total_jobs_counter_key();
-        let mut batch = WriteBatch::new();
-        batch.merge(&key, encode_counter(-1));
-        self.db.write(batch).await?;
-        Ok(())
-    }
-
-    /// Increment the completed jobs counter.
-    /// Call this when a job transitions to a terminal state (Succeeded, Failed, Cancelled).
+    /// Increment the completed jobs counter as a standalone write.
     pub(crate) async fn increment_completed_jobs_counter(&self) -> Result<(), JobStoreShardError> {
         let key = shard_completed_jobs_counter_key();
         let mut batch = WriteBatch::new();
@@ -170,8 +194,7 @@ impl JobStoreShard {
         Ok(())
     }
 
-    /// Decrement the completed jobs counter.
-    /// Call this when a terminal job is restarted or deleted.
+    /// Decrement the completed jobs counter as a standalone write.
     pub(crate) async fn decrement_completed_jobs_counter(&self) -> Result<(), JobStoreShardError> {
         let key = shard_completed_jobs_counter_key();
         let mut batch = WriteBatch::new();
