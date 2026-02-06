@@ -440,20 +440,23 @@ impl EtcdCoordinator {
         };
         debug!(node_id = %self.base.node_id, desired_len = desired.len(), have_locks = ?current_locks, "reconcile: computed desired vs current");
 
-        // Release undesired shards (sorted for deterministic ordering)
+        // Release/cancel undesired shards (sorted for deterministic ordering).
+        // This cancels both held shards AND in-flight acquisitions for shards
+        // this node no longer desires, preventing guards stuck in the Acquiring
+        // phase from continuing to compete for locks they don't need.
         {
-            let mut to_release: Vec<ShardId> = {
+            let mut to_cancel: Vec<ShardId> = {
                 let guards = self.shard_guards.lock().await;
                 let mut v = Vec::new();
-                for (sid, guard) in guards.iter() {
-                    if !desired.contains(sid) && guard.state.lock().await.held_key.is_some() {
+                for (sid, _guard) in guards.iter() {
+                    if !desired.contains(sid) {
                         v.push(*sid);
                     }
                 }
                 v
             };
-            to_release.sort_unstable();
-            for sid in to_release {
+            to_cancel.sort_unstable();
+            for sid in to_cancel {
                 self.ensure_shard_guard(sid).await.set_desired(false).await;
             }
         }
