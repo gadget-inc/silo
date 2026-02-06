@@ -6,7 +6,7 @@ use crate::codec::{decode_task, encode_attempt, encode_lease};
 use crate::concurrency::{ReleaseGrantRollback, RequestTicketTaskOutcome};
 use crate::dst_events::{self, DstEvent};
 use crate::job::{JobStatus, JobView};
-use crate::job_attempt::{AttemptStatus, JobAttempt};
+use crate::job_attempt::{AttemptStatus, JobAttempt, JobAttemptView};
 use crate::job_store_shard::helpers::{DbWriteBatcher, now_epoch_ms};
 use crate::job_store_shard::{DequeueResult, JobStoreShard, JobStoreShardError};
 use crate::keys::{attempt_key, job_info_key, leased_task_key};
@@ -36,8 +36,9 @@ impl JobStoreShard {
 
         let mut out: Vec<LeasedTask> = Vec::new();
         let mut refresh_out: Vec<LeasedRefreshTask> = Vec::new();
-        // Tuple: (tenant, job_view, job_id, attempt_number, relative_attempt_number)
-        let mut pending_attempts: Vec<(String, JobView, String, u32, u32)> = Vec::new();
+        // Tuple: (tenant, job_view, encoded_attempt_bytes)
+        // We keep the encoded bytes to construct JobAttemptView without a DB readback.
+        let mut pending_attempts: Vec<(String, JobView, Vec<u8>)> = Vec::new();
 
         // Track grants made during this dequeue for rollback on failure
         // Format: (tenant, queue, task_id)
@@ -202,13 +203,7 @@ impl JobStoreShard {
 
                                 // Track for response
                                 let view = job_view.unwrap();
-                                pending_attempts.push((
-                                    tenant.clone(),
-                                    view,
-                                    job_id.clone(),
-                                    *attempt_number,
-                                    *relative_attempt_number,
-                                ));
+                                pending_attempts.push((tenant.clone(), view, attempt_val));
                                 ack_keys.push(entry.key.clone());
                                 // Grant already recorded by try_reserve - no need to call record_grant
 
@@ -499,14 +494,8 @@ impl JobStoreShard {
                     let akey = attempt_key(&tenant, &job_id, attempt_number);
                     batch.put(&akey, &attempt_val);
 
-                    // Defer constructing AttemptView; fetch from DB after batch is written
-                    pending_attempts.push((
-                        tenant.clone(),
-                        view,
-                        job_id.clone(),
-                        attempt_number,
-                        relative_attempt_number,
-                    ));
+                    // Construct AttemptView directly from encoded bytes (no DB readback needed)
+                    pending_attempts.push((tenant.clone(), view, attempt_val));
                     ack_keys.push(entry.key.clone());
 
                     // Track for DST event emission after commit
@@ -593,16 +582,9 @@ impl JobStoreShard {
             // Continue looping to process any follow-up tasks
         }
 
-        // Build LeasedTask results from pending_attempts
-        for (tenant, job_view, job_id, attempt_number, _relative_attempt_number) in
-            pending_attempts.into_iter()
-        {
-            let attempt_view = self
-                .get_job_attempt(tenant.as_str(), &job_id, attempt_number)
-                .await?
-                .ok_or_else(|| {
-                    JobStoreShardError::Rkyv("attempt not found after dequeue".to_string())
-                })?;
+        // Build LeasedTask results from pending_attempts using pre-encoded bytes
+        for (tenant, job_view, attempt_bytes) in pending_attempts.into_iter() {
+            let attempt_view = JobAttemptView::new(&attempt_bytes)?;
             out.push(LeasedTask::new(tenant, job_view, attempt_view));
         }
         tracing::debug!(
