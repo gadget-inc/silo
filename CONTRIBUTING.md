@@ -177,6 +177,20 @@ References:
 
 - Perfetto layer crate docs: [`tracing-perfetto`](https://docs.rs/tracing-perfetto/latest/tracing_perfetto/)
 
+## Benchmark history
+
+You can view throughput benchmark trends over time by fetching results from CI:
+
+```shell
+# Last 30 days (default)
+node scripts/benchmark-history.mjs
+
+# Last 90 days
+node scripts/benchmark-history.mjs --days 90
+```
+
+This fetches the `job_shard_throughput` benchmark output from each successful main branch CI run, and opens an interactive HTML report with charts and a table showing enqueue/dequeue throughput over time.
+
 ## Deterministic Simulation Testing (DST)
 
 Silo uses deterministic simulation testing via [turmoil](https://github.com/tokio-rs/turmoil) and [mad-turmoil](https://crates.io/crates/mad-turmoil) to test distributed scenarios with controlled randomness and simulated time. This allows us to:
