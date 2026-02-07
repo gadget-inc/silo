@@ -4,10 +4,6 @@ use grpc_integration_helpers::{create_test_factory, setup_test_server, shutdown_
 use silo::pb::*;
 use silo::settings::AppConfig;
 
-// =============================================================================
-// RestartJob gRPC Integration Tests
-// =============================================================================
-
 /// Test restarting a cancelled job via gRPC
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_restart_cancelled_job() -> anyhow::Result<()> {

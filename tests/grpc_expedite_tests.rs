@@ -4,10 +4,6 @@ use grpc_integration_helpers::{create_test_factory, setup_test_server, shutdown_
 use silo::pb::*;
 use silo::settings::AppConfig;
 
-// =============================================================================
-// ExpediteJob gRPC Integration Tests
-// =============================================================================
-
 /// Test expediting a future-scheduled job via gRPC
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_expedite_future_scheduled_job() -> anyhow::Result<()> {

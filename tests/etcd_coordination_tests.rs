@@ -615,10 +615,6 @@ async fn shard_guard_shutdown_while_releasing() {
     h.abort();
 }
 
-// =============================================================================
-// Coordinator-level tests (full EtcdCoordinator tests)
-// =============================================================================
-
 /// Test that a single etcd coordinator owns all shards when alone.
 #[silo::test(flavor = "multi_thread", worker_threads = 2)]
 async fn etcd_single_node_owns_all_shards() {
@@ -1164,10 +1160,6 @@ async fn etcd_graceful_shutdown_releases_shards_promptly() {
     c1.shutdown().await.unwrap();
     h1.abort();
 }
-
-// =============================================================================
-// Shard Split Tests
-// =============================================================================
 
 /// Test that request_split creates a split record in etcd.
 #[silo::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1765,10 +1757,6 @@ async fn etcd_split_in_multi_node_cluster() {
     h2.abort();
 }
 
-// =============================================================================
-// Crash Recovery Tests
-// =============================================================================
-
 /// Test crash recovery during early phase abandons the split.
 #[silo::test(flavor = "multi_thread", worker_threads = 2)]
 async fn etcd_crash_recovery_early_phase_abandons_split() {
@@ -2065,10 +2053,6 @@ async fn etcd_grpc_request_split_executes_to_completion() {
     coord.shutdown().await.unwrap();
     handle.abort();
 }
-
-// =============================================================================
-// Placement Ring Tests
-// =============================================================================
 
 /// Test that a single node with default ring owns all default shards.
 #[silo::test(flavor = "multi_thread", worker_threads = 2)]

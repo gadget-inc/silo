@@ -460,10 +460,6 @@ where
     }
 }
 
-// ============================================================================
-// Test Entry Point Helpers
-// ============================================================================
-
 /// Maximum time allowed for a subprocess to complete (in seconds).
 ///
 /// The k8s_shard_splits test uses filesystem-based SlateDB which runs at about
@@ -724,10 +720,6 @@ pub fn verify_determinism(scenario: &str, seed: u64) {
     );
 }
 
-// ============================================================================
-// Invariant Verification Infrastructure
-// ============================================================================
-//
 // These types and functions help verify system invariants during DST scenarios.
 // Invariants are derived from the Alloy specification in specs/job_shard.als.
 
@@ -1456,10 +1448,6 @@ impl InvariantTracker {
     }
 }
 
-// ============================================================================
-// Server-Side Invariant Validation
-// ============================================================================
-//
 // These functions query the server directly to validate invariants that can't
 // be reliably tracked client-side due to network delays and message loss.
 
