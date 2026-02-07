@@ -28,9 +28,7 @@ pub enum AttemptOutcome {
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
 #[archive(check_bytes)]
 pub enum AttemptStatus {
-    Running {
-        started_at_ms: i64,
-    },
+    Running,
     Succeeded {
         finished_at_ms: i64,
         result: Vec<u8>,
@@ -56,6 +54,9 @@ pub struct JobAttempt {
     /// Attempt number within current run (resets to 1 on job restart)
     pub relative_attempt_number: u32,
     pub task_id: String,
+    /// When the attempt started (epoch ms). Set at dequeue time for running attempts,
+    /// or preserved from the source system for imported attempts.
+    pub started_at_ms: i64,
     pub status: AttemptStatus,
 }
 
@@ -98,13 +99,14 @@ impl JobAttemptView {
     pub fn task_id(&self) -> &str {
         self.archived().task_id.as_str()
     }
+    pub fn started_at_ms(&self) -> i64 {
+        self.archived().started_at_ms
+    }
 
     pub fn state(&self) -> AttemptStatus {
         pub(crate) type ArchivedAttemptState = <AttemptStatus as Archive>::Archived;
         match &self.archived().status {
-            ArchivedAttemptState::Running { started_at_ms } => AttemptStatus::Running {
-                started_at_ms: *started_at_ms,
-            },
+            ArchivedAttemptState::Running => AttemptStatus::Running,
             ArchivedAttemptState::Succeeded {
                 finished_at_ms,
                 result,

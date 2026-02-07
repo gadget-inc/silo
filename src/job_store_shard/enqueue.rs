@@ -371,7 +371,7 @@ impl JobStoreShard {
 
     /// Complete an enqueue after successful write/commit and DST event emission.
     /// Flushes to disk, logs grants, and wakes up the broker.
-    async fn finish_enqueue(
+    pub(crate) async fn finish_enqueue(
         &self,
         job_id: &str,
         start_at_ms: i64,
@@ -393,7 +393,7 @@ impl JobStoreShard {
     }
 
     /// Rollback in-memory concurrency grants after a failed write/commit.
-    fn rollback_grants(&self, tenant: &str, grants: &[(String, String)]) {
+    pub(crate) fn rollback_grants(&self, tenant: &str, grants: &[(String, String)]) {
         for (queue, task_id) in grants {
             self.concurrency.rollback_grant(tenant, queue, task_id);
         }

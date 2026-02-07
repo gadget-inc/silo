@@ -363,6 +363,7 @@ impl JobStoreShard {
             worker_id: worker_id.to_string(),
             task: task.clone(),
             expiry_ms,
+            started_at_ms: now_ms,
         };
         let leased_value = encode_lease(&record)?;
         batch.put(&lease_key, &leased_value);
@@ -386,9 +387,8 @@ impl JobStoreShard {
             attempt_number,
             relative_attempt_number,
             task_id: task_id.to_string(),
-            status: AttemptStatus::Running {
-                started_at_ms: now_ms,
-            },
+            started_at_ms: now_ms,
+            status: AttemptStatus::Running,
         };
         let attempt_val = encode_attempt(&attempt)?;
         let akey = attempt_key(tenant, job_id, attempt_number);
@@ -666,6 +666,7 @@ impl JobStoreShard {
             worker_id: worker_id.to_string(),
             task: task.clone(),
             expiry_ms,
+            started_at_ms: 0, // Not applicable for RefreshFloatingLimit tasks
         };
         let leased_value = encode_lease(&record)?;
         state.batch.put(&lease_key, &leased_value);

@@ -404,7 +404,7 @@ async fn grpc_server_query_msgpack_data_types() -> anyhow::Result<()> {
             let enq = EnqueueRequest {
                 shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 id: format!("type_test_{}", i),
-                priority: (i * 50) as u32,                   // 0, 50, 100
+                priority: ([0, 50, 99][i as usize]) as u32, // 0, 50, 99
                 start_at_ms: 1000000000 + (i as i64 * 1000), // Different timestamps
                 retry_policy: None,
                 payload: Some(SerializedBytes {
@@ -479,11 +479,11 @@ async fn grpc_server_query_msgpack_data_types() -> anyhow::Result<()> {
         assert!((rows[1]["priority_ratio"].as_f64().unwrap() - 0.5).abs() < 0.001);
         assert!(!rows[1]["nullable_time"].is_null()); // Not null (priority != 0)
 
-        // Row 2: priority=100, enqueue_time_ms=1000002000
+        // Row 2: priority=99, enqueue_time_ms=1000002000
         assert_eq!(rows[2]["id"], "type_test_2");
-        assert_eq!(rows[2]["priority"], 100);
+        assert_eq!(rows[2]["priority"], 99);
         assert_eq!(rows[2]["enqueue_time_ms"], 1000002000_i64);
-        assert!((rows[2]["priority_ratio"].as_f64().unwrap() - 1.0).abs() < 0.001);
+        assert!((rows[2]["priority_ratio"].as_f64().unwrap() - 0.99).abs() < 0.001);
 
         // Test aggregation with different result types
         let agg_resp = client
@@ -511,10 +511,10 @@ async fn grpc_server_query_msgpack_data_types() -> anyhow::Result<()> {
         })?;
 
         assert_eq!(agg_row["count_val"], 3); // COUNT returns Int64
-        assert_eq!(agg_row["sum_val"], 150); // SUM of 0+50+100
-        assert!((agg_row["avg_val"].as_f64().unwrap() - 50.0).abs() < 0.001); // AVG returns Float64
+        assert_eq!(agg_row["sum_val"], 149); // SUM of 0+50+99
+        assert!((agg_row["avg_val"].as_f64().unwrap() - 49.666).abs() < 0.01); // AVG returns Float64
         assert_eq!(agg_row["min_val"], 0);
-        assert_eq!(agg_row["max_val"], 100);
+        assert_eq!(agg_row["max_val"], 99);
 
         shutdown_server(shutdown_tx, server).await?;
         Ok::<(), anyhow::Error>(())

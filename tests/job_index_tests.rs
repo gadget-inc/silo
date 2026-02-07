@@ -267,6 +267,7 @@ async fn reaper_without_retries_marks_failed_in_index() {
         worker_id: archived.worker_id.as_str().to_string(),
         task,
         expiry_ms: now_ms() - 1,
+        started_at_ms: archived.started_at_ms,
     };
     let new_val = encode_lease(&expired).unwrap();
     shard.db().put(&lease_key, &new_val).await.unwrap();
@@ -338,6 +339,7 @@ async fn reaper_with_retries_moves_to_scheduled_in_index() {
         worker_id: archived.worker_id.as_str().to_string(),
         task,
         expiry_ms: now_ms() - 1,
+        started_at_ms: archived.started_at_ms,
     };
     let new_val = encode_lease(&expired).unwrap();
     shard.db().put(&lease_key, &new_val).await.unwrap();

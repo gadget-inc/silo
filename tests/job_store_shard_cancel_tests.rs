@@ -361,6 +361,7 @@ async fn reap_expired_lease_cancelled_job_sets_cancelled_status() {
             worker_id: archived.worker_id.as_str().to_string(),
             task,
             expiry_ms: expired_ms,
+            started_at_ms: archived.started_at_ms,
         };
         let new_val = encode_lease(&new_record).unwrap();
         shard

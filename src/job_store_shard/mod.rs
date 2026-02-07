@@ -7,6 +7,7 @@ mod enqueue;
 mod expedite;
 mod floating;
 pub(crate) mod helpers;
+pub mod import;
 mod lease;
 mod rate_limit;
 mod restart;
@@ -100,6 +101,8 @@ pub enum JobStoreShardError {
     Serde(#[from] serde_json::Error),
     #[error("rkyv serialization error: {0}")]
     Rkyv(String),
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
     #[error("lease not found for task id {0}")]
     LeaseNotFound(String),
     #[error("lease owner mismatch for task id {task_id}: expected {expected}, got {got}")]

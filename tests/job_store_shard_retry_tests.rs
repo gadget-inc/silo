@@ -1035,6 +1035,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         worker_id: archived.worker_id.as_str().to_string(),
         task,
         expiry_ms: expired_ms,
+        started_at_ms: archived.started_at_ms,
     };
     let new_val = encode_lease(&new_record).unwrap();
     shard

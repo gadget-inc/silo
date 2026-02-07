@@ -6,6 +6,8 @@ import type { ServiceInfo } from "@protobuf-ts/runtime-rpc";
 import { Silo } from "./silo";
 import type { ResetShardsResponse } from "./silo";
 import type { ResetShardsRequest } from "./silo";
+import type { ImportJobsResponse } from "./silo";
+import type { ImportJobsRequest } from "./silo";
 import type { ConfigureShardResponse } from "./silo";
 import type { ConfigureShardRequest } from "./silo";
 import type { GetSplitStatusResponse } from "./silo";
@@ -200,6 +202,15 @@ export interface ISiloClient {
      * @generated from protobuf rpc: ConfigureShard
      */
     configureShard(input: ConfigureShardRequest, options?: RpcOptions): UnaryCall<ConfigureShardRequest, ConfigureShardResponse>;
+    /**
+     * Import jobs from another system with historical attempts.
+     * Unlike Enqueue, ImportJobs accepts completed attempt records and lets Silo
+     * take ownership going forward. Used for migrating workloads from other job queues.
+     * Each job is imported independently; per-job errors are returned in the response.
+     *
+     * @generated from protobuf rpc: ImportJobs
+     */
+    importJobs(input: ImportJobsRequest, options?: RpcOptions): UnaryCall<ImportJobsRequest, ImportJobsResponse>;
     /**
      * Reset all shards owned by this server.
      * WARNING: Destructive operation. Only available in dev mode.
@@ -424,6 +435,18 @@ export class SiloClient implements ISiloClient, ServiceInfo {
         return stackIntercept<ConfigureShardRequest, ConfigureShardResponse>("unary", this._transport, method, opt, input);
     }
     /**
+     * Import jobs from another system with historical attempts.
+     * Unlike Enqueue, ImportJobs accepts completed attempt records and lets Silo
+     * take ownership going forward. Used for migrating workloads from other job queues.
+     * Each job is imported independently; per-job errors are returned in the response.
+     *
+     * @generated from protobuf rpc: ImportJobs
+     */
+    importJobs(input: ImportJobsRequest, options?: RpcOptions): UnaryCall<ImportJobsRequest, ImportJobsResponse> {
+        const method = this.methods[19], opt = this._transport.mergeOptions(options);
+        return stackIntercept<ImportJobsRequest, ImportJobsResponse>("unary", this._transport, method, opt, input);
+    }
+    /**
      * Reset all shards owned by this server.
      * WARNING: Destructive operation. Only available in dev mode.
      * Clears all jobs, tasks, queues, and other data.
@@ -431,7 +454,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: ResetShards
      */
     resetShards(input: ResetShardsRequest, options?: RpcOptions): UnaryCall<ResetShardsRequest, ResetShardsResponse> {
-        const method = this.methods[19], opt = this._transport.mergeOptions(options);
+        const method = this.methods[20], opt = this._transport.mergeOptions(options);
         return stackIntercept<ResetShardsRequest, ResetShardsResponse>("unary", this._transport, method, opt, input);
     }
 }

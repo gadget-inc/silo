@@ -57,6 +57,7 @@ impl JobStoreShard {
             worker_id: current_owner.to_string(),
             task: decoded.to_task(),
             expiry_ms: now_epoch_ms() + DEFAULT_LEASE_MS,
+            started_at_ms: decoded.started_at_ms(),
         };
         let value = encode_lease(&record)?;
 
@@ -125,15 +126,20 @@ impl JobStoreShard {
                 finished_at_ms: now_ms,
             },
         };
+        let attempt_key = attempt_key(&tenant, &job_id, attempt_number);
+
+        // started_at_ms is stored on the lease record, so no extra DB read needed
+        let started_at_ms = decoded.started_at_ms();
+
         let attempt = JobAttempt {
             job_id: job_id.clone(),
             attempt_number,
             relative_attempt_number,
             task_id: task_id.to_string(),
+            started_at_ms,
             status: attempt_status,
         };
         let attempt_val = encode_attempt(&attempt)?;
-        let attempt_key = attempt_key(&tenant, &job_id, attempt_number);
 
         // Atomically update attempt and remove lease
         let mut batch = WriteBatch::new();

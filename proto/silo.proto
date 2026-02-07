@@ -137,7 +137,7 @@ message JobAttempt {
   uint32 attempt_number = 2;             // Which attempt this is (1 = first attempt).
   string task_id = 3;                    // Unique task ID for this attempt.
   AttemptStatus status = 4;              // Current status of the attempt.
-  optional int64 started_at_ms = 5;      // Unix timestamp (ms) when attempt started. Present if running.
+  int64 started_at_ms = 5;               // Unix timestamp (ms) when attempt started. Present for all attempts.
   optional int64 finished_at_ms = 6;     // Unix timestamp (ms) when attempt finished. Present if completed.
   optional SerializedBytes result = 7;     // Result data if attempt succeeded.
   optional string error_code = 8;          // Error code if attempt failed.
@@ -485,6 +485,52 @@ message ConfigureShardResponse {
   string current_ring = 2;  // The placement ring after the change (empty = default ring).
 }
 
+// A historical attempt record for job import.
+// All attempts must be in terminal states (no Running).
+message ImportAttempt {
+  AttemptStatus status = 1;            // Must be terminal (SUCCEEDED, FAILED, or CANCELLED).
+  int64 started_at_ms = 2;            // When the attempt started (epoch ms).
+  int64 finished_at_ms = 3;           // When the attempt finished (epoch ms).
+  optional SerializedBytes result = 4; // Present if succeeded.
+  optional string error_code = 5;      // Present if failed.
+  optional SerializedBytes error_data = 6; // Present if failed.
+}
+
+// Request to import a single job from another system.
+// Unlike Enqueue, ImportJob accepts historical attempts and lets Silo take ownership going forward.
+message ImportJobRequest {
+  string shard = 1;                      // Shard ID (UUID) where the job should be stored.
+  string id = 2;                         // Required job ID (migration preserves IDs).
+  uint32 priority = 3;                   // Priority from 0-99. Lower is higher priority.
+  int64 enqueue_time_ms = 4;            // Original enqueue time from source system (0 = now).
+  int64 start_at_ms = 5;                // When the next attempt should start (0 = now, only for non-terminal).
+  optional RetryPolicy retry_policy = 6; // Retry configuration.
+  SerializedBytes payload = 7;           // Opaque serialized payload.
+  repeated Limit limits = 8;             // Ordered list of limits.
+  optional string tenant = 9;            // Tenant ID for multi-tenant deployments.
+  map<string, string> metadata = 10;     // Arbitrary key/value metadata.
+  string task_group = 11;               // Task group for organizing tasks.
+  repeated ImportAttempt attempts = 12;  // Historical attempts, all terminal.
+}
+
+// Batch request to import multiple jobs.
+message ImportJobsRequest {
+  repeated ImportJobRequest jobs = 1;
+}
+
+// Result of importing a single job.
+message ImportJobResult {
+  string id = 1;               // The job's ID.
+  bool success = 2;            // Whether the import succeeded.
+  optional string error = 3;   // Error message if import failed.
+  JobStatus status = 4;        // The determined status of the imported job.
+}
+
+// Response containing results for each imported job.
+message ImportJobsResponse {
+  repeated ImportJobResult results = 1;
+}
+
 // The Silo job queue service.
 service Silo {
   // Get cluster topology for client-side routing.
@@ -575,6 +621,12 @@ service Silo {
   // The shard will be handed off to a node that participates in the new ring.
   // Returns the previous and current ring assignments.
   rpc ConfigureShard(ConfigureShardRequest) returns (ConfigureShardResponse);
+
+  // Import jobs from another system with historical attempts.
+  // Unlike Enqueue, ImportJobs accepts completed attempt records and lets Silo
+  // take ownership going forward. Used for migrating workloads from other job queues.
+  // Each job is imported independently; per-job errors are returned in the response.
+  rpc ImportJobs(ImportJobsRequest) returns (ImportJobsResponse);
 
   // Reset all shards owned by this server.
   // WARNING: Destructive operation. Only available in dev mode.

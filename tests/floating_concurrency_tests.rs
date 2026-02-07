@@ -1682,6 +1682,7 @@ async fn floating_limit_refresh_task_lease_expiry_allows_rescheduling() {
         worker_id: decoded_lease.worker_id().to_string(),
         task: decoded_lease.to_task(),
         expiry_ms: expired_ms,
+        started_at_ms: decoded_lease.started_at_ms(),
     };
     let new_val = encode_lease(&new_record).expect("encode lease");
     shard
@@ -1853,6 +1854,7 @@ async fn floating_limit_refresh_task_lease_expiry_preserves_state() {
         worker_id: decoded_lease.worker_id().to_string(),
         task: decoded_lease.to_task(),
         expiry_ms: expired_ms,
+        started_at_ms: decoded_lease.started_at_ms(),
     };
     let new_val = encode_lease(&new_record).expect("encode lease");
     shard

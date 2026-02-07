@@ -240,6 +240,11 @@ impl DecodedLease {
         self.archived().expiry_ms
     }
 
+    /// Get started_at_ms from this lease (when the attempt started)
+    pub fn started_at_ms(&self) -> i64 {
+        self.archived().started_at_ms
+    }
+
     /// Get a reference to the archived task (zero-copy)
     pub fn archived_task(&self) -> &ArchivedTask {
         &self.archived().task

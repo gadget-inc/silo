@@ -306,9 +306,9 @@ export interface JobAttempt {
      */
     status: AttemptStatus; // Current status of the attempt.
     /**
-     * @generated from protobuf field: optional int64 started_at_ms = 5
+     * @generated from protobuf field: int64 started_at_ms = 5
      */
-    startedAtMs?: bigint; // Unix timestamp (ms) when attempt started. Present if running.
+    startedAtMs: bigint; // Unix timestamp (ms) when attempt started. Present for all attempts.
     /**
      * @generated from protobuf field: optional int64 finished_at_ms = 6
      */
@@ -1293,6 +1293,141 @@ export interface ConfigureShardResponse {
     currentRing: string; // The placement ring after the change (empty = default ring).
 }
 /**
+ * A historical attempt record for job import.
+ * All attempts must be in terminal states (no Running).
+ *
+ * @generated from protobuf message silo.v1.ImportAttempt
+ */
+export interface ImportAttempt {
+    /**
+     * @generated from protobuf field: silo.v1.AttemptStatus status = 1
+     */
+    status: AttemptStatus; // Must be terminal (SUCCEEDED, FAILED, or CANCELLED).
+    /**
+     * @generated from protobuf field: int64 started_at_ms = 2
+     */
+    startedAtMs: bigint; // When the attempt started (epoch ms).
+    /**
+     * @generated from protobuf field: int64 finished_at_ms = 3
+     */
+    finishedAtMs: bigint; // When the attempt finished (epoch ms).
+    /**
+     * @generated from protobuf field: optional silo.v1.SerializedBytes result = 4
+     */
+    result?: SerializedBytes; // Present if succeeded.
+    /**
+     * @generated from protobuf field: optional string error_code = 5
+     */
+    errorCode?: string; // Present if failed.
+    /**
+     * @generated from protobuf field: optional silo.v1.SerializedBytes error_data = 6
+     */
+    errorData?: SerializedBytes; // Present if failed.
+}
+/**
+ * Request to import a single job from another system.
+ * Unlike Enqueue, ImportJob accepts historical attempts and lets Silo take ownership going forward.
+ *
+ * @generated from protobuf message silo.v1.ImportJobRequest
+ */
+export interface ImportJobRequest {
+    /**
+     * @generated from protobuf field: string shard = 1
+     */
+    shard: string; // Shard ID (UUID) where the job should be stored.
+    /**
+     * @generated from protobuf field: string id = 2
+     */
+    id: string; // Required job ID (migration preserves IDs).
+    /**
+     * @generated from protobuf field: uint32 priority = 3
+     */
+    priority: number; // Priority from 0-99. Lower is higher priority.
+    /**
+     * @generated from protobuf field: int64 enqueue_time_ms = 4
+     */
+    enqueueTimeMs: bigint; // Original enqueue time from source system (0 = now).
+    /**
+     * @generated from protobuf field: int64 start_at_ms = 5
+     */
+    startAtMs: bigint; // When the next attempt should start (0 = now, only for non-terminal).
+    /**
+     * @generated from protobuf field: optional silo.v1.RetryPolicy retry_policy = 6
+     */
+    retryPolicy?: RetryPolicy; // Retry configuration.
+    /**
+     * @generated from protobuf field: silo.v1.SerializedBytes payload = 7
+     */
+    payload?: SerializedBytes; // Opaque serialized payload.
+    /**
+     * @generated from protobuf field: repeated silo.v1.Limit limits = 8
+     */
+    limits: Limit[]; // Ordered list of limits.
+    /**
+     * @generated from protobuf field: optional string tenant = 9
+     */
+    tenant?: string; // Tenant ID for multi-tenant deployments.
+    /**
+     * @generated from protobuf field: map<string, string> metadata = 10
+     */
+    metadata: {
+        [key: string]: string;
+    }; // Arbitrary key/value metadata.
+    /**
+     * @generated from protobuf field: string task_group = 11
+     */
+    taskGroup: string; // Task group for organizing tasks.
+    /**
+     * @generated from protobuf field: repeated silo.v1.ImportAttempt attempts = 12
+     */
+    attempts: ImportAttempt[]; // Historical attempts, all terminal.
+}
+/**
+ * Batch request to import multiple jobs.
+ *
+ * @generated from protobuf message silo.v1.ImportJobsRequest
+ */
+export interface ImportJobsRequest {
+    /**
+     * @generated from protobuf field: repeated silo.v1.ImportJobRequest jobs = 1
+     */
+    jobs: ImportJobRequest[];
+}
+/**
+ * Result of importing a single job.
+ *
+ * @generated from protobuf message silo.v1.ImportJobResult
+ */
+export interface ImportJobResult {
+    /**
+     * @generated from protobuf field: string id = 1
+     */
+    id: string; // The job's ID.
+    /**
+     * @generated from protobuf field: bool success = 2
+     */
+    success: boolean; // Whether the import succeeded.
+    /**
+     * @generated from protobuf field: optional string error = 3
+     */
+    error?: string; // Error message if import failed.
+    /**
+     * @generated from protobuf field: silo.v1.JobStatus status = 4
+     */
+    status: JobStatus; // The determined status of the imported job.
+}
+/**
+ * Response containing results for each imported job.
+ *
+ * @generated from protobuf message silo.v1.ImportJobsResponse
+ */
+export interface ImportJobsResponse {
+    /**
+     * @generated from protobuf field: repeated silo.v1.ImportJobResult results = 1
+     */
+    results: ImportJobResult[];
+}
+/**
  * Rate limiting algorithm for Gubernator-based limits.
  *
  * @generated from protobuf enum silo.v1.GubernatorAlgorithm
@@ -2193,7 +2328,7 @@ class JobAttempt$Type extends MessageType<JobAttempt> {
             { no: 2, name: "attempt_number", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
             { no: 3, name: "task_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
             { no: 4, name: "status", kind: "enum", T: () => ["silo.v1.AttemptStatus", AttemptStatus, "ATTEMPT_STATUS_"] },
-            { no: 5, name: "started_at_ms", kind: "scalar", opt: true, T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 5, name: "started_at_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
             { no: 6, name: "finished_at_ms", kind: "scalar", opt: true, T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
             { no: 7, name: "result", kind: "message", T: () => SerializedBytes },
             { no: 8, name: "error_code", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
@@ -2206,6 +2341,7 @@ class JobAttempt$Type extends MessageType<JobAttempt> {
         message.attemptNumber = 0;
         message.taskId = "";
         message.status = 0;
+        message.startedAtMs = 0n;
         if (value !== undefined)
             reflectionMergePartial<JobAttempt>(this, message, value);
         return message;
@@ -2227,7 +2363,7 @@ class JobAttempt$Type extends MessageType<JobAttempt> {
                 case /* silo.v1.AttemptStatus status */ 4:
                     message.status = reader.int32();
                     break;
-                case /* optional int64 started_at_ms */ 5:
+                case /* int64 started_at_ms */ 5:
                     message.startedAtMs = reader.int64().toBigInt();
                     break;
                 case /* optional int64 finished_at_ms */ 6:
@@ -2266,8 +2402,8 @@ class JobAttempt$Type extends MessageType<JobAttempt> {
         /* silo.v1.AttemptStatus status = 4; */
         if (message.status !== 0)
             writer.tag(4, WireType.Varint).int32(message.status);
-        /* optional int64 started_at_ms = 5; */
-        if (message.startedAtMs !== undefined)
+        /* int64 started_at_ms = 5; */
+        if (message.startedAtMs !== 0n)
             writer.tag(5, WireType.Varint).int64(message.startedAtMs);
         /* optional int64 finished_at_ms = 6; */
         if (message.finishedAtMs !== undefined)
@@ -5375,6 +5511,402 @@ class ConfigureShardResponse$Type extends MessageType<ConfigureShardResponse> {
  * @generated MessageType for protobuf message silo.v1.ConfigureShardResponse
  */
 export const ConfigureShardResponse = new ConfigureShardResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class ImportAttempt$Type extends MessageType<ImportAttempt> {
+    constructor() {
+        super("silo.v1.ImportAttempt", [
+            { no: 1, name: "status", kind: "enum", T: () => ["silo.v1.AttemptStatus", AttemptStatus, "ATTEMPT_STATUS_"] },
+            { no: 2, name: "started_at_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 3, name: "finished_at_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 4, name: "result", kind: "message", T: () => SerializedBytes },
+            { no: 5, name: "error_code", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
+            { no: 6, name: "error_data", kind: "message", T: () => SerializedBytes }
+        ]);
+    }
+    create(value?: PartialMessage<ImportAttempt>): ImportAttempt {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.status = 0;
+        message.startedAtMs = 0n;
+        message.finishedAtMs = 0n;
+        if (value !== undefined)
+            reflectionMergePartial<ImportAttempt>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: ImportAttempt): ImportAttempt {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* silo.v1.AttemptStatus status */ 1:
+                    message.status = reader.int32();
+                    break;
+                case /* int64 started_at_ms */ 2:
+                    message.startedAtMs = reader.int64().toBigInt();
+                    break;
+                case /* int64 finished_at_ms */ 3:
+                    message.finishedAtMs = reader.int64().toBigInt();
+                    break;
+                case /* optional silo.v1.SerializedBytes result */ 4:
+                    message.result = SerializedBytes.internalBinaryRead(reader, reader.uint32(), options, message.result);
+                    break;
+                case /* optional string error_code */ 5:
+                    message.errorCode = reader.string();
+                    break;
+                case /* optional silo.v1.SerializedBytes error_data */ 6:
+                    message.errorData = SerializedBytes.internalBinaryRead(reader, reader.uint32(), options, message.errorData);
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: ImportAttempt, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* silo.v1.AttemptStatus status = 1; */
+        if (message.status !== 0)
+            writer.tag(1, WireType.Varint).int32(message.status);
+        /* int64 started_at_ms = 2; */
+        if (message.startedAtMs !== 0n)
+            writer.tag(2, WireType.Varint).int64(message.startedAtMs);
+        /* int64 finished_at_ms = 3; */
+        if (message.finishedAtMs !== 0n)
+            writer.tag(3, WireType.Varint).int64(message.finishedAtMs);
+        /* optional silo.v1.SerializedBytes result = 4; */
+        if (message.result)
+            SerializedBytes.internalBinaryWrite(message.result, writer.tag(4, WireType.LengthDelimited).fork(), options).join();
+        /* optional string error_code = 5; */
+        if (message.errorCode !== undefined)
+            writer.tag(5, WireType.LengthDelimited).string(message.errorCode);
+        /* optional silo.v1.SerializedBytes error_data = 6; */
+        if (message.errorData)
+            SerializedBytes.internalBinaryWrite(message.errorData, writer.tag(6, WireType.LengthDelimited).fork(), options).join();
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.ImportAttempt
+ */
+export const ImportAttempt = new ImportAttempt$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class ImportJobRequest$Type extends MessageType<ImportJobRequest> {
+    constructor() {
+        super("silo.v1.ImportJobRequest", [
+            { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 3, name: "priority", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
+            { no: 4, name: "enqueue_time_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 5, name: "start_at_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 6, name: "retry_policy", kind: "message", T: () => RetryPolicy },
+            { no: 7, name: "payload", kind: "message", T: () => SerializedBytes },
+            { no: 8, name: "limits", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => Limit },
+            { no: 9, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
+            { no: 10, name: "metadata", kind: "map", K: 9 /*ScalarType.STRING*/, V: { kind: "scalar", T: 9 /*ScalarType.STRING*/ } },
+            { no: 11, name: "task_group", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 12, name: "attempts", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => ImportAttempt }
+        ]);
+    }
+    create(value?: PartialMessage<ImportJobRequest>): ImportJobRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.shard = "";
+        message.id = "";
+        message.priority = 0;
+        message.enqueueTimeMs = 0n;
+        message.startAtMs = 0n;
+        message.limits = [];
+        message.metadata = {};
+        message.taskGroup = "";
+        message.attempts = [];
+        if (value !== undefined)
+            reflectionMergePartial<ImportJobRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: ImportJobRequest): ImportJobRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string shard */ 1:
+                    message.shard = reader.string();
+                    break;
+                case /* string id */ 2:
+                    message.id = reader.string();
+                    break;
+                case /* uint32 priority */ 3:
+                    message.priority = reader.uint32();
+                    break;
+                case /* int64 enqueue_time_ms */ 4:
+                    message.enqueueTimeMs = reader.int64().toBigInt();
+                    break;
+                case /* int64 start_at_ms */ 5:
+                    message.startAtMs = reader.int64().toBigInt();
+                    break;
+                case /* optional silo.v1.RetryPolicy retry_policy */ 6:
+                    message.retryPolicy = RetryPolicy.internalBinaryRead(reader, reader.uint32(), options, message.retryPolicy);
+                    break;
+                case /* silo.v1.SerializedBytes payload */ 7:
+                    message.payload = SerializedBytes.internalBinaryRead(reader, reader.uint32(), options, message.payload);
+                    break;
+                case /* repeated silo.v1.Limit limits */ 8:
+                    message.limits.push(Limit.internalBinaryRead(reader, reader.uint32(), options));
+                    break;
+                case /* optional string tenant */ 9:
+                    message.tenant = reader.string();
+                    break;
+                case /* map<string, string> metadata */ 10:
+                    this.binaryReadMap10(message.metadata, reader, options);
+                    break;
+                case /* string task_group */ 11:
+                    message.taskGroup = reader.string();
+                    break;
+                case /* repeated silo.v1.ImportAttempt attempts */ 12:
+                    message.attempts.push(ImportAttempt.internalBinaryRead(reader, reader.uint32(), options));
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    private binaryReadMap10(map: ImportJobRequest["metadata"], reader: IBinaryReader, options: BinaryReadOptions): void {
+        let len = reader.uint32(), end = reader.pos + len, key: keyof ImportJobRequest["metadata"] | undefined, val: ImportJobRequest["metadata"][any] | undefined;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case 1:
+                    key = reader.string();
+                    break;
+                case 2:
+                    val = reader.string();
+                    break;
+                default: throw new globalThis.Error("unknown map entry field for silo.v1.ImportJobRequest.metadata");
+            }
+        }
+        map[key ?? ""] = val ?? "";
+    }
+    internalBinaryWrite(message: ImportJobRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string shard = 1; */
+        if (message.shard !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.shard);
+        /* string id = 2; */
+        if (message.id !== "")
+            writer.tag(2, WireType.LengthDelimited).string(message.id);
+        /* uint32 priority = 3; */
+        if (message.priority !== 0)
+            writer.tag(3, WireType.Varint).uint32(message.priority);
+        /* int64 enqueue_time_ms = 4; */
+        if (message.enqueueTimeMs !== 0n)
+            writer.tag(4, WireType.Varint).int64(message.enqueueTimeMs);
+        /* int64 start_at_ms = 5; */
+        if (message.startAtMs !== 0n)
+            writer.tag(5, WireType.Varint).int64(message.startAtMs);
+        /* optional silo.v1.RetryPolicy retry_policy = 6; */
+        if (message.retryPolicy)
+            RetryPolicy.internalBinaryWrite(message.retryPolicy, writer.tag(6, WireType.LengthDelimited).fork(), options).join();
+        /* silo.v1.SerializedBytes payload = 7; */
+        if (message.payload)
+            SerializedBytes.internalBinaryWrite(message.payload, writer.tag(7, WireType.LengthDelimited).fork(), options).join();
+        /* repeated silo.v1.Limit limits = 8; */
+        for (let i = 0; i < message.limits.length; i++)
+            Limit.internalBinaryWrite(message.limits[i], writer.tag(8, WireType.LengthDelimited).fork(), options).join();
+        /* optional string tenant = 9; */
+        if (message.tenant !== undefined)
+            writer.tag(9, WireType.LengthDelimited).string(message.tenant);
+        /* map<string, string> metadata = 10; */
+        for (let k of globalThis.Object.keys(message.metadata))
+            writer.tag(10, WireType.LengthDelimited).fork().tag(1, WireType.LengthDelimited).string(k).tag(2, WireType.LengthDelimited).string(message.metadata[k]).join();
+        /* string task_group = 11; */
+        if (message.taskGroup !== "")
+            writer.tag(11, WireType.LengthDelimited).string(message.taskGroup);
+        /* repeated silo.v1.ImportAttempt attempts = 12; */
+        for (let i = 0; i < message.attempts.length; i++)
+            ImportAttempt.internalBinaryWrite(message.attempts[i], writer.tag(12, WireType.LengthDelimited).fork(), options).join();
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.ImportJobRequest
+ */
+export const ImportJobRequest = new ImportJobRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class ImportJobsRequest$Type extends MessageType<ImportJobsRequest> {
+    constructor() {
+        super("silo.v1.ImportJobsRequest", [
+            { no: 1, name: "jobs", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => ImportJobRequest }
+        ]);
+    }
+    create(value?: PartialMessage<ImportJobsRequest>): ImportJobsRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.jobs = [];
+        if (value !== undefined)
+            reflectionMergePartial<ImportJobsRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: ImportJobsRequest): ImportJobsRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* repeated silo.v1.ImportJobRequest jobs */ 1:
+                    message.jobs.push(ImportJobRequest.internalBinaryRead(reader, reader.uint32(), options));
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: ImportJobsRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* repeated silo.v1.ImportJobRequest jobs = 1; */
+        for (let i = 0; i < message.jobs.length; i++)
+            ImportJobRequest.internalBinaryWrite(message.jobs[i], writer.tag(1, WireType.LengthDelimited).fork(), options).join();
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.ImportJobsRequest
+ */
+export const ImportJobsRequest = new ImportJobsRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class ImportJobResult$Type extends MessageType<ImportJobResult> {
+    constructor() {
+        super("silo.v1.ImportJobResult", [
+            { no: 1, name: "id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "success", kind: "scalar", T: 8 /*ScalarType.BOOL*/ },
+            { no: 3, name: "error", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
+            { no: 4, name: "status", kind: "enum", T: () => ["silo.v1.JobStatus", JobStatus, "JOB_STATUS_"] }
+        ]);
+    }
+    create(value?: PartialMessage<ImportJobResult>): ImportJobResult {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.id = "";
+        message.success = false;
+        message.status = 0;
+        if (value !== undefined)
+            reflectionMergePartial<ImportJobResult>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: ImportJobResult): ImportJobResult {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string id */ 1:
+                    message.id = reader.string();
+                    break;
+                case /* bool success */ 2:
+                    message.success = reader.bool();
+                    break;
+                case /* optional string error */ 3:
+                    message.error = reader.string();
+                    break;
+                case /* silo.v1.JobStatus status */ 4:
+                    message.status = reader.int32();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: ImportJobResult, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string id = 1; */
+        if (message.id !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.id);
+        /* bool success = 2; */
+        if (message.success !== false)
+            writer.tag(2, WireType.Varint).bool(message.success);
+        /* optional string error = 3; */
+        if (message.error !== undefined)
+            writer.tag(3, WireType.LengthDelimited).string(message.error);
+        /* silo.v1.JobStatus status = 4; */
+        if (message.status !== 0)
+            writer.tag(4, WireType.Varint).int32(message.status);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.ImportJobResult
+ */
+export const ImportJobResult = new ImportJobResult$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class ImportJobsResponse$Type extends MessageType<ImportJobsResponse> {
+    constructor() {
+        super("silo.v1.ImportJobsResponse", [
+            { no: 1, name: "results", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => ImportJobResult }
+        ]);
+    }
+    create(value?: PartialMessage<ImportJobsResponse>): ImportJobsResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.results = [];
+        if (value !== undefined)
+            reflectionMergePartial<ImportJobsResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: ImportJobsResponse): ImportJobsResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* repeated silo.v1.ImportJobResult results */ 1:
+                    message.results.push(ImportJobResult.internalBinaryRead(reader, reader.uint32(), options));
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: ImportJobsResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* repeated silo.v1.ImportJobResult results = 1; */
+        for (let i = 0; i < message.results.length; i++)
+            ImportJobResult.internalBinaryWrite(message.results[i], writer.tag(1, WireType.LengthDelimited).fork(), options).join();
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.ImportJobsResponse
+ */
+export const ImportJobsResponse = new ImportJobsResponse$Type();
 /**
  * @generated ServiceType for protobuf service silo.v1.Silo
  */
@@ -5398,5 +5930,6 @@ export const Silo = new ServiceType("silo.v1.Silo", [
     { name: "RequestSplit", options: {}, I: RequestSplitRequest, O: RequestSplitResponse },
     { name: "GetSplitStatus", options: {}, I: GetSplitStatusRequest, O: GetSplitStatusResponse },
     { name: "ConfigureShard", options: {}, I: ConfigureShardRequest, O: ConfigureShardResponse },
+    { name: "ImportJobs", options: {}, I: ImportJobsRequest, O: ImportJobsResponse },
     { name: "ResetShards", options: {}, I: ResetShardsRequest, O: ResetShardsResponse }
 ]);
