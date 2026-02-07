@@ -3,16 +3,16 @@
 //! Allows future-scheduled jobs to be expedited to run immediately,
 //! skipping the scheduled start time or retry backoff delay.
 
-use slatedb::ErrorKind as SlateErrorKind;
 use slatedb::IsolationLevel;
 
 use crate::codec::{decode_task, encode_task};
 use crate::job::JobStatusKind;
-use crate::job_store_shard::helpers::{decode_job_status_owned, now_epoch_ms};
+use crate::job_store_shard::helpers::{
+    decode_job_status_owned, now_epoch_ms, retry_on_txn_conflict,
+};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{job_cancelled_key, job_status_key, task_key};
 use crate::task::Task;
-use tracing::debug;
 
 /// Error returned when a job cannot be expedited because it's not in an expeditable state.
 #[derive(Debug, Clone)]
@@ -45,33 +45,7 @@ impl JobStoreShard {
     ///
     /// Uses a transaction with optimistic concurrency control to detect if the job state changes during the expedite flow. Retries automatically on conflict.
     pub async fn expedite_job(&self, tenant: &str, id: &str) -> Result<(), JobStoreShardError> {
-        const MAX_RETRIES: usize = 5;
-
-        for attempt in 0..MAX_RETRIES {
-            match self.expedite_job_inner(tenant, id).await {
-                Ok(()) => return Ok(()),
-                Err(JobStoreShardError::Slate(ref e))
-                    if e.kind() == SlateErrorKind::Transaction =>
-                {
-                    // Transaction conflict - retry with exponential backoff
-                    if attempt + 1 < MAX_RETRIES {
-                        let delay_ms = 10 * (1 << attempt); // 10ms, 20ms, 40ms, 80ms
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        debug!(
-                            job_id = %id,
-                            attempt = attempt + 1,
-                            "expedite_job transaction conflict, retrying"
-                        );
-                        continue;
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        Err(JobStoreShardError::TransactionConflict(
-            "expedite_job".to_string(),
-        ))
+        retry_on_txn_conflict("expedite_job", || self.expedite_job_inner(tenant, id)).await
     }
 
     /// Inner implementation of expedite_job that runs within a single transaction attempt.

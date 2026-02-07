@@ -19,6 +19,41 @@ use crate::keys::{idx_metadata_key, idx_status_time_key, job_info_key, job_statu
 use crate::retry::RetryPolicy;
 use crate::task::{GubernatorRateLimitData, Task};
 
+/// Whether a concurrency grant was obtained or the job was queued for later.
+enum GrantResult {
+    /// Slot granted immediately; caller should advance to the next limit.
+    Granted,
+    /// Not granted; a RequestTicket/request was written. Caller should return.
+    Queued,
+}
+
+/// Process the outcome of a `handle_enqueue` call, updating shared loop state.
+/// Returns `Granted` if the caller should continue to the next limit, or `Queued`
+/// if the caller should return early.
+fn record_grant_outcome(
+    outcome: Option<RequestTicketOutcome>,
+    queue_key: &str,
+    grants: &mut Vec<(String, String)>,
+    current_task_id: &mut String,
+    current_held_queues: &mut Vec<String>,
+    current_index: &mut usize,
+) -> GrantResult {
+    match outcome {
+        None => {
+            // Granted immediately - record grant and continue to next limit
+            grants.push((queue_key.to_string(), current_task_id.clone()));
+            current_held_queues.push(queue_key.to_string());
+            *current_index += 1;
+            *current_task_id = Uuid::new_v4().to_string();
+            GrantResult::Granted
+        }
+        Some(_) => {
+            // Not granted - RequestTicket was created by handle_enqueue
+            GrantResult::Queued
+        }
+    }
+}
+
 impl JobStoreShard {
     /// Enqueue a new job with optional limits (concurrency and/or rate limits).
     /// The payload is stored as raw bytes (MessagePack-encoded by the client).
@@ -443,19 +478,18 @@ impl JobStoreShard {
                         )
                         .await?;
 
-                    match outcome {
-                        None => {
-                            // Granted immediately - record grant and continue to next limit
-                            grants.push((cl.key.clone(), current_task_id.clone()));
-                            current_held_queues.push(cl.key.clone());
-                            current_index += 1;
-                            current_task_id = Uuid::new_v4().to_string();
-                            // Continue loop to process next limit
-                        }
-                        Some(_) => {
-                            // Not granted - RequestTicket was created by handle_enqueue
-                            return Ok(grants);
-                        }
+                    if matches!(
+                        record_grant_outcome(
+                            outcome,
+                            &cl.key,
+                            &mut grants,
+                            &mut current_task_id,
+                            &mut current_held_queues,
+                            &mut current_index,
+                        ),
+                        GrantResult::Queued
+                    ) {
+                        return Ok(grants);
                     }
                 }
 
@@ -510,19 +544,18 @@ impl JobStoreShard {
                         )?;
                     }
 
-                    match outcome {
-                        None => {
-                            // Granted immediately - record grant and continue to next limit
-                            grants.push((fl.key.clone(), current_task_id.clone()));
-                            current_held_queues.push(fl.key.clone());
-                            current_index += 1;
-                            current_task_id = Uuid::new_v4().to_string();
-                            // Continue loop to process next limit
-                        }
-                        Some(_) => {
-                            // Not granted - RequestTicket was created by handle_enqueue
-                            return Ok(grants);
-                        }
+                    if matches!(
+                        record_grant_outcome(
+                            outcome,
+                            &fl.key,
+                            &mut grants,
+                            &mut current_task_id,
+                            &mut current_held_queues,
+                            &mut current_index,
+                        ),
+                        GrantResult::Queued
+                    ) {
+                        return Ok(grants);
                     }
                 }
 

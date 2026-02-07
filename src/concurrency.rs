@@ -272,27 +272,31 @@ impl ConcurrencyCounts {
         limit: usize,
         job_id: &str,
     ) -> bool {
-        let mut h = self.holders.lock().unwrap();
         let key = format!("{}|{}", tenant, queue);
-        let set = h.entry(key).or_default();
+        let reserved = {
+            let mut h = self.holders.lock().unwrap();
+            let set = h.entry(key).or_default();
 
-        // Check if we're at capacity
-        if set.len() >= limit {
-            return false;
+            // Check if we're at capacity
+            if set.len() >= limit {
+                return false;
+            }
+
+            // Reserve the slot atomically
+            set.insert(task_id.to_string());
+            true
+        };
+
+        if reserved {
+            dst_events::emit(DstEvent::ConcurrencyTicketGranted {
+                tenant: tenant.to_string(),
+                queue: queue.to_string(),
+                task_id: task_id.to_string(),
+                job_id: job_id.to_string(),
+            });
         }
 
-        // Reserve the slot atomically
-        set.insert(task_id.to_string());
-
-        // Emit DST event for instrumentation
-        dst_events::emit(DstEvent::ConcurrencyTicketGranted {
-            tenant: tenant.to_string(),
-            queue: queue.to_string(),
-            task_id: task_id.to_string(),
-            job_id: job_id.to_string(),
-        });
-
-        true
+        reserved
     }
 
     /// Mark a queue as hydrated without actually scanning storage.
@@ -323,8 +327,8 @@ impl ConcurrencyCounts {
 
     /// Release a reservation made by `try_reserve` if the DB write fails.
     pub fn release_reservation(&self, tenant: &str, queue: &str, task_id: &str) {
-        let mut h = self.holders.lock().unwrap();
         let key = format!("{}|{}", tenant, queue);
+        let mut h = self.holders.lock().unwrap();
         if let Some(set) = h.get_mut(&key) {
             set.remove(task_id);
         }
@@ -341,11 +345,13 @@ impl ConcurrencyCounts {
         reserve_task_id: &str,
         reserve_job_id: &str,
     ) {
-        let mut h = self.holders.lock().unwrap();
         let key = format!("{}|{}", tenant, queue);
-        let set = h.entry(key).or_default();
-        set.remove(release_task_id);
-        set.insert(reserve_task_id.to_string());
+        {
+            let mut h = self.holders.lock().unwrap();
+            let set = h.entry(key).or_default();
+            set.remove(release_task_id);
+            set.insert(reserve_task_id.to_string());
+        }
 
         // Emit DST events for instrumentation
         dst_events::emit(DstEvent::ConcurrencyTicketReleased {
@@ -364,10 +370,12 @@ impl ConcurrencyCounts {
     /// Atomically release a task without granting to another.
     /// Used when there are no pending requests to grant to.
     pub fn atomic_release(&self, tenant: &str, queue: &str, task_id: &str) {
-        let mut h = self.holders.lock().unwrap();
         let key = format!("{}|{}", tenant, queue);
-        if let Some(set) = h.get_mut(&key) {
-            set.remove(task_id);
+        {
+            let mut h = self.holders.lock().unwrap();
+            if let Some(set) = h.get_mut(&key) {
+                set.remove(task_id);
+            }
         }
 
         // Emit DST event for instrumentation
@@ -387,8 +395,8 @@ impl ConcurrencyCounts {
         released_task_id: &str,
         reserved_task_id: &str,
     ) {
-        let mut h = self.holders.lock().unwrap();
         let key = format!("{}|{}", tenant, queue);
+        let mut h = self.holders.lock().unwrap();
         let set = h.entry(key).or_default();
         set.remove(reserved_task_id);
         set.insert(released_task_id.to_string());
@@ -397,8 +405,8 @@ impl ConcurrencyCounts {
     /// Rollback a release operation if DB write fails.
     /// Re-adds the released task.
     pub fn rollback_release(&self, tenant: &str, queue: &str, task_id: &str) {
-        let mut h = self.holders.lock().unwrap();
         let key = format!("{}|{}", tenant, queue);
+        let mut h = self.holders.lock().unwrap();
         let set = h.entry(key).or_default();
         set.insert(task_id.to_string());
     }
