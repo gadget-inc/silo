@@ -1168,6 +1168,17 @@ mod splitter_unit_tests {
             shard.placement_ring = current.clone();
             Ok((previous, current))
         }
+
+        async fn force_release_shard_lease(
+            &self,
+            _shard_id: &ShardId,
+        ) -> Result<(), CoordinationError> {
+            Ok(())
+        }
+
+        async fn reclaim_existing_leases(&self) -> Result<Vec<ShardId>, CoordinationError> {
+            Ok(vec![])
+        }
     }
 
     #[async_trait]

@@ -563,6 +563,13 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         let safety_reconcile_interval = Duration::from_secs(30);
         let mut safety_reconcile_timer = tokio::time::interval(safety_reconcile_interval);
 
+        // Reclaim shards from a previous run before initial reconciliation.
+        // This opens shards we still own (triggering WAL recovery) and installs
+        // guards in Held state so reconciliation can manage them normally.
+        if let Err(e) = self.reclaim_and_open_shards().await {
+            warn!(node_id = %self.base.node_id, error = %e, "failed to reclaim shards from previous run");
+        }
+
         // Do initial reconciliation immediately
         debug!(node_id = %self.base.node_id, "performing initial shard reconciliation");
         if let Err(e) = self.reconcile_shards().await {
@@ -987,6 +994,126 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         )))
     }
 
+    /// Scan for shard leases held by this node from a previous run, returning
+    /// rich metadata (resource_version, uid) needed to create reclaimed guards.
+    async fn reclaim_existing_leases_with_metadata(
+        &self,
+    ) -> Result<Vec<(ShardId, String, Option<String>)>, CoordinationError> {
+        let label_selector = format!(
+            "silo.dev/type=shard,silo.dev/cluster={}",
+            self.cluster_prefix
+        );
+
+        let lease_list = self
+            .backend
+            .list_leases(&self.namespace, &label_selector)
+            .await?;
+
+        let mut reclaimed = Vec::new();
+        for lease in lease_list {
+            let holder = lease.spec.as_ref().and_then(|s| s.holder_identity.as_ref());
+            let is_ours = holder.map(|h| h == &self.base.node_id).unwrap_or(false);
+
+            if is_ours
+                && let Some(shard_id_str) = lease
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|l| l.get("silo.dev/shard"))
+                && let Ok(shard_id) = ShardId::parse(shard_id_str)
+            {
+                let rv = lease.metadata.resource_version.clone().unwrap_or_default();
+                let uid = lease.metadata.uid.clone();
+                reclaimed.push((shard_id, rv, uid));
+            }
+        }
+
+        Ok(reclaimed)
+    }
+
+    /// Reclaim shards from a previous run and open them before normal reconciliation.
+    ///
+    /// This is called once at startup to recover shards this node still owns
+    /// from before a crash/restart. Each reclaimed shard is opened via the factory
+    /// (triggering SlateDB WAL recovery) and a guard in `Held` state is installed.
+    async fn reclaim_and_open_shards(&self) -> Result<(), CoordinationError> {
+        let reclaimed = self.reclaim_existing_leases_with_metadata().await?;
+        if reclaimed.is_empty() {
+            return Ok(());
+        }
+
+        let mut opened_count = 0u32;
+
+        for (shard_id, rv, uid) in &reclaimed {
+            // Look up range from shard map (short-lived lock)
+            let range = {
+                let shard_map = self.base.shard_map.lock().await;
+                match shard_map.get_shard(shard_id) {
+                    Some(info) => info.range.clone(),
+                    None => {
+                        warn!(shard_id = %shard_id, "reclaim: shard not found in shard map, skipping");
+                        continue;
+                    }
+                }
+            };
+
+            let shard = match self.base.factory.open(shard_id, &range).await {
+                Ok(shard) => shard,
+                Err(e) => {
+                    tracing::error!(shard_id = %shard_id, error = %e, "reclaim: failed to open shard, skipping");
+                    continue;
+                }
+            };
+
+            shard.maybe_spawn_background_cleanup(range);
+
+            {
+                let mut owned = self.base.owned.lock().await;
+                owned.insert(*shard_id);
+            }
+
+            let shard_available = self.get_shard_available_notifier(*shard_id).await;
+            let guard = K8sShardGuard::new_reclaimed(
+                *shard_id,
+                self.backend.clone(),
+                self.namespace.clone(),
+                self.cluster_prefix.clone(),
+                self.base.node_id.clone(),
+                self.lease_duration_secs,
+                self.base.shutdown_rx.clone(),
+                shard_available,
+                rv.clone(),
+                uid.clone(),
+            );
+            let runner = guard.clone();
+            let owned_arc = self.base.owned.clone();
+            let factory = self.base.factory.clone();
+            let shard_map_arc = self.base.shard_map.clone();
+            let coordinator: Arc<dyn Coordinator> = Arc::new(self.clone());
+            tokio::spawn(async move {
+                runner
+                    .run(owned_arc, factory, shard_map_arc, coordinator)
+                    .await
+            });
+
+            {
+                let mut guards = self.shard_guards.lock().await;
+                guards.insert(*shard_id, guard);
+            }
+
+            opened_count += 1;
+        }
+
+        if opened_count > 0 {
+            info!(
+                count = opened_count,
+                "reclaimed and opened shards from previous run"
+            );
+        }
+
+        Ok(())
+    }
+
     /// Update the shard map ConfigMap after a split with retry logic.
     async fn update_shard_map_for_split(
         &self,
@@ -1285,6 +1412,80 @@ impl<B: K8sBackend> Coordinator for K8sCoordinator<B> {
         })
         .await
     }
+
+    async fn force_release_shard_lease(&self, shard_id: &ShardId) -> Result<(), CoordinationError> {
+        let lease_name = keys::k8s_shard_lease_name(&self.cluster_prefix, shard_id);
+        let now = Utc::now();
+
+        let existing = self
+            .backend
+            .get_lease(&self.namespace, &lease_name)
+            .await?
+            .ok_or(CoordinationError::ShardNotFound(*shard_id))?;
+
+        let current_rv = existing
+            .metadata
+            .resource_version
+            .as_ref()
+            .ok_or_else(|| CoordinationError::BackendError("no resourceVersion".into()))?;
+
+        // Unconditionally clear the holder identity regardless of who holds it
+        let updated_lease = Lease {
+            metadata: kube::api::ObjectMeta {
+                name: Some(lease_name.clone()),
+                namespace: Some(self.namespace.clone()),
+                resource_version: Some(current_rv.clone()),
+                uid: existing.metadata.uid.clone(),
+                labels: existing.metadata.labels.clone(),
+                ..Default::default()
+            },
+            spec: Some(k8s_openapi::api::coordination::v1::LeaseSpec {
+                holder_identity: Some(String::new()),
+                lease_duration_seconds: Some(self.lease_duration_secs),
+                acquire_time: existing.spec.as_ref().and_then(|s| s.acquire_time.clone()),
+                renew_time: Some(MicroTime(now)),
+                ..Default::default()
+            }),
+        };
+
+        self.backend
+            .replace_lease(&self.namespace, &lease_name, &updated_lease)
+            .await?;
+
+        info!(shard_id = %shard_id, "force-released shard lease");
+        Ok(())
+    }
+
+    async fn reclaim_existing_leases(&self) -> Result<Vec<ShardId>, CoordinationError> {
+        let label_selector = format!(
+            "silo.dev/type=shard,silo.dev/cluster={}",
+            self.cluster_prefix
+        );
+
+        let lease_list = self
+            .backend
+            .list_leases(&self.namespace, &label_selector)
+            .await?;
+
+        let mut reclaimed = Vec::new();
+        for lease in lease_list {
+            let holder = lease.spec.as_ref().and_then(|s| s.holder_identity.as_ref());
+            let is_ours = holder.map(|h| h == &self.base.node_id).unwrap_or(false);
+
+            if is_ours
+                && let Some(shard_id_str) = lease
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|l| l.get("silo.dev/shard"))
+                && let Ok(shard_id) = ShardId::parse(shard_id_str)
+            {
+                reclaimed.push(shard_id);
+            }
+        }
+
+        Ok(reclaimed)
+    }
 }
 
 /// State for a shard guard, including the resourceVersion for fencing
@@ -1342,6 +1543,42 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                 phase: ShardPhase::Idle,
                 resource_version: None,
                 lease_uid: None,
+            }),
+            notify: Notify::new(),
+            shutdown,
+            shard_available,
+        })
+    }
+
+    /// Create a guard already in Held state for a shard reclaimed from a previous run.
+    ///
+    /// The guard starts in `Held` phase with `desired: true`, meaning it will sit
+    /// in the `Idle | Held` wait arm until reconciliation decides what to do with it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_reclaimed(
+        shard_id: ShardId,
+        backend: B,
+        namespace: String,
+        cluster_prefix: String,
+        node_id: String,
+        lease_duration_secs: i32,
+        shutdown: watch::Receiver<bool>,
+        shard_available: Arc<Notify>,
+        resource_version: String,
+        lease_uid: Option<String>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            shard_id,
+            backend,
+            namespace,
+            cluster_prefix,
+            node_id,
+            lease_duration_secs,
+            state: Mutex::new(ShardState {
+                desired: true,
+                phase: ShardPhase::Held,
+                resource_version: Some(resource_version),
+                lease_uid,
             }),
             notify: Notify::new(),
             shutdown,
@@ -1550,14 +1787,8 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                                 });
                                 info!(shard_id = %self.shard_id, rv = %rv, attempts = attempt, "k8s shard: acquired and opened");
 
-                                // Start renewal loop
-                                self.clone()
-                                    .run_renewal_loop(
-                                        owned_arc.clone(),
-                                        factory.clone(),
-                                        &lease_name,
-                                    )
-                                    .await;
+                                // Permanent lease - no renewal loop needed.
+                                // The lease persists until explicitly released.
                                 break;
                             }
                             Err(e) => {
@@ -1749,21 +1980,12 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                 let existing_uid = existing.metadata.uid.clone();
                 let spec = existing.spec.as_ref();
                 let holder = spec.and_then(|s| s.holder_identity.as_ref());
-                let renew_time = spec
-                    .and_then(|s| s.renew_time.as_ref())
-                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t.0.to_rfc3339()).ok());
-                let duration_secs = spec
-                    .and_then(|s| s.lease_duration_seconds)
-                    .unwrap_or(self.lease_duration_secs);
 
-                let is_expired = renew_time
-                    .map(|rt| now > rt + chrono::Duration::seconds(duration_secs as i64))
-                    .unwrap_or(true);
-
-                // Check if holder is empty (released) or expired or already ours
+                // Permanent leases: only acquire if holder is empty (released/force-released)
+                // or already ours (reclaim after restart). No expiry-based takeover.
                 let holder_is_empty = holder.map(|h| h.is_empty()).unwrap_or(true);
                 let is_ours = holder.map(|h| h == &self.node_id).unwrap_or(false);
-                let can_acquire = holder_is_empty || is_expired || is_ours;
+                let can_acquire = holder_is_empty || is_ours;
 
                 if can_acquire {
                     // Use JSON Patch with test operation for true CAS
@@ -1817,12 +2039,11 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                     return Ok((new_rv, result.metadata.uid));
                 }
 
-                // Lease is held by someone else and not expired
+                // Permanent lease: held by someone else, cannot acquire
                 debug!(
                     shard_id = %self.shard_id,
                     holder = ?holder,
-                    is_expired,
-                    "try_acquire_lease_cas: lease held by another node"
+                    "try_acquire_lease_cas: lease held by another node (permanent lease)"
                 );
                 Err(CoordinationError::BackendError(
                     "lease held by another node".into(),
@@ -1939,153 +2160,6 @@ impl<B: K8sBackend> K8sShardGuard<B> {
             new_rv = %new_rv,
             "release_lease_cas: cleared holder"
         );
-        Ok(new_rv)
-    }
-
-    async fn run_renewal_loop(
-        self: Arc<Self>,
-        owned_arc: Arc<Mutex<HashSet<ShardId>>>,
-        factory: Arc<ShardFactory>,
-        lease_name: &str,
-    ) {
-        let renew_interval = Duration::from_secs((self.lease_duration_secs / 3).max(1) as u64);
-
-        loop {
-            // Wait for renewal interval, but wake up early if notified
-            tokio::select! {
-                _ = tokio::time::sleep(renew_interval) => {}
-                _ = self.notify.notified() => {}
-            }
-
-            let (phase, desired, expected_rv) = {
-                let st = self.state.lock().await;
-                (st.phase, st.desired, st.resource_version.clone())
-            };
-
-            // Exit if no longer held, or if we should release
-            if phase != ShardPhase::Held || !desired {
-                break;
-            }
-
-            if *self.shutdown.borrow() {
-                break;
-            }
-
-            if expected_rv.is_none() {
-                warn!(
-                    shard_id = %self.shard_id,
-                    "renewal loop: no resourceVersion, exiting"
-                );
-                break;
-            }
-
-            // [SILO-COORD-INV-4] Renew with CAS to detect if we lost the lease.
-            // If renewal fails (CAS conflict), we've lost ownership - this prevents
-            // a "flapped" node (one that lost connectivity) from continuing to serve
-            // requests after another node has acquired the shard.
-            let renew_timeout = Duration::from_secs(5);
-            let renew_result = match tokio::time::timeout(
-                renew_timeout,
-                self.renew_lease_cas(lease_name),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    warn!(shard_id = %self.shard_id, "timed out renewing shard lease (K8s API may be slow)");
-                    // Treat timeout as a transient error - we'll retry on the next interval.
-                    // Don't treat it as lost ownership since we may still hold the lease.
-                    continue;
-                }
-            };
-            match renew_result {
-                Ok(new_rv) => {
-                    // Update our fencing token
-                    let mut st = self.state.lock().await;
-                    st.resource_version = Some(new_rv);
-                }
-                Err(e) => {
-                    warn!(shard_id = %self.shard_id, error = %e, "failed to renew shard lease (lost ownership)");
-                    // We lost the lease - close the shard and update state
-                    if let Err(close_err) = factory.close(&self.shard_id).await {
-                        tracing::error!(shard_id = %self.shard_id, error = %close_err, "failed to close shard after losing lease");
-                    }
-                    {
-                        let mut st = self.state.lock().await;
-                        st.resource_version = None;
-                        st.lease_uid = None;
-                        st.phase = ShardPhase::Idle;
-                    }
-                    let mut owned = owned_arc.lock().await;
-                    owned.remove(&self.shard_id);
-                    dst_events::emit(DstEvent::ShardReleased {
-                        node_id: self.node_id.clone(),
-                        shard_id: self.shard_id.to_string(),
-                    });
-                    self.notify.notify_one();
-                    break;
-                }
-            }
-        }
-    }
-
-    /// Renew the lease with CAS semantics.
-    /// We fetch the current lease, verify we're still the holder, then update with CAS.
-    async fn renew_lease_cas(&self, lease_name: &str) -> Result<String, CoordinationError> {
-        let now = Utc::now();
-
-        // Get current lease to verify we still own it and get current state
-        let existing = self
-            .backend
-            .get_lease(&self.namespace, lease_name)
-            .await?
-            .ok_or_else(|| CoordinationError::BackendError("lease not found".into()))?;
-
-        let current_rv = existing
-            .metadata
-            .resource_version
-            .as_ref()
-            .ok_or_else(|| CoordinationError::BackendError("no resourceVersion".into()))?;
-
-        // Verify we're still the holder
-        let holder = existing
-            .spec
-            .as_ref()
-            .and_then(|s| s.holder_identity.as_ref());
-
-        if holder != Some(&self.node_id) {
-            return Err(CoordinationError::BackendError(format!(
-                "we are no longer the holder (holder={:?})",
-                holder
-            )));
-        }
-
-        // Renew using replace with CAS
-        let updated_lease = Lease {
-            metadata: kube::api::ObjectMeta {
-                name: Some(lease_name.to_string()),
-                namespace: Some(self.namespace.clone()),
-                resource_version: Some(current_rv.clone()),
-                uid: existing.metadata.uid.clone(),
-                labels: existing.metadata.labels.clone(),
-                ..Default::default()
-            },
-            spec: Some(k8s_openapi::api::coordination::v1::LeaseSpec {
-                holder_identity: Some(self.node_id.clone()),
-                lease_duration_seconds: Some(self.lease_duration_secs),
-                acquire_time: existing.spec.as_ref().and_then(|s| s.acquire_time.clone()),
-                renew_time: Some(MicroTime(now)),
-                ..Default::default()
-            }),
-        };
-
-        let result = self
-            .backend
-            .replace_lease(&self.namespace, lease_name, &updated_lease)
-            .await?;
-        let new_rv = result.metadata.resource_version.ok_or_else(|| {
-            CoordinationError::BackendError("no resource_version in response".into())
-        })?;
         Ok(new_rv)
     }
 }

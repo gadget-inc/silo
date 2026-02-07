@@ -10,8 +10,8 @@ use std::path::Path;
 use crate::pb::silo_client::SiloClient;
 use crate::pb::{
     CancelJobRequest, ConfigureShardRequest, CpuProfileRequest, DeleteJobRequest,
-    ExpediteJobRequest, GetClusterInfoRequest, GetJobRequest, GetSplitStatusRequest, QueryRequest,
-    RequestSplitRequest, RestartJobRequest,
+    ExpediteJobRequest, ForceReleaseShardRequest, GetClusterInfoRequest, GetJobRequest,
+    GetSplitStatusRequest, QueryRequest, RequestSplitRequest, RestartJobRequest,
 };
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -760,6 +760,37 @@ pub async fn shard_configure<W: Write>(
         writeln!(out, "Shard {} configured", shard)?;
         writeln!(out, "Previous ring: {}", previous_display)?;
         writeln!(out, "Current ring:  {}", current_display)?;
+    }
+
+    Ok(())
+}
+
+/// Force-release a shard lease regardless of the current holder.
+///
+/// This is an operator escape hatch for recovering from permanently lost nodes.
+/// After force-releasing, any live node that desires the shard can acquire it.
+pub async fn shard_force_release<W: Write>(
+    opts: &GlobalOptions,
+    out: &mut W,
+    shard: &str,
+) -> anyhow::Result<()> {
+    let mut client = connect(&opts.address).await?;
+
+    let response = client
+        .force_release_shard(ForceReleaseShardRequest {
+            shard: shard.to_string(),
+        })
+        .await?
+        .into_inner();
+
+    if opts.json {
+        let json_output = serde_json::json!({
+            "shard_id": shard,
+            "released": response.released,
+        });
+        writeln!(out, "{}", serde_json::to_string_pretty(&json_output)?)?;
+    } else {
+        writeln!(out, "Force-released shard lease for {}", shard)?;
     }
 
     Ok(())

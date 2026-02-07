@@ -1486,3 +1486,56 @@ async fn grpc_server_reset_shards_eight_shards_immediately_available() -> anyhow
     .expect("test timed out")?;
     Ok(())
 }
+
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_force_release_shard_succeeds() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        // Force-release the test shard (NoneCoordinator no-ops, but verifies gRPC plumbing)
+        let resp = client
+            .force_release_shard(ForceReleaseShardRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+            })
+            .await?
+            .into_inner();
+        assert!(resp.released, "force-release should return released=true");
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_force_release_shard_invalid_id_returns_error() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        // Force-release with an invalid shard ID (not a UUID)
+        let result = client
+            .force_release_shard(ForceReleaseShardRequest {
+                shard: "not-a-valid-uuid".to_string(),
+            })
+            .await;
+        assert!(result.is_err(), "invalid shard ID should return an error");
+        let status = result.unwrap_err();
+        assert_eq!(
+            status.code(),
+            tonic::Code::InvalidArgument,
+            "invalid shard ID should return InvalidArgument"
+        );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}

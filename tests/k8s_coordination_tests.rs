@@ -20,7 +20,9 @@ use tokio::sync::{Mutex, Notify};
 
 use silo::coordination::CoordinationError;
 use silo::coordination::k8s::K8sShardGuard;
-use silo::coordination::{Coordinator, K8sCoordinator, K8sCoordinatorConfig, KubeBackend};
+use silo::coordination::{
+    Coordinator, K8sBackend, K8sCoordinator, K8sCoordinatorConfig, KubeBackend,
+};
 use silo::coordination::{ShardSplitter, SplitPhase};
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
@@ -2084,13 +2086,15 @@ async fn k8s_concurrent_shutdown_multiple_nodes() {
     h1.abort();
 }
 
-/// Test very short lease TTL (aggressive expiry)
+/// Test that a short lease_duration_seconds value (informational only with permanent leases)
+/// does not affect shard ownership stability. With permanent leases, the TTL field on the
+/// K8s Lease object is informational only -- ownership persists regardless of TTL.
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
-async fn k8s_short_lease_ttl() {
+async fn k8s_short_lease_duration_does_not_affect_ownership() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
     let num_shards: u32 = 4;
-    let short_ttl: i64 = 5; // 5 seconds (minimum practical)
+    let short_ttl: i64 = 5; // 5 seconds -- informational only with permanent leases
 
     let (c1, h1) = match K8sCoordinator::start(
         make_coordinator_config(
@@ -2107,19 +2111,19 @@ async fn k8s_short_lease_ttl() {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Skipping short TTL test: {}", e);
+            eprintln!("Skipping short lease duration test: {}", e);
             return;
         }
     };
 
-    // Should still converge with short TTL
+    // Should converge normally
     assert!(
         c1.wait_converged(Duration::from_secs(15)).await,
-        "should converge with short TTL"
+        "should converge with short lease_duration_seconds"
     );
 
-    // Should maintain ownership over time (renewals working)
-    tokio::time::sleep(Duration::from_secs(8)).await; // Longer than TTL
+    // Wait well past the TTL -- permanent leases should not expire
+    tokio::time::sleep(Duration::from_secs(8)).await;
 
     let owned = c1.owned_shards().await;
     let expected: HashSet<ShardId> = c1
@@ -2132,7 +2136,7 @@ async fn k8s_short_lease_ttl() {
     let owned_set: HashSet<ShardId> = owned.into_iter().collect();
     assert_eq!(
         owned_set, expected,
-        "should still own all shards after TTL period (renewals working)"
+        "permanent leases should not expire regardless of lease_duration_seconds"
     );
 
     // Cleanup
@@ -4261,4 +4265,649 @@ async fn k8s_reconciliation_cancels_in_flight_acquisitions() {
     c3.shutdown().await.unwrap();
     h1.abort();
     h3.abort();
+}
+
+// ========================================================================
+// Permanent Shard Lease Tests
+// ========================================================================
+
+/// Test that aborting a shard guard (simulating a crash) does NOT release the K8s lease.
+/// The holderIdentity should persist in the K8s Lease object.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_shard_lease_persists_after_abort() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let shard_id = ShardId::new();
+    let node_id = "crash-persist-node";
+
+    let (guard, _owned, _tx, handle) =
+        match make_k8s_guard(&namespace, &prefix, node_id, shard_id).await {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("Skipping K8S permanent lease test: {}", e);
+                return;
+            }
+        };
+
+    // Acquire the shard
+    guard.set_desired(true).await;
+    let acquired = wait_until(Duration::from_secs(5), || async { guard.is_held().await }).await;
+    assert!(acquired, "guard should acquire shard");
+
+    // Abort the guard task (simulates crash -- no graceful release)
+    handle.abort();
+    let _ = handle.await;
+
+    // Verify the K8s Lease still has holderIdentity set to our node
+    let backend = KubeBackend::try_default().await.unwrap();
+    let lease_name = silo::coordination::keys::k8s_shard_lease_name(&prefix, &shard_id);
+    let lease = backend
+        .get_lease(&namespace, &lease_name)
+        .await
+        .expect("get lease")
+        .expect("lease should exist");
+    let holder = lease
+        .spec
+        .as_ref()
+        .and_then(|s| s.holder_identity.as_ref())
+        .expect("holder_identity should be set");
+    assert_eq!(
+        holder, node_id,
+        "K8s lease holder should persist after crash (abort)"
+    );
+}
+
+/// Test that a permanent lease blocks another node from acquiring the shard.
+/// When a node crashes, its shard stays unavailable until explicitly released.
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k8s_permanent_lease_blocks_other_nodes() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let shard_id = ShardId::new();
+
+    // Node 1 acquires the shard
+    let (g1, _owned1, _tx1, h1) =
+        match make_k8s_guard(&namespace, &prefix, "blocker-k8s-1", shard_id).await {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("Skipping K8S permanent lease blocks test: {}", e);
+                return;
+            }
+        };
+    g1.set_desired(true).await;
+    let acquired = wait_until(Duration::from_secs(5), || async { g1.is_held().await }).await;
+    assert!(acquired, "node 1 should acquire");
+
+    // Crash node 1 (abort without release)
+    h1.abort();
+    let _ = h1.await;
+
+    // Node 2 tries to acquire the same shard -- should be blocked by permanent lease
+    let (g2, _owned2, _tx2, h2) = make_k8s_guard(&namespace, &prefix, "blocker-k8s-2", shard_id)
+        .await
+        .unwrap();
+    g2.set_desired(true).await;
+
+    // Wait a bit -- node 2 should NOT be able to acquire
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        !g2.is_held().await,
+        "node 2 should NOT acquire shard owned by crashed node"
+    );
+
+    h2.abort();
+}
+
+/// Test that force_release_shard_lease clears the holder and allows another node to acquire.
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k8s_force_release_allows_reacquisition() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let shard_id = ShardId::new();
+    let num_shards: u32 = 4;
+
+    // Node 1 acquires the shard via a guard
+    let (g1, _owned1, _tx1, h1) =
+        match make_k8s_guard(&namespace, &prefix, "force-k8s-1", shard_id).await {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("Skipping K8S force-release test: {}", e);
+                return;
+            }
+        };
+    g1.set_desired(true).await;
+    let acquired = wait_until(Duration::from_secs(5), || async { g1.is_held().await }).await;
+    assert!(acquired, "node 1 should acquire");
+
+    // Crash node 1
+    h1.abort();
+    let _ = h1.await;
+
+    // Force-release via a coordinator (which has the force_release_shard_lease method)
+    let (coord, coord_handle) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "force-k8s-releaser",
+        "http://127.0.0.1:50099",
+        num_shards
+    );
+    coord
+        .force_release_shard_lease(&shard_id)
+        .await
+        .expect("force-release should succeed");
+
+    // Verify the lease holder is now empty
+    let backend = KubeBackend::try_default().await.unwrap();
+    let lease_name = silo::coordination::keys::k8s_shard_lease_name(&prefix, &shard_id);
+    let lease = backend
+        .get_lease(&namespace, &lease_name)
+        .await
+        .expect("get lease")
+        .expect("lease should exist");
+    let holder = lease
+        .spec
+        .as_ref()
+        .and_then(|s| s.holder_identity.as_ref())
+        .expect("holder_identity should exist");
+    assert!(
+        holder.is_empty(),
+        "holder should be empty after force-release, got: {}",
+        holder
+    );
+
+    // Node 2 should now be able to acquire
+    let (g2, owned2, _tx2, h2) = make_k8s_guard(&namespace, &prefix, "force-k8s-2", shard_id)
+        .await
+        .unwrap();
+    g2.set_desired(true).await;
+    let acquired2 = wait_until(Duration::from_secs(5), || async {
+        g2.is_held().await && owned2.lock().await.contains(&shard_id)
+    })
+    .await;
+    assert!(
+        acquired2,
+        "node 2 should acquire after force-release of crashed node's lease"
+    );
+
+    // Cleanup
+    g2.set_desired(false).await;
+    let _ = wait_until(Duration::from_secs(3), || async { !g2.is_held().await }).await;
+    h2.abort();
+    coord.shutdown().await.unwrap();
+    coord_handle.abort();
+}
+
+/// Test that reclaim_existing_leases returns empty after graceful shutdown.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_reclaim_existing_leases_after_graceful_shutdown() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 4;
+
+    // Start coordinator and let it acquire shards
+    let (c1, h1) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "reclaim-k8s-1",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+    assert!(
+        c1.wait_converged(Duration::from_secs(15)).await,
+        "coordinator should converge"
+    );
+    let owned_before: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    assert_eq!(owned_before.len(), num_shards as usize);
+
+    // Graceful shutdown releases leases
+    c1.shutdown().await.unwrap();
+    h1.abort();
+
+    // Start a new coordinator with the same node_id -- reclaim should find nothing
+    let (c2, h2) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "reclaim-k8s-1",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+    let reclaimed = c2.reclaim_existing_leases().await.expect("reclaim");
+    assert!(
+        reclaimed.is_empty(),
+        "graceful shutdown should release all leases, so reclaim finds nothing"
+    );
+    c2.shutdown().await.unwrap();
+    h2.abort();
+}
+
+/// Test that reclaim_existing_leases finds shards after a simulated crash.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_reclaim_existing_leases_after_crash() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 4;
+    let node_id = "reclaim-crash-k8s";
+
+    // Start coordinator, let it acquire shards, then simulate crash
+    let (c1, h1) = K8sCoordinator::start(
+        make_coordinator_config(
+            &namespace,
+            &prefix,
+            node_id,
+            "http://127.0.0.1:50051",
+            num_shards,
+            10,
+        ),
+        make_test_factory(node_id),
+    )
+    .await
+    .expect("start c1");
+    assert!(
+        c1.wait_converged(Duration::from_secs(15)).await,
+        "coordinator should converge"
+    );
+    let owned_before: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    assert_eq!(owned_before.len(), num_shards as usize);
+
+    // Simulate crash: abort without graceful shutdown
+    h1.abort();
+    drop(c1);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Start a new coordinator with the same node_id -- reclaim should find the old leases
+    let (c2, h2) = K8sCoordinator::start(
+        make_coordinator_config(
+            &namespace,
+            &prefix,
+            node_id,
+            "http://127.0.0.1:50051",
+            num_shards,
+            10,
+        ),
+        make_test_factory(node_id),
+    )
+    .await
+    .expect("start c2");
+    let reclaimed: HashSet<ShardId> = c2
+        .reclaim_existing_leases()
+        .await
+        .expect("reclaim")
+        .into_iter()
+        .collect();
+
+    assert_eq!(
+        reclaimed, owned_before,
+        "reclaim should find all shards from the crashed coordinator"
+    );
+
+    c2.shutdown().await.unwrap();
+    h2.abort();
+}
+
+/// Test that crash-restart automatically reclaims and opens shards from the previous run.
+///
+/// This tests the full startup reclamation integration: crash -> restart with same node_id ->
+/// shards are automatically reclaimed, opened (WAL recovery), and the coordinator converges
+/// owning all shards without requiring any manual intervention.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_crash_restart_reclaims_and_opens_shards() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 4;
+    let node_id = "reclaim-restart-k8s";
+
+    // Start coordinator, let it acquire all shards
+    let (c1, h1) = K8sCoordinator::start(
+        make_coordinator_config(
+            &namespace,
+            &prefix,
+            node_id,
+            "http://127.0.0.1:50051",
+            num_shards,
+            10,
+        ),
+        make_test_factory(node_id),
+    )
+    .await
+    .expect("start c1");
+    assert!(
+        c1.wait_converged(Duration::from_secs(15)).await,
+        "coordinator should converge"
+    );
+    let owned_before: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    assert_eq!(owned_before.len(), num_shards as usize);
+
+    // Simulate crash: abort without graceful shutdown so leases persist
+    h1.abort();
+    drop(c1);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Start a new coordinator with the same node_id.
+    // The startup reclamation should automatically discover, open, and own the shards.
+    let (c2, h2) = K8sCoordinator::start(
+        make_coordinator_config(
+            &namespace,
+            &prefix,
+            node_id,
+            "http://127.0.0.1:50051",
+            num_shards,
+            10,
+        ),
+        make_test_factory(node_id),
+    )
+    .await
+    .expect("start c2");
+
+    // The coordinator should converge quickly -- reclaimed shards are opened immediately
+    // during startup before the first reconcile, so owned set should match right away.
+    assert!(
+        c2.wait_converged(Duration::from_secs(15)).await,
+        "restarted coordinator should converge with reclaimed shards"
+    );
+
+    let owned_after: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
+    assert_eq!(
+        owned_after, owned_before,
+        "restarted coordinator should own the same shards as before the crash"
+    );
+
+    c2.shutdown().await.unwrap();
+    h2.abort();
+}
+
+/// Test hash ring divergence on restart: A and B share shards, A crashes, restarts
+/// with the same node_id, reclaims all its old shards (WAL recovery), then releases
+/// the ones that the hash ring says should belong to B via reconciliation.
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k8s_hash_ring_divergence_on_restart() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 8;
+
+    // Start A and B, let them partition shards
+    let (ca, ha) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "diverge-k8s-a",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let (cb, hb) = K8sCoordinator::start(
+        make_coordinator_config(
+            &namespace,
+            &prefix,
+            "diverge-k8s-b",
+            "http://127.0.0.1:50052",
+            num_shards,
+            10,
+        ),
+        make_test_factory("diverge-k8s-b"),
+    )
+    .await
+    .expect("start cb");
+
+    assert!(
+        ca.wait_converged(Duration::from_secs(30)).await,
+        "ca should converge"
+    );
+    assert!(
+        cb.wait_converged(Duration::from_secs(30)).await,
+        "cb should converge"
+    );
+
+    let all_shards: HashSet<ShardId> = ca
+        .get_shard_map()
+        .await
+        .unwrap()
+        .shard_ids()
+        .into_iter()
+        .collect();
+    let a_owned_before: HashSet<ShardId> = ca.owned_shards().await.into_iter().collect();
+    let b_owned_before: HashSet<ShardId> = cb.owned_shards().await.into_iter().collect();
+    assert_eq!(
+        a_owned_before
+            .union(&b_owned_before)
+            .copied()
+            .collect::<HashSet<_>>(),
+        all_shards,
+        "all shards should be covered"
+    );
+    assert!(a_owned_before.is_disjoint(&b_owned_before), "no overlap");
+    assert!(!a_owned_before.is_empty() && !b_owned_before.is_empty());
+
+    // Crash A (abort without graceful shutdown -- permanent leases persist)
+    ha.abort();
+    drop(ca);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // B still owns its shards, but can't take A's due to permanent leases
+    let b_owned_during_crash: HashSet<ShardId> = cb.owned_shards().await.into_iter().collect();
+    assert_eq!(b_owned_during_crash, b_owned_before);
+
+    // Restart A with the same node_id -- reclaim opens old shards, then reconciliation
+    // hands off shards that the hash ring assigns to B
+    let (ca2, ha2) = K8sCoordinator::start(
+        make_coordinator_config(
+            &namespace,
+            &prefix,
+            "diverge-k8s-a",
+            "http://127.0.0.1:50051",
+            num_shards,
+            10,
+        ),
+        make_test_factory("diverge-k8s-a"),
+    )
+    .await
+    .expect("start ca2");
+
+    // Both should converge to the same distribution as before the crash
+    assert!(
+        ca2.wait_converged(Duration::from_secs(30)).await,
+        "restarted A should converge"
+    );
+    assert!(
+        cb.wait_converged(Duration::from_secs(30)).await,
+        "B should converge after A restarts"
+    );
+
+    let a_owned_after: HashSet<ShardId> = ca2.owned_shards().await.into_iter().collect();
+    let b_owned_after: HashSet<ShardId> = cb.owned_shards().await.into_iter().collect();
+
+    assert_eq!(
+        a_owned_after
+            .union(&b_owned_after)
+            .copied()
+            .collect::<HashSet<_>>(),
+        all_shards,
+        "all shards should be covered after restart"
+    );
+    assert!(
+        a_owned_after.is_disjoint(&b_owned_after),
+        "no overlap after restart"
+    );
+    // The distribution should match the pre-crash state (same nodes, same hash ring)
+    assert_eq!(
+        a_owned_after, a_owned_before,
+        "A should own the same shards after restart as before crash"
+    );
+    assert_eq!(
+        b_owned_after, b_owned_before,
+        "B should own the same shards after restart as before crash"
+    );
+
+    // Cleanup
+    ca2.shutdown().await.unwrap();
+    cb.shutdown().await.unwrap();
+    ha2.abort();
+    hb.abort();
+}
+
+/// Test the full coordinator-level flow: crash preserves leases, other nodes can't take them,
+/// force-release unblocks reacquisition.
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k8s_coordinator_crash_blocks_reacquisition_until_force_release() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 4;
+
+    // Start node 1, let it own all shards
+    let (c1, h1) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "coord-crash-k8s-1",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+    assert!(c1.wait_converged(Duration::from_secs(15)).await);
+    let all_shards: HashSet<ShardId> = c1
+        .get_shard_map()
+        .await
+        .unwrap()
+        .shard_ids()
+        .into_iter()
+        .collect();
+    let c1_owned: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    assert_eq!(c1_owned, all_shards);
+
+    // Crash node 1 (abort without shutdown)
+    h1.abort();
+    drop(c1);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Start node 2 -- it should NOT be able to acquire node 1's shards
+    let (c2, h2) = K8sCoordinator::start(
+        make_coordinator_config(
+            &namespace,
+            &prefix,
+            "coord-crash-k8s-2",
+            "http://127.0.0.1:50052",
+            num_shards,
+            10,
+        ),
+        make_test_factory("coord-crash-k8s-2"),
+    )
+    .await
+    .expect("start c2");
+
+    // Give c2 time to try acquiring -- it should fail since leases are permanent
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let c2_owned: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
+    assert!(
+        c2_owned.is_empty(),
+        "node 2 should NOT acquire any shards while node 1's permanent leases exist"
+    );
+
+    // Force-release all of node 1's shards via coordinator
+    for shard_id in &all_shards {
+        c2.force_release_shard_lease(shard_id)
+            .await
+            .expect("force-release should succeed");
+    }
+
+    // Now c2 should be able to acquire all shards
+    let all_acquired = wait_until(Duration::from_secs(15), || async {
+        let owned: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
+        owned == all_shards
+    })
+    .await;
+    assert!(
+        all_acquired,
+        "node 2 should acquire all shards after force-release"
+    );
+
+    // Cleanup
+    c2.shutdown().await.unwrap();
+    h2.abort();
+}
+
+/// Test that force_release_shard_lease returns ShardNotFound for a non-existent shard.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_force_release_nonexistent_shard_returns_error() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 4;
+
+    let (c1, h1) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "force-err-k8s",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+    assert!(c1.wait_converged(Duration::from_secs(15)).await);
+
+    // Force-release a shard that doesn't exist (random UUID, no K8s Lease object)
+    let fake_shard_id = ShardId::new();
+    let result = c1.force_release_shard_lease(&fake_shard_id).await;
+    assert!(
+        matches!(result, Err(CoordinationError::ShardNotFound(id)) if id == fake_shard_id),
+        "force-releasing a non-existent shard should return ShardNotFound, got: {:?}",
+        result,
+    );
+
+    c1.shutdown().await.unwrap();
+    h1.abort();
+}
+
+/// Test that reclaim_existing_leases does NOT return shards owned by a different node_id.
+/// This validates the critical node_id stability assumption of permanent leases.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_reclaim_with_different_node_id_returns_empty() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 4;
+
+    // Start coordinator A, let it acquire all shards
+    let (ca, ha) = K8sCoordinator::start(
+        make_coordinator_config(
+            &namespace,
+            &prefix,
+            "original-k8s-a",
+            "http://127.0.0.1:50051",
+            num_shards,
+            10,
+        ),
+        make_test_factory("original-k8s-a"),
+    )
+    .await
+    .expect("start ca");
+    assert!(
+        ca.wait_converged(Duration::from_secs(15)).await,
+        "coordinator A should converge"
+    );
+    let owned: HashSet<ShardId> = ca.owned_shards().await.into_iter().collect();
+    assert_eq!(owned.len(), num_shards as usize);
+
+    // Crash coordinator A (abort without graceful shutdown -- permanent leases persist)
+    ha.abort();
+    drop(ca);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Start coordinator B with a DIFFERENT node_id but same prefix.
+    // reclaim_existing_leases should return empty because B doesn't own A's leases.
+    let (cb, hb) = K8sCoordinator::start(
+        make_coordinator_config(
+            &namespace,
+            &prefix,
+            "different-k8s-b",
+            "http://127.0.0.1:50051",
+            num_shards,
+            10,
+        ),
+        make_test_factory("different-k8s-b"),
+    )
+    .await
+    .expect("start cb");
+    let reclaimed = cb.reclaim_existing_leases().await.expect("reclaim");
+    assert!(
+        reclaimed.is_empty(),
+        "different node_id should NOT reclaim another node's leases, but found: {:?}",
+        reclaimed,
+    );
+
+    cb.shutdown().await.unwrap();
+    hb.abort();
 }

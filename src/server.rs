@@ -1698,6 +1698,21 @@ impl Silo for SiloService {
         }))
     }
 
+    async fn force_release_shard(
+        &self,
+        req: Request<ForceReleaseShardRequest>,
+    ) -> Result<Response<ForceReleaseShardResponse>, Status> {
+        let r = req.into_inner();
+        let shard_id = Self::parse_shard_id(&r.shard)?;
+
+        self.coordinator
+            .force_release_shard_lease(&shard_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(ForceReleaseShardResponse { released: true }))
+    }
+
     async fn configure_shard(
         &self,
         req: Request<ConfigureShardRequest>,

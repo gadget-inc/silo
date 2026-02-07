@@ -4,6 +4,8 @@
 import type { RpcTransport } from "@protobuf-ts/runtime-rpc";
 import type { ServiceInfo } from "@protobuf-ts/runtime-rpc";
 import { Silo } from "./silo";
+import type { ForceReleaseShardResponse } from "./silo";
+import type { ForceReleaseShardRequest } from "./silo";
 import type { ResetShardsResponse } from "./silo";
 import type { ResetShardsRequest } from "./silo";
 import type { ImportJobsResponse } from "./silo";
@@ -219,6 +221,14 @@ export interface ISiloClient {
      * @generated from protobuf rpc: ResetShards
      */
     resetShards(input: ResetShardsRequest, options?: RpcOptions): UnaryCall<ResetShardsRequest, ResetShardsResponse>;
+    /**
+     * Force-release a shard lease regardless of the current holder.
+     * Operator escape hatch for recovering from permanently lost nodes.
+     * After force-release, any live node that desires the shard can acquire it.
+     *
+     * @generated from protobuf rpc: ForceReleaseShard
+     */
+    forceReleaseShard(input: ForceReleaseShardRequest, options?: RpcOptions): UnaryCall<ForceReleaseShardRequest, ForceReleaseShardResponse>;
 }
 /**
  * The Silo job queue service.
@@ -456,5 +466,16 @@ export class SiloClient implements ISiloClient, ServiceInfo {
     resetShards(input: ResetShardsRequest, options?: RpcOptions): UnaryCall<ResetShardsRequest, ResetShardsResponse> {
         const method = this.methods[20], opt = this._transport.mergeOptions(options);
         return stackIntercept<ResetShardsRequest, ResetShardsResponse>("unary", this._transport, method, opt, input);
+    }
+    /**
+     * Force-release a shard lease regardless of the current holder.
+     * Operator escape hatch for recovering from permanently lost nodes.
+     * After force-release, any live node that desires the shard can acquire it.
+     *
+     * @generated from protobuf rpc: ForceReleaseShard
+     */
+    forceReleaseShard(input: ForceReleaseShardRequest, options?: RpcOptions): UnaryCall<ForceReleaseShardRequest, ForceReleaseShardResponse> {
+        const method = this.methods[21], opt = this._transport.mergeOptions(options);
+        return stackIntercept<ForceReleaseShardRequest, ForceReleaseShardResponse>("unary", this._transport, method, opt, input);
     }
 }

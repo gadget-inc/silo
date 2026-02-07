@@ -73,25 +73,33 @@ macro_rules! start_etcd_coordinator {
     }};
 }
 
-async fn make_guard(
+fn next_node_id() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "test-node-{}",
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    )
+}
+
+async fn make_guard_with_node_id(
     coord: &EtcdConnection,
     cluster_prefix: &str,
     shard_id: ShardId,
+    node_id: String,
 ) -> (
     std::sync::Arc<EtcdShardGuard>,
     std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<ShardId>>>,
     tokio::sync::watch::Sender<bool>,
     tokio::task::JoinHandle<()>,
 ) {
-    let mut client = coord.client();
-    let liveness_lease_id = client.lease_grant(5, None).await.unwrap().id();
+    let client = coord.client();
     let owned = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
     let (tx, rx) = tokio::sync::watch::channel(false);
     let guard = EtcdShardGuard::new(
         shard_id,
         client.clone(),
         cluster_prefix.to_string(),
-        liveness_lease_id,
+        node_id,
         rx,
     );
     let runner = guard.clone();
@@ -119,6 +127,19 @@ async fn make_guard(
         runner.run(owned_arc, factory, shard_map, coordinator).await;
     });
     (guard, owned, tx, handle)
+}
+
+async fn make_guard(
+    coord: &EtcdConnection,
+    cluster_prefix: &str,
+    shard_id: ShardId,
+) -> (
+    std::sync::Arc<EtcdShardGuard>,
+    std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<ShardId>>>,
+    tokio::sync::watch::Sender<bool>,
+    tokio::task::JoinHandle<()>,
+) {
+    make_guard_with_node_id(coord, cluster_prefix, shard_id, next_node_id()).await
 }
 
 async fn wait_until<F, Fut>(timeout: Duration, mut f: F) -> bool
@@ -164,7 +185,7 @@ async fn shard_guard_acquire_and_release() {
     let released = wait_until(Duration::from_secs(3), || async {
         let st = guard.state.lock().await;
         let ow = owned.lock().await;
-        st.phase == ShardPhase::Idle && st.held_key.is_none() && !ow.contains(&shard_id)
+        st.phase == ShardPhase::Idle && !st.is_held && !ow.contains(&shard_id)
     })
     .await;
     assert!(released, "guard should release lock and clear owned");
@@ -258,19 +279,18 @@ async fn shard_guard_idempotent_set_desired_true() {
     })
     .await;
     assert!(acquired, "should acquire initially");
-    let key1 = { guard.state.lock().await.held_key.clone() };
 
     // Calling set_desired(true) again should not cause release/reacquire
     guard.set_desired(true).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let (phase, key2, in_owned) = {
+    let (phase, is_held, in_owned) = {
         let st = guard.state.lock().await;
         let ow = owned.lock().await;
-        (st.phase, st.held_key.clone(), ow.contains(&shard_id))
+        (st.phase, st.is_held, ow.contains(&shard_id))
     };
     assert_eq!(phase, ShardPhase::Held);
-    assert_eq!(key1, key2);
+    assert!(is_held);
     assert!(in_owned);
 
     // Cleanup: release
@@ -278,7 +298,7 @@ async fn shard_guard_idempotent_set_desired_true() {
     let released = wait_until(Duration::from_secs(3), || async {
         let st = guard.state.lock().await;
         let ow = owned.lock().await;
-        st.phase == ShardPhase::Idle && st.held_key.is_none() && !ow.contains(&shard_id)
+        st.phase == ShardPhase::Idle && !st.is_held && !ow.contains(&shard_id)
     })
     .await;
     assert!(released);
@@ -432,24 +452,22 @@ async fn shard_guard_release_cancelled_on_desired_true() {
     })
     .await;
     assert!(acquired);
-    let key_before = { g.state.lock().await.held_key.clone() };
-    assert!(key_before.is_some());
+    assert!(g.state.lock().await.is_held);
 
     // Begin release then flip desired back to true during the delay window
     g.set_desired(false).await;
     tokio::time::sleep(Duration::from_millis(50)).await; // < 100ms delay
     g.set_desired(true).await;
 
-    // Expect we remain Held and the held_key is unchanged (no unlock/reacquire)
+    // Expect we remain Held and ownership is unchanged (no release/reacquire)
     let still_held = wait_until(Duration::from_secs(3), || async {
         g.state.lock().await.phase == ShardPhase::Held
     })
     .await;
     assert!(still_held);
-    let key_after = { g.state.lock().await.held_key.clone() };
-    assert_eq!(
-        key_before, key_after,
-        "held key should be preserved if release is cancelled"
+    assert!(
+        g.state.lock().await.is_held,
+        "ownership should be preserved if release is cancelled"
     );
     assert!(owned.lock().await.contains(&shard_id));
 
@@ -476,7 +494,7 @@ async fn shard_guard_shutdown_in_idle() {
     {
         let st = guard.state.lock().await;
         assert_eq!(st.phase, ShardPhase::Idle);
-        assert!(st.held_key.is_none());
+        assert!(!st.is_held);
     }
     // Signal shutdown
     let _ = tx.send(true);
@@ -569,7 +587,7 @@ async fn shard_guard_shutdown_while_held() {
         "should reach ShutDown phase"
     );
     let st = g.state.lock().await;
-    assert_eq!(st.held_key, None);
+    assert_eq!(st.is_held, false);
     assert!(!owned.lock().await.contains(&shard_id));
     h.abort();
 }
@@ -610,7 +628,7 @@ async fn shard_guard_shutdown_while_releasing() {
         "should reach ShutDown phase"
     );
     let st = g.state.lock().await;
-    assert_eq!(st.held_key, None);
+    assert_eq!(st.is_held, false);
     assert!(!owned.lock().await.contains(&shard_id));
     h.abort();
 }
@@ -2968,4 +2986,560 @@ async fn etcd_reconciliation_cancels_in_flight_acquisitions() {
     c3.shutdown().await.unwrap();
     h1.abort();
     h3.abort();
+}
+
+// =============================================================================
+// Permanent shard lease tests
+// =============================================================================
+
+/// Test that aborting a guard (simulating crash) does NOT release the shard owner key in etcd.
+/// This is the core invariant of permanent leases: ownership survives crashes.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shard_lease_persists_after_abort() {
+    let prefix = unique_prefix();
+    let cfg = silo::settings::AppConfig::load(None).expect("load default config");
+    let coord = EtcdConnection::connect(&cfg.coordination)
+        .await
+        .expect("connect etcd");
+
+    let shard_id = ShardId::new();
+    let node_id = "crash-node-1".to_string();
+    let (guard, _owned, _tx, handle) =
+        make_guard_with_node_id(&coord, &prefix, shard_id, node_id.clone()).await;
+
+    // Acquire the shard
+    guard.set_desired(true).await;
+    let acquired = wait_until(Duration::from_secs(3), || async {
+        guard.state.lock().await.phase == ShardPhase::Held
+    })
+    .await;
+    assert!(acquired, "guard should acquire shard");
+
+    // Abort the guard task (simulates crash -- no graceful release)
+    handle.abort();
+    let _ = handle.await; // wait for abort to complete
+
+    // Verify the owner key still exists in etcd with the original node_id
+    let owner_key = silo::coordination::keys::shard_owner_key(&prefix, &shard_id);
+    let resp = coord
+        .client()
+        .kv_client()
+        .get(owner_key, None)
+        .await
+        .expect("get owner key");
+    assert_eq!(
+        resp.kvs().len(),
+        1,
+        "owner key should persist after crash (abort)"
+    );
+    let value = std::str::from_utf8(resp.kvs()[0].value()).expect("valid utf8");
+    assert_eq!(value, node_id, "owner should still be the crashed node");
+}
+
+/// Test that a permanent lease blocks another node from acquiring the shard.
+/// When a node crashes, its shard stays unavailable until explicitly released.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn permanent_lease_blocks_other_nodes() {
+    let prefix = unique_prefix();
+    let cfg = silo::settings::AppConfig::load(None).expect("load default config");
+    let coord1 = EtcdConnection::connect(&cfg.coordination)
+        .await
+        .expect("connect etcd #1");
+    let coord2 = EtcdConnection::connect(&cfg.coordination)
+        .await
+        .expect("connect etcd #2");
+
+    let shard_id = ShardId::new();
+
+    // Node 1 acquires the shard
+    let (g1, _owned1, _tx1, h1) =
+        make_guard_with_node_id(&coord1, &prefix, shard_id, "blocker-node".to_string()).await;
+    g1.set_desired(true).await;
+    let acquired = wait_until(Duration::from_secs(3), || async {
+        g1.state.lock().await.phase == ShardPhase::Held
+    })
+    .await;
+    assert!(acquired, "node 1 should acquire");
+
+    // Crash node 1 (abort without release)
+    h1.abort();
+    let _ = h1.await;
+
+    // Node 2 tries to acquire the same shard -- should be blocked
+    let (g2, _owned2, _tx2, h2) =
+        make_guard_with_node_id(&coord2, &prefix, shard_id, "blocked-node".to_string()).await;
+    g2.set_desired(true).await;
+
+    // Wait a bit -- node 2 should NOT be able to acquire
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let st2 = g2.state.lock().await;
+    assert_ne!(
+        st2.phase,
+        ShardPhase::Held,
+        "node 2 should NOT acquire shard owned by crashed node"
+    );
+    assert_eq!(
+        st2.phase,
+        ShardPhase::Acquiring,
+        "node 2 should be stuck in Acquiring phase"
+    );
+    drop(st2);
+
+    h2.abort();
+}
+
+/// Test that force_release_shard_lease clears the owner key and allows reacquisition.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn force_release_allows_reacquisition() {
+    let prefix = unique_prefix();
+    let cfg = silo::settings::AppConfig::load(None).expect("load default config");
+    let coord1 = EtcdConnection::connect(&cfg.coordination)
+        .await
+        .expect("connect etcd #1");
+    let coord2 = EtcdConnection::connect(&cfg.coordination)
+        .await
+        .expect("connect etcd #2");
+
+    let shard_id = ShardId::new();
+
+    // Node 1 acquires the shard
+    let (g1, _owned1, _tx1, h1) =
+        make_guard_with_node_id(&coord1, &prefix, shard_id, "force-node-1".to_string()).await;
+    g1.set_desired(true).await;
+    let acquired = wait_until(Duration::from_secs(3), || async {
+        g1.state.lock().await.phase == ShardPhase::Held
+    })
+    .await;
+    assert!(acquired, "node 1 should acquire");
+
+    // Crash node 1
+    h1.abort();
+    let _ = h1.await;
+
+    // Force-release the shard via direct etcd KV delete
+    let owner_key = silo::coordination::keys::shard_owner_key(&prefix, &shard_id);
+    let resp = coord1
+        .client()
+        .kv_client()
+        .delete(owner_key, None)
+        .await
+        .expect("force-release");
+    assert_eq!(resp.deleted(), 1, "should delete one key");
+
+    // Node 2 should now be able to acquire
+    let (g2, owned2, _tx2, h2) =
+        make_guard_with_node_id(&coord2, &prefix, shard_id, "force-node-2".to_string()).await;
+    g2.set_desired(true).await;
+    let acquired2 = wait_until(Duration::from_secs(5), || async {
+        g2.state.lock().await.phase == ShardPhase::Held
+    })
+    .await;
+    assert!(
+        acquired2,
+        "node 2 should acquire after force-release of crashed node's lease"
+    );
+    assert!(owned2.lock().await.contains(&shard_id));
+
+    // Cleanup
+    g2.set_desired(false).await;
+    let _ = wait_until(Duration::from_secs(3), || async {
+        g2.state.lock().await.phase == ShardPhase::Idle
+    })
+    .await;
+    h2.abort();
+}
+
+/// Test that reclaim_existing_leases correctly finds leases owned by this node.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reclaim_existing_leases_finds_owned_shards() {
+    let prefix = unique_prefix();
+    let num_shards: u32 = 4;
+
+    // Start coordinator and let it acquire shards
+    let (c1, h1) = start_etcd_coordinator!(
+        &prefix,
+        "reclaim-node",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+    assert!(
+        c1.wait_converged(Duration::from_secs(15)).await,
+        "coordinator should converge"
+    );
+    let owned_before: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    assert_eq!(owned_before.len(), num_shards as usize);
+
+    // Shutdown (graceful -- this releases leases) then verify reclaim returns empty
+    c1.shutdown().await.unwrap();
+    h1.abort();
+
+    // Start a new coordinator with the same node_id and prefix -- since we gracefully
+    // shut down, reclaim should find nothing (leases were released)
+    let (c2, h2) = start_etcd_coordinator!(
+        &prefix,
+        "reclaim-node",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+    let reclaimed = c2.reclaim_existing_leases().await.expect("reclaim");
+    assert!(
+        reclaimed.is_empty(),
+        "graceful shutdown should release all leases, so reclaim finds nothing"
+    );
+    c2.shutdown().await.unwrap();
+    h2.abort();
+}
+
+/// Test that reclaim_existing_leases finds shards after a simulated crash.
+/// Uses raw etcd KV to pre-populate owner keys, simulating a crash scenario
+/// where the node's leases were not released.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reclaim_existing_leases_finds_shards_after_crash() {
+    let prefix = unique_prefix();
+    let num_shards: u32 = 4;
+    let node_id = "reclaim-crash-node";
+
+    // Start coordinator, let it acquire shards, then simulate crash by aborting
+    let (c1, h1) = start_etcd_coordinator!(&prefix, node_id, "http://127.0.0.1:50051", num_shards);
+    assert!(
+        c1.wait_converged(Duration::from_secs(15)).await,
+        "coordinator should converge"
+    );
+    let owned_before: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    assert_eq!(owned_before.len(), num_shards as usize);
+
+    // Simulate crash: abort the background task without graceful shutdown.
+    // Drop the coordinator -- the owner keys should persist.
+    h1.abort();
+    drop(c1);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Start a new coordinator with the same node_id -- reclaim should find the old leases
+    let (c2, h2) = start_etcd_coordinator!(&prefix, node_id, "http://127.0.0.1:50051", num_shards);
+    let reclaimed: HashSet<ShardId> = c2
+        .reclaim_existing_leases()
+        .await
+        .expect("reclaim")
+        .into_iter()
+        .collect();
+
+    assert_eq!(
+        reclaimed, owned_before,
+        "reclaim should find all shards from the crashed coordinator"
+    );
+
+    c2.shutdown().await.unwrap();
+    h2.abort();
+}
+
+/// Test that crash-restart automatically reclaims and opens shards from the previous run.
+///
+/// This tests the full startup reclamation integration: crash -> restart with same node_id ->
+/// shards are automatically reclaimed, opened (WAL recovery), and the coordinator converges
+/// owning all shards without requiring any manual intervention.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn etcd_crash_restart_reclaims_and_opens_shards() {
+    let prefix = unique_prefix();
+    let num_shards: u32 = 4;
+    let node_id = "reclaim-restart-node";
+
+    // Start coordinator, let it acquire all shards
+    let (c1, h1) = start_etcd_coordinator!(&prefix, node_id, "http://127.0.0.1:50051", num_shards);
+    assert!(
+        c1.wait_converged(Duration::from_secs(15)).await,
+        "coordinator should converge"
+    );
+    let owned_before: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    assert_eq!(owned_before.len(), num_shards as usize);
+
+    // Simulate crash: abort without graceful shutdown so leases persist
+    h1.abort();
+    drop(c1);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Start a new coordinator with the same node_id.
+    // The startup reclamation should automatically discover, open, and own the shards.
+    let (c2, h2) = start_etcd_coordinator!(&prefix, node_id, "http://127.0.0.1:50051", num_shards);
+
+    // The coordinator should converge quickly -- reclaimed shards are opened immediately
+    // during startup before the first reconcile, so owned set should match right away.
+    assert!(
+        c2.wait_converged(Duration::from_secs(15)).await,
+        "restarted coordinator should converge with reclaimed shards"
+    );
+
+    let owned_after: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
+    assert_eq!(
+        owned_after, owned_before,
+        "restarted coordinator should own the same shards as before the crash"
+    );
+
+    c2.shutdown().await.unwrap();
+    h2.abort();
+}
+
+/// Test hash ring divergence on restart: A and B share shards, A crashes, restarts
+/// with the same node_id, reclaims all its old shards (WAL recovery), then releases
+/// the ones that the hash ring says should belong to B via reconciliation.
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn etcd_hash_ring_divergence_on_restart() {
+    let prefix = unique_prefix();
+    let num_shards: u32 = 8;
+
+    // Start A and B, let them partition shards
+    let (ca, ha) =
+        start_etcd_coordinator!(&prefix, "diverge-a", "http://127.0.0.1:50051", num_shards);
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let endpoints = get_etcd_endpoints();
+    let (cb, hb) = EtcdCoordinator::start(
+        &endpoints,
+        &prefix,
+        "diverge-b",
+        "http://127.0.0.1:50052",
+        num_shards,
+        10,
+        make_test_factory("diverge-b"),
+        Vec::new(),
+    )
+    .await
+    .expect("start cb");
+
+    assert!(
+        ca.wait_converged(Duration::from_secs(30)).await,
+        "ca should converge"
+    );
+    assert!(
+        cb.wait_converged(Duration::from_secs(30)).await,
+        "cb should converge"
+    );
+
+    let all_shards: HashSet<ShardId> = ca
+        .get_shard_map()
+        .await
+        .unwrap()
+        .shard_ids()
+        .into_iter()
+        .collect();
+    let a_owned_before: HashSet<ShardId> = ca.owned_shards().await.into_iter().collect();
+    let b_owned_before: HashSet<ShardId> = cb.owned_shards().await.into_iter().collect();
+    assert_eq!(
+        a_owned_before
+            .union(&b_owned_before)
+            .copied()
+            .collect::<HashSet<_>>(),
+        all_shards,
+        "all shards should be covered"
+    );
+    assert!(a_owned_before.is_disjoint(&b_owned_before), "no overlap");
+    // With 8 shards and 2 nodes, each should have some
+    assert!(!a_owned_before.is_empty() && !b_owned_before.is_empty());
+
+    // Crash A (abort without graceful shutdown -- permanent leases persist)
+    ha.abort();
+    drop(ca);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // B still owns its shards, but can't take A's due to permanent leases
+    let b_owned_during_crash: HashSet<ShardId> = cb.owned_shards().await.into_iter().collect();
+    assert_eq!(b_owned_during_crash, b_owned_before);
+
+    // Restart A with the same node_id -- reclaim opens old shards, then reconciliation
+    // hands off shards that the hash ring assigns to B
+    let (ca2, ha2) =
+        start_etcd_coordinator!(&prefix, "diverge-a", "http://127.0.0.1:50051", num_shards);
+
+    // Both should converge to the same distribution as before the crash
+    assert!(
+        ca2.wait_converged(Duration::from_secs(30)).await,
+        "restarted A should converge"
+    );
+    assert!(
+        cb.wait_converged(Duration::from_secs(30)).await,
+        "B should converge after A restarts"
+    );
+
+    let a_owned_after: HashSet<ShardId> = ca2.owned_shards().await.into_iter().collect();
+    let b_owned_after: HashSet<ShardId> = cb.owned_shards().await.into_iter().collect();
+
+    assert_eq!(
+        a_owned_after
+            .union(&b_owned_after)
+            .copied()
+            .collect::<HashSet<_>>(),
+        all_shards,
+        "all shards should be covered after restart"
+    );
+    assert!(
+        a_owned_after.is_disjoint(&b_owned_after),
+        "no overlap after restart"
+    );
+    // The distribution should match the pre-crash state (same nodes, same hash ring)
+    assert_eq!(
+        a_owned_after, a_owned_before,
+        "A should own the same shards after restart as before crash"
+    );
+    assert_eq!(
+        b_owned_after, b_owned_before,
+        "B should own the same shards after restart as before crash"
+    );
+
+    // Cleanup
+    ca2.shutdown().await.unwrap();
+    cb.shutdown().await.unwrap();
+    ha2.abort();
+    hb.abort();
+}
+
+/// Test the full coordinator-level flow: crash preserves leases, other nodes can't take them,
+/// force-release unblocks.
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn coordinator_crash_blocks_reacquisition_until_force_release() {
+    let prefix = unique_prefix();
+    let num_shards: u32 = 4;
+
+    // Start node 1, let it own all shards
+    let (c1, h1) = start_etcd_coordinator!(
+        &prefix,
+        "coord-crash-1",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+    assert!(c1.wait_converged(Duration::from_secs(15)).await);
+    let all_shards: HashSet<ShardId> = c1
+        .get_shard_map()
+        .await
+        .unwrap()
+        .shard_ids()
+        .into_iter()
+        .collect();
+    let c1_owned: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    assert_eq!(c1_owned, all_shards);
+
+    // Crash node 1 (abort without shutdown)
+    h1.abort();
+    drop(c1);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Start node 2 -- it should NOT be able to acquire node 1's shards
+    let endpoints = get_etcd_endpoints();
+    let (c2, h2) = EtcdCoordinator::start(
+        &endpoints,
+        &prefix,
+        "coord-crash-2",
+        "http://127.0.0.1:50052",
+        num_shards,
+        10,
+        make_test_factory("coord-crash-2"),
+        Vec::new(),
+    )
+    .await
+    .expect("start c2");
+
+    // Give c2 time to try acquiring -- it should fail since leases are permanent
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let c2_owned: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
+    assert!(
+        c2_owned.is_empty(),
+        "node 2 should NOT acquire any shards while node 1's permanent leases exist"
+    );
+
+    // Force-release all of node 1's shards via raw etcd client
+    let cfg = silo::settings::AppConfig::load(None).expect("load config");
+    let raw_conn = EtcdConnection::connect(&cfg.coordination)
+        .await
+        .expect("connect etcd for force-release");
+    for shard_id in &all_shards {
+        let owner_key = silo::coordination::keys::shard_owner_key(&prefix, shard_id);
+        raw_conn
+            .client()
+            .kv_client()
+            .delete(owner_key, None)
+            .await
+            .expect("force release");
+    }
+
+    // Now node 2 should be able to acquire -- may take a few reconciliation cycles
+    let all_acquired = wait_until(Duration::from_secs(30), || async {
+        let owned: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
+        owned == all_shards
+    })
+    .await;
+    assert!(all_acquired, "c2 should own all shards after force-release");
+
+    c2.shutdown().await.unwrap();
+    h2.abort();
+}
+
+/// Test that force_release_shard_lease returns ShardNotFound for a non-existent shard.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn force_release_nonexistent_shard_returns_error() {
+    let prefix = unique_prefix();
+    let num_shards: u32 = 4;
+
+    let (c1, h1) = start_etcd_coordinator!(
+        &prefix,
+        "force-err-node",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+    assert!(c1.wait_converged(Duration::from_secs(15)).await);
+
+    // Force-release a shard that doesn't exist (random UUID)
+    let fake_shard_id = ShardId::new();
+    let result = c1.force_release_shard_lease(&fake_shard_id).await;
+    assert!(
+        matches!(result, Err(CoordinationError::ShardNotFound(id)) if id == fake_shard_id),
+        "force-releasing a non-existent shard should return ShardNotFound, got: {:?}",
+        result,
+    );
+
+    c1.shutdown().await.unwrap();
+    h1.abort();
+}
+
+/// Test that reclaim_existing_leases does NOT return shards owned by a different node_id.
+/// This validates the critical node_id stability assumption of permanent leases.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reclaim_with_different_node_id_returns_empty() {
+    let prefix = unique_prefix();
+    let num_shards: u32 = 4;
+
+    // Start coordinator A, let it acquire all shards
+    let (ca, ha) = start_etcd_coordinator!(
+        &prefix,
+        "original-node-a",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+    assert!(
+        ca.wait_converged(Duration::from_secs(15)).await,
+        "coordinator A should converge"
+    );
+    let owned: HashSet<ShardId> = ca.owned_shards().await.into_iter().collect();
+    assert_eq!(owned.len(), num_shards as usize);
+
+    // Crash coordinator A (abort without graceful shutdown -- permanent leases persist)
+    ha.abort();
+    drop(ca);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Start coordinator B with a DIFFERENT node_id but same prefix.
+    // reclaim_existing_leases should return empty because B doesn't own A's leases.
+    let (cb, hb) = start_etcd_coordinator!(
+        &prefix,
+        "different-node-b",
+        "http://127.0.0.1:50051",
+        num_shards
+    );
+    let reclaimed = cb.reclaim_existing_leases().await.expect("reclaim");
+    assert!(
+        reclaimed.is_empty(),
+        "different node_id should NOT reclaim another node's leases, but found: {:?}",
+        reclaimed,
+    );
+
+    cb.shutdown().await.unwrap();
+    hb.abort();
 }
