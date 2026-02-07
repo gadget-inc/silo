@@ -108,10 +108,6 @@ async fn query_collect(engine: &ClusterQueryEngine, query: &str) -> Vec<RecordBa
         .expect("collect")
 }
 
-// =============================================================================
-// Single Shard Tests (verify cluster engine works with single local shard)
-// =============================================================================
-
 #[silo::test]
 async fn cluster_query_single_shard_basic() {
     let (_temps, factory, shard_map) = create_multi_shard_factory(1).await;
@@ -188,10 +184,6 @@ async fn cluster_query_single_shard_count() {
 
     assert_eq!(counts, vec![5]);
 }
-
-// =============================================================================
-// Multi-Shard Local Tests (all shards local, no remote)
-// =============================================================================
 
 #[silo::test]
 async fn cluster_query_multi_shard_combines_results() {
@@ -719,10 +711,6 @@ async fn cluster_query_multi_shard_limit() {
     assert_eq!(ids.len(), 5);
 }
 
-// =============================================================================
-// Queues Table Tests
-// =============================================================================
-
 #[silo::test]
 async fn cluster_query_queues_table_multi_shard() {
     let (_temps, factory, shard_map) = create_multi_shard_factory(2).await;
@@ -792,10 +780,6 @@ async fn cluster_query_queues_table_multi_shard() {
     assert!(queue_names.contains(&"queue-b".to_string()));
 }
 
-// =============================================================================
-// Explain Plan Tests
-// =============================================================================
-
 #[silo::test]
 async fn cluster_query_explain_shows_partitions() {
     let (_temps, factory, _shard_map) = create_multi_shard_factory(3).await;
@@ -816,10 +800,6 @@ async fn cluster_query_explain_shows_partitions() {
         plan
     );
 }
-
-// =============================================================================
-// Metadata Filter Tests
-// =============================================================================
 
 #[silo::test]
 async fn cluster_query_metadata_filter_multi_shard() {
@@ -874,10 +854,6 @@ async fn cluster_query_metadata_filter_multi_shard() {
 
     assert_eq!(ids, vec!["prod_job"]);
 }
-
-// =============================================================================
-// Error Handling Tests
-// =============================================================================
 
 #[silo::test]
 async fn cluster_query_malformed_sql_syntax_error() {
@@ -1021,10 +997,6 @@ async fn cluster_query_division_by_zero() {
         );
     }
 }
-
-// =============================================================================
-// Partial Shard Failure Tests (using shards with missing data paths)
-// =============================================================================
 
 #[silo::test]
 async fn cluster_query_handles_missing_shard_gracefully() {
@@ -1200,10 +1172,6 @@ async fn cluster_query_group_by_shard_id_with_missing_shards() {
     assert_eq!(results.get(&shard1_id), Some(&1));
 }
 
-// =============================================================================
-// Tenant Isolation Tests
-// =============================================================================
-
 #[silo::test]
 async fn cluster_query_tenant_isolation_multi_shard() {
     let (_temps, factory, shard_map) = create_multi_shard_factory(2).await;
@@ -1257,10 +1225,6 @@ async fn cluster_query_tenant_isolation_multi_shard() {
     let ids = extract_string_column(&batches, 0);
     assert_eq!(ids, vec!["b_job"]);
 }
-
-// =============================================================================
-// Cross-Tenant Query Tests (no tenant filter - admin/cluster-wide visibility)
-// =============================================================================
 
 /// Test that queries WITHOUT a tenant filter return jobs from ALL tenants
 #[silo::test]

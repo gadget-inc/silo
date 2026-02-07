@@ -266,8 +266,6 @@ impl JobStoreShard {
         self.finish_enqueue(job_id, start_at_ms, &grants).await
     }
 
-    // ==================== Shared Enqueue Helpers ====================
-
     /// Write all enqueue data (job info, metadata, status, limit tasks) to the writer.
     /// Shared between the WriteBatch and transaction enqueue paths.
     #[allow(clippy::too_many_arguments)]

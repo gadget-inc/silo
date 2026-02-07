@@ -408,8 +408,6 @@ async fn sql_metadata_with_status_and_id_prefix() {
     assert_eq!(got, vec!["app_1"]);
 }
 
-// ===== Predicate Pushdown Verification Tests =====
-
 #[silo::test]
 async fn verify_exact_id_pushdown() {
     let (_tmp, shard) = open_temp_shard().await;
@@ -581,8 +579,6 @@ async fn explain_plan_shows_filter_pushdown() {
     );
 }
 
-// ===== Status Kind Coverage Tests =====
-
 #[silo::test]
 async fn sql_filter_scheduled_status() {
     let (_tmp, shard) = open_temp_shard().await;
@@ -696,8 +692,6 @@ async fn sql_filter_failed_status() {
 
     assert_eq!(got, vec!["fail1"]);
 }
-
-// ===== Column Type and Projection Tests =====
 
 #[silo::test]
 async fn sql_select_all_columns() {
@@ -827,8 +821,6 @@ async fn sql_filter_by_enqueue_time() {
     assert_eq!(got, vec!["new"]);
 }
 
-// ===== Empty and Null Cases =====
-
 #[silo::test]
 async fn sql_jobs_without_metadata() {
     let (_tmp, shard) = open_temp_shard().await;
@@ -910,8 +902,6 @@ async fn sql_count_aggregate() {
     assert_eq!(count_arr.value(0), 3);
 }
 
-// ===== LIKE Pattern Tests =====
-
 #[silo::test]
 async fn sql_suffix_id_match() {
     let (_tmp, shard) = open_temp_shard().await;
@@ -951,8 +941,6 @@ async fn sql_contains_id_match() {
     assert_eq!(got, vec!["has_middle_too", "prefix_middle_suffix"]);
 }
 
-// ===== Limit Tests =====
-
 #[silo::test]
 async fn sql_explicit_limit() {
     let (_tmp, shard) = open_temp_shard().await;
@@ -989,8 +977,6 @@ async fn sql_limit_beyond_available() {
 
     assert_eq!(got, vec!["j1", "j2"]);
 }
-
-// ===== Tenant Isolation Tests =====
 
 #[silo::test]
 async fn sql_tenant_isolation() {
@@ -1077,8 +1063,6 @@ async fn sql_default_tenant() {
     assert_eq!(got, vec!["default_job"]);
 }
 
-// ===== Error Handling Tests =====
-
 #[silo::test]
 async fn sql_invalid_column_name() {
     let (_tmp, shard) = open_temp_shard().await;
@@ -1102,8 +1086,6 @@ async fn sql_invalid_syntax() {
     // Should get an error for incomplete SQL
     assert!(result.is_err());
 }
-
-// ===== Metadata Edge Cases =====
 
 #[silo::test]
 async fn sql_metadata_empty_value() {
@@ -1181,8 +1163,6 @@ async fn sql_metadata_special_chars() {
     assert_eq!(got, vec!["special"]);
 }
 
-// ===== Additional Pushdown Verification Tests =====
-
 #[silo::test]
 async fn verify_priority_not_pushed() {
     let (_tmp, shard) = open_temp_shard().await;
@@ -1259,10 +1239,6 @@ async fn sql_multiple_order_by() {
     // c has priority 5, then b (newer) then a (older)
     assert_eq!(got, vec!["c", "b", "a"]);
 }
-
-// =============================================================================
-// Queues Table Tests - Tests for the concurrency queue SQL table
-// =============================================================================
 
 use silo::job::{ConcurrencyLimit, Limit};
 

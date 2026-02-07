@@ -378,10 +378,6 @@ async fn cleanup_concurrent_with_job_processing() {
     assert_eq!(zzz_jobs, 0, "zzz jobs should be cleaned up");
 }
 
-// ============================================================================
-// Pre-Cleanup System Behavior Tests
-// ============================================================================
-//
 // After a shard split, cleanup runs asynchronously in the background.
 // The system must continue serving requests correctly BEFORE cleanup completes,
 // even with uncleaned out-of-range data present in the shard.

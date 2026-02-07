@@ -774,11 +774,6 @@ async fn k8s_coordinator_metadata() {
     handle.abort();
 }
 
-// =============================================================================
-// SHARD GUARD TESTS
-// These test the lower-level K8sShardGuard directly
-// =============================================================================
-
 /// Helper to create a K8sShardGuard for testing
 async fn make_k8s_guard(
     namespace: &str,
@@ -1163,10 +1158,6 @@ async fn k8s_shard_guard_shutdown_while_held() {
     assert!(released, "owned should be cleared on shutdown");
     handle.abort();
 }
-
-// =============================================================================
-// SAFETY & CORRECTNESS TESTS
-// =============================================================================
 
 /// Critical test: Verify no split-brain during transitions
 /// At no point should two nodes simultaneously believe they own the same shard

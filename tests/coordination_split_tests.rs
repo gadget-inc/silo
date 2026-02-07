@@ -438,10 +438,6 @@ async fn get_split_status_returns_none_for_nonexistent() {
     let _ = h1.abort();
 }
 
-// ============================================================================
-// End-to-end split execution tests
-// ============================================================================
-
 /// Test that execute_split completes a full split cycle
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
 async fn execute_split_completes_full_cycle() {

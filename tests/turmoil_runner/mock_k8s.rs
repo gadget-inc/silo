@@ -30,10 +30,6 @@ use std::time::Duration;
 use tokio::sync::{Mutex, broadcast};
 use tracing::trace;
 
-// ============================================================================
-// Mock K8s State
-// ============================================================================
-
 /// In-memory state for the mock K8s API, simulating the K8s API server.
 /// This can be shared between multiple coordinators to test multi-node scenarios.
 #[derive(Debug)]
@@ -571,10 +567,6 @@ impl MockK8sState {
         *self.failure_rate.lock().await = rate.clamp(0.0, 1.0);
     }
 
-    // ========================================================================
-    // ConfigMap operations
-    // ========================================================================
-
     /// Get a ConfigMap by namespace and name
     pub async fn get_configmap(
         &self,
@@ -900,10 +892,6 @@ fn match_configmap_labels(configmap: &StoredConfigMap, selector: Option<&str>) -
     true
 }
 
-// ============================================================================
-// K8sBackend implementation for MockK8sState
-// ============================================================================
-
 /// Wrapper around Arc<MockK8sState> that implements K8sBackend trait.
 /// This allows using the mock state as a backend for the real K8sCoordinator.
 #[derive(Clone)]
@@ -1216,10 +1204,6 @@ fn stored_configmap_to_configmap_internal(stored: &StoredConfigMap) -> ConfigMap
         ..Default::default()
     }
 }
-
-// ============================================================================
-// Unit Tests for MockK8sState
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

@@ -54,10 +54,6 @@ pub type ConfigMapWatchStream =
 /// - Test implementations: Simulated K8s API for deterministic testing
 #[async_trait]
 pub trait K8sBackend: Send + Sync + Clone + 'static {
-    // ========================================================================
-    // Lease operations
-    // ========================================================================
-
     /// Get a lease by namespace and name.
     /// Returns None if the lease doesn't exist.
     async fn get_lease(
@@ -106,10 +102,6 @@ pub trait K8sBackend: Send + Sync + Clone + 'static {
     /// Watch for lease changes matching the given label selector.
     /// Returns a stream of watch events.
     fn watch_leases(&self, namespace: &str, label_selector: &str) -> LeaseWatchStream;
-
-    // ========================================================================
-    // ConfigMap operations
-    // ========================================================================
 
     /// Get a ConfigMap by namespace and name.
     /// Returns None if the ConfigMap doesn't exist.
@@ -160,10 +152,6 @@ pub trait K8sBackend: Send + Sync + Clone + 'static {
     /// Returns a stream of watch events for changes to the named ConfigMap.
     fn watch_configmap(&self, namespace: &str, name: &str) -> ConfigMapWatchStream;
 }
-
-// ============================================================================
-// Real Kubernetes backend using kube-rs
-// ============================================================================
 
 /// Real Kubernetes backend using kube-rs client.
 #[derive(Clone)]

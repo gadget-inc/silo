@@ -132,8 +132,6 @@ impl JobStoreShard {
         })
     }
 
-    // ==================== Batch Counter Operations ====================
-    //
     // These add counter merges to an existing WriteBatch, avoiding the overhead
     // of a separate database write. Use these when the caller already has a
     // WriteBatch that will be written atomically.
@@ -166,8 +164,6 @@ impl JobStoreShard {
         batch.merge(&key, encode_counter(-1));
     }
 
-    // ==================== Standalone Counter Operations ====================
-    //
     // These create their own WriteBatch and write directly to the database.
     // Use these after transaction commits where counters cannot be included
     // in the transaction due to conflict concerns.

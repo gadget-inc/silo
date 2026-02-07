@@ -26,10 +26,6 @@ mod scenarios;
 
 use helpers::{get_seed, is_fuzz_mode, is_subprocess, verify_determinism};
 
-// ============================================================================
-// Test Functions
-// ============================================================================
-
 // DST tests use plain #[test] instead of #[silo::test] because they set up
 // their own deterministic tracing subscriber in init_deterministic_tracing().
 // Using #[silo::test] would set up a global subscriber first, causing a conflict.
