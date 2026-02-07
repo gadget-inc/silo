@@ -23,6 +23,12 @@ impl RetryPolicy {
     }
 }
 
+/// Check whether retries are exhausted given the number of failures so far.
+/// Returns true when `failures_so_far` exceeds `policy.retry_count`.
+pub fn retries_exhausted(failures_so_far: u32, policy: &RetryPolicy) -> bool {
+    failures_so_far > policy.retry_count
+}
+
 /// Compute the time (epoch ms) for the next retry attempt, if any.
 /// - `failure_time_ms`: time the last attempt failed
 /// - `failures_so_far`: number of failed attempts so far (0 for first failure)
@@ -34,9 +40,7 @@ pub fn next_retry_time_ms(
     failures_so_far: u32,
     policy: &RetryPolicy,
 ) -> Option<i64> {
-    let retries_allowed = policy.retry_count;
-    // If failures so far exceed allowed retries, stop. Allow while failures_so_far <= retries_allowed
-    if failures_so_far > retries_allowed {
+    if retries_exhausted(failures_so_far, policy) {
         return None;
     }
 

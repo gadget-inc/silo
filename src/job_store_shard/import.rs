@@ -16,7 +16,7 @@ use crate::job_attempt::{AttemptStatus, JobAttempt};
 use crate::job_store_shard::helpers::{TxnWriter, now_epoch_ms};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{attempt_key, idx_metadata_key, job_info_key};
-use crate::retry::RetryPolicy;
+use crate::retry::{RetryPolicy, retries_exhausted};
 
 /// Imported attempt from another system. All attempts must be terminal.
 #[derive(Debug, Clone)]
@@ -109,9 +109,6 @@ impl JobStoreShard {
         for attempt in 0..MAX_RETRIES {
             match self.import_job_txn(tenant, &params).await {
                 Ok(status) => return Ok(status),
-                Err(JobStoreShardError::JobAlreadyExists(_)) => {
-                    return Err(JobStoreShardError::JobAlreadyExists(params.id.clone()));
-                }
                 Err(JobStoreShardError::Slate(ref e))
                     if e.kind() == SlateErrorKind::Transaction =>
                 {
@@ -119,9 +116,9 @@ impl JobStoreShard {
                         let delay_ms = 10 * (1 << attempt);
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                         debug!(
-                            job_id = %params.id,
+                            operation = "import_job",
                             attempt = attempt + 1,
-                            "import_job transaction conflict, retrying"
+                            "transaction conflict, retrying"
                         );
                         continue;
                     }
@@ -347,35 +344,29 @@ fn determine_import_status(
             true,
         ),
         ImportedAttemptStatus::Failed { .. } => {
-            // Check if retries remain
             let failed_count = params
                 .attempts
                 .iter()
                 .filter(|a| matches!(a.status, ImportedAttemptStatus::Failed { .. }))
                 .count() as u32;
 
-            if let Some(ref policy) = params.retry_policy {
-                // Use the retry module logic: retries exhausted when failed_count > retry_count
-                if failed_count > policy.retry_count {
-                    (
-                        JobStatus::failed(last_attempt.finished_at_ms),
-                        JobStatusKind::Failed,
-                        true,
-                    )
-                } else {
-                    let next_attempt = num_attempts + 1;
-                    (
-                        JobStatus::scheduled(now_ms, effective_start_at_ms, next_attempt),
-                        JobStatusKind::Scheduled,
-                        false,
-                    )
-                }
-            } else {
-                // No retry policy -> Failed
+            let exhausted = match params.retry_policy {
+                Some(ref policy) => retries_exhausted(failed_count, policy),
+                None => true, // No retry policy -> always exhausted
+            };
+
+            if exhausted {
                 (
                     JobStatus::failed(last_attempt.finished_at_ms),
                     JobStatusKind::Failed,
                     true,
+                )
+            } else {
+                let next_attempt = num_attempts + 1;
+                (
+                    JobStatus::scheduled(now_ms, effective_start_at_ms, next_attempt),
+                    JobStatusKind::Scheduled,
+                    false,
                 )
             }
         }

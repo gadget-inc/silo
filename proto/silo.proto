@@ -137,7 +137,7 @@ message JobAttempt {
   uint32 attempt_number = 2;             // Which attempt this is (1 = first attempt).
   string task_id = 3;                    // Unique task ID for this attempt.
   AttemptStatus status = 4;              // Current status of the attempt.
-  optional int64 started_at_ms = 5;      // Unix timestamp (ms) when attempt started. Present for all attempts.
+  int64 started_at_ms = 5;               // Unix timestamp (ms) when attempt started. Present for all attempts.
   optional int64 finished_at_ms = 6;     // Unix timestamp (ms) when attempt finished. Present if completed.
   optional SerializedBytes result = 7;     // Result data if attempt succeeded.
   optional string error_code = 8;          // Error code if attempt failed.

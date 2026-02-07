@@ -363,6 +363,7 @@ impl JobStoreShard {
             worker_id: worker_id.to_string(),
             task: task.clone(),
             expiry_ms,
+            started_at_ms: now_ms,
         };
         let leased_value = encode_lease(&record)?;
         batch.put(&lease_key, &leased_value);
@@ -665,6 +666,7 @@ impl JobStoreShard {
             worker_id: worker_id.to_string(),
             task: task.clone(),
             expiry_ms,
+            started_at_ms: 0, // Not applicable for RefreshFloatingLimit tasks
         };
         let leased_value = encode_lease(&record)?;
         state.batch.put(&lease_key, &leased_value);

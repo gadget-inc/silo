@@ -57,6 +57,7 @@ impl JobStoreShard {
             worker_id: current_owner.to_string(),
             task: decoded.to_task(),
             expiry_ms: now_epoch_ms() + DEFAULT_LEASE_MS,
+            started_at_ms: decoded.started_at_ms(),
         };
         let value = encode_lease(&record)?;
 
@@ -127,14 +128,8 @@ impl JobStoreShard {
         };
         let attempt_key = attempt_key(&tenant, &job_id, attempt_number);
 
-        // Read the existing attempt to preserve started_at_ms
-        let started_at_ms = match self.db.get(&attempt_key).await? {
-            Some(raw) => {
-                let view = crate::job_attempt::JobAttemptView::new(&raw)?;
-                view.started_at_ms()
-            }
-            None => now_ms, // Shouldn't happen, but fall back to now
-        };
+        // started_at_ms is stored on the lease record, so no extra DB read needed
+        let started_at_ms = decoded.started_at_ms();
 
         let attempt = JobAttempt {
             job_id: job_id.clone(),

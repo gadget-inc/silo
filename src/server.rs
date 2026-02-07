@@ -176,7 +176,7 @@ pub fn job_attempt_view_to_proto(
         attempt_number: attempt.attempt_number(),
         task_id: attempt.task_id().to_string(),
         status: status.into(),
-        started_at_ms: Some(attempt.started_at_ms()),
+        started_at_ms: attempt.started_at_ms(),
         finished_at_ms,
         result,
         error_code,

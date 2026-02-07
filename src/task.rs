@@ -131,6 +131,8 @@ pub struct LeaseRecord {
     pub worker_id: String,
     pub task: Task,
     pub expiry_ms: i64,
+    /// When the attempt started (epoch ms). Only meaningful for RunAttempt tasks.
+    pub started_at_ms: i64,
 }
 
 /// Stored representation for a concurrency holder record: value at holders/<queue>/<task-id>

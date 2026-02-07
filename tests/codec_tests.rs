@@ -91,6 +91,7 @@ fn test_lease_roundtrip() {
             task_group: "default".to_string(),
         },
         expiry_ms: 12345,
+        started_at_ms: 10000,
     };
     let encoded = encode_lease(&lease).unwrap();
     assert_eq!(encoded[0], LEASE_RECORD_VERSION);
@@ -407,6 +408,7 @@ fn test_decoded_lease_accessors_run_attempt() {
             task_group: "grp".to_string(),
         },
         expiry_ms: 50000,
+        started_at_ms: 40000,
     };
     let encoded = encode_lease(&lease).unwrap();
     let decoded = decode_lease(&encoded).unwrap();
@@ -446,6 +448,7 @@ fn test_decoded_lease_accessors_refresh_floating_limit() {
             task_group: "workers".to_string(),
         },
         expiry_ms: 60000,
+        started_at_ms: 0,
     };
     let encoded = encode_lease(&lease).unwrap();
     let decoded = decode_lease(&encoded).unwrap();
