@@ -1,14 +1,14 @@
 //! Job cancellation operations.
 
-use slatedb::ErrorKind as SlateErrorKind;
 use slatedb::IsolationLevel;
 
 use crate::codec::{decode_job_cancellation, encode_job_cancellation, encode_job_status};
 use crate::job::{JobCancellation, JobStatus, JobStatusKind};
-use crate::job_store_shard::helpers::{decode_job_status_owned, now_epoch_ms};
+use crate::job_store_shard::helpers::{
+    decode_job_status_owned, now_epoch_ms, retry_on_txn_conflict,
+};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{idx_status_time_key, job_cancelled_key, job_status_key};
-use tracing::debug;
 
 impl JobStoreShard {
     /// Cancel a job by id. Prevents further execution and signals running workers to stop.
@@ -23,33 +23,7 @@ impl JobStoreShard {
     /// Uses a transaction with optimistic concurrency control to detect if the job state
     /// changes during the cancellation flow. Retries automatically on conflict.
     pub async fn cancel_job(&self, tenant: &str, id: &str) -> Result<(), JobStoreShardError> {
-        const MAX_RETRIES: usize = 5;
-
-        for attempt in 0..MAX_RETRIES {
-            match self.cancel_job_inner(tenant, id).await {
-                Ok(()) => return Ok(()),
-                Err(JobStoreShardError::Slate(ref e))
-                    if e.kind() == SlateErrorKind::Transaction =>
-                {
-                    // Transaction conflict - retry with exponential backoff
-                    if attempt + 1 < MAX_RETRIES {
-                        let delay_ms = 10 * (1 << attempt); // 10ms, 20ms, 40ms, 80ms
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        debug!(
-                            job_id = %id,
-                            attempt = attempt + 1,
-                            "cancel_job transaction conflict, retrying"
-                        );
-                        continue;
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        Err(JobStoreShardError::TransactionConflict(
-            "cancel_job".to_string(),
-        ))
+        retry_on_txn_conflict("cancel_job", || self.cancel_job_inner(tenant, id)).await
     }
 
     /// Inner implementation of cancel_job that runs within a single transaction attempt.

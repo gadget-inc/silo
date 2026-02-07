@@ -2,18 +2,18 @@
 //!
 //! Allows cancelled or failed jobs to be restarted, giving them a fresh set of retries.
 
-use slatedb::ErrorKind as SlateErrorKind;
 use slatedb::IsolationLevel;
 use uuid::Uuid;
 
 use crate::codec::encode_job_status;
 use crate::dst_events::{self, DstEvent};
 use crate::job::{JobStatus, JobStatusKind};
-use crate::job_store_shard::helpers::{decode_job_status_owned, now_epoch_ms};
+use crate::job_store_shard::helpers::{
+    decode_job_status_owned, now_epoch_ms, retry_on_txn_conflict,
+};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{attempt_prefix, idx_status_time_key, job_cancelled_key, job_status_key};
 use crate::task::Task;
-use tracing::debug;
 
 /// Error returned when a job cannot be restarted because it's not in a restartable state.
 #[derive(Debug, Clone)]
@@ -57,33 +57,7 @@ impl JobStoreShard {
     /// Uses a transaction with optimistic concurrency control to detect if the job state
     /// changes during the restart flow. Retries automatically on conflict.
     pub async fn restart_job(&self, tenant: &str, id: &str) -> Result<(), JobStoreShardError> {
-        const MAX_RETRIES: usize = 5;
-
-        for attempt in 0..MAX_RETRIES {
-            match self.restart_job_inner(tenant, id).await {
-                Ok(()) => return Ok(()),
-                Err(JobStoreShardError::Slate(ref e))
-                    if e.kind() == SlateErrorKind::Transaction =>
-                {
-                    // Transaction conflict - retry with exponential backoff
-                    if attempt + 1 < MAX_RETRIES {
-                        let delay_ms = 10 * (1 << attempt); // 10ms, 20ms, 40ms, 80ms
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        debug!(
-                            job_id = %id,
-                            attempt = attempt + 1,
-                            "restart_job transaction conflict, retrying"
-                        );
-                        continue;
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        Err(JobStoreShardError::TransactionConflict(
-            "restart_job".to_string(),
-        ))
+        retry_on_txn_conflict("restart_job", || self.restart_job_inner(tenant, id)).await
     }
 
     /// Inner implementation of restart_job that runs within a single transaction attempt.

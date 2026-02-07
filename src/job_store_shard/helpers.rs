@@ -127,6 +127,46 @@ pub(crate) fn put_task<W: WriteBatcher>(
     Ok(())
 }
 
+/// Retry an operation that may fail with a SlateDB transaction conflict.
+///
+/// Encapsulates the MAX_RETRIES=5 loop with exponential backoff and
+/// `TransactionConflict` error return on exhaustion.
+pub(crate) async fn retry_on_txn_conflict<F, Fut>(
+    operation_name: &str,
+    mut f: F,
+) -> Result<(), JobStoreShardError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), JobStoreShardError>>,
+{
+    const MAX_RETRIES: usize = 5;
+
+    for attempt in 0..MAX_RETRIES {
+        match f().await {
+            Ok(()) => return Ok(()),
+            Err(JobStoreShardError::Slate(ref e))
+                if e.kind() == slatedb::ErrorKind::Transaction =>
+            {
+                if attempt + 1 < MAX_RETRIES {
+                    let delay_ms = 10 * (1 << attempt); // 10ms, 20ms, 40ms, 80ms
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    tracing::debug!(
+                        operation = %operation_name,
+                        attempt = attempt + 1,
+                        "transaction conflict, retrying"
+                    );
+                    continue;
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(JobStoreShardError::TransactionConflict(
+        operation_name.to_string(),
+    ))
+}
+
 /// Decode a `JobStatus` from raw rkyv bytes into an owned value.
 pub(crate) fn decode_job_status_owned(raw: &[u8]) -> Result<JobStatus, JobStoreShardError> {
     let decoded = decode_job_status(raw)?;
