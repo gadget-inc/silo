@@ -32,12 +32,12 @@
   - [x] typescript client implementation
   - [x] failure to refresh handling
   - [x] performance optimization to not refresh if no jobs currently enqueued with limit
-- [ ] review what happened with the check-if-cancelled-on-dequeue thing happened, if alloy model matches rust impl
+- [x] review what happened with the check-if-cancelled-on-dequeue thing happened, if alloy model matches rust impl
 - [x] webui / operator tooling
   - [ ] use / refine
 - [x] /healthz endpoint
 - [x] /metrics prometheus endpoint
-- [ ] opentelemetry support
+- [x] opentelemetry support
 - [x] investigate how we might do schema evolution
 - [x] secondary indexes for filtering
   - requirements:
@@ -47,7 +47,7 @@
     - [x] optional filter on new metadata key/values
     - [x] fancy sql api
 - [x] once transaction support, make enqueue idempotency not a read-then-write but some sort of conditional write
-- [ ] validate that concurrency queues can reach 0
+- [x] validate that concurrency queues can reach 0
 - [ ] validate GRPC typescript client retry configuration with toxiproxy
 - [ ] waiting state? that matches the gadget ui, but we dont have it modeled because it changes in time without anything else changing
   - [ ] do we need to be able to query for it in the SQL layer? probably
@@ -56,10 +56,10 @@
 - [x] rust best practices review
 - [x] benchmarks in CI, codspeed or similar regression tracker
 - [x] make sure failure data is also stored using msgpack
-- [ ] shard splitting
+- [x] shard splitting
   - [x] wire up re-cleanup on re-aquire
   - [x] add tests for actually processing jobs before cleanup has happened
   - [x] validate all sigils present
   - [x] add split DST scenarios
   - [x] ensure that cleanup is aborted cleanly when a shard is closed mid-cleanup
-- [ ] asynchronously hydrate concurrency queue counts to make startup faster
+- [x] asynchronously hydrate concurrency queue counts to make startup faster
