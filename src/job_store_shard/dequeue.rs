@@ -386,9 +386,8 @@ impl JobStoreShard {
             attempt_number,
             relative_attempt_number,
             task_id: task_id.to_string(),
-            status: AttemptStatus::Running {
-                started_at_ms: now_ms,
-            },
+            started_at_ms: now_ms,
+            status: AttemptStatus::Running,
         };
         let attempt_val = encode_attempt(&attempt)?;
         let akey = attempt_key(tenant, job_id, attempt_number);

@@ -107,9 +107,8 @@ fn test_job_attempt_roundtrip() {
         attempt_number: 1,
         relative_attempt_number: 1,
         task_id: "task-1".to_string(),
-        status: AttemptStatus::Running {
-            started_at_ms: 1000,
-        },
+        started_at_ms: 1000,
+        status: AttemptStatus::Running,
     };
     let encoded = encode_attempt(&attempt).unwrap();
     assert_eq!(encoded[0], JOB_ATTEMPT_VERSION);

@@ -135,21 +135,13 @@ pub fn job_attempt_view_to_proto(
     attempt: &crate::job_attempt::JobAttemptView,
 ) -> crate::pb::JobAttempt {
     let state = attempt.state();
-    let (status, started_at_ms, finished_at_ms, result, error_code, error_data) = match state {
-        JobAttemptStatus::Running { started_at_ms } => (
-            AttemptStatus::Running,
-            Some(started_at_ms),
-            None,
-            None,
-            None,
-            None,
-        ),
+    let (status, finished_at_ms, result, error_code, error_data) = match state {
+        JobAttemptStatus::Running => (AttemptStatus::Running, None, None, None, None),
         JobAttemptStatus::Succeeded {
             finished_at_ms,
             result,
         } => (
             AttemptStatus::Succeeded,
-            None,
             Some(finished_at_ms),
             Some(SerializedBytes {
                 encoding: Some(serialized_bytes::Encoding::Msgpack(result)),
@@ -163,7 +155,6 @@ pub fn job_attempt_view_to_proto(
             error,
         } => (
             AttemptStatus::Failed,
-            None,
             Some(finished_at_ms),
             None,
             Some(error_code),
@@ -173,7 +164,6 @@ pub fn job_attempt_view_to_proto(
         ),
         JobAttemptStatus::Cancelled { finished_at_ms } => (
             AttemptStatus::Cancelled,
-            None,
             Some(finished_at_ms),
             None,
             None,
@@ -186,7 +176,7 @@ pub fn job_attempt_view_to_proto(
         attempt_number: attempt.attempt_number(),
         task_id: attempt.task_id().to_string(),
         status: status.into(),
-        started_at_ms,
+        started_at_ms: Some(attempt.started_at_ms()),
         finished_at_ms,
         result,
         error_code,
@@ -205,6 +195,7 @@ fn map_err(e: JobStoreShardError) -> Status {
         }
         JobStoreShardError::JobNotRestartable(ref e) => Status::failed_precondition(e.to_string()),
         JobStoreShardError::JobNotExpediteable(ref e) => Status::failed_precondition(e.to_string()),
+        JobStoreShardError::InvalidArgument(ref msg) => Status::invalid_argument(msg.clone()),
         other => Status::internal(other.to_string()),
     }
 }
@@ -359,6 +350,150 @@ impl SiloService {
         }
     }
 
+    /// Validate and convert a single import job request from proto to domain types.
+    /// Returns the validated shard ID, tenant, and import params.
+    async fn validate_import_job(
+        &self,
+        job_req: ImportJobRequest,
+    ) -> Result<
+        (
+            crate::shard_range::ShardId,
+            String,
+            crate::job_store_shard::import::ImportJobParams,
+        ),
+        Status,
+    > {
+        let shard_id = Self::parse_shard_id(&job_req.shard)?;
+        let tenant = self.validate_tenant(job_req.tenant.as_deref())?;
+        self.validate_tenant_in_shard_range(&shard_id, &tenant)
+            .await?;
+
+        if job_req.id.is_empty() {
+            return Err(Status::invalid_argument("job id is required for import"));
+        }
+
+        if job_req.task_group.is_empty() {
+            return Err(Status::invalid_argument("task_group is required"));
+        }
+
+        if job_req.priority > 99 {
+            return Err(Status::invalid_argument(
+                "priority must be between 0 and 99",
+            ));
+        }
+
+        // Validate metadata constraints
+        if job_req.metadata.len() > 16 {
+            return Err(Status::invalid_argument(
+                "metadata has too many entries (max 16)",
+            ));
+        }
+        for (k, v) in &job_req.metadata {
+            if k.chars().count() >= 64 {
+                return Err(Status::invalid_argument(
+                    "metadata key too long (must be < 64 chars)",
+                ));
+            }
+            if v.len() as u128 >= (u16::MAX as u128) {
+                return Err(Status::invalid_argument(
+                    "metadata value too long (must be < u16::MAX bytes)",
+                ));
+            }
+        }
+
+        let payload_bytes = job_req
+            .payload
+            .as_ref()
+            .and_then(|p| {
+                p.encoding
+                    .as_ref()
+                    .map(|serialized_bytes::Encoding::Msgpack(data)| data.clone())
+            })
+            .unwrap_or_default();
+
+        let retry = job_req.retry_policy.map(|rp| crate::retry::RetryPolicy {
+            retry_count: rp.retry_count,
+            initial_interval_ms: rp.initial_interval_ms,
+            max_interval_ms: rp.max_interval_ms,
+            randomize_interval: rp.randomize_interval,
+            backoff_factor: rp.backoff_factor,
+        });
+
+        let limits: Vec<crate::job::Limit> = job_req
+            .limits
+            .into_iter()
+            .filter_map(proto_limit_to_job_limit)
+            .collect();
+
+        let metadata: Option<Vec<(String, String)>> = if job_req.metadata.is_empty() {
+            None
+        } else {
+            Some(job_req.metadata.into_iter().collect())
+        };
+
+        // Convert proto attempts to domain attempts
+        let mut attempts = Vec::with_capacity(job_req.attempts.len());
+        for proto_attempt in job_req.attempts {
+            let status = match AttemptStatus::try_from(proto_attempt.status) {
+                Ok(AttemptStatus::Succeeded) => {
+                    let result = proto_attempt
+                        .result
+                        .and_then(|s| {
+                            s.encoding
+                                .map(|serialized_bytes::Encoding::Msgpack(data)| data)
+                        })
+                        .unwrap_or_default();
+                    crate::job_store_shard::import::ImportedAttemptStatus::Succeeded { result }
+                }
+                Ok(AttemptStatus::Failed) => {
+                    let error_code = proto_attempt.error_code.unwrap_or_default();
+                    let error = proto_attempt
+                        .error_data
+                        .and_then(|s| {
+                            s.encoding
+                                .map(|serialized_bytes::Encoding::Msgpack(data)| data)
+                        })
+                        .unwrap_or_default();
+                    crate::job_store_shard::import::ImportedAttemptStatus::Failed {
+                        error_code,
+                        error,
+                    }
+                }
+                Ok(AttemptStatus::Cancelled) => {
+                    crate::job_store_shard::import::ImportedAttemptStatus::Cancelled
+                }
+                Ok(AttemptStatus::Running) => {
+                    return Err(Status::invalid_argument(
+                        "import attempts must be terminal (not Running)",
+                    ));
+                }
+                Err(_) => {
+                    return Err(Status::invalid_argument("invalid attempt status"));
+                }
+            };
+            attempts.push(crate::job_store_shard::import::ImportedAttempt {
+                status,
+                started_at_ms: proto_attempt.started_at_ms,
+                finished_at_ms: proto_attempt.finished_at_ms,
+            });
+        }
+
+        let params = crate::job_store_shard::import::ImportJobParams {
+            id: job_req.id.clone(),
+            priority: job_req.priority as u8,
+            enqueue_time_ms: job_req.enqueue_time_ms,
+            start_at_ms: job_req.start_at_ms,
+            retry_policy: retry,
+            payload: payload_bytes,
+            limits,
+            metadata,
+            task_group: job_req.task_group,
+            attempts,
+        };
+
+        Ok((shard_id, tenant, params))
+    }
+
     /// Validate that the tenant_id falls within the shard's tenant range.
     ///
     /// This prevents clients from accidentally sending requests to the wrong shard,
@@ -481,6 +616,13 @@ impl Silo for SiloService {
         let tenant = self.validate_tenant(r.tenant.as_deref())?;
         self.validate_tenant_in_shard_range(&shard_id, &tenant)
             .await?;
+
+        if r.priority > 99 {
+            return Err(Status::invalid_argument(
+                "priority must be between 0 and 99",
+            ));
+        }
+
         let payload_bytes = r
             .payload
             .as_ref()
@@ -727,7 +869,7 @@ impl Silo for SiloService {
                     })),
                 }))
             }
-            crate::job_attempt::AttemptStatus::Running { .. } => {
+            crate::job_attempt::AttemptStatus::Running => {
                 // This shouldn't happen - job status is terminal but attempt is still running
                 Err(Status::internal(
                     "job status is terminal but attempt is still running",
@@ -1155,6 +1297,103 @@ impl Silo for SiloService {
 
         let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn import_jobs(
+        &self,
+        req: Request<ImportJobsRequest>,
+    ) -> Result<Response<ImportJobsResponse>, Status> {
+        let r = req.into_inner();
+
+        if r.jobs.is_empty() {
+            return Ok(Response::new(ImportJobsResponse {
+                results: Vec::new(),
+            }));
+        }
+
+        // Validate and convert all jobs, tracking original index for result ordering
+        // Jobs that fail validation get immediate error results
+        let mut results: Vec<Option<ImportJobResult>> = vec![None; r.jobs.len()];
+
+        // Group validated jobs by (shard_id, tenant) for batched execution
+        // Each entry stores (original_index, params)
+        let mut batches: std::collections::HashMap<
+            (crate::shard_range::ShardId, String),
+            Vec<(usize, crate::job_store_shard::import::ImportJobParams)>,
+        > = std::collections::HashMap::new();
+
+        for (i, job_req) in r.jobs.into_iter().enumerate() {
+            let job_id = job_req.id.clone();
+            match self.validate_import_job(job_req).await {
+                Ok((shard_id, tenant, params)) => {
+                    batches
+                        .entry((shard_id, tenant))
+                        .or_default()
+                        .push((i, params));
+                }
+                Err(e) => {
+                    results[i] = Some(ImportJobResult {
+                        id: job_id,
+                        success: false,
+                        error: Some(e.to_string()),
+                        status: JobStatus::Failed.into(),
+                    });
+                }
+            }
+        }
+
+        // Execute each batch against its shard
+        for ((shard_id, tenant), batch) in batches {
+            let shard = match self.shard_with_redirect(&shard_id).await {
+                Ok(s) => s,
+                Err(e) => {
+                    for (i, params) in batch {
+                        results[i] = Some(ImportJobResult {
+                            id: params.id,
+                            success: false,
+                            error: Some(e.to_string()),
+                            status: JobStatus::Failed.into(),
+                        });
+                    }
+                    continue;
+                }
+            };
+
+            let (indices, params): (Vec<usize>, Vec<_>) = batch.into_iter().unzip();
+
+            match shard.import_jobs(&tenant, params).await {
+                Ok(import_results) => {
+                    for (idx, result) in indices.into_iter().zip(import_results) {
+                        results[idx] = Some(ImportJobResult {
+                            id: result.job_id,
+                            success: result.success,
+                            error: result.error,
+                            status: job_status_kind_to_proto(result.status).into(),
+                        });
+                    }
+                }
+                Err(e) => {
+                    for idx in indices {
+                        results[idx] = Some(ImportJobResult {
+                            id: String::new(),
+                            success: false,
+                            error: Some(e.to_string()),
+                            status: JobStatus::Failed.into(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Unwrap all results (every slot should be filled)
+        let final_results = results
+            .into_iter()
+            .map(|r| r.expect("all import results should be filled"))
+            .collect();
+
+        Ok(Response::new(ImportJobsResponse {
+            results: final_results,
+        }))
     }
 
     async fn reset_shards(

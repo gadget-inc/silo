@@ -692,7 +692,7 @@ async fn reap_ignores_unexpired_leases() {
         .expect("get a1")
         .expect("a1 exists");
     match a1.state() {
-        AttemptStatus::Running { .. } => {}
+        AttemptStatus::Running => {}
         other => panic!("expected Running, got {:?}", other),
     }
 }

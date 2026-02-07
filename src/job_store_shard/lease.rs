@@ -125,15 +125,26 @@ impl JobStoreShard {
                 finished_at_ms: now_ms,
             },
         };
+        let attempt_key = attempt_key(&tenant, &job_id, attempt_number);
+
+        // Read the existing attempt to preserve started_at_ms
+        let started_at_ms = match self.db.get(&attempt_key).await? {
+            Some(raw) => {
+                let view = crate::job_attempt::JobAttemptView::new(&raw)?;
+                view.started_at_ms()
+            }
+            None => now_ms, // Shouldn't happen, but fall back to now
+        };
+
         let attempt = JobAttempt {
             job_id: job_id.clone(),
             attempt_number,
             relative_attempt_number,
             task_id: task_id.to_string(),
+            started_at_ms,
             status: attempt_status,
         };
         let attempt_val = encode_attempt(&attempt)?;
-        let attempt_key = attempt_key(&tenant, &job_id, attempt_number);
 
         // Atomically update attempt and remove lease
         let mut batch = WriteBatch::new();
