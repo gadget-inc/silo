@@ -371,6 +371,117 @@ Profiling uses sampling and has low overhead (~1-2%). The default 100Hz frequenc
 
 ---
 
+### shard split
+
+Split a shard into two child shards at a specified tenant ID boundary or at the automatic midpoint.
+
+```bash
+siloctl shard split <shard> [--at <tenant_id> | --auto] [--wait]
+```
+
+| Argument / Option | Description |
+|-------------------|-------------|
+| `<shard>` | Shard ID (UUID) to split |
+| `--at <tenant_id>` | Split at a specific tenant ID boundary |
+| `--auto` | Split at the lexicographic midpoint of the shard's range |
+| `--wait` | Block until the split completes |
+
+You must specify either `--at` or `--auto`.
+
+**Example — split at a specific boundary:**
+
+```bash
+siloctl shard split a1b2c3d4-e5f6-7890-abcd-ef1234567890 --at "customer-m"
+```
+
+```
+Split initiated for shard a1b2c3d4-e5f6-7890-abcd-ef1234567890
+  Split point: "customer-m"
+  Child 1: f1e2d3c4-b5a6-0987-dcba-fedcba098765
+  Child 2: 11223344-5566-7788-99aa-bbccddeeff00
+```
+
+**Example — automatic midpoint split with wait:**
+
+```bash
+siloctl shard split a1b2c3d4-e5f6-7890-abcd-ef1234567890 --auto --wait
+```
+
+```
+Split initiated for shard a1b2c3d4-e5f6-7890-abcd-ef1234567890
+  Split point: "8" (auto)
+Waiting for split to complete...
+Split complete.
+  Child 1: f1e2d3c4-b5a6-0987-dcba-fedcba098765
+  Child 2: 11223344-5566-7788-99aa-bbccddeeff00
+```
+
+<Aside type="caution">
+During the split, requests to tenants on the splitting shard will receive `UNAVAILABLE` errors. Silo clients retry these automatically, but plan splits during low-traffic periods if possible.
+</Aside>
+
+---
+
+### shard split-status
+
+Check the status of an in-progress or completed split.
+
+```bash
+siloctl shard split-status <shard>
+```
+
+| Argument | Description |
+|----------|-------------|
+| `<shard>` | Shard ID (UUID) to check |
+
+**Example:**
+
+```bash
+siloctl shard split-status a1b2c3d4-e5f6-7890-abcd-ef1234567890
+```
+
+```
+Split Status
+============
+Shard:    a1b2c3d4-e5f6-7890-abcd-ef1234567890
+Phase:    Cloning
+Child 1:  f1e2d3c4-b5a6-0987-dcba-fedcba098765
+Child 2:  11223344-5566-7788-99aa-bbccddeeff00
+```
+
+Possible phases: `Requested`, `Pausing`, `Cloning`, `Complete`. See [Data Layout — Shard Splitting](/guides/data-layout#shard-splitting) for details on each phase.
+
+---
+
+### shard configure
+
+Configure shard properties such as placement ring assignment.
+
+```bash
+siloctl shard configure <shard> [--ring <name>]
+```
+
+| Argument / Option | Description |
+|-------------------|-------------|
+| `<shard>` | Shard ID (UUID) to configure |
+| `--ring <name>` | Assign the shard to a placement ring |
+
+**Example:**
+
+```bash
+siloctl shard configure a1b2c3d4-e5f6-7890-abcd-ef1234567890 --ring "us-east"
+```
+
+```
+Shard a1b2c3d4-e5f6-7890-abcd-ef1234567890 configured: ring=us-east
+```
+
+<Aside type="note">
+Changing a shard's placement ring may cause it to move to a different node if the current owner is not a member of the new ring. See [Data Layout — Placement Rings](/guides/data-layout#placement-rings) for details.
+</Aside>
+
+---
+
 ### validate-config
 
 Validate a Silo configuration file without starting the server. This is useful for checking configuration syntax and semantics before deployment.

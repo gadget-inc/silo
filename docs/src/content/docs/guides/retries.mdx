@@ -1,0 +1,136 @@
+---
+title: Retry Policies
+description: Configuring automatic retries with exponential backoff and jitter
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+By default, Silo does **not** retry failed jobs. A job without a retry policy that fails is immediately marked as `Failed`. To enable automatic retries, attach a `retryPolicy` when enqueueing a job.
+
+## Configuring a Retry Policy
+
+```typescript
+const handle = await client.enqueue({
+  payload: { task: "send-webhook" },
+  taskGroup: "webhooks",
+  retryPolicy: {
+    retryCount: 5,                  // retry up to 5 times after the initial failure
+    initialIntervalMs: 1000n,       // first retry after 1 second
+    maxIntervalMs: 60000n,          // cap backoff at 60 seconds
+    backoffFactor: 2.0,             // double the interval each retry
+    randomizeInterval: true,        // add jitter to prevent thundering herd
+  },
+});
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `retryCount` | `number` | — | Maximum number of retries after the initial attempt fails. Required. |
+| `initialIntervalMs` | `bigint` | `1000n` | Delay before the first retry, in milliseconds. |
+| `maxIntervalMs` | `bigint` | — | Upper bound on the backoff interval. If not set, backoff grows without limit. |
+| `backoffFactor` | `number` | `2.0` | Multiplier applied to the interval after each failure. |
+| `randomizeInterval` | `boolean` | `false` | When true, adds jitter to the computed interval. |
+
+## Exponential Backoff
+
+The retry delay for attempt `n` (0-indexed from the first retry) is computed as:
+
+```
+delay = initialIntervalMs * backoffFactor ^ n
+```
+
+If `maxIntervalMs` is set, the delay is capped at that value.
+
+**Example timeline** with `initialIntervalMs: 1000n`, `backoffFactor: 2.0`, `maxIntervalMs: 30000n`, `retryCount: 5`:
+
+| Failure # | Computed delay | Capped delay | Cumulative wait |
+|-----------|---------------|--------------|-----------------|
+| 1 | 1,000 ms | 1,000 ms | 1 s |
+| 2 | 2,000 ms | 2,000 ms | 3 s |
+| 3 | 4,000 ms | 4,000 ms | 7 s |
+| 4 | 8,000 ms | 8,000 ms | 15 s |
+| 5 | 16,000 ms | 16,000 ms | 31 s |
+
+After the 5th retry fails, the job is marked as `Failed` with no further retries.
+
+## Jitter
+
+When `randomizeInterval` is `true`, Silo multiplies the computed delay by a factor in the range `[1.0, 2.0)`. The jitter is deterministic — it's derived from the failure timestamp and attempt count, so the same failure always produces the same jitter. This prevents thundering herd problems when many jobs fail at the same time, while keeping retry timing predictable for debugging.
+
+## Attempt Numbering
+
+Each job tracks two attempt counters:
+
+- **`attemptNumber`** (absolute): Starts at 1 and increments with every attempt across the entire lifetime of the job. Never resets.
+- **`relativeAttemptNumber`**: Starts at 1 and increments with each attempt. Resets to 1 when the job is restarted.
+
+Retry exhaustion is based on `relativeAttemptNumber`. A job with `retryCount: 3` will fail after the `relativeAttemptNumber` exceeds 3 retries (4 total attempts in that run).
+
+```typescript
+handler: async (task) => {
+  console.log(`Attempt ${task.attemptNumber}`);           // absolute, never resets
+  console.log(`Relative attempt ${task.relativeAttemptNumber}`); // resets on restart
+  console.log(`Last attempt? ${task.isLastAttempt}`);     // true if retries exhausted next
+};
+```
+
+<Aside type="tip">
+The `isLastAttempt` flag is `true` when the current attempt is the last one before the retry policy is exhausted. Use this to trigger alerting or fallback behavior on the final attempt.
+</Aside>
+
+## Interaction with Restart
+
+[Restarting](/guides/cancel-restart-delete#restarting-jobs) a failed or cancelled job resets `relativeAttemptNumber` to 1, giving the job a fresh set of retries. However, `attemptNumber` continues incrementing from where it left off.
+
+For example, a job with `retryCount: 2` that fails all attempts, then gets restarted:
+
+| Event | `attemptNumber` | `relativeAttemptNumber` |
+|-------|-----------------|------------------------|
+| Initial attempt | 1 | 1 |
+| Retry 1 | 2 | 2 |
+| Retry 2 | 3 | 3 |
+| Job fails (retries exhausted) | — | — |
+| Restart → new attempt | 4 | 1 |
+| Retry 1 | 5 | 2 |
+| Retry 2 | 6 | 3 |
+
+## Interaction with Expedite
+
+[Expediting](/guides/cancel-restart-delete#expediting-jobs) a job that's waiting for its retry backoff moves it to run immediately. It does not change the retry count or attempt numbers — it simply skips the remaining backoff delay.
+
+```bash
+# Job is scheduled to retry in 30 seconds — run it now instead
+siloctl job expedite 0 my-job-id
+```
+
+## Concurrency Ticket Release During Backoff
+
+When a job fails and enters retry backoff, Silo releases any concurrency tickets the job was holding. This allows other jobs to use those concurrency slots while the failed job waits. When the retry fires, the job re-enters the concurrency queue and acquires a fresh ticket before executing.
+
+## Rate Limit Retry Policy
+
+Rate limits configured via [Gubernator](/guides/concurrency-limits) have their own separate retry policy, independent of the job's retry policy. When a rate limit check fails (the rate limit is exhausted), the job retries the rate limit check according to this policy:
+
+```typescript
+limits: [
+  {
+    type: "rateLimit",
+    name: "api-limit",
+    uniqueKey: "user:123",
+    limit: 100n,
+    durationMs: 60000n,
+    retryPolicy: {
+      initialBackoffMs: 100n,
+      maxBackoffMs: 5000n,
+      backoffMultiplier: 2.0,
+      maxRetries: 0,  // 0 means retry until the rate limit window resets
+    },
+  },
+],
+```
+
+When `maxRetries` is `0`, the job will keep retrying the rate limit check until the rate limit window resets and capacity is available. This is generally what you want — the job waits for the rate limit to open rather than failing permanently.
+
+<Aside type="note">
+The rate limit retry policy only controls retries for the rate limit check itself. If the job's handler fails after passing the rate limit, the job's own `retryPolicy` governs those retries.
+</Aside>

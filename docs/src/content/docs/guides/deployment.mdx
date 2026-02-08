@@ -2,6 +2,8 @@
 title: Deployment
 ---
 
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
 To use Silo for job execution, you must set up two things:
 
 - the Silo server, which will store your jobs and broker tasks
@@ -11,37 +13,230 @@ Your worker instances will poll the Silo server for new tasks to run, run them l
 
 If you want to run multiple Silo instances in a cluster to spread out your load, you must also configure a cluster membership system for Silo. Currently, etcd and Kubernetes API based cluster membership providers are available.
 
-## Object storage vs local disk
+## Object Storage vs Local Disk
 
 Silo's main thing is storing job data in object storage, which avoids the need for stateful compute nodes. Everything gets easier as an operator when you can treat a service like cattle instead of pets, and Silo intends to be cattle.
 
-Object storage has some drawbacks, however -- you must accept either high costs and low latency, or low costs and high latency.
+Object storage has some drawbacks, however — you must accept either high costs and low latency, or low costs and high latency.
 
-## Shard count
+## Shard Count
 
-### Impact of shard count on costs
+The initial shard count is configured when the cluster is first created:
 
-TODO -- more shards means fewer writes per shard
+```toml
+[coordination]
+initial_shard_count = 8
+```
 
-### Impact of shard count on throughput
+Choosing the right shard count involves balancing cost and throughput. You can always split shards later, but you cannot merge them.
 
-TODO -- more shards means more throughput, but too much per shard overhead, extra object storage writes / compaction overhead
+### Impact of Shard Count on Costs
 
-### Tenants need to be small enough to fit in one shard and not create hotspots
+Each shard is an independent SlateDB instance with its own WAL, SSTs, compaction, and garbage collection. More shards means:
 
+- **More object storage operations**: Each shard flushes its WAL and writes SSTs independently. With 8 shards on one node, you get 8x the object storage write operations compared to 1 shard (though each write is smaller).
+- **More compaction overhead**: Each shard runs its own compactor, producing more small SST files that get merged over time.
+- **Less data per shard**: Fewer writes per shard means smaller SSTs and less total data to compact, which can actually reduce per-shard costs.
 
-### Using local disk for WAL
+The net effect depends on your workload. For low-throughput systems, fewer shards (4-8) minimize fixed overhead. For high-throughput systems, the per-shard overhead is amortized by the volume of useful work.
 
-TODO
+### Impact of Shard Count on Throughput
 
-### Using local disk for object storage cache
+Each shard processes requests serially for a given tenant (transactions are per-shard). More shards means:
 
-TODO
+- **More parallelism**: Operations on different shards run concurrently, even on the same node. A 16-shard cluster can process 16 independent tenant operations in parallel.
+- **Better distribution**: More shards gives finer-grained load balancing across nodes when the cluster scales.
+- **Per-shard overhead**: Each shard has fixed overhead for compaction, lease maintenance, and background tasks. Very high shard counts (hundreds) on a single node can saturate CPU.
 
-## Using etcd for cluster membership
+A good starting point is **2-4 shards per node**. For example, 8 shards across 2-4 nodes.
 
-TODO
+### Tenant Sizing
 
-## Using Kubernetes for cluster membership
+All of a tenant's data lives on a single shard. If one tenant generates disproportionate load, it can create a hotspot on that shard. When this happens:
 
-TODO
+1. [Split the shard](/guides/data-layout#shard-splitting) so the hot tenant gets its own shard
+2. The hot tenant's shard can then be isolated on a dedicated node if needed
+
+<Aside type="caution">
+Tenant data cannot span multiple shards. Design your tenant IDs so that load is distributed across tenants. If you have a single dominant tenant, plan to split its shard early.
+</Aside>
+
+## Using Local Disk for WAL
+
+SlateDB uses a two-tier storage model: a write-ahead log (WAL) for durability and SST files for long-term storage. By default, both the WAL and SSTs are written to object storage. You can optionally place the WAL on local disk for lower write latency.
+
+```toml
+[database]
+backend = "gcs"
+path = "gs://my-bucket/silo/%shard%"
+
+[database.wal]
+backend = "fs"
+path = "/var/lib/silo/wal/%shard%"
+```
+
+**How it works:**
+
+1. Writes go to the in-memory memtable and the local WAL on disk
+2. Periodically, the memtable is flushed to SST files in object storage
+3. On graceful shard close (e.g., shard moves to another node), the memtable is flushed to object storage and the local WAL directory is deleted
+
+**Pros:**
+- Significantly lower write latency (local disk vs. object storage round-trip)
+- Reduced object storage write costs for WAL operations
+
+**Cons:**
+- Local WAL data is not replicated. If a node crashes before the memtable is flushed, the unflushed WAL entries are lost.
+- Requires local disk provisioning on each node
+
+<Aside type="note">
+The window of potential data loss on a crash is small — typically the last few hundred milliseconds of writes. For most workloads, this is an acceptable trade-off for the latency improvement. See [Guarantees](/guides/guarantees#data-durability) for more detail.
+</Aside>
+
+## Using Local Disk for Object Storage Cache
+
+SlateDB supports a block cache that can cache frequently-read data on local disk to reduce read latency and object storage GET costs. Silo does not yet expose cache-on-disk configuration, but this is a SlateDB feature that may be made available in a future release.
+
+## Using etcd for Cluster Membership
+
+etcd is the simplest way to run a multi-node Silo cluster. Silo uses etcd to track cluster membership, store the shard map, and coordinate shard ownership.
+
+### What Silo Stores in etcd
+
+| Resource | Key Pattern | Purpose |
+|----------|-------------|---------|
+| Member leases | `{prefix}/members/{node_id}` | Node membership with TTL-based liveness |
+| Shard map | `{prefix}/shard-map` | Authoritative shard-to-range mapping |
+| Shard locks | `{prefix}/shards/{shard_id}` | Distributed locks for shard ownership |
+
+### Requirements
+
+- An etcd cluster (v3.5+) accessible from all Silo nodes
+- Network connectivity between Silo nodes and etcd
+- No special RBAC — Silo uses standard key-value operations and leases
+
+### Configuration
+
+```toml
+[coordination]
+backend = "etcd"
+cluster_prefix = "silo-prod"
+lease_ttl_secs = 10
+initial_shard_count = 8
+etcd_endpoints = ["http://etcd-0:2379", "http://etcd-1:2379", "http://etcd-2:2379"]
+```
+
+| Field | Description |
+|-------|-------------|
+| `backend` | Set to `"etcd"` |
+| `cluster_prefix` | Namespace prefix for all etcd keys. Use different prefixes for separate clusters sharing the same etcd. |
+| `lease_ttl_secs` | TTL for membership and shard leases. If a node doesn't renew within this time, it's considered dead. Default: `10`. |
+| `initial_shard_count` | Number of shards to create when the cluster is first initialized. |
+| `etcd_endpoints` | List of etcd endpoints. Defaults to `["http://127.0.0.1:2379"]`. |
+
+**Full example** (from a two-node development setup):
+
+```toml
+[server]
+grpc_addr = "0.0.0.0:50051"
+
+[coordination]
+backend = "etcd"
+cluster_prefix = "silo-dev"
+lease_ttl_secs = 10
+initial_shard_count = 8
+etcd_endpoints = ["http://127.0.0.1:2379"]
+
+[database]
+backend = "fs"
+path = "./data/silo/%shard%"
+```
+
+## Using Kubernetes for Cluster Membership
+
+In Kubernetes environments, Silo can use the Kubernetes API directly for cluster coordination instead of requiring a separate etcd deployment.
+
+### What Silo Creates in Kubernetes
+
+| Resource | Name Pattern | Purpose |
+|----------|-------------|---------|
+| Lease | `{prefix}-member-{node_id}` | Node membership with lease-based liveness |
+| Lease | `{prefix}-shard-{shard_id}` | Shard ownership via `holderIdentity` |
+| ConfigMap | `{prefix}-shard-map` | Authoritative shard-to-range mapping |
+
+All resources are created in the configured namespace and labeled with `silo.dev/cluster={prefix}` for easy identification.
+
+### RBAC Requirements
+
+Silo needs permission to manage Leases and ConfigMaps in its namespace. Create a Role and RoleBinding for the Silo service account:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: silo-coordination
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: silo-coordination
+subjects:
+  - kind: ServiceAccount
+    name: silo
+roleRef:
+  kind: Role
+  name: silo-coordination
+  apiGroup: rbac.authorization.k8s.io
+```
+
+### Configuration
+
+The `advertised_grpc_addr` field is critical in Kubernetes. It must be set to the pod's IP so other nodes can reach this node directly. Use the Kubernetes Downward API to inject the pod IP:
+
+```yaml
+env:
+  - name: POD_IP
+    valueFrom:
+      fieldRef:
+        fieldPath: status.podIP
+```
+
+```toml
+[server]
+grpc_addr = "0.0.0.0:50051"
+
+[coordination]
+backend = "k8s"
+cluster_prefix = "silo-prod"
+lease_ttl_secs = 15
+initial_shard_count = 8
+k8s_namespace = "default"
+advertised_grpc_addr = "${POD_IP}:50051"
+
+[database]
+backend = "gcs"
+path = "gs://my-bucket/silo/%shard%"
+
+[database.wal]
+backend = "fs"
+path = "/var/lib/silo/wal/%shard%"
+```
+
+| Field | Description |
+|-------|-------------|
+| `backend` | Set to `"k8s"` |
+| `cluster_prefix` | Prefix for all K8s resource names. |
+| `lease_ttl_secs` | TTL for membership and shard leases. Default: `10`. |
+| `k8s_namespace` | Kubernetes namespace for coordination resources. Default: `"default"`. |
+| `advertised_grpc_addr` | Address other nodes use to reach this node. Must be the pod IP in K8s. Supports `${VAR}` environment variable substitution. |
+
+<Aside type="tip">
+If `advertised_grpc_addr` is not set, Silo falls back to `grpc_addr`. In Kubernetes, `grpc_addr` is typically `0.0.0.0:50051` (bind all interfaces), which isn't routable from other pods. Always set `advertised_grpc_addr` to `${POD_IP}:50051`.
+</Aside>

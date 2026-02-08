@@ -1,0 +1,187 @@
+---
+title: Data Layout
+description: Multitenancy, sharding, and shard splitting
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Silo partitions job data across shards, which are independent SlateDB database instances backed by object storage. This guide covers how tenants map to shards, how shards are routed and split, and how placement rings provide geographic or logical isolation.
+
+## Multitenancy
+
+A **tenant** is Silo's unit of data isolation. All of a tenant's jobs, metadata, and indexes live on a single shard, which means per-tenant operations are fast and transactional.
+
+### Single-Tenant Mode
+
+When tenancy is disabled (the default), Silo uses a synthetic tenant ID of `"-"` for all jobs. You don't need to provide a tenant ID when enqueueing or querying.
+
+### Multi-Tenant Mode
+
+When tenancy is enabled in the server configuration, every API call must include a tenant ID:
+
+```toml
+[tenancy]
+enabled = true
+```
+
+```typescript
+await client.enqueue({
+  payload: { task: "process" },
+  taskGroup: "default",
+  tenant: "customer-123",
+});
+```
+
+Tenant IDs must be:
+- Between 1 and 64 characters
+- Valid UTF-8 strings
+
+<Aside type="note">
+A single tenant's data cannot be split across multiple shards. If a tenant grows too large for one shard, you should split the shard so that the hot tenant gets a shard to itself. Silo does not automatically split tenants across shards.
+</Aside>
+
+### What Tenancy Provides
+
+- **Data isolation**: Each tenant's data is stored with its tenant ID as a key prefix. Queries and operations are scoped to a tenant.
+- **Per-tenant scaling**: Because tenants map to shards, you can isolate hot tenants onto their own shards via splitting.
+- **Per-tenant limits**: Concurrency and rate limits can be scoped per tenant using the limit key.
+
+## Sharding
+
+Silo uses **range-based partitioning** to assign tenants to shards. The tenant ID keyspace is divided into contiguous, non-overlapping lexicographic ranges, and each range is owned by one shard.
+
+### How Tenants Map to Shards
+
+Each shard owns a range `[start, end)` of tenant IDs. When a request arrives, Silo performs a binary search on the sorted shard ranges to find which shard owns that tenant ID.
+
+For example, with 4 shards the ranges might be:
+
+| Shard | Range Start | Range End |
+|-------|------------|-----------|
+| Shard A | (unbounded) | `"4"` |
+| Shard B | `"4"` | `"8"` |
+| Shard C | `"8"` | `"c"` |
+| Shard D | `"c"` | (unbounded) |
+
+A tenant ID of `"customer-123"` falls in Shard D (because `"c" ≤ "customer-123"`).
+
+### Initial Shard Layout
+
+When a cluster is first created, Silo divides the keyspace evenly using hex boundaries:
+
+- **Up to 16 shards**: Single hex digit boundaries (`"2"`, `"4"`, `"6"`, `"8"`, `"a"`, `"c"`, `"e"`)
+- **Up to 256 shards**: Two hex digit boundaries (`"02"`, `"04"`, ..., `"fe"`)
+- **More than 256 shards**: Four hex digit boundaries
+
+The initial shard count is configured in the coordination settings:
+
+```toml
+[coordination]
+initial_shard_count = 8
+```
+
+### Shard Identity
+
+Each shard has a UUID that persists across restarts and node changes. This UUID is used in storage paths (via the `%shard%` pattern) and coordination keys. When a shard is split, the parent UUID is retired and two new UUIDs are created for the children.
+
+## Shard Routing
+
+In a cluster, shards are distributed across nodes. When a request arrives at a node that doesn't own the target shard, the node returns a **redirect** with the address of the owning node. The client automatically retries the request against the correct node.
+
+This means clients can connect to any node in the cluster — they'll be redirected to the right place. The TypeScript client caches the cluster topology to minimize redirects:
+
+```typescript
+const client = new SiloGRPCClient({
+  servers: ["node1:50051", "node2:50051"],
+  shardRouting: {
+    numShards: 16,
+    topologyRefreshIntervalMs: 60000,
+  },
+});
+
+// Fetch the current shard map so requests go directly to the right node
+await client.refreshTopology();
+```
+
+## Shard Splitting
+
+When a shard becomes a bottleneck — because it has too many tenants, a single hot tenant, or too much data — you can split it into two smaller shards.
+
+### Manual Split
+
+Split at a specific tenant ID boundary:
+
+```bash
+siloctl shard split <shard-id> --at "customer-m"
+```
+
+This creates two child shards: one owning `[original_start, "customer-m")` and the other owning `["customer-m", original_end)`.
+
+### Automatic Split
+
+Let Silo choose the midpoint:
+
+```bash
+siloctl shard split <shard-id> --auto
+```
+
+The `--auto` flag computes the lexicographic midpoint of the shard's range and splits there.
+
+### The Split Protocol
+
+Splitting follows a phased protocol:
+
+1. **Requested**: The split is initiated and recorded.
+2. **Pausing**: Traffic to the parent shard is paused. The shard returns `UNAVAILABLE` errors, and clients retry with backoff.
+3. **Cloning**: The parent's SlateDB database is cloned to create two child databases. The shard map is atomically updated to replace the parent with the children. This atomic update is the **commit point**.
+4. **Complete**: The child shards are opened and begin serving traffic. Background cleanup removes data outside each child's range.
+
+<Aside type="caution">
+During the Pausing and Cloning phases (typically a few seconds), requests to tenants on the splitting shard will receive `UNAVAILABLE` errors. The Silo client retries these automatically. Plan splits during low-traffic periods if possible.
+</Aside>
+
+### Monitoring a Split
+
+Check the status of an in-progress split:
+
+```bash
+siloctl shard split-status <shard-id>
+```
+
+Or wait for completion:
+
+```bash
+siloctl shard split <shard-id> --auto --wait
+```
+
+### Crash Recovery
+
+The split protocol is crash-safe:
+
+- **Before the commit point** (shard map update): The split is abandoned on restart. The parent shard continues serving normally.
+- **After the commit point**: The children exist in the shard map. On restart, nodes open the children and complete any remaining cleanup.
+
+There is no rollback — the protocol only moves forward.
+
+## Placement Rings
+
+Placement rings let you control which nodes can own which shards. This is useful for geographic isolation (keeping certain tenants' data in a specific region) or logical isolation (dedicating nodes to high-priority workloads).
+
+Each shard can be assigned to a placement ring:
+
+```bash
+siloctl shard configure <shard-id> --ring "us-east"
+```
+
+Nodes advertise which rings they belong to in the coordination config:
+
+```toml
+[coordination]
+placement_rings = ["us-east"]
+```
+
+Shard ownership assignment (via rendezvous hashing) only considers nodes that are members of the shard's ring. Shards with no ring assigned can be owned by any node.
+
+<Aside type="tip">
+After splitting a shard, you can assign the children to different rings to move specific tenants to specific regions.
+</Aside>

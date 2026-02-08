@@ -1,0 +1,132 @@
+---
+title: Guarantees
+description: Execution semantics, durability, and consistency guarantees
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+This guide covers the guarantees Silo provides around job execution, data durability, and cluster consistency.
+
+## At-Least-Once Execution
+
+Silo guarantees that every job runs **at least once** (unless cancelled). If a worker crashes, the network partitions, or any other failure occurs, the job will eventually be retried. This means workers may see the same job more than once.
+
+<Aside type="caution">
+Workers must be idempotent if they cannot tolerate duplicate execution. Use external deduplication (e.g., unique constraints in your database) or design your operations to be safe when repeated.
+</Aside>
+
+There is no exactly-once execution guarantee. Specifically, a worker can complete a job successfully but fail to report the result back to Silo (due to a crash or network issue). In this case, Silo will treat the job as if the worker crashed and retry it.
+
+## Lease Mechanism
+
+When a worker dequeues a task, Silo creates a **lease** with a 10-second expiration. The worker must either complete the task or heartbeat before the lease expires.
+
+**Lease lifecycle:**
+
+1. Worker dequeues a task → Silo creates a lease expiring in 10 seconds
+2. Worker heartbeats periodically → Silo extends the lease by another 10 seconds
+3. Worker reports success or failure → Silo deletes the lease
+4. If the worker stops heartbeating → the lease expires and the task is requeued
+
+The heartbeat response also carries cancellation status. If a job is cancelled while a worker is processing it, the worker discovers this on its next heartbeat.
+
+### What Happens When a Worker Crashes
+
+When a worker crashes or becomes unreachable:
+
+1. The worker stops sending heartbeats
+2. The lease expires within 10 seconds
+3. Silo's lease reaper detects the expired lease
+4. The job is re-enqueued as if it failed with a `WORKER_CRASHED` error
+5. If the job has a retry policy, it is retried; otherwise it is marked as `Failed`
+
+### What Happens When a Worker Succeeds but Doesn't Report
+
+If a worker completes a job successfully but crashes before reporting the result:
+
+1. The lease expires (same as a crash)
+2. The job is retried — Silo cannot distinguish this from a true crash
+3. This is why at-least-once semantics require worker idempotency
+
+## Data Durability
+
+Silo's durability depends on the storage configuration. There are two modes.
+
+### Pure Object Storage (Default)
+
+Writes flow through: **memtable → WAL in object storage → SSTs in object storage**.
+
+Data is durable once the WAL entry is written to object storage. This is the safest configuration — surviving node failures, disk failures, and restarts without data loss. The trade-off is higher write latency, since every write must round-trip to object storage.
+
+### Object Storage + Local WAL
+
+Writes flow through: **memtable → local WAL on disk → SSTs in object storage**.
+
+```toml
+[database]
+backend = "gcs"
+path = "gs://my-bucket/silo/%shard%"
+
+[database.wal]
+backend = "fs"
+path = "/var/lib/silo/wal/%shard%"
+```
+
+The local WAL gives significantly lower write latency because WAL writes go to local disk instead of object storage. However, local WAL data is **not replicated**. If a node dies before its memtable is flushed to SSTs in object storage, unflushed WAL entries are lost.
+
+On graceful shard close (e.g., when a shard moves to another node), Silo flushes the memtable to object storage and deletes the local WAL directory. Data loss only occurs on ungraceful node death with unflushed data.
+
+<Aside type="note">
+Choose pure object storage WAL for maximum durability at higher latency. Choose local WAL for lower latency when you can tolerate rare data loss on node crashes. In practice, the window of potential loss is small — typically the last few hundred milliseconds of writes before a crash.
+</Aside>
+
+### Object Storage Cache
+
+SlateDB supports a block cache for caching frequently-read data on local disk. Silo does not yet expose cache-on-disk configuration, but this is a SlateDB feature that may be made configurable in the future.
+
+## Cluster Coordination
+
+In a multi-node deployment, Silo uses a coordinator (etcd or Kubernetes) to manage shard ownership.
+
+### Shard Ownership
+
+Each shard is owned by exactly one node at a time. Ownership is enforced through distributed leases:
+
+- **etcd**: Each shard has an etcd lock. The node holding the lock owns the shard.
+- **Kubernetes**: Each shard has a K8s Lease object. The node named in `holderIdentity` owns the shard.
+
+Nodes renew their leases periodically. If a node fails to renew (crash, network partition), the lease expires and other nodes can claim the shard.
+
+### Split-Brain Prevention
+
+Shard leases use compare-and-swap (CAS) semantics for renewal. A node must prove it is still the current holder before extending the lease. If another node has taken ownership (e.g., because the lease expired during a network partition), the CAS fails and the original node releases the shard.
+
+### Membership
+
+Nodes register themselves with the coordinator on startup and maintain a membership lease. If a node's membership lease expires:
+
+1. Other nodes detect the removal
+2. The coordinator reassigns the lost node's shards using rendezvous hashing
+3. Surviving nodes claim and open the orphaned shards
+
+Before reconciling shard ownership, each node verifies it is still in the member list. This prevents a node with an expired membership from incorrectly releasing all its shards.
+
+## Shard Split Safety
+
+[Shard splitting](/guides/data-layout#shard-splitting) is designed to maintain consistency even through crashes.
+
+### During a Split
+
+1. **Traffic paused**: The parent shard returns `UNAVAILABLE` errors during the split. Clients automatically retry with backoff.
+2. **Clone**: Silo clones the parent's SlateDB database to create two child shards.
+3. **Commit point**: The shard map is atomically updated to replace the parent with the two children. This is the point of no return.
+4. **Activate children**: Nodes compute ownership of the new shards and open them.
+
+### Crash Recovery
+
+Splits are designed to be crash-safe:
+
+- **Crash before commit point**: The shard map still contains the parent. On restart, the incomplete clone is abandoned. The parent continues operating normally.
+- **Crash after commit point**: The shard map contains the children. On restart, nodes open the child shards. Any remaining cleanup (like deleting data outside each child's range) is completed.
+
+The split protocol only moves forward — there is no rollback. The atomic shard map update is the single commit point that determines whether the split happened.
