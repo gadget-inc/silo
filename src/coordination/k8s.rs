@@ -1757,16 +1757,28 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                                             shard_id = %self.shard_id,
                                             "shutdown requested during shard open, releasing lease"
                                         );
-                                        // Close the shard we just opened
-                                        if let Err(e) = factory.close(&self.shard_id).await {
-                                            tracing::error!(
-                                                shard_id = %self.shard_id,
-                                                error = %e,
-                                                "failed to close shard after shutdown during acquisition"
-                                            );
+                                        // Close the shard we just opened - only release lease if close succeeds
+                                        match factory.close(&self.shard_id).await {
+                                            Ok(()) => {
+                                                dst_events::emit(DstEvent::ShardClosed {
+                                                    node_id: self.node_id.clone(),
+                                                    shard_id: self.shard_id.to_string(),
+                                                });
+                                                // Release the lease
+                                                let _ = self.release_lease_cas(&lease_name).await;
+                                            }
+                                            Err(e) => {
+                                                // Close failed - do NOT release the lease.
+                                                // This mimics crash behavior: the permanent lease
+                                                // stays held until operator force-release, preventing
+                                                // another node from acquiring unflushed data.
+                                                tracing::error!(
+                                                    shard_id = %self.shard_id,
+                                                    error = %e,
+                                                    "failed to close shard after shutdown during acquisition, keeping lease to prevent data loss"
+                                                );
+                                            }
                                         }
-                                        // Release the lease
-                                        let _ = self.release_lease_cas(&lease_name).await;
                                         break;
                                     }
                                 }
@@ -1842,53 +1854,68 @@ impl<B: K8sBackend> K8sShardGuard<B> {
 
                     if !cancelled {
                         // Close the shard before releasing the lease
-                        if let Err(e) = factory.close(&self.shard_id).await {
-                            tracing::error!(shard_id = %self.shard_id, error = %e, "failed to close shard before releasing lease");
-                        }
+                        match factory.close(&self.shard_id).await {
+                            Ok(()) => {
+                                dst_events::emit(DstEvent::ShardClosed {
+                                    node_id: self.node_id.clone(),
+                                    shard_id: self.shard_id.to_string(),
+                                });
 
-                        // Release the lease by clearing holderIdentity with CAS
-                        let has_rv = {
-                            let st = self.state.lock().await;
-                            st.resource_version.is_some()
-                        };
+                                // Release the lease by clearing holderIdentity with CAS
+                                let has_rv = {
+                                    let st = self.state.lock().await;
+                                    st.resource_version.is_some()
+                                };
 
-                        if has_rv {
-                            let release_timeout = Duration::from_secs(5);
-                            match tokio::time::timeout(
-                                release_timeout,
-                                self.release_lease_cas(&lease_name),
-                            )
-                            .await
-                            {
-                                Ok(Ok(_)) => {
-                                    debug!(
-                                        shard_id = %self.shard_id,
-                                        "k8s shard: released with CAS"
-                                    );
+                                if has_rv {
+                                    let release_timeout = Duration::from_secs(5);
+                                    match tokio::time::timeout(
+                                        release_timeout,
+                                        self.release_lease_cas(&lease_name),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(_)) => {
+                                            debug!(
+                                                shard_id = %self.shard_id,
+                                                "k8s shard: released with CAS"
+                                            );
+                                        }
+                                        Ok(Err(e)) => {
+                                            // This is okay - we may have already lost the lease
+                                            debug!(shard_id = %self.shard_id, error = %e, "k8s shard: release CAS failed (may have lost lease)");
+                                        }
+                                        Err(_) => {
+                                            warn!(shard_id = %self.shard_id, "timed out releasing shard lease (K8s API may be slow)");
+                                        }
+                                    }
                                 }
-                                Ok(Err(e)) => {
-                                    // This is okay - we may have already lost the lease
-                                    debug!(shard_id = %self.shard_id, error = %e, "k8s shard: release CAS failed (may have lost lease)");
+
+                                {
+                                    let mut st = self.state.lock().await;
+                                    st.resource_version = None;
+                                    st.lease_uid = None;
+                                    st.phase = ShardPhase::Idle;
                                 }
-                                Err(_) => {
-                                    warn!(shard_id = %self.shard_id, "timed out releasing shard lease (K8s API may be slow)");
-                                }
+                                let mut owned = owned_arc.lock().await;
+                                owned.remove(&self.shard_id);
+                                dst_events::emit(DstEvent::ShardReleased {
+                                    node_id: self.node_id.clone(),
+                                    shard_id: self.shard_id.to_string(),
+                                });
+                                debug!(shard_id = %self.shard_id, "k8s shard: released");
+                            }
+                            Err(e) => {
+                                // Close failed - revert to Held so reconciliation retries
+                                tracing::error!(
+                                    shard_id = %self.shard_id,
+                                    error = %e,
+                                    "failed to close shard, reverting to Held to prevent data loss"
+                                );
+                                let mut st = self.state.lock().await;
+                                st.phase = ShardPhase::Held;
                             }
                         }
-
-                        {
-                            let mut st = self.state.lock().await;
-                            st.resource_version = None;
-                            st.lease_uid = None;
-                            st.phase = ShardPhase::Idle;
-                        }
-                        let mut owned = owned_arc.lock().await;
-                        owned.remove(&self.shard_id);
-                        dst_events::emit(DstEvent::ShardReleased {
-                            node_id: self.node_id.clone(),
-                            shard_id: self.shard_id.to_string(),
-                        });
-                        debug!(shard_id = %self.shard_id, "k8s shard: released");
                     }
                 }
                 ShardPhase::ShuttingDown => {
@@ -1897,47 +1924,71 @@ impl<B: K8sBackend> K8sShardGuard<B> {
 
                     // Close the shard before releasing the lease
                     tracing::trace!(shard_id = %self.shard_id, "guard calling factory.close");
-                    if let Err(e) = factory.close(&self.shard_id).await {
-                        tracing::error!(shard_id = %self.shard_id, error = %e, "failed to close shard during shutdown");
-                    }
-                    tracing::trace!(shard_id = %self.shard_id, "guard factory.close completed");
-
-                    // Release our lease if we hold it
-                    let has_rv = {
-                        let st = self.state.lock().await;
-                        st.resource_version.is_some()
+                    let close_succeeded = match factory.close(&self.shard_id).await {
+                        Ok(()) => {
+                            dst_events::emit(DstEvent::ShardClosed {
+                                node_id: self.node_id.clone(),
+                                shard_id: self.shard_id.to_string(),
+                            });
+                            true
+                        }
+                        Err(e) => {
+                            // Close failed - do NOT release the lease.
+                            // This mimics crash behavior: the permanent lease stays held
+                            // until operator force-release, preventing another node from
+                            // acquiring unflushed data.
+                            tracing::error!(
+                                shard_id = %self.shard_id,
+                                error = %e,
+                                "failed to close shard during shutdown, keeping lease to prevent data loss"
+                            );
+                            false
+                        }
                     };
+                    tracing::trace!(shard_id = %self.shard_id, close_succeeded, "guard factory.close completed");
 
-                    if has_rv {
-                        tracing::trace!(shard_id = %self.shard_id, "guard releasing lease");
-                        let release_timeout = Duration::from_secs(5);
-                        match tokio::time::timeout(
-                            release_timeout,
-                            self.release_lease_cas(&lease_name),
-                        )
-                        .await
-                        {
-                            Ok(_) => {
-                                tracing::trace!(shard_id = %self.shard_id, "guard lease released");
-                            }
-                            Err(_) => {
-                                warn!(shard_id = %self.shard_id, "timed out releasing shard lease during shutdown");
+                    if close_succeeded {
+                        // Release our lease if we hold it
+                        let has_rv = {
+                            let st = self.state.lock().await;
+                            st.resource_version.is_some()
+                        };
+
+                        if has_rv {
+                            tracing::trace!(shard_id = %self.shard_id, "guard releasing lease");
+                            let release_timeout = Duration::from_secs(5);
+                            match tokio::time::timeout(
+                                release_timeout,
+                                self.release_lease_cas(&lease_name),
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    tracing::trace!(shard_id = %self.shard_id, "guard lease released");
+                                }
+                                Err(_) => {
+                                    warn!(shard_id = %self.shard_id, "timed out releasing shard lease during shutdown");
+                                }
                             }
                         }
-                    }
 
-                    {
+                        {
+                            let mut st = self.state.lock().await;
+                            st.resource_version = None;
+                            st.lease_uid = None;
+                            st.phase = ShardPhase::ShutDown;
+                        }
+                        let mut owned = owned_arc.lock().await;
+                        owned.remove(&self.shard_id);
+                        dst_events::emit(DstEvent::ShardReleased {
+                            node_id: self.node_id.clone(),
+                            shard_id: self.shard_id.to_string(),
+                        });
+                    } else {
+                        // Transition to ShutDown but keep the lease held
                         let mut st = self.state.lock().await;
-                        st.resource_version = None;
-                        st.lease_uid = None;
                         st.phase = ShardPhase::ShutDown;
                     }
-                    let mut owned = owned_arc.lock().await;
-                    owned.remove(&self.shard_id);
-                    dst_events::emit(DstEvent::ShardReleased {
-                        node_id: self.node_id.clone(),
-                        shard_id: self.shard_id.to_string(),
-                    });
                     tracing::trace!(shard_id = %self.shard_id, "guard shutdown complete");
                     break;
                 }

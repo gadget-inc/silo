@@ -4911,3 +4911,375 @@ async fn k8s_reclaim_with_different_node_id_returns_empty() {
     cb.shutdown().await.unwrap();
     hb.abort();
 }
+
+/// Test that graceful shutdown clears the holderIdentity on K8s shard Lease objects,
+/// allowing other nodes to immediately acquire them without force-release.
+/// This is critical for permanent shard leases: graceful shutdown must release leases
+/// even though crashes intentionally leave them held.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_graceful_shutdown_clears_lease_holder_identity() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 4;
+    let node_id = "shutdown-lease-k8s";
+
+    // Start coordinator and let it acquire all shards
+    let factory = make_test_factory(node_id);
+    let (c1, h1) = K8sCoordinator::start(
+        make_coordinator_config(
+            &namespace,
+            &prefix,
+            node_id,
+            "http://127.0.0.1:50051",
+            num_shards,
+            10,
+        ),
+        factory,
+    )
+    .await
+    .expect("start c1");
+    assert!(
+        c1.wait_converged(Duration::from_secs(15)).await,
+        "coordinator should converge"
+    );
+
+    // Collect the shard IDs
+    let shard_ids: Vec<ShardId> = c1
+        .get_shard_map()
+        .await
+        .unwrap()
+        .shard_ids()
+        .into_iter()
+        .collect();
+    assert_eq!(shard_ids.len(), num_shards as usize);
+
+    // Verify leases have holderIdentity set before shutdown
+    let backend = KubeBackend::try_default().await.unwrap();
+    for shard_id in &shard_ids {
+        let lease_name = silo::coordination::keys::k8s_shard_lease_name(&prefix, shard_id);
+        let lease = backend
+            .get_lease(&namespace, &lease_name)
+            .await
+            .expect("get lease")
+            .expect("lease should exist");
+        let holder = lease.spec.as_ref().and_then(|s| s.holder_identity.as_ref());
+        assert_eq!(
+            holder,
+            Some(&node_id.to_string()),
+            "lease for shard {} should be held by {} before shutdown",
+            shard_id,
+            node_id,
+        );
+    }
+
+    // Graceful shutdown
+    c1.shutdown().await.unwrap();
+    h1.abort();
+
+    // Verify leases have holderIdentity cleared after shutdown
+    for shard_id in &shard_ids {
+        let lease_name = silo::coordination::keys::k8s_shard_lease_name(&prefix, shard_id);
+        let lease = backend
+            .get_lease(&namespace, &lease_name)
+            .await
+            .expect("get lease")
+            .expect("lease should still exist as object");
+        let holder = lease.spec.as_ref().and_then(|s| s.holder_identity.as_ref());
+        assert!(
+            holder.is_none() || holder == Some(&String::new()),
+            "lease for shard {} should have empty holderIdentity after graceful shutdown, but found: {:?}",
+            shard_id,
+            holder,
+        );
+    }
+
+    // Verify a new node can immediately acquire the shards (no force-release needed)
+    let (c2, h2) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "shutdown-lease-k8s-2",
+        "http://127.0.0.1:50052",
+        num_shards
+    );
+    assert!(
+        c2.wait_converged(Duration::from_secs(15)).await,
+        "new coordinator should converge and acquire all shards without force-release"
+    );
+    let c2_owned: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
+    let expected: HashSet<ShardId> = shard_ids.into_iter().collect();
+    assert_eq!(
+        c2_owned, expected,
+        "new coordinator should own all shards after graceful shutdown of first"
+    );
+
+    // Cleanup
+    c2.shutdown().await.unwrap();
+    h2.abort();
+}
+
+/// Helper to create a K8s guard with an externally-provided factory.
+/// This allows tests to know the factory's tmpdir for fault injection (e.g., chmod).
+async fn make_k8s_guard_with_factory(
+    namespace: &str,
+    cluster_prefix: &str,
+    node_id: &str,
+    shard_id: ShardId,
+    factory: Arc<ShardFactory>,
+) -> Result<
+    (
+        Arc<K8sShardGuard<KubeBackend>>,
+        Arc<Mutex<HashSet<ShardId>>>,
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ),
+    String,
+> {
+    let backend = KubeBackend::try_default()
+        .await
+        .map_err(|e| format!("K8S not available: {}", e))?;
+
+    let owned = Arc::new(Mutex::new(HashSet::new()));
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let shard_available = Arc::new(Notify::new());
+
+    let guard = K8sShardGuard::new(
+        shard_id,
+        backend,
+        namespace.to_string(),
+        cluster_prefix.to_string(),
+        node_id.to_string(),
+        10,
+        rx,
+        shard_available,
+    );
+
+    let runner = guard.clone();
+    let owned_arc = owned.clone();
+    let mut shard_map_inner = ShardMap::default();
+    shard_map_inner.add_shard(ShardInfo::new(shard_id, ShardRange::full()));
+    let shard_map = Arc::new(Mutex::new(shard_map_inner));
+    let none_coord = silo::coordination::NoneCoordinator::new(
+        node_id,
+        "http://127.0.0.1:0",
+        1,
+        factory.clone(),
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+    let coordinator: Arc<dyn silo::coordination::Coordinator> = Arc::new(none_coord);
+    let handle = tokio::spawn(async move {
+        runner.run(owned_arc, factory, shard_map, coordinator).await;
+    });
+
+    Ok((guard, owned, tx, handle))
+}
+
+/// Make a directory tree read-only so SlateDB writes fail, simulating a storage failure.
+fn make_dir_tree_readonly(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    // First recurse into subdirectories
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                make_dir_tree_readonly(&entry_path);
+            } else {
+                let _ =
+                    std::fs::set_permissions(&entry_path, std::fs::Permissions::from_mode(0o444));
+            }
+        }
+    }
+    // Make this directory non-writable (but keep execute for traversal)
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555));
+}
+
+/// Restore a directory tree to writable after a test.
+fn restore_dir_tree_writable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    // Restore this directory first so we can traverse it
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                restore_dir_tree_writable(&entry_path);
+            } else {
+                let _ =
+                    std::fs::set_permissions(&entry_path, std::fs::Permissions::from_mode(0o644));
+            }
+        }
+    }
+}
+
+use silo::coordination::ShardPhase;
+
+/// If factory.close() fails during a normal release, the guard should revert to Held
+/// and the lease should remain held in K8s, preventing another node from acquiring it.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_shard_close_failure_keeps_lease() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let shard_id = ShardId::new();
+    let node_id = "close-fail-release";
+
+    let tmpdir = std::env::temp_dir().join(format!("silo-k8s-test-{}", node_id));
+    let mut factory = ShardFactory::new(
+        DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmpdir.join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+            slatedb: None,
+        },
+        MockGubernatorClient::new_arc(),
+        None,
+    );
+    factory.set_close_timeout(Duration::from_secs(3));
+    let factory = Arc::new(factory);
+
+    let (guard, owned, _tx, handle) =
+        match make_k8s_guard_with_factory(&namespace, &prefix, node_id, shard_id, factory).await {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("Skipping K8S close failure test: {}", e);
+                return;
+            }
+        };
+
+    // Acquire the shard
+    guard.set_desired(true).await;
+    let acquired = wait_until(Duration::from_secs(5), || async {
+        guard.is_held().await && owned.lock().await.contains(&shard_id)
+    })
+    .await;
+    assert!(acquired, "guard should acquire lease");
+
+    // Make the shard data directory read-only so close() fails
+    let shard_data_path = tmpdir.join(shard_id.to_string());
+    assert!(
+        shard_data_path.exists(),
+        "shard data dir should exist after acquisition"
+    );
+    make_dir_tree_readonly(&shard_data_path);
+
+    // Trigger release
+    guard.set_desired(false).await;
+    guard.notify.notify_one();
+
+    // Wait for the guard to process the release attempt and revert to Held.
+    // The close timeout is 3s, plus time for the release delay and processing.
+    let reverted = wait_until(Duration::from_secs(10), || async {
+        let st = guard.state.lock().await;
+        st.phase == ShardPhase::Held
+    })
+    .await;
+    assert!(reverted, "guard should revert to Held after close failure");
+
+    // Verify the lease is still held and owned
+    assert!(guard.is_held().await, "lease should still be held");
+    assert!(
+        owned.lock().await.contains(&shard_id),
+        "shard should still be in owned set"
+    );
+
+    // Restore permissions so close can succeed on retry
+    restore_dir_tree_writable(&shard_data_path);
+
+    // Trigger release again - should succeed this time
+    guard.set_desired(false).await;
+    guard.notify.notify_one();
+
+    let released = wait_until(Duration::from_secs(5), || async {
+        !guard.is_held().await && !owned.lock().await.contains(&shard_id)
+    })
+    .await;
+    assert!(released, "guard should release after permissions restored");
+
+    handle.abort();
+    // Clean up tmpdir
+    let _ = std::fs::remove_dir_all(&tmpdir);
+}
+
+/// If factory.close() fails during shutdown, the lease should remain held in K8s,
+/// mimicking crash behavior so no other node acquires unflushed data.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_shard_close_failure_during_shutdown_keeps_lease() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let shard_id = ShardId::new();
+    let node_id = "close-fail-shutdown";
+
+    let tmpdir = std::env::temp_dir().join(format!("silo-k8s-test-{}", node_id));
+    let mut factory = ShardFactory::new(
+        DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmpdir.join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+            slatedb: None,
+        },
+        MockGubernatorClient::new_arc(),
+        None,
+    );
+    factory.set_close_timeout(Duration::from_secs(3));
+    let factory = Arc::new(factory);
+
+    let (guard, owned, tx, handle) =
+        match make_k8s_guard_with_factory(&namespace, &prefix, node_id, shard_id, factory).await {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("Skipping K8S close failure shutdown test: {}", e);
+                return;
+            }
+        };
+
+    // Acquire the shard
+    guard.set_desired(true).await;
+    let acquired = wait_until(Duration::from_secs(5), || async {
+        guard.is_held().await && owned.lock().await.contains(&shard_id)
+    })
+    .await;
+    assert!(acquired, "guard should acquire lease");
+
+    // Make the shard data directory read-only so close() fails
+    let shard_data_path = tmpdir.join(shard_id.to_string());
+    assert!(
+        shard_data_path.exists(),
+        "shard data dir should exist after acquisition"
+    );
+    make_dir_tree_readonly(&shard_data_path);
+
+    // Trigger shutdown
+    let _ = tx.send(true);
+    guard.notify.notify_one();
+
+    // Wait for the guard to reach ShutDown phase.
+    // The close timeout is 3s, plus processing time.
+    let shut_down = wait_until(Duration::from_secs(10), || async {
+        let st = guard.state.lock().await;
+        st.phase == ShardPhase::ShutDown
+    })
+    .await;
+    assert!(shut_down, "guard should reach ShutDown phase");
+
+    // Verify the lease is still held (resource_version not cleared) because close failed
+    {
+        let st = guard.state.lock().await;
+        assert!(
+            st.resource_version.is_some(),
+            "resource_version should still be set (lease not released) after close failure during shutdown"
+        );
+    }
+
+    // Owned set should still contain the shard (lease not released)
+    assert!(
+        owned.lock().await.contains(&shard_id),
+        "shard should still be in owned set since lease was not released"
+    );
+
+    // Cleanup
+    restore_dir_tree_writable(&shard_data_path);
+    handle.abort();
+    let _ = std::fs::remove_dir_all(&tmpdir);
+}

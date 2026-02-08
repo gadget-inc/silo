@@ -7,6 +7,7 @@ use tokio::sync::{Mutex, Notify, watch};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
+use crate::dst_events::{self, DstEvent};
 use crate::factory::ShardFactory;
 use crate::shard_range::{ShardId, ShardMap, SplitInProgress};
 
@@ -1298,6 +1299,10 @@ impl EtcdShardGuard {
                                         let mut owned = owned_arc.lock().await;
                                         owned.insert(self.shard_id);
                                     }
+                                    dst_events::emit(DstEvent::ShardAcquired {
+                                        node_id: self.node_id.clone(),
+                                        shard_id: self.shard_id.to_string(),
+                                    });
                                     info!(shard_id = %self.shard_id, attempts = attempt, "shard: acquired and opened");
                                     break;
                                 }
@@ -1348,22 +1353,41 @@ impl EtcdShardGuard {
                         }
                         if was_held {
                             // Close the shard before releasing ownership
-                            if let Err(e) = factory.close(&self.shard_id).await {
-                                tracing::error!(shard_id = %self.shard_id, error = %e, "failed to close shard before releasing ownership");
+                            match factory.close(&self.shard_id).await {
+                                Ok(()) => {
+                                    dst_events::emit(DstEvent::ShardClosed {
+                                        node_id: self.node_id.clone(),
+                                        shard_id: self.shard_id.to_string(),
+                                    });
+                                    if let Err(e) = self.release_ownership().await {
+                                        tracing::error!(shard_id = %self.shard_id, error = %e, "failed to release shard ownership");
+                                    }
+                                    {
+                                        let mut st = self.state.lock().await;
+                                        st.is_held = false;
+                                        st.phase = ShardPhase::Idle;
+                                    }
+                                    {
+                                        let mut owned = owned_arc.lock().await;
+                                        owned.remove(&self.shard_id);
+                                    }
+                                    dst_events::emit(DstEvent::ShardReleased {
+                                        node_id: self.node_id.clone(),
+                                        shard_id: self.shard_id.to_string(),
+                                    });
+                                    debug!(shard_id = %self.shard_id, "shard: release done");
+                                }
+                                Err(e) => {
+                                    // Close failed - revert to Held so reconciliation retries
+                                    tracing::error!(
+                                        shard_id = %self.shard_id,
+                                        error = %e,
+                                        "failed to close shard, reverting to Held to prevent data loss"
+                                    );
+                                    let mut st = self.state.lock().await;
+                                    st.phase = ShardPhase::Held;
+                                }
                             }
-                            if let Err(e) = self.release_ownership().await {
-                                tracing::error!(shard_id = %self.shard_id, error = %e, "failed to release shard ownership");
-                            }
-                            {
-                                let mut st = self.state.lock().await;
-                                st.is_held = false;
-                                st.phase = ShardPhase::Idle;
-                            }
-                            {
-                                let mut owned = owned_arc.lock().await;
-                                owned.remove(&self.shard_id);
-                            }
-                            debug!(shard_id = %self.shard_id, "shard: release done");
                         } else {
                             let mut st = self.state.lock().await;
                             st.phase = ShardPhase::Idle;
@@ -1377,15 +1401,40 @@ impl EtcdShardGuard {
                     let was_held = self.state.lock().await.is_held;
                     if was_held {
                         // Close the shard before releasing ownership
-                        if let Err(e) = factory.close(&self.shard_id).await {
-                            tracing::error!(shard_id = %self.shard_id, error = %e, "failed to close shard during shutdown");
-                        }
-                        if let Err(e) = self.release_ownership().await {
-                            tracing::error!(shard_id = %self.shard_id, error = %e, "failed to release shard ownership during shutdown");
-                        }
-                        {
-                            let mut owned = owned_arc.lock().await;
-                            owned.remove(&self.shard_id);
+                        let close_succeeded = match factory.close(&self.shard_id).await {
+                            Ok(()) => {
+                                dst_events::emit(DstEvent::ShardClosed {
+                                    node_id: self.node_id.clone(),
+                                    shard_id: self.shard_id.to_string(),
+                                });
+                                true
+                            }
+                            Err(e) => {
+                                // Close failed - do NOT release ownership.
+                                // This mimics crash behavior: the permanent lease stays held
+                                // until operator force-release, preventing another node from
+                                // acquiring unflushed data.
+                                tracing::error!(
+                                    shard_id = %self.shard_id,
+                                    error = %e,
+                                    "failed to close shard during shutdown, keeping ownership to prevent data loss"
+                                );
+                                false
+                            }
+                        };
+
+                        if close_succeeded {
+                            if let Err(e) = self.release_ownership().await {
+                                tracing::error!(shard_id = %self.shard_id, error = %e, "failed to release shard ownership during shutdown");
+                            }
+                            {
+                                let mut owned = owned_arc.lock().await;
+                                owned.remove(&self.shard_id);
+                            }
+                            dst_events::emit(DstEvent::ShardReleased {
+                                node_id: self.node_id.clone(),
+                                shard_id: self.shard_id.to_string(),
+                            });
                         }
                     }
                     {

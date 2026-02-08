@@ -28,6 +28,12 @@ lease_ttl_secs = 15
 #
 advertised_grpc_addr = "${POD_IP}:50051"
 
+# Stable node identity for permanent shard leases.
+# With StatefulSets, POD_NAME is stable across restarts (e.g., silo-0, silo-1),
+# so a restarted pod automatically re-acquires its own shard leases.
+# If not set, a random UUID is generated on each startup.
+node_id = "${POD_NAME}"
+
 [webui]
 enabled = true
 addr = "0.0.0.0:50052"

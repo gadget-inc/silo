@@ -3543,3 +3543,381 @@ async fn reclaim_with_different_node_id_returns_empty() {
     cb.shutdown().await.unwrap();
     hb.abort();
 }
+
+/// Test that graceful shutdown deletes the shard owner keys in etcd,
+/// allowing other nodes to immediately acquire them without force-release.
+/// This is the etcd parallel of k8s_graceful_shutdown_clears_lease_holder_identity.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn etcd_graceful_shutdown_clears_shard_owner_keys() {
+    let prefix = unique_prefix();
+    let num_shards: u32 = 4;
+    let node_id = "shutdown-lease-etcd";
+
+    // Start coordinator and let it acquire all shards
+    let endpoints = get_etcd_endpoints();
+    let factory = make_test_factory(node_id);
+    let (c1, h1) = match EtcdCoordinator::start(
+        &endpoints,
+        &prefix,
+        node_id,
+        "http://127.0.0.1:50051",
+        num_shards,
+        10,
+        factory,
+        Vec::new(),
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Skipping test: {}", e);
+            return;
+        }
+    };
+    assert!(
+        c1.wait_converged(Duration::from_secs(15)).await,
+        "coordinator should converge"
+    );
+
+    // Collect the shard IDs
+    let shard_ids: Vec<ShardId> = c1
+        .get_shard_map()
+        .await
+        .unwrap()
+        .shard_ids()
+        .into_iter()
+        .collect();
+    assert_eq!(shard_ids.len(), num_shards as usize);
+
+    // Verify owner keys exist before shutdown
+    let cfg = silo::settings::AppConfig::load(None).expect("load default config");
+    let conn = EtcdConnection::connect(&cfg.coordination)
+        .await
+        .expect("connect etcd");
+    let mut client = conn.client();
+    for shard_id in &shard_ids {
+        let owner_key = silo::coordination::keys::shard_owner_key(&prefix, shard_id);
+        let resp = client
+            .get(owner_key.as_bytes(), None)
+            .await
+            .expect("get key");
+        assert!(
+            resp.count() > 0,
+            "owner key for shard {} should exist before shutdown",
+            shard_id,
+        );
+        let kv = resp.kvs().first().unwrap();
+        assert_eq!(
+            std::str::from_utf8(kv.value()).unwrap(),
+            node_id,
+            "owner key for shard {} should be held by {}",
+            shard_id,
+            node_id,
+        );
+    }
+
+    // Graceful shutdown
+    c1.shutdown().await.unwrap();
+    h1.abort();
+
+    // Verify owner keys are deleted after shutdown
+    for shard_id in &shard_ids {
+        let owner_key = silo::coordination::keys::shard_owner_key(&prefix, shard_id);
+        let resp = client
+            .get(owner_key.as_bytes(), None)
+            .await
+            .expect("get key");
+        assert_eq!(
+            resp.count(),
+            0,
+            "owner key for shard {} should be deleted after graceful shutdown, but found value: {:?}",
+            shard_id,
+            resp.kvs()
+                .first()
+                .map(|kv| String::from_utf8_lossy(kv.value()).to_string()),
+        );
+    }
+
+    // Verify a new node can immediately acquire the shards (no force-release needed)
+    let (c2, h2) = start_etcd_coordinator!(
+        &prefix,
+        "shutdown-lease-etcd-2",
+        "http://127.0.0.1:50052",
+        num_shards
+    );
+    assert!(
+        c2.wait_converged(Duration::from_secs(15)).await,
+        "new coordinator should converge and acquire all shards without force-release"
+    );
+    let c2_owned: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
+    let expected: HashSet<ShardId> = shard_ids.into_iter().collect();
+    assert_eq!(
+        c2_owned, expected,
+        "new coordinator should own all shards after graceful shutdown of first"
+    );
+
+    // Cleanup
+    c2.shutdown().await.unwrap();
+    h2.abort();
+}
+
+/// Helper to create an etcd guard with an externally-provided factory.
+/// This allows tests to know the factory's tmpdir for fault injection (e.g., chmod).
+async fn make_guard_with_factory(
+    coord: &EtcdConnection,
+    cluster_prefix: &str,
+    shard_id: ShardId,
+    node_id: String,
+    factory: Arc<ShardFactory>,
+) -> (
+    std::sync::Arc<EtcdShardGuard>,
+    std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<ShardId>>>,
+    tokio::sync::watch::Sender<bool>,
+    tokio::task::JoinHandle<()>,
+) {
+    let client = coord.client();
+    let owned = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let guard = EtcdShardGuard::new(
+        shard_id,
+        client.clone(),
+        cluster_prefix.to_string(),
+        node_id.clone(),
+        rx,
+    );
+    let runner = guard.clone();
+    let owned_arc = owned.clone();
+    let mut shard_map = silo::shard_range::ShardMap::new();
+    shard_map.add_shard(silo::shard_range::ShardInfo::new(
+        shard_id,
+        silo::shard_range::ShardRange::full(),
+    ));
+    let shard_map = Arc::new(tokio::sync::Mutex::new(shard_map));
+    let none_coord = silo::coordination::NoneCoordinator::new(
+        &node_id,
+        "http://127.0.0.1:0",
+        1,
+        factory.clone(),
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+    let coordinator: Arc<dyn Coordinator> = Arc::new(none_coord);
+    let handle = tokio::spawn(async move {
+        runner.run(owned_arc, factory, shard_map, coordinator).await;
+    });
+    (guard, owned, tx, handle)
+}
+
+/// Make a directory tree read-only so SlateDB writes fail, simulating a storage failure.
+fn make_dir_tree_readonly(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                make_dir_tree_readonly(&entry_path);
+            } else {
+                let _ =
+                    std::fs::set_permissions(&entry_path, std::fs::Permissions::from_mode(0o444));
+            }
+        }
+    }
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555));
+}
+
+/// Restore a directory tree to writable after a test.
+fn restore_dir_tree_writable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                restore_dir_tree_writable(&entry_path);
+            } else {
+                let _ =
+                    std::fs::set_permissions(&entry_path, std::fs::Permissions::from_mode(0o644));
+            }
+        }
+    }
+}
+
+/// If factory.close() fails during a normal release, the guard should keep retrying
+/// and the ownership key should persist in etcd until close succeeds.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn etcd_shard_close_failure_keeps_ownership() {
+    let prefix = unique_prefix();
+    let cfg = silo::settings::AppConfig::load(None).expect("load default config");
+    let coord = EtcdConnection::connect(&cfg.coordination)
+        .await
+        .expect("connect etcd");
+
+    let shard_id = ShardId::new();
+    let node_id = next_node_id();
+    let tmpdir = std::env::temp_dir().join(format!("silo-etcd-close-fail-{}", &node_id));
+    let mut factory = ShardFactory::new(
+        DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmpdir.join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+            slatedb: None,
+        },
+        MockGubernatorClient::new_arc(),
+        None,
+    );
+    factory.set_close_timeout(Duration::from_secs(3));
+    let factory = Arc::new(factory);
+
+    let (guard, owned, _tx, handle) =
+        make_guard_with_factory(&coord, &prefix, shard_id, node_id, factory).await;
+
+    // Acquire the shard
+    guard.set_desired(true).await;
+    let acquired = wait_until(Duration::from_secs(5), || async {
+        let st = guard.state.lock().await;
+        st.phase == ShardPhase::Held && st.is_held
+    })
+    .await;
+    assert!(acquired, "guard should acquire ownership");
+
+    // Make the shard data directory read-only so close() fails
+    let shard_data_path = tmpdir.join(shard_id.to_string());
+    assert!(
+        shard_data_path.exists(),
+        "shard data dir should exist after acquisition"
+    );
+    make_dir_tree_readonly(&shard_data_path);
+
+    // Trigger release
+    guard.set_desired(false).await;
+    guard.notify.notify_one();
+
+    // Wait for at least one close attempt to fail (timeout is 3s).
+    // The etcd guard's state machine automatically retries (Held→Releasing cycle),
+    // so we can't check for Held phase (it's transient). Instead, wait long enough
+    // for at least one close attempt to have timed out, then verify ownership persists.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Verify ownership is still held despite the close retry loop
+    assert!(
+        owned.lock().await.contains(&shard_id),
+        "shard should still be in owned set"
+    );
+
+    // Verify the owner key still exists in etcd
+    let owner_key = silo::coordination::keys::shard_owner_key(&prefix, &shard_id);
+    let resp = coord
+        .client()
+        .get(owner_key.as_bytes(), None)
+        .await
+        .expect("etcd get");
+    assert!(
+        !resp.kvs().is_empty(),
+        "owner key should still exist in etcd"
+    );
+
+    // Restore permissions so close can succeed on the next retry cycle
+    restore_dir_tree_writable(&shard_data_path);
+
+    // The guard is already retrying release in its Held→Releasing loop,
+    // so it will pick up the restored permissions and succeed.
+    let released = wait_until(Duration::from_secs(10), || async {
+        let st = guard.state.lock().await;
+        st.phase == ShardPhase::Idle && !st.is_held
+    })
+    .await;
+    assert!(released, "guard should release after permissions restored");
+    assert!(
+        !owned.lock().await.contains(&shard_id),
+        "shard should be removed from owned set"
+    );
+
+    handle.abort();
+    let _ = std::fs::remove_dir_all(&tmpdir);
+}
+
+/// If factory.close() fails during shutdown, the ownership key should persist in etcd,
+/// mimicking crash behavior so no other node acquires unflushed data.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn etcd_shard_close_failure_during_shutdown_keeps_ownership() {
+    let prefix = unique_prefix();
+    let cfg = silo::settings::AppConfig::load(None).expect("load default config");
+    let coord = EtcdConnection::connect(&cfg.coordination)
+        .await
+        .expect("connect etcd");
+
+    let shard_id = ShardId::new();
+    let node_id = next_node_id();
+    let tmpdir = std::env::temp_dir().join(format!("silo-etcd-close-fail-sd-{}", &node_id));
+    let mut factory = ShardFactory::new(
+        DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmpdir.join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+            slatedb: None,
+        },
+        MockGubernatorClient::new_arc(),
+        None,
+    );
+    factory.set_close_timeout(Duration::from_secs(3));
+    let factory = Arc::new(factory);
+
+    let (guard, owned, tx, handle) =
+        make_guard_with_factory(&coord, &prefix, shard_id, node_id, factory).await;
+
+    // Acquire the shard
+    guard.set_desired(true).await;
+    let acquired = wait_until(Duration::from_secs(5), || async {
+        let st = guard.state.lock().await;
+        st.phase == ShardPhase::Held && st.is_held
+    })
+    .await;
+    assert!(acquired, "guard should acquire ownership");
+
+    // Make the shard data directory read-only so close() fails
+    let shard_data_path = tmpdir.join(shard_id.to_string());
+    assert!(
+        shard_data_path.exists(),
+        "shard data dir should exist after acquisition"
+    );
+    make_dir_tree_readonly(&shard_data_path);
+
+    // Trigger shutdown
+    let _ = tx.send(true);
+    guard.notify.notify_one();
+
+    // Wait for the guard to reach ShutDown phase.
+    // The close timeout is 3s, plus processing time.
+    let shut_down = wait_until(Duration::from_secs(10), || async {
+        let st = guard.state.lock().await;
+        st.phase == ShardPhase::ShutDown
+    })
+    .await;
+    assert!(shut_down, "guard should reach ShutDown phase");
+
+    // Verify the shard is still in owned set (ownership not released because close failed)
+    assert!(
+        owned.lock().await.contains(&shard_id),
+        "shard should still be in owned set since ownership was not released"
+    );
+
+    // Verify the owner key still exists in etcd
+    let owner_key = silo::coordination::keys::shard_owner_key(&prefix, &shard_id);
+    let resp = coord
+        .client()
+        .get(owner_key.as_bytes(), None)
+        .await
+        .expect("etcd get");
+    assert!(
+        !resp.kvs().is_empty(),
+        "owner key should still exist in etcd after shutdown with close failure"
+    );
+
+    // Cleanup
+    restore_dir_tree_writable(&shard_data_path);
+    handle.abort();
+    let _ = std::fs::remove_dir_all(&tmpdir);
+}

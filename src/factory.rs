@@ -47,11 +47,18 @@ impl ShardEntry {
 /// and shards can be opened/closed dynamically as ownership changes.
 /// Per-shard OnceCell ensures that concurrent opens for the same shard
 /// are serialized while opens for different shards proceed in parallel.
+/// Default timeout for shard close operations (30 seconds).
+/// SlateDB's internal retrying_object_store retries indefinitely on transient errors,
+/// so we need a timeout to prevent close from hanging forever if the object store is
+/// unreachable or the filesystem is read-only.
+const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct ShardFactory {
     instances: DashMap<ShardId, Arc<ShardEntry>>,
     template: DatabaseTemplate,
     rate_limiter: Arc<dyn RateLimitClient>,
     metrics: Option<Metrics>,
+    close_timeout: Duration,
 }
 
 impl ShardFactory {
@@ -65,6 +72,7 @@ impl ShardFactory {
             template,
             rate_limiter,
             metrics,
+            close_timeout: DEFAULT_CLOSE_TIMEOUT,
         }
     }
 
@@ -88,7 +96,15 @@ impl ShardFactory {
             },
             rate_limiter: NullGubernatorClient::new(),
             metrics: None,
+            close_timeout: DEFAULT_CLOSE_TIMEOUT,
         }
+    }
+
+    /// Set the timeout for shard close operations.
+    /// SlateDB retries indefinitely on transient errors, so this timeout prevents
+    /// close from hanging forever. Useful for tests that inject storage failures.
+    pub fn set_close_timeout(&mut self, timeout: Duration) {
+        self.close_timeout = timeout;
     }
 
     /// Get a shard by its ID.
@@ -305,14 +321,47 @@ impl ShardFactory {
     }
 
     /// Close a specific shard and remove it from the factory.
+    ///
+    /// If `shard.close()` fails or times out, the shard is re-inserted into instances
+    /// so that close can be retried later. This prevents silent data loss where a failed
+    /// close is followed by a lease release.
+    ///
+    /// A timeout is applied because SlateDB's internal retrying_object_store retries
+    /// indefinitely on transient errors, which would cause close to hang forever if
+    /// the object store is unreachable.
     pub async fn close(&self, shard_id: &ShardId) -> Result<(), JobStoreShardError> {
         tracing::trace!(shard_id = %shard_id, "factory.close: removing from instances");
-        if let Some((_, entry)) = self.instances.remove(shard_id)
-            && let Some(shard) = entry.get()
-        {
-            tracing::trace!(shard_id = %shard_id, "factory.close: calling shard.close()");
-            shard.close().await?;
-            tracing::info!(shard_id = %shard_id, "closed shard");
+        if let Some((id, entry)) = self.instances.remove(shard_id) {
+            if let Some(shard) = entry.get() {
+                tracing::trace!(shard_id = %shard_id, "factory.close: calling shard.close()");
+                let close_result = tokio::time::timeout(self.close_timeout, shard.close()).await;
+                match close_result {
+                    Ok(Ok(())) => {
+                        tracing::info!(shard_id = %shard_id, "closed shard");
+                    }
+                    Ok(Err(e)) => {
+                        // Close returned an error - re-insert so close can be retried
+                        tracing::error!(shard_id = %shard_id, error = %e, "factory.close: shard.close() failed, re-inserting into instances");
+                        self.instances.insert(id, entry);
+                        return Err(e);
+                    }
+                    Err(_elapsed) => {
+                        // Timeout - re-insert so close can be retried
+                        tracing::error!(
+                            shard_id = %shard_id,
+                            timeout_secs = self.close_timeout.as_secs(),
+                            "factory.close: shard.close() timed out (object store may be unreachable), re-inserting into instances"
+                        );
+                        self.instances.insert(id, entry);
+                        return Err(JobStoreShardError::Rkyv(format!(
+                            "shard close timed out after {}s",
+                            self.close_timeout.as_secs()
+                        )));
+                    }
+                }
+            } else {
+                tracing::trace!(shard_id = %shard_id, "factory.close: shard not initialized");
+            }
         } else {
             tracing::trace!(shard_id = %shard_id, "factory.close: shard not found in instances");
         }

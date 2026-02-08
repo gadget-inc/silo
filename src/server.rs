@@ -18,7 +18,7 @@ use crate::arrow_ipc::batch_to_ipc;
 pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("silo_descriptor");
 
 use crate::coordination::{Coordinator, ShardSplitter};
-use crate::factory::{CloseAllError, ShardFactory};
+use crate::factory::ShardFactory;
 use crate::job::{GubernatorAlgorithm, GubernatorRateLimit, JobStatusKind, RateLimitRetryPolicy};
 use crate::job_attempt::{AttemptOutcome, AttemptStatus as JobAttemptStatus};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
@@ -1826,14 +1826,9 @@ where
 
     serve.await?;
     info!("all connections drained, shutting down services");
-    match factory.close_all().await {
-        Ok(()) => info!("closed all shards"),
-        Err(CloseAllError { errors }) => {
-            for (name, err) in errors {
-                tracing::error!(shard = %name, error = %err, "failed to close shard");
-            }
-        }
-    }
+    // Note: shards are NOT closed here. The coordinator shutdown in main.rs
+    // handles the ordered close→release-lease sequence, which is critical for
+    // permanent leases. factory.close_all() in main.rs serves as a safety net.
     reaper.await.ok();
     Ok(())
 }

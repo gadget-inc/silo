@@ -1,0 +1,130 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: silo-config
+  namespace: silo-test
+data:
+  config.toml: |
+    [server]
+    grpc_addr = "0.0.0.0:50051"
+
+    [logging]
+    format = "json"
+
+    [coordination]
+    backend = "k8s"
+    cluster_prefix = "silo-local-test"
+    lease_ttl_secs = 10
+    initial_shard_count = 6
+    k8s_namespace = "silo-test"
+    advertised_grpc_addr = "${POD_IP}:50051"
+    node_id = "${POD_NAME}"
+
+    [tenancy]
+    enabled = true
+
+    [webui]
+    enabled = true
+    addr = "0.0.0.0:50052"
+
+    [metrics]
+    enabled = true
+    addr = "0.0.0.0:9090"
+
+    [database]
+    backend = "fs"
+    path = "/data/shared/%shard%"
+
+    [database.wal]
+    backend = "fs"
+    path = "/data/wal/%shard%"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: silo
+  namespace: silo-test
+spec:
+  clusterIP: None
+  selector:
+    app: silo
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+    - name: webui
+      port: 50052
+      targetPort: 50052
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: silo
+  namespace: silo-test
+spec:
+  serviceName: silo
+  replicas: 3
+  selector:
+    matchLabels:
+      app: silo
+  template:
+    metadata:
+      labels:
+        app: silo
+    spec:
+      serviceAccountName: silo
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: silo
+          image: silo:latest
+          imagePullPolicy: Never
+          args: ["-c", "/etc/silo/config.toml"]
+          ports:
+            - containerPort: 50051
+              name: grpc
+            - containerPort: 50052
+              name: webui
+            - containerPort: 9090
+              name: metrics
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: RUST_LOG
+              value: "info,silo::coordination=debug"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/silo
+              readOnly: true
+            - name: shared-data
+              mountPath: /data/shared
+            - name: wal-data
+              mountPath: /data/wal
+          readinessProbe:
+            grpc:
+              port: 50051
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            grpc:
+              port: 50051
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: config
+          configMap:
+            name: silo-config
+        - name: shared-data
+          hostPath:
+            path: /tmp/silo-test-shared
+            type: DirectoryOrCreate
+        - name: wal-data
+          emptyDir: {}

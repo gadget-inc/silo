@@ -873,12 +873,13 @@ impl GlobalConcurrencyTracker {
     }
 }
 
-/// Tracks shard ownership for split-brain detection.
+/// Tracks shard ownership for split-brain detection and close-before-release ordering.
 ///
-/// Verifies the invariant:
+/// Verifies the invariants:
 /// - noSplitBrain: A shard is owned by at most one node at any time
+/// - closeBeforeRelease: Every ShardReleased was preceded by ShardClosed from the same node/shard
 ///
-/// This tracker receives ShardAcquired/ShardReleased events from server-side
+/// This tracker receives ShardAcquired/ShardClosed/ShardReleased events from server-side
 /// instrumentation, allowing continuous verification without polling.
 #[derive(Debug, Default)]
 pub struct ShardOwnershipTracker {
@@ -888,6 +889,11 @@ pub struct ShardOwnershipTracker {
     violations: Mutex<Vec<(String, String, String, u64)>>,
     /// Monotonic counter for ordering events
     event_counter: std::sync::atomic::AtomicU64,
+    /// Tracks which (node_id, shard_id) pairs have been closed but not yet released.
+    /// Used to verify close-before-release ordering.
+    pending_closes: Mutex<HashSet<(String, String)>>,
+    /// Records close-before-release violations: (shard_id, node_id, timestamp)
+    close_order_violations: Mutex<Vec<(String, String, u64)>>,
 }
 
 impl ShardOwnershipTracker {
@@ -936,11 +942,45 @@ impl ShardOwnershipTracker {
         );
     }
 
+    /// Record that a node successfully closed a shard's storage.
+    pub fn shard_closed(&self, node_id: &str, shard_id: &str) {
+        let timestamp = self
+            .event_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        let mut pending = self.pending_closes.lock().unwrap();
+        pending.insert((node_id.to_string(), shard_id.to_string()));
+        tracing::trace!(
+            shard_id = %shard_id,
+            node_id = %node_id,
+            timestamp = timestamp,
+            "shard_closed"
+        );
+    }
+
     /// Record that a node released ownership of a shard.
+    /// Also verifies that ShardClosed was emitted before ShardReleased.
     pub fn shard_released(&self, node_id: &str, shard_id: &str) {
         let timestamp = self
             .event_counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        // Check close-before-release ordering
+        {
+            let mut pending = self.pending_closes.lock().unwrap();
+            let key = (node_id.to_string(), shard_id.to_string());
+            if !pending.remove(&key) {
+                // ShardReleased without a preceding ShardClosed
+                tracing::error!(
+                    shard_id = %shard_id,
+                    node_id = %node_id,
+                    timestamp = timestamp,
+                    "CLOSE-BEFORE-RELEASE VIOLATION: ShardReleased without preceding ShardClosed"
+                );
+                let mut violations = self.close_order_violations.lock().unwrap();
+                violations.push((shard_id.to_string(), node_id.to_string(), timestamp));
+            }
+        }
 
         let mut owners = self.current_owners.lock().unwrap();
 
@@ -990,6 +1030,27 @@ impl ShardOwnershipTracker {
                 .collect();
             panic!(
                 "INVARIANT VIOLATION (noSplitBrain): {} split-brain events detected:\n  {}",
+                violations.len(),
+                details.join("\n  ")
+            );
+        }
+    }
+
+    /// Verify close-before-release ordering. Panics if any violations were detected.
+    pub fn verify_close_before_release(&self) {
+        let violations = self.close_order_violations.lock().unwrap();
+        if !violations.is_empty() {
+            let details: Vec<String> = violations
+                .iter()
+                .map(|(shard, node, ts)| {
+                    format!(
+                        "shard {} released by {} without preceding close at event {}",
+                        shard, node, ts
+                    )
+                })
+                .collect();
+            panic!(
+                "INVARIANT VIOLATION (closeBeforeRelease): {} violations detected:\n  {}",
                 violations.len(),
                 details.join("\n  ")
             );
@@ -1357,6 +1418,7 @@ impl InvariantTracker {
         self.concurrency.verify_no_duplicate_job_leases();
         self.jobs.verify_no_terminal_leases();
         self.shards.verify_no_split_brain();
+        self.shards.verify_close_before_release();
     }
 
     /// Process all confirmed DST events and validate invariants.
@@ -1436,6 +1498,12 @@ impl InvariantTracker {
                     ref shard_id,
                 } => {
                     self.shards.shard_acquired(node_id, shard_id);
+                }
+                DstEvent::ShardClosed {
+                    ref node_id,
+                    ref shard_id,
+                } => {
+                    self.shards.shard_closed(node_id, shard_id);
                 }
                 DstEvent::ShardReleased {
                     ref node_id,
