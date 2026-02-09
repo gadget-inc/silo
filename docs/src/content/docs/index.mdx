@@ -8,7 +8,7 @@ Status: working prototype
 
 ### Features
 
-- high throughput, durable job brokering server
+- high throughput, durable job brokering server with no data loss on node crashes (permanent shard leases protect unflushed WAL data)
 - low cost at scale by using object storage as the source of truth
 - high-cardinality, cheap multitenancy built in
 - **task groups** for routing jobs to specialized worker pools and isolating workloads

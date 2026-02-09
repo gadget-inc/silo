@@ -259,6 +259,36 @@ This permanently removes the job. Running jobs should be cancelled first. This o
 
 ---
 
+### shard force-release
+
+Force-release a shard's ownership lease regardless of the current holder. This is an operator escape hatch for recovering from permanently lost nodes.
+
+With permanent shard leases, a crashed node retains its shard leases to protect unflushed WAL data. If the node will never come back (e.g., the disk was destroyed), use this command to release the lease so another node can acquire the shard.
+
+```bash
+siloctl shard force-release <shard>
+```
+
+| Argument | Description |
+|----------|-------------|
+| `<shard>` | Shard ID (UUID) to force-release |
+
+**Example:**
+
+```bash
+siloctl shard force-release a1b2c3d4-e5f6-7890-abcd-ef1234567890
+```
+
+```
+Force-released shard lease for a1b2c3d4-e5f6-7890-abcd-ef1234567890
+```
+
+<Aside type="danger">
+Force-releasing a shard lease may cause data loss if the original node still has unflushed WAL data on local disk. Only use this when you are certain the node is permanently lost and will not come back.
+</Aside>
+
+---
+
 ### query
 
 Execute an SQL query against a shard's data. Useful for debugging and inspection.
@@ -441,6 +471,22 @@ siloctl job expedite 0 problematic-job-id
 ```bash
 siloctl job cancel 0 problematic-job-id
 siloctl job restart 0 problematic-job-id
+```
+
+### Recovering from a Lost Node
+
+If a node is permanently lost (e.g., disk destroyed, VM terminated), its shard leases persist and block other nodes from acquiring those shards. Force-release the leases to recover:
+
+```bash
+# Check which shards the lost node owned
+siloctl cluster info
+
+# Force-release each shard owned by the lost node
+siloctl shard force-release <shard-id-1>
+siloctl shard force-release <shard-id-2>
+
+# Verify other nodes acquired the shards
+siloctl cluster info
 ```
 
 ### Inspecting Cluster Health

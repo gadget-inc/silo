@@ -32,7 +32,28 @@ TODO -- more shards means more throughput, but too much per shard overhead, extr
 
 ### Using local disk for WAL
 
-TODO
+For maximum write performance, you can configure the write-ahead log (WAL) to use local disk while keeping the main data in object storage. This avoids the latency of writing every WAL entry to object storage.
+
+```toml
+[database]
+backend = "gcs"
+path = "gs://my-bucket/silo/%shard%"
+
+[database.wal]
+backend = "fs"
+path = "/var/lib/silo/wal/%shard%"
+```
+
+When using a local WAL, data is first written to local disk and then periodically flushed to object storage. On graceful shutdown, `apply_wal_on_close = true` (the default) ensures the WAL is fully flushed to object storage before the shard is closed.
+
+**Crash recovery with permanent shard leases**: If a node crashes before the WAL is flushed, the unflushed data only exists on local disk. Silo uses **permanent shard leases** to protect this data: the crashed node's shard leases persist, preventing any other node from opening the shard and missing the local WAL data. When the node restarts with the same identity (see `node_id` below), it reclaims its shard leases and recovers the WAL from local disk.
+
+For this to work, you need:
+
+1. **Stable node identity**: Set `node_id` in your coordination config so that a restarted node uses the same identity. In Kubernetes with StatefulSets, use `node_id = "${POD_NAME}"`.
+2. **Persistent local storage**: The local WAL directory must survive pod restarts. Use a `PersistentVolumeClaim` or local volumes in Kubernetes.
+
+If a node is permanently lost (e.g., the disk is destroyed), an operator must force-release its shard leases using `siloctl shard force-release <shard-id>`. Any unflushed WAL data on that node will be lost.
 
 ### Using local disk for object storage cache
 

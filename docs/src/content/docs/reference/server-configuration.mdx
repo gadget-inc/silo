@@ -120,12 +120,15 @@ path = "/var/lib/silo/wal/%shard%"
 
 When using a local WAL with cloud object storage:
 - Writes are faster because they go to local disk first
-- On shard close (or node shutdown), WAL is flushed to object storage to ensure durabiliy
+- On graceful shard close (or node shutdown), WAL is flushed to object storage to ensure durability
 - The local WAL directory is deleted after successful flush
+- On crash, shard leases are permanent and persist until the node restarts and recovers the WAL. Set `node_id` to a stable value (e.g., `"${POD_NAME}"`) to enable automatic WAL recovery after restarts. See the [Internals guide](/guides/internals/#permanent-shard-leases) for details.
 
 #### `apply_wal_on_close`
 
 When running on pure object storage, your Silo instances don't necessarily need to apply the WAL to the rest of the storage before shutting down. But, when running with a split WAL, where the WAL is not on object storage, you should apply the WAL to the rest of the storage before shutting down to ensure durability. `apply_wal_on_close` is set to `true` by default, which triggers this behavior.
+
+Note that `apply_wal_on_close` only applies during **graceful** shutdowns. If a node crashes, the WAL is not flushed. Silo's permanent shard leases ensure the crashed node retains ownership of its shards, so when the node restarts, it can recover the unflushed WAL from local disk.
 
 ### SlateDB Configuration
 
@@ -227,8 +230,9 @@ lease_ttl_secs = 10
 | `backend` | string | `"none"` | Coordination backend: `"none"`, `"etcd"`, or `"k8s"` |
 | `cluster_prefix` | string | `"silo"` | Prefix for namespacing coordination keys/leases |
 | `num_shards` | number | `8` | Total number of shards in the cluster |
-| `lease_ttl_secs` | number | `10` | TTL for coordination leases in seconds |
+| `lease_ttl_secs` | number | `10` | TTL for the **membership** lease in seconds. This controls how quickly the cluster detects a node has crashed. Shard ownership leases are permanent and not affected by this TTL. |
 | `advertised_grpc_addr` | string | (none) | Address other nodes use to connect to this node |
+| `node_id` | string | (random UUID) | Stable node identity for this instance. If set, the node will reclaim shard leases from a previous run on startup, enabling WAL recovery after crashes. See [Permanent shard leases](/guides/internals/#permanent-shard-leases). |
 
 ### Coordination Backends
 
@@ -275,6 +279,7 @@ num_shards = 16
 lease_ttl_secs = 15
 k8s_namespace = "silo"
 advertised_grpc_addr = "${POD_IP}:50051"
+node_id = "${POD_NAME}"
 ```
 
 | Option | Type | Default | Description |

@@ -60,9 +60,11 @@ See `src/keys.rs` for the full implementation and parsing utilities.
 
 ## Clustering approach
 
-Silo works by separating the compute and storage tiers. Storage is provided by object storage, and the compute is "stateless", in the sense that it can be started and stopped without fear of dataloss.
+Silo works by separating the compute and storage tiers. Storage is provided by object storage, and the compute nodes are ephemeral -- they can be scaled up and down elastically. Data durability comes from object storage, not from the compute nodes themselves.
 
 Within a cluster, all data is sharded. At any one time, each shard is opened and exclusively read or written to by a single compute node. The number of shards can grow over time by splitting shards.
+
+When using a local WAL (write-ahead log) for performance, shard leases are **permanent** -- they persist through node crashes to prevent WAL data loss. See [Permanent shard leases](#permanent-shard-leases) below for details.
 
 ### Shard splitting
 
@@ -101,30 +103,30 @@ Key ideas:
 
 - **Membership (ephemeral)**: Each node registers under `coord/members/<node_id>` with a membership lease (TTL, e.g. 10s). Value includes `{ addr, started_at, node_id, capabilities }`.
 - **Ring computation**: All nodes watch `coord/members/` and deterministically build a consistent hash ring (e.g. Ketama with N virtual nodes per member).
-- **Ownership lock (per shard)**: The active owner of shard `<S>` is the node that successfully holds an etcd key `coord/shards/<S>/owner` attached to a liveness lease. Value: `{ owner_id, owner_addr, acquired_at, lease_id }`.
-- **Lease model**: Use two independent leases per node: one membership lease for `coord/members/*`, and one liveness lease shared by all `coord/shards/*/owner` keys that node holds. This lets us drop membership first (triggering ring rebalance) before releasing ownership.
-- **Data plane independence**: Nodes serve a shard only if they currently hold its `owner` key. Requests never consult etcd; they rely on local in-memory ownership state maintained via watches/keepalives.
+- **Ownership (permanent)**: The active owner of shard `<S>` is the node that holds the etcd key `coord/shards/<S>/owner`. Value: `{ owner_id, owner_addr, acquired_at }`. Unlike membership, shard ownership keys are **not** tied to any TTL-based lease -- they persist until explicitly released (graceful shutdown) or force-released (operator action).
+- **Data plane independence**: Nodes serve a shard only if they currently hold its `owner` key and are active members. Requests never consult etcd; they rely on local in-memory ownership state maintained via watches/keepalives.
 
 Node lifecycle:
 
 1. **Join**
 
-   - Create two leases (TTL ~10s, keepalive ~2s): membership lease and liveness lease.
+   - Create a membership lease (TTL ~10s, keepalive ~2s).
    - Put `coord/members/<node_id>` with the membership lease.
+   - Scan for any shard leases already held by this node from a previous run (reclaim existing leases for WAL recovery).
    - Build ring from current `coord/members/*` and compute desired shard set.
-   - Reconcile: for each desired shard, try to acquire `coord/shards/<S>/owner` via etcd transaction with the liveness lease. Only start serving a shard after this key has been written
+   - Reconcile: for each desired shard, try to acquire `coord/shards/<S>/owner` via a put-if-absent transaction. Only start serving a shard after this key has been written.
    - Start watches on `coord/members/*` and `coord/shards/<S>/owner` for shards you own or are next-in-line for.
 
 2. **Steady state**
 
-   - Maintain keepalives for both leases. If keepalives fail (channel closes or prolonged error), immediately pause serving all owned shards to avoid split-brain.
+   - Maintain keepalives for the membership lease. If keepalives fail (channel closes or prolonged error), immediately pause serving all owned shards to avoid split-brain.
    - On membership change event, recompute ring and run reconciliation: acquire new shards, release shards no longer owned.
 
 3. **Graceful leave**
 
 - Delete `coord/members/<node_id>` (using the membership lease), triggering ring recompute so contenders begin acquisition retries.
 - Quiesce briefly per shard (1–2s) to drain in-flight work.
-- Revoke the liveness lease, which deletes all `coord/shards/*/owner` keys for this node; new owners acquire on their next retry.
+- Explicitly release each `coord/shards/*/owner` key for this node (delete-if-owner); new owners acquire on their next retry.
 
 ### Safe ring changes
 
@@ -134,21 +136,37 @@ The flow:
 
 1. A node either adds or removes its membership details under `coord/members/<node_id>`
 2. All nodes discover this membership change, and update their in-memory hash rings, which shifts which shards they are responsible for.
-3. New shard owners immediately start trying to acquire the lease for the shards they want to own. Each runs a jittered loop: try `Put` of `coord/shards/<S>/owner` with its liveness lease using "create only if not exists" semantics (i.e., CAS on missing key). If exists, backoff and retry; never overwrite.
+3. New shard owners immediately start trying to acquire the lease for the shards they want to own. Each runs a jittered loop: try `Put` of `coord/shards/<S>/owner` using "create only if not exists" semantics (i.e., CAS on missing key). If exists, backoff and retry; never overwrite.
 4. Old shard owners wait a little bit, ensuring that the new shard owners discover the change and begin their retry loops in advance.
-5. Old shard owners start relinquishing their shard locks, and stop serving requests for those shards when that's happened.
+5. Old shard owners start relinquishing their shard locks (explicit delete-if-owner), and stop serving requests for those shards when that's happened.
 
-Crash case: the previous owner's liveness lease expiry auto-deletes the key; the next retry succeeds and service starts.
+Crash case: the previous owner's shard lease persists (see [Permanent shard leases](#permanent-shard-leases)). An operator must force-release the lease via `siloctl shard force-release` before another node can acquire it.
 
 ### Correctness and split-brain avoidance
 
-Only the node holding `coord/shards/<S>/owner` may serve `<S>`. All others must return NOT_OWNER immediately. Nodes must pause serving a shard if etcd keepalive fails, even if they still have the key locally, because their lease may have expired in etcd and another node could acquire ownership.
+Only the node holding `coord/shards/<S>/owner` **and** with active membership may serve `<S>`. All others must return NOT_OWNER immediately. Nodes must pause serving a shard if their membership keepalive fails, even if they still hold the shard lease, because another node might need to take over.
 
 Failure modes:
 
-- **Crash**: lease expires; `owner` keys auto-deleted; next owner acquires.
-- **Network partition**: owner loses keepalive; it must cease serving; another node acquires after TTL; clients experiencing NOT_OWNER/timeout will retry and be redirected.
+- **Crash**: shard leases persist (permanent). The crashed node retains its shard leases, preventing another node from accidentally opening the shard and losing WAL data. When the node restarts with the same `node_id`, it reclaims its leases and recovers the WAL. If the node is permanently lost, an operator must force-release the shard leases via `siloctl shard force-release`.
+- **Network partition**: owner loses membership keepalive; it must cease serving. Unlike a crash, the shard lease is still held, so no other node can acquire it until it's released or force-released.
 - **Simultaneous join**: consistent hashing minimizes movement; CAS on `owner` guarantees single winner.
+
+### Permanent shard leases
+
+Shard leases are **permanent** -- they are not tied to any TTL-based lease and survive node crashes. This is critical for preventing WAL data loss when using a local filesystem for the write-ahead log.
+
+**Why permanent leases?** When a node writes to a shard, data first goes to the local WAL before being flushed to object storage. If a node crashes before the WAL is flushed, that data only exists on the crashed node's local disk. If another node were to immediately acquire the shard (as would happen with TTL-based ephemeral leases), it would open the shard from object storage and miss the unflushed WAL data, causing data loss.
+
+With permanent leases:
+
+1. **Node crashes** -- the shard lease persists, blocking other nodes from acquiring the shard.
+2. **Node restarts** -- if the node restarts with the same `node_id` (e.g., a Kubernetes StatefulSet pod), it finds its existing shard leases, reclaims them, opens the shard databases, and recovers the WAL data from local disk. No data is lost.
+3. **Node permanently lost** -- if a node will never come back, an operator uses `siloctl shard force-release <shard-id>` to release the lease. The operator accepts that any unflushed WAL data on that node is lost. Another node then acquires the shard and starts serving it from the last state in object storage.
+
+**Configuration for permanent leases**: For permanent leases to work correctly across restarts, the `node_id` must be stable. In Kubernetes, set `node_id = "${POD_NAME}"` so that a restarted StatefulSet pod re-acquires its own leases. If `node_id` is not configured, a random UUID is generated on each startup, meaning a restarted node won't reclaim its previous leases.
+
+**When local WAL is not used**: If the WAL is stored in object storage (same backend as the main data), permanent leases still apply but are less critical -- there's no local data to lose on crash. An operator could force-release shards from a crashed node without risking data loss in this configuration.
 
 ### Request handling and redirection
 
@@ -156,13 +174,13 @@ On each RPC, the server checks a local map of owned shards. If not the owner, re
 
 Timing parameters (tunable):
 
-- Lease TTL: 10s; keepalive: every 2s; optional quiesce deadline: 1–2s per shard.
+- Membership lease TTL: 10s; keepalive: every 2s; optional quiesce deadline: 1–2s per shard.
 - Watch backoff with jitter to avoid thundering herds on membership changes.
 
 Key layout (control plane):
 
-- `coord/members/<node_id>` → ephemeral; node metadata
-- `coord/shards/<shard_id>/owner` → ephemeral; ownership record
+- `coord/members/<node_id>` → ephemeral (tied to membership lease TTL); node metadata
+- `coord/shards/<shard_id>/owner` → permanent (no TTL); ownership record
 
 ## Concurrency Queues
 
@@ -185,7 +203,7 @@ Incoming jobs may specify that they need to pass a Gubernator rate limit to proc
 
 ## Do we group data by tenant or not?
 
-Silo currently groups all the data for a given tenant into the same SlateDB instance. This has major performance benefits, as all transactions for the hot path can transact locally, in-memory, on the one compute node that has that tenant's shard open. This allows for much higher throughput and lower resource utilization than something that uses consensus or distributed transactions for every state change. 
+Silo currently groups all the data for a given tenant into the same SlateDB instance. This has major performance benefits, as all transactions for the hot path can transact locally, in-memory, on the one compute node that has that tenant's shard open. This allows for much higher throughput and lower resource utilization than something that uses consensus or distributed transactions for every state change. When using a local WAL for maximum performance, permanent shard leases ensure the node retains shard ownership through crashes, allowing WAL recovery on restart without data loss.
 
 There's a couple downsides to this:
  - there is a maximum scale any one tenant can reach. It is different for different workloads, but we've measured it to be about 4k jobs / second / shard.
