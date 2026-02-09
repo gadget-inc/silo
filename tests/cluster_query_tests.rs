@@ -597,19 +597,19 @@ async fn cluster_query_multi_shard_filter_pushdown() {
         .await
         .expect("create engine");
 
-    // Query only scheduled jobs
+    // Query only waiting jobs (enqueued with start_at_ms = now, so they are Waiting)
     let batches = query_collect(
         &engine,
-        "SELECT id FROM jobs WHERE tenant = '-' AND status_kind = 'Scheduled'",
+        "SELECT id FROM jobs WHERE tenant = '-' AND status_kind = 'Waiting'",
     )
     .await;
     let ids = extract_string_column(&batches, 0);
 
-    // Should only get the scheduled job from shard 1
+    // Should only get the waiting job from shard 1 (shard 0's job is Running)
     assert_eq!(
         ids.len(),
         1,
-        "expected 1 scheduled job but got {}: {:?}",
+        "expected 1 waiting job but got {}: {:?}",
         ids.len(),
         ids
     );
@@ -1468,10 +1468,10 @@ async fn cluster_query_by_status_no_tenant_filter() {
         .await
         .expect("create engine");
 
-    // Query by status without tenant filter
+    // Query by status without tenant filter (jobs enqueued with now are Waiting)
     let batches = query_collect(
         &engine,
-        "SELECT tenant, id FROM jobs WHERE status_kind = 'Scheduled' ORDER BY id",
+        "SELECT tenant, id FROM jobs WHERE status_kind = 'Waiting' ORDER BY id",
     )
     .await;
 

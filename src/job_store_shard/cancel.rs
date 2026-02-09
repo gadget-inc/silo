@@ -8,7 +8,7 @@ use crate::job_store_shard::helpers::{
     decode_job_status_owned, now_epoch_ms, retry_on_txn_conflict,
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
-use crate::keys::{idx_status_time_key, job_cancelled_key, job_status_key};
+use crate::keys::{idx_status_time_key, job_cancelled_key, job_status_key, status_index_timestamp};
 
 impl JobStoreShard {
     /// Cancel a job by id. Prevents further execution and signals running workers to stop.
@@ -84,8 +84,8 @@ impl JobStoreShard {
         // For Running jobs, status stays Running - worker discovers on heartbeat
         if was_scheduled {
             // Delete old status index entry
-            let old_time =
-                idx_status_time_key(tenant, status.kind.as_str(), status.changed_at_ms, id);
+            let old_ts = status_index_timestamp(&status);
+            let old_time = idx_status_time_key(tenant, status.kind.as_str(), old_ts, id);
             txn.delete(&old_time)?;
 
             // Set status to Cancelled immediately since job never started

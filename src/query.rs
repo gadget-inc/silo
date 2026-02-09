@@ -377,7 +377,7 @@ impl Scan for JobsScanner {
         limit: Option<usize>,
     ) -> SendableRecordBatchStream {
         let mut tenant_filter: Option<String> = None;
-        let mut status_kind: Option<crate::job::JobStatusKind> = None;
+        let mut status_filter: Option<QueryStatusFilter> = None;
         let mut id_filter: Option<String> = None;
         // Track optional metadata filter of the form metadata['key'] = 'value' or element_at(metadata, 'key') = 'value'
         let mut metadata_filter: Option<(String, String)> = None;
@@ -385,7 +385,7 @@ impl Scan for JobsScanner {
             if let Some((col, val)) = parse_eq_filter(f) {
                 match col.as_str() {
                     "tenant" => tenant_filter = Some(val),
-                    "status_kind" => status_kind = parse_status_kind(&val),
+                    "status_kind" => status_filter = parse_status_kind(&val),
                     "id" => id_filter = Some(val),
                     _ => {}
                 }
@@ -450,30 +450,89 @@ impl Scan for JobsScanner {
                         }
                     }
                 }
-            } else if let Some(kind) = status_kind {
-                // Status filter - use all-tenant scan if no tenant specified
-                if let Some(ref t) = tenant_filter {
-                    match shard
-                        .scan_jobs_by_status(t.as_str(), kind, hard_limit)
-                        .await
-                    {
-                        Ok(v) => v.into_iter().map(|id| (t.clone(), id)).collect(),
-                        Err(e) => {
-                            let _ = tx
-                                .send(Err(DataFusionError::Execution(e.to_string())))
-                                .await;
-                            return;
+            } else if let Some(sf) = status_filter {
+                // Status filter - dispatch based on QueryStatusFilter variant
+                let now_ms = crate::job_store_shard::helpers::now_epoch_ms();
+                match sf {
+                    QueryStatusFilter::Waiting => {
+                        if let Some(ref t) = tenant_filter {
+                            match shard
+                                .scan_jobs_waiting(t.as_str(), now_ms, hard_limit)
+                                .await
+                            {
+                                Ok(v) => v.into_iter().map(|id| (t.clone(), id)).collect(),
+                                Err(e) => {
+                                    let _ = tx
+                                        .send(Err(DataFusionError::Execution(e.to_string())))
+                                        .await;
+                                    return;
+                                }
+                            }
+                        } else {
+                            match shard.scan_all_jobs_waiting(now_ms, hard_limit).await {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _ = tx
+                                        .send(Err(DataFusionError::Execution(e.to_string())))
+                                        .await;
+                                    return;
+                                }
+                            }
                         }
                     }
-                } else {
-                    // Scan all tenants
-                    match shard.scan_all_jobs_by_status(kind, hard_limit).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let _ = tx
-                                .send(Err(DataFusionError::Execution(e.to_string())))
-                                .await;
-                            return;
+                    QueryStatusFilter::FutureScheduled => {
+                        if let Some(ref t) = tenant_filter {
+                            match shard
+                                .scan_jobs_future_scheduled(t.as_str(), now_ms, hard_limit)
+                                .await
+                            {
+                                Ok(v) => v.into_iter().map(|id| (t.clone(), id)).collect(),
+                                Err(e) => {
+                                    let _ = tx
+                                        .send(Err(DataFusionError::Execution(e.to_string())))
+                                        .await;
+                                    return;
+                                }
+                            }
+                        } else {
+                            match shard
+                                .scan_all_jobs_future_scheduled(now_ms, hard_limit)
+                                .await
+                            {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _ = tx
+                                        .send(Err(DataFusionError::Execution(e.to_string())))
+                                        .await;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    QueryStatusFilter::Stored(kind) => {
+                        if let Some(ref t) = tenant_filter {
+                            match shard
+                                .scan_jobs_by_status(t.as_str(), kind, hard_limit)
+                                .await
+                            {
+                                Ok(v) => v.into_iter().map(|id| (t.clone(), id)).collect(),
+                                Err(e) => {
+                                    let _ = tx
+                                        .send(Err(DataFusionError::Execution(e.to_string())))
+                                        .await;
+                                    return;
+                                }
+                            }
+                        } else {
+                            match shard.scan_all_jobs_by_status(kind, hard_limit).await {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _ = tx
+                                        .send(Err(DataFusionError::Execution(e.to_string())))
+                                        .await;
+                                    return;
+                                }
+                            }
                         }
                     }
                 }
@@ -647,7 +706,7 @@ impl Scan for JobsScanner {
                             for (_, id) in &existing_pairs {
                                 if let Some(status) = status_map.get(id) {
                                     if need_kind {
-                                        kinds.push(Some(format!("{:?}", status.kind)));
+                                        kinds.push(Some(display_status_kind(status)));
                                     }
                                     if need_changed {
                                         changed.push(Some(status.changed_at_ms));
@@ -1191,16 +1250,48 @@ fn literal_to_string(s: &datafusion::scalar::ScalarValue) -> Option<String> {
     }
 }
 
-fn parse_status_kind(s: &str) -> Option<crate::job::JobStatusKind> {
+/// Represents the different status filters that can be used in WHERE clauses.
+/// Waiting and Scheduled are virtual statuses derived from the stored Scheduled status.
+#[derive(Debug, Clone, Copy)]
+enum QueryStatusFilter {
+    /// A stored status kind (Running, Failed, Cancelled, Succeeded)
+    Stored(crate::job::JobStatusKind),
+    /// Virtual: Scheduled + start_time <= now (ready to run)
+    Waiting,
+    /// Virtual: Scheduled + start_time > now (future only)
+    FutureScheduled,
+}
+
+fn parse_status_kind(s: &str) -> Option<QueryStatusFilter> {
     use crate::job::JobStatusKind;
     match s {
-        "Scheduled" | "scheduled" => Some(JobStatusKind::Scheduled),
-        "Running" | "running" => Some(JobStatusKind::Running),
-        "Failed" | "failed" => Some(JobStatusKind::Failed),
-        "Cancelled" | "canceled" | "cancelled" => Some(JobStatusKind::Cancelled),
-        "Succeeded" | "success" | "succeeded" => Some(JobStatusKind::Succeeded),
+        "Waiting" | "waiting" => Some(QueryStatusFilter::Waiting),
+        "Scheduled" | "scheduled" => Some(QueryStatusFilter::FutureScheduled),
+        "Running" | "running" => Some(QueryStatusFilter::Stored(JobStatusKind::Running)),
+        "Failed" | "failed" => Some(QueryStatusFilter::Stored(JobStatusKind::Failed)),
+        "Cancelled" | "canceled" | "cancelled" => {
+            Some(QueryStatusFilter::Stored(JobStatusKind::Cancelled))
+        }
+        "Succeeded" | "success" | "succeeded" => {
+            Some(QueryStatusFilter::Stored(JobStatusKind::Succeeded))
+        }
         _ => None,
     }
+}
+
+/// Compute the display status kind string for a job status.
+/// Scheduled jobs with start_time <= now display as "Waiting".
+fn display_status_kind(status: &crate::job::JobStatus) -> String {
+    if status.kind == crate::job::JobStatusKind::Scheduled {
+        let now_ms = crate::job_store_shard::helpers::now_epoch_ms();
+        if status
+            .next_attempt_starts_after_ms
+            .is_none_or(|t| t <= now_ms)
+        {
+            return "Waiting".to_string();
+        }
+    }
+    format!("{:?}", status.kind)
 }
 
 /// Convert Arrow RecordBatches directly to MessagePack-encoded rows.
