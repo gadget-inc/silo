@@ -108,8 +108,9 @@ async fn request_split_fails_if_not_owner() {
     let _guard = acquire_test_mutex();
 
     let prefix = unique_prefix();
-    // Use 8 shards to ensure even distribution across 2 nodes via rendezvous hashing
-    let num_shards: u32 = 8;
+    // Use 32 shards to ensure statistically even distribution across 2 nodes via rendezvous hashing.
+    // With random UUIDs and 2 nodes, 32 shards makes the probability of all landing on one node negligible.
+    let num_shards: u32 = 32;
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
 
     let (c1, h1) = EtcdCoordinator::start(
@@ -138,7 +139,7 @@ async fn request_split_fails_if_not_owner() {
     .await
     .expect("start coordinator 2");
 
-    // Wait for convergence - with 8 shards, this may take longer
+    // Wait for convergence
     assert!(c1.wait_converged(Duration::from_secs(30)).await);
     assert!(c2.wait_converged(Duration::from_secs(30)).await);
 
@@ -793,8 +794,9 @@ async fn split_in_multi_node_cluster() {
     let _guard = acquire_test_mutex();
 
     let prefix = unique_prefix();
-    // Use 8 shards to ensure even distribution across 2 nodes via rendezvous hashing
-    let num_shards: u32 = 8;
+    // Use 32 shards to ensure statistically even distribution across 2 nodes via rendezvous hashing.
+    // With random UUIDs and 2 nodes, 32 shards makes the probability of all landing on one node negligible.
+    let num_shards: u32 = 32;
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
 
     let (c1, h1) = EtcdCoordinator::start(
@@ -823,7 +825,7 @@ async fn split_in_multi_node_cluster() {
     .await
     .expect("start coordinator 2");
 
-    // With 8 shards, convergence may take longer
+    // With 32 shards, convergence may take longer
     assert!(c1.wait_converged(Duration::from_secs(30)).await);
     assert!(c2.wait_converged(Duration::from_secs(30)).await);
 
@@ -865,8 +867,8 @@ async fn split_in_multi_node_cluster() {
 
     // Both coordinators should eventually see the updated shard map
     // Wait for the shard map change to propagate via etcd watch
-    // After splitting one shard, we should have 9 shards (8 original - 1 split + 2 children = 9)
-    let expected_shards = 9;
+    // After splitting one shard, we should have 33 shards (32 original - 1 split + 2 children = 33)
+    let expected_shards = (num_shards + 1) as usize;
     let mut retries = 20;
     loop {
         let map2 = c2.get_shard_map().await.expect("c2 shard map");
@@ -880,8 +882,16 @@ async fn split_in_multi_node_cluster() {
     let map1 = c1.get_shard_map().await.expect("c1 shard map");
     let map2 = c2.get_shard_map().await.expect("c2 shard map");
 
-    assert_eq!(map1.len(), expected_shards, "c1 should see 9 shards");
-    assert_eq!(map2.len(), expected_shards, "c2 should see 9 shards");
+    assert_eq!(
+        map1.len(),
+        expected_shards,
+        "c1 should see {expected_shards} shards"
+    );
+    assert_eq!(
+        map2.len(),
+        expected_shards,
+        "c2 should see {expected_shards} shards"
+    );
 
     assert!(map2.get_shard(&split.left_child_id).is_some());
     assert!(map2.get_shard(&split.right_child_id).is_some());
