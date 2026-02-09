@@ -894,6 +894,10 @@ pub struct ShardOwnershipTracker {
     pending_closes: Mutex<HashSet<(String, String)>>,
     /// Records close-before-release violations: (shard_id, node_id, timestamp)
     close_order_violations: Mutex<Vec<(String, String, u64)>>,
+    /// Nodes that have been marked as crashed. When a crashed node's shards are
+    /// acquired by another node, it is not considered split-brain since the crashed
+    /// node is no longer running (even though it never emitted ShardReleased events).
+    crashed_nodes: Mutex<HashSet<String>>,
 }
 
 impl ShardOwnershipTracker {
@@ -904,7 +908,8 @@ impl ShardOwnershipTracker {
     }
 
     /// Record that a node acquired ownership of a shard.
-    /// If another node already owns this shard, records a split-brain violation.
+    /// If another node already owns this shard, records a split-brain violation
+    /// (unless the previous owner was marked as crashed via `node_crashed`).
     pub fn shard_acquired(&self, node_id: &str, shard_id: &str) {
         let timestamp = self
             .event_counter
@@ -914,21 +919,34 @@ impl ShardOwnershipTracker {
 
         if let Some(existing_owner) = owners.get(shard_id) {
             if existing_owner != node_id {
-                // SPLIT-BRAIN DETECTED!
-                tracing::error!(
-                    shard_id = %shard_id,
-                    existing_owner = %existing_owner,
-                    new_owner = %node_id,
-                    timestamp = timestamp,
-                    "SPLIT-BRAIN DETECTED: shard acquired by new node while still owned by another"
-                );
-                let mut violations = self.violations.lock().unwrap();
-                violations.push((
-                    shard_id.to_string(),
-                    existing_owner.clone(),
-                    node_id.to_string(),
-                    timestamp,
-                ));
+                // Check if the existing owner was marked as crashed — if so, this is
+                // expected takeover behavior, not split-brain.
+                let crashed = self.crashed_nodes.lock().unwrap();
+                if crashed.contains(existing_owner) {
+                    tracing::debug!(
+                        shard_id = %shard_id,
+                        crashed_owner = %existing_owner,
+                        new_owner = %node_id,
+                        timestamp = timestamp,
+                        "shard takeover from crashed node (not split-brain)"
+                    );
+                } else {
+                    // SPLIT-BRAIN DETECTED!
+                    tracing::error!(
+                        shard_id = %shard_id,
+                        existing_owner = %existing_owner,
+                        new_owner = %node_id,
+                        timestamp = timestamp,
+                        "SPLIT-BRAIN DETECTED: shard acquired by new node while still owned by another"
+                    );
+                    let mut violations = self.violations.lock().unwrap();
+                    violations.push((
+                        shard_id.to_string(),
+                        existing_owner.clone(),
+                        node_id.to_string(),
+                        timestamp,
+                    ));
+                }
             }
             // Even if same node, update is fine (idempotent)
         }
@@ -1013,6 +1031,15 @@ impl ShardOwnershipTracker {
                 "shard_release_of_unowned"
             );
         }
+    }
+
+    /// Record that a node crashed without emitting ShardClosed/ShardReleased events.
+    /// Marks the node as crashed so that when DST events are replayed during
+    /// `process_and_validate`, acquisitions by other nodes for shards previously
+    /// owned by this crashed node are not flagged as split-brain.
+    pub fn node_crashed(&self, node_id: &str) {
+        let mut crashed = self.crashed_nodes.lock().unwrap();
+        crashed.insert(node_id.to_string());
     }
 
     /// Verify no split-brain occurred. Panics if any violations were detected.

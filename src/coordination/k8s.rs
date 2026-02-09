@@ -578,8 +578,6 @@ impl<B: K8sBackend> K8sCoordinator<B> {
 
         loop {
             tokio::select! {
-                biased;
-
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         debug!(node_id = %self.base.node_id, "coordination loop shutting down");
@@ -1112,6 +1110,26 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         }
 
         Ok(())
+    }
+
+    /// Simulate a crash: stop all guards immediately WITHOUT releasing leases.
+    /// Leases persist in K8s, allowing reclaim on restart or force-release by operator.
+    pub async fn crash(&self) {
+        // Set all guards directly to ShutDown (bypasses ShuttingDown's close+release)
+        let guards = self.shard_guards.lock().await;
+        for (sid, guard) in guards.iter() {
+            let mut st = guard.state.lock().await;
+            st.phase = ShardPhase::ShutDown;
+            debug!(shard_id = %sid, "crash: guard set to ShutDown");
+        }
+        drop(guards);
+
+        // Clear owned set
+        let mut owned = self.base.owned.lock().await;
+        owned.clear();
+
+        // Signal shutdown to stop background tasks (coordination loop, watchers)
+        self.base.signal_shutdown();
     }
 
     /// Update the shard map ConfigMap after a split with retry logic.
@@ -1650,7 +1668,9 @@ impl<B: K8sBackend> K8sShardGuard<B> {
         loop {
             if *self.shutdown.borrow() {
                 let mut st = self.state.lock().await;
-                st.phase = ShardPhase::ShuttingDown;
+                if st.phase != ShardPhase::ShutDown {
+                    st.phase = ShardPhase::ShuttingDown;
+                }
             }
 
             {

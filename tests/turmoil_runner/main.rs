@@ -159,6 +159,26 @@ fn k8s_coordination() {
 
 #[test]
 #[cfg(feature = "k8s")]
+fn k8s_permanent_lease_reclaim() {
+    if is_subprocess() || is_fuzz_mode() {
+        scenarios::k8s_permanent_leases::run_reclaim();
+    } else {
+        verify_determinism("k8s_permanent_lease_reclaim", get_seed());
+    }
+}
+
+#[test]
+#[cfg(feature = "k8s")]
+fn k8s_permanent_lease_force_release() {
+    if is_subprocess() || is_fuzz_mode() {
+        scenarios::k8s_permanent_leases::run_force_release();
+    } else {
+        verify_determinism("k8s_permanent_lease_force_release", get_seed());
+    }
+}
+
+#[test]
+#[cfg(feature = "k8s")]
 fn k8s_shard_splits() {
     if is_subprocess() || is_fuzz_mode() {
         scenarios::k8s_shard_splits::run();
