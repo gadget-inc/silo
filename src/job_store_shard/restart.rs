@@ -162,12 +162,8 @@ impl JobStoreShard {
         txn.put(&status_key, &status_value)?;
 
         // Insert new status index entry
-        let new_time = idx_status_time_key(
-            tenant,
-            new_status.kind.as_str(),
-            new_status.changed_at_ms,
-            id,
-        );
+        let new_ts = crate::keys::status_index_timestamp(&new_status);
+        let new_time = idx_status_time_key(tenant, new_status.kind.as_str(), new_ts, id);
         txn.put(&new_time, [])?;
 
         // [SILO-RESTART-5] Post: Create new task in DB queue with next attempt number

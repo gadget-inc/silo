@@ -389,9 +389,9 @@ async fn cluster_two_nodes_status_filter_query() {
         .await
         .expect("failed to create query engine");
 
-    // Test status filter - this is what the webui uses
+    // Test status filter - jobs enqueued with start_at_ms=0 are Waiting (start_time <= now)
     let df = query_engine
-        .sql("SELECT id, status_kind, enqueue_time_ms, priority FROM jobs WHERE status_kind = 'Scheduled' ORDER BY enqueue_time_ms ASC LIMIT 100")
+        .sql("SELECT id, status_kind, enqueue_time_ms, priority FROM jobs WHERE status_kind = 'Waiting' ORDER BY enqueue_time_ms ASC LIMIT 100")
         .await
         .expect("query failed");
     let batches = df.collect().await.expect("collect failed");
@@ -399,18 +399,18 @@ async fn cluster_two_nodes_status_filter_query() {
     let mut count = 0;
     for batch in &batches {
         count += batch.num_rows();
-        // Verify all returned rows have Scheduled status
+        // Verify all returned rows have Waiting status
         if let Some(status_col) = batch
             .column_by_name("status_kind")
             .and_then(|c| c.as_any().downcast_ref::<StringArray>())
         {
             for i in 0..batch.num_rows() {
-                assert_eq!(status_col.value(i), "Scheduled");
+                assert_eq!(status_col.value(i), "Waiting");
             }
         }
     }
 
-    assert_eq!(count, 5, "should have 5 scheduled jobs");
+    assert_eq!(count, 5, "should have 5 waiting jobs");
 
     // Cleanup
     let _ = shutdown_tx1.send(());
@@ -797,8 +797,8 @@ async fn cluster_two_nodes_projection_remote_shards() {
             );
             assert_eq!(
                 status_col.value(i),
-                "Scheduled",
-                "status should be Scheduled"
+                "Waiting",
+                "status should be Waiting (jobs enqueued with start_at_ms=0)"
             );
             // Just verify enqueue_time_ms is accessible (timestamp value depends on test env)
             let _ = time_col.value(i);

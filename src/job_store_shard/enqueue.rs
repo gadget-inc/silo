@@ -15,7 +15,9 @@ use crate::job_store_shard::JobStoreShardError;
 use crate::job_store_shard::helpers::{
     DbWriteBatcher, TxnWriter, WriteBatcher, decode_job_status_owned, now_epoch_ms, put_task,
 };
-use crate::keys::{idx_metadata_key, idx_status_time_key, job_info_key, job_status_key};
+use crate::keys::{
+    idx_metadata_key, idx_status_time_key, job_info_key, job_status_key, status_index_timestamp,
+};
 use crate::retry::RetryPolicy;
 use crate::task::{GubernatorRateLimitData, Task};
 
@@ -601,9 +603,8 @@ impl JobStoreShard {
         // Delete old index entries if present
         if let Some(old_raw) = writer.get(&job_status_key(tenant, job_id)).await? {
             let old = decode_job_status_owned(&old_raw)?;
-            let old_kind = old.kind;
-            let old_changed = old.changed_at_ms;
-            let old_time = idx_status_time_key(tenant, old_kind.as_str(), old_changed, job_id);
+            let old_ts = status_index_timestamp(&old);
+            let old_time = idx_status_time_key(tenant, old.kind.as_str(), old_ts, job_id);
             writer.delete(&old_time)?;
         }
 
@@ -633,9 +634,11 @@ impl JobStoreShard {
         writer.put(job_status_key(tenant, job_id), &job_status_value)?;
 
         // Insert new index entries
+        // For Scheduled statuses, use next_attempt_starts_after_ms as the timestamp
+        // to enable efficient waiting/future-scheduled range scans.
         let new_kind = new_status.kind;
-        let changed = new_status.changed_at_ms;
-        let timek = idx_status_time_key(tenant, new_kind.as_str(), changed, job_id);
+        let ts = status_index_timestamp(&new_status);
+        let timek = idx_status_time_key(tenant, new_kind.as_str(), ts, job_id);
         writer.put(&timek, [])?;
         Ok(())
     }

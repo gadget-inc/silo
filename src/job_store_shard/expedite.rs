@@ -176,19 +176,13 @@ impl JobStoreShard {
         txn.put(&status_key, &new_status_value)?;
 
         // Update status/time index
-        let old_time_key = crate::keys::idx_status_time_key(
-            tenant,
-            status.kind.as_str(),
-            status.changed_at_ms,
-            id,
-        );
+        let old_ts = crate::keys::status_index_timestamp(&status);
+        let old_time_key =
+            crate::keys::idx_status_time_key(tenant, status.kind.as_str(), old_ts, id);
         txn.delete(&old_time_key)?;
-        let new_time_key = crate::keys::idx_status_time_key(
-            tenant,
-            new_status.kind.as_str(),
-            new_status.changed_at_ms,
-            id,
-        );
+        let new_ts = crate::keys::status_index_timestamp(&new_status);
+        let new_time_key =
+            crate::keys::idx_status_time_key(tenant, new_status.kind.as_str(), new_ts, id);
         txn.put(&new_time_key, [])?;
 
         // Commit the transaction

@@ -11,6 +11,8 @@
 
 use storekey::{Decode, Encode, decode, encode_vec};
 
+use crate::job::{JobStatus, JobStatusKind};
+
 mod prefix {
     pub const JOB_INFO: u8 = 0x01;
     pub const JOB_STATUS: u8 = 0x02;
@@ -236,6 +238,19 @@ pub fn idx_status_time_prefix(tenant: &str, status: &str) -> Vec<u8> {
     )
 }
 
+/// Prefix for scanning status index for a tenant, status, and time bound.
+/// Used to construct range scan boundaries for waiting/future-scheduled queries.
+pub fn idx_status_time_prefix_with_time(
+    tenant: &str,
+    status: &str,
+    inverted_timestamp: u64,
+) -> Vec<u8> {
+    encode_prefix_with(
+        prefix::IDX_STATUS_TIME,
+        &(tenant.to_string(), status.to_string(), inverted_timestamp),
+    )
+}
+
 /// Prefix for scanning all status index entries (cross-tenant).
 pub fn idx_status_time_all_prefix() -> Vec<u8> {
     vec![prefix::IDX_STATUS_TIME]
@@ -269,6 +284,20 @@ pub fn parse_status_time_index_key(key: &[u8]) -> Option<ParsedStatusTimeIndexKe
         inverted_timestamp: data.inverted_timestamp,
         job_id: data.job_id,
     })
+}
+
+/// For Scheduled statuses, returns next_attempt_starts_after_ms for index keying.
+/// For all other statuses, returns changed_at_ms.
+/// This allows the status/time index to order Scheduled jobs by their start time,
+/// enabling efficient range scans to split waiting vs future-scheduled jobs.
+pub fn status_index_timestamp(status: &JobStatus) -> i64 {
+    if status.kind == JobStatusKind::Scheduled {
+        status
+            .next_attempt_starts_after_ms
+            .unwrap_or(status.changed_at_ms)
+    } else {
+        status.changed_at_ms
+    }
 }
 
 /// Index: jobs by metadata key/value (unsorted within key/value).

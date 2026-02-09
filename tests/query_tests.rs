@@ -584,11 +584,26 @@ async fn sql_filter_scheduled_status() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
 
-    // Enqueue jobs (they start as Scheduled)
+    // Enqueue jobs: s1 and s2 with current time (will be "Waiting"), s3 with future time (will be "Scheduled")
     enqueue_job(&shard, "s1", 10, now).await;
     enqueue_job(&shard, "s2", 10, now).await;
+    // s3 starts in the future - this is true "Scheduled" (not yet waiting)
+    shard
+        .enqueue(
+            "-",
+            Some("s3".to_string()),
+            10,
+            now + 60_000,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue");
 
-    // Make one Running
+    // Make s1 Running
     shard
         .dequeue("w", "default", 1)
         .await
@@ -601,8 +616,14 @@ async fn sql_filter_scheduled_status() {
         "SELECT id FROM jobs WHERE tenant = '-' AND status_kind = 'Scheduled' ORDER BY id",
     )
     .await;
+    assert_eq!(got, vec!["s3"]);
 
-    // Only s2 should still be Scheduled (s1 is Running)
+    // s2 (enqueued with now, start_time <= now) shows as "Waiting"
+    let got = query_ids(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant = '-' AND status_kind = 'Waiting' ORDER BY id",
+    )
+    .await;
     assert_eq!(got, vec!["s2"]);
 }
 
