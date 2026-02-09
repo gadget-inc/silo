@@ -959,6 +959,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         client,
         workerId: `no-refresh-handler-worker-${Date.now()}`,
         taskGroup: DEFAULT_TASK_GROUP,
+        pollIntervalMs: 50,
         handler,
         onError: (error) => {
           errors.push(error);
