@@ -230,7 +230,7 @@ jobs:
         working-directory: typescript_client
         env:
           CI: "true"
-          SILO_SERVERS: "localhost:50051,localhost:50052"
+          SILO_SERVERS: "localhost:7450,localhost:7451"
         run: pnpm test
 
   build-docker:

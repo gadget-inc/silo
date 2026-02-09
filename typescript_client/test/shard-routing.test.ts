@@ -6,8 +6,8 @@ describe("Shard Routing", () => {
   describe("shardForTenant range-based lookup", () => {
     it("finds correct shard for tenant in range", () => {
       const shards: ShardInfoWithRange[] = [
-        { shardId: "shard-1", serverAddr: "server-a:50051", rangeStart: "", rangeEnd: "m" },
-        { shardId: "shard-2", serverAddr: "server-b:50051", rangeStart: "m", rangeEnd: "" },
+        { shardId: "shard-1", serverAddr: "server-a:7450", rangeStart: "", rangeEnd: "m" },
+        { shardId: "shard-2", serverAddr: "server-b:7450", rangeStart: "m", rangeEnd: "" },
       ];
 
       // "apple" comes before "m"
@@ -18,7 +18,7 @@ describe("Shard Routing", () => {
 
     it("handles empty rangeStart (no lower bound)", () => {
       const shards: ShardInfoWithRange[] = [
-        { shardId: "shard-1", serverAddr: "server-a:50051", rangeStart: "", rangeEnd: "" },
+        { shardId: "shard-1", serverAddr: "server-a:7450", rangeStart: "", rangeEnd: "" },
       ];
 
       expect(shardForTenant("any-tenant", shards)?.shardId).toBe("shard-1");
@@ -26,7 +26,7 @@ describe("Shard Routing", () => {
 
     it("handles empty rangeEnd (no upper bound)", () => {
       const shards: ShardInfoWithRange[] = [
-        { shardId: "shard-1", serverAddr: "server-a:50051", rangeStart: "a", rangeEnd: "" },
+        { shardId: "shard-1", serverAddr: "server-a:7450", rangeStart: "a", rangeEnd: "" },
       ];
 
       expect(shardForTenant("zebra", shards)?.shardId).toBe("shard-1");
@@ -38,10 +38,10 @@ describe("Shard Routing", () => {
 
     it("handles multiple shard ranges", () => {
       const shards: ShardInfoWithRange[] = [
-        { shardId: "shard-1", serverAddr: "server-a:50051", rangeStart: "", rangeEnd: "4" },
-        { shardId: "shard-2", serverAddr: "server-b:50051", rangeStart: "4", rangeEnd: "8" },
-        { shardId: "shard-3", serverAddr: "server-a:50051", rangeStart: "8", rangeEnd: "c" },
-        { shardId: "shard-4", serverAddr: "server-b:50051", rangeStart: "c", rangeEnd: "" },
+        { shardId: "shard-1", serverAddr: "server-a:7450", rangeStart: "", rangeEnd: "4" },
+        { shardId: "shard-2", serverAddr: "server-b:7450", rangeStart: "4", rangeEnd: "8" },
+        { shardId: "shard-3", serverAddr: "server-a:7450", rangeStart: "8", rangeEnd: "c" },
+        { shardId: "shard-4", serverAddr: "server-b:7450", rangeStart: "c", rangeEnd: "" },
       ];
 
       expect(shardForTenant("1", shards)?.shardId).toBe("shard-1");
@@ -56,7 +56,7 @@ describe("Shard Routing", () => {
 
     beforeEach(() => {
       client = new SiloGRPCClient({
-        servers: "localhost:50051",
+        servers: "localhost:7450",
         useTls: false,
         shardRouting: {
           topologyRefreshIntervalMs: 0,
@@ -73,13 +73,13 @@ describe("Shard Routing", () => {
         response: Promise.resolve({
           numShards: 4,
           shardOwners: [
-            { shardId: "00000000-0000-0000-0000-000000000001", grpcAddr: "server-a:50051", nodeId: "node-a", rangeStart: "", rangeEnd: "4" },
-            { shardId: "00000000-0000-0000-0000-000000000002", grpcAddr: "server-b:50051", nodeId: "node-b", rangeStart: "4", rangeEnd: "8" },
-            { shardId: "00000000-0000-0000-0000-000000000003", grpcAddr: "server-a:50051", nodeId: "node-a", rangeStart: "8", rangeEnd: "c" },
-            { shardId: "00000000-0000-0000-0000-000000000004", grpcAddr: "server-b:50051", nodeId: "node-b", rangeStart: "c", rangeEnd: "" },
+            { shardId: "00000000-0000-0000-0000-000000000001", grpcAddr: "server-a:7450", nodeId: "node-a", rangeStart: "", rangeEnd: "4" },
+            { shardId: "00000000-0000-0000-0000-000000000002", grpcAddr: "server-b:7450", nodeId: "node-b", rangeStart: "4", rangeEnd: "8" },
+            { shardId: "00000000-0000-0000-0000-000000000003", grpcAddr: "server-a:7450", nodeId: "node-a", rangeStart: "8", rangeEnd: "c" },
+            { shardId: "00000000-0000-0000-0000-000000000004", grpcAddr: "server-b:7450", nodeId: "node-b", rangeStart: "c", rangeEnd: "" },
           ],
           thisNodeId: "node-a",
-          thisGrpcAddr: "server-a:50051",
+          thisGrpcAddr: "server-a:7450",
         }),
       });
 
@@ -91,10 +91,10 @@ describe("Shard Routing", () => {
 
       const topology = client.getTopology();
       expect(topology.shards.length).toBe(4);
-      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000001")).toBe("server-a:50051");
-      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000002")).toBe("server-b:50051");
-      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000003")).toBe("server-a:50051");
-      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000004")).toBe("server-b:50051");
+      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000001")).toBe("server-a:7450");
+      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000002")).toBe("server-b:7450");
+      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000003")).toBe("server-a:7450");
+      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000004")).toBe("server-b:7450");
     });
 
     it("creates connections to discovered servers", async () => {
@@ -102,11 +102,11 @@ describe("Shard Routing", () => {
         response: Promise.resolve({
           numShards: 2,
           shardOwners: [
-            { shardId: "00000000-0000-0000-0000-000000000001", grpcAddr: "server-x:50051", nodeId: "node-x", rangeStart: "", rangeEnd: "m" },
-            { shardId: "00000000-0000-0000-0000-000000000002", grpcAddr: "server-y:50051", nodeId: "node-y", rangeStart: "m", rangeEnd: "" },
+            { shardId: "00000000-0000-0000-0000-000000000001", grpcAddr: "server-x:7450", nodeId: "node-x", rangeStart: "", rangeEnd: "m" },
+            { shardId: "00000000-0000-0000-0000-000000000002", grpcAddr: "server-y:7450", nodeId: "node-y", rangeStart: "m", rangeEnd: "" },
           ],
           thisNodeId: "node-x",
-          thisGrpcAddr: "server-x:50051",
+          thisGrpcAddr: "server-x:7450",
         }),
       });
 
@@ -116,14 +116,14 @@ describe("Shard Routing", () => {
 
       await client.refreshTopology();
 
-      expect(connections.has("server-x:50051")).toBe(true);
-      expect(connections.has("server-y:50051")).toBe(true);
+      expect(connections.has("server-x:7450")).toBe(true);
+      expect(connections.has("server-y:7450")).toBe(true);
     });
 
     it("tries next server if first fails during topology refresh", async () => {
       client.close();
       client = new SiloGRPCClient({
-        servers: ["failing-server:50051", "working-server:50051"],
+        servers: ["failing-server:7450", "working-server:7450"],
         useTls: false,
         shardRouting: {
           topologyRefreshIntervalMs: 0,
@@ -133,21 +133,21 @@ describe("Shard Routing", () => {
       const connections = (client as any)._connections as Map<string, any>;
 
       // First server fails
-      const failingConn = connections.get("failing-server:50051");
+      const failingConn = connections.get("failing-server:7450");
       failingConn.client.getClusterInfo = vi.fn().mockReturnValue({
         response: Promise.reject(new Error("connection refused")),
       });
 
       // Second server succeeds
-      const workingConn = connections.get("working-server:50051");
+      const workingConn = connections.get("working-server:7450");
       workingConn.client.getClusterInfo = vi.fn().mockReturnValue({
         response: Promise.resolve({
           numShards: 1,
           shardOwners: [
-            { shardId: "00000000-0000-0000-0000-000000000001", grpcAddr: "working-server:50051", nodeId: "node-1", rangeStart: "", rangeEnd: "" },
+            { shardId: "00000000-0000-0000-0000-000000000001", grpcAddr: "working-server:7450", nodeId: "node-1", rangeStart: "", rangeEnd: "" },
           ],
           thisNodeId: "node-1",
-          thisGrpcAddr: "working-server:50051",
+          thisGrpcAddr: "working-server:7450",
         }),
       });
 
@@ -155,7 +155,7 @@ describe("Shard Routing", () => {
 
       const topology = client.getTopology();
       expect(topology.shards.length).toBe(1);
-      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000001")).toBe("working-server:50051");
+      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000001")).toBe("working-server:7450");
     });
 
     it("throws if all servers fail during topology refresh after exhausting retries", async () => {
@@ -178,7 +178,7 @@ describe("Shard Routing", () => {
   describe("gRPC retry configuration", () => {
     it("configures gRPC-level retries for transient failures", () => {
       const client = new SiloGRPCClient({
-        servers: "localhost:50051",
+        servers: "localhost:7450",
         useTls: false,
         shardRouting: {
           topologyRefreshIntervalMs: 0,
@@ -222,7 +222,7 @@ describe("Shard Routing", () => {
       };
 
       const client = new SiloGRPCClient({
-        servers: "localhost:50051",
+        servers: "localhost:7450",
         useTls: false,
         shardRouting: {
           topologyRefreshIntervalMs: 0,
@@ -248,14 +248,14 @@ describe("Shard Routing", () => {
     // Helper to set up mock topology so shard resolution works
     const setupMockTopology = (c: SiloGRPCClient) => {
       (c as any)._shards = [
-        { shardId: "00000000-0000-0000-0000-000000000001", serverAddr: "localhost:50051", rangeStart: "", rangeEnd: "" }
+        { shardId: "00000000-0000-0000-0000-000000000001", serverAddr: "localhost:7450", rangeStart: "", rangeEnd: "" }
       ];
-      (c as any)._shardToServer.set("00000000-0000-0000-0000-000000000001", "localhost:50051");
+      (c as any)._shardToServer.set("00000000-0000-0000-0000-000000000001", "localhost:7450");
     };
 
     beforeEach(() => {
       client = new SiloGRPCClient({
-        servers: "localhost:50051",
+        servers: "localhost:7450",
         useTls: false,
         shardRouting: {
           maxWrongShardRetries: 3,
@@ -290,12 +290,12 @@ describe("Shard Routing", () => {
 
       it("extracts redirect address from error metadata", () => {
         const error = new RpcError("shard not found", "NOT_FOUND", {
-          "x-silo-shard-owner-addr": "other-server:50051",
+          "x-silo-shard-owner-addr": "other-server:7450",
           "x-silo-shard-owner-node": "node-2",
         });
 
         expect(error.meta?.["x-silo-shard-owner-addr"]).toBe(
-          "other-server:50051"
+          "other-server:7450"
         );
         expect(error.meta?.["x-silo-shard-owner-node"]).toBe("node-2");
       });
@@ -309,7 +309,7 @@ describe("Shard Routing", () => {
           callCount++;
           if (callCount === 1) {
             throw new RpcError("shard not found", "NOT_FOUND", {
-              "x-silo-shard-owner-addr": "localhost:50051",
+              "x-silo-shard-owner-addr": "localhost:7450",
             });
           }
           return {
@@ -381,7 +381,7 @@ describe("Shard Routing", () => {
           callCount++;
           if (callCount === 1) {
             throw new RpcError("shard not found", "NOT_FOUND", {
-              "x-silo-shard-owner-addr": "new-server:50051",
+              "x-silo-shard-owner-addr": "new-server:7450",
             });
           }
           return {
@@ -410,7 +410,7 @@ describe("Shard Routing", () => {
         });
 
         expect(handle.id).toBe("job-456");
-        expect(getOrCreateSpy).toHaveBeenCalledWith("new-server:50051");
+        expect(getOrCreateSpy).toHaveBeenCalledWith("new-server:7450");
       });
     });
 
@@ -452,7 +452,7 @@ describe("Shard Routing", () => {
           callCount++;
           if (callCount === 1) {
             throw new RpcError("shard not found", "NOT_FOUND", {
-              "x-silo-shard-owner-addr": "localhost:50051",
+              "x-silo-shard-owner-addr": "localhost:7450",
             });
           }
           return {

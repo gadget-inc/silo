@@ -36,13 +36,13 @@ The `[server]` section configures the main gRPC server.
 
 ```toml
 [server]
-grpc_addr = "127.0.0.1:50051"
+grpc_addr = "127.0.0.1:7450"
 dev_mode = false
 ```
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `grpc_addr` | string | `"127.0.0.1:50051"` | Address and port for the gRPC server to listen on |
+| `grpc_addr` | string | `"127.0.0.1:7450"` | Address and port for the gRPC server to listen on |
 | `dev_mode` | bool | `false` | Enable development mode features like `ResetShards` RPC. **Never enable in production.** |
 
 <Aside type="danger">
@@ -278,7 +278,7 @@ cluster_prefix = "silo-prod"
 num_shards = 16
 lease_ttl_secs = 15
 k8s_namespace = "silo"
-advertised_grpc_addr = "${POD_IP}:50051"
+advertised_grpc_addr = "${POD_IP}:7450"
 node_id = "${POD_NAME}"
 ```
 
@@ -300,12 +300,12 @@ In clustered deployments, the `advertised_grpc_addr` tells other nodes how to co
 
 ```toml
 [server]
-grpc_addr = "0.0.0.0:50051"  # Bind to all interfaces
+grpc_addr = "0.0.0.0:7450"  # Bind to all interfaces
 
 [coordination]
 backend = "k8s"
 # Advertise the pod IP (injected via Downward API)
-advertised_grpc_addr = "${POD_IP}:50051"
+advertised_grpc_addr = "${POD_IP}:7450"
 ```
 
 ---
@@ -434,7 +434,7 @@ You can use environment variable substitution in Kubernetes to inject values via
 ```toml
 [coordination]
 # Inject pod IP from Kubernetes Downward API
-advertised_grpc_addr = "${POD_IP}:50051"
+advertised_grpc_addr = "${POD_IP}:7450"
 
 # Use a default if the env var isn't set
 cluster_prefix = "${CLUSTER_NAME:-silo-default}"

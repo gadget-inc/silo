@@ -7,8 +7,8 @@
 # This is useful for injecting Kubernetes Downward API values.
 
 [server]
-# Bind to all interfaces on port 50051
-grpc_addr = "0.0.0.0:50051"
+# Bind to all interfaces on port 7450
+grpc_addr = "0.0.0.0:7450"
 
 [coordination]
 backend = "k8s"
@@ -26,7 +26,7 @@ lease_ttl_secs = 15
 #         fieldRef:
 #           fieldPath: status.podIP
 #
-advertised_grpc_addr = "${POD_IP}:50051"
+advertised_grpc_addr = "${POD_IP}:7450"
 
 # Stable node identity for permanent shard leases.
 # With StatefulSets, POD_NAME is stable across restarts (e.g., silo-0, silo-1),
@@ -36,7 +36,7 @@ node_id = "${POD_NAME}"
 
 [webui]
 enabled = true
-addr = "0.0.0.0:50052"
+addr = "0.0.0.0:7460"
 
 [database]
 # Use GCS backend for Google Cloud Storage

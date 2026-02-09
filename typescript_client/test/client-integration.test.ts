@@ -10,7 +10,7 @@ import {
 const SILO_SERVERS = (
   process.env.SILO_SERVERS ||
   process.env.SILO_SERVER ||
-  "localhost:50051"
+  "localhost:7450"
 ).split(",");
 const RUN_INTEGRATION =
   process.env.RUN_INTEGRATION === "true" || process.env.CI === "true";

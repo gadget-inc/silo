@@ -21,7 +21,7 @@ You can cancel a job directly using the client:
 import { SiloGRPCClient, JobNotFoundError } from "@silo-ai/client";
 
 const client = new SiloGRPCClient({
-  servers: ["localhost:50051"],
+  servers: ["localhost:7450"],
 });
 
 // Cancel a job by ID
@@ -181,7 +181,7 @@ You can restart a job directly using the client:
 import { SiloGRPCClient, JobNotFoundError } from "@silo-ai/client";
 
 const client = new SiloGRPCClient({
-  servers: ["localhost:50051"],
+  servers: ["localhost:7450"],
 });
 
 // Restart a job by ID
@@ -333,7 +333,7 @@ You can expedite a job directly using the client:
 import { SiloGRPCClient, JobNotFoundError } from "@silo-ai/client";
 
 const client = new SiloGRPCClient({
-  servers: ["localhost:50051"],
+  servers: ["localhost:7450"],
 });
 
 // Expedite a job by ID

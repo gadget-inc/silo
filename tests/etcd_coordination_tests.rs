@@ -640,7 +640,7 @@ async fn etcd_single_node_owns_all_shards() {
     let num_shards: u32 = 8;
 
     let (coord, handle) =
-        start_etcd_coordinator!(&prefix, "test-node-1", "http://127.0.0.1:50051", num_shards);
+        start_etcd_coordinator!(&prefix, "test-node-1", "http://127.0.0.1:7450", num_shards);
 
     // Wait for convergence
     assert!(
@@ -672,7 +672,7 @@ async fn etcd_multiple_nodes_partition_shards() {
     let num_shards: u32 = 16;
 
     let (c1, h1) =
-        start_etcd_coordinator!(&prefix, "test-node-1", "http://127.0.0.1:50051", num_shards);
+        start_etcd_coordinator!(&prefix, "test-node-1", "http://127.0.0.1:7450", num_shards);
 
     // Small delay to let c1 start acquiring shards
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -682,7 +682,7 @@ async fn etcd_multiple_nodes_partition_shards() {
         &endpoints,
         &prefix,
         "test-node-2",
-        "http://127.0.0.1:50052",
+        "http://127.0.0.1:7451",
         num_shards,
         10,
         make_test_factory("test-node-2"),
@@ -732,7 +732,7 @@ async fn etcd_rebalances_on_membership_change() {
 
     // Start with one node
     let (c1, h1) =
-        start_etcd_coordinator!(&prefix, "test-node-1", "http://127.0.0.1:50051", num_shards);
+        start_etcd_coordinator!(&prefix, "test-node-1", "http://127.0.0.1:7450", num_shards);
 
     assert!(c1.wait_converged(Duration::from_secs(15)).await);
     let initial_owned: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
@@ -754,7 +754,7 @@ async fn etcd_rebalances_on_membership_change() {
         &endpoints,
         &prefix,
         "test-node-2",
-        "http://127.0.0.1:50052",
+        "http://127.0.0.1:7451",
         num_shards,
         10,
         make_test_factory("test-node-2"),
@@ -796,7 +796,7 @@ async fn etcd_three_nodes_even_distribution() {
     // Use 12 shards (divisible by 3) - enough to test distribution without being slow
     let num_shards: u32 = 12;
 
-    let (c1, h1) = start_etcd_coordinator!(&prefix, "node-1", "http://127.0.0.1:50051", num_shards);
+    let (c1, h1) = start_etcd_coordinator!(&prefix, "node-1", "http://127.0.0.1:7450", num_shards);
 
     // Stagger node starts to reduce contention
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -805,7 +805,7 @@ async fn etcd_three_nodes_even_distribution() {
         &endpoints,
         &prefix,
         "node-2",
-        "http://127.0.0.1:50052",
+        "http://127.0.0.1:7451",
         num_shards,
         10,
         make_test_factory("node-2"),
@@ -819,7 +819,7 @@ async fn etcd_three_nodes_even_distribution() {
         &endpoints,
         &prefix,
         "node-3",
-        "http://127.0.0.1:50053",
+        "http://127.0.0.1:7452",
         num_shards,
         10,
         make_test_factory("node-3"),
@@ -897,7 +897,7 @@ async fn etcd_removing_node_rebalances() {
     // Use 12 shards - enough to test rebalancing without being slow
     let num_shards: u32 = 12;
 
-    let (c1, h1) = start_etcd_coordinator!(&prefix, "node-1", "http://127.0.0.1:50051", num_shards);
+    let (c1, h1) = start_etcd_coordinator!(&prefix, "node-1", "http://127.0.0.1:7450", num_shards);
 
     // Stagger node starts to reduce contention
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -906,7 +906,7 @@ async fn etcd_removing_node_rebalances() {
         &endpoints,
         &prefix,
         "node-2",
-        "http://127.0.0.1:50052",
+        "http://127.0.0.1:7451",
         num_shards,
         10,
         make_test_factory("node-2"),
@@ -920,7 +920,7 @@ async fn etcd_removing_node_rebalances() {
         &endpoints,
         &prefix,
         "node-3",
-        "http://127.0.0.1:50053",
+        "http://127.0.0.1:7452",
         num_shards,
         10,
         make_test_factory("node-3"),
@@ -981,7 +981,7 @@ async fn etcd_ownership_stability_during_steady_state() {
     let num_shards: u32 = 16;
 
     let (c1, h1) =
-        start_etcd_coordinator!(&prefix, "stable-1", "http://127.0.0.1:50051", num_shards);
+        start_etcd_coordinator!(&prefix, "stable-1", "http://127.0.0.1:7450", num_shards);
 
     // Stagger node starts to reduce contention
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -990,7 +990,7 @@ async fn etcd_ownership_stability_during_steady_state() {
         &endpoints,
         &prefix,
         "stable-2",
-        "http://127.0.0.1:50052",
+        "http://127.0.0.1:7451",
         num_shards,
         10,
         make_test_factory("stable-2"),
@@ -1031,8 +1031,7 @@ async fn etcd_no_split_brain_during_transitions() {
     let prefix = unique_prefix();
     let num_shards: u32 = 32;
 
-    let (c1, h1) =
-        start_etcd_coordinator!(&prefix, "brain-1", "http://127.0.0.1:50051", num_shards);
+    let (c1, h1) = start_etcd_coordinator!(&prefix, "brain-1", "http://127.0.0.1:7450", num_shards);
 
     // Wait for c1 to own all shards
     assert!(c1.wait_converged(Duration::from_secs(15)).await);
@@ -1042,7 +1041,7 @@ async fn etcd_no_split_brain_during_transitions() {
         &endpoints,
         &prefix,
         "brain-2",
-        "http://127.0.0.1:50052",
+        "http://127.0.0.1:7451",
         num_shards,
         10,
         make_test_factory("brain-2"),
@@ -1112,7 +1111,7 @@ async fn etcd_graceful_shutdown_releases_shards_promptly() {
         &endpoints,
         &prefix,
         "graceful-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards,
         short_ttl,
         make_test_factory("graceful-1"),
@@ -1133,7 +1132,7 @@ async fn etcd_graceful_shutdown_releases_shards_promptly() {
         &endpoints,
         &prefix,
         "graceful-2",
-        "http://127.0.0.1:50052",
+        "http://127.0.0.1:7451",
         num_shards,
         short_ttl,
         make_test_factory("graceful-2"),
@@ -1185,12 +1184,8 @@ async fn etcd_request_split_creates_split_record() {
     let prefix = unique_prefix();
     let num_shards: u32 = 1; // Use 1 shard so it covers the entire keyspace
 
-    let (coord, handle) = start_etcd_coordinator!(
-        &prefix,
-        "split-test-1",
-        "http://127.0.0.1:50051",
-        num_shards
-    );
+    let (coord, handle) =
+        start_etcd_coordinator!(&prefix, "split-test-1", "http://127.0.0.1:7450", num_shards);
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
 
     assert!(
@@ -1245,7 +1240,7 @@ async fn etcd_request_split_fails_if_not_owner() {
     let (c1, h1) = start_etcd_coordinator!(
         &prefix,
         "split-owner-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
 
@@ -1256,7 +1251,7 @@ async fn etcd_request_split_fails_if_not_owner() {
         &endpoints,
         &prefix,
         "split-owner-2",
-        "http://127.0.0.1:50052",
+        "http://127.0.0.1:7451",
         num_shards,
         10,
         make_test_factory("split-owner-2"),
@@ -1306,7 +1301,7 @@ async fn etcd_request_split_fails_if_already_in_progress() {
     let num_shards: u32 = 1; // Use 1 shard so it covers the entire keyspace
 
     let (coord, handle) =
-        start_etcd_coordinator!(&prefix, "split-dup-1", "http://127.0.0.1:50051", num_shards);
+        start_etcd_coordinator!(&prefix, "split-dup-1", "http://127.0.0.1:7450", num_shards);
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
 
     assert!(coord.wait_converged(Duration::from_secs(15)).await);
@@ -1345,7 +1340,7 @@ async fn etcd_is_shard_paused_returns_correct_values() {
     let (coord, handle) = start_etcd_coordinator!(
         &prefix,
         "paused-test-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
@@ -1390,7 +1385,7 @@ async fn etcd_split_state_persists_across_restart() {
     let (c1, h1) = start_etcd_coordinator!(
         &prefix,
         "persist-test-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     let c1: Arc<dyn Coordinator> = Arc::new(c1);
@@ -1421,7 +1416,7 @@ async fn etcd_split_state_persists_across_restart() {
         &endpoints,
         &prefix,
         "persist-test-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards,
         10,
         make_test_factory("persist-test-1-restart"),
@@ -1461,12 +1456,8 @@ async fn etcd_execute_split_completes_full_cycle() {
     let prefix = unique_prefix();
     let num_shards: u32 = 1;
 
-    let (coord, handle) = start_etcd_coordinator!(
-        &prefix,
-        "split-exec-1",
-        "http://127.0.0.1:50051",
-        num_shards
-    );
+    let (coord, handle) =
+        start_etcd_coordinator!(&prefix, "split-exec-1", "http://127.0.0.1:7450", num_shards);
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
 
     assert!(coord.wait_converged(Duration::from_secs(15)).await);
@@ -1528,7 +1519,7 @@ async fn etcd_execute_split_fails_without_request() {
     let (coord, handle) = start_etcd_coordinator!(
         &prefix,
         "split-no-req-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
@@ -1560,7 +1551,7 @@ async fn etcd_execute_split_resumes_from_partial_state() {
     let (coord, handle) = start_etcd_coordinator!(
         &prefix,
         "split-resume-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
@@ -1616,7 +1607,7 @@ async fn etcd_sequential_splits_work_correctly() {
     let num_shards: u32 = 1;
 
     let (coord, handle) =
-        start_etcd_coordinator!(&prefix, "split-seq-1", "http://127.0.0.1:50051", num_shards);
+        start_etcd_coordinator!(&prefix, "split-seq-1", "http://127.0.0.1:7450", num_shards);
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
 
     assert!(coord.wait_converged(Duration::from_secs(15)).await);
@@ -1677,7 +1668,7 @@ async fn etcd_split_in_multi_node_cluster() {
     let (c1, h1) = start_etcd_coordinator!(
         &prefix,
         "split-multi-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
 
@@ -1688,7 +1679,7 @@ async fn etcd_split_in_multi_node_cluster() {
         &endpoints,
         &prefix,
         "split-multi-2",
-        "http://127.0.0.1:50052",
+        "http://127.0.0.1:7451",
         num_shards,
         10,
         make_test_factory("split-multi-2"),
@@ -1785,7 +1776,7 @@ async fn etcd_crash_recovery_early_phase_abandons_split() {
     let (c1, h1) = start_etcd_coordinator!(
         &prefix,
         "crash-early-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     let c1: Arc<dyn Coordinator> = Arc::new(c1);
@@ -1818,7 +1809,7 @@ async fn etcd_crash_recovery_early_phase_abandons_split() {
         &endpoints,
         &prefix,
         "crash-early-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards,
         10,
         make_test_factory("crash-early-1-restart"),
@@ -1871,7 +1862,7 @@ async fn etcd_crash_recovery_cloning_phase_abandons_split() {
     let (c1, h1) = start_etcd_coordinator!(
         &prefix,
         "crash-cloning-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     let c1: Arc<dyn Coordinator> = Arc::new(c1);
@@ -1906,7 +1897,7 @@ async fn etcd_crash_recovery_cloning_phase_abandons_split() {
         &endpoints,
         &prefix,
         "crash-cloning-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards,
         10,
         make_test_factory("crash-cloning-1-restart"),
@@ -1961,12 +1952,8 @@ async fn etcd_grpc_request_split_executes_to_completion() {
     let num_shards: u32 = 1;
 
     // Start etcd coordinator
-    let (coord, handle) = start_etcd_coordinator!(
-        &prefix,
-        "grpc-split-1",
-        "http://127.0.0.1:50099",
-        num_shards
-    );
+    let (coord, handle) =
+        start_etcd_coordinator!(&prefix, "grpc-split-1", "http://127.0.0.1:7499", num_shards);
     let coord = Arc::new(coord);
 
     assert!(coord.wait_converged(Duration::from_secs(15)).await);
@@ -2079,12 +2066,8 @@ async fn etcd_single_node_default_ring_owns_all_shards() {
     let num_shards: u32 = 4;
 
     // Node with empty placement_rings participates in default ring
-    let (coord, handle) = start_etcd_coordinator!(
-        &prefix,
-        "default-node",
-        "http://127.0.0.1:50051",
-        num_shards
-    );
+    let (coord, handle) =
+        start_etcd_coordinator!(&prefix, "default-node", "http://127.0.0.1:7450", num_shards);
 
     assert!(
         coord.wait_converged(Duration::from_secs(10)).await,
@@ -2110,12 +2093,8 @@ async fn etcd_multi_ring_shard_assignment() {
     let num_shards: u32 = 8;
 
     // Start a default node (empty placement_rings = default ring)
-    let (c_default, h_default) = start_etcd_coordinator!(
-        &prefix,
-        "default-node",
-        "http://127.0.0.1:50051",
-        num_shards
-    );
+    let (c_default, h_default) =
+        start_etcd_coordinator!(&prefix, "default-node", "http://127.0.0.1:7450", num_shards);
     let c_default: Arc<dyn Coordinator> = Arc::new(c_default);
 
     assert!(
@@ -2137,7 +2116,7 @@ async fn etcd_multi_ring_shard_assignment() {
         &endpoints,
         &prefix,
         "gpu-node",
-        "http://127.0.0.1:50052",
+        "http://127.0.0.1:7451",
         num_shards,
         10,
         make_test_factory("gpu-node"),
@@ -2241,7 +2220,7 @@ async fn etcd_configure_shard_ring_changes() {
     let num_shards: u32 = 2;
 
     let (coord, handle) =
-        start_etcd_coordinator!(&prefix, "test-node", "http://127.0.0.1:50051", num_shards);
+        start_etcd_coordinator!(&prefix, "test-node", "http://127.0.0.1:7450", num_shards);
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
 
     assert!(
@@ -2316,12 +2295,8 @@ async fn etcd_member_info_reports_rings() {
     let num_shards: u32 = 4;
 
     // Start a default node
-    let (c1, h1) = start_etcd_coordinator!(
-        &prefix,
-        "node-default",
-        "http://127.0.0.1:50051",
-        num_shards
-    );
+    let (c1, h1) =
+        start_etcd_coordinator!(&prefix, "node-default", "http://127.0.0.1:7450", num_shards);
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -2331,7 +2306,7 @@ async fn etcd_member_info_reports_rings() {
         &endpoints,
         &prefix,
         "node-multi",
-        "http://127.0.0.1:50052",
+        "http://127.0.0.1:7451",
         num_shards,
         10,
         make_test_factory("node-multi"),
@@ -2387,12 +2362,8 @@ async fn etcd_ring_change_triggers_handoff() {
     let num_shards: u32 = 4;
 
     // Start default node
-    let (c_default, h_default) = start_etcd_coordinator!(
-        &prefix,
-        "default-node",
-        "http://127.0.0.1:50051",
-        num_shards
-    );
+    let (c_default, h_default) =
+        start_etcd_coordinator!(&prefix, "default-node", "http://127.0.0.1:7450", num_shards);
     let c_default: Arc<dyn Coordinator> = Arc::new(c_default);
 
     assert!(c_default.wait_converged(Duration::from_secs(15)).await);
@@ -2407,7 +2378,7 @@ async fn etcd_ring_change_triggers_handoff() {
         &endpoints,
         &prefix,
         "tenant-node",
-        "http://127.0.0.1:50052",
+        "http://127.0.0.1:7451",
         num_shards,
         10,
         make_test_factory("tenant-node"),
@@ -2483,7 +2454,7 @@ async fn etcd_rapid_membership_churn_converges() {
     let num_shards: u32 = 16;
 
     // Start first node, then quickly add/remove others to simulate churn
-    let (c1, h1) = start_etcd_coordinator!(&prefix, "n1", "http://127.0.0.1:50051", num_shards);
+    let (c1, h1) = start_etcd_coordinator!(&prefix, "n1", "http://127.0.0.1:7450", num_shards);
 
     // Stagger node starts to reduce contention
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2492,7 +2463,7 @@ async fn etcd_rapid_membership_churn_converges() {
         &endpoints,
         &prefix,
         "n2",
-        "http://127.0.0.1:50052",
+        "http://127.0.0.1:7451",
         num_shards,
         10,
         make_test_factory("n2"),
@@ -2506,7 +2477,7 @@ async fn etcd_rapid_membership_churn_converges() {
         &endpoints,
         &prefix,
         "n3",
-        "http://127.0.0.1:50053",
+        "http://127.0.0.1:7452",
         num_shards,
         10,
         make_test_factory("n3"),
@@ -2524,7 +2495,7 @@ async fn etcd_rapid_membership_churn_converges() {
         &endpoints,
         &prefix,
         "n2",
-        "http://127.0.0.1:50052",
+        "http://127.0.0.1:7451",
         num_shards,
         10,
         make_test_factory("n2b"),
@@ -2589,7 +2560,7 @@ async fn etcd_membership_persists_beyond_lease_ttl() {
         &endpoints,
         &prefix,
         "n1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards,
         lease_ttl_secs,
         make_test_factory("n1"),
@@ -2662,7 +2633,7 @@ async fn etcd_shard_owner_map_matches_actual_ownership() {
         &endpoints,
         &prefix,
         "n1",
-        "http://127.0.0.1:50061",
+        "http://127.0.0.1:7461",
         num_shards,
         lease_ttl_secs,
         make_test_factory("n1"),
@@ -2675,7 +2646,7 @@ async fn etcd_shard_owner_map_matches_actual_ownership() {
         &endpoints,
         &prefix,
         "n2",
-        "http://127.0.0.1:50062",
+        "http://127.0.0.1:7462",
         num_shards,
         lease_ttl_secs,
         make_test_factory("n2"),
@@ -2704,12 +2675,12 @@ async fn etcd_shard_owner_map_matches_actual_ownership() {
     for (shard_id, addr) in &owner_map.shard_to_addr {
         if s1.contains(shard_id) {
             assert_eq!(
-                addr, "http://127.0.0.1:50061",
+                addr, "http://127.0.0.1:7461",
                 "shard {shard_id} owned by c1 should map to c1's addr"
             );
         } else if s2.contains(shard_id) {
             assert_eq!(
-                addr, "http://127.0.0.1:50062",
+                addr, "http://127.0.0.1:7462",
                 "shard {shard_id} owned by c2 should map to c2's addr"
             );
         } else {
@@ -2731,12 +2702,8 @@ async fn etcd_wait_converged_refreshes_shard_map() {
     let num_shards: u32 = 4;
 
     // Start a default node
-    let (c_default, h_default) = start_etcd_coordinator!(
-        &prefix,
-        "default-node",
-        "http://127.0.0.1:50051",
-        num_shards
-    );
+    let (c_default, h_default) =
+        start_etcd_coordinator!(&prefix, "default-node", "http://127.0.0.1:7450", num_shards);
     let c_default: Arc<dyn Coordinator> = Arc::new(c_default);
 
     assert!(
@@ -2754,7 +2721,7 @@ async fn etcd_wait_converged_refreshes_shard_map() {
         &endpoints,
         &prefix,
         "gpu-node",
-        "http://127.0.0.1:50052",
+        "http://127.0.0.1:7451",
         num_shards,
         10,
         make_test_factory("gpu-node"),
@@ -2826,12 +2793,8 @@ async fn etcd_orphaned_ring_shard_remains_unowned() {
     let num_shards: u32 = 2;
 
     // Start only a default node
-    let (coord, handle) = start_etcd_coordinator!(
-        &prefix,
-        "default-node",
-        "http://127.0.0.1:50051",
-        num_shards
-    );
+    let (coord, handle) =
+        start_etcd_coordinator!(&prefix, "default-node", "http://127.0.0.1:7450", num_shards);
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
 
     assert!(coord.wait_converged(Duration::from_secs(15)).await);
@@ -2906,13 +2869,13 @@ async fn etcd_reconciliation_cancels_in_flight_acquisitions() {
     let endpoints = get_etcd_endpoints();
 
     // Start two nodes and converge
-    let (c1, h1) = start_etcd_coordinator!(&prefix, "node-1", "http://127.0.0.1:50051", num_shards);
+    let (c1, h1) = start_etcd_coordinator!(&prefix, "node-1", "http://127.0.0.1:7450", num_shards);
     tokio::time::sleep(Duration::from_millis(100)).await;
     let (c2, h2) = EtcdCoordinator::start(
         &endpoints,
         &prefix,
         "node-2",
-        "http://127.0.0.1:50052",
+        "http://127.0.0.1:7451",
         num_shards,
         10,
         make_test_factory("node-2"),
@@ -2944,7 +2907,7 @@ async fn etcd_reconciliation_cancels_in_flight_acquisitions() {
         &endpoints,
         &prefix,
         "node-3",
-        "http://127.0.0.1:50053",
+        "http://127.0.0.1:7452",
         num_shards,
         10,
         make_test_factory("node-3"),

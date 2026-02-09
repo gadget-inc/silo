@@ -25,8 +25,8 @@ use tracing::{error, info, warn};
 #[command(name = "silo-bench")]
 #[command(about = "Benchmark tool for measuring Silo task throughput")]
 struct Args {
-    /// Address of the Silo server (e.g., http://localhost:50051)
-    #[arg(long, short = 'a', default_value = "http://localhost:50051")]
+    /// Address of the Silo server (e.g., http://localhost:7450)
+    #[arg(long, short = 'a', default_value = "http://localhost:7450")]
     address: String,
 
     /// Number of concurrent workers polling for tasks

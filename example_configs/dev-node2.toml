@@ -1,7 +1,7 @@
 # Config for dev node 2 (process-compose)
 
 [server]
-grpc_addr = "127.0.0.1:50052"
+grpc_addr = "127.0.0.1:7451"
 dev_mode = true
 
 [coordination]

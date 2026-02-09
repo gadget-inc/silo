@@ -15,11 +15,11 @@ use silo::siloctl::{self, GlobalOptions};
 #[command(about = "Administration CLI for Silo job queue clusters")]
 #[command(version)]
 struct Args {
-    /// Silo server address (e.g., http://localhost:50051)
+    /// Silo server address (e.g., http://localhost:7450)
     #[arg(
         long,
         short = 'a',
-        default_value = "http://localhost:50051",
+        default_value = "http://localhost:7450",
         global = true
     )]
     address: String,

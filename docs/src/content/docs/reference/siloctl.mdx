@@ -23,7 +23,7 @@ These options apply to all commands:
 
 | Option | Description |
 |--------|-------------|
-| `-a`, `--address <URL>` | Silo server address (default: `http://localhost:50051`) |
+| `-a`, `--address <URL>` | Silo server address (default: `http://localhost:7450`) |
 | `-t`, `--tenant <ID>` | Tenant ID for multi-tenant clusters |
 | `--json` | Output in JSON format instead of human-readable tables |
 | `-h`, `--help` | Print help information |
@@ -45,19 +45,19 @@ siloctl cluster info
 Cluster Information
 ===================
 Total shards: 8
-Connected to: node-1 (10.0.0.5:50051)
+Connected to: node-1 (10.0.0.5:7450)
 
 Shard Ownership:
    Shard               Node ID  gRPC Address
 ------------------------------------------------------------
-       0                node-1  10.0.0.5:50051
-       1                node-1  10.0.0.5:50051
-       2                node-2  10.0.0.6:50051
-       3                node-2  10.0.0.6:50051
-       4                node-3  10.0.0.7:50051
-       5                node-3  10.0.0.7:50051
-       6                node-4  10.0.0.8:50051
-       7                node-4  10.0.0.8:50051
+       0                node-1  10.0.0.5:7450
+       1                node-1  10.0.0.5:7450
+       2                node-2  10.0.0.6:7450
+       3                node-2  10.0.0.6:7450
+       4                node-3  10.0.0.7:7450
+       5                node-3  10.0.0.7:7450
+       6                node-4  10.0.0.8:7450
+       7                node-4  10.0.0.8:7450
 ```
 
 **JSON output:**
@@ -70,10 +70,10 @@ siloctl --json cluster info
 {
   "num_shards": 8,
   "this_node_id": "node-1",
-  "this_grpc_addr": "10.0.0.5:50051",
+  "this_grpc_addr": "10.0.0.5:7450",
   "shard_owners": [
-    {"shard_id": 0, "node_id": "node-1", "grpc_addr": "10.0.0.5:50051"},
-    {"shard_id": 1, "node_id": "node-1", "grpc_addr": "10.0.0.5:50051"}
+    {"shard_id": 0, "node_id": "node-1", "grpc_addr": "10.0.0.5:7450"},
+    {"shard_id": 1, "node_id": "node-1", "grpc_addr": "10.0.0.5:7450"}
   ]
 }
 ```
@@ -359,7 +359,7 @@ siloctl profile [OPTIONS]
 **Example:**
 
 ```bash
-siloctl -a http://silo-node:50051 profile --duration 30
+siloctl -a http://silo-node:7450 profile --duration 30
 ```
 
 ```
@@ -523,9 +523,9 @@ siloctl -t customer-123 job cancel 0 job-id
 
 ```bash
 # Connect to production
-siloctl -a http://silo.production.internal:50051 cluster info
+siloctl -a http://silo.production.internal:7450 cluster info
 
 # Or set an environment variable (not directly supported, but you can alias)
-alias siloctl-prod='siloctl -a http://silo.production.internal:50051'
+alias siloctl-prod='siloctl -a http://silo.production.internal:7450'
 siloctl-prod cluster info
 ```

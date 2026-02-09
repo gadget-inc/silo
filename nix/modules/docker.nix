@@ -14,7 +14,7 @@
       config = {
         Entrypoint = [ "${self'.packages.silo}/bin/silo" ];
         ExposedPorts = {
-          "50051/tcp" = { };
+          "7450/tcp" = { };
           "8080/tcp" = { };
         };
         Env = [

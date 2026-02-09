@@ -209,7 +209,7 @@ Silo supports on-demand CPU profiling for production debugging. Profiles are cap
 Use `siloctl` to capture a CPU profile from a running node:
 
 ```bash
-siloctl -a http://silo-node:50051 profile --duration 30
+siloctl -a http://silo-node:7450 profile --duration 30
 ```
 
 Options:
@@ -220,7 +220,7 @@ Options:
 Example with all options:
 
 ```bash
-siloctl -a http://silo-node:50051 profile \
+siloctl -a http://silo-node:7450 profile \
   --duration 60 \
   --frequency 250 \
   --output my-profile.pb.gz
@@ -266,7 +266,7 @@ Both tools open an interactive web UI with:
 
 ```bash
 # Capture a 60-second profile during high load
-siloctl -a http://silo-node:50051 profile --duration 60
+siloctl -a http://silo-node:7450 profile --duration 60
 
 # Open in pprof and look at the flame graph
 pprof -http=:8080 profile-*.pb.gz

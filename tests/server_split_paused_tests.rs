@@ -165,8 +165,7 @@ impl SplitStorageBackend for MockPausedCoordinator {
 
 /// Helper to create a test service with mock coordinator
 async fn create_test_service(paused: bool) -> (SiloService, Arc<MockPausedCoordinator>, ShardId) {
-    let coord =
-        Arc::new(MockPausedCoordinator::new("test-node", "http://localhost:50051", 1).await);
+    let coord = Arc::new(MockPausedCoordinator::new("test-node", "http://localhost:7450", 1).await);
     coord.set_paused(paused);
 
     let shard_ids: Vec<ShardId> = coord.owned_shards().await;

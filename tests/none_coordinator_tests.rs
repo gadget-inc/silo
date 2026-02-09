@@ -24,7 +24,7 @@ fn make_test_factory() -> Arc<ShardFactory> {
 async fn none_coordinator_owns_all_shards() {
     let coord = NoneCoordinator::new(
         "test-node",
-        "http://localhost:50051",
+        "http://localhost:7450",
         16,
         make_test_factory(),
         Vec::new(),
@@ -43,7 +43,7 @@ async fn none_coordinator_owns_all_shards() {
 async fn none_coordinator_always_converged() {
     let coord = NoneCoordinator::new(
         "test-node",
-        "http://localhost:50051",
+        "http://localhost:7450",
         16,
         make_test_factory(),
         Vec::new(),
@@ -58,7 +58,7 @@ async fn none_coordinator_always_converged() {
 async fn none_coordinator_single_member() {
     let coord = NoneCoordinator::new(
         "test-node",
-        "http://localhost:50051",
+        "http://localhost:7450",
         16,
         make_test_factory(),
         Vec::new(),
@@ -75,7 +75,7 @@ async fn none_coordinator_single_member() {
 async fn none_coordinator_shard_map() {
     let coord = NoneCoordinator::new(
         "test-node",
-        "http://localhost:50051",
+        "http://localhost:7450",
         4,
         make_test_factory(),
         Vec::new(),
@@ -91,7 +91,7 @@ async fn none_coordinator_shard_map() {
     for shard_info in map.shard_map.shards() {
         assert_eq!(
             map.shard_to_addr.get(&shard_info.id),
-            Some(&"http://localhost:50051".to_string())
+            Some(&"http://localhost:7450".to_string())
         );
         assert_eq!(
             map.shard_to_node.get(&shard_info.id),
