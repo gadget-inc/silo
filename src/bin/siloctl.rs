@@ -125,6 +125,11 @@ enum ShardAction {
         #[arg(long)]
         ring: Option<String>,
     },
+    /// Force-release a shard lease (for operator recovery when a node is permanently lost)
+    ForceRelease {
+        /// Shard ID (UUID) to force-release
+        shard: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -208,6 +213,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
             }
             ShardAction::Configure { shard, ring } => {
                 siloctl::shard_configure(&opts, &mut stdout, shard, ring.clone()).await
+            }
+            ShardAction::ForceRelease { shard } => {
+                siloctl::shard_force_release(&opts, &mut stdout, shard).await
             }
         },
         Command::Query { shard, sql } => siloctl::query(&opts, &mut stdout, shard, sql).await,

@@ -14,6 +14,8 @@ pub mod high_message_loss;
 #[cfg(feature = "k8s")]
 pub mod k8s_coordination;
 #[cfg(feature = "k8s")]
+pub mod k8s_permanent_leases;
+#[cfg(feature = "k8s")]
 pub mod k8s_shard_splits;
 pub mod lease_expiry;
 pub mod multiple_workers;

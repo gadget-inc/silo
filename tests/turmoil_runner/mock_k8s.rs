@@ -567,6 +567,100 @@ impl MockK8sState {
         *self.failure_rate.lock().await = rate.clamp(0.0, 1.0);
     }
 
+    /// Force-release a shard lease by clearing its holderIdentity.
+    /// Simulates an operator action or automated recovery clearing a crashed node's lease.
+    /// Bypasses failure injection so this always succeeds.
+    pub async fn force_release_shard_lease(
+        &self,
+        namespace: &str,
+        cluster_prefix: &str,
+        shard_id: &silo::shard_range::ShardId,
+    ) -> Result<(), CoordinationError> {
+        let lease_name = format!("{}-shard-{}", cluster_prefix, shard_id.as_uuid());
+
+        let mut leases = self.leases.lock().await;
+        let ns_leases = leases.entry(namespace.to_string()).or_default();
+
+        let existing = ns_leases
+            .get(&lease_name)
+            .ok_or_else(|| {
+                CoordinationError::BackendError(format!("lease {} not found", lease_name))
+            })?
+            .clone();
+
+        let new_rv = self.next_resource_version();
+
+        let mut updated_lease = existing.lease.clone();
+        if let Some(spec) = updated_lease.spec.as_mut() {
+            spec.holder_identity = Some(String::new());
+            spec.renew_time = Some(MicroTime(Utc::now()));
+        }
+        updated_lease.metadata.resource_version = Some(new_rv.clone());
+
+        let stored = StoredLease {
+            lease: updated_lease.clone(),
+            resource_version: new_rv,
+            uid: existing.uid.clone(),
+        };
+        ns_leases.insert(lease_name.clone(), stored);
+
+        let delay = self.get_watch_delay().await;
+        self.emit_lease_watch_event(
+            WatchEvent {
+                event_type: WatchEventType::Modified,
+                namespace: namespace.to_string(),
+                name: lease_name.clone(),
+                object: updated_lease,
+            },
+            delay,
+        );
+
+        trace!(namespace, name = %lease_name, "mock: force-released shard lease");
+        Ok(())
+    }
+
+    /// Get all shard lease holders for a cluster prefix.
+    /// Returns a map of shard_id -> holder node_id (only non-empty holders).
+    /// Bypasses failure injection.
+    pub async fn get_shard_holders(
+        &self,
+        namespace: &str,
+        cluster_prefix: &str,
+    ) -> std::collections::HashMap<silo::shard_range::ShardId, String> {
+        let label_selector = format!(
+            "silo.dev/type=shard,silo.dev/cluster={}",
+            cluster_prefix
+        );
+        let leases = self.leases.lock().await;
+        let Some(ns_leases) = leases.get(namespace) else {
+            return std::collections::HashMap::new();
+        };
+
+        let mut result = std::collections::HashMap::new();
+        let prefix = format!("{}-shard-", cluster_prefix);
+        for stored in ns_leases.values() {
+            if !match_labels(&stored.lease, Some(&label_selector)) {
+                continue;
+            }
+            if let Some(holder) = stored
+                .lease
+                .spec
+                .as_ref()
+                .and_then(|s| s.holder_identity.as_ref())
+                .filter(|h| !h.is_empty())
+                && let Some(name) = stored.lease.metadata.name.as_ref()
+                && let Some(id_part) = name.strip_prefix(&prefix)
+                && let Ok(uuid) = uuid::Uuid::parse_str(id_part)
+            {
+                result.insert(
+                    silo::shard_range::ShardId::from_uuid(uuid),
+                    holder.clone(),
+                );
+            }
+        }
+        result
+    }
+
     /// Get a ConfigMap by namespace and name
     pub async fn get_configmap(
         &self,

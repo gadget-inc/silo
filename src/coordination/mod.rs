@@ -10,16 +10,25 @@
 //! # Membership and Shard Ownership Model
 //!
 //! [SILO-COORD-INV-10] A node's state is either "member" (active in the cluster with
-//! a valid membership lease) or "not a member" (no valid lease). The Alloy model also
-//! defines a "flapped" state for nodes that have lost membership but still think they
-//! own shards - in the Rust implementation, this dangerous state is prevented by:
+//! a valid membership lease) or "not a member" (no valid lease).
 //!
-//! 1. Shard lease renewal uses CAS semantics - if we've lost our membership, renewal
-//!    fails and we close our shards immediately (see SILO-COORD-INV-4)
-//! 2. Before reconciling shard ownership, we verify our own membership (SILO-COORD-INV-6)
+//! Shard leases are **permanent**: they persist until explicitly released (graceful
+//! shutdown) or force-released (operator action). They are NOT tied to membership
+//! leases and survive node crashes. This ensures the crashed node's WAL can be
+//! recovered when it restarts.
 //!
-//! This means a node is effectively "member XOR not-member" with no intermediate state
-//! where it could serve requests without valid leases.
+//! [SILO-COORD-INV-4] A flapped node cannot safely serve any shard. Even though
+//! permanent leases persist through crashes, a node that has lost membership cannot
+//! serve requests: if it actually crashed, it is not running; if its membership
+//! keepalive expired while still alive, reconciliation detects the loss and the
+//! server cannot route to shards it no longer manages.
+//!
+//! [SILO-COORD-INV-6] Lease *acquisition* requires membership - only a current member
+//! can acquire a new shard lease. But existing leases persist through flaps.
+//!
+//! [SILO-COORD-INV-14] Node flap preserves all shard leases. When a node crashes,
+//! its shard leases are retained so that no other node can take over the shard
+//! and potentially lose the crashed node's WAL data.
 
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
@@ -501,6 +510,18 @@ pub trait Coordinator: SplitStorageBackend + Send + Sync {
         shard_id: &ShardId,
         ring: Option<&str>,
     ) -> Result<(Option<String>, Option<String>), CoordinationError>;
+
+    /// Force-release a shard lease regardless of the current holder.
+    ///
+    /// Operator escape hatch for permanently lost nodes. After force-release,
+    /// the shard becomes available for acquisition by any live node.
+    async fn force_release_shard_lease(&self, shard_id: &ShardId) -> Result<(), CoordinationError>;
+
+    /// Scan for shard leases already held by this node from a previous run.
+    ///
+    /// Returns shard IDs that should be reclaimed on startup (triggering WAL recovery).
+    /// Used during restart to find shards this node still owns from before it crashed.
+    async fn reclaim_existing_leases(&self) -> Result<Vec<ShardId>, CoordinationError>;
 }
 
 /// Dynamically create a coordinator based on configuration.

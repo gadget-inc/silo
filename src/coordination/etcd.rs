@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use etcd_client::{Client, ConnectOptions, GetOptions, LockOptions, PutOptions};
+use etcd_client::{Client, ConnectOptions, GetOptions, PutOptions};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,6 +7,7 @@ use tokio::sync::{Mutex, Notify, watch};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
+use crate::dst_events::{self, DstEvent};
 use crate::factory::ShardFactory;
 use crate::shard_range::{ShardId, ShardMap, SplitInProgress};
 
@@ -19,6 +20,9 @@ use super::{
 };
 
 /// etcd-based coordinator for distributed shard ownership.
+///
+/// Shard leases are permanent (KV-based, not tied to any etcd lease).
+/// Only membership leases use etcd's built-in TTL/keepalive mechanism.
 #[derive(Clone)]
 pub struct EtcdCoordinator {
     /// Shared coordinator state (node_id, grpc_addr, owned set, shutdown, factory)
@@ -26,7 +30,6 @@ pub struct EtcdCoordinator {
     client: Client,
     cluster_prefix: String,
     membership_lease_id: i64,
-    liveness_lease_id: i64,
     shard_guards: Arc<Mutex<HashMap<ShardId, Arc<EtcdShardGuard>>>>,
 }
 
@@ -67,13 +70,9 @@ impl EtcdCoordinator {
             Self::load_or_create_shard_map(&mut client, &cluster_prefix, initial_shard_count)
                 .await?;
 
-        // Create membership and liveness leases
+        // Create membership lease (keepalive-based for liveness detection).
+        // Shard leases are permanent KV entries, not tied to any etcd lease.
         let membership_lease = client
-            .lease_grant(ttl_secs, None)
-            .await
-            .map_err(|e| CoordinationError::BackendError(e.to_string()))?
-            .id();
-        let liveness_lease = client
             .lease_grant(ttl_secs, None)
             .await
             .map_err(|e| CoordinationError::BackendError(e.to_string()))?
@@ -114,7 +113,6 @@ impl EtcdCoordinator {
             client: client.clone(),
             cluster_prefix: cluster_prefix.clone(),
             membership_lease_id: membership_lease,
-            liveness_lease_id: liveness_lease,
             shard_guards: Arc::new(Mutex::new(HashMap::new())),
         };
         let shutdown_rx = base.shutdown_rx.clone();
@@ -124,7 +122,6 @@ impl EtcdCoordinator {
         let nid = node_id.clone();
         let mut lease_bg = client.lease_client();
         let mut watch_bg = client.watch_client();
-        let mut lock_bg = client.lock_client();
 
         let handle = tokio::spawn(async move {
             // Start lease keepalives with retries
@@ -144,27 +141,8 @@ impl EtcdCoordinator {
                 }
             };
 
-            let (mut live_keeper, mut live_stream) = loop {
-                if *shutdown_rx.borrow() {
-                    return;
-                }
-                match lease_bg.keep_alive(liveness_lease).await {
-                    Ok(x) => {
-                        debug!(node_id = %nid, lease_id = liveness_lease, "liveness lease keepalive channel established");
-                        break x;
-                    }
-                    Err(e) => {
-                        warn!(node_id = %nid, error = %e, "failed to start liveness keepalive, retrying...");
-                        sleep(Duration::from_millis(200)).await;
-                    }
-                }
-            };
-
             if let Err(e) = memb_keeper.keep_alive().await {
                 error!(node_id = %nid, error = %e, "failed to send initial membership keepalive");
-            }
-            if let Err(e) = live_keeper.keep_alive().await {
-                error!(node_id = %nid, error = %e, "failed to send initial liveness keepalive");
             }
 
             // Establish member watch with retries
@@ -211,8 +189,15 @@ impl EtcdCoordinator {
                 }
             };
 
+            // Reclaim shards from a previous run before initial reconciliation.
+            // This opens shards we still own (triggering WAL recovery) and installs
+            // guards in Held state so reconciliation can manage them normally.
+            if let Err(e) = me_bg.reclaim_and_open_shards().await {
+                warn!(node_id = %nid, error = %e, "failed to reclaim shards from previous run");
+            }
+
             // Initial reconcile
-            if let Err(err) = me_bg.reconcile_shards(&mut lock_bg).await {
+            if let Err(err) = me_bg.reconcile_shards().await {
                 warn!(node_id = %nid, error = %err, "initial reconcile failed");
             }
 
@@ -228,17 +213,14 @@ impl EtcdCoordinator {
                 tokio::select! {
                     _ = keepalive_timer.tick() => {
                         if *shutdown_rx.borrow() { break; }
-                        // Send keepalive requests to both leases
+                        // Send keepalive for membership lease
                         if let Err(e) = memb_keeper.keep_alive().await {
                             error!(node_id = %nid, error = %e, "failed to send membership keepalive");
-                        }
-                        if let Err(e) = live_keeper.keep_alive().await {
-                            error!(node_id = %nid, error = %e, "failed to send liveness keepalive");
                         }
                     }
                     _ = resync.tick() => {
                         if *shutdown_rx.borrow() { break; }
-                        if let Err(err) = me_bg.reconcile_shards(&mut lock_bg).await {
+                        if let Err(err) = me_bg.reconcile_shards().await {
                             warn!(node_id = %nid, error = %err, "periodic reconcile failed");
                         }
                     }
@@ -247,7 +229,7 @@ impl EtcdCoordinator {
                         match resp {
                             Ok(Some(_msg)) => {
                                 info!(node_id = %nid, "membership changed; reconciling now");
-                                if let Err(err) = me_bg.reconcile_shards(&mut lock_bg).await {
+                                if let Err(err) = me_bg.reconcile_shards().await {
                                     warn!(node_id = %nid, error = %err, "watch-triggered reconcile failed");
                                 }
                             }
@@ -269,7 +251,7 @@ impl EtcdCoordinator {
                                     warn!(node_id = %nid, error = %err, "failed to reload shard map");
                                 } else {
                                     // Reconcile after shard map change to pick up ownership changes
-                                    if let Err(err) = me_bg.reconcile_shards(&mut lock_bg).await {
+                                    if let Err(err) = me_bg.reconcile_shards().await {
                                         warn!(node_id = %nid, error = %err, "post-shard-map-change reconcile failed");
                                     }
                                 }
@@ -293,20 +275,6 @@ impl EtcdCoordinator {
                             }
                             Err(e) => {
                                 error!(node_id = %nid, error = %e, "membership lease keepalive error");
-                            }
-                        }
-                    }
-                    resp = live_stream.message() => {
-                        if *shutdown_rx.borrow() { break; }
-                        match resp {
-                            Ok(Some(ka_resp)) => {
-                                debug!(node_id = %nid, ttl = ka_resp.ttl(), "liveness keepalive response received");
-                            }
-                            Ok(None) => {
-                                error!(node_id = %nid, "liveness lease keepalive stream closed! Lease will expire.");
-                            }
-                            Err(e) => {
-                                error!(node_id = %nid, error = %e, "liveness lease keepalive error");
                             }
                         }
                     }
@@ -401,10 +369,82 @@ impl EtcdCoordinator {
         }
     }
 
-    async fn reconcile_shards(
-        &self,
-        _lock: &mut etcd_client::LockClient,
-    ) -> Result<(), etcd_client::Error> {
+    /// Reclaim shards from a previous run and open them before normal reconciliation.
+    ///
+    /// This is called once at startup to recover shards this node still owns
+    /// from before a crash/restart. Each reclaimed shard is opened via the factory
+    /// (triggering SlateDB WAL recovery) and a guard in `Held` state is installed.
+    async fn reclaim_and_open_shards(&self) -> Result<(), CoordinationError> {
+        let reclaimed = self.reclaim_existing_leases().await?;
+        if reclaimed.is_empty() {
+            return Ok(());
+        }
+
+        let mut opened_count = 0u32;
+
+        for shard_id in &reclaimed {
+            // Look up range from shard map (short-lived lock)
+            let range = {
+                let shard_map = self.base.shard_map.lock().await;
+                match shard_map.get_shard(shard_id) {
+                    Some(info) => info.range.clone(),
+                    None => {
+                        warn!(shard_id = %shard_id, "reclaim: shard not found in shard map, skipping");
+                        continue;
+                    }
+                }
+            };
+
+            let shard = match self.base.factory.open(shard_id, &range).await {
+                Ok(shard) => shard,
+                Err(e) => {
+                    error!(shard_id = %shard_id, error = %e, "reclaim: failed to open shard, skipping");
+                    continue;
+                }
+            };
+
+            shard.maybe_spawn_background_cleanup(range);
+
+            {
+                let mut owned = self.base.owned.lock().await;
+                owned.insert(*shard_id);
+            }
+
+            let guard = EtcdShardGuard::new_reclaimed(
+                *shard_id,
+                self.client.clone(),
+                self.cluster_prefix.clone(),
+                self.base.node_id.clone(),
+                self.base.shutdown_rx.clone(),
+            );
+            let runner = guard.clone();
+            let owned_arc = self.base.owned.clone();
+            let factory = self.base.factory.clone();
+            let shard_map = self.base.shard_map.clone();
+            let coordinator: Arc<dyn Coordinator> = Arc::new(self.clone());
+            tokio::spawn(
+                async move { runner.run(owned_arc, factory, shard_map, coordinator).await },
+            );
+
+            {
+                let mut guards = self.shard_guards.lock().await;
+                guards.insert(*shard_id, guard);
+            }
+
+            opened_count += 1;
+        }
+
+        if opened_count > 0 {
+            info!(
+                count = opened_count,
+                "reclaimed and opened shards from previous run"
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn reconcile_shards(&self) -> Result<(), etcd_client::Error> {
         // Get full member info for ring-aware placement
         let members = self
             .get_members()
@@ -432,7 +472,7 @@ impl EtcdCoordinator {
             let g = self.shard_guards.lock().await;
             let mut v = Vec::new();
             for (sid, guard) in g.iter() {
-                if guard.state.lock().await.held_key.is_some() {
+                if guard.state.lock().await.is_held {
                     v.push(*sid);
                 }
             }
@@ -491,7 +531,7 @@ impl EtcdCoordinator {
             shard_id,
             self.client.clone(),
             self.cluster_prefix.clone(),
-            self.liveness_lease_id,
+            self.base.node_id.clone(),
             self.base.shutdown_rx.clone(),
         );
         let runner = guard.clone();
@@ -833,11 +873,6 @@ impl Coordinator for EtcdCoordinator {
             .clone()
             .lease_revoke(self.membership_lease_id)
             .await;
-        let _ = self
-            .client
-            .clone()
-            .lease_revoke(self.liveness_lease_id)
-            .await;
         Ok(())
     }
 
@@ -923,20 +958,78 @@ impl Coordinator for EtcdCoordinator {
             max_retries
         )))
     }
+
+    async fn force_release_shard_lease(&self, shard_id: &ShardId) -> Result<(), CoordinationError> {
+        let owner_key = keys::shard_owner_key(&self.cluster_prefix, shard_id);
+        let resp = self
+            .client
+            .kv_client()
+            .delete(owner_key, None)
+            .await
+            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+
+        if resp.deleted() == 0 {
+            return Err(CoordinationError::ShardNotFound(*shard_id));
+        }
+
+        info!(shard_id = %shard_id, "force-released shard lease");
+        Ok(())
+    }
+
+    async fn reclaim_existing_leases(&self) -> Result<Vec<ShardId>, CoordinationError> {
+        let shards_prefix = keys::shards_prefix(&self.cluster_prefix);
+        let resp = self
+            .client
+            .kv_client()
+            .get(shards_prefix, Some(GetOptions::new().with_prefix()))
+            .await
+            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+
+        let mut reclaimed = Vec::new();
+        for kv in resp.kvs() {
+            let value = String::from_utf8_lossy(kv.value());
+            if value == self.base.node_id {
+                // This shard's owner key has our node_id - parse the shard ID from the key path
+                let key_str = String::from_utf8_lossy(kv.key());
+                // Key format: {prefix}/coord/shards/{shard_id}/owner
+                if let Some(shard_id_str) = key_str
+                    .strip_suffix("/owner")
+                    .and_then(|s| s.rsplit('/').next())
+                {
+                    match shard_id_str.parse::<uuid::Uuid>() {
+                        Ok(uuid) => {
+                            let shard_id = ShardId::from(uuid);
+                            info!(shard_id = %shard_id, "found existing shard lease to reclaim");
+                            reclaimed.push(shard_id);
+                        }
+                        Err(e) => {
+                            warn!(key = %key_str, error = %e, "failed to parse shard ID from owner key");
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(reclaimed)
+    }
 }
 
 pub struct ShardState {
     pub desired: bool,
     pub phase: ShardPhase,
-    pub held_key: Option<Vec<u8>>,
+    pub is_held: bool,
 }
 
-/// Per-shard lock guard for etcd backend.
+/// Per-shard ownership guard for etcd backend.
+///
+/// Uses KV transactions (put-if-absent / delete-if-owner) for permanent shard
+/// ownership instead of the Lock API. Shard owner keys are not tied to any etcd
+/// lease, so they persist until explicitly deleted.
 pub struct EtcdShardGuard {
     pub shard_id: ShardId,
     pub client: Client,
     pub cluster_prefix: String,
-    pub liveness_lease_id: i64,
+    pub node_id: String,
     pub state: Mutex<ShardState>,
     pub notify: Notify,
     pub shutdown: watch::Receiver<bool>,
@@ -947,18 +1040,45 @@ impl EtcdShardGuard {
         shard_id: ShardId,
         client: Client,
         cluster_prefix: String,
-        liveness_lease_id: i64,
+        node_id: String,
         shutdown: watch::Receiver<bool>,
     ) -> Arc<Self> {
         Arc::new(Self {
             shard_id,
             client,
             cluster_prefix,
-            liveness_lease_id,
+            node_id,
             state: Mutex::new(ShardState {
                 desired: false,
                 phase: ShardPhase::Idle,
-                held_key: None,
+                is_held: false,
+            }),
+            notify: Notify::new(),
+            shutdown,
+        })
+    }
+
+    /// Create a guard already in Held state for a shard reclaimed from a previous run.
+    ///
+    /// The guard starts in `Held` phase with `desired: true` and `is_held: true`,
+    /// meaning it will sit in the `Idle | Held` wait arm until reconciliation
+    /// decides what to do with it.
+    pub fn new_reclaimed(
+        shard_id: ShardId,
+        client: Client,
+        cluster_prefix: String,
+        node_id: String,
+        shutdown: watch::Receiver<bool>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            shard_id,
+            client,
+            cluster_prefix,
+            node_id,
+            state: Mutex::new(ShardState {
+                desired: true,
+                phase: ShardPhase::Held,
+                is_held: true,
             }),
             notify: Notify::new(),
             shutdown,
@@ -1012,6 +1132,63 @@ impl EtcdShardGuard {
         debug!(shard_id = %self.shard_id, "wait_shutdown: timed out");
     }
 
+    /// Try to acquire shard ownership using a KV put-if-absent transaction.
+    /// Returns Ok(true) if acquired, Ok(false) if already owned by another node.
+    async fn try_acquire_ownership(&self) -> Result<bool, etcd_client::Error> {
+        let owner_key = self.owner_key();
+        let txn = etcd_client::Txn::new()
+            .when([etcd_client::Compare::create_revision(
+                owner_key.clone(),
+                etcd_client::CompareOp::Equal,
+                0,
+            )])
+            .and_then([etcd_client::TxnOp::put(
+                owner_key.clone(),
+                self.node_id.clone(),
+                None, // No lease - permanent ownership
+            )])
+            .or_else([etcd_client::TxnOp::get(owner_key, None)]);
+
+        let txn_resp = self.client.kv_client().txn(txn).await?;
+
+        if txn_resp.succeeded() {
+            return Ok(true);
+        }
+
+        // Key already exists - check if it's ours (reclaim scenario)
+        if let Some(etcd_client::TxnOpResponse::Get(get_resp)) = txn_resp.op_responses().first()
+            && let Some(kv) = get_resp.kvs().first()
+        {
+            let current_owner = String::from_utf8_lossy(kv.value());
+            if current_owner == self.node_id {
+                // Already ours from a previous run - reclaim
+                return Ok(true);
+            }
+            debug!(
+                shard_id = %self.shard_id,
+                current_owner = %current_owner,
+                "shard owned by another node"
+            );
+        }
+
+        Ok(false)
+    }
+
+    /// Release shard ownership using a KV delete-if-owner transaction.
+    async fn release_ownership(&self) -> Result<(), etcd_client::Error> {
+        let owner_key = self.owner_key();
+        let txn = etcd_client::Txn::new()
+            .when([etcd_client::Compare::value(
+                owner_key.clone(),
+                etcd_client::CompareOp::Equal,
+                self.node_id.clone(),
+            )])
+            .and_then([etcd_client::TxnOp::delete(owner_key, None)]);
+
+        let _ = self.client.kv_client().txn(txn).await?;
+        Ok(())
+    }
+
     pub async fn run(
         self: Arc<Self>,
         owned_arc: Arc<Mutex<HashSet<ShardId>>>,
@@ -1029,7 +1206,7 @@ impl EtcdShardGuard {
 
             {
                 let mut st = self.state.lock().await;
-                match (st.phase, st.desired, st.held_key.is_some()) {
+                match (st.phase, st.desired, st.is_held) {
                     (ShardPhase::ShutDown, _, _) => {}
                     (ShardPhase::ShuttingDown, _, _) => {}
                     (ShardPhase::Idle, true, false) => {
@@ -1054,11 +1231,9 @@ impl EtcdShardGuard {
             match phase {
                 ShardPhase::ShutDown => break,
                 ShardPhase::Acquiring => {
-                    let name = self.owner_key();
-                    let span =
-                        info_span!("shard.acquire", shard_id = %self.shard_id, lock_key = %name);
+                    let owner_key = self.owner_key();
+                    let span = info_span!("shard.acquire", shard_id = %self.shard_id, owner_key = %owner_key);
                     async {
-                        let mut lock_cli = self.client.lock_client();
                         let mut attempt: u32 = 0;
 
                         // Use first 8 bytes of UUID for jitter seed
@@ -1082,60 +1257,9 @@ impl EtcdShardGuard {
                                 }
                             }
 
-                            // Create a short-lived lease (3s TTL) for this specific lock attempt. If this attempt times out and we retry, the old lease will expire and clean up any orphan lock key, preventing it from blocking
-                            // subsequent attempts. We use 3s which is longer than our 500ms timeout to give etcd time to process the lock before it expires.
-                            let attempt_lease = match self.client.clone().lease_grant(3, None).await {
-                                Ok(resp) => resp.id(),
-                                Err(e) => {
-                                    warn!(shard_id = %self.shard_id, error = %e, "failed to create attempt lease, retrying");
-                                    tokio::time::sleep(Duration::from_millis(100)).await;
-                                    continue;
-                                }
-                            };
-
-                            match tokio::time::timeout(
-                                Duration::from_millis(500),
-                                lock_cli.lock(
-                                    name.as_bytes().to_vec(),
-                                    Some(LockOptions::new().with_lease(attempt_lease)),
-                                ),
-                            )
-                            .await
-                            {
-                                Ok(Ok(resp)) => {
-                                    let key = resp.key().to_vec();
-
-                                    // Successfully acquired the lock with the short-lived lease.
-                                    // Start keeping this lease alive so the lock doesn't expire.
-                                    let mut client_clone = self.client.clone();
-                                    let shutdown_rx = self.shutdown.clone();
-                                    tokio::spawn(async move {
-                                        // Keep the attempt lease alive until shutdown
-                                        let ka_result = client_clone.lease_keep_alive(attempt_lease).await;
-                                        if let Ok((mut keeper, mut stream)) = ka_result {
-                                            // Use an interval to enforce minimum 1 second between keepalives.
-                                            let mut keepalive_interval = tokio::time::interval(Duration::from_secs(1));
-                                            loop {
-                                                tokio::select! {
-                                                    _ = keepalive_interval.tick() => {
-                                                        if *shutdown_rx.borrow() {
-                                                            break;
-                                                        }
-                                                        if keeper.keep_alive().await.is_err() {
-                                                            break;
-                                                        }
-                                                    }
-                                                    resp = stream.message() => {
-                                                        // Process keepalive responses; break if stream closes
-                                                        if resp.is_err() || resp.unwrap().is_none() {
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    });
-
+                            // Try to acquire ownership via KV put-if-absent transaction
+                            match self.try_acquire_ownership().await {
+                                Ok(true) => {
                                     // Look up the shard's range from the shard map
                                     let range = {
                                         let map = shard_map.lock().await;
@@ -1143,20 +1267,17 @@ impl EtcdShardGuard {
                                             Some(info) => info.range.clone(),
                                             None => {
                                                 tracing::error!(shard_id = %self.shard_id, "shard not found in shard map");
-                                                let mut lock_cli = self.client.lock_client();
-                                                let _ = lock_cli.unlock(key).await;
+                                                let _ = self.release_ownership().await;
                                                 continue;
                                             }
                                         }
                                     };
-                                    // Open the shard BEFORE marking as Held - if open fails, we should release the lock and not claim ownership.
+                                    // Open the shard BEFORE marking as Held - if open fails, we should release ownership and not claim it.
                                     let shard = match factory.open(&self.shard_id, &range).await {
                                         Ok(shard) => shard,
                                         Err(e) => {
-                                            // Failed to open - release the lock and retry
-                                            tracing::error!(shard_id = %self.shard_id, error = %e, "failed to open shard, releasing lock");
-                                            let mut lock_cli = self.client.lock_client();
-                                            let _ = lock_cli.unlock(key).await;
+                                            tracing::error!(shard_id = %self.shard_id, error = %e, "failed to open shard, releasing ownership");
+                                            let _ = self.release_ownership().await;
                                             // Exponential backoff before retry
                                             let backoff_ms = 200 * (1 << attempt.min(5));
                                             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
@@ -1171,24 +1292,22 @@ impl EtcdShardGuard {
 
                                     {
                                         let mut st = self.state.lock().await;
-                                        st.held_key = Some(key);
+                                        st.is_held = true;
                                         st.phase = ShardPhase::Held;
                                     }
                                     {
                                         let mut owned = owned_arc.lock().await;
                                         owned.insert(self.shard_id);
                                     }
+                                    dst_events::emit(DstEvent::ShardAcquired {
+                                        node_id: self.node_id.clone(),
+                                        shard_id: self.shard_id.to_string(),
+                                    });
                                     info!(shard_id = %self.shard_id, attempts = attempt, "shard: acquired and opened");
                                     break;
                                 }
-                                Ok(Err(_)) | Err(_) => {
-                                    // Lock attempt failed or timed out. Revoke the attempt lease to
-                                    // immediately clean up any orphan key (best effort - if this fails,
-                                    // the lease will expire in 3s anyway).
-                                    if let Err(e) = self.client.clone().lease_revoke(attempt_lease).await {
-                                        debug!(shard_id = %self.shard_id, error = %e, "failed to revoke attempt lease (will expire in 3s)");
-                                    }
-
+                                Ok(false) => {
+                                    // Owned by another node - retry with jitter
                                     attempt = attempt.wrapping_add(1);
                                     let jitter_ms = (jitter_seed
                                         .wrapping_mul(31)
@@ -1199,6 +1318,11 @@ impl EtcdShardGuard {
                                         debug!(shard_id = %self.shard_id, attempt = attempt, "shard: acquire retry");
                                     }
                                 }
+                                Err(e) => {
+                                    warn!(shard_id = %self.shard_id, error = %e, "shard: acquire txn error, retrying");
+                                    attempt = attempt.wrapping_add(1);
+                                    tokio::time::sleep(Duration::from_millis(100)).await;
+                                }
                             }
                         }
                     }
@@ -1206,15 +1330,14 @@ impl EtcdShardGuard {
                     .await;
                 }
                 ShardPhase::Releasing => {
-                    let name = self.owner_key();
-                    let span =
-                        info_span!("shard.release", shard_id = %self.shard_id, lock_key = %name);
+                    let owner_key = self.owner_key();
+                    let span = info_span!("shard.release", shard_id = %self.shard_id, owner_key = %owner_key);
                     async {
                         debug!(shard_id = %self.shard_id, "shard: release start (delay)");
                         tokio::time::sleep(Duration::from_millis(100)).await;
 
                         let mut cancelled = false;
-                        let key_opt = {
+                        let was_held = {
                             let mut st = self.state.lock().await;
                             if st.phase == ShardPhase::ShuttingDown {
                                 // fall through
@@ -1223,28 +1346,48 @@ impl EtcdShardGuard {
                                 cancelled = true;
                                 debug!(shard_id = %self.shard_id, "shard: release cancelled");
                             }
-                            st.held_key.clone()
+                            st.is_held
                         };
                         if cancelled {
                             return;
                         }
-                        if let Some(key) = key_opt {
-                            // Close the shard before releasing the lock
-                            if let Err(e) = factory.close(&self.shard_id).await {
-                                tracing::error!(shard_id = %self.shard_id, error = %e, "failed to close shard before releasing lock");
+                        if was_held {
+                            // Close the shard before releasing ownership
+                            match factory.close(&self.shard_id).await {
+                                Ok(()) => {
+                                    dst_events::emit(DstEvent::ShardClosed {
+                                        node_id: self.node_id.clone(),
+                                        shard_id: self.shard_id.to_string(),
+                                    });
+                                    if let Err(e) = self.release_ownership().await {
+                                        tracing::error!(shard_id = %self.shard_id, error = %e, "failed to release shard ownership");
+                                    }
+                                    {
+                                        let mut st = self.state.lock().await;
+                                        st.is_held = false;
+                                        st.phase = ShardPhase::Idle;
+                                    }
+                                    {
+                                        let mut owned = owned_arc.lock().await;
+                                        owned.remove(&self.shard_id);
+                                    }
+                                    dst_events::emit(DstEvent::ShardReleased {
+                                        node_id: self.node_id.clone(),
+                                        shard_id: self.shard_id.to_string(),
+                                    });
+                                    debug!(shard_id = %self.shard_id, "shard: release done");
+                                }
+                                Err(e) => {
+                                    // Close failed - revert to Held so reconciliation retries
+                                    tracing::error!(
+                                        shard_id = %self.shard_id,
+                                        error = %e,
+                                        "failed to close shard, reverting to Held to prevent data loss"
+                                    );
+                                    let mut st = self.state.lock().await;
+                                    st.phase = ShardPhase::Held;
+                                }
                             }
-                            let mut lock_cli = self.client.lock_client();
-                            let _ = lock_cli.unlock(key).await;
-                            {
-                                let mut st = self.state.lock().await;
-                                st.held_key = None;
-                                st.phase = ShardPhase::Idle;
-                            }
-                            {
-                                let mut owned = owned_arc.lock().await;
-                                owned.remove(&self.shard_id);
-                            }
-                            debug!(shard_id = %self.shard_id, "shard: release done");
                         } else {
                             let mut st = self.state.lock().await;
                             st.phase = ShardPhase::Idle;
@@ -1255,22 +1398,48 @@ impl EtcdShardGuard {
                     .await;
                 }
                 ShardPhase::ShuttingDown => {
-                    let key_opt = { self.state.lock().await.held_key.clone() };
-                    if let Some(key) = key_opt {
-                        // Close the shard before releasing the lock
-                        if let Err(e) = factory.close(&self.shard_id).await {
-                            tracing::error!(shard_id = %self.shard_id, error = %e, "failed to close shard during shutdown");
-                        }
-                        let mut lock_cli = self.client.lock_client();
-                        let _ = lock_cli.unlock(key).await;
-                        {
-                            let mut owned = owned_arc.lock().await;
-                            owned.remove(&self.shard_id);
+                    let was_held = self.state.lock().await.is_held;
+                    if was_held {
+                        // Close the shard before releasing ownership
+                        let close_succeeded = match factory.close(&self.shard_id).await {
+                            Ok(()) => {
+                                dst_events::emit(DstEvent::ShardClosed {
+                                    node_id: self.node_id.clone(),
+                                    shard_id: self.shard_id.to_string(),
+                                });
+                                true
+                            }
+                            Err(e) => {
+                                // Close failed - do NOT release ownership.
+                                // This mimics crash behavior: the permanent lease stays held
+                                // until operator force-release, preventing another node from
+                                // acquiring unflushed data.
+                                tracing::error!(
+                                    shard_id = %self.shard_id,
+                                    error = %e,
+                                    "failed to close shard during shutdown, keeping ownership to prevent data loss"
+                                );
+                                false
+                            }
+                        };
+
+                        if close_succeeded {
+                            if let Err(e) = self.release_ownership().await {
+                                tracing::error!(shard_id = %self.shard_id, error = %e, "failed to release shard ownership during shutdown");
+                            }
+                            {
+                                let mut owned = owned_arc.lock().await;
+                                owned.remove(&self.shard_id);
+                            }
+                            dst_events::emit(DstEvent::ShardReleased {
+                                node_id: self.node_id.clone(),
+                                shard_id: self.shard_id.to_string(),
+                            });
                         }
                     }
                     {
                         let mut st = self.state.lock().await;
-                        st.held_key = None;
+                        st.is_held = false;
                         st.phase = ShardPhase::ShutDown;
                     }
                     break;

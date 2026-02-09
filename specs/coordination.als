@@ -115,7 +115,9 @@ sig ShardMapEntry {
 
 /**
  * A shard lease - indicates which node owns a shard at a given time.
- * In the implementation, this is an etcd lock on the shard's owner key.
+ * Shard leases are permanent: they persist until explicitly released
+ * (graceful shutdown) or force-released (operator action). They are
+ * NOT tied to membership leases and survive node flaps/crashes.
  */
 sig ShardLease {
     lease_shard: one Shard,
@@ -467,16 +469,16 @@ pred canServe[n: Node, s: Shard, t: Time] {
 
 /**
  * Node acquires lease on a shard.
- * 
- * In the implementation, this is an etcd Lock operation on the shard's owner key.
- * The lock is tied to the node's liveness lease.
- * 
+ *
+ * In the implementation, this is a put-if-absent on the shard's owner key.
+ * The lease is permanent (not tied to any etcd/k8s lease TTL).
+ *
  * Preconditions:
  * - Shard exists in the shard map
  * - No other node currently holds the lease
  * - Node is a member of the cluster
  * - Node has not flapped
- * 
+ *
  * Postconditions:
  * - Node holds the lease at tnext
  */
@@ -502,12 +504,13 @@ pred leaseAcquire[n: Node, s: Shard, t: Time, tnext: Time] {
 
 /**
  * Node releases lease on a shard.
- * 
- * In the implementation, this is an etcd Unlock operation.
- * 
+ *
+ * In the implementation, this is a delete-if-owner on the shard's owner key.
+ * Used during graceful shutdown.
+ *
  * Preconditions:
  * - Node holds the lease for the shard
- * 
+ *
  * Postconditions:
  * - No node holds the lease at tnext
  */
@@ -523,28 +526,24 @@ pred leaseRelease[n: Node, s: Shard, t: Time, tnext: Time] {
 }
 
 /**
- * Lease expires when node flaps.
- * 
- * When a node's membership lease expires in etcd, its shard leases
- * also expire because they are tied to the same liveness lease.
- * 
+ * Force-release a shard lease.
+ *
+ * Operator escape hatch for permanently lost nodes. Unconditionally
+ * releases a shard's lease regardless of the current holder.
+ *
  * Preconditions:
- * - Node held the lease
- * - Node has flapped (membership expired)
- * 
+ * - Shard has a lease holder
+ *
  * Postconditions:
  * - Lease is released (no holder)
  */
-pred leaseExpire[n: Node, s: Shard, t: Time, tnext: Time] {
-    -- Pre: Node held lease at t
-    holdsLease[n, s, t]
-    
-    -- Pre: Node flapped (will not be member at tnext)
-    hasFlapped[n, tnext] or not isMember[n, tnext]
-    
+pred forceReleaseLease[s: Shard, t: Time, tnext: Time] {
+    -- Pre: Shard has a lease holder
+    hasLeaseHolder[s, t]
+
     -- Post: No lease holder at tnext
     not hasLeaseHolder[s, tnext]
-    
+
     -- Frame: Other leases unchanged
     all s2: Shard | s2 != s implies (leaseHolder[s2, tnext] = leaseHolder[s2, t])
 }
@@ -1261,9 +1260,10 @@ fact wellFormed {
     -- A lease can only exist for a shard that exists
     all l: ShardLease | shardExists[l.lease_shard, l.lease_time]
     
-    -- A lease holder must be a member (unless flapping - caught elsewhere)
-    all l: ShardLease | isMember[l.lease_holder, l.lease_time] or hasFlapped[l.lease_holder, l.lease_time]
-    
+    -- With permanent leases, a lease can exist for nodes that are neither members
+    -- nor flapped (e.g., crashed and recovered but not yet rejoined). Leases can
+    -- only be *acquired* by members (enforced by leaseAcquireStep preconditions).
+
     -- At most one split per parent shard per time
     all s: Shard, t: Time | lone sp: SplitInProgress | sp.split_parent = s and sp.split_time = t
     
@@ -1427,7 +1427,7 @@ pred step[t: Time, tnext: Time] {
     -- Lease transitions
     or (some n: Node, s: Shard | leaseAcquireStep[n, s, t, tnext])
     or (some n: Node, s: Shard | leaseReleaseStep[n, s, t, tnext])
-    or (some n: Node, s: Shard | leaseExpireStep[n, s, t, tnext])
+    or (some s: Shard | forceReleaseLeaseStep[s, t, tnext])
     
     -- Split transitions
     or (some n: Node, s: Shard, sp: SplitPoint, left, right: Shard | 
@@ -1489,43 +1489,44 @@ pred nodeLeaveStep[n: Node, t: Time, tnext: Time] {
     workerFrame[t, tnext]
 }
 
-/** Node flaps (loses connectivity) with full frame conditions */
+/** Node flaps (loses connectivity) with full frame conditions.
+ * With permanent shard leases, leases persist through flap. The node
+ * loses membership but retains its shard leases. When it recovers and
+ * rejoins, it can reclaim its shards and process the WAL. */
 pred nodeFlapStep[n: Node, t: Time, tnext: Time] {
     -- Preconditions
     isMember[n, t]
     not hasFlapped[n, t]
-    
+
     -- Postconditions
     not isMember[n, tnext]
     hasFlapped[n, tnext]
-    
-    -- All leases held by this node expire
-    all s: Shard | holdsLease[n, s, t] implies not hasLeaseHolder[s, tnext]
-    
+
+    -- Permanent leases: all leases are preserved through flap
+    leaseFrame[t, tnext]
+
     -- All incomplete splits are abandoned when the node crashes.
     -- The shard map update is the commit point - if children don't exist in the shard map,
     -- the split never completed and is safe to abandon. Orphaned clone databases may exist
     -- but don't affect correctness.
-    all s: Shard | (holdsLease[n, s, t] and splitInProgressFor[s, t] and 
+    all s: Shard | (holdsLease[n, s, t] and splitInProgressFor[s, t] and
                     splitPhaseAt[s, t] in (SplitRequested + SplitPausing + SplitCloning)) implies
         not splitInProgressFor[s, tnext]
-    
+
     -- SplitComplete phase splits are also cleaned up (just the record deletion)
-    all s: Shard | (holdsLease[n, s, t] and splitInProgressFor[s, t] and 
+    all s: Shard | (holdsLease[n, s, t] and splitInProgressFor[s, t] and
                     splitPhaseAt[s, t] = SplitComplete) implies
         not splitInProgressFor[s, tnext]
-    
+
     -- Splits not involving shards held by n are unchanged
     all s: Shard | not holdsLease[n, s, t] implies {
         splitInProgressFor[s, tnext] iff splitInProgressFor[s, t]
         splitInProgressFor[s, t] implies splitPhaseAt[s, tnext] = splitPhaseAt[s, t]
     }
-    
+
     -- Frame conditions for other nodes
     membershipFrameExcept[n, t, tnext]
     shardMapFrame[t, tnext]
-    -- Leases for shards NOT held by n are unchanged
-    all s: Shard | not holdsLease[n, s, t] implies leaseHolder[s, tnext] = leaseHolder[s, t]
     workerFrame[t, tnext]
 }
 
@@ -1603,15 +1604,15 @@ pred leaseReleaseStep[n: Node, s: Shard, t: Time, tnext: Time] {
     workerFrame[t, tnext]
 }
 
-/** Lease expire (due to node flap) with full frame conditions */
-pred leaseExpireStep[n: Node, s: Shard, t: Time, tnext: Time] {
+/** Force-release a shard lease with full frame conditions.
+ * Operator escape hatch for permanently lost nodes. */
+pred forceReleaseLeaseStep[s: Shard, t: Time, tnext: Time] {
     -- Preconditions
-    holdsLease[n, s, t]
-    hasFlapped[n, t] or not isMember[n, t]
-    
+    hasLeaseHolder[s, t]
+
     -- Postconditions
     not hasLeaseHolder[s, tnext]
-    
+
     -- Frame conditions
     membershipFrame[t, tnext]
     shardMapFrame[t, tnext]
@@ -2028,14 +2029,26 @@ assert splitPausedBeforeClone {
 }
 
 /**
- * [SILO-COORD-INV-6] Leases require membership.
- * 
- * A node can only hold a lease if it is a member of the cluster
- * (or is in the process of flapping, where the lease hasn't expired yet).
+ * [SILO-COORD-INV-6] Lease acquisition requires membership.
+ *
+ * A lease can only be *acquired* by a node that is a current member.
+ * Existing leases persist through flaps (permanent leases).
  */
-assert leaseRequiresMembership {
-    all l: ShardLease | 
-        isMember[l.lease_holder, l.lease_time] or hasFlapped[l.lease_holder, l.lease_time]
+assert leaseAcquireRequiresMembership {
+    all n: Node, s: Shard, t: Time, tnext: Time |
+        leaseAcquireStep[n, s, t, tnext] implies isMember[n, t]
+}
+
+/**
+ * [SILO-COORD-INV-14] Node flap preserves all shard leases.
+ *
+ * When a node flaps (loses connectivity), its shard leases are preserved.
+ * This ensures the crashed node's WAL can be recovered when it restarts.
+ */
+assert flapPreservesLeases {
+    all n: Node, t: Time, tnext: Time |
+        nodeFlapStep[n, t, tnext] implies
+            (all s: Shard | leaseHolder[s, tnext] = leaseHolder[s, t])
 }
 
 /**
@@ -2225,33 +2238,71 @@ pred exampleNodeHandover {
 }
 
 /**
- * Example: Node flap scenario - node loses connectivity but split-brain prevented.
- * 
+ * Example: Node flap with permanent leases.
+ *
+ * With permanent shard leases, a flapping node retains its lease.
+ * Another node cannot acquire the shard until it is force-released.
+ *
  * This trace requires:
  * 1. Create shard (init->t1)
  * 2. n1 joins (t1->t2)
  * 3. n1 acquires lease (t2->t3)
- * 4. n1 flaps (t3->t4) - lease expires
- * 5. n2 joins (t4->t5)
- * 6. n2 acquires lease (t5->t6)
- * 
- * Key property: n1 cannot serve after flapping, n2 can serve after acquiring
+ * 4. n1 flaps (t3->t4) - lease preserved
+ * 5. Operator force-releases n1's shard lease (t4->t5)
+ * 6. n2 joins (t5->t6)
+ * 7. n2 acquires lease (t6->t7)
+ *
+ * Key property: n1 retains lease after flap, n2 can only acquire after force-release
  */
-pred exampleNodeFlapSafe {
+pred exampleNodeFlapPermanentLease {
     some n1, n2: Node, s: Shard | {
         n1 != n2
-        
+
         -- At some point after setup, n1 owns and can serve
         some t: Time | holdsLease[n1, s, t] and canServe[n1, s, t]
-        
-        -- Then n1 flaps
-        some tFlap: Time | hasFlapped[n1, tFlap] and not holdsLease[n1, s, tFlap]
-        
-        -- Then n2 acquires and can serve (after n1's lease expired)
+
+        -- Then n1 flaps but retains the lease
+        some tFlap: Time | hasFlapped[n1, tFlap] and holdsLease[n1, s, tFlap]
+
+        -- n1 cannot serve while flapped (despite holding lease)
+        all t: Time | hasFlapped[n1, t] implies not canServe[n1, s, t]
+
+        -- After force-release, n2 acquires and can serve
         some tAcq: Time | holdsLease[n2, s, tAcq] and canServe[n2, s, tAcq]
-        
-        -- Critical: when n2 serves, n1 cannot serve (split-brain prevention)
-        all t: Time | holdsLease[n2, s, t] implies not canServe[n1, s, t]
+    }
+}
+
+/**
+ * Example: Node restart and lease reclaim.
+ *
+ * n1 owns shard, flaps, recovers, rejoins, still holds lease, resumes serving.
+ *
+ * This trace requires:
+ * 1. Create shard
+ * 2. n1 joins
+ * 3. n1 acquires lease
+ * 4. n1 flaps - lease preserved
+ * 5. n1 recovers (no longer flapped)
+ * 6. n1 rejoins
+ * 7. n1 can serve again (still holds lease + is member)
+ */
+pred exampleNodeRestart {
+    some n: Node, s: Shard | {
+        -- n owns and can serve
+        some t1: Time | holdsLease[n, s, t1] and canServe[n, s, t1]
+
+        -- n flaps but retains lease
+        some t2: Time | hasFlapped[n, t2] and holdsLease[n, s, t2] and not canServe[n, s, t2]
+
+        -- n recovers and rejoins, still holds lease, can serve again
+        some t3: Time | {
+            isMember[n, t3]
+            holdsLease[n, s, t3]
+            canServe[n, s, t3]
+            not hasFlapped[n, t3]
+            -- t3 is after the flap
+            some t2: Time | hasFlapped[n, t2] and lt[t2, t3]
+        }
     }
 }
 
@@ -2351,39 +2402,38 @@ pred exampleWorkerDuringSplit {
 
 /**
  * Example: Crash during split before UpdateMap (early phase).
- * 
+ *
  * Scenario:
  * - n1 starts a split (reaches SplitPausing or SplitCloning phase)
- * - n1 crashes (flaps)
- * - Split is abandoned (state cleared because children don't exist yet)
+ * - n1 crashes (flaps) - lease preserved, split abandoned
+ * - Operator force-releases n1's shard lease
  * - n2 acquires lease on parent shard
- * - n2 can optionally start a new split
- * 
+ *
  * Key property: The parent shard remains available after the crash,
  * and the system can proceed without the partial split.
  */
 pred exampleCrashDuringEarlySplit {
     some n1, n2: Node, parent: Shard | {
         n1 != n2
-        
+
         -- n1 starts split and reaches an early phase
         some tSplit: Time | {
             holdsLease[n1, parent, tSplit]
             splitInProgressFor[parent, tSplit]
             splitPhaseAt[parent, tSplit] in (SplitPausing + SplitCloning)
         }
-        
-        -- n1 crashes
-        some tFlap: Time | hasFlapped[n1, tFlap]
-        
+
+        -- n1 crashes (lease preserved)
+        some tFlap: Time | hasFlapped[n1, tFlap] and holdsLease[n1, parent, tFlap]
+
         -- After crash, split is abandoned (no longer in progress)
         some tAfter: Time | {
             not splitInProgressFor[parent, tAfter]
             -- Parent shard still exists and is usable
             shardExists[parent, tAfter]
         }
-        
-        -- n2 takes over the parent shard
+
+        -- After force-release, n2 takes over the parent shard
         some tTakeover: Time | holdsLease[n2, parent, tTakeover]
     }
 }
@@ -2461,19 +2511,27 @@ run exampleClusterCreation for 3 but
     6 TenantOrder
 
 -- Node handover example (needs 7+ steps)
-run exampleNodeHandover for 3 but 
-    exactly 3 Node, exactly 1 Shard, exactly 3 Addr, 
-    exactly 3 TenantId, exactly 8 Time, exactly 1 SplitPoint, exactly 1 Worker,
-    8 NodeMembership, 8 NodeFlapped, 8 ShardMapEntry, 8 ShardLease, 
-    8 SplitInProgress, 8 WorkerRouteCache, 8 WorkerRequest, 8 WorkerRetryableError,
+run exampleNodeHandover for 3 but
+    exactly 3 Node, exactly 1 Shard, exactly 3 Addr,
+    exactly 3 TenantId, exactly 10 Time, exactly 1 SplitPoint, exactly 1 Worker,
+    10 NodeMembership, 10 NodeFlapped, 10 ShardMapEntry, 10 ShardLease,
+    10 SplitInProgress, 10 WorkerRouteCache, 10 WorkerRequest, 10 WorkerRetryableError,
     6 TenantOrder
 
--- Node flap safety example (needs 8+ steps: create, join, acquire, flap, join2, acquire2, ...)
-run exampleNodeFlapSafe for 3 but 
-    exactly 3 Node, exactly 1 Shard, exactly 3 Addr, 
-    exactly 3 TenantId, exactly 8 Time, exactly 1 SplitPoint, exactly 1 Worker,
-    8 NodeMembership, 8 NodeFlapped, 8 ShardMapEntry, 8 ShardLease, 
-    8 SplitInProgress, 8 WorkerRouteCache, 8 WorkerRequest, 8 WorkerRetryableError,
+-- Node flap with permanent lease (needs 9+ steps: create, join, acquire, flap, force-release, join2, acquire2, ...)
+run exampleNodeFlapPermanentLease for 3 but
+    exactly 3 Node, exactly 1 Shard, exactly 3 Addr,
+    exactly 3 TenantId, exactly 10 Time, exactly 1 SplitPoint, exactly 1 Worker,
+    10 NodeMembership, 10 NodeFlapped, 10 ShardMapEntry, 10 ShardLease,
+    10 SplitInProgress, 10 WorkerRouteCache, 10 WorkerRequest, 10 WorkerRetryableError,
+    6 TenantOrder
+
+-- Node restart and lease reclaim (needs 8+ steps: create, join, acquire, flap, recover, rejoin, ...)
+run exampleNodeRestart for 3 but
+    exactly 2 Node, exactly 1 Shard, exactly 2 Addr,
+    exactly 3 TenantId, exactly 10 Time, exactly 1 SplitPoint, exactly 0 Worker,
+    10 NodeMembership, 10 NodeFlapped, 10 ShardMapEntry, 10 ShardLease,
+    10 SplitInProgress, 0 WorkerRouteCache, 0 WorkerRequest, 0 WorkerRetryableError,
     6 TenantOrder
 
 -- Shard split example (needs 10+ steps: create, join, acquire, split phases x5, ...)
@@ -2553,8 +2611,15 @@ check splitPausedBeforeClone for 3 but
     6 SplitInProgress, 0 WorkerRouteCache, 0 WorkerRequest, 0 WorkerRetryableError,
     8 TenantOrder
 
--- Lease membership requirement
-check leaseRequiresMembership for 3 but 
+-- Lease acquisition requires membership
+check leaseAcquireRequiresMembership for 3 but
+    2 Node, 2 Shard, 2 Addr, 3 TenantId, 6 Time, 1 SplitPoint, 0 Worker,
+    6 NodeMembership, 6 NodeFlapped, 6 ShardMapEntry, 6 ShardLease,
+    6 SplitInProgress, 0 WorkerRouteCache, 0 WorkerRequest, 0 WorkerRetryableError,
+    6 TenantOrder
+
+-- Flap preserves leases
+check flapPreservesLeases for 3 but
     2 Node, 2 Shard, 2 Addr, 3 TenantId, 6 Time, 1 SplitPoint, 0 Worker,
     6 NodeMembership, 6 NodeFlapped, 6 ShardMapEntry, 6 ShardLease,
     6 SplitInProgress, 0 WorkerRouteCache, 0 WorkerRequest, 0 WorkerRetryableError,

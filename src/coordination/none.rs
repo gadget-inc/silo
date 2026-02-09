@@ -160,6 +160,19 @@ impl Coordinator for NoneCoordinator {
         })
     }
 
+    async fn force_release_shard_lease(
+        &self,
+        _shard_id: &ShardId,
+    ) -> Result<(), CoordinationError> {
+        // No-op in single-node mode - no external coordination
+        Ok(())
+    }
+
+    async fn reclaim_existing_leases(&self) -> Result<Vec<ShardId>, CoordinationError> {
+        // Single-node mode always owns everything, no reclamation needed
+        Ok(vec![])
+    }
+
     async fn update_shard_placement_ring(
         &self,
         shard_id: &ShardId,

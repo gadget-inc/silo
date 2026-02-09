@@ -299,6 +299,15 @@ pub struct CoordinationConfig {
     /// To participate in both default and named rings, explicitly include "default".
     #[serde(default)]
     pub placement_rings: Vec<String>,
+
+    /// Stable node identity for this silo instance.
+    /// If not set, a random UUID is generated on each startup.
+    ///
+    /// For Kubernetes StatefulSet deployments with permanent shard leases,
+    /// set this to the pod name (e.g., `node_id = "${POD_NAME}"`) so that
+    /// a restarted pod re-acquires its own leases automatically.
+    #[serde(default)]
+    pub node_id: Option<String>,
 }
 
 impl Default for CoordinationConfig {
@@ -312,6 +321,7 @@ impl Default for CoordinationConfig {
             etcd_endpoints: default_etcd_endpoints(),
             k8s_namespace: default_k8s_namespace(),
             placement_rings: Vec::new(),
+            node_id: None,
         }
     }
 }

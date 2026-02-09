@@ -531,6 +531,16 @@ message ImportJobsResponse {
   repeated ImportJobResult results = 1;
 }
 
+// Request to force-release a shard's ownership lease.
+// Operator escape hatch for permanently lost nodes.
+message ForceReleaseShardRequest {
+  string shard = 1; // The shard ID (UUID) to force-release.
+}
+
+// Response after force-releasing a shard lease.
+message ForceReleaseShardResponse {
+  bool released = 1; // True if the lease was released.
+}
 // The Silo job queue service.
 service Silo {
   // Get cluster topology for client-side routing.
@@ -632,4 +642,9 @@ service Silo {
   // WARNING: Destructive operation. Only available in dev mode.
   // Clears all jobs, tasks, queues, and other data.
   rpc ResetShards(ResetShardsRequest) returns (ResetShardsResponse);
+
+  // Force-release a shard lease regardless of the current holder.
+  // Operator escape hatch for recovering from permanently lost nodes.
+  // After force-release, any live node that desires the shard can acquire it.
+  rpc ForceReleaseShard(ForceReleaseShardRequest) returns (ForceReleaseShardResponse);
 }

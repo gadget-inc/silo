@@ -1,0 +1,34 @@
+[server]
+grpc_addr = "0.0.0.0:50051"
+
+[logging]
+format = "json"
+
+[coordination]
+backend = "k8s"
+cluster_prefix = "silo-local-test"
+lease_ttl_secs = 10
+initial_shard_count = 6
+k8s_namespace = "silo-test"
+advertised_grpc_addr = "${POD_IP}:50051"
+
+[tenancy]
+enabled = true
+
+[webui]
+enabled = true
+addr = "0.0.0.0:50052"
+
+[metrics]
+enabled = true
+addr = "0.0.0.0:9090"
+
+[database]
+backend = "fs"
+# Shared hostPath volume simulates shared object storage
+path = "/data/shared/%shard%"
+
+[database.wal]
+backend = "fs"
+# Local WAL per pod for low-latency writes
+path = "/data/wal/%shard%"

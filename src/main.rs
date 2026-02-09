@@ -73,7 +73,11 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     // Initialize coordination - coordinator will open/close shards as ownership changes
-    let node_id = uuid::Uuid::new_v4().to_string();
+    let node_id = cfg
+        .coordination
+        .node_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     // Use advertised_grpc_addr if set, otherwise fall back to the bind address.
     // This allows separating the bind address (e.g., 0.0.0.0:50051) from the
     // address other nodes should use to connect (e.g., pod-ip:50051).
@@ -225,7 +229,15 @@ async fn main() -> anyhow::Result<()> {
         let _ = handle.await;
     }
 
-    // Close all shards gracefully before exit
+    // Gracefully shutdown the coordinator, releasing all shard leases.
+    // This must happen before factory.close_all() because the coordinator's shutdown
+    // closes each shard and then releases its lease (important for permanent leases
+    // which persist across crashes and would otherwise block reacquisition).
+    if let Err(e) = coordinator.shutdown().await {
+        error!(error = %e, "failed to shutdown coordinator");
+    }
+
+    // Close any remaining shards not handled by the coordinator shutdown
     if let Err(e) = factory.close_all().await {
         error!(error = %e, "failed to close some shards during shutdown");
     }

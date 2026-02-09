@@ -1428,6 +1428,29 @@ export interface ImportJobsResponse {
     results: ImportJobResult[];
 }
 /**
+ * Request to force-release a shard's ownership lease.
+ * Operator escape hatch for permanently lost nodes.
+ *
+ * @generated from protobuf message silo.v1.ForceReleaseShardRequest
+ */
+export interface ForceReleaseShardRequest {
+    /**
+     * @generated from protobuf field: string shard = 1
+     */
+    shard: string; // The shard ID (UUID) to force-release.
+}
+/**
+ * Response after force-releasing a shard lease.
+ *
+ * @generated from protobuf message silo.v1.ForceReleaseShardResponse
+ */
+export interface ForceReleaseShardResponse {
+    /**
+     * @generated from protobuf field: bool released = 1
+     */
+    released: boolean; // True if the lease was released.
+}
+/**
  * Rate limiting algorithm for Gubernator-based limits.
  *
  * @generated from protobuf enum silo.v1.GubernatorAlgorithm
@@ -5907,6 +5930,100 @@ class ImportJobsResponse$Type extends MessageType<ImportJobsResponse> {
  * @generated MessageType for protobuf message silo.v1.ImportJobsResponse
  */
 export const ImportJobsResponse = new ImportJobsResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class ForceReleaseShardRequest$Type extends MessageType<ForceReleaseShardRequest> {
+    constructor() {
+        super("silo.v1.ForceReleaseShardRequest", [
+            { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value?: PartialMessage<ForceReleaseShardRequest>): ForceReleaseShardRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.shard = "";
+        if (value !== undefined)
+            reflectionMergePartial<ForceReleaseShardRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: ForceReleaseShardRequest): ForceReleaseShardRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string shard */ 1:
+                    message.shard = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: ForceReleaseShardRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string shard = 1; */
+        if (message.shard !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.shard);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.ForceReleaseShardRequest
+ */
+export const ForceReleaseShardRequest = new ForceReleaseShardRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class ForceReleaseShardResponse$Type extends MessageType<ForceReleaseShardResponse> {
+    constructor() {
+        super("silo.v1.ForceReleaseShardResponse", [
+            { no: 1, name: "released", kind: "scalar", T: 8 /*ScalarType.BOOL*/ }
+        ]);
+    }
+    create(value?: PartialMessage<ForceReleaseShardResponse>): ForceReleaseShardResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.released = false;
+        if (value !== undefined)
+            reflectionMergePartial<ForceReleaseShardResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: ForceReleaseShardResponse): ForceReleaseShardResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* bool released */ 1:
+                    message.released = reader.bool();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: ForceReleaseShardResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* bool released = 1; */
+        if (message.released !== false)
+            writer.tag(1, WireType.Varint).bool(message.released);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.ForceReleaseShardResponse
+ */
+export const ForceReleaseShardResponse = new ForceReleaseShardResponse$Type();
 /**
  * @generated ServiceType for protobuf service silo.v1.Silo
  */
@@ -5931,5 +6048,6 @@ export const Silo = new ServiceType("silo.v1.Silo", [
     { name: "GetSplitStatus", options: {}, I: GetSplitStatusRequest, O: GetSplitStatusResponse },
     { name: "ConfigureShard", options: {}, I: ConfigureShardRequest, O: ConfigureShardResponse },
     { name: "ImportJobs", options: {}, I: ImportJobsRequest, O: ImportJobsResponse },
-    { name: "ResetShards", options: {}, I: ResetShardsRequest, O: ResetShardsResponse }
+    { name: "ResetShards", options: {}, I: ResetShardsRequest, O: ResetShardsResponse },
+    { name: "ForceReleaseShard", options: {}, I: ForceReleaseShardRequest, O: ForceReleaseShardResponse }
 ]);
