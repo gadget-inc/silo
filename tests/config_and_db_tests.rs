@@ -449,8 +449,8 @@ fn expand_env_vars_dollar_without_brace() {
 fn expand_env_vars_real_k8s_example() {
     // SAFETY: Test runs single-threaded and uses a unique env var name
     unsafe { std::env::set_var("POD_IP", "10.0.0.5") };
-    let input = "${POD_IP}:50051";
-    assert_eq!(expand_env_vars_for_test(input), "10.0.0.5:50051");
+    let input = "${POD_IP}:7450";
+    assert_eq!(expand_env_vars_for_test(input), "10.0.0.5:7450");
     unsafe { std::env::remove_var("POD_IP") };
 }
 

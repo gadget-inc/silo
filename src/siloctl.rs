@@ -20,7 +20,7 @@ use tonic::transport::Channel;
 /// Global options that apply to all siloctl commands
 #[derive(Debug, Clone)]
 pub struct GlobalOptions {
-    /// Silo server address (e.g., http://localhost:50051)
+    /// Silo server address (e.g., http://localhost:7450)
     pub address: String,
     /// Tenant ID for multi-tenant clusters
     pub tenant: Option<String>,
@@ -31,7 +31,7 @@ pub struct GlobalOptions {
 impl Default for GlobalOptions {
     fn default() -> Self {
         Self {
-            address: "http://localhost:50051".to_string(),
+            address: "http://localhost:7450".to_string(),
             tenant: None,
             json: false,
         }

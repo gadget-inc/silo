@@ -109,7 +109,7 @@ describe("SiloGRPCClient", () => {
   describe("constructor", () => {
     it("accepts a string server address", () => {
       const client = createClient({
-        servers: "localhost:50051",
+        servers: "localhost:7450",
         ...defaultOptions,
       });
       expect(client).toBeInstanceOf(SiloGRPCClient);
@@ -117,7 +117,7 @@ describe("SiloGRPCClient", () => {
 
     it("accepts multiple server addresses", () => {
       const client = createClient({
-        servers: ["localhost:50051", "localhost:50052"],
+        servers: ["localhost:7450", "localhost:7451"],
         ...defaultOptions,
       });
       expect(client).toBeInstanceOf(SiloGRPCClient);
@@ -125,7 +125,7 @@ describe("SiloGRPCClient", () => {
 
     it("accepts a host/port server address", () => {
       const client = createClient({
-        servers: { host: "localhost", port: 50051 },
+        servers: { host: "localhost", port: 7450 },
         ...defaultOptions,
       });
       expect(client).toBeInstanceOf(SiloGRPCClient);
@@ -133,7 +133,7 @@ describe("SiloGRPCClient", () => {
 
     it("accepts a string token", () => {
       const client = createClient({
-        servers: "localhost:50051",
+        servers: "localhost:7450",
         token: "my-token",
         ...defaultOptions,
       });
@@ -142,7 +142,7 @@ describe("SiloGRPCClient", () => {
 
     it("accepts a token function", () => {
       const client = createClient({
-        servers: "localhost:50051",
+        servers: "localhost:7450",
         token: async () => "my-token",
         ...defaultOptions,
       });
@@ -151,7 +151,7 @@ describe("SiloGRPCClient", () => {
 
     it("accepts custom grpc client options", () => {
       const client = createClient({
-        servers: "localhost:50051",
+        servers: "localhost:7450",
         ...defaultOptions,
         grpcClientOptions: {
           "grpc.max_send_message_length": 1024 * 1024,
@@ -162,7 +162,7 @@ describe("SiloGRPCClient", () => {
 
     it("accepts custom rpc options", () => {
       const client = createClient({
-        servers: "localhost:50051",
+        servers: "localhost:7450",
         ...defaultOptions,
         rpcOptions: { timeout: 5000 },
       });
@@ -171,7 +171,7 @@ describe("SiloGRPCClient", () => {
 
     it("accepts rpc options as a function", () => {
       const client = createClient({
-        servers: "localhost:50051",
+        servers: "localhost:7450",
         ...defaultOptions,
         rpcOptions: () => ({ timeout: 5000 }),
       });
@@ -271,7 +271,7 @@ describe("SiloGRPCClient", () => {
     describe("getTopology", () => {
       it("returns the current topology", () => {
         const client = createClient({
-          servers: "localhost:50051",
+          servers: "localhost:7450",
           useTls: false,
           shardRouting: {
             topologyRefreshIntervalMs: 0,
@@ -287,7 +287,7 @@ describe("SiloGRPCClient", () => {
     describe("handle factory", () => {
       it("creates a JobHandle for an existing job ID", () => {
         const client = createClient({
-          servers: "localhost:50051",
+          servers: "localhost:7450",
           ...defaultOptions,
         });
 
@@ -300,7 +300,7 @@ describe("SiloGRPCClient", () => {
 
       it("creates a JobHandle without tenant", () => {
         const client = createClient({
-          servers: "localhost:50051",
+          servers: "localhost:7450",
           ...defaultOptions,
         });
 

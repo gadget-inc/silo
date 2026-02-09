@@ -121,7 +121,7 @@ async fn k8s_single_node_owns_all_shards() {
         &namespace,
         &prefix,
         "test-node-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
 
@@ -159,7 +159,7 @@ async fn k8s_multiple_nodes_partition_shards() {
         &namespace,
         &prefix,
         "test-node-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
 
@@ -171,7 +171,7 @@ async fn k8s_multiple_nodes_partition_shards() {
             &namespace,
             &prefix,
             "test-node-2",
-            "http://127.0.0.1:50052",
+            "http://127.0.0.1:7451",
             num_shards,
             10,
         ),
@@ -225,7 +225,7 @@ async fn k8s_rebalances_on_membership_change() {
         &namespace,
         &prefix,
         "test-node-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
 
@@ -249,7 +249,7 @@ async fn k8s_rebalances_on_membership_change() {
             &namespace,
             &prefix,
             "test-node-2",
-            "http://127.0.0.1:50052",
+            "http://127.0.0.1:7451",
             num_shards,
             10,
         ),
@@ -295,7 +295,7 @@ async fn k8s_three_nodes_even_distribution() {
         &namespace,
         &prefix,
         "node-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
 
@@ -306,7 +306,7 @@ async fn k8s_three_nodes_even_distribution() {
             &namespace,
             &prefix,
             "node-2",
-            "http://127.0.0.1:50052",
+            "http://127.0.0.1:7451",
             num_shards,
             10,
         ),
@@ -321,7 +321,7 @@ async fn k8s_three_nodes_even_distribution() {
             &namespace,
             &prefix,
             "node-3",
-            "http://127.0.0.1:50053",
+            "http://127.0.0.1:7452",
             num_shards,
             10,
         ),
@@ -401,7 +401,7 @@ async fn k8s_removing_node_rebalances() {
         &namespace,
         &prefix,
         "node-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
 
@@ -412,7 +412,7 @@ async fn k8s_removing_node_rebalances() {
             &namespace,
             &prefix,
             "node-2",
-            "http://127.0.0.1:50052",
+            "http://127.0.0.1:7451",
             num_shards,
             10,
         ),
@@ -427,7 +427,7 @@ async fn k8s_removing_node_rebalances() {
             &namespace,
             &prefix,
             "node-3",
-            "http://127.0.0.1:50053",
+            "http://127.0.0.1:7452",
             num_shards,
             10,
         ),
@@ -492,7 +492,7 @@ async fn k8s_rapid_membership_churn_converges() {
         &namespace,
         &prefix,
         "node-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
 
@@ -503,7 +503,7 @@ async fn k8s_rapid_membership_churn_converges() {
             &namespace,
             &prefix,
             "node-2",
-            "http://127.0.0.1:50052",
+            "http://127.0.0.1:7451",
             num_shards,
             10,
         ),
@@ -518,7 +518,7 @@ async fn k8s_rapid_membership_churn_converges() {
             &namespace,
             &prefix,
             "node-3",
-            "http://127.0.0.1:50053",
+            "http://127.0.0.1:7452",
             num_shards,
             10,
         ),
@@ -539,7 +539,7 @@ async fn k8s_rapid_membership_churn_converges() {
             &namespace,
             &prefix,
             "node-2",
-            "http://127.0.0.1:50052",
+            "http://127.0.0.1:7451",
             num_shards,
             10,
         ),
@@ -626,7 +626,7 @@ async fn k8s_get_members_returns_correct_info() {
         &namespace,
         &prefix,
         "member-node-1",
-        "http://10.0.0.1:50051",
+        "http://10.0.0.1:7450",
         num_shards
     );
 
@@ -637,7 +637,7 @@ async fn k8s_get_members_returns_correct_info() {
             &namespace,
             &prefix,
             "member-node-2",
-            "http://10.0.0.2:50052",
+            "http://10.0.0.2:7451",
             num_shards,
             10,
         ),
@@ -672,8 +672,8 @@ async fn k8s_get_members_returns_correct_info() {
     // Verify addresses
     for m in &members_from_c1 {
         match m.node_id.as_str() {
-            "member-node-1" => assert_eq!(m.grpc_addr, "http://10.0.0.1:50051"),
-            "member-node-2" => assert_eq!(m.grpc_addr, "http://10.0.0.2:50052"),
+            "member-node-1" => assert_eq!(m.grpc_addr, "http://10.0.0.1:7450"),
+            "member-node-2" => assert_eq!(m.grpc_addr, "http://10.0.0.2:7451"),
             other => panic!("unexpected member: {}", other),
         }
     }
@@ -696,7 +696,7 @@ async fn k8s_get_shard_owner_map_accurate() {
         &namespace,
         &prefix,
         "map-node-1",
-        "http://10.0.0.1:50051",
+        "http://10.0.0.1:7450",
         num_shards
     );
 
@@ -707,7 +707,7 @@ async fn k8s_get_shard_owner_map_accurate() {
             &namespace,
             &prefix,
             "map-node-2",
-            "http://10.0.0.2:50052",
+            "http://10.0.0.2:7451",
             num_shards,
             10,
         ),
@@ -739,7 +739,7 @@ async fn k8s_get_shard_owner_map_accurate() {
     // Owners should be one of our nodes
     for (shard_id, addr) in &map.shard_to_addr {
         assert!(
-            addr == "http://10.0.0.1:50051" || addr == "http://10.0.0.2:50052",
+            addr == "http://10.0.0.1:7450" || addr == "http://10.0.0.2:7451",
             "shard {} has unexpected owner addr: {}",
             shard_id,
             addr
@@ -1173,7 +1173,7 @@ async fn k8s_no_split_brain_during_transitions() {
         &namespace,
         &prefix,
         "brain-node-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
 
@@ -1184,7 +1184,7 @@ async fn k8s_no_split_brain_during_transitions() {
             &namespace,
             &prefix,
             "brain-node-2",
-            "http://127.0.0.1:50052",
+            "http://127.0.0.1:7451",
             num_shards,
             10,
         ),
@@ -1203,7 +1203,7 @@ async fn k8s_no_split_brain_during_transitions() {
             &namespace,
             &prefix,
             "brain-node-3",
-            "http://127.0.0.1:50053",
+            "http://127.0.0.1:7452",
             num_shards,
             10,
         ),
@@ -1275,7 +1275,7 @@ async fn k8s_prompt_acquisition_after_node_departure() {
         &namespace,
         &prefix,
         "prompt-node-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
 
@@ -1286,7 +1286,7 @@ async fn k8s_prompt_acquisition_after_node_departure() {
             &namespace,
             &prefix,
             "prompt-node-2",
-            "http://127.0.0.1:50052",
+            "http://127.0.0.1:7451",
             num_shards,
             10,
         ),
@@ -1352,7 +1352,7 @@ async fn k8s_multiple_add_remove_cycles() {
         &namespace,
         &prefix,
         "cycle-node-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     assert!(
@@ -1369,7 +1369,7 @@ async fn k8s_multiple_add_remove_cycles() {
                 &namespace,
                 &prefix,
                 &node_id,
-                "http://127.0.0.1:50052",
+                "http://127.0.0.1:7451",
                 num_shards,
                 10,
             ),
@@ -1434,7 +1434,7 @@ async fn k8s_four_node_cluster() {
         &namespace,
         &prefix,
         "four-node-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
 
@@ -1445,7 +1445,7 @@ async fn k8s_four_node_cluster() {
             &namespace,
             &prefix,
             "four-node-2",
-            "http://127.0.0.1:50052",
+            "http://127.0.0.1:7451",
             num_shards,
             10,
         ),
@@ -1460,7 +1460,7 @@ async fn k8s_four_node_cluster() {
             &namespace,
             &prefix,
             "four-node-3",
-            "http://127.0.0.1:50053",
+            "http://127.0.0.1:7452",
             num_shards,
             10,
         ),
@@ -1475,7 +1475,7 @@ async fn k8s_four_node_cluster() {
             &namespace,
             &prefix,
             "four-node-4",
-            "http://127.0.0.1:50054",
+            "http://127.0.0.1:7453",
             num_shards,
             10,
         ),
@@ -1540,7 +1540,7 @@ async fn k8s_wait_converged_triggers_reconciliation() {
         &namespace,
         &prefix,
         "converge-trigger-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
 
@@ -1564,7 +1564,7 @@ async fn k8s_wait_converged_triggers_reconciliation() {
             &namespace,
             &prefix,
             "converge-trigger-2",
-            "http://127.0.0.1:50052",
+            "http://127.0.0.1:7451",
             num_shards,
             10,
         ),
@@ -1829,7 +1829,7 @@ async fn k8s_node_restart_same_id() {
         &namespace,
         &prefix,
         "restart-node",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     assert!(
@@ -1860,7 +1860,7 @@ async fn k8s_node_restart_same_id() {
             &namespace,
             &prefix,
             "restart-node",
-            "http://127.0.0.1:50051",
+            "http://127.0.0.1:7450",
             num_shards,
             10,
         ),
@@ -1896,7 +1896,7 @@ async fn k8s_immediate_shutdown_after_start() {
         &namespace,
         &prefix,
         "immediate-shutdown",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
 
@@ -1920,7 +1920,7 @@ async fn k8s_simultaneous_node_additions() {
             &namespace,
             &prefix,
             "simul-1",
-            "http://127.0.0.1:50051",
+            "http://127.0.0.1:7450",
             num_shards,
             10,
         ),
@@ -1931,7 +1931,7 @@ async fn k8s_simultaneous_node_additions() {
             &namespace,
             &prefix,
             "simul-2",
-            "http://127.0.0.1:50052",
+            "http://127.0.0.1:7451",
             num_shards,
             10,
         ),
@@ -1942,7 +1942,7 @@ async fn k8s_simultaneous_node_additions() {
             &namespace,
             &prefix,
             "simul-3",
-            "http://127.0.0.1:50053",
+            "http://127.0.0.1:7452",
             num_shards,
             10,
         ),
@@ -2014,7 +2014,7 @@ async fn k8s_concurrent_shutdown_multiple_nodes() {
         &namespace,
         &prefix,
         "conc-shut-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
 
@@ -2025,7 +2025,7 @@ async fn k8s_concurrent_shutdown_multiple_nodes() {
             &namespace,
             &prefix,
             "conc-shut-2",
-            "http://127.0.0.1:50052",
+            "http://127.0.0.1:7451",
             num_shards,
             10,
         ),
@@ -2040,7 +2040,7 @@ async fn k8s_concurrent_shutdown_multiple_nodes() {
             &namespace,
             &prefix,
             "conc-shut-3",
-            "http://127.0.0.1:50053",
+            "http://127.0.0.1:7452",
             num_shards,
             10,
         ),
@@ -2101,7 +2101,7 @@ async fn k8s_short_lease_duration_does_not_affect_ownership() {
             &namespace,
             &prefix,
             "short-ttl-1",
-            "http://127.0.0.1:50051",
+            "http://127.0.0.1:7450",
             num_shards,
             short_ttl,
         ),
@@ -2238,7 +2238,7 @@ async fn k8s_ownership_stability_during_steady_state() {
         &namespace,
         &prefix,
         "stable-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
 
@@ -2249,7 +2249,7 @@ async fn k8s_ownership_stability_during_steady_state() {
             &namespace,
             &prefix,
             "stable-2",
-            "http://127.0.0.1:50052",
+            "http://127.0.0.1:7451",
             num_shards,
             10,
         ),
@@ -2333,7 +2333,7 @@ async fn k8s_coordinator_zero_shards() {
             &namespace,
             &prefix,
             "zero-shards",
-            "http://127.0.0.1:50051",
+            "http://127.0.0.1:7450",
             num_shards,
             10,
         ),
@@ -2374,7 +2374,7 @@ async fn k8s_graceful_shutdown_releases_shards_promptly() {
             &namespace,
             &prefix,
             "graceful-1",
-            "http://127.0.0.1:50051",
+            "http://127.0.0.1:7450",
             num_shards,
             short_ttl,
         ),
@@ -2393,7 +2393,7 @@ async fn k8s_graceful_shutdown_releases_shards_promptly() {
             &namespace,
             &prefix,
             "graceful-2",
-            "http://127.0.0.1:50052",
+            "http://127.0.0.1:7451",
             num_shards,
             short_ttl,
         ),
@@ -2450,7 +2450,7 @@ async fn k8s_request_split_creates_split_record() {
         &namespace,
         &prefix,
         "split-test-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
@@ -2514,7 +2514,7 @@ async fn k8s_request_split_fails_if_not_owner() {
         &namespace,
         &prefix,
         "split-owner-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     let c1: Arc<dyn Coordinator> = Arc::new(c1_raw);
@@ -2527,7 +2527,7 @@ async fn k8s_request_split_fails_if_not_owner() {
             &namespace,
             &prefix,
             "split-owner-2",
-            "http://127.0.0.1:50052",
+            "http://127.0.0.1:7451",
             num_shards,
             10,
         ),
@@ -2598,7 +2598,7 @@ async fn k8s_request_split_fails_if_already_in_progress() {
         &namespace,
         &prefix,
         "split-dup-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
@@ -2642,7 +2642,7 @@ async fn k8s_request_split_fails_for_invalid_split_point() {
         &namespace,
         &prefix,
         "split-invalid-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
@@ -2695,7 +2695,7 @@ async fn k8s_is_shard_paused_returns_correct_values() {
         &namespace,
         &prefix,
         "paused-test-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
@@ -2743,7 +2743,7 @@ async fn k8s_split_state_persists_across_restart() {
         &namespace,
         &prefix,
         "persist-test-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     let c1: Arc<dyn Coordinator> = Arc::new(c1);
@@ -2775,7 +2775,7 @@ async fn k8s_split_state_persists_across_restart() {
             &namespace,
             &prefix,
             "persist-test-1",
-            "http://127.0.0.1:50051",
+            "http://127.0.0.1:7450",
             num_shards,
             10,
         ),
@@ -2821,7 +2821,7 @@ async fn k8s_get_split_status_returns_none_for_nonexistent() {
         &namespace,
         &prefix,
         "nonexist-test-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
@@ -2858,7 +2858,7 @@ async fn k8s_execute_split_completes_full_cycle() {
         &namespace,
         &prefix,
         "split-exec-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
@@ -2931,7 +2931,7 @@ async fn k8s_shard_paused_during_split_execution() {
         &namespace,
         &prefix,
         "split-pause-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
@@ -2993,7 +2993,7 @@ async fn k8s_execute_split_fails_without_request() {
         &namespace,
         &prefix,
         "split-no-req-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
@@ -3028,7 +3028,7 @@ async fn k8s_execute_split_resumes_from_partial_state() {
         &namespace,
         &prefix,
         "split-resume-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
@@ -3089,7 +3089,7 @@ async fn k8s_sequential_splits_work_correctly() {
         &namespace,
         &prefix,
         "split-seq-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
@@ -3155,7 +3155,7 @@ async fn k8s_split_in_multi_node_cluster() {
         &namespace,
         &prefix,
         "split-multi-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
 
@@ -3168,7 +3168,7 @@ async fn k8s_split_in_multi_node_cluster() {
             &namespace,
             &prefix,
             "split-multi-2",
-            "http://127.0.0.1:50052",
+            "http://127.0.0.1:7451",
             num_shards,
             10,
         ),
@@ -3253,7 +3253,7 @@ async fn k8s_crash_recovery_early_phase_abandons_split() {
         &namespace,
         &prefix,
         "crash-early-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     let c1: Arc<dyn Coordinator> = Arc::new(c1);
@@ -3287,7 +3287,7 @@ async fn k8s_crash_recovery_early_phase_abandons_split() {
             &namespace,
             &prefix,
             "crash-early-1",
-            "http://127.0.0.1:50051",
+            "http://127.0.0.1:7450",
             num_shards,
             10,
         ),
@@ -3347,7 +3347,7 @@ async fn k8s_child_shards_acquired_via_watch_after_split() {
         &namespace,
         &prefix,
         "watch-split-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
 
@@ -3356,7 +3356,7 @@ async fn k8s_child_shards_acquired_via_watch_after_split() {
             &namespace,
             &prefix,
             "watch-split-2",
-            "http://127.0.0.1:50052",
+            "http://127.0.0.1:7451",
             num_shards,
             10,
         ),
@@ -3455,7 +3455,7 @@ async fn k8s_child_shards_usable_after_split() {
         &namespace,
         &prefix,
         "child-usable-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
@@ -3568,7 +3568,7 @@ async fn k8s_crash_recovery_cloning_phase_abandons_split() {
         &namespace,
         &prefix,
         "crash-cloning-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     let c1: Arc<dyn Coordinator> = Arc::new(c1);
@@ -3604,7 +3604,7 @@ async fn k8s_crash_recovery_cloning_phase_abandons_split() {
             &namespace,
             &prefix,
             "crash-cloning-1",
-            "http://127.0.0.1:50051",
+            "http://127.0.0.1:7450",
             num_shards,
             10,
         ),
@@ -3678,7 +3678,7 @@ async fn k8s_single_node_default_ring_owns_all_shards() {
         &namespace,
         &prefix,
         "default-node",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
 
@@ -3711,7 +3711,7 @@ async fn k8s_multi_ring_shard_assignment() {
         &namespace,
         &prefix,
         "default-node",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     let c_default: Arc<dyn Coordinator> = Arc::new(c_default);
@@ -3735,7 +3735,7 @@ async fn k8s_multi_ring_shard_assignment() {
             &namespace,
             &prefix,
             "gpu-node",
-            "http://127.0.0.1:50052",
+            "http://127.0.0.1:7451",
             num_shards,
             10,
             vec!["gpu".to_string()],
@@ -3845,7 +3845,7 @@ async fn k8s_configure_shard_ring_changes() {
         &namespace,
         &prefix,
         "test-node",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
@@ -3927,7 +3927,7 @@ async fn k8s_member_info_reports_rings() {
         &namespace,
         &prefix,
         "node-default",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
 
@@ -3939,7 +3939,7 @@ async fn k8s_member_info_reports_rings() {
             &namespace,
             &prefix,
             "node-multi",
-            "http://127.0.0.1:50052",
+            "http://127.0.0.1:7451",
             num_shards,
             10,
             vec!["gpu".to_string(), "high-memory".to_string()],
@@ -4001,7 +4001,7 @@ async fn k8s_ring_change_triggers_handoff() {
         &namespace,
         &prefix,
         "default-node",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     let c_default: Arc<dyn Coordinator> = Arc::new(c_default);
@@ -4018,7 +4018,7 @@ async fn k8s_ring_change_triggers_handoff() {
             &namespace,
             &prefix,
             "tenant-node",
-            "http://127.0.0.1:50052",
+            "http://127.0.0.1:7451",
             num_shards,
             10,
             vec!["tenant-acme".to_string()],
@@ -4100,7 +4100,7 @@ async fn k8s_orphaned_ring_shard_remains_unowned() {
         &namespace,
         &prefix,
         "default-node",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
@@ -4181,7 +4181,7 @@ async fn k8s_reconciliation_cancels_in_flight_acquisitions() {
         &namespace,
         &prefix,
         "node-1",
-        "http://127.0.0.1:50051",
+        "http://127.0.0.1:7450",
         num_shards
     );
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -4190,7 +4190,7 @@ async fn k8s_reconciliation_cancels_in_flight_acquisitions() {
             &namespace,
             &prefix,
             "node-2",
-            "http://127.0.0.1:50052",
+            "http://127.0.0.1:7451",
             num_shards,
             10,
         ),
@@ -4223,7 +4223,7 @@ async fn k8s_reconciliation_cancels_in_flight_acquisitions() {
             &namespace,
             &prefix,
             "node-3",
-            "http://127.0.0.1:50053",
+            "http://127.0.0.1:7452",
             num_shards,
             10,
         ),

@@ -224,7 +224,7 @@ fn test_member_in_ring_default() {
     // Member with empty rings participates in default
     let member_default = MemberInfo {
         node_id: "default-node".to_string(),
-        grpc_addr: "http://default:50051".to_string(),
+        grpc_addr: "http://default:7450".to_string(),
         startup_time_ms: Some(1000),
         hostname: None,
         placement_rings: vec![],
@@ -235,7 +235,7 @@ fn test_member_in_ring_default() {
     // Member with explicit rings does NOT participate in default
     let member_gpu = MemberInfo {
         node_id: "gpu-node".to_string(),
-        grpc_addr: "http://gpu:50051".to_string(),
+        grpc_addr: "http://gpu:7450".to_string(),
         startup_time_ms: Some(1000),
         hostname: None,
         placement_rings: vec!["gpu".to_string()],
@@ -247,7 +247,7 @@ fn test_member_in_ring_default() {
     // Member with explicit "default" ring participates in default
     let member_explicit_default = MemberInfo {
         node_id: "explicit-default".to_string(),
-        grpc_addr: "http://explicit:50051".to_string(),
+        grpc_addr: "http://explicit:7450".to_string(),
         startup_time_ms: Some(1000),
         hostname: None,
         placement_rings: vec!["default".to_string(), "gpu".to_string()],
@@ -264,14 +264,14 @@ fn test_select_owner_for_shard_default() {
     let members = vec![
         MemberInfo {
             node_id: "default-node".to_string(),
-            grpc_addr: "http://default:50051".to_string(),
+            grpc_addr: "http://default:7450".to_string(),
             startup_time_ms: Some(1000),
             hostname: None,
             placement_rings: vec![],
         },
         MemberInfo {
             node_id: "gpu-node".to_string(),
-            grpc_addr: "http://gpu:50051".to_string(),
+            grpc_addr: "http://gpu:7450".to_string(),
             startup_time_ms: Some(1000),
             hostname: None,
             placement_rings: vec!["gpu".to_string()],
@@ -292,14 +292,14 @@ fn test_select_owner_for_shard_specific() {
     let members = vec![
         MemberInfo {
             node_id: "default-node".to_string(),
-            grpc_addr: "http://default:50051".to_string(),
+            grpc_addr: "http://default:7450".to_string(),
             startup_time_ms: Some(1000),
             hostname: None,
             placement_rings: vec![],
         },
         MemberInfo {
             node_id: "gpu-node".to_string(),
-            grpc_addr: "http://gpu:50051".to_string(),
+            grpc_addr: "http://gpu:7450".to_string(),
             startup_time_ms: Some(1000),
             hostname: None,
             placement_rings: vec!["gpu".to_string()],
@@ -319,7 +319,7 @@ fn test_member_with_multiple_rings_can_own_multiple_shard_types() {
     // Create member with multiple rings
     let members = vec![MemberInfo {
         node_id: "multi-ring-node".to_string(),
-        grpc_addr: "http://multi:50051".to_string(),
+        grpc_addr: "http://multi:7450".to_string(),
         startup_time_ms: Some(1000),
         hostname: None,
         placement_rings: vec!["gpu".to_string(), "high-memory".to_string()],
@@ -347,7 +347,7 @@ fn test_no_eligible_owner_returns_none() {
     // Create only default members
     let members = vec![MemberInfo {
         node_id: "default-node".to_string(),
-        grpc_addr: "http://default:50051".to_string(),
+        grpc_addr: "http://default:7450".to_string(),
         startup_time_ms: Some(1000),
         hostname: None,
         placement_rings: vec![],
@@ -367,21 +367,21 @@ fn test_rendezvous_hash_consistent_with_ring_filtering() {
     let members = vec![
         MemberInfo {
             node_id: "gpu-1".to_string(),
-            grpc_addr: "http://gpu1:50051".to_string(),
+            grpc_addr: "http://gpu1:7450".to_string(),
             startup_time_ms: Some(1000),
             hostname: None,
             placement_rings: vec!["gpu".to_string()],
         },
         MemberInfo {
             node_id: "gpu-2".to_string(),
-            grpc_addr: "http://gpu2:50051".to_string(),
+            grpc_addr: "http://gpu2:7450".to_string(),
             startup_time_ms: Some(1000),
             hostname: None,
             placement_rings: vec!["gpu".to_string()],
         },
         MemberInfo {
             node_id: "gpu-3".to_string(),
-            grpc_addr: "http://gpu3:50051".to_string(),
+            grpc_addr: "http://gpu3:7450".to_string(),
             startup_time_ms: Some(1000),
             hostname: None,
             placement_rings: vec!["gpu".to_string()],
@@ -416,14 +416,14 @@ fn test_compute_desired_shards_for_node() {
     let members = vec![
         MemberInfo {
             node_id: "default-node".to_string(),
-            grpc_addr: "http://default:50051".to_string(),
+            grpc_addr: "http://default:7450".to_string(),
             startup_time_ms: Some(1000),
             hostname: None,
             placement_rings: vec![],
         },
         MemberInfo {
             node_id: "gpu-node".to_string(),
-            grpc_addr: "http://gpu:50051".to_string(),
+            grpc_addr: "http://gpu:7450".to_string(),
             startup_time_ms: Some(1000),
             hostname: None,
             placement_rings: vec!["gpu".to_string()],

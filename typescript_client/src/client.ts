@@ -1717,15 +1717,18 @@ export class SiloGRPCClient {
     // If no shards known, try all configured servers
     if (servers.size === 0) {
       for (const conn of this._connections.values()) {
-        await conn.client.resetShards({}, this._rpcOptions());
+        const call = conn.client.resetShards({}, this._rpcOptions());
+        await call.response;
       }
       return;
     }
 
-    // Reset on each unique server
+    // Reset on each unique server sequentially to avoid SlateDB conflicts
+    // when nodes share the same underlying object storage
     for (const addr of servers) {
       const conn = this._getOrCreateConnection(addr);
-      await conn.client.resetShards({}, this._rpcOptions());
+      const call = conn.client.resetShards({}, this._rpcOptions());
+      await call.response;
     }
   }
 }

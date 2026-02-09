@@ -205,7 +205,7 @@ impl WalConfig {
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct ServerConfig {
     #[serde(default = "default_grpc_addr")]
-    pub grpc_addr: String, // e.g. 127.0.0.1:50051
+    pub grpc_addr: String, // e.g. 127.0.0.1:7450
     /// Enable development mode features like ResetShards RPC.
     /// WARNING: This allows destructive operations and should never be enabled in production.
     #[serde(default)]
@@ -217,7 +217,7 @@ pub struct WebUiConfig {
     /// Enable web UI server
     #[serde(default = "default_webui_enabled")]
     pub enabled: bool,
-    /// Web UI listen address (e.g., "127.0.0.1:50052")
+    /// Web UI listen address (e.g., "127.0.0.1:8080")
     #[serde(default = "default_webui_addr")]
     pub addr: String,
 }
@@ -276,11 +276,11 @@ pub struct CoordinationConfig {
     /// The gRPC address that other nodes should use to connect to this node.
     /// If not set, falls back to server.grpc_addr.
     ///
-    /// This is useful when the bind address (e.g., 0.0.0.0:50051) differs from
-    /// the routable address (e.g., pod-ip:50051 or service-name:50051).
+    /// This is useful when the bind address (e.g., 0.0.0.0:7450) differs from
+    /// the routable address (e.g., pod-ip:7450 or service-name:7450).
     ///
     /// In Kubernetes, this should typically be set to the pod IP or a headless
-    /// service DNS name like "$(POD_NAME).my-service.$(NAMESPACE).svc.cluster.local:50051".
+    /// service DNS name like "$(POD_NAME).my-service.$(NAMESPACE).svc.cluster.local:7450".
     #[serde(default)]
     pub advertised_grpc_addr: Option<String>,
 
@@ -353,7 +353,7 @@ fn default_etcd_endpoints() -> Vec<String> {
 }
 
 fn default_grpc_addr() -> String {
-    "127.0.0.1:50051".to_string()
+    "127.0.0.1:7450".to_string()
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

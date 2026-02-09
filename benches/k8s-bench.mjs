@@ -7,9 +7,9 @@
  * silo-bench with the provided arguments.
  * 
  * Usage:
- *   npx zx benches/k8s-bench.mjs --address http://silo-service:50051 --workers 16
- *   npx zx benches/k8s-bench.mjs -a http://silo-service:50051 -w 16 -d 60
- *   npx zx benches/k8s-bench.mjs --address http://silo-service:50051 --keep-pod
+ *   npx zx benches/k8s-bench.mjs --address http://silo-service:7450 --workers 16
+ *   npx zx benches/k8s-bench.mjs -a http://silo-service:7450 -w 16 -d 60
+ *   npx zx benches/k8s-bench.mjs --address http://silo-service:7450 --keep-pod
  * 
  * Environment variables:
  *   SILO_IMAGE - Docker image to use (default: silo:latest)

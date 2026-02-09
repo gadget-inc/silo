@@ -37,7 +37,7 @@ async fn setup_test_state() -> (tempfile::TempDir, AppState, ShardMap) {
     let coordinator: Arc<dyn Coordinator> = Arc::new(
         NoneCoordinator::new(
             "test-node",
-            "127.0.0.1:50051",
+            "127.0.0.1:7450",
             1,
             factory.clone(),
             Vec::new(),
@@ -410,7 +410,7 @@ async fn setup_multi_shard_state(num_shards: usize) -> (tempfile::TempDir, AppSt
     let coordinator: Arc<dyn Coordinator> = Arc::new(
         NoneCoordinator::new(
             "test-node",
-            "127.0.0.1:50051",
+            "127.0.0.1:7450",
             num_shards as u32,
             factory.clone(),
             Vec::new(),

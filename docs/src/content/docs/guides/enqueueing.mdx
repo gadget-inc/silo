@@ -14,7 +14,7 @@ You can enqueue a job by enqueuing a payload with a task group:
 import { SiloGRPCClient } from "@silo-ai/client";
 
 const client = new SiloGRPCClient({
-  servers: ["localhost:50051"],
+  servers: ["localhost:7450"],
 });
 
 // Enqueue a simple job - returns a JobHandle
@@ -39,9 +39,9 @@ Before enqueueing jobs, you need to create a `SiloGRPCClient` instance:
 ```typescript
 const client = new SiloGRPCClient({
   // Required: one or more server addresses
-  servers: "localhost:50051",
-  // or multiple servers: ["server1:50051", "server2:50051"]
-  // or as object: { host: "localhost", port: 50051 }
+  servers: "localhost:7450",
+  // or multiple servers: ["server1:7450", "server2:7450"]
+  // or as object: { host: "localhost", port: 7450 }
   
   // Optional: use TLS (default: true)
   useTls: false,

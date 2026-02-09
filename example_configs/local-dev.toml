@@ -2,7 +2,7 @@
 # No coordination (single-node mode), local filesystem storage
 
 [server]
-grpc_addr = "127.0.0.1:50051"
+grpc_addr = "127.0.0.1:7450"
 
 # [logging]
 # Log format: "text" (default, human-readable) or "json" (structured)
@@ -13,7 +13,7 @@ backend = "none"
 
 [webui]
 enabled = true
-addr = "127.0.0.1:50052"
+addr = "127.0.0.1:7460"
 
 [metrics]
 # Enable Prometheus metrics endpoint (default: true)

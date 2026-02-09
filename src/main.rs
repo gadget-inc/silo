@@ -79,8 +79,8 @@ async fn main() -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     // Use advertised_grpc_addr if set, otherwise fall back to the bind address.
-    // This allows separating the bind address (e.g., 0.0.0.0:50051) from the
-    // address other nodes should use to connect (e.g., pod-ip:50051).
+    // This allows separating the bind address (e.g., 0.0.0.0:7450) from the
+    // address other nodes should use to connect (e.g., pod-ip:7450).
     let advertised_grpc_addr = cfg
         .coordination
         .advertised_grpc_addr
