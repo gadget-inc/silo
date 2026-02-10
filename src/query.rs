@@ -23,8 +23,6 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
-const DEFAULT_SCAN_LIMIT: usize = 10_000;
-
 use crate::job_store_shard::JobStoreShard;
 
 /// Shared utility to get the EXPLAIN plan for a query.
@@ -138,6 +136,23 @@ impl ShardQueryEngine {
 
         None
     }
+
+    /// Extract the actual pushed down filter expressions from a physical plan.
+    ///
+    /// Returns the `Expr` objects that DataFusion passed to our scan operator after
+    /// query optimization. Used with `parse_jobs_scan_strategy` in tests to verify
+    /// that the correct index-backed scan path is selected for a given query.
+    pub fn extract_pushed_filter_exprs(plan: &Arc<dyn ExecutionPlan>) -> Option<Vec<Expr>> {
+        if let Some(silo_plan) = plan.as_any().downcast_ref::<SiloExecutionPlan>() {
+            return Some(silo_plan.filters.clone());
+        }
+        for child in plan.children() {
+            if let Some(exprs) = Self::extract_pushed_filter_exprs(child) {
+                return Some(exprs);
+            }
+        }
+        None
+    }
 }
 
 /// Scan trait for table scanners.
@@ -150,6 +165,12 @@ pub trait Scan: std::fmt::Debug + Send + Sync + 'static {
         batch_size: usize,
         limit: Option<usize>,
     ) -> SendableRecordBatchStream;
+
+    /// Describe the scan strategy for EXPLAIN output. Returns a human-readable
+    /// description of what index/scan path will be used for the given filters.
+    fn describe(&self, _filters: &[Expr], _limit: Option<usize>) -> String {
+        "CustomScan".to_string()
+    }
 }
 
 /// Reference to a scanner implementing the Scan trait
@@ -209,16 +230,11 @@ impl TableProvider for SiloTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
-        let mut out: Vec<TableProviderFilterPushDown> = Vec::with_capacity(filters.len());
-        for f in filters {
-            if parse_metadata_eq_filter(f).is_some() || parse_metadata_contains_filter(f).is_some()
-            {
-                out.push(TableProviderFilterPushDown::Exact);
-            } else {
-                out.push(TableProviderFilterPushDown::Inexact);
-            }
-        }
-        Ok(out)
+        // All filters are Inexact - we use them for scan optimization (index lookups)
+        // but DataFusion still applies them as post-filters for correctness.
+        // This is important because our scan only handles one metadata filter at a time,
+        // and DataFusion may call this method multiple times with different filter subsets.
+        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 
     fn statistics(&self) -> Option<Statistics> {
@@ -308,10 +324,130 @@ impl ExecutionPlan for SiloExecutionPlan {
 impl DisplayAs for SiloExecutionPlan {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "SiloExecutionPlan")
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
+                let desc = self.scanner.describe(&self.filters, self.limit);
+                write!(f, "SiloExecutionPlan: {}", desc)
             }
-            DisplayFormatType::TreeRender => write!(f, "SiloExecutionPlan"),
+        }
+    }
+}
+
+/// Represents the scan strategy chosen for a jobs query based on pushed-down filters.
+/// This is the resolved dispatch decision: which index/scan method will be used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobsScanStrategy {
+    /// Lookup a single job by exact ID
+    ExactId { tenant: Option<String>, id: String },
+    /// Scan the metadata index for an exact key=value match
+    MetadataExact {
+        tenant: Option<String>,
+        key: String,
+        value: String,
+    },
+    /// Scan the metadata index for a key with a value prefix
+    MetadataPrefix {
+        tenant: Option<String>,
+        key: String,
+        prefix: String,
+    },
+    /// Scan the status/time index for a specific status
+    Status {
+        tenant: Option<String>,
+        status: QueryStatusFilter,
+    },
+    /// Full scan (no index-backed filter)
+    FullScan { tenant: Option<String> },
+}
+
+impl std::fmt::Display for JobsScanStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JobsScanStrategy::ExactId { tenant, id } => {
+                write!(f, "ExactId(tenant={:?}, id={:?})", tenant, id)
+            }
+            JobsScanStrategy::MetadataExact { tenant, key, value } => {
+                write!(
+                    f,
+                    "MetadataExact(tenant={:?}, key={:?}, value={:?})",
+                    tenant, key, value
+                )
+            }
+            JobsScanStrategy::MetadataPrefix {
+                tenant,
+                key,
+                prefix,
+            } => {
+                write!(
+                    f,
+                    "MetadataPrefix(tenant={:?}, key={:?}, prefix={:?})",
+                    tenant, key, prefix
+                )
+            }
+            JobsScanStrategy::Status { tenant, status } => {
+                write!(f, "Status(tenant={:?}, status={})", tenant, status)
+            }
+            JobsScanStrategy::FullScan { tenant } => {
+                write!(f, "FullScan(tenant={:?})", tenant)
+            }
+        }
+    }
+}
+
+/// Parse DataFusion filter expressions into a scan strategy.
+/// This determines which index-backed scan path will be used.
+pub fn parse_jobs_scan_strategy(filters: &[Expr]) -> JobsScanStrategy {
+    let mut tenant_filter: Option<String> = None;
+    let mut status_filter: Option<QueryStatusFilter> = None;
+    let mut id_filter: Option<String> = None;
+    let mut metadata_filter: Option<(String, String)> = None;
+    let mut metadata_prefix_filter: Option<(String, String)> = None;
+
+    for f in filters {
+        if let Some((col, val)) = parse_eq_filter(f) {
+            match col.as_str() {
+                "tenant" => tenant_filter = Some(val),
+                "status_kind" => status_filter = parse_status_kind(&val),
+                "id" => id_filter = Some(val),
+                _ => {}
+            }
+        } else if metadata_filter.is_none() && metadata_prefix_filter.is_none() {
+            if let Some((k, v)) = parse_metadata_eq_filter(f) {
+                metadata_filter = Some((k, v));
+            } else if let Some((k, v)) = parse_metadata_contains_filter(f) {
+                metadata_filter = Some((k, v));
+            } else if let Some((k, v)) = parse_metadata_prefix_filter(f) {
+                metadata_prefix_filter = Some((k, v));
+            }
+        }
+    }
+
+    if let Some(id) = id_filter {
+        JobsScanStrategy::ExactId {
+            tenant: tenant_filter,
+            id,
+        }
+    } else if let Some((key, value)) = metadata_filter {
+        JobsScanStrategy::MetadataExact {
+            tenant: tenant_filter,
+            key,
+            value,
+        }
+    } else if let Some((key, prefix)) = metadata_prefix_filter {
+        JobsScanStrategy::MetadataPrefix {
+            tenant: tenant_filter,
+            key,
+            prefix,
+        }
+    } else if let Some(status) = status_filter {
+        JobsScanStrategy::Status {
+            tenant: tenant_filter,
+            status,
+        }
+    } else {
+        JobsScanStrategy::FullScan {
+            tenant: tenant_filter,
         }
     }
 }
@@ -369,6 +505,11 @@ impl JobsScanner {
 }
 
 impl Scan for JobsScanner {
+    fn describe(&self, filters: &[Expr], limit: Option<usize>) -> String {
+        let strategy = parse_jobs_scan_strategy(filters);
+        format!("jobs[{}], limit={:?}", strategy, limit)
+    }
+
     fn scan(
         &self,
         projection: SchemaRef,
@@ -376,194 +517,188 @@ impl Scan for JobsScanner {
         batch_size: usize,
         limit: Option<usize>,
     ) -> SendableRecordBatchStream {
-        let mut tenant_filter: Option<String> = None;
-        let mut status_filter: Option<QueryStatusFilter> = None;
-        let mut id_filter: Option<String> = None;
-        // Track optional metadata filter of the form metadata['key'] = 'value' or element_at(metadata, 'key') = 'value'
-        let mut metadata_filter: Option<(String, String)> = None;
-        for f in filters {
-            if let Some((col, val)) = parse_eq_filter(f) {
-                match col.as_str() {
-                    "tenant" => tenant_filter = Some(val),
-                    "status_kind" => status_filter = parse_status_kind(&val),
-                    "id" => id_filter = Some(val),
-                    _ => {}
-                }
-            } else if let Some((k, v)) = parse_metadata_eq_filter(f) {
-                metadata_filter = Some((k, v));
-            } else if let Some((k, v)) = parse_metadata_contains_filter(f) {
-                metadata_filter = Some((k, v));
-            }
-        }
+        let strategy = parse_jobs_scan_strategy(filters);
 
         let (tx, rx) = mpsc::channel::<DfResult<RecordBatch>>(2);
         let shard = Arc::clone(&self.shard);
         let proj_for_stream = Arc::clone(&projection);
         tokio::spawn(async move {
             let mut sent: usize = 0;
-            let hard_limit = limit.unwrap_or(DEFAULT_SCAN_LIMIT);
 
-            // Get list of (tenant, job_id) pairs to process
-            // When tenant_filter is None, scan ALL tenants
-            let job_pairs: Vec<(String, String)> = if let Some(idv) = id_filter.clone() {
-                // For ID filter with tenant specified, use that tenant
-                // Without tenant, scan all tenants looking for the job
-                if let Some(ref t) = tenant_filter {
-                    vec![(t.clone(), idv)]
-                } else {
-                    // Search all tenants for this job ID
-                    match shard.scan_all_jobs(hard_limit).await {
-                        Ok(all) => all.into_iter().filter(|(_, id)| id == &idv).collect(),
-                        Err(e) => {
-                            let _ = tx
-                                .send(Err(DataFusionError::Execution(e.to_string())))
-                                .await;
-                            return;
-                        }
-                    }
-                }
-            } else if let Some((meta_key, meta_val)) = metadata_filter.clone() {
-                // Metadata filter - scan specific tenant or all tenants
-                if let Some(ref t) = tenant_filter {
-                    match shard
-                        .scan_jobs_by_metadata(t.as_str(), &meta_key, &meta_val, hard_limit)
-                        .await
-                    {
-                        Ok(v) => v.into_iter().map(|id| (t.clone(), id)).collect(),
-                        Err(e) => {
-                            let _ = tx
-                                .send(Err(DataFusionError::Execution(e.to_string())))
-                                .await;
-                            return;
-                        }
-                    }
-                } else {
-                    // Scan all jobs and filter by metadata post-hoc
-                    // (Less efficient but works without tenant)
-                    match shard.scan_all_jobs(hard_limit).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let _ = tx
-                                .send(Err(DataFusionError::Execution(e.to_string())))
-                                .await;
-                            return;
-                        }
-                    }
-                }
-            } else if let Some(sf) = status_filter {
-                // Status filter - dispatch based on QueryStatusFilter variant
-                let now_ms = crate::job_store_shard::helpers::now_epoch_ms();
-                match sf {
-                    QueryStatusFilter::Waiting => {
-                        if let Some(ref t) = tenant_filter {
-                            match shard
-                                .scan_jobs_waiting(t.as_str(), now_ms, hard_limit)
-                                .await
-                            {
-                                Ok(v) => v.into_iter().map(|id| (t.clone(), id)).collect(),
-                                Err(e) => {
-                                    let _ = tx
-                                        .send(Err(DataFusionError::Execution(e.to_string())))
-                                        .await;
-                                    return;
-                                }
-                            }
-                        } else {
-                            match shard.scan_all_jobs_waiting(now_ms, hard_limit).await {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    let _ = tx
-                                        .send(Err(DataFusionError::Execution(e.to_string())))
-                                        .await;
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                    QueryStatusFilter::FutureScheduled => {
-                        if let Some(ref t) = tenant_filter {
-                            match shard
-                                .scan_jobs_future_scheduled(t.as_str(), now_ms, hard_limit)
-                                .await
-                            {
-                                Ok(v) => v.into_iter().map(|id| (t.clone(), id)).collect(),
-                                Err(e) => {
-                                    let _ = tx
-                                        .send(Err(DataFusionError::Execution(e.to_string())))
-                                        .await;
-                                    return;
-                                }
-                            }
-                        } else {
-                            match shard
-                                .scan_all_jobs_future_scheduled(now_ms, hard_limit)
-                                .await
-                            {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    let _ = tx
-                                        .send(Err(DataFusionError::Execution(e.to_string())))
-                                        .await;
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                    QueryStatusFilter::Stored(kind) => {
-                        if let Some(ref t) = tenant_filter {
-                            match shard
-                                .scan_jobs_by_status(t.as_str(), kind, hard_limit)
-                                .await
-                            {
-                                Ok(v) => v.into_iter().map(|id| (t.clone(), id)).collect(),
-                                Err(e) => {
-                                    let _ = tx
-                                        .send(Err(DataFusionError::Execution(e.to_string())))
-                                        .await;
-                                    return;
-                                }
-                            }
-                        } else {
-                            match shard.scan_all_jobs_by_status(kind, hard_limit).await {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    let _ = tx
-                                        .send(Err(DataFusionError::Execution(e.to_string())))
-                                        .await;
-                                    return;
-                                }
+            // Dispatch based on parsed scan strategy to get (tenant, job_id) pairs
+            let job_pairs: Vec<(String, String)> = match strategy {
+                JobsScanStrategy::ExactId { tenant, id } => {
+                    if let Some(t) = tenant {
+                        vec![(t, id)]
+                    } else {
+                        match shard.scan_all_jobs(limit).await {
+                            Ok(all) => all.into_iter().filter(|(_, jid)| jid == &id).collect(),
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Err(DataFusionError::Execution(e.to_string())))
+                                    .await;
+                                return;
                             }
                         }
                     }
                 }
-            } else {
-                // No specific filter - scan all jobs
-                if let Some(ref t) = tenant_filter {
-                    match shard.scan_jobs(t.as_str(), hard_limit).await {
-                        Ok(v) => v.into_iter().map(|id| (t.clone(), id)).collect(),
-                        Err(e) => {
-                            let _ = tx
-                                .send(Err(DataFusionError::Execution(e.to_string())))
-                                .await;
-                            return;
+                JobsScanStrategy::MetadataExact { tenant, key, value } => {
+                    if let Some(ref t) = tenant {
+                        match shard.scan_jobs_by_metadata(t, &key, &value, limit).await {
+                            Ok(v) => v.into_iter().map(|id| (t.clone(), id)).collect(),
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Err(DataFusionError::Execution(e.to_string())))
+                                    .await;
+                                return;
+                            }
+                        }
+                    } else {
+                        match shard.scan_all_jobs(limit).await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Err(DataFusionError::Execution(e.to_string())))
+                                    .await;
+                                return;
+                            }
                         }
                     }
-                } else {
-                    // Scan all tenants
-                    match shard.scan_all_jobs(hard_limit).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let _ = tx
-                                .send(Err(DataFusionError::Execution(e.to_string())))
-                                .await;
-                            return;
+                }
+                JobsScanStrategy::MetadataPrefix {
+                    tenant,
+                    key,
+                    prefix,
+                } => {
+                    if let Some(ref t) = tenant {
+                        match shard
+                            .scan_jobs_by_metadata_prefix(t, &key, &prefix, limit)
+                            .await
+                        {
+                            Ok(v) => v.into_iter().map(|id| (t.clone(), id)).collect(),
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Err(DataFusionError::Execution(e.to_string())))
+                                    .await;
+                                return;
+                            }
+                        }
+                    } else {
+                        match shard.scan_all_jobs(limit).await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Err(DataFusionError::Execution(e.to_string())))
+                                    .await;
+                                return;
+                            }
+                        }
+                    }
+                }
+                JobsScanStrategy::Status { tenant, status } => {
+                    let now_ms = crate::job_store_shard::helpers::now_epoch_ms();
+                    match status {
+                        QueryStatusFilter::Waiting => {
+                            if let Some(ref t) = tenant {
+                                match shard.scan_jobs_waiting(t.as_str(), now_ms, limit).await {
+                                    Ok(v) => v.into_iter().map(|id| (t.clone(), id)).collect(),
+                                    Err(e) => {
+                                        let _ = tx
+                                            .send(Err(DataFusionError::Execution(e.to_string())))
+                                            .await;
+                                        return;
+                                    }
+                                }
+                            } else {
+                                match shard.scan_all_jobs_waiting(now_ms, limit).await {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        let _ = tx
+                                            .send(Err(DataFusionError::Execution(e.to_string())))
+                                            .await;
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        QueryStatusFilter::FutureScheduled => {
+                            if let Some(ref t) = tenant {
+                                match shard
+                                    .scan_jobs_future_scheduled(t.as_str(), now_ms, limit)
+                                    .await
+                                {
+                                    Ok(v) => v.into_iter().map(|id| (t.clone(), id)).collect(),
+                                    Err(e) => {
+                                        let _ = tx
+                                            .send(Err(DataFusionError::Execution(e.to_string())))
+                                            .await;
+                                        return;
+                                    }
+                                }
+                            } else {
+                                match shard.scan_all_jobs_future_scheduled(now_ms, limit).await {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        let _ = tx
+                                            .send(Err(DataFusionError::Execution(e.to_string())))
+                                            .await;
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        QueryStatusFilter::Stored(kind) => {
+                            if let Some(ref t) = tenant {
+                                match shard.scan_jobs_by_status(t.as_str(), kind, limit).await {
+                                    Ok(v) => v.into_iter().map(|id| (t.clone(), id)).collect(),
+                                    Err(e) => {
+                                        let _ = tx
+                                            .send(Err(DataFusionError::Execution(e.to_string())))
+                                            .await;
+                                        return;
+                                    }
+                                }
+                            } else {
+                                match shard.scan_all_jobs_by_status(kind, limit).await {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        let _ = tx
+                                            .send(Err(DataFusionError::Execution(e.to_string())))
+                                            .await;
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                JobsScanStrategy::FullScan { tenant } => {
+                    if let Some(ref t) = tenant {
+                        match shard.scan_jobs(t, limit).await {
+                            Ok(v) => v.into_iter().map(|id| (t.clone(), id)).collect(),
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Err(DataFusionError::Execution(e.to_string())))
+                                    .await;
+                                return;
+                            }
+                        }
+                    } else {
+                        match shard.scan_all_jobs(limit).await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Err(DataFusionError::Execution(e.to_string())))
+                                    .await;
+                                return;
+                            }
                         }
                     }
                 }
             };
 
             let mut i: usize = 0;
-            while i < job_pairs.len() && sent < hard_limit {
+            while i < job_pairs.len() && limit.is_none_or(|l| sent < l) {
                 let start = i;
                 let end = std::cmp::min(job_pairs.len(), start + batch_size);
 
@@ -890,6 +1025,24 @@ impl QueuesScanner {
 }
 
 impl Scan for QueuesScanner {
+    fn describe(&self, filters: &[Expr], limit: Option<usize>) -> String {
+        let mut tenant = None;
+        let mut queue = None;
+        for f in filters {
+            if let Some((col, val)) = parse_eq_filter(f) {
+                match col.as_str() {
+                    "tenant" => tenant = Some(val),
+                    "queue_name" => queue = Some(val),
+                    _ => {}
+                }
+            }
+        }
+        format!(
+            "queues[tenant={:?}, queue={:?}], limit={:?}",
+            tenant, queue, limit
+        )
+    }
+
     fn scan(
         &self,
         projection: SchemaRef,
@@ -912,8 +1065,6 @@ impl Scan for QueuesScanner {
         let (tx, rx) = mpsc::channel::<DfResult<RecordBatch>>(2);
         let shard = Arc::clone(&self.shard);
         let proj_for_stream = Arc::clone(&projection);
-        let hard_limit = limit.unwrap_or(DEFAULT_SCAN_LIMIT);
-
         tokio::spawn(async move {
             let db = shard.db();
             let mut entries: Vec<QueueEntry> = Vec::new();
@@ -928,7 +1079,7 @@ impl Scan for QueuesScanner {
 
             if let Ok(mut iter) = db.scan::<Vec<u8>, _>(holders_start..=holders_end).await {
                 while let Ok(Some(kv)) = iter.next().await {
-                    if entries.len() >= hard_limit {
+                    if limit.is_some_and(|l| entries.len() >= l) {
                         break;
                     }
                     if let Some(parsed) = crate::keys::parse_concurrency_holder_key(&kv.key) {
@@ -967,7 +1118,7 @@ impl Scan for QueuesScanner {
 
             if let Ok(mut iter) = db.scan::<Vec<u8>, _>(requests_start..=requests_end).await {
                 while let Ok(Some(kv)) = iter.next().await {
-                    if entries.len() >= hard_limit {
+                    if limit.is_some_and(|l| entries.len() >= l) {
                         break;
                     }
                     if let Some(parsed) = crate::keys::parse_concurrency_request_key(&kv.key) {
@@ -1195,8 +1346,10 @@ fn parse_metadata_contains_filter(expr: &Expr) -> Option<(String, String)> {
 
     // Match: array_contains(element_at(metadata, 'key'), 'value')
     if let Expr::ScalarFunction(func) = expr {
-        // Check if this is array_contains
-        if func.func.name() == "array_contains" && func.args.len() == 2 {
+        // Check if this is array_contains (DataFusion may rename to array_has)
+        if (func.func.name() == "array_contains" || func.func.name() == "array_has")
+            && func.args.len() == 2
+        {
             // First arg should be element_at(metadata, 'key')
             if let Some(key) = extract_metadata_key_from_expr(&func.args[0]) {
                 // Second arg should be the literal value
@@ -1213,29 +1366,70 @@ fn parse_metadata_contains_filter(expr: &Expr) -> Option<(String, String)> {
     None
 }
 
-// Extract metadata key from element_at(metadata, 'key') expressions using AST traversal
+/// Parse metadata prefix filter patterns and return (key, value_prefix).
+/// Matches:
+///   - `starts_with(array_any_value(element_at(metadata, 'key')), 'prefix')` — ScalarFunction
+///   - `starts_with(element_at(metadata, 'key'), 'prefix')` — also accepted
+///   - `array_any_value(element_at(metadata, 'key')) LIKE 'prefix%'` — Like expression with simple prefix
+///   - `element_at(metadata, 'key') LIKE 'prefix%'` — also accepted
+fn parse_metadata_prefix_filter(expr: &Expr) -> Option<(String, String)> {
+    use datafusion::scalar::ScalarValue;
+
+    // Match: starts_with(array_any_value(element_at(metadata, 'key')), 'prefix')
+    if let Expr::ScalarFunction(func) = expr
+        && func.func.name() == "starts_with"
+        && func.args.len() == 2
+        && let Some(key) = extract_metadata_key_from_expr(&func.args[0])
+        && let Expr::Literal(ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)), _) =
+            &func.args[1]
+    {
+        return Some((key, v.clone()));
+    }
+
+    // Match: array_any_value(element_at(metadata, 'key')) LIKE 'prefix%'
+    // DataFusion rewrites starts_with(x, 'prefix') to x LIKE 'prefix%'
+    if let Expr::Like(like) = expr
+        && !like.negated
+        && !like.case_insensitive
+        && like.escape_char.is_none()
+        && let Some(key) = extract_metadata_key_from_expr(&like.expr)
+        && let Expr::Literal(
+            ScalarValue::Utf8(Some(pattern)) | ScalarValue::LargeUtf8(Some(pattern)),
+            _,
+        ) = like.pattern.as_ref()
+        && pattern.ends_with('%')
+    {
+        let prefix = &pattern[..pattern.len() - 1];
+        if !prefix.contains('%') && !prefix.contains('_') {
+            return Some((key.clone(), prefix.to_string()));
+        }
+    }
+
+    None
+}
+
+// Extract metadata key from element_at(metadata, 'key') expressions using AST traversal.
+// Also handles array_any_value(element_at(metadata, 'key')) which is needed when
+// the caller requires a scalar Utf8 instead of the List<Utf8> that element_at returns on Maps.
 fn extract_metadata_key_from_expr(expr: &Expr) -> Option<String> {
     use datafusion::scalar::ScalarValue;
 
-    // Match: element_at(metadata, 'key') or GetIndexedField for metadata['key']
-    // Note: DataFusion may not use GetIndexedField in this version,
-    // relying on ScalarFunction for element_at instead
     if let Expr::ScalarFunction(func) = expr {
-        // element_at(metadata, 'key')
-        if func.func.name() == "element_at" && func.args.len() == 2 {
-            // First arg should be Column("metadata")
-            if let Expr::Column(col) = &func.args[0]
-                && col.name == "metadata"
-            {
-                // Second arg should be the literal key
-                if let Expr::Literal(
-                    ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)),
-                    _,
-                ) = &func.args[1]
-                {
-                    return Some(v.clone());
-                }
-            }
+        let name = func.func.name();
+        // element_at(metadata, 'key') or map_extract(metadata, 'key')
+        // DataFusion may rename element_at to map_extract during planning.
+        if (name == "element_at" || name == "map_extract")
+            && func.args.len() == 2
+            && let Expr::Column(col) = &func.args[0]
+            && col.name == "metadata"
+            && let Expr::Literal(ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)), _) =
+                &func.args[1]
+        {
+            return Some(v.clone());
+        }
+        // array_any_value(element_at(metadata, 'key')) - unwraps List<Utf8> to Utf8
+        if name == "array_any_value" && func.args.len() == 1 {
+            return extract_metadata_key_from_expr(&func.args[0]);
         }
     }
     None
@@ -1252,14 +1446,24 @@ fn literal_to_string(s: &datafusion::scalar::ScalarValue) -> Option<String> {
 
 /// Represents the different status filters that can be used in WHERE clauses.
 /// Waiting and Scheduled are virtual statuses derived from the stored Scheduled status.
-#[derive(Debug, Clone, Copy)]
-enum QueryStatusFilter {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryStatusFilter {
     /// A stored status kind (Running, Failed, Cancelled, Succeeded)
     Stored(crate::job::JobStatusKind),
     /// Virtual: Scheduled + start_time <= now (ready to run)
     Waiting,
     /// Virtual: Scheduled + start_time > now (future only)
     FutureScheduled,
+}
+
+impl std::fmt::Display for QueryStatusFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QueryStatusFilter::Stored(kind) => write!(f, "{:?}", kind),
+            QueryStatusFilter::Waiting => write!(f, "Waiting"),
+            QueryStatusFilter::FutureScheduled => write!(f, "FutureScheduled"),
+        }
+    }
 }
 
 fn parse_status_kind(s: &str) -> Option<QueryStatusFilter> {

@@ -1261,7 +1261,8 @@ async fn sql_multiple_order_by() {
     assert_eq!(got, vec!["c", "b", "a"]);
 }
 
-use silo::job::{ConcurrencyLimit, Limit};
+use silo::job::{ConcurrencyLimit, JobStatusKind, Limit};
+use silo::query::{JobsScanStrategy, QueryStatusFilter, parse_jobs_scan_strategy};
 
 // Helper to query queues table and extract queue names
 async fn query_queue_names(sql: &ShardQueryEngine, query: &str) -> Vec<String> {
@@ -1686,4 +1687,1239 @@ async fn queues_table_tenant_isolation() {
     )
     .await;
     assert_eq!(y_queues, vec!["queue-y"]);
+}
+
+// ===== Metadata prefix search tests =====
+
+#[silo::test]
+async fn sql_metadata_prefix_starts_with() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job_with_metadata(
+        &shard,
+        "p1",
+        5,
+        now,
+        vec![("env".to_string(), "production".to_string())],
+    )
+    .await;
+    enqueue_job_with_metadata(
+        &shard,
+        "p2",
+        5,
+        now,
+        vec![("env".to_string(), "prod-us".to_string())],
+    )
+    .await;
+    enqueue_job_with_metadata(
+        &shard,
+        "p3",
+        5,
+        now,
+        vec![("env".to_string(), "staging".to_string())],
+    )
+    .await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let mut got = query_ids(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND starts_with(array_any_value(element_at(metadata, 'env')), 'prod')",
+    )
+    .await;
+    got.sort();
+
+    assert_eq!(got, vec!["p1", "p2"]);
+}
+
+#[silo::test]
+async fn sql_metadata_prefix_like() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job_with_metadata(
+        &shard,
+        "l1",
+        5,
+        now,
+        vec![("region".to_string(), "us-east-1".to_string())],
+    )
+    .await;
+    enqueue_job_with_metadata(
+        &shard,
+        "l2",
+        5,
+        now,
+        vec![("region".to_string(), "us-west-2".to_string())],
+    )
+    .await;
+    enqueue_job_with_metadata(
+        &shard,
+        "l3",
+        5,
+        now,
+        vec![("region".to_string(), "eu-west-1".to_string())],
+    )
+    .await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let mut got = query_ids(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND array_any_value(element_at(metadata, 'region')) LIKE 'us-%'",
+    )
+    .await;
+    got.sort();
+
+    assert_eq!(got, vec!["l1", "l2"]);
+}
+
+#[silo::test]
+async fn sql_metadata_prefix_with_status() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job_with_metadata(
+        &shard,
+        "ps1",
+        5,
+        now,
+        vec![("env".to_string(), "prod-us".to_string())],
+    )
+    .await;
+    enqueue_job_with_metadata(
+        &shard,
+        "ps2",
+        5,
+        now,
+        vec![("env".to_string(), "prod-eu".to_string())],
+    )
+    .await;
+    enqueue_job_with_metadata(
+        &shard,
+        "ps3",
+        5,
+        now,
+        vec![("env".to_string(), "staging".to_string())],
+    )
+    .await;
+
+    // Make ps1 Running
+    shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let got = query_ids(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND starts_with(array_any_value(element_at(metadata, 'env')), 'prod') AND status_kind='Running'",
+    )
+    .await;
+
+    assert_eq!(got, vec!["ps1"]);
+}
+
+#[silo::test]
+async fn sql_metadata_prefix_exact_value() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job_with_metadata(
+        &shard,
+        "ev1",
+        5,
+        now,
+        vec![("env".to_string(), "prod".to_string())],
+    )
+    .await;
+    enqueue_job_with_metadata(
+        &shard,
+        "ev2",
+        5,
+        now,
+        vec![("env".to_string(), "production".to_string())],
+    )
+    .await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    // Prefix "prod" should match both "prod" (exact) and "production"
+    let mut got = query_ids(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND starts_with(array_any_value(element_at(metadata, 'env')), 'prod')",
+    )
+    .await;
+    got.sort();
+
+    assert_eq!(got, vec!["ev1", "ev2"]);
+}
+
+#[silo::test]
+async fn sql_metadata_prefix_no_match() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job_with_metadata(
+        &shard,
+        "nm1",
+        5,
+        now,
+        vec![("env".to_string(), "staging".to_string())],
+    )
+    .await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let got = query_ids(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND starts_with(array_any_value(element_at(metadata, 'env')), 'prod')",
+    )
+    .await;
+
+    assert_eq!(got, Vec::<String>::new());
+}
+
+#[silo::test]
+async fn sql_metadata_suffix_like_not_index_pushed() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job_with_metadata(
+        &shard,
+        "sf1",
+        5,
+        now,
+        vec![("env".to_string(), "us-prod".to_string())],
+    )
+    .await;
+    enqueue_job_with_metadata(
+        &shard,
+        "sf2",
+        5,
+        now,
+        vec![("env".to_string(), "eu-prod".to_string())],
+    )
+    .await;
+    enqueue_job_with_metadata(
+        &shard,
+        "sf3",
+        5,
+        now,
+        vec![("env".to_string(), "staging".to_string())],
+    )
+    .await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    // Suffix LIKE '%prod' - not a prefix pattern, should still work via DataFusion post-filter
+    let mut got = query_ids(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND array_any_value(element_at(metadata, 'env')) LIKE '%prod'",
+    )
+    .await;
+    got.sort();
+
+    assert_eq!(got, vec!["sf1", "sf2"]);
+}
+
+// ===== Query plan efficiency verification tests =====
+
+#[silo::test]
+async fn verify_metadata_prefix_pushdown() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job_with_metadata(
+        &shard,
+        "vp1",
+        5,
+        now,
+        vec![("env".to_string(), "production".to_string())],
+    )
+    .await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let plan = sql
+        .get_physical_plan(
+            "SELECT id FROM jobs WHERE tenant='-' AND starts_with(array_any_value(element_at(metadata, 'env')), 'prod')",
+        )
+        .await
+        .expect("plan");
+
+    let pushed =
+        ShardQueryEngine::extract_pushed_filters(&plan).expect("should have pushed filters");
+    assert!(
+        pushed
+            .filters
+            .iter()
+            .any(|f| f.contains("starts_with") || f.contains("metadata")),
+        "Expected metadata prefix filter to be pushed down, got: {:?}",
+        pushed.filters
+    );
+}
+
+#[silo::test]
+async fn verify_metadata_prefix_no_redundant_filter() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job_with_metadata(
+        &shard,
+        "nrf1",
+        5,
+        now,
+        vec![("env".to_string(), "production".to_string())],
+    )
+    .await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let plan = sql
+        .get_physical_plan(
+            "SELECT id FROM jobs WHERE tenant='-' AND starts_with(array_any_value(element_at(metadata, 'env')), 'prod')",
+        )
+        .await
+        .expect("plan");
+
+    // Verify filter is pushed to our scan. DataFusion may still add a FilterExec for other
+    // filters (like tenant which is Inexact), but the important thing is our scan gets the filter.
+    let pushed =
+        ShardQueryEngine::extract_pushed_filters(&plan).expect("should have pushed filters");
+    assert!(
+        pushed
+            .filters
+            .iter()
+            .any(|f| f.contains("starts_with") || f.contains("LIKE") || f.contains("metadata")),
+        "Expected prefix filter in pushed filters, got: {:?}",
+        pushed.filters
+    );
+}
+
+#[silo::test]
+async fn verify_metadata_equality_no_redundant_filter() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job_with_metadata(
+        &shard,
+        "eq1",
+        5,
+        now,
+        vec![("env".to_string(), "prod".to_string())],
+    )
+    .await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let plan = sql
+        .get_physical_plan(
+            "SELECT id FROM jobs WHERE tenant='-' AND array_contains(element_at(metadata, 'env'), 'prod')",
+        )
+        .await
+        .expect("plan");
+
+    // Verify filter is pushed to our scan
+    let pushed =
+        ShardQueryEngine::extract_pushed_filters(&plan).expect("should have pushed filters");
+    assert!(
+        pushed
+            .filters
+            .iter()
+            .any(|f| f.contains("array") || f.contains("metadata")),
+        "Expected metadata equality filter in pushed filters, got: {:?}",
+        pushed.filters
+    );
+}
+
+#[silo::test]
+async fn verify_metadata_prefix_explain_plan() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job_with_metadata(
+        &shard,
+        "ep1",
+        5,
+        now,
+        vec![("env".to_string(), "production".to_string())],
+    )
+    .await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let plan_output = sql
+        .explain(
+            "SELECT id FROM jobs WHERE tenant='-' AND starts_with(array_any_value(element_at(metadata, 'env')), 'prod')",
+        )
+        .await
+        .expect("explain");
+
+    assert!(
+        plan_output.contains("SiloExecutionPlan"),
+        "EXPLAIN plan should mention SiloExecutionPlan: {}",
+        plan_output
+    );
+}
+
+// ===== Storage-level index verification tests =====
+
+use silo::keys::{
+    ParsedMetadataIndexKey, end_bound, idx_metadata_key_only_prefix, parse_metadata_index_key,
+};
+use slatedb::DbIterator;
+
+/// Collect all metadata index entries (0x04) for a given tenant and key.
+async fn collect_metadata_index_entries(
+    shard: &JobStoreShard,
+    tenant: &str,
+    key: &str,
+) -> Vec<ParsedMetadataIndexKey> {
+    let start = idx_metadata_key_only_prefix(tenant, key);
+    let end = end_bound(&start);
+    let mut iter: DbIterator = shard.db().scan::<Vec<u8>, _>(start..end).await.unwrap();
+    let mut out = Vec::new();
+    loop {
+        let maybe = iter.next().await.unwrap();
+        let Some(kv) = maybe else { break };
+        if let Some(parsed) = parse_metadata_index_key(&kv.key) {
+            out.push(parsed);
+        }
+    }
+    out
+}
+
+#[silo::test]
+async fn metadata_index_entries_created_on_enqueue() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job_with_metadata(
+        &shard,
+        "idx1",
+        5,
+        now,
+        vec![
+            ("env".to_string(), "prod".to_string()),
+            ("team".to_string(), "core".to_string()),
+        ],
+    )
+    .await;
+
+    // Check entries for "env" key
+    let env_entries = collect_metadata_index_entries(&shard, "-", "env").await;
+    assert_eq!(env_entries.len(), 1, "should have 1 entry for 'env' key");
+    assert_eq!(env_entries[0].tenant, "-");
+    assert_eq!(env_entries[0].key, "env");
+    assert_eq!(env_entries[0].value, "prod");
+    assert_eq!(env_entries[0].job_id, "idx1");
+
+    // Check entries for "team" key
+    let team_entries = collect_metadata_index_entries(&shard, "-", "team").await;
+    assert_eq!(team_entries.len(), 1, "should have 1 entry for 'team' key");
+    assert_eq!(team_entries[0].key, "team");
+    assert_eq!(team_entries[0].value, "core");
+    assert_eq!(team_entries[0].job_id, "idx1");
+}
+
+#[silo::test]
+async fn metadata_index_prefix_scan_range() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job_with_metadata(
+        &shard,
+        "r1",
+        5,
+        now,
+        vec![("env".to_string(), "production".to_string())],
+    )
+    .await;
+    enqueue_job_with_metadata(
+        &shard,
+        "r2",
+        5,
+        now,
+        vec![("env".to_string(), "prod-us".to_string())],
+    )
+    .await;
+    enqueue_job_with_metadata(
+        &shard,
+        "r3",
+        5,
+        now,
+        vec![("env".to_string(), "staging".to_string())],
+    )
+    .await;
+    enqueue_job_with_metadata(
+        &shard,
+        "r4",
+        5,
+        now,
+        vec![("env".to_string(), "prod".to_string())],
+    )
+    .await;
+
+    // Exact prefix match via storage layer
+    let mut results = shard
+        .scan_jobs_by_metadata_prefix("-", "env", "prod", Some(100))
+        .await
+        .expect("prefix scan");
+    results.sort();
+    assert_eq!(
+        results,
+        vec!["r1", "r2", "r4"],
+        "prefix 'prod' should match 'prod', 'prod-us', and 'production'"
+    );
+
+    // More specific prefix
+    let mut results = shard
+        .scan_jobs_by_metadata_prefix("-", "env", "prod-", Some(100))
+        .await
+        .expect("prefix scan");
+    results.sort();
+    assert_eq!(
+        results,
+        vec!["r2"],
+        "prefix 'prod-' should only match 'prod-us'"
+    );
+
+    // Non-matching prefix
+    let results = shard
+        .scan_jobs_by_metadata_prefix("-", "env", "dev", Some(100))
+        .await
+        .expect("prefix scan");
+    assert!(results.is_empty(), "prefix 'dev' should match nothing");
+
+    // Empty prefix matches all values for the key
+    let mut results = shard
+        .scan_jobs_by_metadata_prefix("-", "env", "", Some(100))
+        .await
+        .expect("prefix scan");
+    results.sort();
+    assert_eq!(
+        results,
+        vec!["r1", "r2", "r3", "r4"],
+        "empty prefix should match all values"
+    );
+}
+
+#[silo::test]
+async fn metadata_prefix_selective_scan() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    // Enqueue 50 jobs with diverse metadata values
+    for i in 0..50 {
+        let env = if i < 3 {
+            format!("prod-{}", i)
+        } else if i < 10 {
+            format!("staging-{}", i)
+        } else {
+            format!("dev-{}", i)
+        };
+        enqueue_job_with_metadata(
+            &shard,
+            &format!("sel{}", i),
+            5,
+            now,
+            vec![("env".to_string(), env)],
+        )
+        .await;
+    }
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let mut got = query_ids(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND starts_with(array_any_value(element_at(metadata, 'env')), 'prod')",
+    )
+    .await;
+    got.sort();
+
+    // Only the 3 prod-* jobs should match
+    assert_eq!(got, vec!["sel0", "sel1", "sel2"]);
+}
+
+// ===== Scan strategy verification tests =====
+// These tests prove that DataFusion's rewritten expressions are correctly parsed
+// into the expected scan strategy, ensuring the right index-backed scan path is used.
+
+#[silo::test]
+async fn strategy_metadata_prefix_starts_with() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job_with_metadata(
+        &shard,
+        "t1",
+        5,
+        now,
+        vec![("env".to_string(), "prod".to_string())],
+    )
+    .await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let plan = sql
+        .get_physical_plan(
+            "SELECT id FROM jobs WHERE tenant='-' AND starts_with(array_any_value(element_at(metadata, 'env')), 'prod')",
+        )
+        .await
+        .expect("plan");
+
+    let exprs =
+        ShardQueryEngine::extract_pushed_filter_exprs(&plan).expect("should have filter exprs");
+    let strategy = parse_jobs_scan_strategy(&exprs);
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::MetadataPrefix {
+            tenant: Some("-".to_string()),
+            key: "env".to_string(),
+            prefix: "prod".to_string(),
+        }
+    );
+}
+
+#[silo::test]
+async fn strategy_metadata_prefix_like() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job_with_metadata(
+        &shard,
+        "t1",
+        5,
+        now,
+        vec![("region".to_string(), "us-east".to_string())],
+    )
+    .await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let plan = sql
+        .get_physical_plan(
+            "SELECT id FROM jobs WHERE tenant='-' AND array_any_value(element_at(metadata, 'region')) LIKE 'us-%'",
+        )
+        .await
+        .expect("plan");
+
+    let exprs =
+        ShardQueryEngine::extract_pushed_filter_exprs(&plan).expect("should have filter exprs");
+    let strategy = parse_jobs_scan_strategy(&exprs);
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::MetadataPrefix {
+            tenant: Some("-".to_string()),
+            key: "region".to_string(),
+            prefix: "us-".to_string(),
+        }
+    );
+}
+
+#[silo::test]
+async fn strategy_metadata_equality() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job_with_metadata(
+        &shard,
+        "t1",
+        5,
+        now,
+        vec![("env".to_string(), "prod".to_string())],
+    )
+    .await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let plan = sql
+        .get_physical_plan(
+            "SELECT id FROM jobs WHERE tenant='-' AND array_contains(element_at(metadata, 'env'), 'prod')",
+        )
+        .await
+        .expect("plan");
+
+    let exprs =
+        ShardQueryEngine::extract_pushed_filter_exprs(&plan).expect("should have filter exprs");
+    let strategy = parse_jobs_scan_strategy(&exprs);
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::MetadataExact {
+            tenant: Some("-".to_string()),
+            key: "env".to_string(),
+            value: "prod".to_string(),
+        }
+    );
+}
+
+#[silo::test]
+async fn strategy_exact_id() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job(&shard, "my-job", 5, now).await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let plan = sql
+        .get_physical_plan("SELECT id FROM jobs WHERE tenant='-' AND id='my-job'")
+        .await
+        .expect("plan");
+
+    let exprs =
+        ShardQueryEngine::extract_pushed_filter_exprs(&plan).expect("should have filter exprs");
+    let strategy = parse_jobs_scan_strategy(&exprs);
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::ExactId {
+            tenant: Some("-".to_string()),
+            id: "my-job".to_string(),
+        }
+    );
+}
+
+#[silo::test]
+async fn strategy_status_filter() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job(&shard, "j1", 5, now).await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let plan = sql
+        .get_physical_plan("SELECT id FROM jobs WHERE tenant='-' AND status_kind='Running'")
+        .await
+        .expect("plan");
+
+    let exprs =
+        ShardQueryEngine::extract_pushed_filter_exprs(&plan).expect("should have filter exprs");
+    let strategy = parse_jobs_scan_strategy(&exprs);
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::Status {
+            tenant: Some("-".to_string()),
+            status: QueryStatusFilter::Stored(JobStatusKind::Running),
+        }
+    );
+}
+
+#[silo::test]
+async fn strategy_full_scan_with_tenant() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job(&shard, "j1", 5, now).await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let plan = sql
+        .get_physical_plan("SELECT id FROM jobs WHERE tenant='-'")
+        .await
+        .expect("plan");
+
+    let exprs =
+        ShardQueryEngine::extract_pushed_filter_exprs(&plan).expect("should have filter exprs");
+    let strategy = parse_jobs_scan_strategy(&exprs);
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::FullScan {
+            tenant: Some("-".to_string()),
+        }
+    );
+}
+
+#[silo::test]
+async fn strategy_id_takes_priority_over_metadata() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job_with_metadata(
+        &shard,
+        "combo",
+        5,
+        now,
+        vec![("env".to_string(), "prod".to_string())],
+    )
+    .await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let plan = sql
+        .get_physical_plan(
+            "SELECT id FROM jobs WHERE tenant='-' AND id='combo' AND array_contains(element_at(metadata, 'env'), 'prod')",
+        )
+        .await
+        .expect("plan");
+
+    let exprs =
+        ShardQueryEngine::extract_pushed_filter_exprs(&plan).expect("should have filter exprs");
+    let strategy = parse_jobs_scan_strategy(&exprs);
+    // ExactId should take priority over metadata filter
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::ExactId {
+            tenant: Some("-".to_string()),
+            id: "combo".to_string(),
+        }
+    );
+}
+
+// ===== Benchmark query EXPLAIN tests =====
+// These tests verify that the benchmark queries from benches/query_performance.rs
+// use the expected scan strategies by examining EXPLAIN output and programmatic
+// strategy extraction. Each test corresponds to one benchmark query pattern.
+
+/// Helper: extract the SiloExecutionPlan line from EXPLAIN output
+fn extract_silo_plan_line(explain: &str) -> String {
+    explain
+        .lines()
+        .find(|l| l.contains("SiloExecutionPlan:"))
+        .unwrap_or_else(|| panic!("No SiloExecutionPlan line in EXPLAIN:\n{}", explain))
+        .trim()
+        .to_string()
+}
+
+/// Helper: get both EXPLAIN text and programmatic strategy for a query
+async fn explain_and_strategy(
+    engine: &ShardQueryEngine,
+    query: &str,
+) -> (String, JobsScanStrategy) {
+    let explain = engine.explain(query).await.expect("explain");
+    let plan = engine.get_physical_plan(query).await.expect("plan");
+    let exprs =
+        ShardQueryEngine::extract_pushed_filter_exprs(&plan).expect("should have filter exprs");
+    let strategy = parse_jobs_scan_strategy(&exprs);
+    (explain, strategy)
+}
+
+// Benchmark query: SELECT COUNT(*) FROM jobs
+// Cross-tenant, no filters → FullScan with no tenant
+#[silo::test]
+async fn explain_bench_total_count() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    enqueue_job(&shard, "j1", 10, now).await;
+
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let (explain, strategy) = explain_and_strategy(&engine, "SELECT COUNT(*) FROM jobs").await;
+
+    let plan_line = extract_silo_plan_line(&explain);
+    assert!(
+        plan_line.contains("FullScan(tenant=None)"),
+        "Expected FullScan with no tenant, got: {}",
+        plan_line
+    );
+    assert_eq!(strategy, JobsScanStrategy::FullScan { tenant: None });
+}
+
+// Benchmark query: SELECT tenant, COUNT(*) as cnt FROM jobs
+//   WHERE status_kind NOT IN ('Succeeded','Failed','Cancelled')
+//   GROUP BY tenant ORDER BY cnt DESC LIMIT 20
+// NOT IN doesn't match equality pushdown → FullScan with no tenant
+#[silo::test]
+async fn explain_bench_top_active_tenants() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    enqueue_job(&shard, "j1", 10, now).await;
+
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let (explain, strategy) = explain_and_strategy(
+        &engine,
+        "SELECT tenant, COUNT(*) as cnt FROM jobs WHERE status_kind NOT IN ('Succeeded','Failed','Cancelled') GROUP BY tenant ORDER BY cnt DESC LIMIT 20",
+    )
+    .await;
+
+    let plan_line = extract_silo_plan_line(&explain);
+    assert!(
+        plan_line.contains("FullScan(tenant=None)"),
+        "NOT IN should fall through to FullScan, got: {}",
+        plan_line
+    );
+    assert_eq!(strategy, JobsScanStrategy::FullScan { tenant: None });
+}
+
+// Benchmark query: SELECT COUNT(*) FROM jobs WHERE tenant = '{t}'
+// Tenant-only filter → FullScan with tenant
+#[silo::test]
+async fn explain_bench_tenant_count() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    enqueue_job(&shard, "j1", 10, now).await;
+
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let (explain, strategy) =
+        explain_and_strategy(&engine, "SELECT COUNT(*) FROM jobs WHERE tenant = '-'").await;
+
+    let plan_line = extract_silo_plan_line(&explain);
+    assert!(
+        plan_line.contains("FullScan(tenant=Some(\"-\"))"),
+        "Tenant-only filter should use FullScan with tenant, got: {}",
+        plan_line
+    );
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::FullScan {
+            tenant: Some("-".to_string()),
+        }
+    );
+}
+
+// Benchmark query: SELECT COUNT(*) FROM jobs WHERE tenant = '{t}' AND status_kind = 'Waiting'
+// Status filter → Status(Waiting) scan strategy
+#[silo::test]
+async fn explain_bench_count_waiting() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    enqueue_job(&shard, "j1", 10, now).await;
+
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let (explain, strategy) = explain_and_strategy(
+        &engine,
+        "SELECT COUNT(*) FROM jobs WHERE tenant = '-' AND status_kind = 'Waiting'",
+    )
+    .await;
+
+    let plan_line = extract_silo_plan_line(&explain);
+    assert!(
+        plan_line.contains("Status(tenant=Some(\"-\"), status=Waiting)"),
+        "Expected Status(Waiting) strategy, got: {}",
+        plan_line
+    );
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::Status {
+            tenant: Some("-".to_string()),
+            status: QueryStatusFilter::Waiting,
+        }
+    );
+}
+
+// Benchmark query: SELECT COUNT(*) FROM jobs WHERE tenant = '{t}' AND status_kind = 'Succeeded'
+#[silo::test]
+async fn explain_bench_count_succeeded() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    enqueue_job(&shard, "j1", 10, now).await;
+
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let (explain, strategy) = explain_and_strategy(
+        &engine,
+        "SELECT COUNT(*) FROM jobs WHERE tenant = '-' AND status_kind = 'Succeeded'",
+    )
+    .await;
+
+    let plan_line = extract_silo_plan_line(&explain);
+    assert!(
+        plan_line.contains("Status(tenant=Some(\"-\"), status=Succeeded)"),
+        "Expected Status(Succeeded) strategy, got: {}",
+        plan_line
+    );
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::Status {
+            tenant: Some("-".to_string()),
+            status: QueryStatusFilter::Stored(JobStatusKind::Succeeded),
+        }
+    );
+}
+
+// Benchmark query: SELECT COUNT(*) FROM jobs WHERE tenant = '{t}' AND status_kind = 'Scheduled'
+#[silo::test]
+async fn explain_bench_count_scheduled() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    enqueue_job(&shard, "j1", 10, now).await;
+
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let (explain, strategy) = explain_and_strategy(
+        &engine,
+        "SELECT COUNT(*) FROM jobs WHERE tenant = '-' AND status_kind = 'Scheduled'",
+    )
+    .await;
+
+    let plan_line = extract_silo_plan_line(&explain);
+    assert!(
+        plan_line.contains("Status(tenant=Some(\"-\"), status=FutureScheduled)"),
+        "Expected Status(FutureScheduled) strategy, got: {}",
+        plan_line
+    );
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::Status {
+            tenant: Some("-".to_string()),
+            status: QueryStatusFilter::FutureScheduled,
+        }
+    );
+}
+
+// Benchmark query: SELECT * FROM jobs WHERE tenant = '{t}' AND status_kind = 'Failed' LIMIT 20
+// Status filter with limit → Status(Failed) strategy.
+// NOTE: DataFusion does NOT push LIMIT down because our filters are Inexact
+// (DataFusion adds FilterExec above, and LIMIT can't be pushed through a filter).
+// This means we scan ALL matching rows from the status index, then DataFusion truncates.
+#[silo::test]
+async fn explain_bench_first_page_failed() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    enqueue_job(&shard, "j1", 10, now).await;
+
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let (explain, strategy) = explain_and_strategy(
+        &engine,
+        "SELECT * FROM jobs WHERE tenant = '-' AND status_kind = 'Failed' LIMIT 20",
+    )
+    .await;
+
+    let plan_line = extract_silo_plan_line(&explain);
+    assert!(
+        plan_line.contains("Status(tenant=Some(\"-\"), status=Failed)"),
+        "Expected Status(Failed) strategy, got: {}",
+        plan_line
+    );
+    // Limit is NOT pushed down because Inexact filters cause FilterExec above our scan
+    assert!(
+        plan_line.contains("limit=None"),
+        "Expected limit=None (not pushed through FilterExec), got: {}",
+        plan_line
+    );
+    // DataFusion handles limit above our scan (Limit in logical plan, GlobalLimitExec in physical)
+    assert!(
+        explain.contains("Limit") || explain.contains("GlobalLimitExec"),
+        "Expected limit handling in plan:\n{}",
+        explain
+    );
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::Status {
+            tenant: Some("-".to_string()),
+            status: QueryStatusFilter::Stored(JobStatusKind::Failed),
+        }
+    );
+}
+
+// Benchmark query: SELECT * FROM jobs WHERE tenant = '{t}' AND status_kind = 'Failed' LIMIT 20 OFFSET 180
+// Same as first_page: limit is NOT pushed down because of Inexact filters.
+// DataFusion handles both OFFSET and LIMIT with GlobalLimitExec.
+#[silo::test]
+async fn explain_bench_10th_page_failed() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    enqueue_job(&shard, "j1", 10, now).await;
+
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let (explain, strategy) = explain_and_strategy(
+        &engine,
+        "SELECT * FROM jobs WHERE tenant = '-' AND status_kind = 'Failed' LIMIT 20 OFFSET 180",
+    )
+    .await;
+
+    let plan_line = extract_silo_plan_line(&explain);
+    assert!(
+        plan_line.contains("Status(tenant=Some(\"-\"), status=Failed)"),
+        "Expected Status(Failed) strategy, got: {}",
+        plan_line
+    );
+    // Limit is NOT pushed through FilterExec
+    assert!(
+        plan_line.contains("limit=None"),
+        "Expected limit=None (not pushed through FilterExec), got: {}",
+        plan_line
+    );
+    // DataFusion handles offset+limit above our scan (Limit in logical plan, GlobalLimitExec in physical)
+    assert!(
+        explain.contains("Limit") || explain.contains("GlobalLimitExec"),
+        "Expected limit/offset handling in plan:\n{}",
+        explain
+    );
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::Status {
+            tenant: Some("-".to_string()),
+            status: QueryStatusFilter::Stored(JobStatusKind::Failed),
+        }
+    );
+}
+
+// Benchmark query: SELECT * FROM jobs WHERE tenant = '{t}' AND id = '{known_id}'
+// Exact ID with tenant → ExactId with tenant, single key lookup (fast path)
+#[silo::test]
+async fn explain_bench_exact_id_with_tenant() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    enqueue_job(&shard, "target-00000000", 10, now).await;
+
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let (explain, strategy) = explain_and_strategy(
+        &engine,
+        "SELECT * FROM jobs WHERE tenant = '-' AND id = 'target-00000000'",
+    )
+    .await;
+
+    let plan_line = extract_silo_plan_line(&explain);
+    assert!(
+        plan_line.contains("ExactId(tenant=Some(\"-\"), id=\"target-00000000\")"),
+        "Expected ExactId with tenant, got: {}",
+        plan_line
+    );
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::ExactId {
+            tenant: Some("-".to_string()),
+            id: "target-00000000".to_string(),
+        }
+    );
+}
+
+// Contrast: exact ID WITHOUT tenant → ExactId with tenant=None (falls back to scan_all_jobs)
+#[silo::test]
+async fn explain_bench_exact_id_no_tenant() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    enqueue_job(&shard, "target-00000000", 10, now).await;
+
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let (explain, strategy) =
+        explain_and_strategy(&engine, "SELECT * FROM jobs WHERE id = 'target-00000000'").await;
+
+    let plan_line = extract_silo_plan_line(&explain);
+    assert!(
+        plan_line.contains("ExactId(tenant=None"),
+        "Expected ExactId with tenant=None, got: {}",
+        plan_line
+    );
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::ExactId {
+            tenant: None,
+            id: "target-00000000".to_string(),
+        }
+    );
+}
+
+// Benchmark query: SELECT * FROM jobs WHERE tenant = '{t}'
+//   AND array_contains(element_at(metadata, 'region'), 'us-east-1')
+//   AND status_kind = 'Waiting'
+// Metadata filter takes priority over status → MetadataExact
+#[silo::test]
+async fn explain_bench_metadata_and_status() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    enqueue_job_with_metadata(
+        &shard,
+        "j1",
+        10,
+        now,
+        vec![("region".to_string(), "us-east-1".to_string())],
+    )
+    .await;
+
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let (explain, strategy) = explain_and_strategy(
+        &engine,
+        "SELECT * FROM jobs WHERE tenant = '-' AND array_contains(element_at(metadata, 'region'), 'us-east-1') AND status_kind = 'Waiting'",
+    )
+    .await;
+
+    let plan_line = extract_silo_plan_line(&explain);
+    // Metadata filter should take priority over status filter
+    assert!(
+        plan_line
+            .contains("MetadataExact(tenant=Some(\"-\"), key=\"region\", value=\"us-east-1\")"),
+        "Expected MetadataExact strategy (metadata takes priority over status), got: {}",
+        plan_line
+    );
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::MetadataExact {
+            tenant: Some("-".to_string()),
+            key: "region".to_string(),
+            value: "us-east-1".to_string(),
+        }
+    );
+}
+
+// Benchmark query: SELECT status_kind, COUNT(*) FROM jobs WHERE tenant = '{t}' GROUP BY status_kind
+// Only tenant filter, no status → FullScan with tenant
+#[silo::test]
+async fn explain_bench_status_breakdown() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    enqueue_job(&shard, "j1", 10, now).await;
+
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let (explain, strategy) = explain_and_strategy(
+        &engine,
+        "SELECT status_kind, COUNT(*) FROM jobs WHERE tenant = '-' GROUP BY status_kind",
+    )
+    .await;
+
+    let plan_line = extract_silo_plan_line(&explain);
+    assert!(
+        plan_line.contains("FullScan(tenant=Some(\"-\"))"),
+        "Status breakdown without specific status should use FullScan, got: {}",
+        plan_line
+    );
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::FullScan {
+            tenant: Some("-".to_string()),
+        }
+    );
+}
+
+// Benchmark query: SELECT * FROM jobs WHERE tenant = '{t}' ORDER BY enqueue_time_ms DESC LIMIT 20
+// No indexed filter besides tenant → FullScan with tenant, limit pushed
+#[silo::test]
+async fn explain_bench_recent_jobs() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    enqueue_job(&shard, "j1", 10, now).await;
+
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let (explain, strategy) = explain_and_strategy(
+        &engine,
+        "SELECT * FROM jobs WHERE tenant = '-' ORDER BY enqueue_time_ms DESC LIMIT 20",
+    )
+    .await;
+
+    let plan_line = extract_silo_plan_line(&explain);
+    assert!(
+        plan_line.contains("FullScan(tenant=Some(\"-\"))"),
+        "ORDER BY without indexed filter should use FullScan, got: {}",
+        plan_line
+    );
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::FullScan {
+            tenant: Some("-".to_string()),
+        }
+    );
+}
+
+// Benchmark query: SELECT COUNT(*) FROM jobs WHERE tenant = '{t}'
+//   AND array_contains(element_at(metadata, 'region'), 'us-east-1')
+// Metadata equality filter → MetadataExact
+#[silo::test]
+async fn explain_bench_metadata_count() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    enqueue_job_with_metadata(
+        &shard,
+        "j1",
+        10,
+        now,
+        vec![("region".to_string(), "us-east-1".to_string())],
+    )
+    .await;
+
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let (explain, strategy) = explain_and_strategy(
+        &engine,
+        "SELECT COUNT(*) FROM jobs WHERE tenant = '-' AND array_contains(element_at(metadata, 'region'), 'us-east-1')",
+    )
+    .await;
+
+    let plan_line = extract_silo_plan_line(&explain);
+    assert!(
+        plan_line
+            .contains("MetadataExact(tenant=Some(\"-\"), key=\"region\", value=\"us-east-1\")"),
+        "Expected MetadataExact strategy, got: {}",
+        plan_line
+    );
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::MetadataExact {
+            tenant: Some("-".to_string()),
+            key: "region".to_string(),
+            value: "us-east-1".to_string(),
+        }
+    );
 }

@@ -499,13 +499,13 @@ async fn scan_jobs_ignores_uncleaned_out_of_range_jobs() {
     );
 
     // scan_jobs for in-range tenant should work
-    let aaa_jobs = shard.scan_jobs("aaa", 100).await.unwrap();
+    let aaa_jobs = shard.scan_jobs("aaa", Some(100)).await.unwrap();
     assert_eq!(aaa_jobs.len(), 2, "should find 2 aaa jobs");
 
     // scan_jobs for out-of-range tenant - the data exists but shouldn't be accessible
     // Note: scan_jobs doesn't filter by range, it just scans by tenant
     // This is OK because the tenant explicitly requested their own data
-    let zzz_jobs = shard.scan_jobs("zzz", 100).await.unwrap();
+    let zzz_jobs = shard.scan_jobs("zzz", Some(100)).await.unwrap();
     // This will return results since scan_jobs is tenant-specific
     // The important thing is dequeue and other operations filter correctly
     assert_eq!(zzz_jobs.len(), 2, "scan_jobs returns tenant's own data");
