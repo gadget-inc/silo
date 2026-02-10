@@ -114,6 +114,10 @@ strip = false # do not strip symbols for profiling
 name = "job_shard_throughput"
 harness = false
 
+[[bench]]
+name = "query_performance"
+harness = false
+
 [[test]]
 name = "turmoil_runner"
 path = "tests/turmoil_runner/main.rs"

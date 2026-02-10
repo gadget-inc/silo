@@ -321,6 +321,12 @@ pub fn idx_metadata_prefix(tenant: &str, key: &str, value: &str) -> Vec<u8> {
     )
 }
 
+/// Prefix for scanning jobs by metadata key only (all values for a given tenant + key).
+/// Used as the end boundary for prefix scans over metadata values.
+pub fn idx_metadata_key_only_prefix(tenant: &str, key: &str) -> Vec<u8> {
+    encode_prefix_with(prefix::IDX_METADATA, &(tenant.to_string(), key.to_string()))
+}
+
 /// Parsed metadata index key components.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedMetadataIndexKey {

@@ -20,7 +20,7 @@ async fn status_index_scheduled_then_running_then_succeeded() {
 
     // Initially Scheduled
     let s = shard
-        .scan_jobs_by_status("-", JobStatusKind::Scheduled, 10)
+        .scan_jobs_by_status("-", JobStatusKind::Scheduled, Some(10))
         .await
         .expect("scan");
     assert!(s.contains(&job_id));
@@ -34,7 +34,7 @@ async fn status_index_scheduled_then_running_then_succeeded() {
     assert_eq!(tasks.len(), 1);
 
     let running = shard
-        .scan_jobs_by_status("-", JobStatusKind::Running, 10)
+        .scan_jobs_by_status("-", JobStatusKind::Running, Some(10))
         .await
         .expect("scan running");
     assert!(running.contains(&job_id));
@@ -47,7 +47,7 @@ async fn status_index_scheduled_then_running_then_succeeded() {
         .expect("report");
 
     let succ = shard
-        .scan_jobs_by_status("-", JobStatusKind::Succeeded, 10)
+        .scan_jobs_by_status("-", JobStatusKind::Succeeded, Some(10))
         .await
         .expect("scan succ");
     assert!(succ.contains(&job_id));
@@ -130,13 +130,13 @@ async fn status_index_failed_and_scheduled_then_order_newest_first() {
 
     // Now A should be in Failed, B should be in Scheduled. Newest-first within each.
     let failed = shard
-        .scan_jobs_by_status("-", JobStatusKind::Failed, 10)
+        .scan_jobs_by_status("-", JobStatusKind::Failed, Some(10))
         .await
         .expect("scan failed");
     assert_eq!(failed[0], a);
 
     let scheduled = shard
-        .scan_jobs_by_status("-", JobStatusKind::Scheduled, 10)
+        .scan_jobs_by_status("-", JobStatusKind::Scheduled, Some(10))
         .await
         .expect("scan sched");
     assert!(scheduled.contains(&b));
@@ -173,7 +173,7 @@ async fn retry_flow_running_to_scheduled_to_running_to_succeeded() {
         .task_id()
         .to_string();
     let running = shard
-        .scan_jobs_by_status("-", JobStatusKind::Running, 10)
+        .scan_jobs_by_status("-", JobStatusKind::Running, Some(10))
         .await
         .expect("scan running");
     assert!(running.contains(&job_id));
@@ -189,7 +189,7 @@ async fn retry_flow_running_to_scheduled_to_running_to_succeeded() {
         .await
         .expect("report err");
     let scheduled = shard
-        .scan_jobs_by_status("-", JobStatusKind::Scheduled, 10)
+        .scan_jobs_by_status("-", JobStatusKind::Scheduled, Some(10))
         .await
         .expect("scan scheduled");
     assert!(scheduled.contains(&job_id));
@@ -199,7 +199,7 @@ async fn retry_flow_running_to_scheduled_to_running_to_succeeded() {
         .task_id()
         .to_string();
     let running2 = shard
-        .scan_jobs_by_status("-", JobStatusKind::Running, 10)
+        .scan_jobs_by_status("-", JobStatusKind::Running, Some(10))
         .await
         .expect("scan running2");
     assert!(running2.contains(&job_id));
@@ -209,7 +209,7 @@ async fn retry_flow_running_to_scheduled_to_running_to_succeeded() {
         .await
         .expect("report ok");
     let succ = shard
-        .scan_jobs_by_status("-", JobStatusKind::Succeeded, 10)
+        .scan_jobs_by_status("-", JobStatusKind::Succeeded, Some(10))
         .await
         .expect("scan succ");
     assert!(succ.contains(&job_id));
@@ -276,7 +276,7 @@ async fn reaper_without_retries_marks_failed_in_index() {
     let _ = shard.reap_expired_leases("-").await.unwrap();
     // Should be Failed in index (no retries)
     let failed = shard
-        .scan_jobs_by_status("-", JobStatusKind::Failed, 10)
+        .scan_jobs_by_status("-", JobStatusKind::Failed, Some(10))
         .await
         .unwrap();
     assert!(failed.contains(&job_id));
@@ -348,7 +348,7 @@ async fn reaper_with_retries_moves_to_scheduled_in_index() {
     let _ = shard.reap_expired_leases("-").await.unwrap();
     // Should be Scheduled in index (retries present)
     let scheduled = shard
-        .scan_jobs_by_status("-", JobStatusKind::Scheduled, 10)
+        .scan_jobs_by_status("-", JobStatusKind::Scheduled, Some(10))
         .await
         .unwrap();
     assert!(scheduled.contains(&job_id));
@@ -383,14 +383,14 @@ async fn delete_removes_from_index() {
         .expect("report ok");
     // Ensure in Succeeded index
     let succ = shard
-        .scan_jobs_by_status("-", JobStatusKind::Succeeded, 10)
+        .scan_jobs_by_status("-", JobStatusKind::Succeeded, Some(10))
         .await
         .unwrap();
     assert!(succ.contains(&job_id));
     // Delete
     shard.delete_job("-", &job_id).await.unwrap();
     let succ2 = shard
-        .scan_jobs_by_status("-", JobStatusKind::Succeeded, 10)
+        .scan_jobs_by_status("-", JobStatusKind::Succeeded, Some(10))
         .await
         .unwrap();
     assert!(!succ2.contains(&job_id));
@@ -429,7 +429,7 @@ async fn cross_tenant_isolation_in_scans() {
         .await
         .unwrap();
     let a_list = shard
-        .scan_jobs_by_status("tenantA", JobStatusKind::Scheduled, 10)
+        .scan_jobs_by_status("tenantA", JobStatusKind::Scheduled, Some(10))
         .await
         .unwrap();
     assert!(a_list.contains(&id_a));
@@ -463,13 +463,13 @@ async fn pagination_and_ordering_newest_first() {
     }
     // Page size 3
     let first_page = shard
-        .scan_jobs_by_status("-", JobStatusKind::Scheduled, 3)
+        .scan_jobs_by_status("-", JobStatusKind::Scheduled, Some(3))
         .await
         .unwrap();
     assert_eq!(first_page.len(), 3);
     // Limit zero returns empty
     let empty = shard
-        .scan_jobs_by_status("-", JobStatusKind::Scheduled, 0)
+        .scan_jobs_by_status("-", JobStatusKind::Scheduled, Some(0))
         .await
         .unwrap();
     assert!(empty.is_empty());
@@ -494,7 +494,7 @@ async fn future_enqueue_is_in_scheduled_scan() {
         .await
         .unwrap();
     let scheduled = shard
-        .scan_jobs_by_status("-", JobStatusKind::Scheduled, 10)
+        .scan_jobs_by_status("-", JobStatusKind::Scheduled, Some(10))
         .await
         .unwrap();
     assert!(scheduled.contains(&id));
@@ -554,7 +554,7 @@ async fn metadata_index_basic_and_delete_cleanup() {
 
     // Scan by (k=v) should include A and B (order unspecified)
     let kv = shard
-        .scan_jobs_by_metadata("-", "k", "v", 10)
+        .scan_jobs_by_metadata("-", "k", "v", Some(10))
         .await
         .expect("scan k=v");
     assert_eq!(kv.len(), 2);
@@ -563,14 +563,14 @@ async fn metadata_index_basic_and_delete_cleanup() {
 
     // Scan by (x=y) should include only A
     let xy = shard
-        .scan_jobs_by_metadata("-", "x", "y", 10)
+        .scan_jobs_by_metadata("-", "x", "y", Some(10))
         .await
         .expect("scan x=y");
     assert_eq!(xy, vec![a.clone()]);
 
     // Scan by (k=w) should include only C
     let kw = shard
-        .scan_jobs_by_metadata("-", "k", "w", 10)
+        .scan_jobs_by_metadata("-", "k", "w", Some(10))
         .await
         .expect("scan k=w");
     assert_eq!(kw, vec![c.clone()]);
@@ -592,7 +592,7 @@ async fn metadata_index_basic_and_delete_cleanup() {
         .expect("complete A");
     shard.delete_job("-", &a).await.expect("delete a");
     let kv2 = shard
-        .scan_jobs_by_metadata("-", "k", "v", 10)
+        .scan_jobs_by_metadata("-", "k", "v", Some(10))
         .await
         .expect("scan k=v after delete");
     assert_eq!(kv2, vec![b]);
@@ -633,7 +633,7 @@ async fn metadata_scan_cross_tenant_isolation() {
         .unwrap();
 
     let list_a = shard
-        .scan_jobs_by_metadata("tenantA", "k", "v", 10)
+        .scan_jobs_by_metadata("tenantA", "k", "v", Some(10))
         .await
         .unwrap();
     assert_eq!(list_a, vec![a]);
@@ -645,7 +645,10 @@ async fn metadata_scan_cross_tenant_isolation() {
 #[silo::test]
 async fn metadata_scan_limit_zero_returns_empty() {
     let (_tmp, shard) = open_temp_shard().await;
-    let empty = shard.scan_jobs_by_metadata("-", "k", "v", 0).await.unwrap();
+    let empty = shard
+        .scan_jobs_by_metadata("-", "k", "v", Some(0))
+        .await
+        .unwrap();
     assert!(empty.is_empty());
 }
 
@@ -672,7 +675,7 @@ async fn scan_jobs_unfiltered_basic_and_ordering() {
             .expect("enqueue");
     }
     // Scan with limit
-    let first_three = shard.scan_jobs("-", 3).await.expect("scan jobs");
+    let first_three = shard.scan_jobs("-", Some(3)).await.expect("scan jobs");
     assert_eq!(first_three.len(), 3);
     // Lexicographic order of job ids
     assert_eq!(
@@ -681,7 +684,7 @@ async fn scan_jobs_unfiltered_basic_and_ordering() {
     );
 
     // Full scan should include all ids in order
-    let all = shard.scan_jobs("-", 10).await.expect("scan all");
+    let all = shard.scan_jobs("-", Some(10)).await.expect("scan all");
     assert_eq!(
         all,
         vec![
@@ -728,10 +731,10 @@ async fn scan_jobs_is_tenant_isolated_and_limit_zero_empty() {
         .unwrap();
 
     // Limit zero
-    let empty = shard.scan_jobs("tenantA", 0).await.unwrap();
+    let empty = shard.scan_jobs("tenantA", Some(0)).await.unwrap();
     assert!(empty.is_empty());
 
     // Tenant isolation: only tenantA job is returned
-    let list_a = shard.scan_jobs("tenantA", 10).await.unwrap();
+    let list_a = shard.scan_jobs("tenantA", Some(10)).await.unwrap();
     assert_eq!(list_a, vec![a]);
 }

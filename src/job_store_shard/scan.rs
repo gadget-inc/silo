@@ -5,28 +5,39 @@ use slatedb::DbIterator;
 use crate::job::JobStatusKind;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{
-    end_bound, idx_metadata_prefix, idx_status_time_all_prefix, idx_status_time_prefix,
-    idx_status_time_prefix_with_time, job_info_prefix, jobs_prefix, parse_job_info_key,
-    parse_metadata_index_key, parse_status_time_index_key,
+    end_bound, idx_metadata_key_only_prefix, idx_metadata_prefix, idx_status_time_all_prefix,
+    idx_status_time_prefix, idx_status_time_prefix_with_time, job_info_prefix, jobs_prefix,
+    parse_job_info_key, parse_metadata_index_key, parse_status_time_index_key,
 };
+
+fn under_limit(count: usize, limit: Option<usize>) -> bool {
+    match limit {
+        Some(l) => count < l,
+        None => true,
+    }
+}
+
+fn initial_capacity(limit: Option<usize>) -> usize {
+    limit.unwrap_or(1024).min(1024)
+}
 
 impl JobStoreShard {
     /// Scan all jobs for a tenant ordered by job id (lexicographic), unfiltered.
     pub async fn scan_jobs(
         &self,
         tenant: &str,
-        limit: usize,
+        limit: Option<usize>,
     ) -> Result<Vec<String>, JobStoreShardError> {
-        if limit == 0 {
+        if limit == Some(0) {
             return Ok(Vec::new());
         }
 
         let start = job_info_prefix(tenant);
         let end = end_bound(&start);
         let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..end).await?;
-        let mut out = Vec::with_capacity(limit);
+        let mut out = Vec::with_capacity(initial_capacity(limit));
 
-        while out.len() < limit {
+        while under_limit(out.len(), limit) {
             let Some(kv) = iter.next().await? else {
                 break;
             };
@@ -44,18 +55,18 @@ impl JobStoreShard {
     /// Used for admin queries that need cluster-wide visibility.
     pub async fn scan_all_jobs(
         &self,
-        limit: usize,
+        limit: Option<usize>,
     ) -> Result<Vec<(String, String)>, JobStoreShardError> {
-        if limit == 0 {
+        if limit == Some(0) {
             return Ok(Vec::new());
         }
 
         let start = jobs_prefix();
         let end = end_bound(&start);
         let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..end).await?;
-        let mut out = Vec::with_capacity(limit);
+        let mut out = Vec::with_capacity(initial_capacity(limit));
 
-        while out.len() < limit {
+        while under_limit(out.len(), limit) {
             let Some(kv) = iter.next().await? else {
                 break;
             };
@@ -74,18 +85,18 @@ impl JobStoreShard {
         &self,
         tenant: &str,
         status: JobStatusKind,
-        limit: usize,
+        limit: Option<usize>,
     ) -> Result<Vec<String>, JobStoreShardError> {
-        if limit == 0 {
+        if limit == Some(0) {
             return Ok(Vec::new());
         }
 
         let start = idx_status_time_prefix(tenant, status.as_str());
         let end = end_bound(&start);
         let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..end).await?;
-        let mut out = Vec::with_capacity(limit);
+        let mut out = Vec::with_capacity(initial_capacity(limit));
 
-        while out.len() < limit {
+        while under_limit(out.len(), limit) {
             let Some(kv) = iter.next().await? else {
                 break;
             };
@@ -104,9 +115,9 @@ impl JobStoreShard {
     pub async fn scan_all_jobs_by_status(
         &self,
         status: JobStatusKind,
-        limit: usize,
+        limit: Option<usize>,
     ) -> Result<Vec<(String, String)>, JobStoreShardError> {
-        if limit == 0 {
+        if limit == Some(0) {
             return Ok(Vec::new());
         }
 
@@ -114,9 +125,9 @@ impl JobStoreShard {
         let start = idx_status_time_all_prefix();
         let end = end_bound(&start);
         let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..end).await?;
-        let mut out = Vec::with_capacity(limit);
+        let mut out = Vec::with_capacity(initial_capacity(limit));
 
-        while out.len() < limit {
+        while under_limit(out.len(), limit) {
             let Some(kv) = iter.next().await? else {
                 break;
             };
@@ -137,9 +148,9 @@ impl JobStoreShard {
         &self,
         tenant: &str,
         now_ms: i64,
-        limit: usize,
+        limit: Option<usize>,
     ) -> Result<Vec<String>, JobStoreShardError> {
-        if limit == 0 {
+        if limit == Some(0) {
             return Ok(Vec::new());
         }
 
@@ -149,9 +160,9 @@ impl JobStoreShard {
         let start = idx_status_time_prefix_with_time(tenant, "Scheduled", inverted_now);
         let prefix_end = end_bound(&idx_status_time_prefix(tenant, "Scheduled"));
         let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..prefix_end).await?;
-        let mut out = Vec::with_capacity(limit);
+        let mut out = Vec::with_capacity(initial_capacity(limit));
 
-        while out.len() < limit {
+        while under_limit(out.len(), limit) {
             let Some(kv) = iter.next().await? else {
                 break;
             };
@@ -169,9 +180,9 @@ impl JobStoreShard {
     pub async fn scan_all_jobs_waiting(
         &self,
         now_ms: i64,
-        limit: usize,
+        limit: Option<usize>,
     ) -> Result<Vec<(String, String)>, JobStoreShardError> {
-        if limit == 0 {
+        if limit == Some(0) {
             return Ok(Vec::new());
         }
 
@@ -179,9 +190,9 @@ impl JobStoreShard {
         let start = idx_status_time_all_prefix();
         let end = end_bound(&start);
         let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..end).await?;
-        let mut out = Vec::with_capacity(limit);
+        let mut out = Vec::with_capacity(initial_capacity(limit));
 
-        while out.len() < limit {
+        while under_limit(out.len(), limit) {
             let Some(kv) = iter.next().await? else {
                 break;
             };
@@ -205,9 +216,9 @@ impl JobStoreShard {
         &self,
         tenant: &str,
         now_ms: i64,
-        limit: usize,
+        limit: Option<usize>,
     ) -> Result<Vec<String>, JobStoreShardError> {
-        if limit == 0 {
+        if limit == Some(0) {
             return Ok(Vec::new());
         }
 
@@ -217,9 +228,9 @@ impl JobStoreShard {
         let start = idx_status_time_prefix(tenant, "Scheduled");
         let boundary = idx_status_time_prefix_with_time(tenant, "Scheduled", inverted_now);
         let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..boundary).await?;
-        let mut out = Vec::with_capacity(limit);
+        let mut out = Vec::with_capacity(initial_capacity(limit));
 
-        while out.len() < limit {
+        while under_limit(out.len(), limit) {
             let Some(kv) = iter.next().await? else {
                 break;
             };
@@ -237,9 +248,9 @@ impl JobStoreShard {
     pub async fn scan_all_jobs_future_scheduled(
         &self,
         now_ms: i64,
-        limit: usize,
+        limit: Option<usize>,
     ) -> Result<Vec<(String, String)>, JobStoreShardError> {
-        if limit == 0 {
+        if limit == Some(0) {
             return Ok(Vec::new());
         }
 
@@ -247,9 +258,9 @@ impl JobStoreShard {
         let start = idx_status_time_all_prefix();
         let end = end_bound(&start);
         let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..end).await?;
-        let mut out = Vec::with_capacity(limit);
+        let mut out = Vec::with_capacity(initial_capacity(limit));
 
-        while out.len() < limit {
+        while under_limit(out.len(), limit) {
             let Some(kv) = iter.next().await? else {
                 break;
             };
@@ -273,18 +284,18 @@ impl JobStoreShard {
         tenant: &str,
         key: &str,
         value: &str,
-        limit: usize,
+        limit: Option<usize>,
     ) -> Result<Vec<String>, JobStoreShardError> {
-        if limit == 0 {
+        if limit == Some(0) {
             return Ok(Vec::new());
         }
 
         let start = idx_metadata_prefix(tenant, key, value);
         let end = end_bound(&start);
         let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..end).await?;
-        let mut out = Vec::with_capacity(limit);
+        let mut out = Vec::with_capacity(initial_capacity(limit));
 
-        while out.len() < limit {
+        while under_limit(out.len(), limit) {
             let Some(kv) = iter.next().await? else {
                 break;
             };
@@ -292,6 +303,43 @@ impl JobStoreShard {
                 && !parsed.job_id.is_empty()
             {
                 out.push(parsed.job_id);
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Scan jobs by metadata key with a value prefix. Returns jobs where the metadata
+    /// value for the given key starts with `value_prefix`. Order is not specified.
+    pub async fn scan_jobs_by_metadata_prefix(
+        &self,
+        tenant: &str,
+        key: &str,
+        value_prefix: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<String>, JobStoreShardError> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+
+        let start = idx_metadata_prefix(tenant, key, value_prefix);
+        let end = end_bound(&idx_metadata_key_only_prefix(tenant, key));
+        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..end).await?;
+        let mut out = Vec::with_capacity(initial_capacity(limit));
+
+        while under_limit(out.len(), limit) {
+            let Some(kv) = iter.next().await? else {
+                break;
+            };
+            if let Some(parsed) = parse_metadata_index_key(&kv.key) {
+                if parsed.value.starts_with(value_prefix) && !parsed.job_id.is_empty() {
+                    out.push(parsed.job_id);
+                } else if parsed.value.as_str() > value_prefix
+                    && !parsed.value.starts_with(value_prefix)
+                {
+                    // Values are sorted lexicographically; once we've passed the prefix range, stop
+                    break;
+                }
             }
         }
 

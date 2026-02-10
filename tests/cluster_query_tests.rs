@@ -569,7 +569,7 @@ async fn cluster_query_multi_shard_filter_pushdown() {
 
     // Verify the job is in shard1's database before we proceed
     let shard1_scheduled = shard1
-        .scan_jobs_by_status("-", silo::job::JobStatusKind::Scheduled, 100)
+        .scan_jobs_by_status("-", silo::job::JobStatusKind::Scheduled, Some(100))
         .await
         .expect("scan shard1");
     assert!(
