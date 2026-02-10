@@ -1361,7 +1361,9 @@ async fn k8s_multiple_add_remove_cycles() {
     );
 
     for i in 0..2 {
-        // Reduced iterations
+        // Stagger node starts to reduce contention on K8s API
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
         // Add node
         let node_id = format!("cycle-node-2-iter-{}", i);
         let (c2, h2) = K8sCoordinator::start(
