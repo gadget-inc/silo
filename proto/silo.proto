@@ -224,6 +224,21 @@ message RestartJobResponse {}
 message ExpediteJobRequest { string shard = 1; string id = 2; optional string tenant = 3; }
 message ExpediteJobResponse {}
 
+// Lease a specific job's task directly, putting it into Running state.
+// This is a test-oriented helper: workers should use LeaseTasks for normal processing.
+// Bypasses concurrency/rate-limit processing and creates a RunAttempt lease directly.
+// Returns FAILED_PRECONDITION if the job is running, terminal, or cancelled.
+// Returns NOT_FOUND if the job doesn't exist.
+message LeaseTaskRequest {
+  string shard = 1;          // Shard ID (UUID) where the job is stored.
+  string id = 2;             // The job's unique ID.
+  optional string tenant = 3; // Tenant ID if multi-tenancy is enabled.
+  string worker_id = 4;      // Worker ID to assign the lease to.
+}
+message LeaseTaskResponse {
+  Task task = 1;             // The leased task.
+}
+
 // Lease tasks for processing from this server.
 // By default, leases from all shards this server owns (fair distribution).
 // If shard is specified, filters to only that shard.
@@ -582,6 +597,12 @@ service Silo {
   // Returns NOT_FOUND if the job doesn't exist.
   rpc ExpediteJob(ExpediteJobRequest) returns (ExpediteJobResponse);
   
+  // Lease a specific job's task directly, putting it into Running state.
+  // Test-oriented helper: workers should use LeaseTasks for normal processing.
+  // Returns FAILED_PRECONDITION if the job is running, terminal, or cancelled.
+  // Returns NOT_FOUND if the job doesn't exist.
+  rpc LeaseTask(LeaseTaskRequest) returns (LeaseTaskResponse);
+
   // Lease tasks for a worker to process.
   // Workers should call this periodically to get work.
   // Returns both job tasks and floating limit refresh tasks.

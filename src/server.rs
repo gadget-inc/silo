@@ -184,6 +184,50 @@ pub fn job_attempt_view_to_proto(
     }
 }
 
+/// Convert a `LeasedTask` into a proto `Task` message.
+fn leased_task_to_proto(lt: &crate::task::LeasedTask, shard_id: &str) -> Task {
+    let job = lt.job();
+    let attempt = lt.attempt();
+    let task_group = job.task_group().to_string();
+    let attempt_number = attempt.attempt_number();
+    let relative_attempt_number = attempt.relative_attempt_number();
+    let tenant_str = lt.tenant_id().to_string();
+
+    // Determine if this is the last attempt based on retry policy
+    let max_attempts = job.retry_policy().map(|p| p.retry_count + 1).unwrap_or(1);
+    let is_last_attempt = relative_attempt_number >= max_attempts;
+
+    let tenant_id = if tenant_str == "-" {
+        None
+    } else {
+        Some(tenant_str)
+    };
+
+    Task {
+        id: attempt.task_id().to_string(),
+        job_id: job.id().to_string(),
+        attempt_number,
+        lease_ms: DEFAULT_LEASE_MS,
+        payload: Some(SerializedBytes {
+            encoding: Some(serialized_bytes::Encoding::Msgpack(
+                job.payload_bytes().to_vec(),
+            )),
+        }),
+        priority: job.priority() as u32,
+        shard: shard_id.to_string(),
+        task_group,
+        tenant_id,
+        is_last_attempt,
+        metadata: job.metadata().into_iter().collect(),
+        limits: job
+            .limits()
+            .into_iter()
+            .map(job_limit_to_proto_limit)
+            .collect(),
+        relative_attempt_number,
+    }
+}
+
 fn map_err(e: JobStoreShardError) -> Status {
     match e {
         JobStoreShardError::JobNotFound(_) => Status::not_found("job not found"),
@@ -195,6 +239,7 @@ fn map_err(e: JobStoreShardError) -> Status {
         }
         JobStoreShardError::JobNotRestartable(ref e) => Status::failed_precondition(e.to_string()),
         JobStoreShardError::JobNotExpediteable(ref e) => Status::failed_precondition(e.to_string()),
+        JobStoreShardError::JobNotLeaseable(ref e) => Status::failed_precondition(e.to_string()),
         JobStoreShardError::InvalidArgument(ref msg) => Status::invalid_argument(msg.clone()),
         other => Status::internal(other.to_string()),
     }
@@ -932,6 +977,30 @@ impl Silo for SiloService {
             .await?;
         shard.expedite_job(&tenant, &r.id).await.map_err(map_err)?;
         Ok(Response::new(ExpediteJobResponse {}))
+    }
+
+    async fn lease_task(
+        &self,
+        req: Request<LeaseTaskRequest>,
+    ) -> Result<Response<LeaseTaskResponse>, Status> {
+        let r = req.into_inner();
+        let shard_id = Self::parse_shard_id(&r.shard)?;
+        let shard = self.shard_with_redirect(&shard_id).await?;
+        let tenant = self.validate_tenant(r.tenant.as_deref())?;
+        self.validate_tenant_in_shard_range(&shard_id, &tenant)
+            .await?;
+
+        if r.worker_id.is_empty() {
+            return Err(Status::invalid_argument("worker_id is required"));
+        }
+
+        let leased = shard
+            .lease_task(&tenant, &r.id, &r.worker_id)
+            .await
+            .map_err(map_err)?;
+
+        let task = leased_task_to_proto(&leased, &r.shard);
+        Ok(Response::new(LeaseTaskResponse { task: Some(task) }))
     }
 
     async fn lease_tasks(

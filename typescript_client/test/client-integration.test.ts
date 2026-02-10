@@ -620,6 +620,97 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
     });
   });
 
+  describe("leaseTask", () => {
+    it("leases a specific job's task directly and completes it", async () => {
+      const uniqueJobId = `lease-task-test-${Date.now()}`;
+      const tenant = "lease-task-tenant";
+
+      const handle = await client.enqueue({
+        tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
+        id: uniqueJobId,
+        payload: { action: "lease-task-test" },
+        priority: 1,
+      });
+
+      // Verify job is scheduled
+      const jobBefore = await client.getJob(handle.id, tenant);
+      expect(jobBefore?.status).toBe(JobStatus.Scheduled);
+
+      // Lease the specific task directly
+      const task = await client.leaseTask({
+        id: handle.id,
+        workerId: "lease-task-test-worker",
+        tenant,
+      });
+
+      expect(task.jobId).toBe(handle.id);
+      expect(task.attemptNumber).toBe(1);
+
+      // Verify job is running
+      const jobRunning = await client.getJob(handle.id, tenant);
+      expect(jobRunning?.status).toBe(JobStatus.Running);
+
+      // Complete the job
+      await client.reportOutcome({
+        shard: task.shard,
+        taskId: task.id,
+        outcome: { type: "success", result: { leased: true } },
+      });
+
+      // Verify job succeeded
+      const jobAfter = await client.getJob(handle.id, tenant);
+      expect(jobAfter?.status).toBe(JobStatus.Succeeded);
+    });
+
+    it("leaseTask throws error for non-existent job", async () => {
+      const tenant = "lease-task-tenant";
+      await expect(
+        client.leaseTask({
+          id: "non-existent-job-id",
+          workerId: "test-worker",
+          tenant,
+        })
+      ).rejects.toThrow();
+    });
+
+    it("leaseTask throws error for running job", async () => {
+      const uniqueJobId = `lease-task-running-test-${Date.now()}`;
+      const tenant = "lease-task-tenant";
+
+      const handle = await client.enqueue({
+        tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
+        id: uniqueJobId,
+        payload: { action: "lease-task-running-test" },
+        priority: 1,
+      });
+
+      // Lease the task to make it running
+      const task = await client.leaseTask({
+        id: handle.id,
+        workerId: "lease-task-running-worker",
+        tenant,
+      });
+
+      // Try to lease again - should fail
+      await expect(
+        client.leaseTask({
+          id: handle.id,
+          workerId: "lease-task-running-worker-2",
+          tenant,
+        })
+      ).rejects.toThrow();
+
+      // Complete the job to clean up
+      await client.reportOutcome({
+        shard: task.shard,
+        taskId: task.id,
+        outcome: { type: "success", result: {} },
+      });
+    });
+  });
+
   describe("query", () => {
     it("queries jobs with SQL", async () => {
       const testBatch = `batch-${Date.now()}`;
