@@ -201,6 +201,33 @@ fn shard_range_midpoint_can_be_used_for_split() {
 }
 
 #[test]
+fn shard_range_midpoint_all_32_shard_ranges() {
+    // All ranges produced by create_initial(32) must have a midpoint
+    let shard_map = ShardMap::create_initial(32).expect("create shard map");
+    for shard_info in shard_map.shards() {
+        let mid = shard_info
+            .range
+            .midpoint()
+            .unwrap_or_else(|| panic!("range {} should have a midpoint", shard_info.range));
+        assert!(
+            shard_info.range.contains(&mid),
+            "midpoint {:?} should be within range {}",
+            mid,
+            shard_info.range
+        );
+    }
+}
+
+#[test]
+fn shard_range_midpoint_prefix_with_low_boundary() {
+    // Regression: ["0", "08") failed when midpoint appended 'M' > '8'
+    let range = ShardRange::new("0", "08");
+    let mid = range.midpoint().expect("should have a midpoint");
+    assert!(mid.as_str() > "0");
+    assert!(mid.as_str() < "08");
+}
+
+#[test]
 fn shard_info_new_has_no_parent() {
     let info = ShardInfo::new(ShardId::new(), ShardRange::full());
     assert!(info.parent_shard_id.is_none());

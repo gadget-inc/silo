@@ -215,12 +215,13 @@ impl ShardRange {
         if diff_pos == min_len {
             // One is a prefix of the other
             if start_bytes.len() < end_bytes.len() {
-                // Start is shorter, we can split by extending start
-                let mut mid = effective_start.clone();
-                // Add a character that's midway through ASCII printable range
-                mid.push('M');
-                if mid.as_str() > effective_start.as_str() && mid.as_str() < effective_end.as_str()
-                {
+                // Start is shorter; extend start with a character that keeps us below end.
+                // Since start is a prefix of end, start + C < end when C < end_bytes[diff_pos].
+                let end_char_at_diff = end_bytes[diff_pos];
+                if end_char_at_diff >= 2 {
+                    let mid_char = end_char_at_diff / 2;
+                    let mut mid = effective_start.clone();
+                    mid.push(mid_char as char);
                     return Some(mid);
                 }
             }
