@@ -578,6 +578,42 @@ export interface ExpediteJobRequest {
 export interface ExpediteJobResponse {
 }
 /**
+ * Lease a specific job's task directly, putting it into Running state.
+ * This is a test-oriented helper: workers should use LeaseTasks for normal processing.
+ * Bypasses concurrency/rate-limit processing and creates a RunAttempt lease directly.
+ * Returns FAILED_PRECONDITION if the job is running, terminal, or cancelled.
+ * Returns NOT_FOUND if the job doesn't exist.
+ *
+ * @generated from protobuf message silo.v1.LeaseTaskRequest
+ */
+export interface LeaseTaskRequest {
+    /**
+     * @generated from protobuf field: string shard = 1
+     */
+    shard: string; // Shard ID (UUID) where the job is stored.
+    /**
+     * @generated from protobuf field: string id = 2
+     */
+    id: string; // The job's unique ID.
+    /**
+     * @generated from protobuf field: optional string tenant = 3
+     */
+    tenant?: string; // Tenant ID if multi-tenancy is enabled.
+    /**
+     * @generated from protobuf field: string worker_id = 4
+     */
+    workerId: string; // Worker ID to assign the lease to.
+}
+/**
+ * @generated from protobuf message silo.v1.LeaseTaskResponse
+ */
+export interface LeaseTaskResponse {
+    /**
+     * @generated from protobuf field: silo.v1.Task task = 1
+     */
+    task?: Task; // The leased task.
+}
+/**
  * Lease tasks for processing from this server.
  * By default, leases from all shards this server owns (fair distribution).
  * If shard is specified, filters to only that shard.
@@ -3255,6 +3291,122 @@ class ExpediteJobResponse$Type extends MessageType<ExpediteJobResponse> {
  * @generated MessageType for protobuf message silo.v1.ExpediteJobResponse
  */
 export const ExpediteJobResponse = new ExpediteJobResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class LeaseTaskRequest$Type extends MessageType<LeaseTaskRequest> {
+    constructor() {
+        super("silo.v1.LeaseTaskRequest", [
+            { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 3, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
+            { no: 4, name: "worker_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value?: PartialMessage<LeaseTaskRequest>): LeaseTaskRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.shard = "";
+        message.id = "";
+        message.workerId = "";
+        if (value !== undefined)
+            reflectionMergePartial<LeaseTaskRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: LeaseTaskRequest): LeaseTaskRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string shard */ 1:
+                    message.shard = reader.string();
+                    break;
+                case /* string id */ 2:
+                    message.id = reader.string();
+                    break;
+                case /* optional string tenant */ 3:
+                    message.tenant = reader.string();
+                    break;
+                case /* string worker_id */ 4:
+                    message.workerId = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: LeaseTaskRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string shard = 1; */
+        if (message.shard !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.shard);
+        /* string id = 2; */
+        if (message.id !== "")
+            writer.tag(2, WireType.LengthDelimited).string(message.id);
+        /* optional string tenant = 3; */
+        if (message.tenant !== undefined)
+            writer.tag(3, WireType.LengthDelimited).string(message.tenant);
+        /* string worker_id = 4; */
+        if (message.workerId !== "")
+            writer.tag(4, WireType.LengthDelimited).string(message.workerId);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.LeaseTaskRequest
+ */
+export const LeaseTaskRequest = new LeaseTaskRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class LeaseTaskResponse$Type extends MessageType<LeaseTaskResponse> {
+    constructor() {
+        super("silo.v1.LeaseTaskResponse", [
+            { no: 1, name: "task", kind: "message", T: () => Task }
+        ]);
+    }
+    create(value?: PartialMessage<LeaseTaskResponse>): LeaseTaskResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        if (value !== undefined)
+            reflectionMergePartial<LeaseTaskResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: LeaseTaskResponse): LeaseTaskResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* silo.v1.Task task */ 1:
+                    message.task = Task.internalBinaryRead(reader, reader.uint32(), options, message.task);
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: LeaseTaskResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* silo.v1.Task task = 1; */
+        if (message.task)
+            Task.internalBinaryWrite(message.task, writer.tag(1, WireType.LengthDelimited).fork(), options).join();
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.LeaseTaskResponse
+ */
+export const LeaseTaskResponse = new LeaseTaskResponse$Type();
 // @generated message type with reflection information, may provide speed optimized methods
 class LeaseTasksRequest$Type extends MessageType<LeaseTasksRequest> {
     constructor() {
@@ -6037,6 +6189,7 @@ export const Silo = new ServiceType("silo.v1.Silo", [
     { name: "CancelJob", options: {}, I: CancelJobRequest, O: CancelJobResponse },
     { name: "RestartJob", options: {}, I: RestartJobRequest, O: RestartJobResponse },
     { name: "ExpediteJob", options: {}, I: ExpediteJobRequest, O: ExpediteJobResponse },
+    { name: "LeaseTask", options: {}, I: LeaseTaskRequest, O: LeaseTaskResponse },
     { name: "LeaseTasks", options: {}, I: LeaseTasksRequest, O: LeaseTasksResponse },
     { name: "ReportOutcome", options: {}, I: ReportOutcomeRequest, O: ReportOutcomeResponse },
     { name: "ReportRefreshOutcome", options: {}, I: ReportRefreshOutcomeRequest, O: ReportRefreshOutcomeResponse },

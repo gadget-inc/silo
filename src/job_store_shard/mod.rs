@@ -9,6 +9,7 @@ mod floating;
 pub(crate) mod helpers;
 pub mod import;
 mod lease;
+mod lease_task;
 mod rate_limit;
 mod restart;
 mod scan;
@@ -17,6 +18,7 @@ pub use cleanup::{CleanupProgress, CleanupResult};
 
 pub use counters::{ShardCounters, counter_merge_operator};
 pub use expedite::JobNotExpediteableError;
+pub use lease_task::JobNotLeaseableError;
 pub use restart::JobNotRestartableError;
 
 pub(crate) use helpers::WriteBatcher;
@@ -125,6 +127,8 @@ pub enum JobStoreShardError {
     JobNotRestartable(#[from] JobNotRestartableError),
     #[error("cannot expedite job: {0}")]
     JobNotExpediteable(#[from] JobNotExpediteableError),
+    #[error("cannot lease job: {0}")]
+    JobNotLeaseable(#[from] JobNotLeaseableError),
     #[error("transaction conflict during {0}, exceeded max retries")]
     TransactionConflict(String),
 }

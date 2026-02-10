@@ -578,6 +578,8 @@ impl<B: K8sBackend> K8sCoordinator<B> {
 
         loop {
             tokio::select! {
+                biased;
+
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         debug!(node_id = %self.base.node_id, "coordination loop shutting down");

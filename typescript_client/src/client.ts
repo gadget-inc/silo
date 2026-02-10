@@ -525,6 +525,16 @@ export interface EnqueueJobOptions {
   metadata?: Record<string, string>;
 }
 
+/** Options for leasing a specific job's task directly */
+export interface LeaseTaskOptions {
+  /** The job ID to lease */
+  id: string;
+  /** The worker ID claiming the task */
+  workerId: string;
+  /** Tenant ID for routing to the correct shard. Uses default tenant if not provided. */
+  tenant?: string;
+}
+
 /** Options for leasing tasks */
 export interface LeaseTasksOptions {
   /** The worker ID claiming the tasks */
@@ -1333,6 +1343,48 @@ export class SiloGRPCClient {
     } catch (error) {
       if (error instanceof RpcError && error.code === "NOT_FOUND") {
         throw new JobNotFoundError(id, tenant);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Lease a specific job's task directly, putting it into Running state.
+   *
+   * This is a test-oriented helper that bypasses concurrency/rate-limit
+   * processing. For normal task processing, use `leaseTasks` instead.
+   *
+   * @param options The options for the lease request.
+   * @returns The leased task.
+   * @throws JobNotFoundError if the job doesn't exist.
+   * @throws Error with FAILED_PRECONDITION if the job is not in a leaseable state
+   *         (already running, terminal, or cancelled).
+   */
+  public async leaseTask(options: LeaseTaskOptions): Promise<Task> {
+    try {
+      return await this._withWrongShardRetry(
+        options.tenant,
+        async (client, shard) => {
+          const call = client.leaseTask(
+            {
+              shard,
+              id: options.id,
+              tenant: options.tenant,
+              workerId: options.workerId,
+            },
+            this._rpcOptions()
+          );
+
+          const response = await call.response;
+          if (!response.task) {
+            throw new Error("leaseTask response missing task");
+          }
+          return response.task;
+        }
+      );
+    } catch (error) {
+      if (error instanceof RpcError && error.code === "NOT_FOUND") {
+        throw new JobNotFoundError(options.id, options.tenant);
       }
       throw error;
     }

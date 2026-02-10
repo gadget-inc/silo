@@ -131,19 +131,19 @@ pub(crate) fn put_task<W: WriteBatcher>(
 ///
 /// Encapsulates the MAX_RETRIES=5 loop with exponential backoff and
 /// `TransactionConflict` error return on exhaustion.
-pub(crate) async fn retry_on_txn_conflict<F, Fut>(
+pub(crate) async fn retry_on_txn_conflict<T, F, Fut>(
     operation_name: &str,
     mut f: F,
-) -> Result<(), JobStoreShardError>
+) -> Result<T, JobStoreShardError>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<(), JobStoreShardError>>,
+    Fut: std::future::Future<Output = Result<T, JobStoreShardError>>,
 {
     const MAX_RETRIES: usize = 5;
 
     for attempt in 0..MAX_RETRIES {
         match f().await {
-            Ok(()) => return Ok(()),
+            Ok(val) => return Ok(val),
             Err(JobStoreShardError::Slate(ref e))
                 if e.kind() == slatedb::ErrorKind::Transaction =>
             {
