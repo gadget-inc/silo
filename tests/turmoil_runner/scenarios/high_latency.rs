@@ -555,6 +555,12 @@ pub fn run() {
                 }
             }
 
+            // Wait a bit longer to allow any in-flight writes to complete before stopping workers.
+            // The terminal_event_count() includes pending events, but we validate against confirmed
+            // events. Under high latency, there may be writes in-flight that haven't been confirmed yet.
+            // Give them time to complete.
+            tokio::time::sleep(Duration::from_millis(invariant_check_interval_ms * 2)).await;
+
             // Signal workers to stop
             verifier_done_flag.store(true, Ordering::SeqCst);
 
@@ -598,11 +604,23 @@ pub fn run() {
 
             // With no message loss, ALL enqueued jobs should reach terminal state
             if enqueued > 0 && terminal < enqueued as usize {
+                let non_terminal = verifier_tracker.jobs.get_non_terminal_jobs();
+                tracing::error!(
+                    terminal = terminal,
+                    enqueued = enqueued,
+                    missing = non_terminal.len(),
+                    "not_all_jobs_terminal"
+                );
+                for (job_id, status) in &non_terminal {
+                    tracing::error!(job_id = %job_id, status = %status, "non_terminal_job");
+                }
                 panic!(
                     "Not all jobs reached terminal state: {}/{} jobs are terminal. \
-                     With no message loss, all jobs should complete.",
+                     With no message loss, all jobs should complete.\n\
+                     Non-terminal jobs: {:?}",
                     terminal,
-                    enqueued
+                    enqueued,
+                    non_terminal
                 );
             }
 
