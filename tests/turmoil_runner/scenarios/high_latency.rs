@@ -318,12 +318,13 @@ pub fn run() {
                 let mut completed = 0u32;
                 let mut failed = 0u32;
                 let mut processing: Vec<Task> = Vec::new();
+                let mut round = 0u32;
 
-                // More rounds to handle all jobs with delays
-                for round in 0..80 {
-                    if worker_done_flag.load(Ordering::SeqCst) {
-                        break;
-                    }
+                // Keep working until the verifier signals convergence.
+                // Under high latency with serial concurrency limits, jobs can take
+                // many rounds to process, so a fixed round limit is insufficient.
+                while !worker_done_flag.load(Ordering::SeqCst) {
+                    round += 1;
 
                     // Variable batch size
                     let max_tasks = rng.random_range(worker_batch_range.0..=worker_batch_range.1);

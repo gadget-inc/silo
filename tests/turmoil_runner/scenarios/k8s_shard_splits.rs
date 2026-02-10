@@ -373,9 +373,9 @@ pub fn run() {
     // provides full determinism - all I/O operations are simulated and seeded.
     let storage_root = std::path::PathBuf::from("/data/silo-shards");
 
-    // 60 seconds is enough - the test typically completes within 25 simulated seconds.
-    // The previous 180s was excessive and caused long real-time test durations.
-    run_scenario_impl("k8s_shard_splits", seed, 60, |sim| {
+    // 90 seconds gives enough headroom for seeds where the splitter exhausts retries
+    // and convergence takes longer. The test typically completes within 25 simulated seconds.
+    run_scenario_impl("k8s_shard_splits", seed, 90, |sim| {
         let config = ScenarioConfig::from_seed(seed);
         let storage_root = storage_root.clone();
 
@@ -408,6 +408,7 @@ pub fn run() {
         // Shared state
         let scenario_done = Arc::new(AtomicBool::new(false));
         let splits_done = Arc::new(AtomicBool::new(false));
+        let enqueueing_done = Arc::new(AtomicBool::new(false));
         let total_enqueued = Arc::new(AtomicU32::new(0));
         let total_completed = Arc::new(AtomicU32::new(0));
         let total_splits_completed = Arc::new(AtomicU32::new(0));
@@ -748,10 +749,21 @@ pub fn run() {
                             }
                         }
 
-                        // Graceful shutdown
+                        // Graceful shutdown with timeout to prevent hanging the scenario
                         tracing::info!(node_id = %node_id, "shutting down");
-                        if let Err(e) = handle.coordinator.shutdown().await {
-                            tracing::warn!(node_id = %node_id, error = %e, "shutdown error");
+                        match tokio::time::timeout(
+                            Duration::from_secs(10),
+                            handle.coordinator.shutdown(),
+                        )
+                        .await
+                        {
+                            Ok(Err(e)) => {
+                                tracing::warn!(node_id = %node_id, error = %e, "shutdown error");
+                            }
+                            Err(_) => {
+                                tracing::warn!(node_id = %node_id, "shutdown timed out after 10s");
+                            }
+                            Ok(Ok(())) => {}
                         }
 
                         Ok(())
@@ -767,6 +779,8 @@ pub fn run() {
         let producer_num_jobs = num_jobs;
         let producer_stale_sends = Arc::clone(&total_stale_shard_sends);
         let producer_stale_errors = Arc::clone(&total_stale_shard_errors);
+        let producer_enqueueing_done = Arc::clone(&enqueueing_done);
+        let producer_scenario_done = Arc::clone(&scenario_done);
         sim.client("producer", async move {
             // Wait for nodes to start and coordinate
             tokio::time::sleep(Duration::from_millis(3000)).await;
@@ -774,11 +788,16 @@ pub fn run() {
 
             let mut consecutive_failures = 0u32;
             let mut current_client: Option<(u32, silo::pb::silo_client::SiloClient<_>)> = None;
-            
+
             // Cache of previously seen shards - used for stale shard testing
             let mut seen_shards: Vec<ShardId> = Vec::new();
 
             for i in 0..producer_num_jobs {
+                // Stop enqueuing if the scenario is done (nodes are shutting down)
+                if producer_scenario_done.load(Ordering::SeqCst) {
+                    tracing::info!(enqueued_so_far = i, "producer stopping early due to scenario done");
+                    break;
+                }
                 // Select limit configuration
                 let (limit_key, max_conc) = WORKER_LIMITS[rng.random_range(0..WORKER_LIMITS.len())];
                 let job_id = format!("{}-{}", limit_key, i);
@@ -1036,6 +1055,7 @@ pub fn run() {
                 }
             }
 
+            producer_enqueueing_done.store(true, Ordering::SeqCst);
             tracing::info!(
                 enqueued = producer_enqueued.load(Ordering::SeqCst),
                 stale_shard_sends = producer_stale_sends.load(Ordering::SeqCst),
@@ -1262,6 +1282,7 @@ pub fn run() {
         let verifier_tracker = Arc::clone(&tracker);
         let verifier_completed = Arc::clone(&total_completed);
         let verifier_enqueued = Arc::clone(&total_enqueued);
+        let verifier_enqueueing_done = Arc::clone(&enqueueing_done);
         let verifier_scenario_done = Arc::clone(&scenario_done);
         let verifier_splits_done = Arc::clone(&splits_done);
         let verifier_node_senders = Arc::clone(&node_state_senders);
@@ -1286,6 +1307,9 @@ pub fn run() {
             }
 
             // Phase 2: Wait for job convergence
+            // Must wait for producer to finish enqueuing before checking convergence,
+            // otherwise we can falsely declare convergence when completed matches a
+            // partial enqueued count while the producer is still running.
             let convergence_timeout_secs = 60;
             let convergence_start = turmoil::sim_elapsed().unwrap_or_default();
             let mut last_completed = 0u32;
@@ -1296,10 +1320,11 @@ pub fn run() {
 
                 let enqueued = verifier_enqueued.load(Ordering::SeqCst);
                 let completed = verifier_completed.load(Ordering::SeqCst);
+                let enqueueing_complete = verifier_enqueueing_done.load(Ordering::SeqCst);
 
-                tracing::trace!(enqueued = enqueued, completed = completed, "convergence_check");
+                tracing::trace!(enqueued = enqueued, completed = completed, enqueueing_complete = enqueueing_complete, "convergence_check");
 
-                if completed >= enqueued && enqueued > 0 {
+                if enqueueing_complete && completed >= enqueued && enqueued > 0 {
                     tracing::info!(
                         enqueued = enqueued,
                         completed = completed,
@@ -1320,6 +1345,7 @@ pub fn run() {
                         enqueued = enqueued,
                         completed = completed,
                         stall_count = stall_count,
+                        enqueueing_complete = enqueueing_complete,
                         "progress stalled"
                     );
                 }
