@@ -1420,6 +1420,29 @@ impl JobStateTracker {
         let terminal = self.terminal_jobs.lock().unwrap();
         terminal.len()
     }
+
+    /// Get all jobs that were tracked but didn't reach terminal state
+    pub fn get_non_terminal_jobs(&self) -> Vec<(String, String)> {
+        let statuses = self.job_statuses.lock().unwrap();
+        let terminal = self.terminal_jobs.lock().unwrap();
+        let active_leases = self.active_leases.lock().unwrap();
+
+        statuses
+            .iter()
+            .filter(|(job_id, _)| !terminal.contains(job_id.as_str()))
+            .map(|(job_id, status)| {
+                let status_str = status_name(*status).to_string();
+                let lease_count = active_leases
+                    .get(job_id)
+                    .map(|l| l.len())
+                    .unwrap_or(0);
+                (
+                    job_id.clone(),
+                    format!("{} (active_leases: {})", status_str, lease_count),
+                )
+            })
+            .collect()
+    }
 }
 
 /// Combined invariant tracker for comprehensive verification.
