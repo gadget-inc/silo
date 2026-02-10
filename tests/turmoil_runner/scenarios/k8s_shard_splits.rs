@@ -408,6 +408,7 @@ pub fn run() {
         // Shared state
         let scenario_done = Arc::new(AtomicBool::new(false));
         let splits_done = Arc::new(AtomicBool::new(false));
+        let producer_done = Arc::new(AtomicBool::new(false));
         let total_enqueued = Arc::new(AtomicU32::new(0));
         let total_completed = Arc::new(AtomicU32::new(0));
         let total_splits_completed = Arc::new(AtomicU32::new(0));
@@ -767,6 +768,7 @@ pub fn run() {
         let producer_num_jobs = num_jobs;
         let producer_stale_sends = Arc::clone(&total_stale_shard_sends);
         let producer_stale_errors = Arc::clone(&total_stale_shard_errors);
+        let producer_done_flag = Arc::clone(&producer_done);
         sim.client("producer", async move {
             // Wait for nodes to start and coordinate
             tokio::time::sleep(Duration::from_millis(3000)).await;
@@ -1036,6 +1038,7 @@ pub fn run() {
                 }
             }
 
+            producer_done_flag.store(true, Ordering::SeqCst);
             tracing::info!(
                 enqueued = producer_enqueued.load(Ordering::SeqCst),
                 stale_shard_sends = producer_stale_sends.load(Ordering::SeqCst),
@@ -1264,6 +1267,7 @@ pub fn run() {
         let verifier_enqueued = Arc::clone(&total_enqueued);
         let verifier_scenario_done = Arc::clone(&scenario_done);
         let verifier_splits_done = Arc::clone(&splits_done);
+        let verifier_producer_done = Arc::clone(&producer_done);
         let verifier_node_senders = Arc::clone(&node_state_senders);
         let verifier_initial_shards = Arc::clone(&initial_shard_count);
         let verifier_current_shards = Arc::clone(&current_shard_count);
@@ -1299,7 +1303,8 @@ pub fn run() {
 
                 tracing::trace!(enqueued = enqueued, completed = completed, "convergence_check");
 
-                if completed >= enqueued && enqueued > 0 {
+                let producer_finished = verifier_producer_done.load(Ordering::SeqCst);
+                if completed >= enqueued && enqueued > 0 && producer_finished {
                     tracing::info!(
                         enqueued = enqueued,
                         completed = completed,
