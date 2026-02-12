@@ -149,20 +149,10 @@ impl JobStoreShard {
         );
         writer.put(&task_key_bytes, &task_value)?;
 
-        // Update state to mark refresh as scheduled - construct new state directly
+        // Update state to mark refresh as scheduled
         let new_state = FloatingLimitState {
             refresh_task_scheduled: true,
-            current_max_concurrency: archived.current_max_concurrency,
-            last_refreshed_at_ms: archived.last_refreshed_at_ms,
-            refresh_interval_ms: archived.refresh_interval_ms,
-            default_max_concurrency: archived.default_max_concurrency,
-            retry_count: archived.retry_count,
-            next_retry_at_ms: archived.next_retry_at_ms.as_ref().copied(),
-            metadata: archived
-                .metadata
-                .iter()
-                .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
-                .collect(),
+            ..FloatingLimitState::from_archived(archived)
         };
         let state_key = floating_limit_state_key(tenant, &fl.key);
         let state_value = encode_floating_limit_state(&new_state)?;
@@ -217,21 +207,13 @@ impl JobStoreShard {
         let decoded = decode_floating_limit_state(&raw)?;
         let archived = decoded.archived();
 
-        // Construct new state directly - avoids intermediate owned allocation
         let new_state = FloatingLimitState {
             current_max_concurrency: new_max_concurrency,
             last_refreshed_at_ms: now_ms,
             refresh_task_scheduled: false,
             retry_count: 0,
             next_retry_at_ms: None,
-            // Preserve unchanged fields from archived view
-            refresh_interval_ms: archived.refresh_interval_ms,
-            default_max_concurrency: archived.default_max_concurrency,
-            metadata: archived
-                .metadata
-                .iter()
-                .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
-                .collect(),
+            ..FloatingLimitState::from_archived(archived)
         };
 
         let mut batch = WriteBatch::new();
@@ -321,21 +303,11 @@ impl JobStoreShard {
             .has_waiting_concurrency_requests(&tenant, &queue_key)
             .await?;
 
-        // Construct new state directly - avoids intermediate owned allocation
         let new_state = FloatingLimitState {
             retry_count: new_retry_count,
             next_retry_at_ms: Some(next_retry_at),
             refresh_task_scheduled: has_waiters,
-            // Preserve unchanged fields from archived view
-            current_max_concurrency: archived.current_max_concurrency,
-            last_refreshed_at_ms: archived.last_refreshed_at_ms,
-            refresh_interval_ms: archived.refresh_interval_ms,
-            default_max_concurrency: archived.default_max_concurrency,
-            metadata: archived
-                .metadata
-                .iter()
-                .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
-                .collect(),
+            ..FloatingLimitState::from_archived(archived)
         };
 
         let mut batch = WriteBatch::new();

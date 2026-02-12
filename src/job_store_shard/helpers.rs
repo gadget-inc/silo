@@ -60,6 +60,12 @@ pub(crate) struct DbWriteBatcher<'a> {
     pub batch: &'a mut WriteBatch,
 }
 
+impl<'a> DbWriteBatcher<'a> {
+    pub fn new(db: &'a Db, batch: &'a mut WriteBatch) -> Self {
+        Self { db, batch }
+    }
+}
+
 impl WriteBatcher for DbWriteBatcher<'_> {
     fn put<K: AsRef<[u8]>, V: AsRef<[u8]>>(
         &mut self,

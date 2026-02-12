@@ -143,10 +143,7 @@ impl JobStoreShard {
         let mut batch = WriteBatch::new();
         let grants = self
             .write_enqueue_data(
-                &mut DbWriteBatcher {
-                    db: &self.db,
-                    batch: &mut batch,
-                },
+                &mut DbWriteBatcher::new(&self.db, &mut batch),
                 tenant,
                 job_id,
                 priority,
@@ -160,10 +157,7 @@ impl JobStoreShard {
             .await?;
 
         // Include counter in the same batch for efficiency
-        self.increment_total_jobs_counter(&mut DbWriteBatcher {
-            db: &self.db,
-            batch: &mut batch,
-        })?;
+        self.increment_total_jobs_counter(&mut DbWriteBatcher::new(&self.db, &mut batch))?;
 
         // Two-phase DST event: emit before write for correct causal ordering,
         // confirm after write succeeds, cancel if write fails.

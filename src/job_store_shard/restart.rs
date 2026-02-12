@@ -5,14 +5,13 @@
 use slatedb::IsolationLevel;
 use uuid::Uuid;
 
-use crate::codec::encode_job_status;
 use crate::dst_events::{self, DstEvent};
 use crate::job::{JobStatus, JobStatusKind};
 use crate::job_store_shard::helpers::{
     TxnWriter, decode_job_status_owned, now_epoch_ms, retry_on_txn_conflict,
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
-use crate::keys::{attempt_prefix, idx_status_time_key, job_cancelled_key, job_status_key};
+use crate::keys::{attempt_prefix, job_cancelled_key, job_status_key};
 use crate::task::Task;
 
 /// Error returned when a job cannot be restarted because it's not in a restartable state.
@@ -152,19 +151,10 @@ impl JobStoreShard {
         // [SILO-RESTART-5] Attempt numbers are monotonically increasing; relative attempts reset to 1 on restart
         let next_attempt_number = max_attempt_number + 1;
 
-        // Delete old status index entry
-        let old_time = idx_status_time_key(tenant, status.kind.as_str(), status.changed_at_ms, id);
-        txn.delete(&old_time)?;
-
         // [SILO-RESTART-6] Post: Set status to Scheduled with next attempt time and attempt number
         let new_status = JobStatus::scheduled(now_ms, start_at_ms, next_attempt_number);
-        let status_value = encode_job_status(&new_status)?;
-        txn.put(&status_key, &status_value)?;
-
-        // Insert new status index entry
-        let new_ts = crate::keys::status_index_timestamp(&new_status);
-        let new_time = idx_status_time_key(tenant, new_status.kind.as_str(), new_ts, id);
-        txn.put(&new_time, [])?;
+        self.set_job_status_with_index(&mut TxnWriter(&txn), tenant, id, new_status)
+            .await?;
 
         // [SILO-RESTART-5] Post: Create new task in DB queue with next attempt number
         let new_task_id = Uuid::new_v4().to_string();

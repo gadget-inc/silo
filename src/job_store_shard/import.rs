@@ -3,7 +3,6 @@
 //! Allows importing jobs from other systems with historical attempt records.
 //! Unlike enqueue, import accepts completed attempts and lets Silo take ownership going forward.
 
-use slatedb::ErrorKind as SlateErrorKind;
 use slatedb::IsolationLevel;
 use slatedb::config::WriteOptions;
 use tracing::debug;
@@ -13,7 +12,7 @@ use crate::codec::{encode_attempt, encode_job_info};
 use crate::dst_events::{self, DstEvent};
 use crate::job::{JobInfo, JobStatus, JobStatusKind, Limit};
 use crate::job_attempt::{AttemptStatus, JobAttempt};
-use crate::job_store_shard::helpers::{TxnWriter, now_epoch_ms};
+use crate::job_store_shard::helpers::{TxnWriter, now_epoch_ms, retry_on_txn_conflict};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError, LimitTaskParams};
 use crate::keys::{attempt_key, idx_metadata_key, job_info_key};
 use crate::retry::{RetryPolicy, retries_exhausted};
@@ -104,32 +103,7 @@ impl JobStoreShard {
             return Err(JobStoreShardError::InvalidArgument(msg));
         }
 
-        const MAX_RETRIES: usize = 5;
-
-        for attempt in 0..MAX_RETRIES {
-            match self.import_job_txn(tenant, &params).await {
-                Ok(status) => return Ok(status),
-                Err(JobStoreShardError::Slate(ref e))
-                    if e.kind() == SlateErrorKind::Transaction =>
-                {
-                    if attempt + 1 < MAX_RETRIES {
-                        let delay_ms = 10 * (1 << attempt);
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        debug!(
-                            operation = "import_job",
-                            attempt = attempt + 1,
-                            "transaction conflict, retrying"
-                        );
-                        continue;
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        Err(JobStoreShardError::TransactionConflict(
-            "import_job".to_string(),
-        ))
+        retry_on_txn_conflict("import_job", || self.import_job_txn(tenant, &params)).await
     }
 
     /// Inner transaction-based import for a single job.

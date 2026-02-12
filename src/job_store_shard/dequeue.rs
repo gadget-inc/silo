@@ -289,10 +289,7 @@ impl JobStoreShard {
         // [SILO-DEQ-6] Mark job as running
         let job_status = JobStatus::running(now_ms);
         self.set_job_status_with_index(
-            &mut DbWriteBatcher {
-                db: &self.db,
-                batch,
-            },
+            &mut DbWriteBatcher::new(&self.db, batch),
             tenant,
             job_id,
             job_status,
@@ -488,10 +485,7 @@ impl JobStoreShard {
                 // Rate limit passed! Proceed to next limit or RunAttempt
                 let grants = self
                     .enqueue_limit_task_at_index(
-                        &mut DbWriteBatcher {
-                            db: &self.db,
-                            batch: &mut state.batch,
-                        },
+                        &mut DbWriteBatcher::new(&self.db, &mut state.batch),
                         LimitTaskParams {
                             tenant: &tenant,
                             task_id: check_task_id,
@@ -535,10 +529,7 @@ impl JobStoreShard {
                     now_ms,
                 );
                 self.schedule_rate_limit_retry(
-                    &mut DbWriteBatcher {
-                        db: &self.db,
-                        batch: &mut state.batch,
-                    },
+                    &mut DbWriteBatcher::new(&self.db, &mut state.batch),
                     &tenant,
                     job_id,
                     attempt_number,
@@ -557,10 +548,7 @@ impl JobStoreShard {
                 tracing::warn!(job_id = %job_id, error = %e, "gubernator rate limit check failed, will retry");
                 let retry_backoff = now_ms + rate_limit.retry_initial_backoff_ms;
                 self.schedule_rate_limit_retry(
-                    &mut DbWriteBatcher {
-                        db: &self.db,
-                        batch: &mut state.batch,
-                    },
+                    &mut DbWriteBatcher::new(&self.db, &mut state.batch),
                     &tenant,
                     job_id,
                     attempt_number,

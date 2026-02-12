@@ -57,6 +57,27 @@ pub struct FloatingLimitState {
     pub metadata: Vec<(String, String)>,
 }
 
+impl FloatingLimitState {
+    /// Create an owned copy from an archived (zero-copy) view.
+    /// Callers can then mutate whichever fields they need before writing back.
+    pub fn from_archived(archived: &ArchivedFloatingLimitState) -> Self {
+        Self {
+            current_max_concurrency: archived.current_max_concurrency,
+            last_refreshed_at_ms: archived.last_refreshed_at_ms,
+            refresh_task_scheduled: archived.refresh_task_scheduled,
+            refresh_interval_ms: archived.refresh_interval_ms,
+            default_max_concurrency: archived.default_max_concurrency,
+            retry_count: archived.retry_count,
+            next_retry_at_ms: archived.next_retry_at_ms.as_ref().copied(),
+            metadata: archived
+                .metadata
+                .iter()
+                .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
+                .collect(),
+        }
+    }
+}
+
 /// Rate limiting algorithm used by Gubernator
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, RkyvSerialize, RkyvDeserialize)]
 #[archive(check_bytes)]
@@ -173,6 +194,12 @@ pub enum JobStatusKind {
 }
 
 impl JobStatusKind {
+    /// Returns true if the job is in a final state where no more attempts will be created.
+    /// This covers Succeeded and Failed, but NOT Cancelled (which can be restarted).
+    pub fn is_final(&self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed)
+    }
+
     /// Return the string name of this status kind for indexing
     pub fn as_str(&self) -> &'static str {
         match self {
