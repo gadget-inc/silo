@@ -4,7 +4,7 @@ title: Running Workers
 
 import { Aside } from '@astrojs/starlight/components';
 
-Workers are processes that poll Silo for tasks and execute them. Each worker polls for tasks from a specific **task group**, processes them, and reports the results back to Silo.
+Workers are processes that poll Silo for tasks and execute them. The `SiloWorker` class handles polling, lease management, heartbeats, and outcome reporting automatically. Each worker polls for tasks from a specific **task group**, processes them with your handler function, and reports the results back to Silo.
 
 ## Basic Worker Setup
 
@@ -20,20 +20,18 @@ const client = new SiloGRPCClient({
 const worker = new SiloWorker({
   client,
   workerId: "worker-1",
-  taskGroup: "emails",  // This worker processes jobs from the "emails" task group
-  handler: async (task) => {
-    const { to, subject, body } = task.payload;
-    
-    // Process the job
+  taskGroup: "emails",
+  handler: async (ctx) => {
+    const { to, subject, body } = ctx.task.payload;
+
     await sendEmail(to, subject, body);
-    
-    // Return a result (optional)
-    return { sent: true, timestamp: Date.now() };
+
+    return { type: "success", result: { sent: true, timestamp: Date.now() } };
   }
 });
 
 // Start polling for tasks
-await worker.start();
+worker.start();
 
 // Later, gracefully stop the worker
 await worker.stop();
@@ -84,6 +82,150 @@ Task groups provide several benefits:
 
 4. **Resource allocation**: Route jobs to workers with appropriate resources (GPU, high memory, etc.).
 
+## The Handler Function
+
+The handler receives a `TaskContext` object and must return a `TaskOutcome`:
+
+```typescript
+import { type TaskHandler } from "@silo-ai/client";
+
+const handler: TaskHandler<MyPayload, MyMetadata, MyResult> = async (ctx) => {
+  // Access the task data
+  const { payload, jobId, attemptNumber, metadata, isLastAttempt } = ctx.task;
+
+  // Do work...
+  const result = await processData(payload);
+
+  // Return a success outcome
+  return { type: "success", result };
+};
+```
+
+### Task Context
+
+The handler's `ctx` argument provides:
+
+- **`ctx.task`** — The task being executed, including:
+  - `id` — Unique task ID
+  - `jobId` — The job ID
+  - `payload` — The decoded job payload (typed via generics)
+  - `attemptNumber` — Which attempt this is (monotonically increasing across restarts)
+  - `relativeAttemptNumber` — Attempt number within the current run (resets on restart)
+  - `isLastAttempt` — Whether this is the final attempt before the job fails
+  - `metadata` — Key/value pairs from the job
+  - `limits` — Concurrency/rate limits declared on this job
+  - `priority` — Job priority (0-99)
+  - `taskGroup` — Task group name
+  - `tenantId` — Tenant ID if multi-tenancy is enabled
+
+- **`ctx.cancellationSignal`** — An `AbortSignal` that aborts when the job is cancelled (either by the server via heartbeat, or by calling `ctx.cancel()`). See [Handling Cancellation](#handling-cancellation).
+
+- **`ctx.cancel()`** — Cancels the job on the server and aborts the signal immediately. The worker will automatically report a cancelled outcome regardless of what the handler returns.
+
+### Task Outcomes
+
+Handlers must return one of three outcome types:
+
+```typescript
+// Success — job completed, result is stored
+return { type: "success", result: { itemsProcessed: 42 } };
+
+// Failure — job failed with an error code
+return { type: "failure", code: "VALIDATION_ERROR", data: { field: "email" } };
+
+// Cancelled — job should be marked as cancelled
+return { type: "cancelled" };
+```
+
+If the handler **throws an error**, the worker catches it and automatically reports a failure outcome with code `"HANDLER_ERROR"` and the serialized error as data. The worker continues processing other tasks.
+
+### Type Safety
+
+`SiloWorker` accepts generic type parameters for the payload, metadata, and result:
+
+```typescript
+interface EmailPayload {
+  to: string;
+  subject: string;
+  body: string;
+}
+
+interface EmailMetadata {
+  source: string;
+  priority: string;
+}
+
+interface EmailResult {
+  messageId: string;
+  sentAt: number;
+}
+
+const worker = new SiloWorker<EmailPayload, EmailMetadata, EmailResult>({
+  client,
+  workerId: "email-worker-1",
+  taskGroup: "emails",
+  handler: async (ctx) => {
+    // ctx.task.payload is typed as EmailPayload
+    // ctx.task.metadata is typed as EmailMetadata
+    const { to, subject, body } = ctx.task.payload;
+    const messageId = await sendEmail(to, subject, body);
+    // Return type is checked against EmailResult
+    return { type: "success", result: { messageId, sentAt: Date.now() } };
+  }
+});
+```
+
+## Handling Cancellation
+
+The worker handles heartbeats automatically and surfaces cancellation through the `ctx.cancellationSignal` abort signal. When a job is cancelled on the server, the signal is aborted on the next heartbeat:
+
+```typescript
+const worker = new SiloWorker({
+  client,
+  workerId: "worker-1",
+  taskGroup: "data-processing",
+  handler: async (ctx) => {
+    for (const item of ctx.task.payload.items) {
+      // Check for cancellation between units of work
+      if (ctx.cancellationSignal.aborted) {
+        return { type: "cancelled" };
+      }
+      await processItem(item);
+    }
+    return { type: "success", result: { processed: true } };
+  }
+});
+```
+
+You can also pass the signal to APIs that support `AbortSignal`:
+
+```typescript
+handler: async (ctx) => {
+  // fetch() will abort if the job is cancelled
+  const response = await fetch(ctx.task.payload.url, {
+    signal: ctx.cancellationSignal
+  });
+  const data = await response.json();
+  return { type: "success", result: data };
+}
+```
+
+Or listen for the abort event:
+
+```typescript
+handler: async (ctx) => {
+  ctx.cancellationSignal.addEventListener("abort", () => {
+    // Clean up resources when cancelled
+    cleanup();
+  });
+  // ...
+}
+```
+
+<Aside type="tip" title="Cancellation vs shutdown">
+The cancellation signal is only aborted when the **job** is cancelled (by the server or by calling `ctx.cancel()`). It is **not** aborted when the worker shuts down via `worker.stop()`. During shutdown, the worker waits for in-flight tasks to complete normally.
+</Aside>
+
 ## Worker Options
 
 The `SiloWorker` constructor accepts the following options:
@@ -101,7 +243,7 @@ const worker = new SiloWorker({
   client,
   workerId: `worker-${process.env.HOSTNAME}-${process.pid}`,
   taskGroup: "default",
-  handler: async (task) => { /* ... */ }
+  handler: async (ctx) => { /* ... */ }
 });
 ```
 
@@ -111,29 +253,15 @@ The task group to poll for tasks. The worker will only receive jobs that were en
 
 ### `handler` (required)
 
-An async function that processes each task. Receives a task object with:
-- `id`: The task ID
-- `jobId`: The job ID
-- `payload`: The job payload (as enqueued)
-- `attemptNumber`: Which attempt this is (1 for first attempt)
+An async function that processes each task. See [The Handler Function](#the-handler-function) for details.
 
-```typescript
-const handler = async (task) => {
-  console.log(`Processing job ${task.jobId}, attempt ${task.attemptNumber}`);
-  
-  // Your processing logic here
-  const result = await processData(task.payload);
-  
-  // Return a result (will be stored with the job)
-  return result;
-};
-```
+### `tenant` (optional)
 
-If the handler throws an error, the job will be marked as failed and may be retried according to its retry policy.
+Tenant ID for this worker. Required when the server has tenancy enabled. The worker will only process tasks for this tenant.
 
 ### `maxConcurrentTasks` (optional)
 
-Maximum number of tasks to process concurrently. Defaults to 10.
+Maximum number of tasks to process concurrently. Defaults to `10`.
 
 ```typescript
 const worker = new SiloWorker({
@@ -141,51 +269,66 @@ const worker = new SiloWorker({
   workerId: "worker-1",
   taskGroup: "heavy-processing",
   maxConcurrentTasks: 2,  // Only process 2 tasks at a time
-  handler: async (task) => { /* ... */ }
+  handler: async (ctx) => { /* ... */ }
 });
 ```
 
+### `concurrentPollers` (optional)
+
+Number of concurrent poll loops to run. More pollers can help ensure work is always available when processing is fast. Defaults to `1`.
+
+### `tasksPerPoll` (optional)
+
+Number of tasks to request per poll call. Defaults to `Math.ceil(maxConcurrentTasks / 2)`.
+
 ### `pollIntervalMs` (optional)
 
-How often to poll for new tasks when idle, in milliseconds. Defaults to 1000 (1 second).
+How often to poll for new tasks when idle, in milliseconds. Defaults to `1000` (1 second).
 
-### `leaseExpirationMarginMs` (optional)
+### `heartbeatIntervalMs` (optional)
 
-How much time before lease expiration to stop processing and renew. Defaults to 5000 (5 seconds).
+Interval in milliseconds between heartbeats for running tasks. Should be less than the server's lease timeout. Defaults to `5000` (5 seconds).
 
-## Handling Results and Errors
+### `refreshHandler` (optional)
 
-### Successful completion
+Handler for floating concurrency limit refresh tasks. See [Concurrency Limits: Floating Limits](/guides/concurrency-limits#floating-concurrency-limits) for details.
 
-Return a value from your handler to store it as the job result:
+### `onError` (optional)
 
-```typescript
-handler: async (task) => {
-  const processed = await processData(task.payload);
-  return { 
-    processedAt: Date.now(),
-    itemCount: processed.length 
-  };
-}
-```
-
-### Failures
-
-Throw an error to mark the job as failed:
+Called when an error occurs during polling or heartbeats. If not provided, errors are logged to `console.error`.
 
 ```typescript
-handler: async (task) => {
-  const result = await callExternalApi(task.payload);
-  
-  if (!result.success) {
-    throw new Error(`API call failed: ${result.error}`);
+const worker = new SiloWorker({
+  client,
+  workerId: "worker-1",
+  taskGroup: "default",
+  handler: async (ctx) => { /* ... */ },
+  onError: (error, context) => {
+    logger.error("Worker error", { error, taskId: context?.taskId });
   }
-  
-  return result.data;
-}
+});
 ```
 
-If the job has a retry policy, it will be automatically retried.
+## Graceful Shutdown
+
+`worker.stop()` gracefully shuts down the worker:
+
+1. Stops polling for new tasks
+2. Waits for all in-flight tasks to complete (up to the timeout)
+3. Returns once all tasks have finished
+
+```typescript
+// Handle process signals
+process.on("SIGTERM", async () => {
+  console.log("Received SIGTERM, shutting down gracefully...");
+  await worker.stop(30_000); // Wait up to 30 seconds for tasks to finish
+  process.exit(0);
+});
+```
+
+<Aside type="caution" title="Shutdown timeout">
+If tasks don't complete within the timeout (default 30 seconds), the remaining queued tasks are abandoned. In-flight tasks that are still running will have their leases expire on the server and be retried by another worker.
+</Aside>
 
 ## Running Multiple Workers
 
@@ -206,7 +349,7 @@ const worker = new SiloWorker({
   workerId,
   taskGroup: process.env.TASK_GROUP || "default",
   maxConcurrentTasks: parseInt(process.env.MAX_CONCURRENT || "10"),
-  handler: async (task) => {
+  handler: async (ctx) => {
     // Your handler logic
   }
 });
@@ -218,7 +361,7 @@ process.on("SIGTERM", async () => {
   process.exit(0);
 });
 
-await worker.start();
+worker.start();
 console.log(`Worker ${workerId} started, polling task group: ${process.env.TASK_GROUP}`);
 ```
 

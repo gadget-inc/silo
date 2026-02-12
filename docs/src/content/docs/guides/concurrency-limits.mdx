@@ -108,51 +108,43 @@ Between refreshes, the floating limit behaves exactly like a regular concurrency
 
 ### Worker Implementation
 
-Workers must handle `RefreshFloatingLimitTask` items returned from `LeaseTasks()`:
+Workers handle floating limit refreshes using the `refreshHandler` option on `SiloWorker`. When a floating limit needs refreshing, the worker receives a refresh task and calls your handler to compute the new max concurrency value:
 
 ```typescript
-// TypeScript example (conceptual)
-const response = await client.leaseTasks({
+import { SiloGRPCClient, SiloWorker } from "@silo-ai/client";
+
+const worker = new SiloWorker({
+  client,
   workerId: "worker-1",
-  maxTasks: 10
+  taskGroup: "api-calls",
+  handler: async (ctx) => {
+    // Handle regular job tasks
+    await callExternalApi(ctx.task.payload);
+    return { type: "success", result: {} };
+  },
+  refreshHandler: async (ctx) => {
+    // ctx.task contains the refresh task details:
+    //   - ctx.task.queueKey: the floating limit key
+    //   - ctx.task.currentMaxConcurrency: the current value
+    //   - ctx.task.metadata: metadata from the limit definition
+
+    // Compute and return the new max concurrency
+    return await computeMaxConcurrency(
+      ctx.task.queueKey,
+      ctx.task.currentMaxConcurrency,
+      ctx.task.metadata
+    );
+  }
 });
 
-// Process regular job tasks
-for (const task of response.tasks) {
-  // ... handle job execution
-}
-
-// Process floating limit refresh tasks
-for (const refreshTask of response.refreshTasks) {
-  try {
-    // Compute the new max concurrency based on your logic
-    const newMaxConcurrency = await computeMaxConcurrency(
-      refreshTask.queueKey,
-      refreshTask.currentMaxConcurrency,
-      refreshTask.metadata
-    );
-    
-    // Report success with the new value
-    await client.reportRefreshOutcome({
-      shard: /* shard id */,
-      taskId: refreshTask.id,
-      success: {
-        newMaxConcurrency: newMaxConcurrency
-      }
-    });
-  } catch (error) {
-    // Report failure - Silo will retry with exponential backoff
-    await client.reportRefreshOutcome({
-      shard: /* shard id */,
-      taskId: refreshTask.id,
-      failure: {
-        code: "REFRESH_ERROR",
-        message: error.message
-      }
-    });
-  }
-}
+worker.start();
 ```
+
+The worker handles outcome reporting automatically. If your `refreshHandler` returns a number, it's reported as a success. If it throws an error, it's reported as a failure and Silo will retry with exponential backoff.
+
+<Aside type="tip">
+Any worker polling the same task group can receive refresh tasks. You only need to provide `refreshHandler` on workers that poll task groups where floating limits are used.
+</Aside>
 
 ### Computing Max Concurrency
 
