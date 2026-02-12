@@ -322,13 +322,9 @@ impl ShardFactory {
 
     /// Close a specific shard and remove it from the factory.
     ///
-    /// If `shard.close()` fails or times out, the shard is re-inserted into instances
-    /// so that close can be retried later. This prevents silent data loss where a failed
-    /// close is followed by a lease release.
+    /// If `shard.close()` fails or times out, the shard is re-inserted into instances so that close can be retried later. This prevents silent data loss where a failed close is followed by a lease release.
     ///
-    /// A timeout is applied because SlateDB's internal retrying_object_store retries
-    /// indefinitely on transient errors, which would cause close to hang forever if
-    /// the object store is unreachable.
+    /// A timeout is applied because SlateDB's internal retrying_object_store retries indefinitely on transient errors, which would cause close to hang forever if the object store is unreachable.
     pub async fn close(&self, shard_id: &ShardId) -> Result<(), JobStoreShardError> {
         tracing::trace!(shard_id = %shard_id, "factory.close: removing from instances");
         if let Some((id, entry)) = self.instances.remove(shard_id) {
@@ -572,14 +568,8 @@ impl ShardFactory {
     /// Clone a shard to create a child shard for splitting.
     ///
     /// This creates a point-in-time clone of the parent shard's database using
-    /// SlateDB's checkpoint and clone functionality. The clone shares SST files
-    /// with the parent via object storage, so only metadata is copied.
+    /// SlateDB's checkpoint and clone functionality. The clone shares SST files with the parent via object storage, so only metadata is copied.
     ///
-    /// # Arguments
-    /// * `parent_id` - The shard being split (must be open)
-    /// * `child_id` - The new child shard ID
-    ///
-    /// # Errors
     /// Returns an error if:
     /// - The parent shard is not open
     /// - The clone operation fails
@@ -598,14 +588,12 @@ impl ShardFactory {
             .and_then(|entry| entry.get())
             .ok_or_else(|| ShardFactoryError::ShardNotOpen(*parent_id))?;
 
-        // Ensure all data is flushed to object storage before creating checkpoint
-        // This is required for SlateDB cloning to work correctly
+        // Ensure all data is flushed to object storage before creating checkpoint. This is required for SlateDB cloning to work correctly
         parent_shard.db().flush().await.map_err(|e| {
             ShardFactoryError::CloneError(format!("failed to flush before checkpoint: {}", e))
         })?;
 
         // Create a checkpoint in the parent database
-        // The checkpoint captures a consistent view of the database
         let checkpoint_options = slatedb::config::CheckpointOptions {
             lifetime: Some(Duration::from_secs(300)), // 5 minutes should be enough for the clone
             ..Default::default()
@@ -625,9 +613,7 @@ impl ShardFactory {
             "created checkpoint for shard cloning"
         );
 
-        // For cloning to work, both parent and child must be accessible from the same
-        // object store. We extract the common root from the template and create relative
-        // paths for both.
+        // For cloning to work, both parent and child must be accessible from the same  object store. We extract the common root from the template and create relative paths for both.
         //
         // Template path example: "/tmp/silo-data/%shard%"
         // Parent full path: "/tmp/silo-data/parent-uuid"
@@ -650,9 +636,7 @@ impl ShardFactory {
             ))
         })?;
 
-        // Validate that the placeholder is at a path boundary (preceded by / or at start of path).
-        // This ensures that when we split the template into root + relative paths for cloning,
-        // the relative path will be the shard ID as a subdirectory, not concatenated with a prefix.
+        // Validate that the placeholder is at a path boundary (preceded by / or at start of path). This ensures that when we split the template into root + relative paths for cloning, the relative path will be the shard ID as a subdirectory, not concatenated with a prefix.
         // e.g., "/data/%shard%" is valid (root="/data", relative="<uuid>")
         //       "/data/shard-%shard%" is INVALID - would create path mismatch during clone
         if pos > 0 {

@@ -3,7 +3,7 @@ use etcd_client::{Client, ConnectOptions, GetOptions, PutOptions};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, Notify, watch};
+use tokio::sync::{Mutex, watch};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
@@ -15,8 +15,8 @@ use crate::shard_range::{ShardId, ShardMap, SplitInProgress};
 pub use super::ShardPhase;
 
 use super::{
-    CoordinationError, Coordinator, CoordinatorBase, MemberInfo, ShardOwnerMap,
-    SplitStorageBackend, compute_desired_shards_for_node, get_hostname, keys,
+    CoordinationError, Coordinator, CoordinatorBase, MemberInfo, ShardGuardContext,
+    ShardGuardState, ShardOwnerMap, SplitStorageBackend, get_hostname, keys,
 };
 
 /// etcd-based coordinator for distributed shard ownership.
@@ -444,73 +444,36 @@ impl EtcdCoordinator {
         Ok(())
     }
 
-    async fn reconcile_shards(&self) -> Result<(), etcd_client::Error> {
-        // Get full member info for ring-aware placement
-        let members = self
-            .get_members()
-            .await
-            .map_err(|e| etcd_client::Error::IoError(std::io::Error::other(e.to_string())))?;
-        let member_ids: Vec<String> = members.iter().map(|m| m.node_id.clone()).collect();
-        debug!(node_id = %self.base.node_id, members = ?member_ids, "reconcile: begin");
+    async fn reconcile_shards(&self) -> Result<(), CoordinationError> {
+        let members = self.get_members().await?;
 
-        // Safety check: if we don't see ourselves in the member list, our membership lease may have expired or there's a connectivity issue. Don't reconcile based on incomplete membership data - it would cause us to release all shards.
-        if members.is_empty() {
-            warn!(node_id = %self.base.node_id, "reconcile: no members found, skipping reconcile");
-            return Ok(());
-        }
-        if !member_ids.contains(&self.base.node_id) {
-            warn!(node_id = %self.base.node_id, members = ?member_ids, "reconcile: our node not in member list, skipping reconcile (membership may have expired)");
-            return Ok(());
-        }
-
-        let shard_map = self.base.shard_map.lock().await;
-        let shards: Vec<&crate::shard_range::ShardInfo> = shard_map.shards().iter().collect();
-        let desired = compute_desired_shards_for_node(&shards, &self.base.node_id, &members);
-        drop(shard_map);
-
-        let current_locks: Vec<ShardId> = {
-            let g = self.shard_guards.lock().await;
-            let mut v = Vec::new();
-            for (sid, guard) in g.iter() {
-                if guard.state.lock().await.is_held {
-                    v.push(*sid);
-                }
-            }
-            v
+        let guard_shard_ids: HashSet<ShardId> = {
+            let guards = self.shard_guards.lock().await;
+            guards.keys().copied().collect()
         };
-        debug!(node_id = %self.base.node_id, desired_len = desired.len(), have_locks = ?current_locks, "reconcile: computed desired vs current");
 
-        // Release/cancel undesired shards (sorted for deterministic ordering).
-        // This cancels both held shards AND in-flight acquisitions for shards
-        // this node no longer desires, preventing guards stuck in the Acquiring
-        // phase from continuing to compete for locks they don't need.
+        let actions = match self
+            .base
+            .compute_reconcile_actions(&members, &guard_shard_ids)
+            .await
         {
-            let mut to_cancel: Vec<ShardId> = {
-                let guards = self.shard_guards.lock().await;
-                let mut v = Vec::new();
-                for (sid, _guard) in guards.iter() {
-                    if !desired.contains(sid) {
-                        v.push(*sid);
-                    }
-                }
-                v
-            };
-            to_cancel.sort_unstable();
-            for sid in to_cancel {
-                self.ensure_shard_guard(sid).await.set_desired(false).await;
-            }
+            Some(a) => a,
+            None => return Ok(()),
+        };
+
+        for sid in actions.to_cancel {
+            self.ensure_shard_guard(sid)
+                .await
+                .ctx
+                .set_desired(false)
+                .await;
         }
-
-        // Acquire desired shards (sorted for deterministic ordering)
-        {
-            let mut snapshot: Vec<ShardId> = desired.iter().copied().collect();
-            snapshot.sort_unstable();
-            for shard_id in snapshot {
-                self.ensure_shard_guard(shard_id)
-                    .await
-                    .set_desired(true)
-                    .await;
-            }
+        for sid in actions.to_acquire {
+            self.ensure_shard_guard(sid)
+                .await
+                .ctx
+                .set_desired(true)
+                .await;
         }
 
         Ok(())
@@ -542,28 +505,6 @@ impl EtcdCoordinator {
         tokio::spawn(async move { runner.run(owned_arc, factory, shard_map, coordinator).await });
         guards.insert(shard_id, guard.clone());
         guard
-    }
-
-    #[allow(dead_code)]
-    async fn get_sorted_member_ids(&self) -> Result<Vec<String>, etcd_client::Error> {
-        let resp = self
-            .client
-            .kv_client()
-            .get(
-                keys::members_prefix(&self.cluster_prefix),
-                Some(GetOptions::new().with_prefix()),
-            )
-            .await?;
-        let mut member_ids: Vec<String> = resp
-            .kvs()
-            .iter()
-            .filter_map(|kv| {
-                let key = String::from_utf8_lossy(kv.key());
-                key.split('/').next_back().map(|s| s.to_string())
-            })
-            .collect();
-        member_ids.sort();
-        Ok(member_ids)
     }
 
     /// Reload the shard map from etcd into local cache.
@@ -860,9 +801,9 @@ impl Coordinator for EtcdCoordinator {
         // Shut down each guard sequentially for deterministic ordering
         // We trigger shutdown on each guard individually rather than using signal_shutdown() which would notify all guards concurrently
         for (_sid, guard) in guards_sorted {
-            guard.trigger_shutdown().await;
-            guard.notify.notify_one();
-            guard.wait_shutdown(Duration::from_millis(5000)).await;
+            guard.ctx.trigger_shutdown().await;
+            guard.ctx.notify.notify_one();
+            guard.ctx.wait_shutdown(Duration::from_millis(5000)).await;
         }
 
         // Signal shutdown to stop background tasks
@@ -1014,25 +955,16 @@ impl Coordinator for EtcdCoordinator {
     }
 }
 
-pub struct ShardState {
-    pub desired: bool,
-    pub phase: ShardPhase,
-    pub is_held: bool,
-}
-
 /// Per-shard ownership guard for etcd backend.
 ///
 /// Uses KV transactions (put-if-absent / delete-if-owner) for permanent shard
 /// ownership instead of the Lock API. Shard owner keys are not tied to any etcd
 /// lease, so they persist until explicitly deleted.
 pub struct EtcdShardGuard {
-    pub shard_id: ShardId,
+    pub ctx: ShardGuardContext<()>,
     pub client: Client,
     pub cluster_prefix: String,
     pub node_id: String,
-    pub state: Mutex<ShardState>,
-    pub notify: Notify,
-    pub shutdown: watch::Receiver<bool>,
 }
 
 impl EtcdShardGuard {
@@ -1044,23 +976,16 @@ impl EtcdShardGuard {
         shutdown: watch::Receiver<bool>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            shard_id,
+            ctx: ShardGuardContext::new(shard_id, shutdown),
             client,
             cluster_prefix,
             node_id,
-            state: Mutex::new(ShardState {
-                desired: false,
-                phase: ShardPhase::Idle,
-                is_held: false,
-            }),
-            notify: Notify::new(),
-            shutdown,
         })
     }
 
     /// Create a guard already in Held state for a shard reclaimed from a previous run.
     ///
-    /// The guard starts in `Held` phase with `desired: true` and `is_held: true`,
+    /// The guard starts in `Held` phase with `desired: true` and token `Some(())`,
     /// meaning it will sit in the `Idle | Held` wait arm until reconciliation
     /// decides what to do with it.
     pub fn new_reclaimed(
@@ -1071,65 +996,23 @@ impl EtcdShardGuard {
         shutdown: watch::Receiver<bool>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            shard_id,
+            ctx: ShardGuardContext::new_with_state(
+                shard_id,
+                shutdown,
+                ShardGuardState {
+                    desired: true,
+                    phase: ShardPhase::Held,
+                    ownership_token: Some(()),
+                },
+            ),
             client,
             cluster_prefix,
             node_id,
-            state: Mutex::new(ShardState {
-                desired: true,
-                phase: ShardPhase::Held,
-                is_held: true,
-            }),
-            notify: Notify::new(),
-            shutdown,
         })
     }
 
     fn owner_key(&self) -> String {
-        keys::shard_owner_key(&self.cluster_prefix, &self.shard_id)
-    }
-
-    pub async fn set_desired(&self, desired: bool) {
-        let mut st = self.state.lock().await;
-        if matches!(st.phase, ShardPhase::ShutDown | ShardPhase::ShuttingDown) {
-            debug!(shard_id = %self.shard_id, desired = desired, phase = %st.phase, "shard: can't change desired state after shut down");
-            return;
-        }
-
-        if st.desired != desired {
-            let prev_desired = st.desired;
-            let prev_phase = st.phase;
-            st.desired = desired;
-            debug!(shard_id = %self.shard_id, prev_desired = prev_desired, desired = desired, phase = %prev_phase, "shard: set_desired");
-            self.notify.notify_one();
-        }
-    }
-
-    /// Trigger shutdown for this specific guard (sets phase to ShuttingDown).
-    pub async fn trigger_shutdown(&self) {
-        let mut st = self.state.lock().await;
-        if !matches!(st.phase, ShardPhase::ShutDown | ShardPhase::ShuttingDown) {
-            debug!(shard_id = %self.shard_id, "trigger_shutdown: transitioning to ShuttingDown");
-            st.phase = ShardPhase::ShuttingDown;
-        }
-    }
-
-    /// Wait for this guard to complete shutdown (phase becomes ShutDown).
-    /// Returns immediately if already shut down.
-    pub async fn wait_shutdown(&self, timeout: Duration) {
-        let poll_interval = Duration::from_millis(10);
-        let max_iterations = (timeout.as_millis() / poll_interval.as_millis()).max(1) as usize;
-
-        for _ in 0..max_iterations {
-            {
-                let st = self.state.lock().await;
-                if st.phase == ShardPhase::ShutDown {
-                    return;
-                }
-            }
-            tokio::time::sleep(poll_interval).await;
-        }
-        debug!(shard_id = %self.shard_id, "wait_shutdown: timed out");
+        keys::shard_owner_key(&self.cluster_prefix, &self.ctx.shard_id)
     }
 
     /// Try to acquire shard ownership using a KV put-if-absent transaction.
@@ -1165,7 +1048,7 @@ impl EtcdShardGuard {
                 return Ok(true);
             }
             debug!(
-                shard_id = %self.shard_id,
+                shard_id = %self.ctx.shard_id,
                 current_owner = %current_owner,
                 "shard owned by another node"
             );
@@ -1199,60 +1082,42 @@ impl EtcdShardGuard {
         use tracing::{Instrument, info_span};
 
         loop {
-            if *self.shutdown.borrow() {
-                let mut st = self.state.lock().await;
+            if self.ctx.is_shutdown() {
+                let mut st = self.ctx.state.lock().await;
                 st.phase = ShardPhase::ShuttingDown;
             }
 
             {
-                let mut st = self.state.lock().await;
-                match (st.phase, st.desired, st.is_held) {
-                    (ShardPhase::ShutDown, _, _) => {}
-                    (ShardPhase::ShuttingDown, _, _) => {}
-                    (ShardPhase::Idle, true, false) => {
-                        debug!(
-                            shard_id = %self.shard_id,
-                            "shard: transition Idle -> Acquiring"
-                        );
-                        st.phase = ShardPhase::Acquiring;
-                    }
-                    (ShardPhase::Held, false, true) => {
-                        debug!(
-                            shard_id = %self.shard_id,
-                            "shard: transition Held -> Releasing"
-                        );
-                        st.phase = ShardPhase::Releasing;
-                    }
-                    _ => {}
-                }
+                let mut st = self.ctx.state.lock().await;
+                st.maybe_transition();
             }
 
-            let phase = { self.state.lock().await.phase };
+            let phase = { self.ctx.state.lock().await.phase };
             match phase {
                 ShardPhase::ShutDown => break,
                 ShardPhase::Acquiring => {
                     let owner_key = self.owner_key();
-                    let span = info_span!("shard.acquire", shard_id = %self.shard_id, owner_key = %owner_key);
+                    let span = info_span!("shard.acquire", shard_id = %self.ctx.shard_id, owner_key = %owner_key);
                     async {
                         let mut attempt: u32 = 0;
 
                         // Use first 8 bytes of UUID for jitter seed
-                        let uuid_bytes = self.shard_id.as_uuid().as_bytes();
+                        let uuid_bytes = self.ctx.shard_id.as_uuid().as_bytes();
                         let jitter_seed = u64::from_le_bytes(uuid_bytes[0..8].try_into().unwrap());
                         let initial_jitter_ms = jitter_seed % 80;
                         tokio::time::sleep(Duration::from_millis(initial_jitter_ms)).await;
 
                         loop {
-                            if { self.state.lock().await.phase } != ShardPhase::Acquiring {
+                            if { self.ctx.state.lock().await.phase } != ShardPhase::Acquiring {
                                 break;
                             }
                             {
-                                let mut st = self.state.lock().await;
+                                let mut st = self.ctx.state.lock().await;
                                 if !st.desired || st.phase != ShardPhase::Acquiring {
                                     if !st.desired && st.phase == ShardPhase::Acquiring {
                                         st.phase = ShardPhase::Idle;
                                     }
-                                    info!(shard_id = %self.shard_id, desired = st.desired, phase = %st.phase, "shard: acquire abort");
+                                    info!(shard_id = %self.ctx.shard_id, desired = st.desired, phase = %st.phase, "shard: acquire abort");
                                     break;
                                 }
                             }
@@ -1263,20 +1128,20 @@ impl EtcdShardGuard {
                                     // Look up the shard's range from the shard map
                                     let range = {
                                         let map = shard_map.lock().await;
-                                        match map.get_shard(&self.shard_id) {
+                                        match map.get_shard(&self.ctx.shard_id) {
                                             Some(info) => info.range.clone(),
                                             None => {
-                                                tracing::error!(shard_id = %self.shard_id, "shard not found in shard map");
+                                                tracing::error!(shard_id = %self.ctx.shard_id, "shard not found in shard map");
                                                 let _ = self.release_ownership().await;
                                                 continue;
                                             }
                                         }
                                     };
                                     // Open the shard BEFORE marking as Held - if open fails, we should release ownership and not claim it.
-                                    let shard = match factory.open(&self.shard_id, &range).await {
+                                    let shard = match factory.open(&self.ctx.shard_id, &range).await {
                                         Ok(shard) => shard,
                                         Err(e) => {
-                                            tracing::error!(shard_id = %self.shard_id, error = %e, "failed to open shard, releasing ownership");
+                                            tracing::error!(shard_id = %self.ctx.shard_id, error = %e, "failed to open shard, releasing ownership");
                                             let _ = self.release_ownership().await;
                                             // Exponential backoff before retry
                                             let backoff_ms = 200 * (1 << attempt.min(5));
@@ -1291,19 +1156,19 @@ impl EtcdShardGuard {
                                     shard.maybe_spawn_background_cleanup(range.clone());
 
                                     {
-                                        let mut st = self.state.lock().await;
-                                        st.is_held = true;
+                                        let mut st = self.ctx.state.lock().await;
+                                        st.ownership_token = Some(());
                                         st.phase = ShardPhase::Held;
                                     }
                                     {
                                         let mut owned = owned_arc.lock().await;
-                                        owned.insert(self.shard_id);
+                                        owned.insert(self.ctx.shard_id);
                                     }
                                     dst_events::emit(DstEvent::ShardAcquired {
                                         node_id: self.node_id.clone(),
-                                        shard_id: self.shard_id.to_string(),
+                                        shard_id: self.ctx.shard_id.to_string(),
                                     });
-                                    info!(shard_id = %self.shard_id, attempts = attempt, "shard: acquired and opened");
+                                    info!(shard_id = %self.ctx.shard_id, attempts = attempt, "shard: acquired and opened");
                                     break;
                                 }
                                 Ok(false) => {
@@ -1315,11 +1180,11 @@ impl EtcdShardGuard {
                                         % 150;
                                     tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
                                     if attempt % 8 == 0 {
-                                        debug!(shard_id = %self.shard_id, attempt = attempt, "shard: acquire retry");
+                                        debug!(shard_id = %self.ctx.shard_id, attempt = attempt, "shard: acquire retry");
                                     }
                                 }
                                 Err(e) => {
-                                    warn!(shard_id = %self.shard_id, error = %e, "shard: acquire txn error, retrying");
+                                    warn!(shard_id = %self.ctx.shard_id, error = %e, "shard: acquire txn error, retrying");
                                     attempt = attempt.wrapping_add(1);
                                     tokio::time::sleep(Duration::from_millis(100)).await;
                                 }
@@ -1331,81 +1196,81 @@ impl EtcdShardGuard {
                 }
                 ShardPhase::Releasing => {
                     let owner_key = self.owner_key();
-                    let span = info_span!("shard.release", shard_id = %self.shard_id, owner_key = %owner_key);
+                    let span = info_span!("shard.release", shard_id = %self.ctx.shard_id, owner_key = %owner_key);
                     async {
-                        debug!(shard_id = %self.shard_id, "shard: release start (delay)");
+                        debug!(shard_id = %self.ctx.shard_id, "shard: release start (delay)");
                         tokio::time::sleep(Duration::from_millis(100)).await;
 
                         let mut cancelled = false;
                         let was_held = {
-                            let mut st = self.state.lock().await;
+                            let mut st = self.ctx.state.lock().await;
                             if st.phase == ShardPhase::ShuttingDown {
                                 // fall through
                             } else if st.desired {
                                 st.phase = ShardPhase::Held;
                                 cancelled = true;
-                                debug!(shard_id = %self.shard_id, "shard: release cancelled");
+                                debug!(shard_id = %self.ctx.shard_id, "shard: release cancelled");
                             }
-                            st.is_held
+                            st.has_token()
                         };
                         if cancelled {
                             return;
                         }
                         if was_held {
                             // Close the shard before releasing ownership
-                            match factory.close(&self.shard_id).await {
+                            match factory.close(&self.ctx.shard_id).await {
                                 Ok(()) => {
                                     dst_events::emit(DstEvent::ShardClosed {
                                         node_id: self.node_id.clone(),
-                                        shard_id: self.shard_id.to_string(),
+                                        shard_id: self.ctx.shard_id.to_string(),
                                     });
                                     if let Err(e) = self.release_ownership().await {
-                                        tracing::error!(shard_id = %self.shard_id, error = %e, "failed to release shard ownership");
+                                        tracing::error!(shard_id = %self.ctx.shard_id, error = %e, "failed to release shard ownership");
                                     }
                                     {
-                                        let mut st = self.state.lock().await;
-                                        st.is_held = false;
+                                        let mut st = self.ctx.state.lock().await;
+                                        st.ownership_token = None;
                                         st.phase = ShardPhase::Idle;
                                     }
                                     {
                                         let mut owned = owned_arc.lock().await;
-                                        owned.remove(&self.shard_id);
+                                        owned.remove(&self.ctx.shard_id);
                                     }
                                     dst_events::emit(DstEvent::ShardReleased {
                                         node_id: self.node_id.clone(),
-                                        shard_id: self.shard_id.to_string(),
+                                        shard_id: self.ctx.shard_id.to_string(),
                                     });
-                                    debug!(shard_id = %self.shard_id, "shard: release done");
+                                    debug!(shard_id = %self.ctx.shard_id, "shard: release done");
                                 }
                                 Err(e) => {
                                     // Close failed - revert to Held so reconciliation retries
                                     tracing::error!(
-                                        shard_id = %self.shard_id,
+                                        shard_id = %self.ctx.shard_id,
                                         error = %e,
                                         "failed to close shard, reverting to Held to prevent data loss"
                                     );
-                                    let mut st = self.state.lock().await;
+                                    let mut st = self.ctx.state.lock().await;
                                     st.phase = ShardPhase::Held;
                                 }
                             }
                         } else {
-                            let mut st = self.state.lock().await;
+                            let mut st = self.ctx.state.lock().await;
                             st.phase = ShardPhase::Idle;
-                            debug!(shard_id = %self.shard_id, "shard: release noop");
+                            debug!(shard_id = %self.ctx.shard_id, "shard: release noop");
                         }
                     }
                     .instrument(span)
                     .await;
                 }
                 ShardPhase::ShuttingDown => {
-                    let was_held = self.state.lock().await.is_held;
+                    let was_held = self.ctx.state.lock().await.has_token();
                     if was_held {
                         // Close the shard before releasing ownership
-                        let close_succeeded = match factory.close(&self.shard_id).await {
+                        let close_succeeded = match factory.close(&self.ctx.shard_id).await {
                             Ok(()) => {
                                 dst_events::emit(DstEvent::ShardClosed {
                                     node_id: self.node_id.clone(),
-                                    shard_id: self.shard_id.to_string(),
+                                    shard_id: self.ctx.shard_id.to_string(),
                                 });
                                 true
                             }
@@ -1415,7 +1280,7 @@ impl EtcdShardGuard {
                                 // until operator force-release, preventing another node from
                                 // acquiring unflushed data.
                                 tracing::error!(
-                                    shard_id = %self.shard_id,
+                                    shard_id = %self.ctx.shard_id,
                                     error = %e,
                                     "failed to close shard during shutdown, keeping ownership to prevent data loss"
                                 );
@@ -1425,31 +1290,27 @@ impl EtcdShardGuard {
 
                         if close_succeeded {
                             if let Err(e) = self.release_ownership().await {
-                                tracing::error!(shard_id = %self.shard_id, error = %e, "failed to release shard ownership during shutdown");
+                                tracing::error!(shard_id = %self.ctx.shard_id, error = %e, "failed to release shard ownership during shutdown");
                             }
                             {
                                 let mut owned = owned_arc.lock().await;
-                                owned.remove(&self.shard_id);
+                                owned.remove(&self.ctx.shard_id);
                             }
                             dst_events::emit(DstEvent::ShardReleased {
                                 node_id: self.node_id.clone(),
-                                shard_id: self.shard_id.to_string(),
+                                shard_id: self.ctx.shard_id.to_string(),
                             });
                         }
                     }
                     {
-                        let mut st = self.state.lock().await;
-                        st.is_held = false;
+                        let mut st = self.ctx.state.lock().await;
+                        st.ownership_token = None;
                         st.phase = ShardPhase::ShutDown;
                     }
                     break;
                 }
                 ShardPhase::Idle | ShardPhase::Held => {
-                    let mut shutdown_rx = self.shutdown.clone();
-                    tokio::select! {
-                        _ = self.notify.notified() => {}
-                        _ = shutdown_rx.changed() => {}
-                    }
+                    self.ctx.wait_for_change().await;
                 }
             }
         }

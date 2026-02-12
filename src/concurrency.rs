@@ -9,27 +9,21 @@
 //!   Enforced by `try_reserve` which atomically checks capacity and reserves a slot.
 //!
 //! - Holders only exist for tasks that are active (in DB queue, buffer, or leased).
-//!   Holders are created at enqueue (granted) or grant_next, and released when task completes,
-//!   lease expires, or cancelled task is cleaned up at dequeue.
+//!   Holders are created at enqueue (granted) or grant_next, and released when task completes, lease expires, or cancelled task is cleaned up at dequeue.
 //!
 //! # TOCTOU Prevention
 //!
-//! To prevent time-of-check-time-of-use races, in-memory concurrency counts are updated
-//! BEFORE the DB write. If the DB write fails, callers must use rollback methods to revert
-//! the in-memory state. This ensures no window exists where capacity appears available
-//! between check and grant.
+//! To prevent time-of-check-time-of-use races, in-memory concurrency counts are updated BEFORE the DB write. If the DB write fails, callers must use rollback methods to revert the in-memory state. This ensures no window exists where capacity appears available between check and grant.
 //!
 //! # Cancellation Semantics
 //!
-//! - [SILO-GRANT-CXL] Requests for cancelled jobs are skipped during grant_next.
-//!   When release_and_grant_next scans for the next request to grant, it checks if the job
-//!   is cancelled and deletes the request without granting.
+//! - Requests for cancelled jobs are skipped during grant_next.
+//!   When release_and_grant_next scans for the next request to grant, it checks if the job is cancelled and deletes the request without granting.
 //!
 //! - Requests for terminal jobs (Succeeded/Failed/Cancelled) are also skipped during grant_next.
-//!   This handles the case where a job succeeds via one attempt while a pending concurrency
-//!   request from a restart or retry is still in the DB.
+//!   This handles the case where a job succeeds via one attempt while a pending concurrency request from a restart or retry is still in the DB.
 //!
-//! - [SILO-DEQ-CXL-REL] Holders for cancelled tasks are released at dequeue cleanup.
+//! - Holders for cancelled tasks are released at dequeue cleanup.
 //!   When dequeue encounters a cancelled job's task, it releases any held tickets.
 
 use std::collections::{HashMap, HashSet};
@@ -131,12 +125,7 @@ impl ConcurrencyCounts {
 
     /// Hydrate a specific queue's concurrency holder state from durable storage.
     ///
-    /// Uses the per-queue prefix for efficient scanning of only the relevant holders.
-    ///
-    /// The `range` parameter filters holders to only load those for tenants within
-    /// the shard's range. This is critical after shard splits - both child shards
-    /// clone the same holder records, and without filtering, both would think they
-    /// own the same concurrency tickets, leading to limit violations.
+    /// Uses the per-queue prefix for efficient scanning of only the relevant holders. The `range` parameter filters holders to only load those for tenants within the shard's range. This is critical after shard splits - both child shards clone the same holder records, and without filtering, both would think they own the same concurrency tickets, leading to limit violations.
     pub async fn hydrate_queue(
         &self,
         db: &Db,
@@ -287,11 +276,9 @@ impl ConcurrencyCounts {
         hydrated.insert(key);
     }
 
-    /// Synchronous try_reserve for testing when the queue is known to be hydrated
-    /// or when testing in-memory reservation logic without DB.
+    /// Synchronous try_reserve for testing when the queue is known to be hydrated or when testing in-memory reservation logic without DB.
     ///
-    /// This method is exposed for testing purposes only. Production code should
-    /// use `try_reserve` which performs lazy hydration.
+    /// This method is exposed for testing purposes only. Production code should use `try_reserve` which performs lazy hydration.
     #[doc(hidden)]
     pub fn try_reserve_sync(
         &self,
@@ -424,8 +411,7 @@ impl ConcurrencyManager {
     /// Handle concurrency for a new job enqueue.
     ///
     /// IMPORTANT: This method atomically reserves in-memory concurrency slots BEFORE returning.
-    /// If the DB write fails after calling this, you MUST call `rollback_grant` to release
-    /// the reservation.
+    /// If the DB write fails after calling this, you MUST call `rollback_grant` to release the reservation.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn handle_enqueue<W: WriteBatcher>(
         &self,
@@ -530,9 +516,7 @@ impl ConcurrencyManager {
 
     /// Process a RequestTicket task during dequeue.
     ///
-    /// IMPORTANT: This method atomically reserves in-memory concurrency slots when granting.
-    /// If the DB write fails after calling this with a Granted outcome, you MUST call
-    /// `rollback_grant` to release the reservation.
+    /// IMPORTANT: This method atomically reserves in-memory concurrency slots when granting.  If the DB write fails after calling this with a Granted outcome, you MUST call `rollback_grant` to release the reservation.
     #[allow(clippy::too_many_arguments)]
     pub async fn process_ticket_request_task(
         &self,
@@ -588,9 +572,7 @@ impl ConcurrencyManager {
 
     /// Release holders and grant next requests.
     ///
-    /// IMPORTANT: This method updates in-memory counts BEFORE returning (atomically).
-    /// If the DB write fails, you MUST call `rollback_release_grants` with the returned
-    /// rollback info to revert the in-memory changes.
+    /// IMPORTANT: This method updates in-memory counts BEFORE returning (atomically). If the DB write fails, you MUST call `rollback_release_grants` with the returned rollback info to revert the in-memory changes.
     ///
     /// Returns a tuple of (rollback_info, queues_to_wakeup).
     /// Call broker.wakeup() for each queue after successful DB write.
@@ -768,8 +750,6 @@ impl ConcurrencyManager {
         }
     }
 }
-
-// Internal helper functions
 
 /// Append DB edits to grant a concurrency slot: creates holder record and RunAttempt task.
 /// Note: In-memory reservation should already be done via try_reserve before calling this.

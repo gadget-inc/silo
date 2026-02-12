@@ -173,7 +173,7 @@ async fn wait_for_change_notify() {
 
     let (_, shutdown_rx) = tokio::sync::watch::channel(false);
     let shard_id = ShardId::new();
-    let ctx = Arc::new(ShardGuardContext::new(shard_id, shutdown_rx));
+    let ctx = Arc::new(ShardGuardContext::<()>::new(shard_id, shutdown_rx));
 
     let ctx_clone = ctx.clone();
     let handle = tokio::spawn(async move {
@@ -199,7 +199,7 @@ async fn wait_for_change_shutdown() {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let shard_id = ShardId::new();
-    let ctx = Arc::new(ShardGuardContext::new(shard_id, shutdown_rx));
+    let ctx = Arc::new(ShardGuardContext::<()>::new(shard_id, shutdown_rx));
 
     let ctx_clone = ctx.clone();
     let handle = tokio::spawn(async move {
@@ -224,7 +224,7 @@ fn is_shutdown_reflects_channel() {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let shard_id = ShardId::new();
-    let ctx = ShardGuardContext::new(shard_id, shutdown_rx);
+    let ctx = ShardGuardContext::<()>::new(shard_id, shutdown_rx);
 
     assert!(!ctx.is_shutdown());
 

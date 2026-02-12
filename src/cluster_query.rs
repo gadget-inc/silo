@@ -1,12 +1,8 @@
 //! Cluster-wide query engine using Apache DataFusion.
 //!
-//! This module provides a query engine that can execute SQL queries across all shards
-//! in a Silo cluster. It creates a multi-partition execution plan where each partition
-//! corresponds to a shard, enabling DataFusion to properly aggregate results across
-//! the entire cluster.
+//! This module provides a query engine that can execute SQL queries across all shards in a Silo cluster. It creates a multi-partition execution plan where each partition corresponds to a shard, enabling DataFusion to properly aggregate results across the entire cluster.
 //!
-//! For local shards, data is read directly. For remote shards, the engine makes
-//! gRPC calls using Arrow IPC for efficient data transfer.
+//! For local shards, data is read directly. For remote shards, the engine makes gRPC calls using Arrow IPC for efficient data transfer.
 
 use std::any::Any;
 use std::collections::HashMap;

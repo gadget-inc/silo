@@ -169,11 +169,11 @@ async fn shard_guard_acquire_and_release() {
     let shard_id = ShardId::new();
     let (guard, owned, _tx, handle) = make_guard(&coord, &prefix, shard_id).await;
 
-    guard.set_desired(true).await;
+    guard.ctx.set_desired(true).await;
 
     // Wait until Held and owned contains shard
     let ok = wait_until(Duration::from_secs(3), || async {
-        let st = guard.state.lock().await;
+        let st = guard.ctx.state.lock().await;
         let ow = owned.lock().await;
         st.phase == ShardPhase::Held && ow.contains(&shard_id)
     })
@@ -181,11 +181,11 @@ async fn shard_guard_acquire_and_release() {
     assert!(ok, "guard should acquire lock and mark owned");
 
     // Release
-    guard.set_desired(false).await;
+    guard.ctx.set_desired(false).await;
     let released = wait_until(Duration::from_secs(3), || async {
-        let st = guard.state.lock().await;
+        let st = guard.ctx.state.lock().await;
         let ow = owned.lock().await;
-        st.phase == ShardPhase::Idle && !st.is_held && !ow.contains(&shard_id)
+        st.phase == ShardPhase::Idle && !st.has_token() && !ow.contains(&shard_id)
     })
     .await;
     assert!(released, "guard should release lock and clear owned");
@@ -208,13 +208,13 @@ async fn shard_guard_contention_and_handoff() {
     let (g1, owned1, _tx1, h1) = make_guard(&coord1, &prefix, shard_id).await;
     let (g2, owned2, _tx2, h2) = make_guard(&coord2, &prefix, shard_id).await;
 
-    g1.set_desired(true).await;
-    g2.set_desired(true).await;
+    g1.ctx.set_desired(true).await;
+    g2.ctx.set_desired(true).await;
 
     // Eventually exactly one should hold
     let one_holds = wait_until(Duration::from_secs(4), || async {
-        let st1 = g1.state.lock().await;
-        let st2 = g2.state.lock().await;
+        let st1 = g1.ctx.state.lock().await;
+        let st2 = g2.ctx.state.lock().await;
         (st1.phase == ShardPhase::Held) ^ (st2.phase == ShardPhase::Held)
     })
     .await;
@@ -224,14 +224,14 @@ async fn shard_guard_contention_and_handoff() {
     );
 
     // Determine current owner
-    let owner_is_1 = { g1.state.lock().await.phase == ShardPhase::Held };
+    let owner_is_1 = { g1.ctx.state.lock().await.phase == ShardPhase::Held };
 
     if owner_is_1 {
         // Release from g1 and verify handoff to g2
-        g1.set_desired(false).await;
+        g1.ctx.set_desired(false).await;
         let handed = wait_until(Duration::from_secs(5), || async {
-            let st1 = g1.state.lock().await;
-            let st2 = g2.state.lock().await;
+            let st1 = g1.ctx.state.lock().await;
+            let st2 = g2.ctx.state.lock().await;
             let ow1 = owned1.lock().await;
             let ow2 = owned2.lock().await;
             st1.phase != ShardPhase::Held
@@ -243,10 +243,10 @@ async fn shard_guard_contention_and_handoff() {
         assert!(handed, "g2 should acquire after g1 releases");
     } else {
         // Release from g2 and verify handoff to g1
-        g2.set_desired(false).await;
+        g2.ctx.set_desired(false).await;
         let handed = wait_until(Duration::from_secs(5), || async {
-            let st1 = g1.state.lock().await;
-            let st2 = g2.state.lock().await;
+            let st1 = g1.ctx.state.lock().await;
+            let st2 = g2.ctx.state.lock().await;
             let ow1 = owned1.lock().await;
             let ow2 = owned2.lock().await;
             st2.phase != ShardPhase::Held
@@ -272,33 +272,33 @@ async fn shard_guard_idempotent_set_desired_true() {
 
     let shard_id = ShardId::new();
     let (guard, owned, _tx, handle) = make_guard(&coord, &prefix, shard_id).await;
-    guard.set_desired(true).await;
+    guard.ctx.set_desired(true).await;
 
     let acquired = wait_until(Duration::from_secs(3), || async {
-        guard.state.lock().await.phase == ShardPhase::Held
+        guard.ctx.state.lock().await.phase == ShardPhase::Held
     })
     .await;
     assert!(acquired, "should acquire initially");
 
     // Calling set_desired(true) again should not cause release/reacquire
-    guard.set_desired(true).await;
+    guard.ctx.set_desired(true).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let (phase, is_held, in_owned) = {
-        let st = guard.state.lock().await;
+        let st = guard.ctx.state.lock().await;
         let ow = owned.lock().await;
-        (st.phase, st.is_held, ow.contains(&shard_id))
+        (st.phase, st.has_token(), ow.contains(&shard_id))
     };
     assert_eq!(phase, ShardPhase::Held);
     assert!(is_held);
     assert!(in_owned);
 
     // Cleanup: release
-    guard.set_desired(false).await;
+    guard.ctx.set_desired(false).await;
     let released = wait_until(Duration::from_secs(3), || async {
-        let st = guard.state.lock().await;
+        let st = guard.ctx.state.lock().await;
         let ow = owned.lock().await;
-        st.phase == ShardPhase::Idle && !st.is_held && !ow.contains(&shard_id)
+        st.phase == ShardPhase::Idle && !st.has_token() && !ow.contains(&shard_id)
     })
     .await;
     assert!(released);
@@ -315,21 +315,21 @@ async fn shard_guard_quick_flip_reacquires() {
 
     let shard_id = ShardId::new();
     let (guard, owned, _tx, handle) = make_guard(&coord, &prefix, shard_id).await;
-    guard.set_desired(true).await;
+    guard.ctx.set_desired(true).await;
     let acquired = wait_until(Duration::from_secs(3), || async {
-        guard.state.lock().await.phase == ShardPhase::Held
+        guard.ctx.state.lock().await.phase == ShardPhase::Held
     })
     .await;
     assert!(acquired);
 
     // Flip to false then quickly back to true before delayed release completes
-    guard.set_desired(false).await;
+    guard.ctx.set_desired(false).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    guard.set_desired(true).await;
+    guard.ctx.set_desired(true).await;
 
     // Expect we end up Held again
     let reacquired = wait_until(Duration::from_secs(5), || async {
-        guard.state.lock().await.phase == ShardPhase::Held
+        guard.ctx.state.lock().await.phase == ShardPhase::Held
     })
     .await;
     assert!(reacquired);
@@ -337,9 +337,9 @@ async fn shard_guard_quick_flip_reacquires() {
     assert!(in_owned, "owned set should include shard after reacquire");
 
     // Cleanup
-    guard.set_desired(false).await;
+    guard.ctx.set_desired(false).await;
     let _ = wait_until(Duration::from_secs(3), || async {
-        guard.state.lock().await.phase == ShardPhase::Idle
+        guard.ctx.state.lock().await.phase == ShardPhase::Idle
     })
     .await;
     handle.abort();
@@ -359,23 +359,23 @@ async fn shard_guard_acquire_aborts_when_desired_changes() {
     let shard_id = ShardId::new();
     // First guard holds the lock to block second guard's acquisition
     let (g1, _o1, _tx1, h1) = make_guard(&coord, &prefix, shard_id).await;
-    g1.set_desired(true).await;
+    g1.ctx.set_desired(true).await;
     let held = wait_until(Duration::from_secs(3), || async {
-        g1.state.lock().await.phase == ShardPhase::Held
+        g1.ctx.state.lock().await.phase == ShardPhase::Held
     })
     .await;
     assert!(held);
 
     // Second guard starts acquiring then we cancel its desire
     let (g2, o2, _tx2, h2) = make_guard(&coord2, &prefix, shard_id).await;
-    g2.set_desired(true).await;
+    g2.ctx.set_desired(true).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    g2.set_desired(false).await;
+    g2.ctx.set_desired(false).await;
 
     // It should not end up holding after some time
     tokio::time::sleep(Duration::from_millis(400)).await;
     let (phase2, owned_contains) = {
-        let st = g2.state.lock().await;
+        let st = g2.ctx.state.lock().await;
         let ow = o2.lock().await;
         (st.phase, ow.contains(&shard_id))
     };
@@ -383,9 +383,9 @@ async fn shard_guard_acquire_aborts_when_desired_changes() {
     assert!(!owned_contains);
 
     // Cleanup
-    g1.set_desired(false).await;
+    g1.ctx.set_desired(false).await;
     let _ = wait_until(Duration::from_secs(3), || async {
-        g1.state.lock().await.phase == ShardPhase::Idle
+        g1.ctx.state.lock().await.phase == ShardPhase::Idle
     })
     .await;
     h1.abort();
@@ -406,30 +406,30 @@ async fn shard_guard_acquire_abort_sets_idle() {
     let shard_id = ShardId::new();
     // Block the lock with g1 so g2 enters Acquiring
     let (g1, _o1, _tx1, h1) = make_guard(&coord1, &prefix, shard_id).await;
-    g1.set_desired(true).await;
+    g1.ctx.set_desired(true).await;
     let held = wait_until(Duration::from_secs(3), || async {
-        g1.state.lock().await.phase == ShardPhase::Held
+        g1.ctx.state.lock().await.phase == ShardPhase::Held
     })
     .await;
     assert!(held);
 
     // Start g2 acquiring then withdraw desire
     let (g2, _o2, _tx2, h2) = make_guard(&coord2, &prefix, shard_id).await;
-    g2.set_desired(true).await;
+    g2.ctx.set_desired(true).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    g2.set_desired(false).await;
+    g2.ctx.set_desired(false).await;
 
     // Expect g2 transitions back to Idle (not stuck in Acquiring)
     let idle = wait_until(Duration::from_secs(2), || async {
-        g2.state.lock().await.phase == ShardPhase::Idle
+        g2.ctx.state.lock().await.phase == ShardPhase::Idle
     })
     .await;
     assert!(idle, "g2 should return to Idle after aborting acquire");
 
     // Cleanup
-    g1.set_desired(false).await;
+    g1.ctx.set_desired(false).await;
     let _ = wait_until(Duration::from_secs(3), || async {
-        g1.state.lock().await.phase == ShardPhase::Idle
+        g1.ctx.state.lock().await.phase == ShardPhase::Idle
     })
     .await;
     h1.abort();
@@ -446,35 +446,35 @@ async fn shard_guard_release_cancelled_on_desired_true() {
 
     let shard_id = ShardId::new();
     let (g, owned, _tx, h) = make_guard(&coord, &prefix, shard_id).await;
-    g.set_desired(true).await;
+    g.ctx.set_desired(true).await;
     let acquired = wait_until(Duration::from_secs(3), || async {
-        g.state.lock().await.phase == ShardPhase::Held
+        g.ctx.state.lock().await.phase == ShardPhase::Held
     })
     .await;
     assert!(acquired);
-    assert!(g.state.lock().await.is_held);
+    assert!(g.ctx.state.lock().await.has_token());
 
     // Begin release then flip desired back to true during the delay window
-    g.set_desired(false).await;
+    g.ctx.set_desired(false).await;
     tokio::time::sleep(Duration::from_millis(50)).await; // < 100ms delay
-    g.set_desired(true).await;
+    g.ctx.set_desired(true).await;
 
     // Expect we remain Held and ownership is unchanged (no release/reacquire)
     let still_held = wait_until(Duration::from_secs(3), || async {
-        g.state.lock().await.phase == ShardPhase::Held
+        g.ctx.state.lock().await.phase == ShardPhase::Held
     })
     .await;
     assert!(still_held);
     assert!(
-        g.state.lock().await.is_held,
+        g.ctx.state.lock().await.has_token(),
         "ownership should be preserved if release is cancelled"
     );
     assert!(owned.lock().await.contains(&shard_id));
 
     // Cleanup
-    g.set_desired(false).await;
+    g.ctx.set_desired(false).await;
     let _ = wait_until(Duration::from_secs(3), || async {
-        g.state.lock().await.phase == ShardPhase::Idle
+        g.ctx.state.lock().await.phase == ShardPhase::Idle
     })
     .await;
     h.abort();
@@ -492,9 +492,9 @@ async fn shard_guard_shutdown_in_idle() {
     let (guard, owned, tx, handle) = make_guard(&coord, &prefix, shard_id).await;
     // Ensure Idle
     {
-        let st = guard.state.lock().await;
+        let st = guard.ctx.state.lock().await;
         assert_eq!(st.phase, ShardPhase::Idle);
-        assert!(!st.is_held);
+        assert!(!st.has_token());
     }
     // Signal shutdown
     let _ = tx.send(true);
@@ -520,20 +520,20 @@ async fn shard_guard_shutdown_while_acquiring() {
     let shard_id = ShardId::new();
     // g1 holds the lock so g2 is acquiring
     let (g1, _o1, _tx1, h1) = make_guard(&coord1, &prefix, shard_id).await;
-    g1.set_desired(true).await;
+    g1.ctx.set_desired(true).await;
     assert!(
         wait_until(Duration::from_secs(3), || async {
-            g1.state.lock().await.phase == ShardPhase::Held
+            g1.ctx.state.lock().await.phase == ShardPhase::Held
         })
         .await
     );
 
     let (g2, o2, tx2, h2) = make_guard(&coord2, &prefix, shard_id).await;
-    g2.set_desired(true).await;
+    g2.ctx.set_desired(true).await;
     // Wait until g2 enters Acquiring
     assert!(
         wait_until(Duration::from_secs(2), || async {
-            let st = g2.state.lock().await;
+            let st = g2.ctx.state.lock().await;
             st.phase == ShardPhase::Acquiring
         })
         .await
@@ -543,14 +543,14 @@ async fn shard_guard_shutdown_while_acquiring() {
     let _ = tx2.send(true);
     tokio::time::sleep(Duration::from_millis(100)).await;
     // It should not end up holding
-    let st2 = g2.state.lock().await;
+    let st2 = g2.ctx.state.lock().await;
     assert_ne!(st2.phase, ShardPhase::Held);
     assert!(!o2.lock().await.contains(&shard_id));
 
     // Cleanup
-    g1.set_desired(false).await;
+    g1.ctx.set_desired(false).await;
     let _ = wait_until(Duration::from_secs(3), || async {
-        g1.state.lock().await.phase == ShardPhase::Idle
+        g1.ctx.state.lock().await.phase == ShardPhase::Idle
     })
     .await;
     h1.abort();
@@ -567,10 +567,10 @@ async fn shard_guard_shutdown_while_held() {
 
     let shard_id = ShardId::new();
     let (g, owned, tx, h) = make_guard(&coord, &prefix, shard_id).await;
-    g.set_desired(true).await;
+    g.ctx.set_desired(true).await;
     assert!(
         wait_until(Duration::from_secs(3), || async {
-            g.state.lock().await.phase == ShardPhase::Held
+            g.ctx.state.lock().await.phase == ShardPhase::Held
         })
         .await
     );
@@ -581,13 +581,13 @@ async fn shard_guard_shutdown_while_held() {
     // Wait for shutdown to complete
     assert!(
         wait_until(Duration::from_secs(5), || async {
-            g.state.lock().await.phase == ShardPhase::ShutDown
+            g.ctx.state.lock().await.phase == ShardPhase::ShutDown
         })
         .await,
         "should reach ShutDown phase"
     );
-    let st = g.state.lock().await;
-    assert_eq!(st.is_held, false);
+    let st = g.ctx.state.lock().await;
+    assert_eq!(st.has_token(), false);
     assert!(!owned.lock().await.contains(&shard_id));
     h.abort();
 }
@@ -602,18 +602,18 @@ async fn shard_guard_shutdown_while_releasing() {
 
     let shard_id = ShardId::new();
     let (g, owned, tx, h) = make_guard(&coord, &prefix, shard_id).await;
-    g.set_desired(true).await;
+    g.ctx.set_desired(true).await;
     assert!(
         wait_until(Duration::from_secs(3), || async {
-            g.state.lock().await.phase == ShardPhase::Held
+            g.ctx.state.lock().await.phase == ShardPhase::Held
         })
         .await
     );
     // Begin release
-    g.set_desired(false).await;
+    g.ctx.set_desired(false).await;
     assert!(
         wait_until(Duration::from_secs(2), || async {
-            g.state.lock().await.phase == ShardPhase::Releasing
+            g.ctx.state.lock().await.phase == ShardPhase::Releasing
         })
         .await
     );
@@ -622,13 +622,13 @@ async fn shard_guard_shutdown_while_releasing() {
     // Wait for shutdown to complete
     assert!(
         wait_until(Duration::from_secs(5), || async {
-            g.state.lock().await.phase == ShardPhase::ShutDown
+            g.ctx.state.lock().await.phase == ShardPhase::ShutDown
         })
         .await,
         "should reach ShutDown phase"
     );
-    let st = g.state.lock().await;
-    assert_eq!(st.is_held, false);
+    let st = g.ctx.state.lock().await;
+    assert_eq!(st.has_token(), false);
     assert!(!owned.lock().await.contains(&shard_id));
     h.abort();
 }
@@ -2971,9 +2971,9 @@ async fn shard_lease_persists_after_abort() {
         make_guard_with_node_id(&coord, &prefix, shard_id, node_id.clone()).await;
 
     // Acquire the shard
-    guard.set_desired(true).await;
+    guard.ctx.set_desired(true).await;
     let acquired = wait_until(Duration::from_secs(3), || async {
-        guard.state.lock().await.phase == ShardPhase::Held
+        guard.ctx.state.lock().await.phase == ShardPhase::Held
     })
     .await;
     assert!(acquired, "guard should acquire shard");
@@ -3017,9 +3017,9 @@ async fn permanent_lease_blocks_other_nodes() {
     // Node 1 acquires the shard
     let (g1, _owned1, _tx1, h1) =
         make_guard_with_node_id(&coord1, &prefix, shard_id, "blocker-node".to_string()).await;
-    g1.set_desired(true).await;
+    g1.ctx.set_desired(true).await;
     let acquired = wait_until(Duration::from_secs(3), || async {
-        g1.state.lock().await.phase == ShardPhase::Held
+        g1.ctx.state.lock().await.phase == ShardPhase::Held
     })
     .await;
     assert!(acquired, "node 1 should acquire");
@@ -3031,11 +3031,11 @@ async fn permanent_lease_blocks_other_nodes() {
     // Node 2 tries to acquire the same shard -- should be blocked
     let (g2, _owned2, _tx2, h2) =
         make_guard_with_node_id(&coord2, &prefix, shard_id, "blocked-node".to_string()).await;
-    g2.set_desired(true).await;
+    g2.ctx.set_desired(true).await;
 
     // Wait a bit -- node 2 should NOT be able to acquire
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let st2 = g2.state.lock().await;
+    let st2 = g2.ctx.state.lock().await;
     assert_ne!(
         st2.phase,
         ShardPhase::Held,
@@ -3068,9 +3068,9 @@ async fn force_release_allows_reacquisition() {
     // Node 1 acquires the shard
     let (g1, _owned1, _tx1, h1) =
         make_guard_with_node_id(&coord1, &prefix, shard_id, "force-node-1".to_string()).await;
-    g1.set_desired(true).await;
+    g1.ctx.set_desired(true).await;
     let acquired = wait_until(Duration::from_secs(3), || async {
-        g1.state.lock().await.phase == ShardPhase::Held
+        g1.ctx.state.lock().await.phase == ShardPhase::Held
     })
     .await;
     assert!(acquired, "node 1 should acquire");
@@ -3092,9 +3092,9 @@ async fn force_release_allows_reacquisition() {
     // Node 2 should now be able to acquire
     let (g2, owned2, _tx2, h2) =
         make_guard_with_node_id(&coord2, &prefix, shard_id, "force-node-2".to_string()).await;
-    g2.set_desired(true).await;
+    g2.ctx.set_desired(true).await;
     let acquired2 = wait_until(Duration::from_secs(5), || async {
-        g2.state.lock().await.phase == ShardPhase::Held
+        g2.ctx.state.lock().await.phase == ShardPhase::Held
     })
     .await;
     assert!(
@@ -3104,9 +3104,9 @@ async fn force_release_allows_reacquisition() {
     assert!(owned2.lock().await.contains(&shard_id));
 
     // Cleanup
-    g2.set_desired(false).await;
+    g2.ctx.set_desired(false).await;
     let _ = wait_until(Duration::from_secs(3), || async {
-        g2.state.lock().await.phase == ShardPhase::Idle
+        g2.ctx.state.lock().await.phase == ShardPhase::Idle
     })
     .await;
     h2.abort();
@@ -3742,10 +3742,10 @@ async fn etcd_shard_close_failure_keeps_ownership() {
         make_guard_with_factory(&coord, &prefix, shard_id, node_id, factory).await;
 
     // Acquire the shard
-    guard.set_desired(true).await;
+    guard.ctx.set_desired(true).await;
     let acquired = wait_until(Duration::from_secs(5), || async {
-        let st = guard.state.lock().await;
-        st.phase == ShardPhase::Held && st.is_held
+        let st = guard.ctx.state.lock().await;
+        st.phase == ShardPhase::Held && st.has_token()
     })
     .await;
     assert!(acquired, "guard should acquire ownership");
@@ -3759,8 +3759,8 @@ async fn etcd_shard_close_failure_keeps_ownership() {
     make_dir_tree_readonly(&shard_data_path);
 
     // Trigger release
-    guard.set_desired(false).await;
-    guard.notify.notify_one();
+    guard.ctx.set_desired(false).await;
+    guard.ctx.notify.notify_one();
 
     // The first close attempt will time out (3s) because the directory is read-only
     // and slatedb's retrying_object_store retries indefinitely. After the timeout,
@@ -3828,10 +3828,10 @@ async fn etcd_shard_close_failure_during_shutdown_keeps_ownership() {
         make_guard_with_factory(&coord, &prefix, shard_id, node_id, factory).await;
 
     // Acquire the shard
-    guard.set_desired(true).await;
+    guard.ctx.set_desired(true).await;
     let acquired = wait_until(Duration::from_secs(5), || async {
-        let st = guard.state.lock().await;
-        st.phase == ShardPhase::Held && st.is_held
+        let st = guard.ctx.state.lock().await;
+        st.phase == ShardPhase::Held && st.has_token()
     })
     .await;
     assert!(acquired, "guard should acquire ownership");
@@ -3846,12 +3846,12 @@ async fn etcd_shard_close_failure_during_shutdown_keeps_ownership() {
 
     // Trigger shutdown
     let _ = tx.send(true);
-    guard.notify.notify_one();
+    guard.ctx.notify.notify_one();
 
     // Wait for the guard to reach ShutDown phase.
     // The close timeout is 3s, plus processing time.
     let shut_down = wait_until(Duration::from_secs(10), || async {
-        let st = guard.state.lock().await;
+        let st = guard.ctx.state.lock().await;
         st.phase == ShardPhase::ShutDown
     })
     .await;

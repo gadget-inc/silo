@@ -244,16 +244,36 @@ impl<T> Default for ShardGuardState<T> {
 }
 
 /// Common context for a shard guard that's shared across backends.
-pub struct ShardGuardContext {
+///
+/// The type parameter `T` is the ownership token type, matching `ShardGuardState<T>`:
+/// - etcd: `()` (held or not)
+/// - k8s: `K8sOwnershipToken` (resourceVersion + optional lease UID)
+pub struct ShardGuardContext<T> {
     pub shard_id: ShardId,
+    pub state: Mutex<ShardGuardState<T>>,
     pub notify: Notify,
     pub shutdown: watch::Receiver<bool>,
 }
 
-impl ShardGuardContext {
+impl<T> ShardGuardContext<T> {
     pub fn new(shard_id: ShardId, shutdown: watch::Receiver<bool>) -> Self {
         Self {
             shard_id,
+            state: Mutex::new(ShardGuardState::new()),
+            notify: Notify::new(),
+            shutdown,
+        }
+    }
+
+    /// Create a context with pre-populated state (e.g., for reclaimed shards).
+    pub fn new_with_state(
+        shard_id: ShardId,
+        shutdown: watch::Receiver<bool>,
+        state: ShardGuardState<T>,
+    ) -> Self {
+        Self {
+            shard_id,
+            state: Mutex::new(state),
             notify: Notify::new(),
             shutdown,
         }
@@ -272,6 +292,60 @@ impl ShardGuardContext {
             _ = shutdown_rx.changed() => {}
         }
     }
+
+    /// Set the desired ownership state for this shard guard.
+    /// No-op if the guard is already shutting down or shut down.
+    pub async fn set_desired(&self, desired: bool) {
+        let mut st = self.state.lock().await;
+        if matches!(st.phase, ShardPhase::ShutDown | ShardPhase::ShuttingDown) {
+            debug!(shard_id = %self.shard_id, desired = desired, phase = %st.phase, "shard: can't change desired state after shut down");
+            return;
+        }
+
+        if st.desired != desired {
+            let prev_desired = st.desired;
+            let prev_phase = st.phase;
+            st.desired = desired;
+            debug!(shard_id = %self.shard_id, prev_desired = prev_desired, desired = desired, phase = %prev_phase, "shard: set_desired");
+            self.notify.notify_one();
+        }
+    }
+
+    /// Trigger shutdown for this specific guard (sets phase to ShuttingDown).
+    pub async fn trigger_shutdown(&self) {
+        let mut st = self.state.lock().await;
+        if !matches!(st.phase, ShardPhase::ShutDown | ShardPhase::ShuttingDown) {
+            debug!(shard_id = %self.shard_id, "trigger_shutdown: transitioning to ShuttingDown");
+            st.phase = ShardPhase::ShuttingDown;
+        }
+    }
+
+    /// Wait for this guard to complete shutdown (phase becomes ShutDown).
+    /// Returns immediately if already shut down.
+    pub async fn wait_shutdown(&self, timeout: Duration) {
+        let poll_interval = Duration::from_millis(10);
+        let max_iterations = (timeout.as_millis() / poll_interval.as_millis()).max(1) as usize;
+
+        for _ in 0..max_iterations {
+            {
+                let st = self.state.lock().await;
+                if st.phase == ShardPhase::ShutDown {
+                    return;
+                }
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+        debug!(shard_id = %self.shard_id, "wait_shutdown: timed out");
+    }
+}
+
+/// Ownership token for the K8s backend.
+///
+/// Contains the resourceVersion (for CAS fencing) and optional lease UID.
+#[derive(Debug, Clone)]
+pub struct K8sOwnershipToken {
+    pub resource_version: String,
+    pub lease_uid: Option<String>,
 }
 
 /// Shared state and helpers for coordinator implementations.
@@ -436,6 +510,57 @@ impl CoordinatorBase {
     pub fn signal_shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
     }
+
+    /// Compute which shards to cancel and which to acquire based on current membership.
+    ///
+    /// Returns `None` if this node is not in the member list (reconciliation should be skipped).
+    /// Both lists are sorted for deterministic ordering.
+    pub async fn compute_reconcile_actions(
+        &self,
+        members: &[MemberInfo],
+        guard_shard_ids: &HashSet<ShardId>,
+    ) -> Option<ReconcileActions> {
+        let member_ids: Vec<String> = members.iter().map(|m| m.node_id.clone()).collect();
+
+        // Safety check: if we don't see ourselves in the member list, our membership may have
+        // expired or there's a connectivity issue. Don't reconcile based on incomplete data.
+        if members.is_empty() {
+            debug!(node_id = %self.node_id, "reconcile: no members found, skipping");
+            return None;
+        }
+        if !member_ids.contains(&self.node_id) {
+            debug!(node_id = %self.node_id, members = ?member_ids, "reconcile: our node not in member list, skipping");
+            return None;
+        }
+
+        let shard_map = self.shard_map.lock().await;
+        let shards: Vec<&crate::shard_range::ShardInfo> = shard_map.shards().iter().collect();
+        let desired = compute_desired_shards_for_node(&shards, &self.node_id, members);
+        drop(shard_map);
+
+        let mut to_cancel: Vec<ShardId> = guard_shard_ids
+            .iter()
+            .filter(|sid| !desired.contains(sid))
+            .copied()
+            .collect();
+        to_cancel.sort_unstable();
+
+        let mut to_acquire: Vec<ShardId> = desired.iter().copied().collect();
+        to_acquire.sort_unstable();
+
+        Some(ReconcileActions {
+            to_cancel,
+            to_acquire,
+        })
+    }
+}
+
+/// Actions computed by `compute_reconcile_actions` for a reconciliation pass.
+pub struct ReconcileActions {
+    /// Shard guards to cancel (set desired=false), sorted.
+    pub to_cancel: Vec<ShardId>,
+    /// Shards to acquire (set desired=true), sorted.
+    pub to_acquire: Vec<ShardId>,
 }
 
 /// Trait for coordination backends.

@@ -195,8 +195,7 @@ pub struct JobStatus {
     /// Present for scheduled jobs (initial or retry), absent for running or terminal jobs.
     pub next_attempt_starts_after_ms: Option<i64>,
     /// The current attempt number for this job's pending task.
-    /// Present when a task exists in the task queue (Scheduled status),
-    /// absent when the job is running (task became a lease) or terminal.
+    /// Present when a task exists in the task queue (Scheduled status), absent when the job is running (task became a lease) or terminal.
     /// Used for O(1) task key reconstruction in expedite operations.
     pub current_attempt: Option<u32>,
 }
@@ -309,7 +308,6 @@ impl JobView {
     }
 
     /// Decode the payload from MessagePack bytes into a serde_json::Value for display.
-    /// This is used by the web UI and SQL query engine for human-readable display.
     pub fn payload_as_json(&self) -> Result<serde_json::Value, rmp_serde::decode::Error> {
         rmp_serde::from_slice(self.payload_bytes())
     }
@@ -326,8 +324,7 @@ impl JobView {
         self.decoded.archived()
     }
 
-    /// Return the job's retry policy as a runtime struct, if present, by copying
-    /// primitive fields from the archived view.
+    /// Return the job's retry policy as a runtime struct, if present, by copying primitive fields from the archived view.
     pub fn retry_policy(&self) -> Option<RetryPolicy> {
         let a = self.archived();
         let pol = a.retry_policy.as_ref()?;

@@ -314,15 +314,6 @@ impl TaskBroker {
         Vec::new()
     }
 
-    /// Try to claim up to `max` ready tasks for a specific task_group. If none, nudge scanner.
-    pub async fn claim_ready_for_task_group_or_nudge(
-        &self,
-        task_group: &str,
-        max: usize,
-    ) -> Vec<BrokerTask> {
-        self.claim_ready_or_nudge(task_group, max).await
-    }
-
     /// Requeue tasks back into the buffer after a failed durable write.
     pub fn requeue(&self, tasks: Vec<BrokerTask>) {
         let mut inflight = self.inflight.lock().unwrap();

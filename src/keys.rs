@@ -7,7 +7,6 @@
 //! - Strings use null-terminated escape encoding (embedded nulls are escaped)
 //! - Integers use big-endian encoding for correct lexicographic ordering
 //! - Tuples encode each field sequentially
-//!
 
 use storekey::{Decode, Encode, decode, encode_vec};
 
@@ -591,8 +590,7 @@ pub fn parse_concurrency_holder_key(key: &[u8]) -> Option<ParsedConcurrencyHolde
 }
 
 /// The KV store key for a job's cancellation flag.
-/// Cancellation is stored separately from status to allow dequeue to blindly write Running
-/// without losing cancellation info.
+/// Cancellation is stored separately from status to allow dequeue to blindly write Running without losing cancellation info.
 pub fn job_cancelled_key(tenant: &str, job_id: &str) -> Vec<u8> {
     encode_with_prefix(
         prefix::JOB_CANCELLED,
@@ -700,9 +698,7 @@ pub fn concurrency_counts_key(tenant: &str, queue: &str) -> Vec<u8> {
 
 /// Create an exclusive end bound for range scanning.
 ///
-/// This computes the lexicographically smallest key that is greater than all keys
-/// starting with the given prefix. This is done by incrementing the prefix as if
-/// it were a big-endian integer, handling carry-over for 0xFF bytes.
+/// This computes the lexicographically smallest key that is greater than all keys starting with the given prefix. This is done by incrementing the prefix as if it were a big-endian integer, handling carry-over for 0xFF bytes.
 ///
 /// Use this with the prefix functions to create a range like `prefix..end_bound(prefix)`.
 ///
