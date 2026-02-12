@@ -692,6 +692,12 @@ pub fn cleanup_completed_at_key() -> Vec<u8> {
     vec![prefix::CLEANUP_COMPLETED_AT]
 }
 
+/// Construct a composite key for in-memory concurrency queue tracking.
+/// Uses storekey encoding for collision-safe (tenant, queue) pairing.
+pub fn concurrency_counts_key(tenant: &str, queue: &str) -> Vec<u8> {
+    encode_vec(&(tenant.to_string(), queue.to_string())).expect("storekey encoding should not fail")
+}
+
 /// Create an exclusive end bound for range scanning.
 ///
 /// This computes the lexicographically smallest key that is greater than all keys
