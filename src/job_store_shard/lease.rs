@@ -170,7 +170,10 @@ impl JobStoreShard {
                 )
                 .await?;
                 // Job reached terminal state - include counter in batch
-                self.increment_completed_jobs_counter_batch(&mut batch);
+                self.increment_completed_jobs_counter(&mut DbWriteBatcher {
+                    db: &self.db,
+                    batch: &mut batch,
+                })?;
                 new_job_status_for_dst = Some("Succeeded".to_string());
             }
             // Worker acknowledges cancellation - set job status to Cancelled
@@ -187,7 +190,10 @@ impl JobStoreShard {
                 )
                 .await?;
                 // Job reached terminal state - include counter in batch
-                self.increment_completed_jobs_counter_batch(&mut batch);
+                self.increment_completed_jobs_counter(&mut DbWriteBatcher {
+                    db: &self.db,
+                    batch: &mut batch,
+                })?;
                 new_job_status_for_dst = Some("Cancelled".to_string());
             }
             // Error: maybe enqueue next attempt; otherwise mark job failed
@@ -271,7 +277,10 @@ impl JobStoreShard {
                         )
                         .await?;
                         // Job reached terminal state (failed permanently) - include counter in batch
-                        self.increment_completed_jobs_counter_batch(&mut batch);
+                        self.increment_completed_jobs_counter(&mut DbWriteBatcher {
+                            db: &self.db,
+                            batch: &mut batch,
+                        })?;
                         new_job_status_for_dst = Some("Failed".to_string());
                     }
                 } else {

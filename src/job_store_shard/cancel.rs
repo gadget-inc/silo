@@ -5,7 +5,7 @@ use slatedb::IsolationLevel;
 use crate::codec::{decode_job_cancellation, encode_job_cancellation, encode_job_status};
 use crate::job::{JobCancellation, JobStatus, JobStatusKind};
 use crate::job_store_shard::helpers::{
-    decode_job_status_owned, now_epoch_ms, retry_on_txn_conflict,
+    TxnWriter, decode_job_status_owned, now_epoch_ms, retry_on_txn_conflict,
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{idx_status_time_key, job_cancelled_key, job_status_key, status_index_timestamp};
@@ -103,14 +103,13 @@ impl JobStoreShard {
             txn.put(&new_time, [])?;
         }
 
+        // Include counter in the transaction (unmark_write excludes it from conflict detection)
+        if was_scheduled {
+            self.increment_completed_jobs_counter(&mut TxnWriter(&txn))?;
+        }
+
         // Commit the transaction - this will detect conflicts with concurrent modifications
         txn.commit().await?;
-
-        // Increment completed jobs counter outside the transaction to avoid conflicts.
-        // TODO(slatedb#1254): Move back inside transaction once SlateDB supports key exclusion.
-        if was_scheduled {
-            self.increment_completed_jobs_counter().await?;
-        }
 
         Ok(())
     }

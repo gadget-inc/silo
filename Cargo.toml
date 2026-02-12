@@ -10,11 +10,7 @@ version = "0.1.0"
 [dependencies]
 clap = { version = "4.3.14", features = ["derive"] }
 futures = "0.3"
-# Use moka cache instead of foyer to avoid slow System::new_all() calls during initialization
-slatedb = { version = "0.10.1", default-features = false, features = [
-    "aws",
-    "moka",
-] }
+slatedb = { git = "https://github.com/slatedb/slatedb.git", branch = "main" }
 object_store = { version = "0.12", features = ["gcp"] }
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
 serde = { version = "1.0", features = ["derive"] }

@@ -245,6 +245,12 @@ impl JobStoreShard {
                 .await?;
         }
 
+        // Include counters in the transaction (unmark_write excludes them from conflict detection)
+        self.increment_total_jobs_counter(&mut writer)?;
+        if is_terminal {
+            self.increment_completed_jobs_counter(&mut writer)?;
+        }
+
         let write_op = if !is_terminal {
             let op = dst_events::next_write_op();
             dst_events::emit_pending(
@@ -273,12 +279,6 @@ impl JobStoreShard {
         }
         if let Some(op) = write_op {
             dst_events::confirm_write(op);
-        }
-
-        // Counters outside transaction to avoid conflicts
-        self.increment_total_jobs_counter().await?;
-        if is_terminal {
-            self.increment_completed_jobs_counter().await?;
         }
 
         // For non-terminal, finish enqueue (flush + broker wakeup)
