@@ -29,9 +29,11 @@ fn unique_prefix() -> String {
     format!("test-cluster-query-{}", Uuid::new_v4())
 }
 
-/// Create a test shard factory with memory backend
-fn make_test_factory(node_id: &str) -> Arc<ShardFactory> {
-    let tmpdir = std::env::temp_dir().join(format!("silo-cluster-query-test-{}", node_id));
+/// Create a test shard factory with memory backend.
+/// Uses a unique prefix to avoid path collisions between parallel tests.
+fn make_test_factory(prefix: &str, node_id: &str) -> Arc<ShardFactory> {
+    let tmpdir =
+        std::env::temp_dir().join(format!("silo-cluster-query-test-{}-{}", prefix, node_id));
     Arc::new(ShardFactory::new(
         DatabaseTemplate {
             backend: Backend::Memory,
@@ -177,8 +179,8 @@ async fn cluster_two_nodes_basic_query() {
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load config");
 
-    let factory1 = make_test_factory("query-n1");
-    let factory2 = make_test_factory("query-n2");
+    let factory1 = make_test_factory(&prefix, "n1");
+    let factory2 = make_test_factory(&prefix, "n2");
 
     // Bind listeners first to get available ports
     let listener1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -303,8 +305,8 @@ async fn cluster_two_nodes_status_filter_query() {
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load config");
 
-    let factory1 = make_test_factory("status-n1");
-    let factory2 = make_test_factory("status-n2");
+    let factory1 = make_test_factory(&prefix, "n1");
+    let factory2 = make_test_factory(&prefix, "n2");
 
     // Bind listeners first to get available ports
     let listener1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -428,8 +430,8 @@ async fn cluster_two_nodes_count_across_shards() {
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load config");
 
-    let factory1 = make_test_factory("groupby-n1");
-    let factory2 = make_test_factory("groupby-n2");
+    let factory1 = make_test_factory(&prefix, "n1");
+    let factory2 = make_test_factory(&prefix, "n2");
 
     // Bind listeners first to get available ports
     let listener1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -551,8 +553,8 @@ async fn cluster_two_nodes_queues_table() {
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load config");
 
-    let factory1 = make_test_factory("queues-n1");
-    let factory2 = make_test_factory("queues-n2");
+    let factory1 = make_test_factory(&prefix, "n1");
+    let factory2 = make_test_factory(&prefix, "n2");
 
     // Bind listeners first to get available ports
     let listener1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -650,8 +652,8 @@ async fn cluster_two_nodes_projection_remote_shards() {
     let prefix = unique_prefix();
     let cfg = silo::settings::AppConfig::load(None).expect("load config");
 
-    let factory1 = make_test_factory("proj-n1");
-    let factory2 = make_test_factory("proj-n2");
+    let factory1 = make_test_factory(&prefix, "n1");
+    let factory2 = make_test_factory(&prefix, "n2");
 
     // Bind listeners first to get available ports
     let listener1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
