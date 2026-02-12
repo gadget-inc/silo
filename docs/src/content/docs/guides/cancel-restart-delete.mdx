@@ -84,25 +84,39 @@ Once a job is cancelled, it stays cancelled. Attempting to cancel an already-can
 
 ### How Workers Discover Cancellation
 
-When a job is running, workers discover cancellation through the heartbeat mechanism:
+The `SiloWorker` handles heartbeats automatically. When a job is cancelled, the worker detects it on the next heartbeat and aborts the `cancellationSignal` passed to your handler. Your handler should check this signal and stop work:
 
 ```typescript
-// Worker code - heartbeat returns cancellation status
-const heartbeat = await client.heartbeat(workerId, taskId, shard, tenant);
+const worker = new SiloWorker({
+  client,
+  workerId: "worker-1",
+  taskGroup: "data-processing",
+  handler: async (ctx) => {
+    for (const item of ctx.task.payload.items) {
+      // Check for cancellation between units of work
+      if (ctx.cancellationSignal.aborted) {
+        return { type: "cancelled" };
+      }
+      await processItem(item);
+    }
+    return { type: "success", result: { processed: true } };
+  }
+});
+```
 
-if (heartbeat.cancelled) {
-  console.log(`Job was cancelled at ${heartbeat.cancelledAtMs}`);
-  // Stop work and report cancelled outcome
-  await client.reportOutcome({
-    taskId,
-    shard,
-    outcome: { type: "cancelled" }
+You can also pass the signal to APIs that accept `AbortSignal`:
+
+```typescript
+handler: async (ctx) => {
+  const response = await fetch(ctx.task.payload.url, {
+    signal: ctx.cancellationSignal
   });
+  // ...
 }
 ```
 
 <Aside type="caution" title="Workers must cooperate">
-Cancellation in Silo is cooperative. Silo notifies workers that a job should stop, but workers must check for cancellation and stop their own work. Long-running workers should heartbeat regularly to detect cancellations promptly.
+Cancellation in Silo is cooperative. The worker notifies your handler via the cancellation signal, but the handler must check the signal and stop its own work. Configure `heartbeatIntervalMs` on the worker (default 5 seconds) to control how quickly cancellations are detected.
 </Aside>
 
 ## Deleting Jobs
