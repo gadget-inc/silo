@@ -4,15 +4,12 @@ title: Silo
 
 Silo is a background job queueing system built on top of object storage via [slatedb](https://slatedb.io)
 
-Status: working prototype
-
 ### Features
 
-- high throughput, durable job brokering server with no data loss on node crashes (permanent shard leases protect unflushed WAL data)
+- high throughput, durable job brokering server with no data loss crashes or scaling events
 - low cost at scale by using object storage as the source of truth
 - high-cardinality, cheap multitenancy built in
-- **task groups** for routing jobs to specialized worker pools and isolating workloads
-- future scheduling
+- rich support for retries, future scheduling, expediting future attempts, priority, and more
 - concurrency limits for limiting throughput of various jobs (with high cardinality and limit change support)
 - compute/storage separation for elastic compute scaling
 - tracks job results so jobs can return stuff to the enqueuing process

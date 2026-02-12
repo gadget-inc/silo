@@ -10,8 +10,9 @@ Silo exposes Prometheus metrics for monitoring system health, performance, and c
 Silo exposes metrics in Prometheus format on a separate HTTP port. Configure the address in your configuration file:
 
 ```toml
-[server]
-metrics_addr = "0.0.0.0:9090"
+[metrics]
+enabled = true
+addr = "0.0.0.0:9090"
 ```
 
 Metrics are available at the `/metrics` endpoint:
@@ -171,12 +172,10 @@ SlateDB periodically compacts SST files to reclaim space and improve read perfor
 
 ## Tracing
 
-Silo supports OpenTelemetry tracing. Configure the OTLP endpoint in your configuration:
+Silo supports OpenTelemetry tracing via the `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable. When set, Silo exports traces using the OTLP protocol:
 
-```toml
-[tracing]
-otlp_endpoint = "http://localhost:4317"
-service_name = "silo"
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 silo -c config.toml
 ```
 
 Key spans include:
@@ -187,11 +186,18 @@ Key spans include:
 
 ## Logging
 
-Silo uses structured logging via `tracing`. Configure the log level:
+Silo uses structured logging via `tracing`. Configure the log output format in your configuration file:
 
 ```toml
-[server]
-log_level = "info"  # trace, debug, info, warn, error
+[logging]
+format = "json"  # "text" (default, human-readable) or "json" (structured)
+```
+
+Control log verbosity with the `RUST_LOG` environment variable:
+
+```bash
+RUST_LOG=info silo -c config.toml              # General info level
+RUST_LOG=silo::coordination=trace silo -c config.toml  # Trace a specific module
 ```
 
 Key log events to monitor:

@@ -25,11 +25,25 @@ export default defineConfig({
 				},
 				{
 					label: 'Guides',
-					autogenerate: { directory: 'guides' },
+					items: [
+						{ slug: 'guides/enqueueing' },
+						{ slug: 'guides/running-workers' },
+						{ slug: 'guides/cancel-restart-delete' },
+						{ slug: 'guides/concurrency-limits' },
+						{ slug: 'guides/querying' },
+						{ slug: 'guides/deployment' },
+						{ slug: 'guides/observability' },
+						{ slug: 'guides/silo-vs-temporal' },
+						{ slug: 'guides/internals' },
+					],
 				},
 				{
 					label: 'Reference',
-					autogenerate: { directory: 'reference' },
+					items: [
+						{ slug: 'reference/server-configuration' },
+						{ slug: 'reference/rpc-reference' },
+						{ slug: 'reference/siloctl' },
+					],
 				},
 			],
 		}),
