@@ -248,62 +248,29 @@ impl ShardFactory {
         template_path: &str,
         shard_name: &str,
     ) -> Result<(crate::storage::ResolvedStore, String), JobStoreShardError> {
-        use crate::settings::Backend;
+        if backend.is_local_fs() {
+            // Local filesystem backends: resolve at the storage root so that
+            // cloned databases can correctly resolve their relative parent SST paths.
+            let pos = Self::validate_template_path(template_path)?;
 
-        match backend {
-            Backend::Fs => {
-                // Validate and get placeholder position
-                let pos = Self::validate_template_path(template_path)?;
+            let root = &template_path[..pos];
+            let root_trimmed = root.trim_end_matches('/');
+            let root_path = if root_trimmed.is_empty() {
+                "/"
+            } else {
+                root_trimmed
+            };
 
-                // Extract root path from template (everything before the placeholder)
-                let root = &template_path[..pos];
-                let root_trimmed = root.trim_end_matches('/');
-                let root_path = if root_trimmed.is_empty() {
-                    "/"
-                } else {
-                    root_trimmed
-                };
-
-                let resolved = resolve_object_store(backend, root_path)?;
-                // For Fs, db_path is the shard name (relative to root)
-                Ok((resolved, shard_name.to_string()))
-            }
-            Backend::Memory => {
-                // Memory backend: use full path with placeholder replaced
-                let full_path = template_path
-                    .replace("%shard%", shard_name)
-                    .replace("{shard}", shard_name);
-                let resolved = resolve_object_store(backend, &full_path)?;
-                let db_path = resolved.canonical_path.clone();
-                Ok((resolved, db_path))
-            }
-            Backend::S3 | Backend::Gcs | Backend::Url => {
-                // Cloud backends: resolve full URL, canonical_path is the db_path
-                let full_path = template_path
-                    .replace("%shard%", shard_name)
-                    .replace("{shard}", shard_name);
-                let resolved = resolve_object_store(backend, &full_path)?;
-                let db_path = resolved.canonical_path.clone();
-                Ok((resolved, db_path))
-            }
-            #[cfg(feature = "dst")]
-            Backend::TurmoilFs => {
-                // TurmoilFs backend: same as Fs but uses turmoil's simulated filesystem
-                // Validate and get placeholder position
-                let pos = Self::validate_template_path(template_path)?;
-
-                let root = &template_path[..pos];
-                let root_trimmed = root.trim_end_matches('/');
-                let root_path = if root_trimmed.is_empty() {
-                    "/"
-                } else {
-                    root_trimmed
-                };
-
-                let resolved = resolve_object_store(backend, root_path)?;
-                // For TurmoilFs, db_path is the shard name (relative to root)
-                Ok((resolved, shard_name.to_string()))
-            }
+            let resolved = resolve_object_store(backend, root_path)?;
+            Ok((resolved, shard_name.to_string()))
+        } else {
+            // Object store backends (Memory, S3, GCS, URL): resolve full path
+            let full_path = template_path
+                .replace("%shard%", shard_name)
+                .replace("{shard}", shard_name);
+            let resolved = resolve_object_store(backend, &full_path)?;
+            let db_path = resolved.canonical_path.clone();
+            Ok((resolved, db_path))
         }
     }
 
@@ -406,68 +373,45 @@ impl ShardFactory {
     /// Delete all data for a shard from storage.
     /// Uses the same path resolution as opening to ensure we delete the correct directory.
     async fn delete_shard_data(&self, shard_name: &str) -> Result<(), JobStoreShardError> {
-        use crate::settings::Backend;
+        if self.template.backend.is_local_fs() {
+            let data_path = self.get_shard_data_path(shard_name)?;
+            let path_str = data_path.to_string_lossy();
 
-        match &self.template.backend {
-            Backend::Fs => {
-                // Use unified path resolution to get the correct data path
-                let data_path = self.get_shard_data_path(shard_name)?;
-                let path_str = data_path.to_string_lossy();
+            if let Err(e) = tokio::fs::remove_dir_all(&data_path).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(shard_name = %shard_name, path = %path_str, error = %e, "failed to delete shard data directory");
+                }
+            } else {
+                tracing::info!(shard_name = %shard_name, path = %path_str, "deleted shard data directory");
+            }
+        } else {
+            // For object store backends, use the object store API to delete all objects
+            let (resolved, db_path) =
+                Self::resolve_at_root(&self.template.backend, &self.template.path, shard_name)?;
 
-                if let Err(e) = tokio::fs::remove_dir_all(&data_path).await {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!(shard_name = %shard_name, path = %path_str, error = %e, "failed to delete shard data directory");
-                    }
-                } else {
-                    tracing::info!(shard_name = %shard_name, path = %path_str, "deleted shard data directory");
+            // List and delete all objects under the shard's path
+            let prefix = ObjectPath::from(db_path.as_str());
+            let objects: Vec<_> = resolved
+                .store
+                .list(Some(&prefix))
+                .try_collect()
+                .await
+                .map_err(|e| {
+                    JobStoreShardError::Rkyv(format!("failed to list objects for deletion: {}", e))
+                })?;
+
+            let count = objects.len();
+            for obj in objects {
+                if let Err(e) = resolved.store.delete(&obj.location).await {
+                    tracing::warn!(
+                        shard_name = %shard_name,
+                        path = %obj.location,
+                        error = %e,
+                        "failed to delete object"
+                    );
                 }
             }
-            #[cfg(feature = "dst")]
-            Backend::TurmoilFs => {
-                // Use unified path resolution to get the correct data path
-                let data_path = self.get_shard_data_path(shard_name)?;
-                let path_str = data_path.to_string_lossy();
-
-                if let Err(e) = tokio::fs::remove_dir_all(&data_path).await {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!(shard_name = %shard_name, path = %path_str, error = %e, "failed to delete shard data directory");
-                    }
-                } else {
-                    tracing::info!(shard_name = %shard_name, path = %path_str, "deleted shard data directory");
-                }
-            }
-            Backend::Memory | Backend::S3 | Backend::Gcs | Backend::Url => {
-                // For object store backends, use the object store API to delete all objects
-                let (resolved, db_path) =
-                    Self::resolve_at_root(&self.template.backend, &self.template.path, shard_name)?;
-
-                // List and delete all objects under the shard's path
-                let prefix = ObjectPath::from(db_path.as_str());
-                let objects: Vec<_> = resolved
-                    .store
-                    .list(Some(&prefix))
-                    .try_collect()
-                    .await
-                    .map_err(|e| {
-                        JobStoreShardError::Rkyv(format!(
-                            "failed to list objects for deletion: {}",
-                            e
-                        ))
-                    })?;
-
-                let count = objects.len();
-                for obj in objects {
-                    if let Err(e) = resolved.store.delete(&obj.location).await {
-                        tracing::warn!(
-                            shard_name = %shard_name,
-                            path = %obj.location,
-                            error = %e,
-                            "failed to delete object"
-                        );
-                    }
-                }
-                tracing::info!(shard_name = %shard_name, objects_deleted = count, "deleted shard data from object store");
-            }
+            tracing::info!(shard_name = %shard_name, objects_deleted = count, "deleted shard data from object store");
         }
 
         Ok(())
@@ -613,89 +557,38 @@ impl ShardFactory {
             "created checkpoint for shard cloning"
         );
 
-        // For cloning to work, both parent and child must be accessible from the same  object store. We extract the common root from the template and create relative paths for both.
-        //
-        // Template path example: "/tmp/silo-data/%shard%"
-        // Parent full path: "/tmp/silo-data/parent-uuid"
-        // Child full path:  "/tmp/silo-data/child-uuid"
-        // Common root: "/tmp/silo-data"
-        // Parent relative: "parent-uuid"
-        // Child relative: "child-uuid"
-
-        // Find the placeholder in the template path
-        let placeholder_pos = self
-            .template
-            .path
-            .find("%shard%")
-            .or_else(|| self.template.path.find("{shard}"));
-
-        let pos = placeholder_pos.ok_or_else(|| {
-            ShardFactoryError::CloneError(format!(
-                "database template path must contain a shard placeholder (%shard% or {{shard}}), got: {}",
-                self.template.path
-            ))
-        })?;
-
-        // Validate that the placeholder is at a path boundary (preceded by / or at start of path). This ensures that when we split the template into root + relative paths for cloning, the relative path will be the shard ID as a subdirectory, not concatenated with a prefix.
-        // e.g., "/data/%shard%" is valid (root="/data", relative="<uuid>")
-        //       "/data/shard-%shard%" is INVALID - would create path mismatch during clone
-        if pos > 0 {
-            let char_before = self.template.path.chars().nth(pos - 1);
-            if char_before != Some('/') {
-                return Err(ShardFactoryError::CloneError(format!(
-                    "shard placeholder in database template path must be preceded by '/' for cloning to work correctly. \
-                     Got: '{}'. Change to something like '/data/%shard%' where the shard ID is a directory name.",
-                    self.template.path
-                )));
-            }
-        }
-
-        // Extract the root path (everything before the placeholder)
-        let root = &self.template.path[..pos];
-        // Trim trailing slashes but keep at least one character
-        let root_trimmed = root.trim_end_matches('/');
-        let root_path = if root_trimmed.is_empty() {
-            "/".to_string()
-        } else {
-            root_trimmed.to_string()
-        };
-        let parent_relative = parent_name.clone();
-        let child_relative = child_name.clone();
-
-        // Resolve the object store at the common root
-        let resolved = resolve_object_store(&self.template.backend, &root_path).map_err(|e| {
-            ShardFactoryError::CloneError(format!("failed to resolve storage root: {}", e))
-        })?;
+        // For cloning to work, both parent and child must be accessible from the
+        // same object store. resolve_at_root gives us the store at the storage root
+        // level, and each shard name is a relative path under that root.
+        let (resolved, _) =
+            Self::resolve_at_root(&self.template.backend, &self.template.path, &parent_name)?;
 
         tracing::debug!(
-            root_path = %root_path,
             canonical_root = %resolved.canonical_path,
-            parent_relative = %parent_relative,
-            child_relative = %child_relative,
+            parent = %parent_name,
+            child = %child_name,
             "preparing to clone shard database"
         );
 
         // Create an Admin for the child path (relative to the root) and clone from parent
         let admin =
-            slatedb::admin::Admin::builder(child_relative.as_str(), Arc::clone(&resolved.store))
+            slatedb::admin::Admin::builder(child_name.as_str(), Arc::clone(&resolved.store))
                 .build();
 
         admin
-            .create_clone(parent_relative.as_str(), Some(checkpoint.id))
+            .create_clone(parent_name.as_str(), Some(checkpoint.id))
             .await
             .map_err(|e| {
                 ShardFactoryError::CloneError(format!(
                     "failed to clone database: {} (root={}, parent={}, child={})",
-                    e, resolved.canonical_path, parent_relative, child_relative
+                    e, resolved.canonical_path, parent_name, child_name
                 ))
             })?;
 
         tracing::info!(
             parent_shard_id = %parent_id,
             child_shard_id = %child_id,
-            root_path = %root_path,
-            parent_relative = %parent_relative,
-            child_relative = %child_relative,
+            canonical_root = %resolved.canonical_path,
             "cloned shard database"
         );
 
