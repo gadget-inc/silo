@@ -159,7 +159,11 @@ pub async fn create_silo_client(
         let connect_result = tokio::time::timeout(attempt_timeout, endpoint.connect()).await;
 
         match connect_result {
-            Ok(Ok(channel)) => return Ok(SiloClient::new(channel)),
+            Ok(Ok(channel)) => {
+                return Ok(SiloClient::new(channel)
+                    .max_decoding_message_size(128 * 1024 * 1024)
+                    .max_encoding_message_size(128 * 1024 * 1024))
+            }
             Ok(Err(e)) => {
                 trace!(
                     attempt = attempt,

@@ -869,6 +869,8 @@ export class SiloGRPCClient {
       "grpc.keepalive_time_ms": 5_000,
       "grpc.keepalive_timeout_ms": 1_000,
       "grpc.keepalive_permit_without_calls": 1,
+      "grpc.max_send_message_length": 128 * 1024 * 1024,
+      "grpc.max_receive_message_length": 128 * 1024 * 1024,
       "grpc.service_config": JSON.stringify(defaultServiceConfig),
       // Enable retries (required for service config retry policy)
       "grpc.enable_retries": 1,

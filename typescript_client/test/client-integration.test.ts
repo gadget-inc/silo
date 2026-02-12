@@ -1024,6 +1024,41 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
     });
   });
 
+  describe("large payloads", () => {
+    it(
+      "enqueues and retrieves a 100MB payload",
+      { timeout: 60_000 },
+      async () => {
+        const tenant = "large-payload-tenant";
+
+        // Build a ~100MB payload using a raw Buffer.
+        // msgpack encodes Buffers as binary data without base64 expansion,
+        // so the wire size stays close to 100MB.
+        const sizeBytes = 100 * 1024 * 1024;
+        const largeBuffer = Buffer.alloc(sizeBytes, 0x42);
+        const payload = { data: largeBuffer };
+
+        const handle = await client.enqueue({
+          tenant,
+          taskGroup: DEFAULT_TASK_GROUP,
+          payload,
+          priority: 50,
+        });
+
+        expect(handle.id).toBeTruthy();
+
+        // Retrieve the job and verify the payload round-trips correctly
+        const job = await client.getJob(handle.id, tenant);
+        expect(job).toBeDefined();
+        expect(job?.id).toBe(handle.id);
+
+        const retrieved = job?.payload as { data: Uint8Array };
+        expect(retrieved.data.length).toBe(sizeBytes);
+        expect(Buffer.from(retrieved.data).equals(largeBuffer)).toBe(true);
+      }
+    );
+  });
+
   describe("floating concurrency limits", () => {
     const tenant = `floating-test-${Date.now()}`;
 
