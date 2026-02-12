@@ -8,14 +8,14 @@ outputs: {}
 runs:
   using: "composite"
   steps:
-    - uses: nixbuild/nix-quick-install-action@v30
+    - uses: nixbuild/nix-quick-install-action@v34
     - name: Cachix setup
       uses: cachix/cachix-action@v16
       with:
         name: silo
         authToken: "${{ inputs.cachix_auth_token }}"
     - name: Restore and save Nix store
-      uses: nix-community/cache-nix-action@v6
+      uses: nix-community/cache-nix-action@v7
       with:
         # Include Cargo.lock since Nix builds depend on Rust dependencies
         # Include runner.arch to separate x86 and ARM64 caches (they have different store paths)
@@ -24,8 +24,6 @@ runs:
         restore-prefixes-first-match: nix-v2-${{ runner.os }}-${{ runner.arch }}-
         # Garbage collect to keep cache size manageable
         gc-max-store-size-linux: 4294967296
-        # Save cache even if job fails (to cache partial builds)
-        save-always: true
     - run: |
         set -eo pipefail
 
