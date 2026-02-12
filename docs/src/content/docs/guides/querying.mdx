@@ -1,0 +1,324 @@
+---
+title: Querying Jobs
+description: Using SQL to inspect and debug jobs in Silo
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Silo includes a built-in SQL query engine powered by [Apache DataFusion](https://datafusion.apache.org/). You can run SQL queries to inspect jobs, monitor queue health, and debug issues — from the TypeScript client, the `siloctl` CLI, or the web UI.
+
+## Running Queries
+
+### From the TypeScript Client
+
+```typescript
+const result = await client.query(
+  "SELECT id, status_kind, priority FROM jobs WHERE tenant = 'customer-123' LIMIT 10",
+  "customer-123"  // tenant for shard routing
+);
+
+for (const row of result.rows) {
+  console.log(row);
+}
+```
+
+The second argument is the tenant used for routing the query to the correct shard. If you're not using multi-tenancy, you can omit it.
+
+### From siloctl
+
+```bash
+# Query a specific shard
+siloctl query <shard-id> "SELECT id, status_kind FROM jobs LIMIT 10"
+
+# With a tenant
+siloctl -t customer-123 query <shard-id> "SELECT id, status_kind FROM jobs WHERE tenant = 'customer-123'"
+
+# JSON output for scripting
+siloctl --json query <shard-id> "SELECT id, status_kind FROM jobs WHERE status_kind = 'Failed'"
+```
+
+<Aside type="tip" title="Finding shard IDs">
+Use `siloctl cluster info` to see all shards and their owners. If you know the tenant, the client's `getShardForTenant()` method returns the shard ID.
+</Aside>
+
+## Tables
+
+Silo exposes two tables: `jobs` and `queues`.
+
+### `jobs` Table
+
+The primary table containing all job data.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `shard_id` | String | UUID of the shard storing this job |
+| `tenant` | String | Tenant identifier |
+| `id` | String | Job ID |
+| `priority` | UInt8 | Priority (0 = highest, 99 = lowest) |
+| `enqueue_time_ms` | Int64 | Unix timestamp in milliseconds when the job was enqueued |
+| `payload` | String (nullable) | JSON-encoded job payload |
+| `status_kind` | String (nullable) | Current job status (see [Status Values](#status-values)) |
+| `status_changed_at_ms` | Int64 (nullable) | Unix timestamp in milliseconds of last status change |
+| `task_group` | String | Task group the job belongs to |
+| `metadata` | Map&lt;String, String&gt; (nullable) | Key-value metadata attached to the job |
+
+### `queues` Table
+
+Shows the current state of concurrency queues — which jobs hold concurrency tickets and which are waiting.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `shard_id` | String | UUID of the shard |
+| `tenant` | String | Tenant identifier |
+| `queue_name` | String | Name of the concurrency queue (the limit key) |
+| `entry_type` | String | `"holder"` (has a ticket) or `"requester"` (waiting for one) |
+| `task_id` | String | Task or request ID |
+| `job_id` | String (nullable) | Job ID (present for requesters) |
+| `priority` | UInt8 (nullable) | Job priority (present for requesters) |
+| `timestamp_ms` | Int64 | When the ticket was granted or the request was made |
+
+## Status Values
+
+The `status_kind` column has the following values:
+
+| Status | Meaning |
+|--------|---------|
+| `Waiting` | Ready to run — the job's start time has arrived and it's in the task queue |
+| `Scheduled` | Scheduled for the future — the job's start time hasn't arrived yet, or it's waiting for a retry backoff |
+| `Running` | Currently being processed by a worker |
+| `Succeeded` | Completed successfully |
+| `Failed` | Failed after exhausting all retries |
+| `Cancelled` | Cancelled by the user |
+
+<Aside type="note" title="Waiting vs Scheduled">
+Both `Waiting` and `Scheduled` are derived from the same internal status. The difference is timing: `Waiting` means the job's `start_time` is at or before now (it's ready to run), while `Scheduled` means `start_time` is in the future (it's not ready yet). A job that's mid-retry-backoff shows as `Scheduled` because its next attempt is scheduled for the future.
+</Aside>
+
+## Example Queries
+
+### Listing Jobs
+
+```sql
+-- All jobs for a tenant
+SELECT id, status_kind, priority, task_group
+FROM jobs
+WHERE tenant = 'customer-123'
+ORDER BY enqueue_time_ms DESC
+LIMIT 50
+
+-- Jobs in a specific task group
+SELECT id, status_kind, enqueue_time_ms
+FROM jobs
+WHERE tenant = 'customer-123' AND task_group = 'emails'
+ORDER BY enqueue_time_ms DESC
+```
+
+### Filtering by Status
+
+```sql
+-- All currently running jobs
+SELECT id, task_group, priority
+FROM jobs
+WHERE tenant = 'customer-123' AND status_kind = 'Running'
+
+-- Failed jobs
+SELECT id, task_group, status_changed_at_ms
+FROM jobs
+WHERE tenant = 'customer-123' AND status_kind = 'Failed'
+ORDER BY status_changed_at_ms DESC
+
+-- Jobs waiting to be picked up
+SELECT id, priority, task_group
+FROM jobs
+WHERE tenant = 'customer-123' AND status_kind = 'Waiting'
+ORDER BY priority ASC
+
+-- Future-scheduled jobs (including retry backoffs)
+SELECT id, task_group
+FROM jobs
+WHERE tenant = 'customer-123' AND status_kind = 'Scheduled'
+```
+
+### Aggregations
+
+```sql
+-- Count jobs by status
+SELECT status_kind, COUNT(*) as count
+FROM jobs
+WHERE tenant = 'customer-123'
+GROUP BY status_kind
+
+-- Count by task group and status
+SELECT task_group, status_kind, COUNT(*) as count
+FROM jobs
+WHERE tenant = 'customer-123'
+GROUP BY task_group, status_kind
+ORDER BY task_group, status_kind
+
+-- Average priority by task group
+SELECT task_group, AVG(CAST(priority AS DOUBLE)) as avg_priority
+FROM jobs
+WHERE tenant = 'customer-123'
+GROUP BY task_group
+```
+
+### Querying Metadata
+
+Jobs can have arbitrary key-value metadata. Querying metadata uses DataFusion's map functions.
+
+**Exact match** — find jobs where a metadata key equals a specific value:
+
+```sql
+SELECT id, status_kind
+FROM jobs
+WHERE tenant = 'customer-123'
+  AND array_contains(element_at(metadata, 'env'), 'production')
+```
+
+**Prefix match** — find jobs where a metadata value starts with a prefix:
+
+```sql
+SELECT id, status_kind
+FROM jobs
+WHERE tenant = 'customer-123'
+  AND starts_with(array_any_value(element_at(metadata, 'region')), 'us-')
+```
+
+You can also use `LIKE` for prefix matching:
+
+```sql
+SELECT id, status_kind
+FROM jobs
+WHERE tenant = 'customer-123'
+  AND array_any_value(element_at(metadata, 'region')) LIKE 'us-%'
+```
+
+**Combining metadata filters with status:**
+
+```sql
+SELECT id, status_kind, priority
+FROM jobs
+WHERE tenant = 'customer-123'
+  AND array_contains(element_at(metadata, 'env'), 'production')
+  AND status_kind = 'Running'
+```
+
+<Aside type="tip" title="Why array_contains?">
+The `metadata` column is a Map type. `element_at(metadata, 'key')` returns a list (since maps can theoretically have duplicate keys), so you use `array_contains()` to check for a value in the list, or `array_any_value()` to unwrap it to a scalar for comparisons and `LIKE`.
+</Aside>
+
+### Inspecting Concurrency Queues
+
+```sql
+-- See all holders and requesters for a queue
+SELECT queue_name, entry_type, task_id, job_id, timestamp_ms
+FROM queues
+WHERE tenant = 'customer-123' AND queue_name = 'user:456'
+
+-- Count holders vs requesters per queue
+SELECT queue_name, entry_type, COUNT(*) as count
+FROM queues
+WHERE tenant = 'customer-123'
+GROUP BY queue_name, entry_type
+
+-- Find queues with waiting requesters (indicates jobs are blocked on concurrency)
+SELECT queue_name, COUNT(*) as waiting
+FROM queues
+WHERE tenant = 'customer-123' AND entry_type = 'requester'
+GROUP BY queue_name
+ORDER BY waiting DESC
+```
+
+### Looking Up a Specific Job
+
+```sql
+-- Get full details for a job by ID
+SELECT *
+FROM jobs
+WHERE tenant = 'customer-123' AND id = 'job-abc-123'
+```
+
+## Writing Performant Queries
+
+Silo uses predicate pushdown to select the most efficient scan strategy based on your `WHERE` clause. Understanding how this works helps you write fast queries.
+
+### Always filter by tenant
+
+When multi-tenancy is enabled, **always include a `WHERE tenant = '...'` condition**. Without it, Silo must scan all tenants on the shard, which is much slower.
+
+```sql
+-- Fast: scans only one tenant's data
+SELECT id FROM jobs WHERE tenant = 'customer-123' AND status_kind = 'Running'
+
+-- Slow: scans all tenants on the shard
+SELECT id FROM jobs WHERE status_kind = 'Running'
+```
+
+### Scan strategy priority
+
+Silo picks the best scan strategy from your filters in this priority order:
+
+1. **Exact ID lookup** — `WHERE id = '...'` — direct key lookup, fastest
+2. **Metadata exact match** — `WHERE array_contains(element_at(metadata, 'key'), 'value')` — uses the metadata index
+3. **Metadata prefix** — `WHERE starts_with(array_any_value(element_at(metadata, 'key')), 'prefix')` — uses the metadata index with prefix scan
+4. **Status filter** — `WHERE status_kind = '...'` — uses the status/time index
+5. **Full scan** — no indexed filter — scans all jobs for the tenant
+
+Only one index-backed filter is used per query. If you combine filters (e.g., status + metadata), the highest-priority one drives the scan and the rest are applied as post-filters.
+
+```sql
+-- Uses ExactId scan (priority 1), even though status filter is also present
+SELECT * FROM jobs WHERE tenant = 'customer-123' AND id = 'job-abc' AND status_kind = 'Running'
+
+-- Uses MetadataExact scan (priority 2)
+SELECT * FROM jobs WHERE tenant = 'customer-123' AND array_contains(element_at(metadata, 'env'), 'prod')
+
+-- Uses Status scan (priority 4)
+SELECT * FROM jobs WHERE tenant = 'customer-123' AND status_kind = 'Failed'
+```
+
+### Use LIMIT
+
+Always add `LIMIT` to exploratory queries. Without it, Silo will scan and return all matching rows.
+
+```sql
+-- Good: bounded result set
+SELECT id, status_kind FROM jobs WHERE tenant = 'customer-123' LIMIT 100
+
+-- Risky with large tenants: returns everything
+SELECT id, status_kind FROM jobs WHERE tenant = 'customer-123'
+```
+
+### Cross-shard queries
+
+The TypeScript client routes queries to a single shard based on the tenant. If you need to query across all shards (e.g., for cluster-wide aggregations), use `siloctl` to query each shard, or use the cluster query engine if available.
+
+```bash
+# Query each shard separately
+siloctl query <shard-0> "SELECT COUNT(*) as count FROM jobs"
+siloctl query <shard-1> "SELECT COUNT(*) as count FROM jobs"
+```
+
+## Supported SQL
+
+Silo's query engine supports standard SQL via Apache DataFusion:
+
+- `SELECT` with column projection and `*`
+- `WHERE` with `AND`, `OR`, comparisons (`=`, `!=`, `>`, `<`, `>=`, `<=`), `LIKE`, `IN`
+- `ORDER BY` (single or multiple columns, `ASC`/`DESC`)
+- `LIMIT` and `OFFSET`
+- `GROUP BY` with aggregate functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`)
+- `CAST` for type conversions
+- `CASE` expressions
+- Arithmetic expressions
+- Map functions: `element_at()`, `array_contains()`, `array_any_value()`, `starts_with()`
+
+<Aside type="caution" title="Read-only">
+Queries are read-only. You cannot use `INSERT`, `UPDATE`, `DELETE`, or any other data-modifying SQL. To modify jobs, use the client API or siloctl commands.
+</Aside>
+
+## Next Steps
+
+- Use [siloctl](/reference/siloctl) for command-line query access and common workflows
+- Set up [observability](/guides/observability) for continuous monitoring alongside ad-hoc queries
+- Learn about [concurrency limits](/guides/concurrency-limits) to understand the `queues` table

@@ -11,28 +11,37 @@ Your worker instances will poll the Silo server for new tasks to run, run them l
 
 If you want to run multiple Silo instances in a cluster to spread out your load, you must also configure a cluster membership system for Silo. Currently, etcd and Kubernetes API based cluster membership providers are available.
 
+## Shard count
+
+The number of shards in a cluster determines both the maximum supported throughput, as well as the object storage operation cost overhead. More shards means more independent writers and thus more throughput, but also more object storage operations for uplpoading individual segments of the database and compacting. Generally, you should aim for a max of 1000 RPS per shard.
+
+The shard count for a Silo cluster is variable over time -- you can split shards as your cluster grows. Shard merging is not supported at this time.
+
+### Tenants need to be small enough to fit in one shard and not create hotspots
+
+All data for a given tenant is stored in a single shard. This means that the tenant's throughput must be able to be handled by the single node serving that shard. We've observed maximum shard throughputs of about 4000 RPS per shard when using a local WAL for maximum performance, which becomes the ceiling for any one tenant's throughput. With shard splitting, you can isolate particularly huge tenants to individual shards, and with placement rings, you can isolate particularly busy shards to dedicated compute nodes.
+
 ## Object storage vs local disk
 
 Silo's main thing is storing job data in object storage, which avoids the need for stateful compute nodes. Everything gets easier as an operator when you can treat a service like cattle instead of pets, and Silo intends to be cattle.
 
 Object storage has some drawbacks, however -- you must accept either high costs and low latency, or low costs and high latency.
 
-## Shard count
+### Pure object storage mode
 
-### Impact of shard count on costs
+Silo supports running in the "pure" object storage mode, where all data is stored in object storage and no local disk is used. This is the default mode and is the most durable and scalable configuration. 
 
-TODO -- more shards means fewer writes per shard
+### Split WAL mode
 
-### Impact of shard count on throughput
+Silo also supports running in the "split WAL" mode, where the WAL is stored in local disk while the main data is stored in object storage. This is the most performant mode and often the cheapest, as it avoids the overhead of writing to object storage for every WAL entry. You can set very low flush intervals and flush to a local disk frequently, and then allow Silo to upload data to object storage in the background. 
 
-TODO -- more shards means more throughput, but too much per shard overhead, extra object storage writes / compaction overhead
+Silo (via SlateDB) will automatically upload built segments of the database to object storage as the data changes. The high-turnover nature of job queues makes this really advantageous, as if a job is enqueued, started, and completed between uploads to object storage, the only data written to object storage is the record of the final state of the job, instead of every intermediate state.
 
-### Tenants need to be small enough to fit in one shard and not create hotspots
+The downside of the split WAL mode is that if a disk is lost, the WAL data is lost. When running on ephemeral storage, this will result in lost writes of both enqueued jobs and processed attempts. However, modern clouds offer really highly available disks, like GCP's Hyperdisk High Availability, which mitigate this risk. Gadget's recommended setup is to use these network-attache,d highly available disks for the WAL, and then use the object storage for the main data, getting the best of both worlds.
 
+#### Split WAL mode configuration
 
-### Using local disk for WAL
-
-For maximum write performance, you can configure the write-ahead log (WAL) to use local disk while keeping the main data in object storage. This avoids the latency of writing every WAL entry to object storage.
+Configure a split WAL mode by setting the `backend` to `gcs` for the main data and `fs` for the WAL.
 
 ```toml
 [database]
@@ -46,7 +55,9 @@ path = "/var/lib/silo/wal/%shard%"
 
 When using a local WAL, data is first written to local disk and then periodically flushed to object storage. On graceful shutdown, `apply_wal_on_close = true` (the default) ensures the WAL is fully flushed to object storage before the shard is closed.
 
-**Crash recovery with permanent shard leases**: If a node crashes before the WAL is flushed, the unflushed data only exists on local disk. Silo uses **permanent shard leases** to protect this data: the crashed node's shard leases persist, preventing any other node from opening the shard and missing the local WAL data. When the node restarts with the same identity (see `node_id` below), it reclaims its shard leases and recovers the WAL from local disk.
+#### Split WAL mode crash recovery
+
+If a node crashes before the WAL is flushed, the unflushed data only exists on the local disk. Silo uses **permanent shard leases** to protect this data: the crashed node's shard leases persist, preventing any other node from opening the shard and missing the local WAL data. When the node restarts with the same identity (see `node_id` below), it reclaims its shard leases and recovers the WAL from local disk.
 
 For this to work, you need:
 
@@ -57,12 +68,155 @@ If a node is permanently lost (e.g., the disk is destroyed), an operator must fo
 
 ### Using local disk for object storage cache
 
-TODO
+You can use a local disk as a **read cache** to speed up repeated reads from object storage. This is separate from the split WAL mode described above — the object storage cache accelerates reads, while the split WAL accelerates writes.
+
+SlateDB can cache fetched SST file parts on local disk so that subsequent reads don't need to hit object storage. This is especially useful for workloads that frequently read the same data, such as polling for job status or querying job metadata.
+
+To enable the cache, configure the `object_store_cache_options` section under `[database.slatedb]`:
+
+```toml
+[database]
+backend = "gcs"
+path = "gs://my-bucket/silo/%shard%"
+
+[database.slatedb.object_store_cache_options]
+root_folder = "/var/silo-cache"
+max_cache_size_bytes = 17179869184  # 16 GB
+cache_puts = true
+```
+
+The cache is enabled when `root_folder` is set. Key options:
+
+- **`root_folder`**: Path to the local directory where cached data is stored. Must be set to enable the cache.
+- **`max_cache_size_bytes`**: Maximum total size of the cache on disk. When exceeded, older entries are evicted.
+- **`cache_puts`**: When `true`, data written to object storage is also written to the local cache, warming it for subsequent reads.
+
+All other options use SlateDB's sensible defaults when omitted. See the [Server Configuration reference](/reference/server-configuration/#slatedb-configuration) for more details on SlateDB tuning.
+
+The cache directory does not need to be durable — if it is lost, reads will simply fall back to object storage and the cache will be rebuilt over time. This makes it a good fit for ephemeral local disks or instance storage.
 
 ## Using etcd for cluster membership
 
-TODO
+To run multiple Silo instances as a cluster, you need a coordination backend that handles node discovery, shard assignment, and ownership. etcd is one of the supported backends.
+
+### How it works
+
+Each Silo node registers itself in etcd with a **membership lease** — a key that is automatically deleted if the node stops renewing it (i.e., if it crashes or is shut down). When the set of members changes, all remaining nodes re-evaluate shard ownership using [rendezvous hashing](https://en.wikipedia.org/wiki/Rendezvous_hashing) and acquire or release shards accordingly.
+
+Shard ownership itself is tracked with separate, **permanent** etcd keys (not tied to the membership lease). This means a crashed node's shards are not immediately reassigned — the node must either restart and reclaim them, or an operator must force-release them with `siloctl`. This protects any unflushed local WAL data from being lost.
+
+### Configuration
+
+```toml
+[coordination]
+backend = "etcd"
+cluster_prefix = "silo-prod"
+initial_shard_count = 16
+lease_ttl_secs = 10
+etcd_endpoints = ["http://etcd-0:2379", "http://etcd-1:2379", "http://etcd-2:2379"]
+```
+
+- **`etcd_endpoints`**: The list of etcd cluster endpoints. Defaults to `["http://127.0.0.1:2379"]` if not set.
+- **`cluster_prefix`**: A string prefix for all etcd keys used by this Silo cluster, allowing multiple Silo clusters to share one etcd instance.
+- **`lease_ttl_secs`**: How long the membership lease lives without renewal. Lower values detect crashes faster but require more frequent keepalives. Keepalives are sent at roughly `lease_ttl_secs / 3` intervals.
+- **`initial_shard_count`**: The number of shards to create when bootstrapping a brand new cluster. Ignored once the cluster is initialized.
+
+For multi-node clusters, you should also set `advertised_grpc_addr` so other nodes know how to reach this one, and `node_id` for stable identity across restarts:
+
+```toml
+[coordination]
+backend = "etcd"
+cluster_prefix = "silo-prod"
+etcd_endpoints = ["http://etcd-0:2379"]
+advertised_grpc_addr = "10.0.1.5:7450"
+node_id = "silo-node-1"
+```
+
+See the [Server Configuration reference](/reference/server-configuration/#coordination-configuration) for the full list of coordination options.
 
 ## Using Kubernetes for cluster membership
 
-TODO
+The Kubernetes coordination backend uses native Kubernetes **Lease** and **ConfigMap** objects for node discovery and shard coordination, avoiding the need for a separate etcd deployment.
+
+### How it works
+
+Each Silo node creates a Kubernetes Lease object in the configured namespace that acts as its membership heartbeat. Shard ownership is also tracked via Lease objects — one per shard. A ConfigMap stores the cluster's shard map (the mapping of shard IDs to key ranges). Nodes watch these resources for changes and use rendezvous hashing to determine which shards they should own, just like the etcd backend.
+
+### Configuration
+
+```toml
+[coordination]
+backend = "k8s"
+cluster_prefix = "silo-prod"
+k8s_namespace = "silo"
+lease_ttl_secs = 15
+advertised_grpc_addr = "${POD_IP}:7450"
+node_id = "${POD_NAME}"
+```
+
+- **`k8s_namespace`**: The Kubernetes namespace where Silo creates its Lease and ConfigMap objects. Defaults to `"default"`.
+- **`advertised_grpc_addr`**: The address other Silo nodes use to connect to this one. In Kubernetes, use `${POD_IP}:7450` with the Downward API (see below).
+- **`node_id`**: A stable identity for this node. With StatefulSets, set this to `${POD_NAME}` (e.g., `silo-0`, `silo-1`) so that a restarted pod automatically reclaims its shard leases and recovers any local WAL data.
+
+Silo config values support `${VAR}` and `${VAR:-default}` environment variable substitution, which pairs well with the Kubernetes Downward API.
+
+### RBAC requirements
+
+Silo needs permissions to manage Leases and ConfigMaps in its namespace. Create a ServiceAccount, Role, and RoleBinding:
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: silo
+  namespace: silo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: silo-coordinator
+  namespace: silo
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: silo-coordinator
+  namespace: silo
+subjects:
+  - kind: ServiceAccount
+    name: silo
+    namespace: silo
+roleRef:
+  kind: Role
+  name: silo-coordinator
+  apiGroup: rbac.authorization.k8s.io
+```
+
+### Pod environment
+
+Expose the pod IP and name via the Downward API so Silo can use them in its config:
+
+```yaml
+env:
+  - name: POD_IP
+    valueFrom:
+      fieldRef:
+        fieldPath: status.podIP
+  - name: POD_NAME
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.name
+```
+
+### Recommended deployment pattern
+
+Use a **StatefulSet** for Silo pods. StatefulSets provide stable pod names (`silo-0`, `silo-1`, etc.) which, combined with `node_id = "${POD_NAME}"`, give each pod a stable identity across restarts. This is required for automatic shard lease reclamation and local WAL recovery after crashes.
+
+If you're using the split WAL mode, attach a `PersistentVolumeClaim` for the WAL directory so it survives pod restarts. See the [split WAL crash recovery](#split-wal-mode-crash-recovery) section above for details.
