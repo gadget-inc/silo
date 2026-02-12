@@ -14,7 +14,7 @@ use crate::dst_events::{self, DstEvent};
 use crate::job::{JobInfo, JobStatus, JobStatusKind, Limit};
 use crate::job_attempt::{AttemptStatus, JobAttempt};
 use crate::job_store_shard::helpers::{TxnWriter, now_epoch_ms};
-use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
+use crate::job_store_shard::{JobStoreShard, JobStoreShardError, LimitTaskParams};
 use crate::keys::{attempt_key, idx_metadata_key, job_info_key};
 use crate::retry::{RetryPolicy, retries_exhausted};
 
@@ -218,7 +218,7 @@ impl JobStoreShard {
 
         // Write status + index
         let mut writer = TxnWriter(&txn);
-        Self::write_new_job_status_with_index(&mut writer, tenant, job_id, job_status)?;
+        Self::write_job_status_with_index(&mut writer, tenant, job_id, job_status)?;
 
         // For non-terminal imports, create a task for the next attempt
         let mut grants = Vec::new();
@@ -229,18 +229,20 @@ impl JobStoreShard {
             grants = self
                 .enqueue_limit_task_at_index(
                     &mut writer,
-                    tenant,
-                    &task_id,
-                    job_id,
-                    next_attempt,
-                    next_attempt,
-                    0,
-                    &params.limits,
-                    params.priority,
-                    effective_start_at_ms,
-                    now_ms,
-                    Vec::new(),
-                    &params.task_group,
+                    LimitTaskParams {
+                        tenant,
+                        task_id: &task_id,
+                        job_id,
+                        attempt_number: next_attempt,
+                        relative_attempt_number: next_attempt,
+                        limit_index: 0,
+                        limits: &params.limits,
+                        priority: params.priority,
+                        start_at_ms: effective_start_at_ms,
+                        now_ms,
+                        held_queues: Vec::new(),
+                        task_group: &params.task_group,
+                    },
                 )
                 .await?;
         }

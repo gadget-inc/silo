@@ -21,8 +21,8 @@ pub use expedite::JobNotExpediteableError;
 pub use lease_task::JobNotLeaseableError;
 pub use restart::JobNotRestartableError;
 
+pub(crate) use enqueue::LimitTaskParams;
 use helpers::DbWriteBatcher;
-pub(crate) use helpers::WriteBatcher;
 pub use helpers::now_epoch_ms;
 
 use slatedb::Db;
@@ -140,20 +140,11 @@ impl From<CodecError> for JobStoreShardError {
     }
 }
 
-impl From<crate::concurrency::HandleEnqueueError> for JobStoreShardError {
-    fn from(e: crate::concurrency::HandleEnqueueError) -> Self {
+impl From<crate::concurrency::ConcurrencyError> for JobStoreShardError {
+    fn from(e: crate::concurrency::ConcurrencyError) -> Self {
         match e {
-            crate::concurrency::HandleEnqueueError::Slate(e) => JobStoreShardError::Slate(e),
-            crate::concurrency::HandleEnqueueError::Encoding(s) => JobStoreShardError::Rkyv(s),
-        }
-    }
-}
-
-impl From<crate::concurrency::ProcessTicketError> for JobStoreShardError {
-    fn from(e: crate::concurrency::ProcessTicketError) -> Self {
-        match e {
-            crate::concurrency::ProcessTicketError::Slate(e) => JobStoreShardError::Slate(e),
-            crate::concurrency::ProcessTicketError::Encoding(s) => JobStoreShardError::Rkyv(s),
+            crate::concurrency::ConcurrencyError::Slate(e) => JobStoreShardError::Slate(e),
+            crate::concurrency::ConcurrencyError::Encoding(s) => JobStoreShardError::Rkyv(s),
         }
     }
 }

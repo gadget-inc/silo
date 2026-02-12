@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -245,6 +246,39 @@ fn map_err(e: JobStoreShardError) -> Status {
     }
 }
 
+/// Extract msgpack payload bytes from a proto SerializedBytes field.
+fn extract_payload_bytes(payload: &Option<SerializedBytes>) -> Vec<u8> {
+    payload
+        .as_ref()
+        .and_then(|p| {
+            p.encoding
+                .as_ref()
+                .map(|serialized_bytes::Encoding::Msgpack(data)| data.clone())
+        })
+        .unwrap_or_default()
+}
+
+/// Convert a proto RetryPolicy to a domain RetryPolicy.
+fn proto_retry_to_domain(rp: crate::pb::RetryPolicy) -> crate::retry::RetryPolicy {
+    crate::retry::RetryPolicy {
+        retry_count: rp.retry_count,
+        initial_interval_ms: rp.initial_interval_ms,
+        max_interval_ms: rp.max_interval_ms,
+        randomize_interval: rp.randomize_interval,
+        backoff_factor: rp.backoff_factor,
+    }
+}
+
+/// Convert a proto metadata map to an optional Vec of (key, value) pairs.
+/// Returns None if the map is empty.
+fn proto_metadata_to_domain(metadata: HashMap<String, String>) -> Option<Vec<(String, String)>> {
+    if metadata.is_empty() {
+        None
+    } else {
+        Some(metadata.into_iter().collect())
+    }
+}
+
 /// gRPC service implementation backed by a `ShardFactory`.
 #[derive(Clone)]
 pub struct SiloService {
@@ -274,6 +308,37 @@ impl SiloService {
     fn parse_shard_id(shard_str: &str) -> Result<crate::shard_range::ShardId, Status> {
         crate::shard_range::ShardId::parse(shard_str)
             .map_err(|_| Status::invalid_argument(format!("invalid shard ID: {}", shard_str)))
+    }
+
+    /// Execute a SQL query against a shard and return the resulting record batches.
+    async fn execute_shard_query(
+        &self,
+        shard_str: &str,
+        sql: &str,
+    ) -> Result<
+        (
+            datafusion::arrow::datatypes::SchemaRef,
+            Vec<datafusion::arrow::array::RecordBatch>,
+        ),
+        Status,
+    > {
+        let shard_id = Self::parse_shard_id(shard_str)?;
+        let shard = self.shard_with_redirect(&shard_id).await?;
+        let query_engine = shard.query_engine();
+
+        let dataframe = query_engine
+            .sql(sql)
+            .await
+            .map_err(|e| Status::invalid_argument(format!("SQL error: {}", e)))?;
+
+        let schema = dataframe.schema().inner().clone();
+
+        let batches = dataframe
+            .collect()
+            .await
+            .map_err(|e| Status::internal(format!("Query execution failed: {}", e)))?;
+
+        Ok((schema, batches))
     }
 
     /// Get shard with async lookup of owner for redirect metadata.
@@ -427,54 +492,16 @@ impl SiloService {
             ));
         }
 
-        // Validate metadata constraints
-        if job_req.metadata.len() > 16 {
-            return Err(Status::invalid_argument(
-                "metadata has too many entries (max 16)",
-            ));
-        }
-        for (k, v) in &job_req.metadata {
-            if k.chars().count() >= 64 {
-                return Err(Status::invalid_argument(
-                    "metadata key too long (must be < 64 chars)",
-                ));
-            }
-            if v.len() as u128 >= (u16::MAX as u128) {
-                return Err(Status::invalid_argument(
-                    "metadata value too long (must be < u16::MAX bytes)",
-                ));
-            }
-        }
+        Self::validate_metadata(&job_req.metadata)?;
 
-        let payload_bytes = job_req
-            .payload
-            .as_ref()
-            .and_then(|p| {
-                p.encoding
-                    .as_ref()
-                    .map(|serialized_bytes::Encoding::Msgpack(data)| data.clone())
-            })
-            .unwrap_or_default();
-
-        let retry = job_req.retry_policy.map(|rp| crate::retry::RetryPolicy {
-            retry_count: rp.retry_count,
-            initial_interval_ms: rp.initial_interval_ms,
-            max_interval_ms: rp.max_interval_ms,
-            randomize_interval: rp.randomize_interval,
-            backoff_factor: rp.backoff_factor,
-        });
-
+        let payload_bytes = extract_payload_bytes(&job_req.payload);
+        let retry = job_req.retry_policy.map(proto_retry_to_domain);
         let limits: Vec<crate::job::Limit> = job_req
             .limits
             .into_iter()
             .filter_map(proto_limit_to_job_limit)
             .collect();
-
-        let metadata: Option<Vec<(String, String)>> = if job_req.metadata.is_empty() {
-            None
-        } else {
-            Some(job_req.metadata.into_iter().collect())
-        };
+        let metadata = proto_metadata_to_domain(job_req.metadata);
 
         // Convert proto attempts to domain attempts
         let mut attempts = Vec::with_capacity(job_req.attempts.len());
@@ -537,6 +564,46 @@ impl SiloService {
         };
 
         Ok((shard_id, tenant, params))
+    }
+
+    /// Parse shard ID, look up the local shard (with redirect metadata on miss), validate tenant, and confirm the tenant falls within the shard's range.
+    async fn resolve_shard_and_tenant(
+        &self,
+        shard: &str,
+        tenant: Option<&str>,
+    ) -> Result<(Arc<JobStoreShard>, String), Status> {
+        let shard_id = Self::parse_shard_id(shard)?;
+        let shard = self.shard_with_redirect(&shard_id).await?;
+        let tenant = self.validate_tenant(tenant)?;
+        self.validate_tenant_in_shard_range(&shard_id, &tenant)
+            .await?;
+        Ok((shard, tenant))
+    }
+
+    /// Validate metadata constraints: at most 16 entries, keys < 64 chars,
+    /// values < u16::MAX bytes.
+    #[allow(clippy::result_large_err)]
+    fn validate_metadata(
+        metadata: &std::collections::HashMap<String, String>,
+    ) -> Result<(), Status> {
+        if metadata.len() > 16 {
+            return Err(Status::invalid_argument(
+                "metadata has too many entries (max 16)",
+            ));
+        }
+        for (k, v) in metadata {
+            if k.chars().count() >= 64 {
+                return Err(Status::invalid_argument(
+                    "metadata key too long (must be < 64 chars)",
+                ));
+            }
+            if v.len() >= u16::MAX as usize {
+                return Err(Status::invalid_argument(
+                    "metadata value too long (must be < u16::MAX bytes)",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Validate that the tenant_id falls within the shard's tenant range.
@@ -656,10 +723,8 @@ impl Silo for SiloService {
         req: Request<EnqueueRequest>,
     ) -> Result<Response<EnqueueResponse>, Status> {
         let r = req.into_inner();
-        let shard_id = Self::parse_shard_id(&r.shard)?;
-        let shard = self.shard_with_redirect(&shard_id).await?;
-        let tenant = self.validate_tenant(r.tenant.as_deref())?;
-        self.validate_tenant_in_shard_range(&shard_id, &tenant)
+        let (shard, tenant) = self
+            .resolve_shard_and_tenant(&r.shard, r.tenant.as_deref())
             .await?;
 
         if r.priority > 99 {
@@ -668,53 +733,16 @@ impl Silo for SiloService {
             ));
         }
 
-        let payload_bytes = r
-            .payload
-            .as_ref()
-            .and_then(|p| {
-                p.encoding
-                    .as_ref()
-                    .map(|serialized_bytes::Encoding::Msgpack(data)| data.clone())
-            })
-            .unwrap_or_default();
-        let retry = r.retry_policy.map(|rp| crate::retry::RetryPolicy {
-            retry_count: rp.retry_count,
-            initial_interval_ms: rp.initial_interval_ms,
-            max_interval_ms: rp.max_interval_ms,
-            randomize_interval: rp.randomize_interval,
-            backoff_factor: rp.backoff_factor,
-        });
-
-        // Convert proto Limits to job::Limit
+        let payload_bytes = extract_payload_bytes(&r.payload);
+        let retry = r.retry_policy.map(proto_retry_to_domain);
         let limits: Vec<crate::job::Limit> = r
             .limits
             .into_iter()
             .filter_map(proto_limit_to_job_limit)
             .collect();
 
-        // Validate metadata constraints: <=16 entries, key < 64 chars, value < u16::MAX
-        if r.metadata.len() > 16 {
-            return Err(Status::invalid_argument(
-                "metadata has too many entries (max 16)",
-            ));
-        }
-        for (k, v) in &r.metadata {
-            if k.chars().count() >= 64 {
-                return Err(Status::invalid_argument(
-                    "metadata key too long (must be < 64 chars)",
-                ));
-            }
-            if v.len() as u128 >= (u16::MAX as u128) {
-                return Err(Status::invalid_argument(
-                    "metadata value too long (must be < u16::MAX bytes)",
-                ));
-            }
-        }
-        let metadata: Option<Vec<(String, String)>> = if r.metadata.is_empty() {
-            None
-        } else {
-            Some(r.metadata.into_iter().collect())
-        };
+        Self::validate_metadata(&r.metadata)?;
+        let metadata = proto_metadata_to_domain(r.metadata);
 
         // Validate task_group - required and must be <= 64 chars
         if r.task_group.is_empty() {
@@ -755,10 +783,8 @@ impl Silo for SiloService {
         req: Request<GetJobRequest>,
     ) -> Result<Response<GetJobResponse>, Status> {
         let r = req.into_inner();
-        let shard_id = Self::parse_shard_id(&r.shard)?;
-        let shard = self.shard_with_redirect(&shard_id).await?;
-        let tenant = self.validate_tenant(r.tenant.as_deref())?;
-        self.validate_tenant_in_shard_range(&shard_id, &tenant)
+        let (shard, tenant) = self
+            .resolve_shard_and_tenant(&r.shard, r.tenant.as_deref())
             .await?;
         let Some(view) = shard.get_job(&tenant, &r.id).await.map_err(map_err)? else {
             return Err(Status::not_found("job not found"));
@@ -828,10 +854,8 @@ impl Silo for SiloService {
         req: Request<GetJobResultRequest>,
     ) -> Result<Response<GetJobResultResponse>, Status> {
         let r = req.into_inner();
-        let shard_id = Self::parse_shard_id(&r.shard)?;
-        let shard = self.shard_with_redirect(&shard_id).await?;
-        let tenant = self.validate_tenant(r.tenant.as_deref())?;
-        self.validate_tenant_in_shard_range(&shard_id, &tenant)
+        let (shard, tenant) = self
+            .resolve_shard_and_tenant(&r.shard, r.tenant.as_deref())
             .await?;
 
         // First check if job exists
@@ -928,10 +952,8 @@ impl Silo for SiloService {
         req: Request<DeleteJobRequest>,
     ) -> Result<Response<DeleteJobResponse>, Status> {
         let r = req.into_inner();
-        let shard_id = Self::parse_shard_id(&r.shard)?;
-        let shard = self.shard_with_redirect(&shard_id).await?;
-        let tenant = self.validate_tenant(r.tenant.as_deref())?;
-        self.validate_tenant_in_shard_range(&shard_id, &tenant)
+        let (shard, tenant) = self
+            .resolve_shard_and_tenant(&r.shard, r.tenant.as_deref())
             .await?;
         shard.delete_job(&tenant, &r.id).await.map_err(map_err)?;
         Ok(Response::new(DeleteJobResponse {}))
@@ -942,10 +964,8 @@ impl Silo for SiloService {
         req: Request<CancelJobRequest>,
     ) -> Result<Response<CancelJobResponse>, Status> {
         let r = req.into_inner();
-        let shard_id = Self::parse_shard_id(&r.shard)?;
-        let shard = self.shard_with_redirect(&shard_id).await?;
-        let tenant = self.validate_tenant(r.tenant.as_deref())?;
-        self.validate_tenant_in_shard_range(&shard_id, &tenant)
+        let (shard, tenant) = self
+            .resolve_shard_and_tenant(&r.shard, r.tenant.as_deref())
             .await?;
         shard.cancel_job(&tenant, &r.id).await.map_err(map_err)?;
         Ok(Response::new(CancelJobResponse {}))
@@ -956,10 +976,8 @@ impl Silo for SiloService {
         req: Request<RestartJobRequest>,
     ) -> Result<Response<RestartJobResponse>, Status> {
         let r = req.into_inner();
-        let shard_id = Self::parse_shard_id(&r.shard)?;
-        let shard = self.shard_with_redirect(&shard_id).await?;
-        let tenant = self.validate_tenant(r.tenant.as_deref())?;
-        self.validate_tenant_in_shard_range(&shard_id, &tenant)
+        let (shard, tenant) = self
+            .resolve_shard_and_tenant(&r.shard, r.tenant.as_deref())
             .await?;
         shard.restart_job(&tenant, &r.id).await.map_err(map_err)?;
         Ok(Response::new(RestartJobResponse {}))
@@ -970,10 +988,8 @@ impl Silo for SiloService {
         req: Request<ExpediteJobRequest>,
     ) -> Result<Response<ExpediteJobResponse>, Status> {
         let r = req.into_inner();
-        let shard_id = Self::parse_shard_id(&r.shard)?;
-        let shard = self.shard_with_redirect(&shard_id).await?;
-        let tenant = self.validate_tenant(r.tenant.as_deref())?;
-        self.validate_tenant_in_shard_range(&shard_id, &tenant)
+        let (shard, tenant) = self
+            .resolve_shard_and_tenant(&r.shard, r.tenant.as_deref())
             .await?;
         shard.expedite_job(&tenant, &r.id).await.map_err(map_err)?;
         Ok(Response::new(ExpediteJobResponse {}))
@@ -984,10 +1000,8 @@ impl Silo for SiloService {
         req: Request<LeaseTaskRequest>,
     ) -> Result<Response<LeaseTaskResponse>, Status> {
         let r = req.into_inner();
-        let shard_id = Self::parse_shard_id(&r.shard)?;
-        let shard = self.shard_with_redirect(&shard_id).await?;
-        let tenant = self.validate_tenant(r.tenant.as_deref())?;
-        self.validate_tenant_in_shard_range(&shard_id, &tenant)
+        let (shard, tenant) = self
+            .resolve_shard_and_tenant(&r.shard, r.tenant.as_deref())
             .await?;
 
         if r.worker_id.is_empty() {
@@ -1043,7 +1057,6 @@ impl Silo for SiloService {
         let mut remaining = max_tasks;
 
         // Poll each shard until we have enough tasks or exhausted all shards
-        // TODO: Could implement fair round-robin across shards for better distribution
         for (shard_id, shard) in shards_to_poll {
             if remaining == 0 {
                 break;
@@ -1059,65 +1072,19 @@ impl Silo for SiloService {
             let now_ms = crate::job_store_shard::now_epoch_ms();
 
             for lt in result.tasks {
-                let job = lt.job();
-                let attempt = lt.attempt();
-                let task_group = job.task_group().to_string();
-                let attempt_number = attempt.attempt_number();
-                let relative_attempt_number = attempt.relative_attempt_number();
-                let tenant_str = lt.tenant_id().to_string();
-                let job_id_str = job.id().to_string();
-
                 // Record attempt and wait time metrics
                 if let Some(ref m) = self.metrics {
-                    let is_retry = relative_attempt_number > 1;
-                    m.record_attempt(&shard_str, &task_group, is_retry);
+                    let job = lt.job();
+                    let task_group = job.task_group();
+                    let relative_attempt_number = lt.attempt().relative_attempt_number();
+                    m.record_attempt(&shard_str, task_group, relative_attempt_number > 1);
 
-                    // Calculate wait time in seconds (enqueue to now)
-                    let enqueue_time_ms = job.enqueue_time_ms();
-                    let wait_time_secs = (now_ms - enqueue_time_ms).max(0) as f64 / 1000.0;
-                    m.record_job_wait_time(&shard_str, &task_group, wait_time_secs);
-
-                    // Increment active leases
-                    m.inc_task_leases_active(&shard_str, &task_group);
+                    let wait_time_secs = (now_ms - job.enqueue_time_ms()).max(0) as f64 / 1000.0;
+                    m.record_job_wait_time(&shard_str, task_group, wait_time_secs);
+                    m.inc_task_leases_active(&shard_str, task_group);
                 }
 
-                // Determine if this is the last attempt based on retry policy and relative attempt
-                let max_attempts = job
-                    .retry_policy()
-                    .map(|p| p.retry_count + 1) // retry_count is retries after first attempt
-                    .unwrap_or(1); // No retry policy means only 1 attempt
-                let is_last_attempt = relative_attempt_number >= max_attempts;
-
-                // Get tenant_id, using None if it's the default "-" tenant
-                let tenant_id = if tenant_str == "-" {
-                    None
-                } else {
-                    Some(tenant_str)
-                };
-
-                all_tasks.push(Task {
-                    id: attempt.task_id().to_string(),
-                    job_id: job_id_str,
-                    attempt_number,
-                    lease_ms: DEFAULT_LEASE_MS,
-                    payload: Some(SerializedBytes {
-                        encoding: Some(serialized_bytes::Encoding::Msgpack(
-                            job.payload_bytes().to_vec(),
-                        )),
-                    }),
-                    priority: job.priority() as u32,
-                    shard: shard_id.to_string(),
-                    task_group,
-                    tenant_id,
-                    is_last_attempt,
-                    metadata: job.metadata().into_iter().collect(),
-                    limits: job
-                        .limits()
-                        .into_iter()
-                        .map(job_limit_to_proto_limit)
-                        .collect(),
-                    relative_attempt_number,
-                });
+                all_tasks.push(leased_task_to_proto(&lt, &shard_str));
             }
 
             for rt in result.refresh_tasks {
@@ -1258,34 +1225,7 @@ impl Silo for SiloService {
 
     async fn query(&self, req: Request<QueryRequest>) -> Result<Response<QueryResponse>, Status> {
         let r = req.into_inner();
-        let shard_id = Self::parse_shard_id(&r.shard)?;
-        let shard = self.shard_with_redirect(&shard_id).await?;
-
-        // Get the cached query engine for this shard
-        let query_engine = shard.query_engine();
-
-        // Execute query
-        let dataframe = query_engine
-            .sql(&r.sql)
-            .await
-            .map_err(|e| Status::invalid_argument(format!("SQL error: {}", e)))?;
-
-        // Get schema before consuming dataframe
-        let schema = Arc::new(dataframe.schema().as_arrow().clone());
-
-        // Collect results
-        let batches = dataframe
-            .collect()
-            .await
-            .map_err(|e| Status::internal(format!("Query execution failed: {}", e)))?;
-
-        // Use schema from dataframe or first batch
-        let schema = if let Some(batch) = batches.first() {
-            batch.schema()
-        } else {
-            schema
-        };
-
+        let (schema, batches) = self.execute_shard_query(&r.shard, &r.sql).await?;
         let columns: Vec<ColumnInfo> = schema
             .fields()
             .iter()
@@ -1322,23 +1262,7 @@ impl Silo for SiloService {
         req: Request<QueryArrowRequest>,
     ) -> Result<Response<Self::QueryArrowStream>, Status> {
         let r = req.into_inner();
-        let shard_id = Self::parse_shard_id(&r.shard)?;
-        let shard = self.shard_with_redirect(&shard_id).await?;
-
-        // Get the cached query engine for this shard
-        let query_engine = shard.query_engine();
-
-        // Execute query
-        let dataframe = query_engine
-            .sql(&r.sql)
-            .await
-            .map_err(|e| Status::invalid_argument(format!("SQL error: {}", e)))?;
-
-        // Collect results
-        let batches = dataframe
-            .collect()
-            .await
-            .map_err(|e| Status::internal(format!("Query execution failed: {}", e)))?;
+        let (_schema, batches) = self.execute_shard_query(&r.shard, &r.sql).await?;
 
         // Create a stream that yields Arrow IPC messages
         let (tx, rx) = tokio::sync::mpsc::channel(16);

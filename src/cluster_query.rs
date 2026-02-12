@@ -1,12 +1,8 @@
 //! Cluster-wide query engine using Apache DataFusion.
 //!
-//! This module provides a query engine that can execute SQL queries across all shards
-//! in a Silo cluster. It creates a multi-partition execution plan where each partition
-//! corresponds to a shard, enabling DataFusion to properly aggregate results across
-//! the entire cluster.
+//! This module provides a query engine that can execute SQL queries across all shards in a Silo cluster. It creates a multi-partition execution plan where each partition corresponds to a shard, enabling DataFusion to properly aggregate results across the entire cluster.
 //!
-//! For local shards, data is read directly. For remote shards, the engine makes
-//! gRPC calls using Arrow IPC for efficient data transfer.
+//! For local shards, data is read directly. For remote shards, the engine makes gRPC calls using Arrow IPC for efficient data transfer.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -541,13 +537,7 @@ async fn query_remote_shard_batches(
     loop {
         attempt += 1;
 
-        // Ensure address has http:// scheme for gRPC connection
-        let full_addr =
-            if current_addr.starts_with("http://") || current_addr.starts_with("https://") {
-                current_addr.clone()
-            } else {
-                format!("http://{}", current_addr)
-            };
+        let full_addr = crate::cluster_client::ensure_http_scheme(&current_addr);
         debug!(shard_id = %shard_id, addr = %full_addr, sql = %sql, attempt, "querying remote shard");
 
         // Connect to remote node

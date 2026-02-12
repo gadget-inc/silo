@@ -6,10 +6,7 @@
 //!
 //! ## Connection Resilience
 //!
-//! The client includes built-in timeout and reconnection logic to handle network
-//! failures gracefully. When a connection fails or times out, the client will
-//! automatically invalidate the cached connection and attempt to reconnect on
-//! the next request.
+//! The client includes built-in timeout and reconnection logic to handle network failures gracefully. When a connection fails or times out, the client will  automatically invalidate the cached connection and attempt to reconnect on the next request.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,8 +28,7 @@ use crate::shard_range::ShardId;
 
 /// Configuration for gRPC client connections.
 ///
-/// These settings control timeouts, retries, and connection behavior for both
-/// internal cluster communication and external client connections.
+/// These settings control timeouts, retries, and connection behavior for both internal cluster communication and external client connections.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     /// Timeout for establishing a connection to a remote node.
@@ -83,8 +79,7 @@ impl ClientConfig {
     }
 
     /// Create a config optimized for deterministic simulation testing (DST).
-    /// Uses very short timeouts to ensure simulations complete within their time budgets,
-    /// while still being long enough to handle normal request processing.
+    /// Uses very short timeouts to ensure simulations complete within their time budgets, while still being long enough to handle normal request processing.
     pub fn for_dst() -> Self {
         Self {
             connect_timeout: Duration::from_secs(2),
@@ -114,18 +109,25 @@ impl ClientConfig {
     }
 }
 
+/// Ensure an address has an `http://` scheme prefix for gRPC connections.
+pub fn ensure_http_scheme(addr: &str) -> String {
+    if addr.starts_with("http://") || addr.starts_with("https://") {
+        addr.to_string()
+    } else {
+        format!("http://{}", addr)
+    }
+}
+
 /// Helper to create a SiloClient with proper timeout and retry configuration.
 ///
-/// This function creates a gRPC client with configurable timeouts and automatic
-/// retry logic with exponential backoff. Retries are attempted when the initial
-/// connection fails.
+/// This function creates a gRPC client with configurable timeouts and automatic retry logic with exponential backoff. Retries are attempted when the initial connection fails.
 ///
-/// Each connection attempt is wrapped with a hard timeout to ensure we don't hang
-/// indefinitely when TCP/HTTP2 gets into a bad state (e.g., due to packet loss or
-/// network partitions that leave the connection half-open).
+/// Each connection attempt is wrapped with a hard timeout to ensure we don't hang indefinitely when TCP/HTTP2 gets into a bad state (e.g., due to packet loss or network partitions that leave the connection half-open).
 ///
 /// # Arguments
 /// * `uri` - The server URI (e.g., "http://localhost:9910")
+///
+/// The URI must have an http/https scheme; use [`ensure_http_scheme`] to add one if needed.
 /// * `config` - Client configuration with timeout and retry settings
 ///
 /// # Example
@@ -137,21 +139,14 @@ pub async fn create_silo_client(
     uri: &str,
     config: &ClientConfig,
 ) -> Result<SiloClient<Channel>, ClusterClientError> {
-    // Ensure address has http:// scheme
-    let full_uri = if uri.starts_with("http://") || uri.starts_with("https://") {
-        uri.to_string()
-    } else {
-        format!("http://{}", uri)
-    };
+    let full_uri = ensure_http_scheme(uri);
 
     let endpoint = config
         .configure_endpoint(&full_uri)
         .map_err(|e| ClusterClientError::ConnectionFailed(full_uri.clone(), e.to_string()))?;
 
-    // Hard timeout per connection attempt. The endpoint has a connect_timeout, but
-    // in practice TCP/HTTP2 can get into states where the timeout doesn't fire
-    // (e.g., half-open connections, corrupted h2 streams). This ensures we don't
-    // hang indefinitely on any single attempt.
+    // Hard timeout per connection attempt. The endpoint has a connect_timeout, but in practice TCP/HTTP2 can get into states where the timeout doesn't fire
+    // (e.g., half-open connections, corrupted h2 streams). This ensures we don't hang indefinitely on any single attempt.
     let attempt_timeout = config.connect_timeout + Duration::from_secs(1);
 
     let mut last_error = None;
@@ -315,12 +310,7 @@ impl ClusterClient {
 
     /// Get or create a gRPC client connection to a remote node
     async fn get_client(&self, addr: &str) -> Result<SiloClient<Channel>, ClusterClientError> {
-        // Ensure address has http:// scheme for gRPC connection
-        let full_addr = if addr.starts_with("http://") || addr.starts_with("https://") {
-            addr.to_string()
-        } else {
-            format!("http://{}", addr)
-        };
+        let full_addr = ensure_http_scheme(addr);
 
         // Check cache first
         if let Some(client) = self.connections.get(&full_addr) {
@@ -339,11 +329,7 @@ impl ClusterClient {
 
     /// Invalidate a cached connection (call after RPC failures to force reconnect)
     pub fn invalidate_connection(&self, addr: &str) {
-        let full_addr = if addr.starts_with("http://") || addr.starts_with("https://") {
-            addr.to_string()
-        } else {
-            format!("http://{}", addr)
-        };
+        let full_addr = ensure_http_scheme(addr);
 
         if self.connections.remove(&full_addr).is_some() {
             debug!(addr = %full_addr, "invalidated cached connection");
@@ -728,10 +714,7 @@ impl ClusterClient {
     }
 
     /// Get node information from all cluster members.
-    ///
-    /// Calls GetNodeInfo RPC on all cluster members and aggregates the results.
-    /// This returns counters and cleanup status for all shards across the cluster.
-    /// For the local node, gets information directly from the factory instead of gRPC.
+    /// Calls GetNodeInfo RPC on all cluster members and aggregates the results. This returns counters and cleanup status for all shards across the cluster. For the local node, gets information directly from the factory instead of gRPC.
     pub async fn get_all_node_info(&self) -> Result<ClusterNodeInfo, ClusterClientError> {
         let Some(coordinator) = &self.coordinator else {
             return Err(ClusterClientError::NoCoordinator);

@@ -1,6 +1,5 @@
 //! Job enqueue operations.
 
-use slatedb::ErrorKind as SlateErrorKind;
 use slatedb::config::WriteOptions;
 use slatedb::{IsolationLevel, WriteBatch};
 use tracing::{debug, info_span};
@@ -14,12 +13,30 @@ use crate::job_store_shard::JobStoreShard;
 use crate::job_store_shard::JobStoreShardError;
 use crate::job_store_shard::helpers::{
     DbWriteBatcher, TxnWriter, WriteBatcher, decode_job_status_owned, now_epoch_ms, put_task,
+    retry_on_txn_conflict,
 };
 use crate::keys::{
     idx_metadata_key, idx_status_time_key, job_info_key, job_status_key, status_index_timestamp,
 };
 use crate::retry::RetryPolicy;
 use crate::task::{GubernatorRateLimitData, Task};
+
+/// Parameters for creating limit-processing tasks.
+/// Bundles the many fields needed by `enqueue_limit_task_at_index` into a single struct.
+pub(crate) struct LimitTaskParams<'a> {
+    pub tenant: &'a str,
+    pub task_id: &'a str,
+    pub job_id: &'a str,
+    pub attempt_number: u32,
+    pub relative_attempt_number: u32,
+    pub limit_index: usize,
+    pub limits: &'a [Limit],
+    pub priority: u8,
+    pub start_at_ms: i64,
+    pub now_ms: i64,
+    pub held_queues: Vec<String>,
+    pub task_group: &'a str,
+}
 
 /// Whether a concurrency grant was obtained or the job was queued for later.
 enum GrantResult {
@@ -193,48 +210,21 @@ impl JobStoreShard {
         metadata: Option<Vec<(String, String)>>,
         task_group: &str,
     ) -> Result<String, JobStoreShardError> {
-        const MAX_RETRIES: usize = 5;
-
-        for attempt in 0..MAX_RETRIES {
-            match self
-                .enqueue_txn(
-                    tenant,
-                    &job_id,
-                    priority,
-                    start_at_ms,
-                    retry_policy.clone(),
-                    payload.clone(),
-                    limits.clone(),
-                    metadata.clone(),
-                    task_group,
-                )
-                .await
-            {
-                Ok(()) => return Ok(job_id),
-                Err(JobStoreShardError::JobAlreadyExists(_)) => {
-                    return Err(JobStoreShardError::JobAlreadyExists(job_id));
-                }
-                Err(JobStoreShardError::Slate(ref e))
-                    if e.kind() == SlateErrorKind::Transaction =>
-                {
-                    if attempt + 1 < MAX_RETRIES {
-                        let delay_ms = 10 * (1 << attempt);
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        debug!(
-                            job_id = %job_id,
-                            attempt = attempt + 1,
-                            "enqueue transaction conflict, retrying"
-                        );
-                        continue;
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        Err(JobStoreShardError::TransactionConflict(
-            "enqueue".to_string(),
-        ))
+        retry_on_txn_conflict("enqueue", || {
+            self.enqueue_txn(
+                tenant,
+                &job_id,
+                priority,
+                start_at_ms,
+                retry_policy.clone(),
+                payload.clone(),
+                limits.clone(),
+                metadata.clone(),
+                task_group,
+            )
+        })
+        .await?;
+        Ok(job_id)
     }
 
     /// Inner transaction-based enqueue for a single attempt.
@@ -354,22 +344,24 @@ impl JobStoreShard {
             writer.put(&mkey, [])?;
         }
 
-        Self::write_new_job_status_with_index(writer, tenant, job_id, job_status)?;
+        Self::write_job_status_with_index(writer, tenant, job_id, job_status)?;
 
         self.enqueue_limit_task_at_index(
             writer,
-            tenant,
-            &first_task_id,
-            job_id,
-            1,
-            1,
-            0,
-            &job.limits,
-            priority,
-            start_at_ms,
-            now_ms,
-            Vec::new(),
-            task_group,
+            LimitTaskParams {
+                tenant,
+                task_id: &first_task_id,
+                job_id,
+                attempt_number: 1,
+                relative_attempt_number: 1,
+                limit_index: 0,
+                limits: &job.limits,
+                priority,
+                start_at_ms,
+                now_ms,
+                held_queues: Vec::new(),
+                task_group,
+            },
         )
         .await
     }
@@ -415,23 +407,25 @@ impl JobStoreShard {
     /// optimization. If granted, it proceeds to the next limit (iteratively).
     ///
     /// Returns a Vec of all grants made (queue, task_id) for potential rollback if DB write fails.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn enqueue_limit_task_at_index<W: WriteBatcher>(
         &self,
         writer: &mut W,
-        tenant: &str,
-        task_id: &str,
-        job_id: &str,
-        attempt_number: u32,
-        relative_attempt_number: u32,
-        limit_index: usize,
-        limits: &[Limit],
-        priority: u8,
-        start_at_ms: i64,
-        now_ms: i64,
-        held_queues: Vec<String>,
-        task_group: &str,
+        params: LimitTaskParams<'_>,
     ) -> Result<Vec<(String, String)>, JobStoreShardError> {
+        let LimitTaskParams {
+            tenant,
+            task_id,
+            job_id,
+            attempt_number,
+            relative_attempt_number,
+            limit_index,
+            limits,
+            priority,
+            start_at_ms,
+            now_ms,
+            held_queues,
+            task_group,
+        } = params;
         let mut grants = Vec::new();
         let mut current_index = limit_index;
         let mut current_held_queues = held_queues;
@@ -614,19 +608,8 @@ impl JobStoreShard {
         Self::write_job_status_with_index(writer, tenant, job_id, new_status)
     }
 
-    /// Write a new job status + index entry (no old status to clean up).
-    /// Use for brand-new jobs where there is no previous status.
-    pub(crate) fn write_new_job_status_with_index<W: WriteBatcher>(
-        writer: &mut W,
-        tenant: &str,
-        job_id: &str,
-        new_status: JobStatus,
-    ) -> Result<(), JobStoreShardError> {
-        Self::write_job_status_with_index(writer, tenant, job_id, new_status)
-    }
-
     /// Shared helper: write status value and index entry.
-    fn write_job_status_with_index<W: WriteBatcher>(
+    pub(crate) fn write_job_status_with_index<W: WriteBatcher>(
         writer: &mut W,
         tenant: &str,
         job_id: &str,

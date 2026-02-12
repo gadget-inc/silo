@@ -397,6 +397,18 @@ pub enum Backend {
     TurmoilFs,
 }
 
+impl Backend {
+    /// Returns true for backends that store data on a local filesystem.
+    pub fn is_local_fs(&self) -> bool {
+        match self {
+            Backend::Fs => true,
+            #[cfg(feature = "dst")]
+            Backend::TurmoilFs => true,
+            _ => false,
+        }
+    }
+}
+
 /// Expand environment variables in a string.
 ///
 /// Supports two syntaxes:

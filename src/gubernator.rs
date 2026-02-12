@@ -1,8 +1,6 @@
 //! Gubernator rate limit client with request coalescing.
 //!
-//! This module provides a client for the Gubernator rate limiting service.
-//! It supports request coalescing to batch multiple rate limit checks into
-//! a single RPC call for efficiency.
+//! This module provides a client for the Gubernator rate limiting service. It supports request coalescing to batch multiple rate limit checks into a single RPC call for efficiency.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -200,8 +198,7 @@ impl GubernatorClient {
         let handle = tokio::spawn(Self::coalesce_loop(client_clone, rx, config));
 
         // Replace the placeholder handle
-        // Note: This is a bit awkward but necessary for the self-referential setup
-        // In practice, the handle is just for cleanup and the loop runs independently
+        // Note: This is a bit awkward but necessary for the self-referential setup. In practice, the handle is just for cleanup and the loop runs independently
         drop(handle);
 
         client

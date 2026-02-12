@@ -158,7 +158,8 @@ impl JobStoreShard {
                 }
             }
         };
-        let _existing_task = decode_task(&task_raw)?;
+        // Validate that the raw bytes decode to a valid task before replacing it
+        decode_task(&task_raw)?;
 
         // Delete the pending task (regardless of type)
         txn.delete(&old_task_key)?;

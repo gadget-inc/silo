@@ -9,27 +9,21 @@
 //!   Enforced by `try_reserve` which atomically checks capacity and reserves a slot.
 //!
 //! - Holders only exist for tasks that are active (in DB queue, buffer, or leased).
-//!   Holders are created at enqueue (granted) or grant_next, and released when task completes,
-//!   lease expires, or cancelled task is cleaned up at dequeue.
+//!   Holders are created at enqueue (granted) or grant_next, and released when task completes, lease expires, or cancelled task is cleaned up at dequeue.
 //!
 //! # TOCTOU Prevention
 //!
-//! To prevent time-of-check-time-of-use races, in-memory concurrency counts are updated
-//! BEFORE the DB write. If the DB write fails, callers must use rollback methods to revert
-//! the in-memory state. This ensures no window exists where capacity appears available
-//! between check and grant.
+//! To prevent time-of-check-time-of-use races, in-memory concurrency counts are updated BEFORE the DB write. If the DB write fails, callers must use rollback methods to revert the in-memory state. This ensures no window exists where capacity appears available between check and grant.
 //!
 //! # Cancellation Semantics
 //!
-//! - [SILO-GRANT-CXL] Requests for cancelled jobs are skipped during grant_next.
-//!   When release_and_grant_next scans for the next request to grant, it checks if the job
-//!   is cancelled and deletes the request without granting.
+//! - Requests for cancelled jobs are skipped during grant_next.
+//!   When release_and_grant_next scans for the next request to grant, it checks if the job is cancelled and deletes the request without granting.
 //!
 //! - Requests for terminal jobs (Succeeded/Failed/Cancelled) are also skipped during grant_next.
-//!   This handles the case where a job succeeds via one attempt while a pending concurrency
-//!   request from a restart or retry is still in the DB.
+//!   This handles the case where a job succeeds via one attempt while a pending concurrency request from a restart or retry is still in the DB.
 //!
-//! - [SILO-DEQ-CXL-REL] Holders for cancelled tasks are released at dequeue cleanup.
+//! - Holders for cancelled tasks are released at dequeue cleanup.
 //!   When dequeue encounters a cancelled job's task, it releases any held tickets.
 
 use std::collections::{HashMap, HashSet};
@@ -37,7 +31,7 @@ use std::sync::Mutex;
 
 use slatedb::{Db, DbIterator, WriteBatch};
 
-use crate::job_store_shard::WriteBatcher;
+use crate::job_store_shard::helpers::WriteBatcher;
 
 use crate::codec::{
     decode_concurrency_action, encode_concurrency_action, encode_holder, encode_task,
@@ -46,52 +40,31 @@ use crate::dst_events::{self, DstEvent};
 use crate::job::{ConcurrencyLimit, JobView};
 use crate::job_store_shard::helpers::decode_job_status_owned;
 use crate::keys::{
-    concurrency_holder_key, concurrency_holders_queue_prefix, concurrency_request_key,
-    concurrency_request_prefix, end_bound, job_cancelled_key, job_status_key,
-    parse_concurrency_holder_key, parse_concurrency_request_key, task_key,
+    concurrency_counts_key, concurrency_holder_key, concurrency_holders_queue_prefix,
+    concurrency_request_key, concurrency_request_prefix, end_bound, job_cancelled_key,
+    job_status_key, parse_concurrency_holder_key, parse_concurrency_request_key, task_key,
 };
 use crate::shard_range::ShardRange;
 use crate::task::{ConcurrencyAction, HolderRecord, Task};
 
-/// Error type for concurrency operations that can fail due to storage errors.
+/// Error type for concurrency operations that can fail due to storage or encoding errors.
 #[derive(Debug, thiserror::Error)]
-pub enum HandleEnqueueError {
+pub enum ConcurrencyError {
     #[error(transparent)]
     Slate(#[from] slatedb::Error),
     #[error("encoding error: {0}")]
     Encoding(String),
 }
 
-impl From<String> for HandleEnqueueError {
+impl From<String> for ConcurrencyError {
     fn from(s: String) -> Self {
-        HandleEnqueueError::Encoding(s)
+        ConcurrencyError::Encoding(s)
     }
 }
 
-impl From<crate::codec::CodecError> for HandleEnqueueError {
+impl From<crate::codec::CodecError> for ConcurrencyError {
     fn from(e: crate::codec::CodecError) -> Self {
-        HandleEnqueueError::Encoding(e.to_string())
-    }
-}
-
-/// Error type for process ticket operations.
-#[derive(Debug, thiserror::Error)]
-pub enum ProcessTicketError {
-    #[error(transparent)]
-    Slate(#[from] slatedb::Error),
-    #[error("encoding error: {0}")]
-    Encoding(String),
-}
-
-impl From<String> for ProcessTicketError {
-    fn from(s: String) -> Self {
-        ProcessTicketError::Encoding(s)
-    }
-}
-
-impl From<crate::codec::CodecError> for ProcessTicketError {
-    fn from(e: crate::codec::CodecError) -> Self {
-        ProcessTicketError::Encoding(e.to_string())
+        ConcurrencyError::Encoding(e.to_string())
     }
 }
 
@@ -130,10 +103,10 @@ pub enum RequestTicketTaskOutcome {
 
 /// In-memory counts for concurrency holders
 pub struct ConcurrencyCounts {
-    // Composite key: "<tenant>|<queue>" -> set of task ids holding tickets
-    holders: Mutex<HashMap<String, HashSet<String>>>,
-    // Track which "tenant|queue" keys have been hydrated from durable storage
-    hydrated_queues: Mutex<HashSet<String>>,
+    // Composite key: storekey-encoded (tenant, queue) -> set of task ids holding tickets
+    holders: Mutex<HashMap<Vec<u8>, HashSet<String>>>,
+    // Track which (tenant, queue) keys have been hydrated from durable storage
+    hydrated_queues: Mutex<HashSet<Vec<u8>>>,
 }
 
 impl Default for ConcurrencyCounts {
@@ -152,12 +125,7 @@ impl ConcurrencyCounts {
 
     /// Hydrate a specific queue's concurrency holder state from durable storage.
     ///
-    /// Uses the per-queue prefix for efficient scanning of only the relevant holders.
-    ///
-    /// The `range` parameter filters holders to only load those for tenants within
-    /// the shard's range. This is critical after shard splits - both child shards
-    /// clone the same holder records, and without filtering, both would think they
-    /// own the same concurrency tickets, leading to limit violations.
+    /// Uses the per-queue prefix for efficient scanning of only the relevant holders. The `range` parameter filters holders to only load those for tenants within the shard's range. This is critical after shard splits - both child shards clone the same holder records, and without filtering, both would think they own the same concurrency tickets, leading to limit violations.
     pub async fn hydrate_queue(
         &self,
         db: &Db,
@@ -165,7 +133,7 @@ impl ConcurrencyCounts {
         tenant: &str,
         queue: &str,
     ) -> Result<(), slatedb::Error> {
-        let key = format!("{}|{}", tenant, queue);
+        let key = concurrency_counts_key(tenant, queue);
 
         // Scan holders for this specific tenant/queue using the queue prefix
         let start = concurrency_holders_queue_prefix(tenant, queue);
@@ -225,7 +193,7 @@ impl ConcurrencyCounts {
         tenant: &str,
         queue: &str,
     ) -> Result<(), slatedb::Error> {
-        let key = format!("{}|{}", tenant, queue);
+        let key = concurrency_counts_key(tenant, queue);
 
         // Fast path: check if already hydrated
         {
@@ -272,7 +240,7 @@ impl ConcurrencyCounts {
         limit: usize,
         job_id: &str,
     ) -> bool {
-        let key = format!("{}|{}", tenant, queue);
+        let key = concurrency_counts_key(tenant, queue);
         let reserved = {
             let mut h = self.holders.lock().unwrap();
             let set = h.entry(key).or_default();
@@ -303,16 +271,14 @@ impl ConcurrencyCounts {
     /// Useful for tests that want to use try_reserve_internal directly.
     #[doc(hidden)]
     pub fn mark_hydrated(&self, tenant: &str, queue: &str) {
-        let key = format!("{}|{}", tenant, queue);
+        let key = concurrency_counts_key(tenant, queue);
         let mut hydrated = self.hydrated_queues.lock().unwrap();
         hydrated.insert(key);
     }
 
-    /// Synchronous try_reserve for testing when the queue is known to be hydrated
-    /// or when testing in-memory reservation logic without DB.
+    /// Synchronous try_reserve for testing when the queue is known to be hydrated or when testing in-memory reservation logic without DB.
     ///
-    /// This method is exposed for testing purposes only. Production code should
-    /// use `try_reserve` which performs lazy hydration.
+    /// This method is exposed for testing purposes only. Production code should use `try_reserve` which performs lazy hydration.
     #[doc(hidden)]
     pub fn try_reserve_sync(
         &self,
@@ -327,7 +293,7 @@ impl ConcurrencyCounts {
 
     /// Release a reservation made by `try_reserve` if the DB write fails.
     pub fn release_reservation(&self, tenant: &str, queue: &str, task_id: &str) {
-        let key = format!("{}|{}", tenant, queue);
+        let key = concurrency_counts_key(tenant, queue);
         let mut h = self.holders.lock().unwrap();
         if let Some(set) = h.get_mut(&key) {
             set.remove(task_id);
@@ -345,7 +311,7 @@ impl ConcurrencyCounts {
         reserve_task_id: &str,
         reserve_job_id: &str,
     ) {
-        let key = format!("{}|{}", tenant, queue);
+        let key = concurrency_counts_key(tenant, queue);
         {
             let mut h = self.holders.lock().unwrap();
             let set = h.entry(key).or_default();
@@ -370,7 +336,7 @@ impl ConcurrencyCounts {
     /// Atomically release a task without granting to another.
     /// Used when there are no pending requests to grant to.
     pub fn atomic_release(&self, tenant: &str, queue: &str, task_id: &str) {
-        let key = format!("{}|{}", tenant, queue);
+        let key = concurrency_counts_key(tenant, queue);
         {
             let mut h = self.holders.lock().unwrap();
             if let Some(set) = h.get_mut(&key) {
@@ -395,7 +361,7 @@ impl ConcurrencyCounts {
         released_task_id: &str,
         reserved_task_id: &str,
     ) {
-        let key = format!("{}|{}", tenant, queue);
+        let key = concurrency_counts_key(tenant, queue);
         let mut h = self.holders.lock().unwrap();
         let set = h.entry(key).or_default();
         set.remove(reserved_task_id);
@@ -405,7 +371,7 @@ impl ConcurrencyCounts {
     /// Rollback a release operation if DB write fails.
     /// Re-adds the released task.
     pub fn rollback_release(&self, tenant: &str, queue: &str, task_id: &str) {
-        let key = format!("{}|{}", tenant, queue);
+        let key = concurrency_counts_key(tenant, queue);
         let mut h = self.holders.lock().unwrap();
         let set = h.entry(key).or_default();
         set.insert(task_id.to_string());
@@ -415,7 +381,7 @@ impl ConcurrencyCounts {
     /// Useful for testing and debugging.
     pub fn holder_count(&self, tenant: &str, queue: &str) -> usize {
         let h = self.holders.lock().unwrap();
-        let key = format!("{}|{}", tenant, queue);
+        let key = concurrency_counts_key(tenant, queue);
         h.get(&key).map(|s| s.len()).unwrap_or(0)
     }
 }
@@ -445,8 +411,7 @@ impl ConcurrencyManager {
     /// Handle concurrency for a new job enqueue.
     ///
     /// IMPORTANT: This method atomically reserves in-memory concurrency slots BEFORE returning.
-    /// If the DB write fails after calling this, you MUST call `rollback_grant` to release
-    /// the reservation.
+    /// If the DB write fails after calling this, you MUST call `rollback_grant` to release the reservation.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn handle_enqueue<W: WriteBatcher>(
         &self,
@@ -463,7 +428,7 @@ impl ConcurrencyManager {
         task_group: &str,
         attempt_number: u32,
         relative_attempt_number: u32,
-    ) -> Result<Option<RequestTicketOutcome>, HandleEnqueueError> {
+    ) -> Result<Option<RequestTicketOutcome>, ConcurrencyError> {
         // Only gate on the first limit (if any)
         let Some(limit) = limits.first() else {
             return Ok(None); // No limits
@@ -532,12 +497,10 @@ impl ConcurrencyManager {
                 task_group: task_group.to_string(),
             };
             let ticket_value = encode_task(&ticket)?;
-            writer
-                .put(
-                    task_key(task_group, start_at_ms, priority, job_id, attempt_number),
-                    &ticket_value,
-                )
-                .map_err(|e| e.to_string())?;
+            writer.put(
+                task_key(task_group, start_at_ms, priority, job_id, attempt_number),
+                &ticket_value,
+            )?;
             Ok(Some(RequestTicketOutcome::FutureRequestTaskWritten {
                 queue: queue.clone(),
                 task_id: request_id,
@@ -553,9 +516,7 @@ impl ConcurrencyManager {
 
     /// Process a RequestTicket task during dequeue.
     ///
-    /// IMPORTANT: This method atomically reserves in-memory concurrency slots when granting.
-    /// If the DB write fails after calling this with a Granted outcome, you MUST call
-    /// `rollback_grant` to release the reservation.
+    /// IMPORTANT: This method atomically reserves in-memory concurrency slots when granting.  If the DB write fails after calling this with a Granted outcome, you MUST call `rollback_grant` to release the reservation.
     #[allow(clippy::too_many_arguments)]
     pub async fn process_ticket_request_task(
         &self,
@@ -570,7 +531,7 @@ impl ConcurrencyManager {
         _attempt_number: u32,
         now_ms: i64,
         job_view: Option<&JobView>,
-    ) -> Result<RequestTicketTaskOutcome, ProcessTicketError> {
+    ) -> Result<RequestTicketTaskOutcome, ConcurrencyError> {
         // Check if job exists
         let Some(view) = job_view else {
             batch.delete(task_key);
@@ -611,9 +572,7 @@ impl ConcurrencyManager {
 
     /// Release holders and grant next requests.
     ///
-    /// IMPORTANT: This method updates in-memory counts BEFORE returning (atomically).
-    /// If the DB write fails, you MUST call `rollback_release_grants` with the returned
-    /// rollback info to revert the in-memory changes.
+    /// IMPORTANT: This method updates in-memory counts BEFORE returning (atomically). If the DB write fails, you MUST call `rollback_release_grants` with the returned rollback info to revert the in-memory changes.
     ///
     /// Returns a tuple of (rollback_info, queues_to_wakeup).
     /// Call broker.wakeup() for each queue after successful DB write.
@@ -625,7 +584,7 @@ impl ConcurrencyManager {
         queues: &[String],
         finished_task_id: &str,
         now_ms: i64,
-    ) -> Result<Vec<ReleaseGrantRollback>, String> {
+    ) -> Result<Vec<ReleaseGrantRollback>, ConcurrencyError> {
         let mut rollbacks: Vec<ReleaseGrantRollback> = Vec::new();
 
         for queue in queues {
@@ -636,15 +595,12 @@ impl ConcurrencyManager {
             // [SILO-GRANT-2] Find pending requests for this queue using binary storekey prefix
             let start = concurrency_request_prefix(tenant, queue);
             let end = end_bound(&start);
-            let mut iter: DbIterator = db
-                .scan::<Vec<u8>, _>(start..end)
-                .await
-                .map_err(|e| e.to_string())?;
+            let mut iter: DbIterator = db.scan::<Vec<u8>, _>(start..end).await?;
 
             let mut granted_task_id: Option<String> = None;
             let mut granted_job_id: Option<String> = None;
 
-            while let Some(kv) = iter.next().await.map_err(|e| e.to_string())? {
+            while let Some(kv) = iter.next().await? {
                 type ArchivedAction = <ConcurrencyAction as rkyv::Archive>::Archived;
                 let decoded = decode_concurrency_action(&kv.value)?;
                 let a: &ArchivedAction = decoded.archived();
@@ -662,11 +618,7 @@ impl ConcurrencyManager {
 
                         // [SILO-GRANT-CXL] Check if job is cancelled - if so, delete request and continue
                         let cancelled_key = job_cancelled_key(tenant, job_id_str);
-                        let is_cancelled = db
-                            .get(&cancelled_key)
-                            .await
-                            .map_err(|e| e.to_string())?
-                            .is_some();
+                        let is_cancelled = db.get(&cancelled_key).await?.is_some();
 
                         if is_cancelled {
                             // [SILO-GRANT-CXL-2] Delete the cancelled request without granting
@@ -684,9 +636,7 @@ impl ConcurrencyManager {
                         // a job succeeds via one attempt while a pending concurrency request from
                         // a restart or retry is still in the DB.
                         let status_key = job_status_key(tenant, job_id_str);
-                        if let Some(status_raw) =
-                            db.get(&status_key).await.map_err(|e| e.to_string())?
-                        {
+                        if let Some(status_raw) = db.get(&status_key).await? {
                             let status =
                                 decode_job_status_owned(&status_raw).map_err(|e| e.to_string())?;
                             if status.is_terminal() {
@@ -801,8 +751,6 @@ impl ConcurrencyManager {
     }
 }
 
-// Internal helper functions
-
 /// Append DB edits to grant a concurrency slot: creates holder record and RunAttempt task.
 /// Note: In-memory reservation should already be done via try_reserve before calling this.
 #[allow(clippy::too_many_arguments)]
@@ -818,14 +766,12 @@ fn append_grant_edits<W: WriteBatcher>(
     attempt_number: u32,
     relative_attempt_number: u32,
     task_group: &str,
-) -> Result<(), String> {
+) -> Result<(), ConcurrencyError> {
     let holder = HolderRecord {
         granted_at_ms: now_ms,
     };
     let holder_val = encode_holder(&holder)?;
-    writer
-        .put(concurrency_holder_key(tenant, queue, task_id), &holder_val)
-        .map_err(|e| e.to_string())?;
+    writer.put(concurrency_holder_key(tenant, queue, task_id), &holder_val)?;
 
     let task = Task::RunAttempt {
         id: task_id.to_string(),
@@ -837,12 +783,10 @@ fn append_grant_edits<W: WriteBatcher>(
         task_group: task_group.to_string(),
     };
     let task_value = encode_task(&task)?;
-    writer
-        .put(
-            task_key(task_group, start_time_ms, priority, job_id, attempt_number),
-            &task_value,
-        )
-        .map_err(|e| e.to_string())?;
+    writer.put(
+        task_key(task_group, start_time_ms, priority, job_id, attempt_number),
+        &task_value,
+    )?;
 
     Ok(())
 }
@@ -859,7 +803,7 @@ fn append_request_edits<W: WriteBatcher>(
     attempt_number: u32,
     relative_attempt_number: u32,
     task_group: &str,
-) -> Result<(), String> {
+) -> Result<(), ConcurrencyError> {
     let action = ConcurrencyAction::EnqueueTask {
         start_time_ms,
         priority,
@@ -876,8 +820,6 @@ fn append_request_edits<W: WriteBatcher>(
         priority,
         &uuid::Uuid::new_v4().to_string(),
     );
-    writer
-        .put(&req_key, &action_val)
-        .map_err(|e| e.to_string())?;
+    writer.put(&req_key, &action_val)?;
     Ok(())
 }

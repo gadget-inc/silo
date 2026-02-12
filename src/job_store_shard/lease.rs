@@ -12,7 +12,7 @@ use crate::dst_events::{self, DstEvent};
 use crate::job::{FloatingLimitState, JobStatus, JobView};
 use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt};
 use crate::job_store_shard::helpers::{DbWriteBatcher, now_epoch_ms};
-use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
+use crate::job_store_shard::{JobStoreShard, JobStoreShardError, LimitTaskParams};
 use crate::keys::{attempt_key, floating_limit_state_key, job_info_key, leased_task_key};
 use crate::task::{DEFAULT_LEASE_MS, HeartbeatResult, LeaseRecord};
 use tracing::{debug, info_span};
@@ -231,18 +231,20 @@ impl JobStoreShard {
                                     db: &self.db,
                                     batch: &mut batch,
                                 },
-                                &tenant,
-                                &next_task_id,
-                                &job_id,
-                                next_attempt_number,
-                                next_relative_attempt_number,
-                                0, // start from first limit
-                                &limits,
-                                priority,
-                                next_time,
-                                now_ms,
-                                Vec::new(), // no held queues - must re-acquire
-                                task_group,
+                                LimitTaskParams {
+                                    tenant: &tenant,
+                                    task_id: &next_task_id,
+                                    job_id: &job_id,
+                                    attempt_number: next_attempt_number,
+                                    relative_attempt_number: next_relative_attempt_number,
+                                    limit_index: 0,
+                                    limits: &limits,
+                                    priority,
+                                    start_at_ms: next_time,
+                                    now_ms,
+                                    held_queues: Vec::new(),
+                                    task_group,
+                                },
                             )
                             .await?;
 
@@ -303,8 +305,7 @@ impl JobStoreShard {
                 task_id,
                 now_ms,
             )
-            .await
-            .map_err(JobStoreShardError::Rkyv)?;
+            .await?;
 
         // Two-phase DST events: emit before write for correct causal ordering,
         // confirm after write succeeds, cancel if write fails.

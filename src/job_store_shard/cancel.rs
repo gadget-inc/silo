@@ -2,13 +2,13 @@
 
 use slatedb::IsolationLevel;
 
-use crate::codec::{decode_job_cancellation, encode_job_cancellation, encode_job_status};
+use crate::codec::{decode_job_cancellation, encode_job_cancellation};
 use crate::job::{JobCancellation, JobStatus, JobStatusKind};
 use crate::job_store_shard::helpers::{
     TxnWriter, decode_job_status_owned, now_epoch_ms, retry_on_txn_conflict,
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
-use crate::keys::{idx_status_time_key, job_cancelled_key, job_status_key, status_index_timestamp};
+use crate::keys::{job_cancelled_key, job_status_key};
 
 impl JobStoreShard {
     /// Cancel a job by id. Prevents further execution and signals running workers to stop.
@@ -83,24 +83,9 @@ impl JobStoreShard {
         // - On grant: cancelled requests are skipped and deleted
         // For Running jobs, status stays Running - worker discovers on heartbeat
         if was_scheduled {
-            // Delete old status index entry
-            let old_ts = status_index_timestamp(&status);
-            let old_time = idx_status_time_key(tenant, status.kind.as_str(), old_ts, id);
-            txn.delete(&old_time)?;
-
-            // Set status to Cancelled immediately since job never started
             let cancelled_status = JobStatus::cancelled(now_ms);
-            let status_value = encode_job_status(&cancelled_status)?;
-            txn.put(&status_key, &status_value)?;
-
-            // Insert new status index entry
-            let new_time = idx_status_time_key(
-                tenant,
-                cancelled_status.kind.as_str(),
-                cancelled_status.changed_at_ms,
-                id,
-            );
-            txn.put(&new_time, [])?;
+            self.set_job_status_with_index(&mut TxnWriter(&txn), tenant, id, cancelled_status)
+                .await?;
         }
 
         // Include counter in the transaction (unmark_write excludes it from conflict detection)
