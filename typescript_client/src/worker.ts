@@ -239,10 +239,7 @@ export class SiloWorker<
   private readonly _tasksPerPoll: number;
   private readonly _pollIntervalMs: number;
   private readonly _heartbeatIntervalMs: number;
-  private readonly _onError: (
-    error: Error,
-    context?: { taskId?: string },
-  ) => void;
+  private readonly _onError: (error: Error, context?: { taskId?: string }) => void;
 
   private _running = false;
   private _abortController: AbortController | null = null;
@@ -251,8 +248,7 @@ export class SiloWorker<
   /** Active task executions, keyed by task ID */
   private _activeExecutions: Map<string, TaskExecution> = new Map();
   /** Heartbeat intervals for active tasks (regular tasks and refresh tasks) */
-  private _heartbeatIntervals: Map<string, ReturnType<typeof setInterval>> =
-    new Map();
+  private _heartbeatIntervals: Map<string, ReturnType<typeof setInterval>> = new Map();
   /** Counter for per-worker round-robin server selection */
   private _pollCounter: number = 0;
 
@@ -264,17 +260,13 @@ export class SiloWorker<
     this._refreshHandler = options.refreshHandler;
     this._concurrentPollers = options.concurrentPollers ?? 1;
     this._maxConcurrentTasks = options.maxConcurrentTasks ?? 10;
-    this._tasksPerPoll =
-      options.tasksPerPoll ?? Math.ceil(this._maxConcurrentTasks / 2);
+    this._tasksPerPoll = options.tasksPerPoll ?? Math.ceil(this._maxConcurrentTasks / 2);
     this._pollIntervalMs = options.pollIntervalMs ?? 1000;
     this._heartbeatIntervalMs = options.heartbeatIntervalMs ?? 5000;
     this._onError =
       options.onError ??
       ((error, ctx) => {
-        console.error(
-          `[SiloWorker] Error${ctx?.taskId ? ` (task ${ctx.taskId})` : ""}:`,
-          error,
-        );
+        console.error(`[SiloWorker] Error${ctx?.taskId ? ` (task ${ctx.taskId})` : ""}:`, error);
       });
 
     // Initialize the task queue with concurrency limit
@@ -342,9 +334,7 @@ export class SiloWorker<
 
     // Wait for all queued and active tasks to complete with timeout
     const queueIdlePromise = this._taskQueue.onIdle();
-    const timeoutPromise = new Promise<void>((resolve) =>
-      setTimeout(resolve, timeoutMs),
-    );
+    const timeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, timeoutMs));
     await Promise.race([queueIdlePromise, timeoutPromise]);
 
     // Clear the queue (any remaining tasks will be abandoned)
@@ -371,9 +361,7 @@ export class SiloWorker<
         await this._poll();
       } catch (error) {
         if (this._running) {
-          this._onError(
-            error instanceof Error ? error : new Error(String(error)),
-          );
+          this._onError(error instanceof Error ? error : new Error(String(error)));
         }
       }
 
@@ -450,12 +438,9 @@ export class SiloWorker<
     // Start heartbeat for this task immediately
     const heartbeatInterval = setInterval(() => {
       this._sendHeartbeatForTask(execution).catch((error) => {
-        this._onError(
-          error instanceof Error ? error : new Error(String(error)),
-          {
-            taskId: task.id,
-          },
-        );
+        this._onError(error instanceof Error ? error : new Error(String(error)), {
+          taskId: task.id,
+        });
       });
     }, this._heartbeatIntervalMs);
     this._heartbeatIntervals.set(task.id, heartbeatInterval);
@@ -466,12 +451,9 @@ export class SiloWorker<
         await this._executeTaskWithExecution(execution);
       })
       .catch((error) => {
-        this._onError(
-          error instanceof Error ? error : new Error(String(error)),
-          {
-            taskId: task.id,
-          },
-        );
+        this._onError(error instanceof Error ? error : new Error(String(error)), {
+          taskId: task.id,
+        });
       })
       .finally(() => {
         // Stop heartbeat for this task
@@ -494,12 +476,9 @@ export class SiloWorker<
     // Start heartbeat for this refresh task (no TaskExecution needed, refresh tasks can't be cancelled)
     const heartbeatInterval = setInterval(() => {
       this._sendHeartbeat(task.id, shard).catch((error) => {
-        this._onError(
-          error instanceof Error ? error : new Error(String(error)),
-          {
-            taskId: task.id,
-          },
-        );
+        this._onError(error instanceof Error ? error : new Error(String(error)), {
+          taskId: task.id,
+        });
       });
     }, this._heartbeatIntervalMs);
     this._heartbeatIntervals.set(task.id, heartbeatInterval);
@@ -510,12 +489,9 @@ export class SiloWorker<
         await this._executeRefreshTask(task, shard);
       })
       .catch((error) => {
-        this._onError(
-          error instanceof Error ? error : new Error(String(error)),
-          {
-            taskId: task.id,
-          },
-        );
+        this._onError(error instanceof Error ? error : new Error(String(error)), {
+          taskId: task.id,
+        });
       })
       .finally(() => {
         // Stop heartbeat
@@ -572,10 +548,7 @@ export class SiloWorker<
   /**
    * Execute a refresh task and report its outcome.
    */
-  private async _executeRefreshTask(
-    task: RefreshTask,
-    shard: string,
-  ): Promise<void> {
+  private async _executeRefreshTask(task: RefreshTask, shard: string): Promise<void> {
     const context: RefreshTaskContext = {
       task,
       shard,
@@ -593,8 +566,7 @@ export class SiloWorker<
       };
     } catch (error) {
       // Handler threw an error, report as failure
-      const errorObj =
-        error instanceof Error ? error : new Error(String(error));
+      const errorObj = error instanceof Error ? error : new Error(String(error));
       outcome = {
         type: "failure",
         code: "REFRESH_HANDLER_ERROR",

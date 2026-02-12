@@ -1,9 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import {
-  SiloGRPCClient,
-  JobStatus,
-  JobNotFoundError,
-} from "../src/client";
+import { SiloGRPCClient, JobStatus, JobNotFoundError } from "../src/client";
 
 // Support comma-separated list of servers for multi-node testing
 const SILO_SERVERS = (
@@ -11,8 +7,7 @@ const SILO_SERVERS = (
   process.env.SILO_SERVER ||
   "localhost:7450"
 ).split(",");
-const RUN_INTEGRATION =
-  process.env.RUN_INTEGRATION === "true" || process.env.CI === "true";
+const RUN_INTEGRATION = process.env.RUN_INTEGRATION === "true" || process.env.CI === "true";
 
 /**
  * Integration tests for JobHandle.
@@ -351,17 +346,17 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
         startAtMs: BigInt(Date.now() + 60000),
       });
 
-      await expect(
-        handle.awaitResult({ pollIntervalMs: 50, timeoutMs: 200 })
-      ).rejects.toThrow(/Timeout/);
+      await expect(handle.awaitResult({ pollIntervalMs: 50, timeoutMs: 200 })).rejects.toThrow(
+        /Timeout/,
+      );
     });
 
     it("throws JobNotFoundError when job does not exist", async () => {
       const handle = client.handle("nonexistent-await-id", "some-tenant");
 
-      await expect(
-        handle.awaitResult({ pollIntervalMs: 50, timeoutMs: 1000 })
-      ).rejects.toThrow(JobNotFoundError);
+      await expect(handle.awaitResult({ pollIntervalMs: 50, timeoutMs: 1000 })).rejects.toThrow(
+        JobNotFoundError,
+      );
     });
   });
 });

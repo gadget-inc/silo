@@ -17,7 +17,7 @@ export function combineAbortSignals(...signals: AbortSignal[]): AbortSignal {
       () => {
         controller.abort();
       },
-      { once: true }
+      { once: true },
     );
   }
 

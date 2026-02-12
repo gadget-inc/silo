@@ -2,11 +2,7 @@ import type { Task as ProtoTask, Limit } from "./pb/silo";
 import { decodeBytes, type SiloGRPCClient } from "./client";
 
 export type { Limit } from "./pb/silo";
-export type {
-  ConcurrencyLimit,
-  FloatingConcurrencyLimit,
-  GubernatorRateLimit,
-} from "./pb/silo";
+export type { ConcurrencyLimit, FloatingConcurrencyLimit, GubernatorRateLimit } from "./pb/silo";
 
 /**
  * Reason why a task was cancelled.
@@ -109,11 +105,7 @@ export class TaskExecution<
   /** Reference to the client for cancel RPC */
   private readonly _client: SiloGRPCClient;
 
-  constructor(
-    task: Task<Payload, Metadata>,
-    workerId: string,
-    client: SiloGRPCClient,
-  ) {
+  constructor(task: Task<Payload, Metadata>, workerId: string, client: SiloGRPCClient) {
     this.task = task;
     this.workerId = workerId;
     this._client = client;
@@ -171,11 +163,9 @@ export class TaskExecution<
 
     // Call the server to persist the cancellation
     // We store the promise so we can await it if needed
-    this._cancelPromise = this._client
-      .cancelJob(this.task.jobId, this.task.tenantId)
-      .catch(() => {
-        // Ignore errors - the job may already be cancelled or completed
-      });
+    this._cancelPromise = this._client.cancelJob(this.task.jobId, this.task.tenantId).catch(() => {
+      // Ignore errors - the job may already be cancelled or completed
+    });
 
     await this._cancelPromise;
   }

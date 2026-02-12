@@ -162,7 +162,7 @@ pub async fn create_silo_client(
             Ok(Ok(channel)) => {
                 return Ok(SiloClient::new(channel)
                     .max_decoding_message_size(128 * 1024 * 1024)
-                    .max_encoding_message_size(128 * 1024 * 1024))
+                    .max_encoding_message_size(128 * 1024 * 1024));
             }
             Ok(Err(e)) => {
                 trace!(
