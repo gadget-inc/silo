@@ -11,7 +11,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio_stream::Stream;
 
-use super::CoordinationError;
+use crate::coordination::CoordinationError;
 
 /// Watch event types for lease changes
 #[derive(Debug, Clone)]

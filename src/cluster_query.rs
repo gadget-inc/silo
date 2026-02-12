@@ -537,13 +537,7 @@ async fn query_remote_shard_batches(
     loop {
         attempt += 1;
 
-        // Ensure address has http:// scheme for gRPC connection
-        let full_addr =
-            if current_addr.starts_with("http://") || current_addr.starts_with("https://") {
-                current_addr.clone()
-            } else {
-                format!("http://{}", current_addr)
-            };
+        let full_addr = crate::cluster_client::ensure_http_scheme(&current_addr);
         debug!(shard_id = %shard_id, addr = %full_addr, sql = %sql, attempt, "querying remote shard");
 
         // Connect to remote node

@@ -14,8 +14,10 @@ use crate::dst_events::{self, DstEvent};
 use crate::factory::ShardFactory;
 use crate::shard_range::{ShardId, ShardMap, SplitInProgress};
 
-use super::k8s_backend::{ConfigMapWatchEvent, K8sBackend, KubeBackend, LeaseWatchEvent};
-use super::{
+use crate::coordination::k8s_backend::{
+    ConfigMapWatchEvent, K8sBackend, KubeBackend, LeaseWatchEvent,
+};
+use crate::coordination::{
     CoordinationError, Coordinator, CoordinatorBase, K8sOwnershipToken, MemberInfo,
     ShardGuardContext, ShardGuardState, ShardOwnerMap, ShardPhase, SplitStorageBackend,
     compute_desired_shards_for_node, get_hostname, keys,

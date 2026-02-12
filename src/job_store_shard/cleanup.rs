@@ -45,21 +45,7 @@ pub struct CleanupResult {
     pub cancelled: bool,
 }
 
-/// Namespace prefixes for different key types.
-/// These match the prefix bytes defined in keys.rs.
-mod prefix {
-    pub const JOB_INFO: u8 = 0x01;
-    pub const JOB_STATUS: u8 = 0x02;
-    pub const IDX_STATUS_TIME: u8 = 0x03;
-    pub const IDX_METADATA: u8 = 0x04;
-    // Note: TASK (0x05) cleanup is handled separately via tasks_prefix()
-    pub const LEASE: u8 = 0x06;
-    pub const ATTEMPT: u8 = 0x07;
-    pub const CONCURRENCY_REQUEST: u8 = 0x08;
-    pub const CONCURRENCY_HOLDER: u8 = 0x09;
-    pub const JOB_CANCELLED: u8 = 0x0A;
-    pub const FLOATING_LIMIT: u8 = 0x0B;
-}
+use crate::keys::prefix;
 
 impl JobStoreShard {
     /// Check if cleanup has been cancelled and return a result if so.

@@ -5,8 +5,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod etcd_test_helpers;
 
 use etcd_test_helpers::EtcdConnection;
-use silo::coordination::etcd::{EtcdCoordinator, EtcdShardGuard, ShardPhase};
-use silo::coordination::{CoordinationError, Coordinator, ShardSplitter, SplitPhase};
+use silo::coordination::etcd::{EtcdCoordinator, EtcdShardGuard};
+use silo::coordination::{CoordinationError, Coordinator, ShardPhase, ShardSplitter, SplitPhase};
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::settings::{Backend, DatabaseTemplate};
@@ -3770,8 +3770,8 @@ async fn etcd_shard_close_failure_keeps_ownership() {
     //
     // Wait for the shard to be fully released after the close timeout + retry cycle.
     let released = wait_until(Duration::from_secs(15), || async {
-        let st = guard.state.lock().await;
-        st.phase == ShardPhase::Idle && !st.is_held
+        let st = guard.ctx.state.lock().await;
+        st.phase == ShardPhase::Idle && !st.has_token()
     })
     .await;
     assert!(released, "guard should release after close retry succeeds");

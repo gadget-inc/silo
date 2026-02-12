@@ -109,6 +109,15 @@ impl ClientConfig {
     }
 }
 
+/// Ensure an address has an `http://` scheme prefix for gRPC connections.
+pub fn ensure_http_scheme(addr: &str) -> String {
+    if addr.starts_with("http://") || addr.starts_with("https://") {
+        addr.to_string()
+    } else {
+        format!("http://{}", addr)
+    }
+}
+
 /// Helper to create a SiloClient with proper timeout and retry configuration.
 ///
 /// This function creates a gRPC client with configurable timeouts and automatic retry logic with exponential backoff. Retries are attempted when the initial connection fails.
@@ -117,6 +126,8 @@ impl ClientConfig {
 ///
 /// # Arguments
 /// * `uri` - The server URI (e.g., "http://localhost:9910")
+///
+/// The URI must have an http/https scheme; use [`ensure_http_scheme`] to add one if needed.
 /// * `config` - Client configuration with timeout and retry settings
 ///
 /// # Example
@@ -128,12 +139,7 @@ pub async fn create_silo_client(
     uri: &str,
     config: &ClientConfig,
 ) -> Result<SiloClient<Channel>, ClusterClientError> {
-    // Ensure address has http:// scheme
-    let full_uri = if uri.starts_with("http://") || uri.starts_with("https://") {
-        uri.to_string()
-    } else {
-        format!("http://{}", uri)
-    };
+    let full_uri = ensure_http_scheme(uri);
 
     let endpoint = config
         .configure_endpoint(&full_uri)
@@ -304,12 +310,7 @@ impl ClusterClient {
 
     /// Get or create a gRPC client connection to a remote node
     async fn get_client(&self, addr: &str) -> Result<SiloClient<Channel>, ClusterClientError> {
-        // Ensure address has http:// scheme for gRPC connection
-        let full_addr = if addr.starts_with("http://") || addr.starts_with("https://") {
-            addr.to_string()
-        } else {
-            format!("http://{}", addr)
-        };
+        let full_addr = ensure_http_scheme(addr);
 
         // Check cache first
         if let Some(client) = self.connections.get(&full_addr) {
@@ -328,11 +329,7 @@ impl ClusterClient {
 
     /// Invalidate a cached connection (call after RPC failures to force reconnect)
     pub fn invalidate_connection(&self, addr: &str) {
-        let full_addr = if addr.starts_with("http://") || addr.starts_with("https://") {
-            addr.to_string()
-        } else {
-            format!("http://{}", addr)
-        };
+        let full_addr = ensure_http_scheme(addr);
 
         if self.connections.remove(&full_addr).is_some() {
             debug!(addr = %full_addr, "invalidated cached connection");

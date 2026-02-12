@@ -55,7 +55,6 @@ impl JobStoreShard {
         task_group: &str,
         max_tasks: usize,
     ) -> Result<DequeueResult, JobStoreShardError> {
-        let _ts_enter = now_epoch_ms();
         if max_tasks == 0 {
             return Ok(DequeueResult {
                 tasks: Vec::new(),

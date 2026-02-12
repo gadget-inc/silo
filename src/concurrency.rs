@@ -31,7 +31,7 @@ use std::sync::Mutex;
 
 use slatedb::{Db, DbIterator, WriteBatch};
 
-use crate::job_store_shard::WriteBatcher;
+use crate::job_store_shard::helpers::WriteBatcher;
 
 use crate::codec::{
     decode_concurrency_action, encode_concurrency_action, encode_holder, encode_task,

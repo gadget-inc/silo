@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -245,6 +246,39 @@ fn map_err(e: JobStoreShardError) -> Status {
     }
 }
 
+/// Extract msgpack payload bytes from a proto SerializedBytes field.
+fn extract_payload_bytes(payload: &Option<SerializedBytes>) -> Vec<u8> {
+    payload
+        .as_ref()
+        .and_then(|p| {
+            p.encoding
+                .as_ref()
+                .map(|serialized_bytes::Encoding::Msgpack(data)| data.clone())
+        })
+        .unwrap_or_default()
+}
+
+/// Convert a proto RetryPolicy to a domain RetryPolicy.
+fn proto_retry_to_domain(rp: crate::pb::RetryPolicy) -> crate::retry::RetryPolicy {
+    crate::retry::RetryPolicy {
+        retry_count: rp.retry_count,
+        initial_interval_ms: rp.initial_interval_ms,
+        max_interval_ms: rp.max_interval_ms,
+        randomize_interval: rp.randomize_interval,
+        backoff_factor: rp.backoff_factor,
+    }
+}
+
+/// Convert a proto metadata map to an optional Vec of (key, value) pairs.
+/// Returns None if the map is empty.
+fn proto_metadata_to_domain(metadata: HashMap<String, String>) -> Option<Vec<(String, String)>> {
+    if metadata.is_empty() {
+        None
+    } else {
+        Some(metadata.into_iter().collect())
+    }
+}
+
 /// gRPC service implementation backed by a `ShardFactory`.
 #[derive(Clone)]
 pub struct SiloService {
@@ -274,6 +308,37 @@ impl SiloService {
     fn parse_shard_id(shard_str: &str) -> Result<crate::shard_range::ShardId, Status> {
         crate::shard_range::ShardId::parse(shard_str)
             .map_err(|_| Status::invalid_argument(format!("invalid shard ID: {}", shard_str)))
+    }
+
+    /// Execute a SQL query against a shard and return the resulting record batches.
+    async fn execute_shard_query(
+        &self,
+        shard_str: &str,
+        sql: &str,
+    ) -> Result<
+        (
+            datafusion::arrow::datatypes::SchemaRef,
+            Vec<datafusion::arrow::array::RecordBatch>,
+        ),
+        Status,
+    > {
+        let shard_id = Self::parse_shard_id(shard_str)?;
+        let shard = self.shard_with_redirect(&shard_id).await?;
+        let query_engine = shard.query_engine();
+
+        let dataframe = query_engine
+            .sql(sql)
+            .await
+            .map_err(|e| Status::invalid_argument(format!("SQL error: {}", e)))?;
+
+        let schema = dataframe.schema().inner().clone();
+
+        let batches = dataframe
+            .collect()
+            .await
+            .map_err(|e| Status::internal(format!("Query execution failed: {}", e)))?;
+
+        Ok((schema, batches))
     }
 
     /// Get shard with async lookup of owner for redirect metadata.
@@ -429,35 +494,14 @@ impl SiloService {
 
         Self::validate_metadata(&job_req.metadata)?;
 
-        let payload_bytes = job_req
-            .payload
-            .as_ref()
-            .and_then(|p| {
-                p.encoding
-                    .as_ref()
-                    .map(|serialized_bytes::Encoding::Msgpack(data)| data.clone())
-            })
-            .unwrap_or_default();
-
-        let retry = job_req.retry_policy.map(|rp| crate::retry::RetryPolicy {
-            retry_count: rp.retry_count,
-            initial_interval_ms: rp.initial_interval_ms,
-            max_interval_ms: rp.max_interval_ms,
-            randomize_interval: rp.randomize_interval,
-            backoff_factor: rp.backoff_factor,
-        });
-
+        let payload_bytes = extract_payload_bytes(&job_req.payload);
+        let retry = job_req.retry_policy.map(proto_retry_to_domain);
         let limits: Vec<crate::job::Limit> = job_req
             .limits
             .into_iter()
             .filter_map(proto_limit_to_job_limit)
             .collect();
-
-        let metadata: Option<Vec<(String, String)>> = if job_req.metadata.is_empty() {
-            None
-        } else {
-            Some(job_req.metadata.into_iter().collect())
-        };
+        let metadata = proto_metadata_to_domain(job_req.metadata);
 
         // Convert proto attempts to domain attempts
         let mut attempts = Vec::with_capacity(job_req.attempts.len());
@@ -689,24 +733,8 @@ impl Silo for SiloService {
             ));
         }
 
-        let payload_bytes = r
-            .payload
-            .as_ref()
-            .and_then(|p| {
-                p.encoding
-                    .as_ref()
-                    .map(|serialized_bytes::Encoding::Msgpack(data)| data.clone())
-            })
-            .unwrap_or_default();
-        let retry = r.retry_policy.map(|rp| crate::retry::RetryPolicy {
-            retry_count: rp.retry_count,
-            initial_interval_ms: rp.initial_interval_ms,
-            max_interval_ms: rp.max_interval_ms,
-            randomize_interval: rp.randomize_interval,
-            backoff_factor: rp.backoff_factor,
-        });
-
-        // Convert proto Limits to job::Limit
+        let payload_bytes = extract_payload_bytes(&r.payload);
+        let retry = r.retry_policy.map(proto_retry_to_domain);
         let limits: Vec<crate::job::Limit> = r
             .limits
             .into_iter()
@@ -714,11 +742,7 @@ impl Silo for SiloService {
             .collect();
 
         Self::validate_metadata(&r.metadata)?;
-        let metadata: Option<Vec<(String, String)>> = if r.metadata.is_empty() {
-            None
-        } else {
-            Some(r.metadata.into_iter().collect())
-        };
+        let metadata = proto_metadata_to_domain(r.metadata);
 
         // Validate task_group - required and must be <= 64 chars
         if r.task_group.is_empty() {
@@ -1033,7 +1057,6 @@ impl Silo for SiloService {
         let mut remaining = max_tasks;
 
         // Poll each shard until we have enough tasks or exhausted all shards
-        // TODO: Could implement fair round-robin across shards for better distribution
         for (shard_id, shard) in shards_to_poll {
             if remaining == 0 {
                 break;
@@ -1202,34 +1225,7 @@ impl Silo for SiloService {
 
     async fn query(&self, req: Request<QueryRequest>) -> Result<Response<QueryResponse>, Status> {
         let r = req.into_inner();
-        let shard_id = Self::parse_shard_id(&r.shard)?;
-        let shard = self.shard_with_redirect(&shard_id).await?;
-
-        // Get the cached query engine for this shard
-        let query_engine = shard.query_engine();
-
-        // Execute query
-        let dataframe = query_engine
-            .sql(&r.sql)
-            .await
-            .map_err(|e| Status::invalid_argument(format!("SQL error: {}", e)))?;
-
-        // Get schema before consuming dataframe
-        let schema = Arc::new(dataframe.schema().as_arrow().clone());
-
-        // Collect results
-        let batches = dataframe
-            .collect()
-            .await
-            .map_err(|e| Status::internal(format!("Query execution failed: {}", e)))?;
-
-        // Use schema from dataframe or first batch
-        let schema = if let Some(batch) = batches.first() {
-            batch.schema()
-        } else {
-            schema
-        };
-
+        let (schema, batches) = self.execute_shard_query(&r.shard, &r.sql).await?;
         let columns: Vec<ColumnInfo> = schema
             .fields()
             .iter()
@@ -1266,23 +1262,7 @@ impl Silo for SiloService {
         req: Request<QueryArrowRequest>,
     ) -> Result<Response<Self::QueryArrowStream>, Status> {
         let r = req.into_inner();
-        let shard_id = Self::parse_shard_id(&r.shard)?;
-        let shard = self.shard_with_redirect(&shard_id).await?;
-
-        // Get the cached query engine for this shard
-        let query_engine = shard.query_engine();
-
-        // Execute query
-        let dataframe = query_engine
-            .sql(&r.sql)
-            .await
-            .map_err(|e| Status::invalid_argument(format!("SQL error: {}", e)))?;
-
-        // Collect results
-        let batches = dataframe
-            .collect()
-            .await
-            .map_err(|e| Status::internal(format!("Query execution failed: {}", e)))?;
+        let (_schema, batches) = self.execute_shard_query(&r.shard, &r.sql).await?;
 
         // Create a stream that yields Arrow IPC messages
         let (tx, rx) = tokio::sync::mpsc::channel(16);

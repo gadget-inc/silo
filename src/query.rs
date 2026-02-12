@@ -1498,6 +1498,8 @@ fn display_status_kind(status: &crate::job::JobStatus) -> String {
     format!("{:?}", status.kind)
 }
 
+/// Get the schema from a set of record batches.
+///
 /// Convert Arrow RecordBatches directly to MessagePack-encoded rows.
 /// Uses streaming serialization to avoid buffering intermediate structures.
 pub fn record_batches_to_msgpack(batches: &[RecordBatch]) -> Result<Vec<Vec<u8>>, String> {

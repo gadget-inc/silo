@@ -11,12 +11,9 @@ use crate::dst_events::{self, DstEvent};
 use crate::factory::ShardFactory;
 use crate::shard_range::{ShardId, ShardMap, SplitInProgress};
 
-// Re-export ShardPhase for backwards compatibility (tests reference it from here)
-pub use super::ShardPhase;
-
-use super::{
+use crate::coordination::{
     CoordinationError, Coordinator, CoordinatorBase, MemberInfo, ShardGuardContext,
-    ShardGuardState, ShardOwnerMap, SplitStorageBackend, get_hostname, keys,
+    ShardGuardState, ShardOwnerMap, ShardPhase, SplitStorageBackend, get_hostname, keys,
 };
 
 /// etcd-based coordinator for distributed shard ownership.

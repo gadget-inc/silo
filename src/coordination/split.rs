@@ -9,7 +9,7 @@ use tracing::{debug, info};
 use crate::factory::ShardFactory;
 use crate::shard_range::{ShardId, ShardMap, SplitInProgress};
 
-use super::{CoordinationError, ShardOwnerMap};
+use crate::coordination::{CoordinationError, ShardOwnerMap};
 
 /// [SILO-COORD-INV-8] Status of post-split cleanup for a shard.
 ///
@@ -206,7 +206,7 @@ impl ShardSplitContext {
     }
 }
 
-use super::Coordinator;
+use crate::coordination::Coordinator;
 
 /// splitter for shard split operations.
 ///
