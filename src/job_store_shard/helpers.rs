@@ -19,10 +19,6 @@ use crate::task::Task;
 /// For batch operations, reads come from the underlying `Db` while writes go to the `WriteBatch`.
 /// For transaction operations, both reads and writes go through the `DbTransaction`.
 ///
-/// Note: Counter operations (merge) are intentionally NOT included in this trait because they must
-/// be done outside of transactions to avoid conflicts. See counters.rs for details.
-/// TODO(slatedb#1254): Once SlateDB supports excluding keys from conflict detection, we may be able
-/// to add merge operations back to this trait.
 pub(crate) trait WriteBatcher {
     /// Put a key-value pair.
     fn put<K: AsRef<[u8]>, V: AsRef<[u8]>>(
@@ -33,6 +29,18 @@ pub(crate) trait WriteBatcher {
 
     /// Delete a key.
     fn delete<K: AsRef<[u8]>>(&mut self, key: K) -> Result<(), slatedb::Error>;
+
+    /// Merge a value into a key (used for counter operations).
+    ///
+    /// For batches, this simply adds a merge to the batch.
+    /// For transactions, this merges and then calls `unmark_write` to exclude the key
+    /// from conflict detection, since counter keys are global shard-level keys that would
+    /// otherwise cause excessive transaction conflicts under concurrent load.
+    fn merge<K: AsRef<[u8]>, V: AsRef<[u8]>>(
+        &mut self,
+        key: K,
+        value: V,
+    ) -> Result<(), slatedb::Error>;
 
     /// Get a value by key.
     ///
@@ -67,6 +75,15 @@ impl WriteBatcher for DbWriteBatcher<'_> {
         Ok(())
     }
 
+    fn merge<K: AsRef<[u8]>, V: AsRef<[u8]>>(
+        &mut self,
+        key: K,
+        value: V,
+    ) -> Result<(), slatedb::Error> {
+        self.batch.merge(key, value);
+        Ok(())
+    }
+
     async fn get(&self, key: &[u8]) -> Result<Option<Bytes>, slatedb::Error> {
         self.db.get(key).await
     }
@@ -90,6 +107,17 @@ impl WriteBatcher for TxnWriter<'_> {
 
     fn delete<K: AsRef<[u8]>>(&mut self, key: K) -> Result<(), slatedb::Error> {
         self.0.delete(key)
+    }
+
+    fn merge<K: AsRef<[u8]>, V: AsRef<[u8]>>(
+        &mut self,
+        key: K,
+        value: V,
+    ) -> Result<(), slatedb::Error> {
+        let key_ref = key.as_ref();
+        self.0.merge(key_ref, value)?;
+        self.0.unmark_write([key_ref])?;
+        Ok(())
     }
 
     async fn get(&self, key: &[u8]) -> Result<Option<Bytes>, slatedb::Error> {

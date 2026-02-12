@@ -21,6 +21,7 @@ pub use expedite::JobNotExpediteableError;
 pub use lease_task::JobNotLeaseableError;
 pub use restart::JobNotRestartableError;
 
+use helpers::DbWriteBatcher;
 pub(crate) use helpers::WriteBatcher;
 pub use helpers::now_epoch_ms;
 
@@ -604,11 +605,15 @@ impl JobStoreShard {
         // Also delete cancellation record if present
         batch.delete(crate::keys::job_cancelled_key(tenant, id));
 
-        // Update counters in the same batch - safe since this is a WriteBatch, not a transaction
-        self.decrement_total_jobs_counter_batch(&mut batch);
+        // Update counters in the same batch
+        let mut writer = DbWriteBatcher {
+            db: &self.db,
+            batch: &mut batch,
+        };
+        self.decrement_total_jobs_counter(&mut writer)?;
         if status.is_some() {
             // Job was in terminal state (we already checked it's terminal above)
-            self.decrement_completed_jobs_counter_batch(&mut batch);
+            self.decrement_completed_jobs_counter(&mut writer)?;
         }
 
         self.db.write(batch).await?;

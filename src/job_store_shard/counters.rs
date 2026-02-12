@@ -9,30 +9,17 @@
 //! the current value, modifying it, and writing it back, we write a delta (+1 or -1) that gets
 //! merged at read time.
 //!
-//! ## Why counter operations are non-transactional
-//!
-//! Counter modifications are done as separate non-transactional writes rather than being included
-//! in the main operation's transaction. This is because:
-//!
-//! 1. SlateDB's SerializableSnapshot transactions track all keys that are read or written
-//! 2. Counter keys are global shard-level keys (single key per counter)
-//! 3. If counters were in transactions, ALL concurrent operations would conflict on these keys
-//! 4. This would cause excessive transaction retries under load (e.g., 20 concurrent enqueues)
-//!
-//! The counters don't need transactional guarantees because:
-//! - They're monotonic operations (increment/decrement)
-//! - They happen after the main transaction commits successfully
-//! - Eventual consistency is acceptable for counter values
-//!
-//! TODO: Once SlateDB supports excluding specific keys from conflict detection
-//! (https://github.com/slatedb/slatedb/issues/1254), we can move counter operations back
-//! inside transactions for better atomicity guarantees.
+//! Counter updates go through the `WriteBatcher::merge` method, which handles both batch and
+//! transaction paths. For transactions, `TxnWriter::merge` calls `unmark_write` to exclude
+//! counter keys from conflict detection, since these global shard-level keys would otherwise
+//! cause excessive transaction conflicts under concurrent load.
 
 use std::sync::Arc;
 
 use slatedb::bytes::Bytes;
-use slatedb::{MergeOperator, MergeOperatorError, WriteBatch};
+use slatedb::{MergeOperator, MergeOperatorError};
 
+use crate::job_store_shard::helpers::WriteBatcher;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{shard_completed_jobs_counter_key, shard_total_jobs_counter_key};
 
@@ -132,70 +119,43 @@ impl JobStoreShard {
         })
     }
 
-    // These add counter merges to an existing WriteBatch, avoiding the overhead
-    // of a separate database write. Use these when the caller already has a
-    // WriteBatch that will be written atomically.
-    //
-    // IMPORTANT: Do NOT use these inside DbTransaction paths — counter keys are
-    // global shard-level keys and will cause transaction conflicts under
-    // concurrent load. Use the standalone (non-batch) variants below instead.
-
-    /// Increment the total jobs counter within an existing WriteBatch.
-    pub(crate) fn increment_total_jobs_counter_batch(&self, batch: &mut WriteBatch) {
+    /// Increment the total jobs counter.
+    pub(crate) fn increment_total_jobs_counter(
+        &self,
+        writer: &mut impl WriteBatcher,
+    ) -> Result<(), JobStoreShardError> {
         let key = shard_total_jobs_counter_key();
-        batch.merge(&key, encode_counter(1));
-    }
-
-    /// Decrement the total jobs counter within an existing WriteBatch.
-    pub(crate) fn decrement_total_jobs_counter_batch(&self, batch: &mut WriteBatch) {
-        let key = shard_total_jobs_counter_key();
-        batch.merge(&key, encode_counter(-1));
-    }
-
-    /// Increment the completed jobs counter within an existing WriteBatch.
-    pub(crate) fn increment_completed_jobs_counter_batch(&self, batch: &mut WriteBatch) {
-        let key = shard_completed_jobs_counter_key();
-        batch.merge(&key, encode_counter(1));
-    }
-
-    /// Decrement the completed jobs counter within an existing WriteBatch.
-    pub(crate) fn decrement_completed_jobs_counter_batch(&self, batch: &mut WriteBatch) {
-        let key = shard_completed_jobs_counter_key();
-        batch.merge(&key, encode_counter(-1));
-    }
-
-    // These create their own WriteBatch and write directly to the database.
-    // Use these after transaction commits where counters cannot be included
-    // in the transaction due to conflict concerns.
-    //
-    // TODO(slatedb#1254): Once SlateDB supports excluding keys from conflict detection,
-    // consider moving these back to transactional operations for better atomicity.
-
-    /// Increment the total jobs counter as a standalone write.
-    /// Use after transaction-based operations where the counter can't be in the transaction.
-    pub(crate) async fn increment_total_jobs_counter(&self) -> Result<(), JobStoreShardError> {
-        let key = shard_total_jobs_counter_key();
-        let mut batch = WriteBatch::new();
-        batch.merge(&key, encode_counter(1));
-        self.db.write(batch).await?;
+        writer.merge(&key, encode_counter(1))?;
         Ok(())
     }
 
-    /// Increment the completed jobs counter as a standalone write.
-    pub(crate) async fn increment_completed_jobs_counter(&self) -> Result<(), JobStoreShardError> {
-        let key = shard_completed_jobs_counter_key();
-        let mut batch = WriteBatch::new();
-        batch.merge(&key, encode_counter(1));
-        self.db.write(batch).await?;
+    /// Decrement the total jobs counter.
+    pub(crate) fn decrement_total_jobs_counter(
+        &self,
+        writer: &mut impl WriteBatcher,
+    ) -> Result<(), JobStoreShardError> {
+        let key = shard_total_jobs_counter_key();
+        writer.merge(&key, encode_counter(-1))?;
         Ok(())
     }
 
-    /// Decrement the completed jobs counter as a standalone write.
-    pub(crate) async fn decrement_completed_jobs_counter(&self) -> Result<(), JobStoreShardError> {
+    /// Increment the completed jobs counter.
+    pub(crate) fn increment_completed_jobs_counter(
+        &self,
+        writer: &mut impl WriteBatcher,
+    ) -> Result<(), JobStoreShardError> {
         let key = shard_completed_jobs_counter_key();
-        let mut batch = WriteBatch::new();
-        batch.merge(&key, encode_counter(-1));
-        self.db.write(batch).await?;
+        writer.merge(&key, encode_counter(1))?;
+        Ok(())
+    }
+
+    /// Decrement the completed jobs counter.
+    pub(crate) fn decrement_completed_jobs_counter(
+        &self,
+        writer: &mut impl WriteBatcher,
+    ) -> Result<(), JobStoreShardError> {
+        let key = shard_completed_jobs_counter_key();
+        writer.merge(&key, encode_counter(-1))?;
         Ok(())
     }
 }

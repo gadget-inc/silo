@@ -143,7 +143,10 @@ impl JobStoreShard {
             .await?;
 
         // Include counter in the same batch for efficiency
-        self.increment_total_jobs_counter_batch(&mut batch);
+        self.increment_total_jobs_counter(&mut DbWriteBatcher {
+            db: &self.db,
+            batch: &mut batch,
+        })?;
 
         // Two-phase DST event: emit before write for correct causal ordering,
         // confirm after write succeeds, cancel if write fails.
@@ -272,6 +275,9 @@ impl JobStoreShard {
             )
             .await?;
 
+        // Include counter in the transaction (unmark_write excludes it from conflict detection)
+        self.increment_total_jobs_counter(&mut TxnWriter(&txn))?;
+
         // Two-phase DST event: emit before commit for correct causal ordering,
         // confirm after commit succeeds, cancel if commit fails.
         let write_op = dst_events::next_write_op();
@@ -296,9 +302,6 @@ impl JobStoreShard {
             return Err(e.into());
         }
         dst_events::confirm_write(write_op);
-
-        // Counter must be outside transaction to avoid conflicts on shared counter key
-        self.increment_total_jobs_counter().await?;
 
         self.finish_enqueue(job_id, start_at_ms, &grants).await
     }

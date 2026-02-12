@@ -9,7 +9,7 @@ use crate::codec::encode_job_status;
 use crate::dst_events::{self, DstEvent};
 use crate::job::{JobStatus, JobStatusKind};
 use crate::job_store_shard::helpers::{
-    decode_job_status_owned, now_epoch_ms, retry_on_txn_conflict,
+    TxnWriter, decode_job_status_owned, now_epoch_ms, retry_on_txn_conflict,
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{attempt_prefix, idx_status_time_key, job_cancelled_key, job_status_key};
@@ -197,6 +197,9 @@ impl JobStoreShard {
             write_op,
         );
 
+        // Include counter in the transaction (unmark_write excludes it from conflict detection)
+        self.decrement_completed_jobs_counter(&mut TxnWriter(&txn))?;
+
         // Commit the transaction
         match txn.commit().await {
             Ok(()) => dst_events::confirm_write(write_op),
@@ -205,11 +208,6 @@ impl JobStoreShard {
                 return Err(e.into());
             }
         }
-
-        // Decrement completed jobs counter - job is going from terminal to scheduled.
-        // This is done outside the transaction to avoid conflicts - see counters.rs for details.
-        // TODO(slatedb#1254): Move back inside transaction once SlateDB supports key exclusion.
-        self.decrement_completed_jobs_counter().await?;
 
         // Wake the broker to pick up the new task promptly
         if start_at_ms <= now_epoch_ms() {

@@ -340,10 +340,19 @@ impl ShardFactory {
                         tracing::info!(shard_id = %shard_id, "closed shard");
                     }
                     Ok(Err(e)) => {
-                        // Close returned an error - re-insert so close can be retried
-                        tracing::error!(shard_id = %shard_id, error = %e, "factory.close: shard.close() failed, re-inserting into instances");
-                        self.instances.insert(id, entry);
-                        return Err(e);
+                        // If the DB is already closed (e.g. a previous timed-out close
+                        // actually completed internally), treat it as a successful close
+                        // rather than re-inserting. The shard is already shut down.
+                        if let JobStoreShardError::Slate(ref slate_err) = e
+                            && matches!(slate_err.kind(), slatedb::ErrorKind::Closed(_))
+                        {
+                            tracing::info!(shard_id = %shard_id, "factory.close: shard already closed, treating as success");
+                        } else {
+                            // Close returned an error - re-insert so close can be retried
+                            tracing::error!(shard_id = %shard_id, error = %e, "factory.close: shard.close() failed, re-inserting into instances");
+                            self.instances.insert(id, entry);
+                            return Err(e);
+                        }
                     }
                     Err(_elapsed) => {
                         // Timeout - re-insert so close can be retried
