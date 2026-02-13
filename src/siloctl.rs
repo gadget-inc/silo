@@ -53,6 +53,36 @@ async fn connect(address: &str) -> anyhow::Result<SiloClient<Channel>> {
     Ok(SiloClient::new(channel))
 }
 
+/// Connect to the node that owns a specific shard.
+///
+/// Queries GetClusterInfo on the initial address to discover cluster topology,
+/// then connects to the node owning the given shard. If the shard is already on
+/// the connected node, reuses the existing connection.
+async fn connect_to_shard_owner(
+    address: &str,
+    shard_id: &str,
+) -> anyhow::Result<SiloClient<Channel>> {
+    let mut client = connect(address).await?;
+    let response = client
+        .get_cluster_info(GetClusterInfoRequest {})
+        .await?
+        .into_inner();
+
+    let owner = response
+        .shard_owners
+        .iter()
+        .find(|s| s.shard_id == shard_id)
+        .ok_or_else(|| anyhow::anyhow!("shard '{}' not found in cluster", shard_id))?;
+
+    // If the shard is on this node, reuse the existing connection
+    if owner.grpc_addr == response.this_grpc_addr {
+        return Ok(client);
+    }
+
+    // Connect to the shard's owner
+    connect(&owner.grpc_addr).await
+}
+
 /// Convert job status enum to string
 fn job_status_to_string(status: i32) -> &'static str {
     match status {
@@ -106,6 +136,8 @@ pub async fn cluster_info<W: Write>(opts: &GlobalOptions, out: &mut W) -> anyhow
                     "shard_id": s.shard_id,
                     "node_id": s.node_id,
                     "grpc_addr": s.grpc_addr,
+                    "range_start": s.range_start,
+                    "range_end": s.range_end,
                 })
             }).collect::<Vec<_>>(),
         });
@@ -121,13 +153,30 @@ pub async fn cluster_info<W: Write>(opts: &GlobalOptions, out: &mut W) -> anyhow
         )?;
         writeln!(out)?;
         writeln!(out, "Shard Ownership:")?;
-        writeln!(out, "{:>8}  {:>20}  gRPC Address", "Shard", "Node ID")?;
-        writeln!(out, "{}", "-".repeat(60))?;
+        writeln!(
+            out,
+            "{:<38}  {:<14}  {:<20}  gRPC Address",
+            "Shard", "Range", "Node ID"
+        )?;
+        writeln!(out, "{}", "-".repeat(100))?;
         for owner in &response.shard_owners {
+            let range = format!(
+                "[{}, {})",
+                if owner.range_start.is_empty() {
+                    "-\u{221e}"
+                } else {
+                    &owner.range_start
+                },
+                if owner.range_end.is_empty() {
+                    "+\u{221e}"
+                } else {
+                    &owner.range_end
+                }
+            );
             writeln!(
                 out,
-                "{:>8}  {:>20}  {}",
-                owner.shard_id, owner.node_id, owner.grpc_addr
+                "{:<38}  {:<14}  {:<20}  {}",
+                owner.shard_id, range, owner.node_id, owner.grpc_addr
             )?;
         }
     }
@@ -143,7 +192,7 @@ pub async fn job_get<W: Write>(
     id: &str,
     include_attempts: bool,
 ) -> anyhow::Result<()> {
-    let mut client = connect(&opts.address).await?;
+    let mut client = connect_to_shard_owner(&opts.address, shard).await?;
     let response = client
         .get_job(GetJobRequest {
             shard: shard.to_string(),
@@ -263,7 +312,7 @@ pub async fn job_cancel<W: Write>(
     shard: &str,
     id: &str,
 ) -> anyhow::Result<()> {
-    let mut client = connect(&opts.address).await?;
+    let mut client = connect_to_shard_owner(&opts.address, shard).await?;
     client
         .cancel_job(CancelJobRequest {
             shard: shard.to_string(),
@@ -288,7 +337,7 @@ pub async fn job_restart<W: Write>(
     shard: &str,
     id: &str,
 ) -> anyhow::Result<()> {
-    let mut client = connect(&opts.address).await?;
+    let mut client = connect_to_shard_owner(&opts.address, shard).await?;
     client
         .restart_job(RestartJobRequest {
             shard: shard.to_string(),
@@ -313,7 +362,7 @@ pub async fn job_expedite<W: Write>(
     shard: &str,
     id: &str,
 ) -> anyhow::Result<()> {
-    let mut client = connect(&opts.address).await?;
+    let mut client = connect_to_shard_owner(&opts.address, shard).await?;
     client
         .expedite_job(ExpediteJobRequest {
             shard: shard.to_string(),
@@ -338,7 +387,7 @@ pub async fn job_delete<W: Write>(
     shard: &str,
     id: &str,
 ) -> anyhow::Result<()> {
-    let mut client = connect(&opts.address).await?;
+    let mut client = connect_to_shard_owner(&opts.address, shard).await?;
     client
         .delete_job(DeleteJobRequest {
             shard: shard.to_string(),
@@ -363,7 +412,7 @@ pub async fn query<W: Write>(
     shard: &str,
     sql: &str,
 ) -> anyhow::Result<()> {
-    let mut client = connect(&opts.address).await?;
+    let mut client = connect_to_shard_owner(&opts.address, shard).await?;
     let response = client
         .query(QueryRequest {
             shard: shard.to_string(),
@@ -553,43 +602,47 @@ pub async fn shard_split<W: Write>(
     auto: bool,
     wait: bool,
 ) -> anyhow::Result<()> {
-    let mut client = connect(&opts.address).await?;
+    // Discover topology and connect to the shard's owner
+    let mut discovery_client = connect(&opts.address).await?;
+    let cluster_info = discovery_client
+        .get_cluster_info(GetClusterInfoRequest {})
+        .await?
+        .into_inner();
 
-    // If auto is set and no split point provided, we need to get the shard's range
-    // and compute the midpoint. For now, we require either --at or --auto.
+    let shard_owner = cluster_info
+        .shard_owners
+        .iter()
+        .find(|s| s.shard_id == shard)
+        .ok_or_else(|| anyhow::anyhow!("shard '{}' not found in cluster", shard))?;
+
+    // Connect to the shard's owner (reuse connection if same node)
+    let mut client = if shard_owner.grpc_addr == cluster_info.this_grpc_addr {
+        discovery_client
+    } else {
+        connect(&shard_owner.grpc_addr).await?
+    };
+
+    // Determine the split point
     let split_point = if let Some(point) = split_point {
         point
     } else if auto {
-        // Get cluster info to find the shard's range
-        let cluster_info = client
-            .get_cluster_info(GetClusterInfoRequest {})
-            .await?
-            .into_inner();
-
-        // Find the shard in the cluster info
-        let shard_info = cluster_info
-            .shard_owners
-            .iter()
-            .find(|s| s.shard_id == shard)
-            .ok_or_else(|| anyhow::anyhow!("Shard '{}' not found in cluster", shard))?;
-
-        // Compute midpoint of the range
-        let start = if shard_info.range_start.is_empty() {
+        // Compute midpoint of the shard's range
+        let start = if shard_owner.range_start.is_empty() {
             "0".to_string()
         } else {
-            shard_info.range_start.clone()
+            shard_owner.range_start.clone()
         };
-        let end = if shard_info.range_end.is_empty() {
+        let end = if shard_owner.range_end.is_empty() {
             "zzzzzzzz".to_string()
         } else {
-            shard_info.range_end.clone()
+            shard_owner.range_end.clone()
         };
 
         compute_midpoint(&start, &end).ok_or_else(|| {
             anyhow::anyhow!(
                 "Cannot compute midpoint for range [{}, {})",
-                shard_info.range_start,
-                shard_info.range_end
+                shard_owner.range_start,
+                shard_owner.range_end
             )
         })?
     } else {
@@ -674,7 +727,7 @@ pub async fn shard_split_status<W: Write>(
     out: &mut W,
     shard: &str,
 ) -> anyhow::Result<()> {
-    let mut client = connect(&opts.address).await?;
+    let mut client = connect_to_shard_owner(&opts.address, shard).await?;
 
     let response = client
         .get_split_status(GetSplitStatusRequest {
@@ -727,7 +780,7 @@ pub async fn shard_configure<W: Write>(
     shard: &str,
     ring: Option<String>,
 ) -> anyhow::Result<()> {
-    let mut client = connect(&opts.address).await?;
+    let mut client = connect_to_shard_owner(&opts.address, shard).await?;
 
     let response = client
         .configure_shard(ConfigureShardRequest {
@@ -774,7 +827,7 @@ pub async fn shard_force_release<W: Write>(
     out: &mut W,
     shard: &str,
 ) -> anyhow::Result<()> {
-    let mut client = connect(&opts.address).await?;
+    let mut client = connect_to_shard_owner(&opts.address, shard).await?;
 
     let response = client
         .force_release_shard(ForceReleaseShardRequest {
