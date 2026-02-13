@@ -35,10 +35,10 @@ use std::time::Duration;
 /// Concurrency limit configurations - mix of strict and permissive limits
 /// to stress concurrency tracking under latency conditions.
 const CONCURRENCY_LIMITS: &[(&str, u32)] = &[
-    ("latency-serial", 1),   // Strict serialization - most sensitive to races
-    ("latency-pair", 2),     // Small concurrency window
-    ("latency-quad", 4),     // Medium concurrency
-    ("latency-octet", 8),    // Larger concurrency
+    ("latency-serial", 1),    // Strict serialization - most sensitive to races
+    ("latency-pair", 2),      // Small concurrency window
+    ("latency-quad", 4),      // Medium concurrency
+    ("latency-octet", 8),     // Larger concurrency
     ("latency-unlimited", 0), // No limit (0 means unlimited)
 ];
 
@@ -587,7 +587,9 @@ pub fn run() {
             }
 
             // Verify concurrency limits were never exceeded
-            verifier_tracker.concurrency.verify_no_duplicate_job_leases();
+            verifier_tracker
+                .concurrency
+                .verify_no_duplicate_job_leases();
 
             let enqueued = verifier_enqueued.load(Ordering::SeqCst);
             let completed = verifier_completed.load(Ordering::SeqCst);
@@ -619,9 +621,7 @@ pub fn run() {
                     "Not all jobs reached terminal state: {}/{} jobs are terminal. \
                      With no message loss, all jobs should complete.\n\
                      Non-terminal jobs: {:?}",
-                    terminal,
-                    enqueued,
-                    non_terminal
+                    terminal, enqueued, non_terminal
                 );
             }
 

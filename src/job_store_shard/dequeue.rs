@@ -5,8 +5,8 @@ use slatedb::{DbIterator, WriteBatch};
 
 use crate::codec::{
     DecodedCheckRateLimitTask, DecodedRefreshFloatingLimitTask, DecodedRequestTicketTask,
-    DecodedRunAttemptTask, DecodedTaskKind, decode_task, decode_task_view_unchecked,
-    encode_attempt, encode_lease,
+    DecodedRunAttemptTask, DecodedTaskKind, decode_task, decode_task_view, encode_attempt,
+    encode_lease, encode_lease_from_request_ticket_grant, encode_lease_from_run_attempt,
 };
 use crate::concurrency::{ReleaseGrantRollback, RequestTicketTaskOutcome};
 use crate::dst_events::{self, DstEvent};
@@ -107,7 +107,7 @@ impl JobStoreShard {
             let shard_range = self.get_range();
 
             for entry in &claimed {
-                let task = match decode_task_view_unchecked(&entry.value) {
+                let task = match decode_task_view(&entry.value) {
                     Ok(task) => task,
                     Err(_) => {
                         // Skip malformed tasks and clean up key.
@@ -285,7 +285,7 @@ impl JobStoreShard {
 
         // Build LeasedTask results from pending_attempts using pre-encoded bytes
         for (tenant, job_view, attempt_bytes) in pending_attempts.into_iter() {
-            let attempt_view = JobAttemptView::new(&attempt_bytes)?;
+            let attempt_view = JobAttemptView::new(attempt_bytes)?;
             out.push(LeasedTask::new(tenant, job_view, attempt_view));
         }
         tracing::debug!(
@@ -306,25 +306,16 @@ impl JobStoreShard {
     async fn write_lease_and_attempt(
         &self,
         batch: &mut WriteBatch,
-        worker_id: &str,
-        task: &Task,
+        leased_value: Vec<u8>,
         task_id: &str,
         tenant: &str,
         job_id: &str,
         attempt_number: u32,
         relative_attempt_number: u32,
         now_ms: i64,
-        expiry_ms: i64,
     ) -> Result<Vec<u8>, JobStoreShardError> {
         // [SILO-DEQ-4] Create lease record
         let lease_key = leased_task_key(task_id);
-        let record = LeaseRecord {
-            worker_id: worker_id.to_string(),
-            task: task.clone(),
-            expiry_ms,
-            started_at_ms: now_ms,
-        };
-        let leased_value = encode_lease(&record)?;
         batch.put(&lease_key, &leased_value);
 
         // [SILO-DEQ-6] Mark job as running
@@ -371,7 +362,6 @@ impl JobStoreShard {
         let attempt_number = task.attempt_number();
         let relative_attempt_number = task.relative_attempt_number();
         let request_id = task.request_id();
-        let req_task_group = task.task_group();
         state.processed_internal = true;
         let tenant = tenant.to_string();
 
@@ -415,29 +405,18 @@ impl JobStoreShard {
                     .grants_to_rollback
                     .push((tenant.clone(), queue.clone(), request_id.clone()));
 
-                // Create RunAttempt task for the lease
-                let run = Task::RunAttempt {
-                    id: request_id.clone(),
-                    tenant: tenant.clone(),
-                    job_id: job_id.to_string(),
-                    attempt_number,
-                    relative_attempt_number,
-                    held_queues: vec![queue],
-                    task_group: req_task_group.to_string(),
-                };
-
                 let attempt_val = self
                     .write_lease_and_attempt(
                         &mut state.batch,
-                        worker_id,
-                        &run,
+                        encode_lease_from_request_ticket_grant(
+                            worker_id, task, &queue, expiry_ms, now_ms,
+                        )?,
                         &request_id,
                         &tenant,
                         job_id,
                         attempt_number,
                         relative_attempt_number,
                         now_ms,
-                        expiry_ms,
                     )
                     .await?;
 
@@ -482,7 +461,6 @@ impl JobStoreShard {
         let limit_index = task.limit_index();
         let rate_limit = task.rate_limit()?;
         let retry_count = task.retry_count();
-        let started_at_ms = task.started_at_ms();
         let priority = task.priority();
         let held_queues = task.held_queues();
         let check_task_group = task.task_group();
@@ -553,39 +531,19 @@ impl JobStoreShard {
                     result.reset_time_ms,
                     now_ms,
                 );
-                self.schedule_rate_limit_retry(
+                self.schedule_rate_limit_retry_from_task(
                     &mut DbWriteBatcher::new(&self.db, &mut state.batch),
-                    &tenant,
-                    job_id,
-                    attempt_number,
-                    check_relative_attempt_number,
-                    limit_index,
-                    &rate_limit,
-                    retry_count,
-                    started_at_ms,
-                    priority,
-                    &held_queues,
+                    task,
                     retry_backoff,
-                    check_task_group,
                 )?;
             }
             Err(e) => {
                 tracing::warn!(job_id = %job_id, error = %e, "gubernator rate limit check failed, will retry");
                 let retry_backoff = now_ms + rate_limit.retry_initial_backoff_ms;
-                self.schedule_rate_limit_retry(
+                self.schedule_rate_limit_retry_from_task(
                     &mut DbWriteBatcher::new(&self.db, &mut state.batch),
-                    &tenant,
-                    job_id,
-                    attempt_number,
-                    check_relative_attempt_number,
-                    limit_index,
-                    &rate_limit,
-                    retry_count,
-                    started_at_ms,
-                    priority,
-                    &held_queues,
+                    task,
                     retry_backoff,
-                    check_task_group,
                 )?;
             }
         }
@@ -710,19 +668,16 @@ impl JobStoreShard {
         // [SILO-DEQ-3] Delete task from task queue
         state.batch.delete(&entry.key);
 
-        let run_task = task.to_owned();
         let attempt_val = self
             .write_lease_and_attempt(
                 &mut state.batch,
-                worker_id,
-                &run_task,
+                encode_lease_from_run_attempt(worker_id, task, expiry_ms, now_ms)?,
                 task_id,
                 tenant,
                 job_id,
                 attempt_number,
                 relative_attempt_number,
                 now_ms,
-                expiry_ms,
             )
             .await?;
 

@@ -5,8 +5,8 @@ use slatedb::{DbIterator, WriteBatch};
 use uuid::Uuid;
 
 use crate::codec::{
-    decode_floating_limit_state, decode_lease, encode_attempt, encode_floating_limit_state,
-    encode_lease,
+    decode_floating_limit_state_bytes, decode_lease, encode_attempt, encode_floating_limit_state,
+    encode_lease, encode_lease_from_run_attempt,
 };
 use crate::dst_events::{self, DstEvent};
 use crate::job::{FloatingLimitState, JobStatus, JobView};
@@ -52,14 +52,24 @@ impl JobStoreShard {
         let job_id = decoded.job_id().to_string();
 
         // [SILO-HB-3] Renew by creating new record with updated expiry
-        // Note: to_task() allocates, but we need owned Task for LeaseRecord
-        let record = LeaseRecord {
-            worker_id: current_owner.to_string(),
-            task: decoded.to_task()?,
-            expiry_ms: now_epoch_ms() + DEFAULT_LEASE_MS,
-            started_at_ms: decoded.started_at_ms(),
+        let expiry_ms = now_epoch_ms() + DEFAULT_LEASE_MS;
+        let value = if let Some(run_attempt) = decoded.run_attempt_task() {
+            encode_lease_from_run_attempt(
+                current_owner,
+                run_attempt,
+                expiry_ms,
+                decoded.started_at_ms(),
+            )?
+        } else {
+            // Fallback for non-RunAttempt leases (for example refresh tasks).
+            let record = LeaseRecord {
+                worker_id: current_owner.to_string(),
+                task: decoded.to_task()?,
+                expiry_ms,
+                started_at_ms: decoded.started_at_ms(),
+            };
+            encode_lease(&record)?
         };
-        let value = encode_lease(&record)?;
 
         let mut batch = WriteBatch::new();
         batch.put(&key, &value);
@@ -482,7 +492,7 @@ impl JobStoreShard {
         tenant: &str,
         task_id: &str,
         queue_key: &str,
-        decoded: &crate::codec::DecodedLease,
+        decoded: &crate::codec::DecodedLease<'_>,
     ) -> Result<(), JobStoreShardError> {
         let now_ms = now_epoch_ms();
         let lease_key = leased_task_key(task_id);
@@ -505,7 +515,7 @@ impl JobStoreShard {
             return Ok(());
         };
 
-        let decoded_state = decode_floating_limit_state(&raw)?;
+        let decoded_state = decode_floating_limit_state_bytes(raw)?;
 
         // Reset the state to allow a new refresh to be scheduled
         // We don't increment retry_count here - we rely on the normal periodic refresh mechanism

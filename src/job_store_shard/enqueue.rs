@@ -72,7 +72,7 @@ fn record_grant_outcome(
     }
 }
 
-fn status_index_timestamp_decoded(status: &DecodedJobStatus) -> i64 {
+fn status_index_timestamp_decoded(status: &DecodedJobStatus<'_>) -> i64 {
     if matches!(status.kind(), crate::job::JobStatusKind::Scheduled) {
         status
             .next_attempt_starts_after_ms()

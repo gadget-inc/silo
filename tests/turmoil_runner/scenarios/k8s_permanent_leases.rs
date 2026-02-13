@@ -23,8 +23,8 @@
 
 use crate::helpers::{
     EnqueueRequest, HashMap, InvariantTracker, LeaseTasksRequest, ReportOutcomeRequest,
-    RetryPolicy, SerializedBytes, create_turmoil_client, dst_turmoilfs_database_template,
-    get_seed, report_outcome_request, run_scenario_impl, serialized_bytes, turmoil,
+    RetryPolicy, SerializedBytes, create_turmoil_client, dst_turmoilfs_database_template, get_seed,
+    report_outcome_request, run_scenario_impl, serialized_bytes, turmoil,
 };
 use crate::mock_k8s::{MockK8sBackend, MockK8sState};
 use rand::rngs::StdRng;
@@ -212,12 +212,8 @@ async fn setup_node_server(
 /// Verify that no shard is owned by multiple nodes (checks ALL lease holders,
 /// not just "active" ones — important for crash scenarios where a crashed node
 /// may still appear as a holder).
-async fn verify_no_split_brain_all_holders(
-    k8s_state: &MockK8sState,
-) -> bool {
-    let holders = k8s_state
-        .get_shard_holders(NAMESPACE, CLUSTER_PREFIX)
-        .await;
+async fn verify_no_split_brain_all_holders(k8s_state: &MockK8sState) -> bool {
+    let holders = k8s_state.get_shard_holders(NAMESPACE, CLUSTER_PREFIX).await;
 
     let mut shard_owners: std::collections::HashMap<ShardId, Vec<String>> =
         std::collections::HashMap::new();
@@ -429,7 +425,10 @@ where
             let mut rng = StdRng::seed_from_u64(seed.wrapping_add(1));
 
             let shard_ids = loop {
-                match producer_k8s_state.get_shard_ids(NAMESPACE, CLUSTER_PREFIX).await {
+                match producer_k8s_state
+                    .get_shard_ids(NAMESPACE, CLUSTER_PREFIX)
+                    .await
+                {
                     Ok(Some(ids)) if !ids.is_empty() => break ids,
                     Ok(_) => tokio::time::sleep(Duration::from_millis(100)).await,
                     Err(e) => {
@@ -867,7 +866,9 @@ where
                 if completion_rate < acceptable_rate && completed < min_completed {
                     panic!(
                         "Too many jobs lost: completed={}, enqueued={}, rate={:.1}%",
-                        completed, enqueued, completion_rate * 100.0,
+                        completed,
+                        enqueued,
+                        completion_rate * 100.0,
                     );
                 }
             }
@@ -881,175 +882,173 @@ where
 /// Reclaim scenario: Crash node-0, verify leases persist, restart with same node_id.
 pub fn run_reclaim() {
     let seed = get_seed();
-    run_scenario("k8s_permanent_lease_reclaim", seed, move |k8s_state, node_senders, _tracker, membership_done, _seed| async move {
-        // Wait for initial convergence
-        tracing::info!("waiting for initial convergence");
-        tokio::time::sleep(Duration::from_secs(8)).await;
+    run_scenario(
+        "k8s_permanent_lease_reclaim",
+        seed,
+        move |k8s_state, node_senders, _tracker, membership_done, _seed| async move {
+            // Wait for initial convergence
+            tracing::info!("waiting for initial convergence");
+            tokio::time::sleep(Duration::from_secs(8)).await;
 
-        // Record which shards node-0 owns before crash
-        let holders_before = k8s_state
-            .get_shard_holders(NAMESPACE, CLUSTER_PREFIX)
-            .await;
-        let node0_shards: Vec<ShardId> = holders_before
-            .iter()
-            .filter(|(_, holder)| *holder == "node-0")
-            .map(|(sid, _)| *sid)
-            .collect();
-        tracing::info!(
-            node0_shard_count = node0_shards.len(),
-            node0_shards = ?node0_shards,
-            "pre-crash shard ownership"
-        );
+            // Record which shards node-0 owns before crash
+            let holders_before = k8s_state.get_shard_holders(NAMESPACE, CLUSTER_PREFIX).await;
+            let node0_shards: Vec<ShardId> = holders_before
+                .iter()
+                .filter(|(_, holder)| *holder == "node-0")
+                .map(|(sid, _)| *sid)
+                .collect();
+            tracing::info!(
+                node0_shard_count = node0_shards.len(),
+                node0_shards = ?node0_shards,
+                "pre-crash shard ownership"
+            );
 
-        // Crash node-0
-        tracing::info!("CRASHING node-0");
-        {
-            let senders = node_senders.lock().unwrap();
-            let _ = senders[0].send(NodeState::Crash);
-        }
+            // Crash node-0
+            tracing::info!("CRASHING node-0");
+            {
+                let senders = node_senders.lock().unwrap();
+                let _ = senders[0].send(NodeState::Crash);
+            }
 
-        // Wait for crash to take effect
-        tokio::time::sleep(Duration::from_secs(2)).await;
+            // Wait for crash to take effect
+            tokio::time::sleep(Duration::from_secs(2)).await;
 
-        // PERMANENCE CHECK: Verify leases are still held by node-0
-        let holders_after_crash = k8s_state
-            .get_shard_holders(NAMESPACE, CLUSTER_PREFIX)
-            .await;
-        let node0_shards_after: Vec<ShardId> = holders_after_crash
-            .iter()
-            .filter(|(_, holder)| *holder == "node-0")
-            .map(|(sid, _)| *sid)
-            .collect();
-        tracing::info!(
-            node0_shard_count_after = node0_shards_after.len(),
-            node0_shards_after = ?node0_shards_after,
-            "post-crash shard ownership (should match pre-crash)"
-        );
-        assert_eq!(
-            node0_shards.len(),
-            node0_shards_after.len(),
-            "Permanent leases should persist through crash! Before: {:?}, After: {:?}",
-            node0_shards,
-            node0_shards_after
-        );
+            // PERMANENCE CHECK: Verify leases are still held by node-0
+            let holders_after_crash = k8s_state.get_shard_holders(NAMESPACE, CLUSTER_PREFIX).await;
+            let node0_shards_after: Vec<ShardId> = holders_after_crash
+                .iter()
+                .filter(|(_, holder)| *holder == "node-0")
+                .map(|(sid, _)| *sid)
+                .collect();
+            tracing::info!(
+                node0_shard_count_after = node0_shards_after.len(),
+                node0_shards_after = ?node0_shards_after,
+                "post-crash shard ownership (should match pre-crash)"
+            );
+            assert_eq!(
+                node0_shards.len(),
+                node0_shards_after.len(),
+                "Permanent leases should persist through crash! Before: {:?}, After: {:?}",
+                node0_shards,
+                node0_shards_after
+            );
 
-        // Restart node-0 with same node_id
-        tracing::info!("RESTARTING node-0");
-        {
-            let senders = node_senders.lock().unwrap();
-            let _ = senders[0].send(NodeState::Active);
-        }
+            // Restart node-0 with same node_id
+            tracing::info!("RESTARTING node-0");
+            {
+                let senders = node_senders.lock().unwrap();
+                let _ = senders[0].send(NodeState::Active);
+            }
 
-        // Wait for reclaim and re-convergence
-        tokio::time::sleep(Duration::from_secs(15)).await;
+            // Wait for reclaim and re-convergence
+            tokio::time::sleep(Duration::from_secs(15)).await;
 
-        // Verify no split-brain after reclaim
-        assert!(
-            verify_no_split_brain_all_holders(&k8s_state).await,
-            "Split-brain detected after reclaim"
-        );
+            // Verify no split-brain after reclaim
+            assert!(
+                verify_no_split_brain_all_holders(&k8s_state).await,
+                "Split-brain detected after reclaim"
+            );
 
-        // Let work continue
-        tokio::time::sleep(Duration::from_secs(10)).await;
+            // Let work continue
+            tokio::time::sleep(Duration::from_secs(10)).await;
 
-        membership_done.store(true, Ordering::SeqCst);
-        tracing::info!("reclaim controller done");
-    });
+            membership_done.store(true, Ordering::SeqCst);
+            tracing::info!("reclaim controller done");
+        },
+    );
 }
 
 /// Force-release scenario: Crash node-0, force-release its leases, let other nodes take over.
 pub fn run_force_release() {
     let seed = get_seed();
-    run_scenario("k8s_permanent_lease_force_release", seed, move |k8s_state, node_senders, tracker, membership_done, _seed| async move {
-        // Wait for initial convergence
-        tracing::info!("waiting for initial convergence");
-        tokio::time::sleep(Duration::from_secs(8)).await;
+    run_scenario(
+        "k8s_permanent_lease_force_release",
+        seed,
+        move |k8s_state, node_senders, tracker, membership_done, _seed| async move {
+            // Wait for initial convergence
+            tracing::info!("waiting for initial convergence");
+            tokio::time::sleep(Duration::from_secs(8)).await;
 
-        // Record which shards node-0 owns before crash
-        let holders_before = k8s_state
-            .get_shard_holders(NAMESPACE, CLUSTER_PREFIX)
-            .await;
-        let node0_shards: Vec<ShardId> = holders_before
-            .iter()
-            .filter(|(_, holder)| *holder == "node-0")
-            .map(|(sid, _)| *sid)
-            .collect();
-        tracing::info!(
-            node0_shard_count = node0_shards.len(),
-            node0_shards = ?node0_shards,
-            "pre-crash shard ownership"
-        );
+            // Record which shards node-0 owns before crash
+            let holders_before = k8s_state.get_shard_holders(NAMESPACE, CLUSTER_PREFIX).await;
+            let node0_shards: Vec<ShardId> = holders_before
+                .iter()
+                .filter(|(_, holder)| *holder == "node-0")
+                .map(|(sid, _)| *sid)
+                .collect();
+            tracing::info!(
+                node0_shard_count = node0_shards.len(),
+                node0_shards = ?node0_shards,
+                "pre-crash shard ownership"
+            );
 
-        // Crash node-0
-        tracing::info!("CRASHING node-0");
-        {
-            let senders = node_senders.lock().unwrap();
-            let _ = senders[0].send(NodeState::Crash);
-        }
-
-        // Wait for crash to take effect
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        // PERMANENCE CHECK: Verify leases are still held by node-0
-        let holders_after_crash = k8s_state
-            .get_shard_holders(NAMESPACE, CLUSTER_PREFIX)
-            .await;
-        let node0_shards_after: Vec<ShardId> = holders_after_crash
-            .iter()
-            .filter(|(_, holder)| *holder == "node-0")
-            .map(|(sid, _)| *sid)
-            .collect();
-        tracing::info!(
-            node0_shard_count_after = node0_shards_after.len(),
-            "post-crash shard ownership (should match pre-crash)"
-        );
-        assert_eq!(
-            node0_shards.len(),
-            node0_shards_after.len(),
-            "Permanent leases should persist through crash!"
-        );
-
-        // Update tracker: node-0 crashed, clear its ownership records
-        // so subsequent acquisitions by other nodes don't trigger false split-brain
-        tracker.shards.node_crashed("node-0");
-
-        // Delete node-0's membership lease (simulates K8s TTL expiry)
-        let member_lease_name = format!("{}-member-node-0", CLUSTER_PREFIX);
-        let _ = k8s_state
-            .delete_lease(NAMESPACE, &member_lease_name)
-            .await;
-        tracing::info!("deleted node-0 membership lease");
-
-        // Wait a bit for membership change to propagate
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        // Force-release each shard lease held by node-0
-        for shard_id in &node0_shards {
-            if let Err(e) = k8s_state
-                .force_release_shard_lease(NAMESPACE, CLUSTER_PREFIX, shard_id)
-                .await
+            // Crash node-0
+            tracing::info!("CRASHING node-0");
             {
-                tracing::warn!(shard_id = %shard_id, error = %e, "force-release failed");
+                let senders = node_senders.lock().unwrap();
+                let _ = senders[0].send(NodeState::Crash);
             }
-        }
-        tracing::info!(
-            count = node0_shards.len(),
-            "force-released node-0's shard leases"
-        );
 
-        // Wait for remaining nodes to acquire orphaned shards
-        tokio::time::sleep(Duration::from_secs(15)).await;
+            // Wait for crash to take effect
+            tokio::time::sleep(Duration::from_secs(2)).await;
 
-        // Verify no split-brain after force-release
-        assert!(
-            verify_no_split_brain_all_holders(&k8s_state).await,
-            "Split-brain detected after force-release"
-        );
+            // PERMANENCE CHECK: Verify leases are still held by node-0
+            let holders_after_crash = k8s_state.get_shard_holders(NAMESPACE, CLUSTER_PREFIX).await;
+            let node0_shards_after: Vec<ShardId> = holders_after_crash
+                .iter()
+                .filter(|(_, holder)| *holder == "node-0")
+                .map(|(sid, _)| *sid)
+                .collect();
+            tracing::info!(
+                node0_shard_count_after = node0_shards_after.len(),
+                "post-crash shard ownership (should match pre-crash)"
+            );
+            assert_eq!(
+                node0_shards.len(),
+                node0_shards_after.len(),
+                "Permanent leases should persist through crash!"
+            );
 
-        // Let work continue
-        tokio::time::sleep(Duration::from_secs(10)).await;
+            // Update tracker: node-0 crashed, clear its ownership records
+            // so subsequent acquisitions by other nodes don't trigger false split-brain
+            tracker.shards.node_crashed("node-0");
 
-        membership_done.store(true, Ordering::SeqCst);
-        tracing::info!("force-release controller done");
-    });
+            // Delete node-0's membership lease (simulates K8s TTL expiry)
+            let member_lease_name = format!("{}-member-node-0", CLUSTER_PREFIX);
+            let _ = k8s_state.delete_lease(NAMESPACE, &member_lease_name).await;
+            tracing::info!("deleted node-0 membership lease");
+
+            // Wait a bit for membership change to propagate
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            // Force-release each shard lease held by node-0
+            for shard_id in &node0_shards {
+                if let Err(e) = k8s_state
+                    .force_release_shard_lease(NAMESPACE, CLUSTER_PREFIX, shard_id)
+                    .await
+                {
+                    tracing::warn!(shard_id = %shard_id, error = %e, "force-release failed");
+                }
+            }
+            tracing::info!(
+                count = node0_shards.len(),
+                "force-released node-0's shard leases"
+            );
+
+            // Wait for remaining nodes to acquire orphaned shards
+            tokio::time::sleep(Duration::from_secs(15)).await;
+
+            // Verify no split-brain after force-release
+            assert!(
+                verify_no_split_brain_all_holders(&k8s_state).await,
+                "Split-brain detected after force-release"
+            );
+
+            // Let work continue
+            tokio::time::sleep(Duration::from_secs(10)).await;
+
+            membership_done.store(true, Ordering::SeqCst);
+            tracing::info!("force-release controller done");
+        },
+    );
 }

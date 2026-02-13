@@ -1,9 +1,7 @@
-use crate::codec::{CodecError, DecodedAttempt, decode_attempt};
-use crate::job_store_shard::JobStoreShardError;
+use bytes::Bytes;
 
-fn codec_error_to_shard_error(e: CodecError) -> JobStoreShardError {
-    JobStoreShardError::Serialization(e.to_string())
-}
+use crate::codec::{DecodedAttempt, decode_attempt_bytes};
+use crate::job_store_shard::JobStoreShardError;
 
 /// Outcome passed by callers when reporting an attempt's completion.
 #[derive(Debug, Clone)]
@@ -71,9 +69,9 @@ impl std::fmt::Debug for JobAttemptView {
 }
 
 impl JobAttemptView {
-    pub fn new(bytes: impl AsRef<[u8]>) -> Result<Self, JobStoreShardError> {
+    pub fn new(bytes: impl Into<Bytes>) -> Result<Self, JobStoreShardError> {
         // Validate and decode up front; reject invalid data early.
-        let decoded = decode_attempt(bytes.as_ref()).map_err(codec_error_to_shard_error)?;
+        let decoded = decode_attempt_bytes(bytes.into())?;
         Ok(Self { decoded })
     }
 

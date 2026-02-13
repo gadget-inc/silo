@@ -1,4 +1,6 @@
-use crate::codec::{CodecError, DecodedJobInfo, decode_job_info};
+use bytes::Bytes;
+
+use crate::codec::{DecodedJobInfo, decode_job_info_bytes};
 use crate::job_store_shard::JobStoreShardError;
 use crate::retry::RetryPolicy;
 
@@ -8,10 +10,6 @@ use crate::retry::RetryPolicy;
 pub struct JobCancellation {
     /// Timestamp (epoch ms) when cancellation was requested
     pub cancelled_at_ms: i64,
-}
-
-fn codec_error_to_shard_error(e: CodecError) -> JobStoreShardError {
-    JobStoreShardError::Serialization(e.to_string())
 }
 
 /// Per-job concurrency limit declaration
@@ -277,9 +275,9 @@ pub struct JobInfo {
 
 impl JobView {
     /// Validate bytes and construct a zero-copy view.
-    pub fn new(bytes: impl AsRef<[u8]>) -> Result<Self, JobStoreShardError> {
+    pub fn new(bytes: impl Into<Bytes>) -> Result<Self, JobStoreShardError> {
         // Validate and decode up front; reject invalid data early.
-        let decoded = decode_job_info(bytes.as_ref()).map_err(codec_error_to_shard_error)?;
+        let decoded = decode_job_info_bytes(bytes.into())?;
         Ok(Self { decoded })
     }
 

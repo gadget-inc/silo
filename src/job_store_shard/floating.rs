@@ -4,7 +4,7 @@ use slatedb::{DbIterator, WriteBatch};
 use uuid::Uuid;
 
 use crate::codec::{
-    DecodedFloatingLimitState, decode_floating_limit_state, decode_lease,
+    DecodedFloatingLimitState, decode_floating_limit_state_bytes, decode_lease,
     encode_floating_limit_state, encode_task,
 };
 use crate::job::{FloatingConcurrencyLimit, FloatingLimitState};
@@ -58,7 +58,7 @@ impl JobStoreShard {
 
         if let Some(raw) = writer.get(&state_key).await? {
             // Hot path: state exists, return zero-copy decoded view
-            return Ok(decode_floating_limit_state(&raw)?);
+            return Ok(decode_floating_limit_state_bytes(raw)?);
         }
 
         // Cold path: first time seeing this queue key, create and write new state
@@ -77,7 +77,7 @@ impl JobStoreShard {
         writer.put(&state_key, &state_bytes)?;
 
         // Decode what we just encoded so we return the same type
-        Ok(decode_floating_limit_state(&state_bytes)?)
+        Ok(decode_floating_limit_state_bytes(state_bytes.into())?)
     }
 
     /// Check if a floating limit refresh is needed and schedule it if so.
@@ -184,7 +184,7 @@ impl JobStoreShard {
                 queue_key
             )));
         };
-        let decoded = decode_floating_limit_state(&raw)?;
+        let decoded = decode_floating_limit_state_bytes(raw)?;
 
         let new_state = FloatingLimitState {
             current_max_concurrency: new_max_concurrency,
@@ -249,7 +249,7 @@ impl JobStoreShard {
                 queue_key
             )));
         };
-        let decoded = decode_floating_limit_state(&raw)?;
+        let decoded = decode_floating_limit_state_bytes(raw)?;
 
         // Calculate exponential backoff using archived retry_count
         const INITIAL_BACKOFF_MS: i64 = 1000; // 1 second

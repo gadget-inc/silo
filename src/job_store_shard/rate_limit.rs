@@ -3,52 +3,34 @@
 use uuid::Uuid;
 
 use crate::gubernator::{GubernatorError, RateLimitResult};
-use crate::job_store_shard::helpers::{WriteBatcher, put_task};
+use crate::job_store_shard::helpers::WriteBatcher;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
-use crate::task::{GubernatorRateLimitData, Task};
+use crate::keys::task_key;
+use crate::task::GubernatorRateLimitData;
+use crate::{codec::DecodedCheckRateLimitTask, codec::encode_check_rate_limit_retry_from_task};
 
 impl JobStoreShard {
-    /// Schedule a rate limit check retry task
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn schedule_rate_limit_retry<W: WriteBatcher>(
+    /// Schedule a rate-limit retry from a decoded task without materializing `Task::CheckRateLimit`.
+    pub(crate) fn schedule_rate_limit_retry_from_task<W: WriteBatcher>(
         &self,
         writer: &mut W,
-        tenant: &str,
-        job_id: &str,
-        attempt_number: u32,
-        relative_attempt_number: u32,
-        limit_index: u32,
-        rate_limit: &GubernatorRateLimitData,
-        retry_count: u32,
-        started_at_ms: i64,
-        priority: u8,
-        held_queues: &[String],
+        task: DecodedCheckRateLimitTask<'_>,
         retry_at_ms: i64,
-        task_group: &str,
     ) -> Result<(), JobStoreShardError> {
-        let retry_task = Task::CheckRateLimit {
-            task_id: Uuid::new_v4().to_string(),
-            tenant: tenant.to_string(),
-            job_id: job_id.to_string(),
-            attempt_number,
-            relative_attempt_number,
-            limit_index,
-            rate_limit: rate_limit.clone(),
-            retry_count: retry_count + 1,
-            started_at_ms,
-            priority,
-            held_queues: held_queues.to_vec(),
-            task_group: task_group.to_string(),
-        };
-        put_task(
-            writer,
-            task_group,
-            retry_at_ms,
-            priority,
-            job_id,
-            attempt_number,
-            &retry_task,
-        )
+        let retry_task_id = Uuid::new_v4().to_string();
+        let value =
+            encode_check_rate_limit_retry_from_task(task, &retry_task_id, task.retry_count() + 1)?;
+        writer.put(
+            task_key(
+                task.task_group(),
+                retry_at_ms,
+                task.priority(),
+                task.job_id(),
+                task.attempt_number(),
+            ),
+            &value,
+        )?;
+        Ok(())
     }
 
     /// Check a rate limit via the rate limit client

@@ -488,7 +488,7 @@ impl JobStoreShard {
         let mut attempts = Vec::new();
 
         while let Some(kv) = iter.next().await? {
-            let view = JobAttemptView::new(&kv.value)?;
+            let view = JobAttemptView::new(kv.value)?;
             attempts.push(view);
         }
 

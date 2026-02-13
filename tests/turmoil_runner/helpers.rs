@@ -1432,10 +1432,7 @@ impl JobStateTracker {
             .filter(|(job_id, _)| !terminal.contains(job_id.as_str()))
             .map(|(job_id, status)| {
                 let status_str = status_name(*status).to_string();
-                let lease_count = active_leases
-                    .get(job_id)
-                    .map(|l| l.len())
-                    .unwrap_or(0);
+                let lease_count = active_leases.get(job_id).map(|l| l.len()).unwrap_or(0);
                 (
                     job_id.clone(),
                     format!("{} (active_leases: {})", status_str, lease_count),

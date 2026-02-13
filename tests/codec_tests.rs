@@ -1,8 +1,9 @@
 use silo::codec::{
     decode_attempt, decode_concurrency_action, decode_floating_limit_state, decode_holder,
     decode_job_cancellation, decode_job_info, decode_job_status, decode_lease, decode_task,
-    decode_task_tenant, encode_attempt, encode_concurrency_action, encode_floating_limit_state,
-    encode_holder, encode_job_cancellation, encode_job_info, encode_job_status, encode_lease,
+    decode_task_tenant, decode_task_view, encode_attempt, encode_check_rate_limit_retry_from_task,
+    encode_concurrency_action, encode_floating_limit_state, encode_holder, encode_job_cancellation,
+    encode_job_info, encode_job_status, encode_lease, encode_lease_from_request_ticket_grant,
     encode_task, task_is_refresh_floating_limit, validate_task,
 };
 use silo::job::{FloatingLimitState, JobCancellation, JobInfo, JobStatus, JobStatusKind};
@@ -480,4 +481,110 @@ fn test_decoded_job_status_accessors() {
     let cancelled_bytes = encode_job_status(&cancelled).expect("encode cancelled");
     let cancelled_decoded = decode_job_status(&cancelled_bytes).expect("decode cancelled");
     assert!(cancelled_decoded.is_terminal());
+}
+
+#[silo::test]
+fn test_encode_lease_from_request_ticket_grant_roundtrip() {
+    let ticket = Task::RequestTicket {
+        queue: "q-main".to_string(),
+        start_time_ms: 10,
+        priority: 5,
+        tenant: "tenant-rt".to_string(),
+        job_id: "job-rt".to_string(),
+        attempt_number: 4,
+        relative_attempt_number: 2,
+        request_id: "req-77".to_string(),
+        task_group: "workers".to_string(),
+    };
+    let ticket_bytes = encode_task(&ticket).expect("encode ticket");
+    let decoded = decode_task_view(&ticket_bytes).expect("decode ticket");
+    let request_ticket = decoded.request_ticket().expect("request ticket view");
+
+    let lease_bytes = encode_lease_from_request_ticket_grant(
+        "worker-rt",
+        request_ticket,
+        "queue-granted",
+        999,
+        555,
+    )
+    .expect("encode lease from ticket");
+    let lease = decode_lease(&lease_bytes).expect("decode lease");
+
+    assert_eq!(lease.worker_id(), "worker-rt");
+    assert_eq!(lease.expiry_ms(), 999);
+    assert_eq!(lease.started_at_ms(), 555);
+    assert_eq!(lease.task_id(), Some("req-77"));
+    assert_eq!(lease.tenant(), "tenant-rt");
+    assert_eq!(lease.job_id(), "job-rt");
+    assert_eq!(lease.attempt_number(), 4);
+    assert_eq!(lease.relative_attempt_number(), 2);
+    assert_eq!(lease.held_queues(), vec!["queue-granted"]);
+    assert_eq!(lease.task_group(), "workers");
+}
+
+#[silo::test]
+fn test_encode_check_rate_limit_retry_from_task_roundtrip() {
+    let task = Task::CheckRateLimit {
+        task_id: "orig-task".to_string(),
+        tenant: "tenant-crl".to_string(),
+        job_id: "job-crl".to_string(),
+        attempt_number: 3,
+        relative_attempt_number: 1,
+        limit_index: 2,
+        rate_limit: GubernatorRateLimitData {
+            name: "name".to_string(),
+            unique_key: "key".to_string(),
+            limit: 10,
+            duration_ms: 1000,
+            hits: 1,
+            algorithm: 0,
+            behavior: 0,
+            retry_initial_backoff_ms: 100,
+            retry_max_backoff_ms: 1000,
+            retry_backoff_multiplier: 2.0,
+            retry_max_retries: 10,
+        },
+        retry_count: 7,
+        started_at_ms: 123,
+        priority: 9,
+        held_queues: vec!["qa".to_string(), "qb".to_string()],
+        task_group: "tg".to_string(),
+    };
+    let task_bytes = encode_task(&task).expect("encode check task");
+    let decoded = decode_task_view(&task_bytes).expect("decode check task");
+    let check = decoded.check_rate_limit().expect("check task view");
+
+    let retry_bytes =
+        encode_check_rate_limit_retry_from_task(check, "retry-task", 8).expect("encode retry task");
+    let decoded_retry = decode_task(&retry_bytes).expect("decode retry task");
+
+    match decoded_retry {
+        Task::CheckRateLimit {
+            task_id,
+            tenant,
+            job_id,
+            attempt_number,
+            relative_attempt_number,
+            limit_index,
+            retry_count,
+            started_at_ms,
+            priority,
+            held_queues,
+            task_group,
+            ..
+        } => {
+            assert_eq!(task_id, "retry-task");
+            assert_eq!(tenant, "tenant-crl");
+            assert_eq!(job_id, "job-crl");
+            assert_eq!(attempt_number, 3);
+            assert_eq!(relative_attempt_number, 1);
+            assert_eq!(limit_index, 2);
+            assert_eq!(retry_count, 8);
+            assert_eq!(started_at_ms, 123);
+            assert_eq!(priority, 9);
+            assert_eq!(held_queues, vec!["qa", "qb"]);
+            assert_eq!(task_group, "tg");
+        }
+        _ => panic!("expected CheckRateLimit variant"),
+    }
 }
