@@ -8,7 +8,7 @@ use slatedb::IsolationLevel;
 use crate::codec::{decode_task, encode_task};
 use crate::job::JobStatusKind;
 use crate::job_store_shard::helpers::{
-    TxnWriter, decode_job_status_owned, now_epoch_ms, retry_on_txn_conflict,
+    TxnWriter, decode_job_status_owned, load_job_view, now_epoch_ms, retry_on_txn_conflict,
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{job_cancelled_key, job_status_key, task_key};
@@ -100,12 +100,7 @@ impl JobStoreShard {
         }
 
         // Load job info to get task_group and priority
-        let job_info_key = crate::keys::job_info_key(tenant, id);
-        let maybe_job_raw = txn.get(&job_info_key).await?;
-        let Some(job_raw) = maybe_job_raw else {
-            return Err(JobStoreShardError::JobNotFound(id.to_string()));
-        };
-        let job_view = crate::job::JobView::new(job_raw)?;
+        let job_view = load_job_view(&TxnWriter(&txn), tenant, id).await?;
         let priority = job_view.priority();
         let task_group = job_view.task_group().to_string();
 

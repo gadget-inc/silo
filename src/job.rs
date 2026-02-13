@@ -61,20 +61,10 @@ impl FloatingLimitState {
     /// Create an owned copy from an archived (zero-copy) view.
     /// Callers can then mutate whichever fields they need before writing back.
     pub fn from_archived(archived: &ArchivedFloatingLimitState) -> Self {
-        Self {
-            current_max_concurrency: archived.current_max_concurrency,
-            last_refreshed_at_ms: archived.last_refreshed_at_ms,
-            refresh_task_scheduled: archived.refresh_task_scheduled,
-            refresh_interval_ms: archived.refresh_interval_ms,
-            default_max_concurrency: archived.default_max_concurrency,
-            retry_count: archived.retry_count,
-            next_retry_at_ms: archived.next_retry_at_ms.as_ref().copied(),
-            metadata: archived
-                .metadata
-                .iter()
-                .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
-                .collect(),
-        }
+        use rkyv::Deserialize as _;
+        archived
+            .deserialize(&mut rkyv::Infallible)
+            .unwrap_or_else(|_| unreachable!("infallible deserialization for FloatingLimitState"))
     }
 }
 
@@ -377,67 +367,23 @@ impl JobView {
 
     /// Return metadata as owned key/value string pairs
     pub fn metadata(&self) -> Vec<(String, String)> {
+        use rkyv::Deserialize as _;
         let a = self.archived();
-        let mut out: Vec<(String, String)> = Vec::with_capacity(a.metadata.len());
-        for pair in a.metadata.iter() {
-            let (k, v) = pair;
-            out.push((k.as_str().to_string(), v.as_str().to_string()));
-        }
-        out
+        a.metadata
+            .deserialize(&mut rkyv::Infallible)
+            .unwrap_or_else(|_| unreachable!("infallible deserialization for metadata"))
     }
 
     /// Return the ordered list of limits (concurrency, rate limits, and floating concurrency limits)
     pub fn limits(&self) -> Vec<Limit> {
+        use rkyv::Deserialize as _;
         let a = self.archived();
-        let mut out = Vec::with_capacity(a.limits.len());
-        for lim in a.limits.iter() {
-            match lim {
-                ArchivedLimit::Concurrency(c) => {
-                    out.push(Limit::Concurrency(ConcurrencyLimit {
-                        key: c.key.as_str().to_string(),
-                        max_concurrency: c.max_concurrency,
-                    }));
-                }
-                ArchivedLimit::RateLimit(r) => {
-                    let algorithm = match &r.algorithm {
-                        ArchivedGubernatorAlgorithm::TokenBucket => {
-                            GubernatorAlgorithm::TokenBucket
-                        }
-                        ArchivedGubernatorAlgorithm::LeakyBucket => {
-                            GubernatorAlgorithm::LeakyBucket
-                        }
-                    };
-                    out.push(Limit::RateLimit(GubernatorRateLimit {
-                        name: r.name.as_str().to_string(),
-                        unique_key: r.unique_key.as_str().to_string(),
-                        limit: r.limit,
-                        duration_ms: r.duration_ms,
-                        hits: r.hits,
-                        algorithm,
-                        behavior: r.behavior,
-                        retry_policy: RateLimitRetryPolicy {
-                            initial_backoff_ms: r.retry_policy.initial_backoff_ms,
-                            max_backoff_ms: r.retry_policy.max_backoff_ms,
-                            backoff_multiplier: r.retry_policy.backoff_multiplier,
-                            max_retries: r.retry_policy.max_retries,
-                        },
-                    }));
-                }
-                ArchivedLimit::FloatingConcurrency(f) => {
-                    let metadata: Vec<(String, String)> = f
-                        .metadata
-                        .iter()
-                        .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
-                        .collect();
-                    out.push(Limit::FloatingConcurrency(FloatingConcurrencyLimit {
-                        key: f.key.as_str().to_string(),
-                        default_max_concurrency: f.default_max_concurrency,
-                        refresh_interval_ms: f.refresh_interval_ms,
-                        metadata,
-                    }));
-                }
-            }
-        }
-        out
+        a.limits
+            .iter()
+            .map(|lim| {
+                lim.deserialize(&mut rkyv::Infallible)
+                    .unwrap_or_else(|_| unreachable!("infallible deserialization for Limit"))
+            })
+            .collect()
     }
 }

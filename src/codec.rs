@@ -5,33 +5,18 @@ use crate::job_attempt::JobAttempt;
 use crate::task::{ConcurrencyAction, GubernatorRateLimitData, HolderRecord, LeaseRecord, Task};
 
 /// Error type for versioned codec operations
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum CodecError {
     /// Data is too short to contain a version header
+    #[error("data too short to contain version header")]
     TooShort,
     /// Version byte doesn't match expected version
+    #[error("unsupported version: expected {expected}, found {found}")]
     UnsupportedVersion { expected: u8, found: u8 },
     /// Underlying rkyv serialization/deserialization error
+    #[error("rkyv error: {0}")]
     Rkyv(String),
 }
-
-impl std::fmt::Display for CodecError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CodecError::TooShort => write!(f, "data too short to contain version header"),
-            CodecError::UnsupportedVersion { expected, found } => {
-                write!(
-                    f,
-                    "unsupported version: expected {}, found {}",
-                    expected, found
-                )
-            }
-            CodecError::Rkyv(e) => write!(f, "rkyv error: {}", e),
-        }
-    }
-}
-
-impl std::error::Error for CodecError {}
 
 impl From<CodecError> for String {
     fn from(e: CodecError) -> String {

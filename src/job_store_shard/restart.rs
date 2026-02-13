@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::dst_events::{self, DstEvent};
 use crate::job::{JobStatus, JobStatusKind};
 use crate::job_store_shard::helpers::{
-    TxnWriter, decode_job_status_owned, now_epoch_ms, retry_on_txn_conflict,
+    TxnWriter, decode_job_status_owned, load_job_view, now_epoch_ms, retry_on_txn_conflict,
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{attempt_prefix, job_cancelled_key, job_status_key};
@@ -117,13 +117,7 @@ impl JobStoreShard {
         }
 
         // Get the job info first to know the priority and compute start_at_ms
-        let job_info_key = crate::keys::job_info_key(tenant, id);
-        let maybe_job_raw = txn.get(&job_info_key).await?;
-        let Some(job_raw) = maybe_job_raw else {
-            return Err(JobStoreShardError::JobNotFound(id.to_string()));
-        };
-
-        let job_view = crate::job::JobView::new(job_raw)?;
+        let job_view = load_job_view(&TxnWriter(&txn), tenant, id).await?;
         let priority = job_view.priority();
         let start_at_ms = job_view.enqueue_time_ms().max(now_ms);
 
@@ -139,8 +133,7 @@ impl JobStoreShard {
             // Attempt keys use storekey encoding: prefix + (tenant, job_id, attempt)
             // The attempt number is the last field encoded as u32 big-endian
             // For simplicity, decode the full key and extract attempt number
-            if kv.key.first() == Some(&0x07) {
-                // 0x07 is the ATTEMPT prefix
+            if kv.key.first() == Some(&crate::keys::prefix::ATTEMPT) {
                 let decoded: Result<(String, String, u32), _> = storekey::decode(&kv.key[1..]);
                 if let Ok((_, _, attempt_num)) = decoded {
                     max_attempt_number = max_attempt_number.max(attempt_num);
