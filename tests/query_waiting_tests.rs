@@ -2,7 +2,7 @@ mod test_helpers;
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, Int64Array, StringArray};
+use datafusion::arrow::array::{Array, Int64Array, StringArray, UInt32Array};
 use datafusion::arrow::record_batch::RecordBatch;
 use silo::job_attempt::AttemptOutcome;
 use silo::job_store_shard::JobStoreShard;
@@ -10,6 +10,7 @@ use silo::keys::{
     ParsedStatusTimeIndexKey, end_bound, idx_status_time_prefix, parse_status_time_index_key,
 };
 use silo::query::ShardQueryEngine;
+use silo::retry::RetryPolicy;
 use slatedb::DbIterator;
 use test_helpers::*;
 
@@ -133,7 +134,7 @@ async fn sql_waiting_status_display() {
 
     let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
     let batches = sql
-        .sql("SELECT id, status_kind FROM jobs WHERE tenant = '-' AND id = 'past-job'")
+        .sql("SELECT id, status_kind, current_attempt FROM jobs WHERE tenant = '-' AND id = 'past-job'")
         .await
         .expect("sql")
         .collect()
@@ -145,19 +146,28 @@ async fn sql_waiting_status_display() {
 
     let statuses = extract_string_column(&batches, 1);
     assert_eq!(statuses, vec!["Waiting"]);
+
+    // Freshly enqueued job should have current_attempt = 1 (1-indexed)
+    let attempt_col = batches[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .expect("current_attempt column");
+    assert_eq!(attempt_col.value(0), 1);
 }
 
 #[silo::test]
 async fn sql_future_scheduled_status_display() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
+    let future_start = now + 60_000;
 
     // Enqueue with future start time (should be Scheduled)
-    enqueue_job(&shard, "future-job", 10, now + 60_000).await;
+    enqueue_job(&shard, "future-job", 10, future_start).await;
 
     let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
     let batches = sql
-        .sql("SELECT id, status_kind FROM jobs WHERE tenant = '-' AND id = 'future-job'")
+        .sql("SELECT id, status_kind, current_attempt, next_attempt_starts_after_ms FROM jobs WHERE tenant = '-' AND id = 'future-job'")
         .await
         .expect("sql")
         .collect()
@@ -169,6 +179,22 @@ async fn sql_future_scheduled_status_display() {
 
     let statuses = extract_string_column(&batches, 1);
     assert_eq!(statuses, vec!["Scheduled"]);
+
+    // Freshly enqueued job should have current_attempt = 1 (1-indexed)
+    let attempt_col = batches[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .expect("current_attempt column");
+    assert_eq!(attempt_col.value(0), 1);
+
+    // next_attempt_starts_after_ms should be the future start time
+    let next_attempt_col = batches[0]
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("next_attempt_starts_after_ms column");
+    assert_eq!(next_attempt_col.value(0), future_start);
 }
 
 #[silo::test]
@@ -699,4 +725,172 @@ async fn index_multiple_jobs_independent() {
     // Total entries should be exactly 3
     let all = collect_all_index_entries(&shard).await;
     assert_eq!(all.len(), 3);
+}
+
+#[silo::test]
+async fn sql_current_attempt_differentiates_new_vs_retried() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    // Enqueue a fresh job with future start time (0 attempts, future-scheduled)
+    enqueue_job(&shard, "fresh", 10, now + 60_000).await;
+
+    // Enqueue a job with a retry policy, then fail it so it gets rescheduled
+    let retry_policy = RetryPolicy {
+        retry_count: 3,
+        initial_interval_ms: 60_000, // long backoff so it stays Scheduled
+        max_interval_ms: 120_000,
+        randomize_interval: false,
+        backoff_factor: 1.0,
+    };
+    shard
+        .enqueue(
+            "-",
+            Some("retried".to_string()),
+            10,
+            now,
+            Some(retry_policy),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue");
+
+    // Dequeue and fail the retried job so it gets rescheduled with attempt 1
+    let tasks = shard
+        .dequeue("worker", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    assert_eq!(tasks.len(), 1);
+    let task_id = tasks[0].attempt().task_id().to_string();
+    shard
+        .report_attempt_outcome(
+            &task_id,
+            AttemptOutcome::Error {
+                error_code: "ERR".to_string(),
+                error: vec![],
+            },
+        )
+        .await
+        .expect("report error");
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+
+    // Query both scheduled jobs
+    let batches = sql
+        .sql("SELECT id, status_kind, current_attempt, next_attempt_starts_after_ms FROM jobs WHERE tenant = '-' AND status_kind = 'Scheduled' ORDER BY id")
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+
+    let ids = extract_string_column(&batches, 0);
+    assert_eq!(ids, vec!["fresh", "retried"]);
+
+    let attempt_col = batches[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .expect("current_attempt column");
+
+    // Fresh job: attempt 1 (1-indexed, first attempt)
+    assert_eq!(attempt_col.value(0), 1, "fresh job should have attempt 1");
+    // Retried job: attempt 2 (failed once, now on second attempt)
+    assert_eq!(attempt_col.value(1), 2, "retried job should have attempt 2");
+
+    // Both should have next_attempt_starts_after_ms set
+    let next_col = batches[0]
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("next_attempt_starts_after_ms column");
+    assert!(
+        !next_col.is_null(0),
+        "fresh job should have next_attempt_starts_after_ms"
+    );
+    assert!(
+        !next_col.is_null(1),
+        "retried job should have next_attempt_starts_after_ms"
+    );
+
+    // The retried job's next attempt should be in the future (backoff from failure)
+    assert!(
+        next_col.value(1) > now,
+        "retried job next_attempt_starts_after_ms should be in the future"
+    );
+}
+
+#[silo::test]
+async fn sql_current_attempt_null_for_running_and_terminal() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job(&shard, "j1", 5, now).await;
+    enqueue_job(&shard, "j2", 10, now).await;
+
+    // Dequeue j1 to make it Running
+    let tasks = shard
+        .dequeue("worker", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    assert_eq!(tasks.len(), 1);
+    let task_id = tasks[0].attempt().task_id().to_string();
+
+    // Complete j1 to make it Succeeded
+    shard
+        .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report success");
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+
+    // Succeeded job: current_attempt and next_attempt_starts_after_ms should be null
+    let batches = sql
+        .sql("SELECT id, current_attempt, next_attempt_starts_after_ms FROM jobs WHERE tenant = '-' AND id = 'j1'")
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+
+    let attempt_col = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .expect("current_attempt column");
+    assert!(
+        attempt_col.is_null(0),
+        "current_attempt should be null for terminal jobs"
+    );
+
+    let next_col = batches[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("next_attempt_starts_after_ms column");
+    assert!(
+        next_col.is_null(0),
+        "next_attempt_starts_after_ms should be null for terminal jobs"
+    );
+
+    // Waiting job: current_attempt should be 1 (1-indexed, first attempt)
+    let batches = sql
+        .sql("SELECT id, current_attempt FROM jobs WHERE tenant = '-' AND id = 'j2'")
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+
+    let attempt_col = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .expect("current_attempt column");
+    assert_eq!(attempt_col.value(0), 1);
 }
