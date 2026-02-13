@@ -117,6 +117,8 @@ async fn discover_cluster(address: &str) -> anyhow::Result<ClusterInfo> {
             shard_id: owner.shard_id,
             grpc_addr: owner.grpc_addr,
             node_id: owner.node_id,
+            range_start: owner.range_start,
+            range_end: owner.range_end,
         })
         .collect();
 
@@ -134,6 +136,8 @@ struct ShardOwnerInfo {
     grpc_addr: String,
     #[allow(dead_code)]
     node_id: String,
+    range_start: String,
+    range_end: String,
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +161,16 @@ impl ClusterInfo {
             .iter()
             .find(|owner| owner.shard_id == shard_id)
             .map(|owner| owner.grpc_addr.as_str())
+    }
+
+    /// Find the shard that owns the given tenant ID based on shard ranges.
+    fn shard_for_tenant(&self, tenant_id: &str) -> Option<&ShardOwnerInfo> {
+        self.shard_owners.iter().find(|owner| {
+            let after_start =
+                owner.range_start.is_empty() || tenant_id >= owner.range_start.as_str();
+            let before_end = owner.range_end.is_empty() || tenant_id < owner.range_end.as_str();
+            after_start && before_end
+        })
     }
 
     /// Get all unique server addresses in the cluster
@@ -420,11 +434,21 @@ async fn enqueuer_loop(
     let mut job_counter = 0u64;
 
     while running.load(Ordering::Relaxed) {
-        // Pick a random shard
-        let shard = cluster_info.random_shard();
+        // Select a tenant first, then route to the correct shard
+        let tenant = tenant_selector.select().to_string();
+
+        // Find the shard that owns this tenant based on range information
+        let shard = match cluster_info.shard_for_tenant(&tenant) {
+            Some(owner) => owner.shard_id.clone(),
+            None => {
+                warn!(enqueuer_id = %enqueuer_id, tenant = %tenant, "No shard found for tenant");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+        };
 
         // Find the server owning this shard
-        let addr = match cluster_info.address_for_shard(shard) {
+        let addr = match cluster_info.address_for_shard(&shard) {
             Some(addr) => addr.to_string(),
             None => {
                 // Fallback: use any available connection
@@ -448,9 +472,6 @@ async fn enqueuer_loop(
                 }
             }
         };
-
-        // Select a tenant according to the weighted distribution
-        let tenant = tenant_selector.select().to_string();
 
         let payload = serde_json::json!({
             "enqueuer": enqueuer_id,
@@ -553,14 +574,45 @@ async fn main() -> anyhow::Result<()> {
     );
     info!(num_shards = cluster_info.num_shards, "Cluster shard count");
     for owner in &cluster_info.shard_owners {
+        let range_display = format!(
+            "[{}, {})",
+            if owner.range_start.is_empty() {
+                "-∞"
+            } else {
+                &owner.range_start
+            },
+            if owner.range_end.is_empty() {
+                "+∞"
+            } else {
+                &owner.range_end
+            }
+        );
         info!(
             shard_id = owner.shard_id,
             grpc_addr = %owner.grpc_addr,
             node_id = %owner.node_id,
+            range = %range_display,
             "Shard owner"
         );
     }
     info!(servers = ?cluster_info.all_addresses(), "Unique servers");
+
+    // Log tenant-to-shard mapping
+    for tenant in tenant_selector.all_tenants() {
+        match cluster_info.shard_for_tenant(tenant) {
+            Some(owner) => {
+                info!(
+                    tenant = %tenant,
+                    shard_id = %owner.shard_id,
+                    grpc_addr = %owner.grpc_addr,
+                    "Tenant routing"
+                );
+            }
+            None => {
+                error!(tenant = %tenant, "No shard found for tenant - enqueue will fail!");
+            }
+        }
+    }
 
     let cluster_info = Arc::new(cluster_info);
 
