@@ -902,6 +902,93 @@ async fn split_in_multi_node_cluster() {
     let _ = h2.abort();
 }
 
+/// Test that execute_split abandons the split and restores the parent shard
+/// when cloning fails (pre-commit error), using a real etcd coordinator.
+///
+/// This simulates the production scenario where SlateDB clone fails:
+/// the split record is cleaned up and the parent shard resumes service.
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn execute_split_abandons_on_clone_failure() {
+    let _guard = acquire_test_mutex();
+
+    let prefix = unique_prefix();
+    let num_shards: u32 = 1;
+    let cfg = silo::settings::AppConfig::load(None).expect("load default config");
+
+    // Use a noop factory that doesn't support cloning - clone_shard will fail
+    // because no shards are actually open in the factory.
+    let factory = Arc::new(ShardFactory::new_noop());
+
+    let (c1, h1) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n1",
+        "http://127.0.0.1:7450",
+        num_shards,
+        10,
+        factory,
+        Vec::new(),
+    )
+    .await
+    .expect("start coordinator");
+
+    assert!(c1.wait_converged(Duration::from_secs(10)).await);
+
+    let shards = c1.owned_shards().await;
+    let shard_id = shards[0];
+
+    let splitter = ShardSplitter::new(Arc::new(c1.clone()));
+
+    // Request a split
+    let _split = splitter
+        .request_split(shard_id, "m".to_string())
+        .await
+        .expect("request split should succeed");
+
+    // Execute should fail because clone_shard will fail
+    let result = splitter
+        .execute_split(shard_id, || c1.get_shard_owner_map())
+        .await;
+    assert!(
+        result.is_err(),
+        "execute_split should fail when cloning fails"
+    );
+
+    // The split record should have been cleaned up (abandoned)
+    let status = splitter
+        .get_split_status(shard_id)
+        .await
+        .expect("get split status");
+    assert!(
+        status.is_none(),
+        "split record should be deleted after clone failure"
+    );
+
+    // The shard should no longer be paused
+    assert!(
+        !splitter.is_shard_paused(shard_id).await,
+        "shard should not be paused after split is abandoned"
+    );
+
+    // The shard map should be unchanged (parent still exists)
+    let shard_map = c1.get_shard_map().await.expect("get shard map");
+    assert_eq!(shard_map.len(), 1, "shard map should have 1 shard");
+    assert!(
+        shard_map.get_shard(&shard_id).is_some(),
+        "parent shard should still exist"
+    );
+
+    // Should be able to request a new split on the same shard
+    let split2 = splitter.request_split(shard_id, "m".to_string()).await;
+    assert!(
+        split2.is_ok(),
+        "should be able to retry split after abandonment"
+    );
+
+    c1.shutdown().await.unwrap();
+    let _ = h1.abort();
+}
+
 /// Test crash recovery during early phase (split should be abandoned)
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
 async fn crash_recovery_early_phase_abandons_split() {
@@ -1296,5 +1383,160 @@ mod splitter_unit_tests {
         // Advance to pausing phase
         splitter.advance_split_phase(shard_id).await.unwrap();
         assert!(splitter.is_shard_paused(shard_id).await);
+    }
+
+    /// Test that execute_split abandons the split and cleans up the record
+    /// when cloning fails (pre-commit error).
+    #[tokio::test]
+    async fn test_execute_split_abandons_on_clone_failure() {
+        let shard_map = Arc::new(Mutex::new(ShardMap::create_initial(4).unwrap()));
+        let owned = Arc::new(Mutex::new(HashSet::new()));
+        // noop factory has no open shards, so clone_shard will fail with ShardNotOpen
+        let factory = Arc::new(ShardFactory::new_noop());
+
+        let mock = Arc::new(MockSplitBackend::new(
+            shard_map.clone(),
+            owned.clone(),
+            factory,
+        ));
+        let splitter = ShardSplitter::new(Arc::clone(&mock) as Arc<dyn Coordinator>);
+
+        let shard_id = shard_map.lock().await.shard_ids()[0];
+        owned.lock().await.insert(shard_id);
+
+        // Request a split
+        let _split = splitter
+            .request_split(shard_id, "2".to_string())
+            .await
+            .unwrap();
+
+        // execute_split should fail because clone_shard will fail (no open shards)
+        let result = splitter
+            .execute_split(shard_id, || async {
+                Ok(ShardOwnerMap {
+                    shard_map: shard_map.lock().await.clone(),
+                    shard_to_node: HashMap::new(),
+                    shard_to_addr: HashMap::new(),
+                })
+            })
+            .await;
+        assert!(result.is_err(), "execute_split should fail on clone error");
+
+        // The split record should have been cleaned up (abandoned)
+        let status = splitter.get_split_status(shard_id).await.unwrap();
+        assert!(
+            status.is_none(),
+            "split record should be deleted after pre-commit failure"
+        );
+
+        // The shard should no longer be paused
+        assert!(
+            !splitter.is_shard_paused(shard_id).await,
+            "shard should not be paused after split is abandoned"
+        );
+
+        // The shard map should be unchanged (parent still exists)
+        let map = shard_map.lock().await;
+        assert!(
+            map.get_shard(&shard_id).is_some(),
+            "parent shard should still exist in shard map"
+        );
+    }
+
+    /// Test that after a failed split is abandoned, a new split can be requested
+    /// on the same shard.
+    #[tokio::test]
+    async fn test_can_retry_split_after_abandonment() {
+        let shard_map = Arc::new(Mutex::new(ShardMap::create_initial(4).unwrap()));
+        let owned = Arc::new(Mutex::new(HashSet::new()));
+        let factory = Arc::new(ShardFactory::new_noop());
+
+        let mock = Arc::new(MockSplitBackend::new(
+            shard_map.clone(),
+            owned.clone(),
+            factory,
+        ));
+        let splitter = ShardSplitter::new(Arc::clone(&mock) as Arc<dyn Coordinator>);
+
+        let shard_id = shard_map.lock().await.shard_ids()[0];
+        owned.lock().await.insert(shard_id);
+
+        // First split attempt: request and execute (will fail on clone)
+        let _split1 = splitter
+            .request_split(shard_id, "2".to_string())
+            .await
+            .unwrap();
+        let result = splitter
+            .execute_split(shard_id, || async {
+                Ok(ShardOwnerMap {
+                    shard_map: shard_map.lock().await.clone(),
+                    shard_to_node: HashMap::new(),
+                    shard_to_addr: HashMap::new(),
+                })
+            })
+            .await;
+        assert!(result.is_err());
+
+        // The split record was abandoned, so we should be able to request a new one
+        let split2 = splitter.request_split(shard_id, "2".to_string()).await;
+        assert!(
+            split2.is_ok(),
+            "should be able to request a new split after the previous one was abandoned"
+        );
+    }
+
+    /// Test that the owned set is not polluted with child shard IDs after
+    /// a pre-commit failure. If the clone fails, no children should be added
+    /// to the owned set.
+    #[tokio::test]
+    async fn test_owned_set_clean_after_clone_failure() {
+        let shard_map = Arc::new(Mutex::new(ShardMap::create_initial(4).unwrap()));
+        let owned = Arc::new(Mutex::new(HashSet::new()));
+        let factory = Arc::new(ShardFactory::new_noop());
+
+        let mock = Arc::new(MockSplitBackend::new(
+            shard_map.clone(),
+            owned.clone(),
+            factory,
+        ));
+        let splitter = ShardSplitter::new(Arc::clone(&mock) as Arc<dyn Coordinator>);
+
+        let shard_id = shard_map.lock().await.shard_ids()[0];
+        owned.lock().await.insert(shard_id);
+
+        // Capture owned set before split
+        let owned_before: HashSet<ShardId> = owned.lock().await.clone();
+
+        // Request and attempt to execute (will fail on clone)
+        let split = splitter
+            .request_split(shard_id, "2".to_string())
+            .await
+            .unwrap();
+        let _ = splitter
+            .execute_split(shard_id, || async {
+                Ok(ShardOwnerMap {
+                    shard_map: shard_map.lock().await.clone(),
+                    shard_to_node: HashMap::new(),
+                    shard_to_addr: HashMap::new(),
+                })
+            })
+            .await;
+
+        // The owned set should only contain the original shards
+        let owned_after: HashSet<ShardId> = owned.lock().await.clone();
+        assert_eq!(
+            owned_before, owned_after,
+            "owned set should not be modified after pre-commit failure"
+        );
+
+        // Specifically, children should NOT be in the owned set
+        assert!(
+            !owned_after.contains(&split.left_child_id),
+            "left child should not be in owned set"
+        );
+        assert!(
+            !owned_after.contains(&split.right_child_id),
+            "right child should not be in owned set"
+        );
     }
 }

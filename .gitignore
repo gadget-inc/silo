@@ -21,8 +21,10 @@
 .claude/rules
 .claude/settings.json
 .claude/skills/fix-ci
+.codex/config.toml
 .codex/skills/fix-ci
 .cursor/cli.json
+.cursor/mcp.json
 .cursor/rules/alloy.mdc
 .cursor/rules/dst.mdc
 .cursor/skills/fix-ci

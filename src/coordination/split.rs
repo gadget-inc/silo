@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::factory::ShardFactory;
 use crate::shard_range::{ShardId, ShardMap, SplitInProgress};
@@ -208,6 +208,17 @@ impl ShardSplitContext {
 
 use crate::coordination::Coordinator;
 
+/// Internal error type that distinguishes whether a split error occurred
+/// before or after the commit point (shard map update).
+enum SplitExecutionError {
+    /// Error occurred before the shard map was updated. The split can be
+    /// safely abandoned and the parent shard restored to service.
+    PreCommit(CoordinationError),
+    /// Error occurred after the shard map was updated. The split is committed
+    /// and cannot be rolled back.
+    PostCommit(CoordinationError),
+}
+
 /// splitter for shard split operations.
 ///
 /// This struct encapsulates all the shared split logic, using the coordinator's `SplitStorageBackend` implementation for backend-specific storage operations.
@@ -341,7 +352,8 @@ impl ShardSplitter {
     /// SplitRequested -> SplitPausing -> SplitCloning -> SplitComplete
     ///
     /// The shard map update (inside SplitCloning) is the "point of no return".
-    /// If we crash before the shard map update, the split is abandoned on recovery.
+    /// If an error occurs before the shard map update, the split is abandoned:
+    /// the split record is deleted so the parent shard resumes normal operation.
     /// Orphaned clone databases may be left behind but don't affect correctness.
     ///
     /// The `get_shard_owner_map` closure is used to compute ownership after the shard map
@@ -355,26 +367,77 @@ impl ShardSplitter {
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = Result<ShardOwnerMap, CoordinationError>>,
     {
+        match self
+            .execute_split_inner(parent_shard_id, get_shard_owner_map)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(SplitExecutionError::PreCommit(e)) => {
+                // [SILO-COORD-INV-15] The split failed before the commit point
+                // (shard map update). Abandon the split by deleting the record
+                // so the parent shard resumes normal operation.
+                warn!(
+                    parent_shard_id = %parent_shard_id,
+                    error = %e,
+                    "split failed before commit, abandoning split to restore parent shard"
+                );
+                if let Err(abandon_err) = self.abandon_split(&parent_shard_id).await {
+                    warn!(
+                        parent_shard_id = %parent_shard_id,
+                        error = %abandon_err,
+                        "failed to abandon split record during error recovery"
+                    );
+                }
+                Err(e)
+            }
+            Err(SplitExecutionError::PostCommit(e)) => {
+                // The split failed after the commit point. The shard map has
+                // already been updated, so the split is committed. Return the
+                // error but don't try to undo the split.
+                Err(e)
+            }
+        }
+    }
+
+    /// Inner implementation of split execution that distinguishes pre-commit
+    /// and post-commit errors.
+    async fn execute_split_inner<F, Fut>(
+        &self,
+        parent_shard_id: ShardId,
+        get_shard_owner_map: F,
+    ) -> Result<(), SplitExecutionError>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<ShardOwnerMap, CoordinationError>>,
+    {
         loop {
             // Load current split state
             let mut split = self
                 .coordinator
                 .load_split(&parent_shard_id)
-                .await?
-                .ok_or(CoordinationError::NoSplitInProgress(parent_shard_id))?;
+                .await
+                .map_err(SplitExecutionError::PreCommit)?
+                .ok_or(SplitExecutionError::PreCommit(
+                    CoordinationError::NoSplitInProgress(parent_shard_id),
+                ))?;
 
             // Verify we own the shard (not needed for SplitComplete which is just cleanup)
             if split.phase != SplitPhase::SplitComplete
                 && !self.ctx.owns_shard(&parent_shard_id).await
             {
-                return Err(CoordinationError::NotShardOwner(parent_shard_id));
+                return Err(SplitExecutionError::PreCommit(
+                    CoordinationError::NotShardOwner(parent_shard_id),
+                ));
             }
 
             match split.phase {
                 SplitPhase::SplitRequested => {
                     // Advance to SplitPausing
                     split.advance_phase();
-                    self.coordinator.store_split(&split).await?;
+                    self.coordinator
+                        .store_split(&split)
+                        .await
+                        .map_err(SplitExecutionError::PreCommit)?;
                     info!(
                         parent_shard_id = %parent_shard_id,
                         phase = %split.phase,
@@ -384,7 +447,10 @@ impl ShardSplitter {
                 SplitPhase::SplitPausing => {
                     // Traffic is now paused. Advance to SplitCloning.
                     split.advance_phase();
-                    self.coordinator.store_split(&split).await?;
+                    self.coordinator
+                        .store_split(&split)
+                        .await
+                        .map_err(SplitExecutionError::PreCommit)?;
                     info!(
                         parent_shard_id = %parent_shard_id,
                         phase = %split.phase,
@@ -409,9 +475,8 @@ impl ShardSplitter {
                         .clone_shard(&parent_shard_id, &split.left_child_id)
                         .await
                         .map_err(|e| {
-                            CoordinationError::BackendError(format!(
-                                "failed to clone left child: {}",
-                                e
+                            SplitExecutionError::PreCommit(CoordinationError::BackendError(
+                                format!("failed to clone left child: {}", e),
                             ))
                         })?;
 
@@ -421,9 +486,8 @@ impl ShardSplitter {
                         .clone_shard(&parent_shard_id, &split.right_child_id)
                         .await
                         .map_err(|e| {
-                            CoordinationError::BackendError(format!(
-                                "failed to clone right child: {}",
-                                e
+                            SplitExecutionError::PreCommit(CoordinationError::BackendError(
+                                format!("failed to clone right child: {}", e),
                             ))
                         })?;
 
@@ -448,13 +512,31 @@ impl ShardSplitter {
 
                     // Update the shard map atomically - THIS IS THE COMMIT POINT
                     // After this succeeds, the split is committed and children exist.
-                    self.coordinator.update_shard_map_for_split(&split).await?;
+                    if let Err(e) = self.coordinator.update_shard_map_for_split(&split).await {
+                        // Shard map update failed - this is still pre-commit.
+                        // Remove the pre-added children from owned set before abandoning.
+                        {
+                            let mut owned = self.ctx.owned.lock().await;
+                            for child_id in &both_children {
+                                owned.remove(child_id);
+                            }
+                        }
+                        return Err(SplitExecutionError::PreCommit(e));
+                    }
+
+                    // --- PAST THE COMMIT POINT ---
+                    // From here on, all errors are post-commit.
 
                     // Reload the shard map to update local cache
-                    self.coordinator.reload_shard_map().await?;
+                    self.coordinator
+                        .reload_shard_map()
+                        .await
+                        .map_err(SplitExecutionError::PostCommit)?;
 
                     // Now compute which children we actually own based on the updated shard map
-                    let owner_map = get_shard_owner_map().await?;
+                    let owner_map = get_shard_owner_map()
+                        .await
+                        .map_err(SplitExecutionError::PostCommit)?;
                     let children_we_own: Vec<ShardId> = both_children
                         .into_iter()
                         .filter(|child_id| {
@@ -475,9 +557,8 @@ impl ShardSplitter {
                         .close(&parent_shard_id)
                         .await
                         .map_err(|e| {
-                            CoordinationError::BackendError(format!(
-                                "failed to close parent shard {}: {}",
-                                parent_shard_id, e
+                            SplitExecutionError::PostCommit(CoordinationError::BackendError(
+                                format!("failed to close parent shard {}: {}", parent_shard_id, e),
                             ))
                         })?;
                     info!(
@@ -502,9 +583,11 @@ impl ShardSplitter {
                         // Look up the child's range from the reloaded shard map
                         let range = {
                             let map = self.ctx.shard_map.lock().await;
-                            let info = map
-                                .get_shard(&child_id)
-                                .ok_or(CoordinationError::ShardNotFound(child_id))?;
+                            let info =
+                                map.get_shard(&child_id)
+                                    .ok_or(SplitExecutionError::PostCommit(
+                                        CoordinationError::ShardNotFound(child_id),
+                                    ))?;
                             info.range.clone()
                         };
                         self.ctx
@@ -512,9 +595,8 @@ impl ShardSplitter {
                             .open(&child_id, &range)
                             .await
                             .map_err(|e| {
-                                CoordinationError::BackendError(format!(
-                                    "failed to open child shard {}: {}",
-                                    child_id, e
+                                SplitExecutionError::PostCommit(CoordinationError::BackendError(
+                                    format!("failed to open child shard {}: {}", child_id, e),
                                 ))
                             })?;
 
@@ -523,10 +605,12 @@ impl ShardSplitter {
                                 .set_cleanup_status(SplitCleanupStatus::CleanupPending)
                                 .await
                                 .map_err(|e| {
-                                    CoordinationError::BackendError(format!(
-                                        "failed to set cleanup status for child shard {}: {}",
-                                        child_id, e
-                                    ))
+                                    SplitExecutionError::PostCommit(
+                                        CoordinationError::BackendError(format!(
+                                            "failed to set cleanup status for child shard {}: {}",
+                                            child_id, e
+                                        )),
+                                    )
                                 })?;
                         }
 
@@ -539,7 +623,10 @@ impl ShardSplitter {
 
                     // Advance to SplitComplete
                     split.advance_phase();
-                    self.coordinator.store_split(&split).await?;
+                    self.coordinator
+                        .store_split(&split)
+                        .await
+                        .map_err(SplitExecutionError::PostCommit)?;
                     info!(
                         parent_shard_id = %parent_shard_id,
                         phase = %split.phase,
@@ -551,7 +638,10 @@ impl ShardSplitter {
                     // The split is already committed (children exist in shard map).
                     // Deleting the split record just removes the tracking metadata.
                     // The committed state (children in shard map) is preserved.
-                    self.coordinator.delete_split(&parent_shard_id).await?;
+                    self.coordinator
+                        .delete_split(&parent_shard_id)
+                        .await
+                        .map_err(SplitExecutionError::PostCommit)?;
                     info!(
                         parent_shard_id = %parent_shard_id,
                         "split record cleaned up"
@@ -560,6 +650,19 @@ impl ShardSplitter {
                 }
             }
         }
+    }
+
+    /// Abandon a split by deleting its record.
+    ///
+    /// This is used when a split fails before the commit point to restore the
+    /// parent shard to normal operation. Orphaned clone databases may be left
+    /// behind but don't affect correctness and will be garbage collected.
+    async fn abandon_split(&self, parent_shard_id: &ShardId) -> Result<(), CoordinationError> {
+        info!(
+            parent_shard_id = %parent_shard_id,
+            "abandoning split, deleting split record to restore parent shard"
+        );
+        self.coordinator.delete_split(parent_shard_id).await
     }
 
     /// Recover from stale split operations after a node restart.

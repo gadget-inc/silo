@@ -1436,7 +1436,8 @@ pred step[t: Time, tnext: Time] {
     or (some n: Node, s: Shard | splitCloneDbStep[n, s, t, tnext])
     or (some n: Node, s: Shard | splitUpdateMapStep[n, s, t, tnext])
     or (some n: Node, s: Shard | splitCleanupStep[n, s, t, tnext])
-    
+    or (some n: Node, s: Shard | splitAbandonStep[n, s, t, tnext])
+
     -- Cleanup and compaction
     or (some n: Node, s: Shard | splitCleanupStartStep[n, s, t, tnext])
     or (some n: Node, s: Shard | splitCleanupCompleteStep[n, s, t, tnext])
@@ -1780,6 +1781,44 @@ pred splitCleanupStep[n: Node, s: Shard, t: Time, tnext: Time] {
     membershipFrame[t, tnext]
     shardMapFrame[t, tnext]
     leaseFrame[t, tnext]
+    workerFrame[t, tnext]
+}
+
+/**
+ * [SILO-COORD-INV-15] Split abandon on runtime failure (before commit).
+ *
+ * When a split fails at runtime before the commit point (shard map update),
+ * the split record is deleted and the parent shard resumes normal operation.
+ * This covers errors like clone failures, storage errors, etc. that occur
+ * while the node is still alive (as opposed to crash recovery in nodeFlapStep).
+ *
+ * Preconditions:
+ * - Split is in a pre-commit phase (SplitRequested, SplitPausing, or SplitCloning)
+ * - Node holds the lease on the parent shard
+ *
+ * Postconditions:
+ * - Split record is deleted (not in progress)
+ * - Parent shard still exists in the shard map (unchanged)
+ * - No children are created
+ */
+pred splitAbandonStep[n: Node, s: Shard, t: Time, tnext: Time] {
+    -- Preconditions
+    splitInProgressFor[s, t]
+    splitPhaseAt[s, t] in (SplitRequested + SplitPausing + SplitCloning)
+    holdsLease[n, s, t]
+
+    -- Postconditions: Split record deleted, parent preserved
+    not splitInProgressFor[s, tnext]
+    -- Parent shard remains in shard map (unchanged)
+    shardExists[s, tnext]
+    shardRangeStart[s, tnext] = shardRangeStart[s, t]
+    shardRangeEnd[s, tnext] = shardRangeEnd[s, t]
+
+    -- Frame conditions
+    membershipFrame[t, tnext]
+    shardMapFrame[t, tnext]
+    leaseFrame[t, tnext]
+    splitFrameExcept[s, t, tnext]
     workerFrame[t, tnext]
 }
 
@@ -2166,8 +2205,32 @@ assert committedSplitStatePreserved {
 }
 
 /**
+ * [SILO-COORD-INV-15] Runtime split abandonment preserves parent shard.
+ *
+ * When a split is abandoned at runtime (before the commit point), the parent
+ * shard must remain available. This covers both crash recovery (INV-11) and
+ * runtime error handling (e.g., clone failures).
+ *
+ * This is a refinement of INV-11 that explicitly captures the runtime case:
+ * if a split transitions from any pre-commit phase directly to "not in progress"
+ * (without going through SplitComplete), the parent shard is preserved.
+ */
+assert runtimeSplitAbandonPreservesParent {
+    all s: Shard, t1, t2: Time |
+        -- If split was in a pre-commit phase at t1
+        (splitInProgressFor[s, t1] and
+         splitPhaseAt[s, t1] in (SplitRequested + SplitPausing + SplitCloning) and
+         -- And at the next step it's gone (abandoned, not committed)
+         next[t1] = t2 and not splitInProgressFor[s, t2]) implies
+        -- Then parent shard still exists and is unchanged
+        (shardExists[s, t2] and
+         shardRangeStart[s, t2] = shardRangeStart[s, t1] and
+         shardRangeEnd[s, t2] = shardRangeEnd[s, t1])
+}
+
+/**
  * Example: Initial cluster creation with single node and single shard.
- * 
+ *
  * Timeline:
  * - t1: Initial state (no nodes, no shards)
  * - t2: Node joins cluster
@@ -2675,7 +2738,13 @@ check splitChildrenPersist for 3 but
     8 TenantOrder
 
 -- Committed split state preserved (no regression)
-check committedSplitStatePreserved for 3 but 
+check committedSplitStatePreserved for 3 but
+    2 Node, 3 Shard, 2 Addr, 4 TenantId, 6 Time, 1 SplitPoint, 0 Worker,
+    6 NodeMembership, 6 NodeFlapped, 12 ShardMapEntry, 6 ShardLease,
+    6 SplitInProgress, 0 WorkerRouteCache, 0 WorkerRequest, 0 WorkerRetryableError,
+    8 TenantOrder
+
+check runtimeSplitAbandonPreservesParent for 3 but
     2 Node, 3 Shard, 2 Addr, 4 TenantId, 6 Time, 1 SplitPoint, 0 Worker,
     6 NodeMembership, 6 NodeFlapped, 12 ShardMapEntry, 6 ShardLease,
     6 SplitInProgress, 0 WorkerRouteCache, 0 WorkerRequest, 0 WorkerRetryableError,

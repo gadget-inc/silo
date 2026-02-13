@@ -60,5 +60,11 @@
       "WebFetch(domain:grpc.io)"
     ],
     "deny": ["Read(.envrc.local)"]
+  },
+  "mcpServers": {
+    "gadget": {
+      "type": "http",
+      "url": "https://admin.gadget.dev/mcp"
+    }
   }
 }
