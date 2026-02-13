@@ -18,6 +18,7 @@ pub use cleanup::{CleanupProgress, CleanupResult};
 
 pub use counters::{ShardCounters, counter_merge_operator};
 pub use expedite::JobNotExpediteableError;
+pub use import::JobNotReimportableError;
 pub use lease_task::JobNotLeaseableError;
 pub use restart::JobNotRestartableError;
 
@@ -131,6 +132,8 @@ pub enum JobStoreShardError {
     JobAlreadyTerminal(String, JobStatusKind),
     #[error("cannot restart job: {0}")]
     JobNotRestartable(#[from] JobNotRestartableError),
+    #[error("cannot reimport job: {0}")]
+    JobNotReimportable(#[from] JobNotReimportableError),
     #[error("cannot expedite job: {0}")]
     JobNotExpediteable(#[from] JobNotExpediteableError),
     #[error("cannot lease job: {0}")]

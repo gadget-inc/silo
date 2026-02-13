@@ -1,11 +1,14 @@
 mod test_helpers;
 
 use silo::job::{
-    GubernatorAlgorithm, GubernatorRateLimit, JobStatusKind, Limit, RateLimitRetryPolicy,
+    ConcurrencyLimit, GubernatorAlgorithm, GubernatorRateLimit, JobStatusKind, Limit,
+    RateLimitRetryPolicy,
 };
-use silo::job_attempt::AttemptOutcome;
+use silo::job_attempt::{AttemptOutcome, AttemptStatus};
+use silo::job_store_shard::JobStoreShard;
 use silo::job_store_shard::import::{ImportJobParams, ImportedAttempt, ImportedAttemptStatus};
 use silo::retry::RetryPolicy;
+use std::sync::Arc;
 
 fn default_retry_policy() -> RetryPolicy {
     RetryPolicy {
@@ -609,7 +612,7 @@ async fn import_duplicate_id_fails() {
     let params = base_import_params("job-dup");
     shard.import_jobs("-", vec![params]).await.unwrap();
 
-    // Try to import again with same ID
+    // Try to import again with same ID and same data (no new attempts)
     let params2 = base_import_params("job-dup");
     let results = shard.import_jobs("-", vec![params2]).await.unwrap();
     assert!(!results[0].success);
@@ -618,7 +621,9 @@ async fn import_duplicate_id_fails() {
             .error
             .as_ref()
             .unwrap()
-            .contains("already exists")
+            .contains("at least one new attempt"),
+        "expected reimport error about new attempts, got: {}",
+        results[0].error.as_ref().unwrap()
     );
 }
 
@@ -1052,4 +1057,1607 @@ async fn import_preserves_started_at_ms() {
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0].started_at_ms(), 1_700_000_000_000);
     assert_eq!(attempts[1].started_at_ms(), 1_700_000_002_000);
+}
+
+// =========================================================================
+// Reimport tests
+// =========================================================================
+
+/// Helper: import a job and then reimport with additional attempts.
+/// Returns the reimport result status.
+async fn do_reimport(
+    shard: &silo::job_store_shard::JobStoreShard,
+    tenant: &str,
+    _id: &str,
+    initial: ImportJobParams,
+    reimport: ImportJobParams,
+) -> JobStatusKind {
+    let results = shard.import_jobs(tenant, vec![initial]).await.unwrap();
+    assert!(
+        results[0].success,
+        "initial import failed: {:?}",
+        results[0].error
+    );
+
+    let results = shard.import_jobs(tenant, vec![reimport]).await.unwrap();
+    assert!(
+        results[0].success,
+        "reimport failed: {:?}",
+        results[0].error
+    );
+    results[0].status
+}
+
+// =========================================================================
+// State transition matrix
+// =========================================================================
+
+#[silo::test]
+async fn reimport_scheduled_zero_attempts_add_failed_exhausted() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+
+    let initial = base_import_params("reimp-s0-fail");
+    let mut reimport = base_import_params("reimp-s0-fail");
+    reimport.retry_policy = None; // no retries -> exhausted
+    reimport.attempts = vec![failed_attempt(1_700_000_001_000)];
+
+    let status = do_reimport(&shard, "-", "reimp-s0-fail", initial, reimport).await;
+    assert_eq!(status, JobStatusKind::Failed);
+
+    let dequeued = shard.dequeue("worker-1", "default", 1).await.unwrap();
+    assert_eq!(dequeued.tasks.len(), 0);
+}
+
+#[silo::test]
+async fn reimport_scheduled_with_attempts_add_failed_retries_remain() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+
+    // Initial: Scheduled with 2 failed attempts (retries remain with retry_count=3)
+    let mut initial = base_import_params("reimp-s2-sched");
+    initial.retry_policy = Some(default_retry_policy());
+    initial.attempts = vec![
+        failed_attempt(1_700_000_001_000),
+        failed_attempt(1_700_000_002_000),
+    ];
+
+    // Reimport: same 2 + 1 more failed, still retries remain (3 fails <= retry_count=3)
+    let mut reimport = base_import_params("reimp-s2-sched");
+    reimport.retry_policy = Some(default_retry_policy());
+    reimport.attempts = vec![
+        failed_attempt(1_700_000_001_000),
+        failed_attempt(1_700_000_002_000),
+        failed_attempt(1_700_000_003_000),
+    ];
+
+    let status = do_reimport(&shard, "-", "reimp-s2-sched", initial, reimport).await;
+    assert_eq!(status, JobStatusKind::Scheduled);
+
+    // New task should be created
+    let dequeued = shard.dequeue("worker-1", "default", 1).await.unwrap();
+    assert_eq!(dequeued.tasks.len(), 1);
+    assert_eq!(dequeued.tasks[0].attempt().attempt_number(), 4);
+}
+
+#[silo::test]
+async fn reimport_scheduled_with_attempts_add_succeeded() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+
+    let mut initial = base_import_params("reimp-s2-succ");
+    initial.retry_policy = Some(default_retry_policy());
+    initial.attempts = vec![
+        failed_attempt(1_700_000_001_000),
+        failed_attempt(1_700_000_002_000),
+    ];
+
+    let mut reimport = base_import_params("reimp-s2-succ");
+    reimport.retry_policy = Some(default_retry_policy());
+    reimport.attempts = vec![
+        failed_attempt(1_700_000_001_000),
+        failed_attempt(1_700_000_002_000),
+        succeeded_attempt(1_700_000_003_000),
+    ];
+
+    let status = do_reimport(&shard, "-", "reimp-s2-succ", initial, reimport).await;
+    assert_eq!(status, JobStatusKind::Succeeded);
+
+    // Old task should be gone
+    let dequeued = shard.dequeue("worker-1", "default", 1).await.unwrap();
+    assert_eq!(dequeued.tasks.len(), 0);
+}
+
+#[silo::test]
+async fn reimport_scheduled_with_attempts_add_failed_exhausted() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+
+    let mut initial = base_import_params("reimp-s2-exh");
+    initial.retry_policy = Some(RetryPolicy {
+        retry_count: 2,
+        initial_interval_ms: 100,
+        max_interval_ms: 10_000,
+        randomize_interval: false,
+        backoff_factor: 2.0,
+    });
+    initial.attempts = vec![
+        failed_attempt(1_700_000_001_000),
+        failed_attempt(1_700_000_002_000),
+    ];
+
+    // 3 total failures > retry_count=2 -> exhausted
+    let mut reimport = base_import_params("reimp-s2-exh");
+    reimport.retry_policy = Some(RetryPolicy {
+        retry_count: 2,
+        initial_interval_ms: 100,
+        max_interval_ms: 10_000,
+        randomize_interval: false,
+        backoff_factor: 2.0,
+    });
+    reimport.attempts = vec![
+        failed_attempt(1_700_000_001_000),
+        failed_attempt(1_700_000_002_000),
+        failed_attempt(1_700_000_003_000),
+    ];
+
+    let status = do_reimport(&shard, "-", "reimp-s2-exh", initial, reimport).await;
+    assert_eq!(status, JobStatusKind::Failed);
+
+    let dequeued = shard.dequeue("worker-1", "default", 1).await.unwrap();
+    assert_eq!(dequeued.tasks.len(), 0);
+}
+
+#[silo::test]
+async fn reimport_failed_exhausted_add_failed_new_retry_policy() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+
+    // Initial: Failed (exhausted with retry_count=0)
+    let mut initial = base_import_params("reimp-f-sched");
+    initial.retry_policy = None;
+    initial.attempts = vec![failed_attempt(1_700_000_001_000)];
+
+    // Reimport: same 1 + 1 more failed, but with retry_count=3 so retries remain
+    let mut reimport = base_import_params("reimp-f-sched");
+    reimport.retry_policy = Some(default_retry_policy());
+    reimport.attempts = vec![
+        failed_attempt(1_700_000_001_000),
+        failed_attempt(1_700_000_002_000),
+    ];
+
+    let status = do_reimport(&shard, "-", "reimp-f-sched", initial, reimport).await;
+    assert_eq!(status, JobStatusKind::Scheduled);
+
+    let dequeued = shard.dequeue("worker-1", "default", 1).await.unwrap();
+    assert_eq!(dequeued.tasks.len(), 1);
+}
+
+#[silo::test]
+async fn reimport_failed_exhausted_still_exhausted() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+
+    let mut initial = base_import_params("reimp-f-f");
+    initial.retry_policy = None;
+    initial.attempts = vec![failed_attempt(1_700_000_001_000)];
+
+    let mut reimport = base_import_params("reimp-f-f");
+    reimport.retry_policy = None;
+    reimport.attempts = vec![
+        failed_attempt(1_700_000_001_000),
+        failed_attempt(1_700_000_002_000),
+    ];
+
+    let status = do_reimport(&shard, "-", "reimp-f-f", initial, reimport).await;
+    assert_eq!(status, JobStatusKind::Failed);
+}
+
+#[silo::test]
+async fn reimport_cancelled_add_failed_exhausted() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+
+    let mut initial = base_import_params("reimp-c-fail");
+    initial.attempts = vec![cancelled_attempt(1_700_000_001_000)];
+
+    let mut reimport = base_import_params("reimp-c-fail");
+    reimport.retry_policy = None;
+    reimport.attempts = vec![
+        cancelled_attempt(1_700_000_001_000),
+        failed_attempt(1_700_000_002_000),
+    ];
+
+    let status = do_reimport(&shard, "-", "reimp-c-fail", initial, reimport).await;
+    assert_eq!(status, JobStatusKind::Failed);
+}
+
+// =========================================================================
+// Reimport precondition rejection
+// =========================================================================
+
+#[silo::test]
+async fn reimport_succeeded_job_fails() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+
+    let mut initial = base_import_params("reimp-rej-succ");
+    initial.attempts = vec![succeeded_attempt(1_700_000_001_000)];
+    shard.import_jobs("-", vec![initial]).await.unwrap();
+
+    let mut reimport = base_import_params("reimp-rej-succ");
+    reimport.attempts = vec![
+        succeeded_attempt(1_700_000_001_000),
+        failed_attempt(1_700_000_002_000),
+    ];
+
+    let results = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(!results[0].success);
+    assert!(
+        results[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("already succeeded")
+    );
+}
+
+#[silo::test]
+async fn reimport_running_job_fails() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+
+    // Import a scheduled job and dequeue it to make it Running
+    let initial = base_import_params("reimp-rej-run");
+    shard.import_jobs("-", vec![initial]).await.unwrap();
+
+    let dequeued = shard.dequeue("worker-1", "default", 1).await.unwrap();
+    assert_eq!(dequeued.tasks.len(), 1);
+
+    // Try reimport while Running
+    let mut reimport = base_import_params("reimp-rej-run");
+    reimport.attempts = vec![failed_attempt(1_700_000_001_000)];
+
+    let results = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(!results[0].success);
+    assert!(
+        results[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("currently running")
+    );
+}
+
+#[silo::test]
+async fn reimport_fewer_attempts_fails() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+
+    let mut initial = base_import_params("reimp-rej-fewer");
+    initial.retry_policy = Some(default_retry_policy());
+    initial.attempts = vec![
+        failed_attempt(1_700_000_001_000),
+        failed_attempt(1_700_000_002_000),
+    ];
+    shard.import_jobs("-", vec![initial]).await.unwrap();
+
+    // Reimport with only 1 attempt (fewer than existing 2)
+    let mut reimport = base_import_params("reimp-rej-fewer");
+    reimport.retry_policy = Some(default_retry_policy());
+    reimport.attempts = vec![failed_attempt(1_700_000_001_000)];
+
+    let results = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(!results[0].success);
+    assert!(
+        results[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("existing attempts")
+    );
+}
+
+#[silo::test]
+async fn reimport_mismatched_attempt_data_fails() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+
+    let mut initial = base_import_params("reimp-rej-mismatch");
+    initial.retry_policy = Some(default_retry_policy());
+    initial.attempts = vec![failed_attempt(1_700_000_001_000)];
+    shard.import_jobs("-", vec![initial]).await.unwrap();
+
+    // Reimport with different error_code for existing attempt
+    let mut reimport = base_import_params("reimp-rej-mismatch");
+    reimport.retry_policy = Some(default_retry_policy());
+    reimport.attempts = vec![
+        ImportedAttempt {
+            status: ImportedAttemptStatus::Failed {
+                error_code: "DIFFERENT_ERR".to_string(),
+                error: vec![1, 2, 3],
+            },
+            started_at_ms: 1_700_000_000_000,
+            finished_at_ms: 1_700_000_001_000,
+        },
+        failed_attempt(1_700_000_002_000),
+    ];
+
+    let results = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(!results[0].success);
+    assert!(
+        results[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("does not match")
+    );
+}
+
+// =========================================================================
+// Scheduling state cleanup
+// =========================================================================
+
+#[silo::test]
+async fn reimport_scheduled_to_scheduled_replaces_task() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+
+    let mut initial = base_import_params("reimp-clean-replace");
+    initial.retry_policy = Some(default_retry_policy());
+    shard.import_jobs("-", vec![initial]).await.unwrap();
+
+    // Verify task exists
+    let tasks_before = test_helpers::count_task_keys(shard.db()).await;
+    assert_eq!(tasks_before, 1);
+
+    // Reimport: still scheduled with new attempt
+    let mut reimport = base_import_params("reimp-clean-replace");
+    reimport.retry_policy = Some(default_retry_policy());
+    reimport.attempts = vec![failed_attempt(1_700_000_001_000)];
+
+    let results = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(results[0].success);
+    assert_eq!(results[0].status, JobStatusKind::Scheduled);
+
+    // Should still have exactly 1 task (old replaced by new)
+    let tasks_after = test_helpers::count_task_keys(shard.db()).await;
+    assert_eq!(tasks_after, 1);
+
+    // Dequeue should give attempt 3 (2 imported + next)
+    let dequeued = shard.dequeue("worker-1", "default", 1).await.unwrap();
+    assert_eq!(dequeued.tasks.len(), 1);
+    assert_eq!(dequeued.tasks[0].attempt().attempt_number(), 2);
+}
+
+// =========================================================================
+// Counter tests
+// =========================================================================
+
+#[silo::test]
+async fn reimport_scheduled_to_terminal_increments_completed() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+
+    let initial = base_import_params("reimp-cnt-inc");
+    shard.import_jobs("-", vec![initial]).await.unwrap();
+
+    let counters = shard.get_counters().await.unwrap();
+    assert_eq!(counters.total_jobs, 1);
+    assert_eq!(counters.completed_jobs, 0);
+
+    let mut reimport = base_import_params("reimp-cnt-inc");
+    reimport.attempts = vec![succeeded_attempt(1_700_000_001_000)];
+    shard.import_jobs("-", vec![reimport]).await.unwrap();
+
+    let counters = shard.get_counters().await.unwrap();
+    assert_eq!(counters.total_jobs, 1);
+    assert_eq!(counters.completed_jobs, 1);
+}
+
+#[silo::test]
+async fn reimport_failed_to_scheduled_decrements_completed() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+
+    let mut initial = base_import_params("reimp-cnt-dec");
+    initial.retry_policy = None;
+    initial.attempts = vec![failed_attempt(1_700_000_001_000)];
+    shard.import_jobs("-", vec![initial]).await.unwrap();
+
+    let counters = shard.get_counters().await.unwrap();
+    assert_eq!(counters.total_jobs, 1);
+    assert_eq!(counters.completed_jobs, 1);
+
+    let mut reimport = base_import_params("reimp-cnt-dec");
+    reimport.retry_policy = Some(default_retry_policy());
+    reimport.attempts = vec![
+        failed_attempt(1_700_000_001_000),
+        failed_attempt(1_700_000_002_000),
+    ];
+    shard.import_jobs("-", vec![reimport]).await.unwrap();
+
+    let counters = shard.get_counters().await.unwrap();
+    assert_eq!(counters.total_jobs, 1);
+    assert_eq!(counters.completed_jobs, 0);
+}
+
+#[silo::test]
+async fn reimport_failed_to_failed_no_counter_change() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+
+    let mut initial = base_import_params("reimp-cnt-same");
+    initial.retry_policy = None;
+    initial.attempts = vec![failed_attempt(1_700_000_001_000)];
+    shard.import_jobs("-", vec![initial]).await.unwrap();
+
+    let counters = shard.get_counters().await.unwrap();
+    assert_eq!(counters.completed_jobs, 1);
+
+    let mut reimport = base_import_params("reimp-cnt-same");
+    reimport.retry_policy = None;
+    reimport.attempts = vec![
+        failed_attempt(1_700_000_001_000),
+        failed_attempt(1_700_000_002_000),
+    ];
+    shard.import_jobs("-", vec![reimport]).await.unwrap();
+
+    let counters = shard.get_counters().await.unwrap();
+    assert_eq!(counters.total_jobs, 1);
+    assert_eq!(counters.completed_jobs, 1);
+}
+
+#[silo::test]
+async fn reimport_multiple_counter_consistency() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+
+    // Import as Scheduled
+    let initial = base_import_params("reimp-cnt-multi");
+    shard.import_jobs("-", vec![initial]).await.unwrap();
+    let counters = shard.get_counters().await.unwrap();
+    assert_eq!(counters.total_jobs, 1);
+    assert_eq!(counters.completed_jobs, 0);
+
+    // Reimport 1: Scheduled -> Failed
+    let mut reimport1 = base_import_params("reimp-cnt-multi");
+    reimport1.retry_policy = None;
+    reimport1.attempts = vec![failed_attempt(1_700_000_001_000)];
+    shard.import_jobs("-", vec![reimport1]).await.unwrap();
+    let counters = shard.get_counters().await.unwrap();
+    assert_eq!(counters.total_jobs, 1);
+    assert_eq!(counters.completed_jobs, 1);
+
+    // Reimport 2: Failed -> Scheduled (new retry policy)
+    let mut reimport2 = base_import_params("reimp-cnt-multi");
+    reimport2.retry_policy = Some(default_retry_policy());
+    reimport2.attempts = vec![
+        failed_attempt(1_700_000_001_000),
+        failed_attempt(1_700_000_002_000),
+    ];
+    shard.import_jobs("-", vec![reimport2]).await.unwrap();
+    let counters = shard.get_counters().await.unwrap();
+    assert_eq!(counters.total_jobs, 1);
+    assert_eq!(counters.completed_jobs, 0);
+
+    // Reimport 3: Scheduled -> Succeeded
+    let mut reimport3 = base_import_params("reimp-cnt-multi");
+    reimport3.attempts = vec![
+        failed_attempt(1_700_000_001_000),
+        failed_attempt(1_700_000_002_000),
+        succeeded_attempt(1_700_000_003_000),
+    ];
+    shard.import_jobs("-", vec![reimport3]).await.unwrap();
+    let counters = shard.get_counters().await.unwrap();
+    assert_eq!(counters.total_jobs, 1);
+    assert_eq!(counters.completed_jobs, 1);
+}
+
+// =========================================================================
+// Multi-reimport tests
+// =========================================================================
+
+#[silo::test]
+async fn reimport_full_migration_cycle() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+
+    // Import with 0 attempts (Scheduled)
+    let initial = base_import_params("reimp-cycle");
+    shard.import_jobs("-", vec![initial]).await.unwrap();
+
+    // Reimport 1: +1 fail (still Scheduled with retries)
+    let mut reimport1 = base_import_params("reimp-cycle");
+    reimport1.retry_policy = Some(default_retry_policy());
+    reimport1.attempts = vec![failed_attempt(1_700_000_001_000)];
+    let results = shard.import_jobs("-", vec![reimport1]).await.unwrap();
+    assert!(results[0].success);
+    assert_eq!(results[0].status, JobStatusKind::Scheduled);
+
+    // Reimport 2: +1 succeed (Succeeded)
+    let mut reimport2 = base_import_params("reimp-cycle");
+    reimport2.attempts = vec![
+        failed_attempt(1_700_000_001_000),
+        succeeded_attempt(1_700_000_002_000),
+    ];
+    let results = shard.import_jobs("-", vec![reimport2]).await.unwrap();
+    assert!(results[0].success);
+    assert_eq!(results[0].status, JobStatusKind::Succeeded);
+
+    // Verify all attempts readable
+    let attempts = shard.get_job_attempts("-", "reimp-cycle").await.unwrap();
+    assert_eq!(attempts.len(), 2);
+}
+
+#[silo::test]
+async fn reimport_three_sequential_accumulating_attempts() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+
+    // Import with 1 failure
+    let mut initial = base_import_params("reimp-accum");
+    initial.retry_policy = Some(default_retry_policy());
+    initial.attempts = vec![failed_attempt(1_700_000_001_000)];
+    shard.import_jobs("-", vec![initial]).await.unwrap();
+
+    // Reimport 1: +1 failure (2 total)
+    let mut reimport1 = base_import_params("reimp-accum");
+    reimport1.retry_policy = Some(default_retry_policy());
+    reimport1.attempts = vec![
+        failed_attempt(1_700_000_001_000),
+        failed_attempt(1_700_000_002_000),
+    ];
+    let results = shard.import_jobs("-", vec![reimport1]).await.unwrap();
+    assert!(results[0].success);
+
+    // Reimport 2: +1 failure (3 total)
+    let mut reimport2 = base_import_params("reimp-accum");
+    reimport2.retry_policy = Some(default_retry_policy());
+    reimport2.attempts = vec![
+        failed_attempt(1_700_000_001_000),
+        failed_attempt(1_700_000_002_000),
+        failed_attempt(1_700_000_003_000),
+    ];
+    let results = shard.import_jobs("-", vec![reimport2]).await.unwrap();
+    assert!(results[0].success);
+
+    // All 3 attempts should be readable
+    let attempts = shard.get_job_attempts("-", "reimp-accum").await.unwrap();
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(attempts[0].attempt_number(), 1);
+    assert_eq!(attempts[1].attempt_number(), 2);
+    assert_eq!(attempts[2].attempt_number(), 3);
+}
+
+// =========================================================================
+// Interaction tests
+// =========================================================================
+
+#[silo::test]
+async fn reimport_all_attempts_readable() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+
+    // Import with 2 failures
+    let mut initial = base_import_params("reimp-readall");
+    initial.retry_policy = Some(default_retry_policy());
+    initial.attempts = vec![
+        failed_attempt(1_700_000_001_000),
+        failed_attempt(1_700_000_002_000),
+    ];
+    shard.import_jobs("-", vec![initial]).await.unwrap();
+
+    // Reimport with +1 succeeded
+    let mut reimport = base_import_params("reimp-readall");
+    reimport.attempts = vec![
+        failed_attempt(1_700_000_001_000),
+        failed_attempt(1_700_000_002_000),
+        succeeded_attempt(1_700_000_003_000),
+    ];
+    shard.import_jobs("-", vec![reimport]).await.unwrap();
+
+    // All 3 attempts should be readable with correct data
+    let attempts = shard.get_job_attempts("-", "reimp-readall").await.unwrap();
+    assert_eq!(attempts.len(), 3);
+
+    assert!(matches!(
+        attempts[0].state(),
+        silo::job_attempt::AttemptStatus::Failed { .. }
+    ));
+    assert!(matches!(
+        attempts[1].state(),
+        silo::job_attempt::AttemptStatus::Failed { .. }
+    ));
+    assert!(matches!(
+        attempts[2].state(),
+        silo::job_attempt::AttemptStatus::Succeeded { .. }
+    ));
+}
+
+// =========================================================================
+// Data integrity: status index
+// =========================================================================
+
+#[silo::test]
+async fn reimport_status_index_correct_after_transition() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+
+    // Import as Scheduled
+    let initial = base_import_params("reimp-idx");
+    shard.import_jobs("-", vec![initial]).await.unwrap();
+
+    // Verify Scheduled status index entry
+    let scheduled_count = test_helpers::count_with_binary_prefix(
+        shard.db(),
+        &silo::keys::idx_status_time_prefix("-", "Scheduled"),
+    )
+    .await;
+    assert_eq!(scheduled_count, 1);
+
+    // Reimport to Succeeded
+    let mut reimport = base_import_params("reimp-idx");
+    reimport.attempts = vec![succeeded_attempt(1_700_000_001_000)];
+    shard.import_jobs("-", vec![reimport]).await.unwrap();
+
+    // Old Scheduled index should be gone, Succeeded should exist
+    let scheduled_count = test_helpers::count_with_binary_prefix(
+        shard.db(),
+        &silo::keys::idx_status_time_prefix("-", "Scheduled"),
+    )
+    .await;
+    assert_eq!(scheduled_count, 0);
+
+    let succeeded_count = test_helpers::count_with_binary_prefix(
+        shard.db(),
+        &silo::keys::idx_status_time_prefix("-", "Succeeded"),
+    )
+    .await;
+    assert_eq!(succeeded_count, 1);
+}
+
+// =========================================================================
+// Reimport transition tests
+// =========================================================================
+//
+// These tests systematically explore all reachable pre-reimport states that
+// can occur from silo lifecycle operations happening between imports.
+// For each state we reimport to both a non-terminal (Scheduled) and terminal
+// (Succeeded) target, then verify ALL side-effect state is correct:
+//   - job status
+//   - cancelled key cleaned up
+//   - task keys (1 if Scheduled, 0 if terminal)
+//   - concurrency holders cleaned up
+//   - concurrency requests cleaned up
+//   - dequeue works if Scheduled
+//   - counters are consistent
+
+/// Convert existing silo attempt records into ImportedAttempt form for reimport matching.
+async fn existing_attempts_as_imported(
+    shard: &JobStoreShard,
+    tenant: &str,
+    job_id: &str,
+) -> Vec<ImportedAttempt> {
+    let attempts = shard.get_job_attempts(tenant, job_id).await.unwrap();
+    attempts
+        .iter()
+        .map(|a| {
+            let (status, finished_at_ms) = match a.state() {
+                AttemptStatus::Succeeded {
+                    finished_at_ms,
+                    result,
+                } => (ImportedAttemptStatus::Succeeded { result }, finished_at_ms),
+                AttemptStatus::Failed {
+                    finished_at_ms,
+                    error_code,
+                    error,
+                } => (
+                    ImportedAttemptStatus::Failed { error_code, error },
+                    finished_at_ms,
+                ),
+                AttemptStatus::Cancelled { finished_at_ms } => {
+                    (ImportedAttemptStatus::Cancelled, finished_at_ms)
+                }
+                AttemptStatus::Running => panic!("attempt should be terminal for reimport"),
+            };
+            ImportedAttempt {
+                status,
+                started_at_ms: a.started_at_ms(),
+                finished_at_ms,
+            }
+        })
+        .collect()
+}
+
+/// Verify all reimport invariants hold after a reimport.
+/// If `isolated` is true, we also check global counts (task keys, lease keys) which
+/// require no other jobs in the shard. If false, we skip checks that could be affected
+/// by other jobs sharing the shard.
+async fn verify_reimport_invariants(
+    shard: &JobStoreShard,
+    tenant: &str,
+    job_id: &str,
+    expected_status: JobStatusKind,
+    expected_attempt_count: usize,
+    scenario_name: &str,
+) {
+    verify_reimport_invariants_inner(
+        shard,
+        tenant,
+        job_id,
+        expected_status,
+        expected_attempt_count,
+        scenario_name,
+        true,
+    )
+    .await;
+}
+
+async fn verify_reimport_invariants_inner(
+    shard: &JobStoreShard,
+    tenant: &str,
+    job_id: &str,
+    expected_status: JobStatusKind,
+    expected_attempt_count: usize,
+    scenario_name: &str,
+    isolated: bool,
+) {
+    let ctx = format!("[{}]", scenario_name);
+
+    // 1. Status is correct
+    let status = shard.get_job_status(tenant, job_id).await.unwrap().unwrap();
+    assert_eq!(
+        status.kind, expected_status,
+        "{ctx} expected status {:?}",
+        expected_status
+    );
+
+    // 2. Cancelled key must not exist after reimport (regardless of terminal/non-terminal)
+    assert!(
+        !shard.is_job_cancelled(tenant, job_id).await.unwrap(),
+        "{ctx} cancelled key should not exist after reimport"
+    );
+
+    // 3. Task keys: (only meaningful when no other jobs are present)
+    if isolated {
+        let task_count = test_helpers::count_task_keys(shard.db()).await;
+        if expected_status == JobStatusKind::Scheduled {
+            assert_eq!(
+                task_count, 1,
+                "{ctx} should have exactly 1 task key when Scheduled"
+            );
+        } else {
+            assert_eq!(task_count, 0, "{ctx} should have 0 task keys when terminal");
+        }
+    }
+
+    // 4. Attempt count is correct
+    let attempts = shard.get_job_attempts(tenant, job_id).await.unwrap();
+    assert_eq!(
+        attempts.len(),
+        expected_attempt_count,
+        "{ctx} expected {} attempts",
+        expected_attempt_count
+    );
+
+    // 5. No lease keys lingering (only meaningful when no other jobs are present)
+    if isolated {
+        let lease_count = test_helpers::count_lease_keys(shard.db()).await;
+        assert_eq!(
+            lease_count, 0,
+            "{ctx} should have 0 lease keys after reimport"
+        );
+    }
+
+    // 7. Status index has entry for the current status
+    // (must check before dequeue which would change the status)
+    let idx_count = test_helpers::count_with_binary_prefix(
+        shard.db(),
+        &silo::keys::idx_status_time_prefix(tenant, expected_status.as_str()),
+    )
+    .await;
+    assert!(
+        idx_count >= 1,
+        "{ctx} status index should have entry for {:?}",
+        expected_status
+    );
+
+    // 8. Dequeue works if Scheduled
+    if expected_status == JobStatusKind::Scheduled {
+        let dequeued = shard.dequeue("worker-1", "default", 1).await.unwrap();
+        assert_eq!(
+            dequeued.tasks.len(),
+            1,
+            "{ctx} should be able to dequeue when Scheduled"
+        );
+        assert_eq!(
+            dequeued.tasks[0].job().id(),
+            job_id,
+            "{ctx} dequeued wrong job"
+        );
+        // Report success to clean up
+        let task_id = dequeued.tasks[0].attempt().task_id().to_string();
+        shard
+            .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: vec![99] })
+            .await
+            .unwrap();
+    }
+}
+
+/// Build reimport params that include existing attempts plus new ones targeting the given status.
+fn build_reimport_params(
+    job_id: &str,
+    existing_attempts: Vec<ImportedAttempt>,
+    target_terminal: bool,
+) -> ImportJobParams {
+    let mut attempts = existing_attempts;
+    if target_terminal {
+        // Add a succeeded attempt to make it terminal
+        attempts.push(succeeded_attempt(1_700_000_100_000));
+    } else {
+        // Add a failed attempt; with retry_count=3 it stays Scheduled
+        attempts.push(failed_attempt(1_700_000_100_000));
+    }
+
+    ImportJobParams {
+        id: job_id.to_string(),
+        priority: 50,
+        enqueue_time_ms: 1_700_000_000_000,
+        start_at_ms: 0,
+        retry_policy: Some(RetryPolicy {
+            retry_count: 10, // generous to always allow retries when non-terminal
+            initial_interval_ms: 10,
+            max_interval_ms: 10_000,
+            randomize_interval: false,
+            backoff_factor: 1.0,
+        }),
+        payload: test_helpers::msgpack_payload(&serde_json::json!({"reimport": true})),
+        limits: vec![],
+        metadata: None,
+        task_group: "default".to_string(),
+        attempts,
+    }
+}
+
+// ── Lifecycle path: fresh Scheduled (import with 0 attempts) ────────────
+
+async fn setup_fresh_scheduled(shard: &Arc<JobStoreShard>, job_id: &str) {
+    let mut params = base_import_params(job_id);
+    params.retry_policy = Some(default_retry_policy());
+    let r = shard.import_jobs("-", vec![params]).await.unwrap();
+    assert!(r[0].success);
+    assert_eq!(r[0].status, JobStatusKind::Scheduled);
+}
+
+#[silo::test]
+async fn reimport_transitions_fresh_scheduled_to_scheduled() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let job_id = "sys-fresh-sched-to-sched";
+    setup_fresh_scheduled(&shard, job_id).await;
+
+    let existing = existing_attempts_as_imported(&shard, "-", job_id).await;
+    let reimport = build_reimport_params(job_id, existing, false);
+    let r = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+
+    verify_reimport_invariants(
+        &shard,
+        "-",
+        job_id,
+        JobStatusKind::Scheduled,
+        1,
+        "fresh→sched",
+    )
+    .await;
+}
+
+#[silo::test]
+async fn reimport_transitions_fresh_scheduled_to_terminal() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let job_id = "sys-fresh-sched-to-term";
+    setup_fresh_scheduled(&shard, job_id).await;
+
+    let existing = existing_attempts_as_imported(&shard, "-", job_id).await;
+    let reimport = build_reimport_params(job_id, existing, true);
+    let r = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+
+    verify_reimport_invariants(
+        &shard,
+        "-",
+        job_id,
+        JobStatusKind::Succeeded,
+        1,
+        "fresh→term",
+    )
+    .await;
+}
+
+// ── Lifecycle path: Cancelled via cancel_job ────────────────────────────
+
+async fn setup_cancelled_via_cancel_job(shard: &Arc<JobStoreShard>, job_id: &str) {
+    setup_fresh_scheduled(shard, job_id).await;
+    shard.cancel_job("-", job_id).await.unwrap();
+    let s = shard.get_job_status("-", job_id).await.unwrap().unwrap();
+    assert_eq!(s.kind, JobStatusKind::Cancelled);
+    // Verify cancelled key exists
+    assert!(shard.is_job_cancelled("-", job_id).await.unwrap());
+}
+
+#[silo::test]
+async fn reimport_transitions_cancel_job_to_scheduled() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let job_id = "sys-cancel-to-sched";
+    setup_cancelled_via_cancel_job(&shard, job_id).await;
+
+    let existing = existing_attempts_as_imported(&shard, "-", job_id).await;
+    let reimport = build_reimport_params(job_id, existing, false);
+    let r = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+
+    verify_reimport_invariants(
+        &shard,
+        "-",
+        job_id,
+        JobStatusKind::Scheduled,
+        1,
+        "cancel→sched",
+    )
+    .await;
+}
+
+#[silo::test]
+async fn reimport_transitions_cancel_job_to_terminal() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let job_id = "sys-cancel-to-term";
+    setup_cancelled_via_cancel_job(&shard, job_id).await;
+
+    let existing = existing_attempts_as_imported(&shard, "-", job_id).await;
+    let reimport = build_reimport_params(job_id, existing, true);
+    let r = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+
+    verify_reimport_invariants(
+        &shard,
+        "-",
+        job_id,
+        JobStatusKind::Succeeded,
+        1,
+        "cancel→term",
+    )
+    .await;
+}
+
+// ── Lifecycle path: Failed via dequeue + error (exhausted) ──────────────
+
+async fn setup_failed_via_dequeue(shard: &Arc<JobStoreShard>, job_id: &str) {
+    let mut params = base_import_params(job_id);
+    params.retry_policy = None; // exhausted after first failure
+    let r = shard.import_jobs("-", vec![params]).await.unwrap();
+    assert!(r[0].success);
+    assert_eq!(r[0].status, JobStatusKind::Scheduled);
+
+    // Dequeue and fail
+    let dequeued = shard.dequeue("worker-1", "default", 1).await.unwrap();
+    assert_eq!(dequeued.tasks.len(), 1);
+    let task_id = dequeued.tasks[0].attempt().task_id().to_string();
+    shard
+        .report_attempt_outcome(
+            &task_id,
+            AttemptOutcome::Error {
+                error_code: "ERR".to_string(),
+                error: vec![1, 2, 3],
+            },
+        )
+        .await
+        .unwrap();
+
+    let s = shard.get_job_status("-", job_id).await.unwrap().unwrap();
+    assert_eq!(s.kind, JobStatusKind::Failed);
+}
+
+#[silo::test]
+async fn reimport_transitions_failed_via_dequeue_to_scheduled() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let job_id = "sys-fail-deq-to-sched";
+    setup_failed_via_dequeue(&shard, job_id).await;
+
+    let existing = existing_attempts_as_imported(&shard, "-", job_id).await;
+    let reimport = build_reimport_params(job_id, existing, false);
+    let r = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+
+    verify_reimport_invariants(
+        &shard,
+        "-",
+        job_id,
+        JobStatusKind::Scheduled,
+        2,
+        "fail-deq→sched",
+    )
+    .await;
+}
+
+#[silo::test]
+async fn reimport_transitions_failed_via_dequeue_to_terminal() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let job_id = "sys-fail-deq-to-term";
+    setup_failed_via_dequeue(&shard, job_id).await;
+
+    let existing = existing_attempts_as_imported(&shard, "-", job_id).await;
+    let reimport = build_reimport_params(job_id, existing, true);
+    let r = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+
+    verify_reimport_invariants(
+        &shard,
+        "-",
+        job_id,
+        JobStatusKind::Succeeded,
+        2,
+        "fail-deq→term",
+    )
+    .await;
+}
+
+// ── Lifecycle path: Scheduled via dequeue + error + retry ───────────────
+
+async fn setup_scheduled_via_retry(shard: &Arc<JobStoreShard>, job_id: &str) {
+    let mut params = base_import_params(job_id);
+    params.retry_policy = Some(RetryPolicy {
+        retry_count: 5,
+        initial_interval_ms: 10,
+        max_interval_ms: 10_000,
+        randomize_interval: false,
+        backoff_factor: 1.0,
+    });
+    let r = shard.import_jobs("-", vec![params]).await.unwrap();
+    assert!(r[0].success);
+
+    // Dequeue, fail (retries remain → Scheduled)
+    let dequeued = shard.dequeue("worker-1", "default", 1).await.unwrap();
+    assert_eq!(dequeued.tasks.len(), 1);
+    let task_id = dequeued.tasks[0].attempt().task_id().to_string();
+    shard
+        .report_attempt_outcome(
+            &task_id,
+            AttemptOutcome::Error {
+                error_code: "RETRY".to_string(),
+                error: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let s = shard.get_job_status("-", job_id).await.unwrap().unwrap();
+    assert_eq!(s.kind, JobStatusKind::Scheduled);
+}
+
+#[silo::test]
+async fn reimport_transitions_retry_scheduled_to_scheduled() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let job_id = "sys-retry-to-sched";
+    setup_scheduled_via_retry(&shard, job_id).await;
+
+    let existing = existing_attempts_as_imported(&shard, "-", job_id).await;
+    let reimport = build_reimport_params(job_id, existing, false);
+    let r = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+
+    verify_reimport_invariants(
+        &shard,
+        "-",
+        job_id,
+        JobStatusKind::Scheduled,
+        2,
+        "retry→sched",
+    )
+    .await;
+}
+
+#[silo::test]
+async fn reimport_transitions_retry_scheduled_to_terminal() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let job_id = "sys-retry-to-term";
+    setup_scheduled_via_retry(&shard, job_id).await;
+
+    let existing = existing_attempts_as_imported(&shard, "-", job_id).await;
+    let reimport = build_reimport_params(job_id, existing, true);
+    let r = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+
+    verify_reimport_invariants(
+        &shard,
+        "-",
+        job_id,
+        JobStatusKind::Succeeded,
+        2,
+        "retry→term",
+    )
+    .await;
+}
+
+// ── Lifecycle path: Cancelled via dequeue + report(Cancelled) ───────────
+
+async fn setup_cancelled_via_dequeue(shard: &Arc<JobStoreShard>, job_id: &str) {
+    let mut params = base_import_params(job_id);
+    params.retry_policy = Some(default_retry_policy());
+    let r = shard.import_jobs("-", vec![params]).await.unwrap();
+    assert!(r[0].success);
+
+    let dequeued = shard.dequeue("worker-1", "default", 1).await.unwrap();
+    assert_eq!(dequeued.tasks.len(), 1);
+    let task_id = dequeued.tasks[0].attempt().task_id().to_string();
+    shard
+        .report_attempt_outcome(&task_id, AttemptOutcome::Cancelled)
+        .await
+        .unwrap();
+
+    let s = shard.get_job_status("-", job_id).await.unwrap().unwrap();
+    assert_eq!(s.kind, JobStatusKind::Cancelled);
+}
+
+#[silo::test]
+async fn reimport_transitions_cancelled_via_dequeue_to_scheduled() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let job_id = "sys-cxl-deq-to-sched";
+    setup_cancelled_via_dequeue(&shard, job_id).await;
+
+    let existing = existing_attempts_as_imported(&shard, "-", job_id).await;
+    let reimport = build_reimport_params(job_id, existing, false);
+    let r = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+
+    verify_reimport_invariants(
+        &shard,
+        "-",
+        job_id,
+        JobStatusKind::Scheduled,
+        2,
+        "cxl-deq→sched",
+    )
+    .await;
+}
+
+#[silo::test]
+async fn reimport_transitions_cancelled_via_dequeue_to_terminal() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let job_id = "sys-cxl-deq-to-term";
+    setup_cancelled_via_dequeue(&shard, job_id).await;
+
+    let existing = existing_attempts_as_imported(&shard, "-", job_id).await;
+    let reimport = build_reimport_params(job_id, existing, true);
+    let r = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+
+    verify_reimport_invariants(
+        &shard,
+        "-",
+        job_id,
+        JobStatusKind::Succeeded,
+        2,
+        "cxl-deq→term",
+    )
+    .await;
+}
+
+// ── Lifecycle path: Cancelled via cancel_job on Running ─────────────────
+// Import → dequeue → Running → cancel_job → heartbeat → report(Cancelled)
+
+async fn setup_cancelled_while_running(shard: &Arc<JobStoreShard>, job_id: &str) {
+    let mut params = base_import_params(job_id);
+    params.retry_policy = Some(default_retry_policy());
+    let r = shard.import_jobs("-", vec![params]).await.unwrap();
+    assert!(r[0].success);
+
+    let dequeued = shard.dequeue("worker-1", "default", 1).await.unwrap();
+    assert_eq!(dequeued.tasks.len(), 1);
+    let task_id = dequeued.tasks[0].attempt().task_id().to_string();
+
+    // Cancel while running
+    shard.cancel_job("-", job_id).await.unwrap();
+    assert!(shard.is_job_cancelled("-", job_id).await.unwrap());
+
+    // Worker discovers cancellation and reports it
+    shard
+        .report_attempt_outcome(&task_id, AttemptOutcome::Cancelled)
+        .await
+        .unwrap();
+
+    let s = shard.get_job_status("-", job_id).await.unwrap().unwrap();
+    assert_eq!(s.kind, JobStatusKind::Cancelled);
+    // Cancelled key still exists (report_outcome doesn't remove it)
+    assert!(shard.is_job_cancelled("-", job_id).await.unwrap());
+}
+
+#[silo::test]
+async fn reimport_transitions_cancel_while_running_to_scheduled() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let job_id = "sys-cxl-run-to-sched";
+    setup_cancelled_while_running(&shard, job_id).await;
+
+    let existing = existing_attempts_as_imported(&shard, "-", job_id).await;
+    let reimport = build_reimport_params(job_id, existing, false);
+    let r = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+
+    verify_reimport_invariants(
+        &shard,
+        "-",
+        job_id,
+        JobStatusKind::Scheduled,
+        2,
+        "cxl-run→sched",
+    )
+    .await;
+}
+
+#[silo::test]
+async fn reimport_transitions_cancel_while_running_to_terminal() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let job_id = "sys-cxl-run-to-term";
+    setup_cancelled_while_running(&shard, job_id).await;
+
+    let existing = existing_attempts_as_imported(&shard, "-", job_id).await;
+    let reimport = build_reimport_params(job_id, existing, true);
+    let r = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+
+    verify_reimport_invariants(
+        &shard,
+        "-",
+        job_id,
+        JobStatusKind::Succeeded,
+        2,
+        "cxl-run→term",
+    )
+    .await;
+}
+
+// ── Lifecycle path: Scheduled with concurrency holder ───────────────────
+
+async fn setup_scheduled_with_concurrency(shard: &Arc<JobStoreShard>, job_id: &str) {
+    let mut params = base_import_params(job_id);
+    params.retry_policy = Some(default_retry_policy());
+    params.limits = vec![Limit::Concurrency(ConcurrencyLimit {
+        key: "sys-test-queue".to_string(),
+        max_concurrency: 10,
+    })];
+    let r = shard.import_jobs("-", vec![params]).await.unwrap();
+    assert!(r[0].success);
+    assert_eq!(r[0].status, JobStatusKind::Scheduled);
+
+    // Verify holder exists
+    assert!(
+        test_helpers::count_concurrency_holders(shard.db()).await > 0,
+        "should have concurrency holder after import with limits"
+    );
+}
+
+#[silo::test]
+async fn reimport_transitions_concurrency_holder_to_scheduled() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let job_id = "sys-conc-hold-to-sched";
+    setup_scheduled_with_concurrency(&shard, job_id).await;
+
+    let existing = existing_attempts_as_imported(&shard, "-", job_id).await;
+    // Must include the same limits for reimport
+    let mut reimport = build_reimport_params(job_id, existing, false);
+    reimport.limits = vec![Limit::Concurrency(ConcurrencyLimit {
+        key: "sys-test-queue".to_string(),
+        max_concurrency: 10,
+    })];
+    let r = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+
+    // Should still have exactly 1 holder (old released, new acquired)
+    let holders = test_helpers::count_concurrency_holders(shard.db()).await;
+    assert_eq!(
+        holders, 1,
+        "[conc-hold→sched] should have 1 holder after reimport"
+    );
+
+    verify_reimport_invariants(
+        &shard,
+        "-",
+        job_id,
+        JobStatusKind::Scheduled,
+        1,
+        "conc-hold→sched",
+    )
+    .await;
+}
+
+#[silo::test]
+async fn reimport_transitions_concurrency_holder_to_terminal() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let job_id = "sys-conc-hold-to-term";
+    setup_scheduled_with_concurrency(&shard, job_id).await;
+
+    let existing = existing_attempts_as_imported(&shard, "-", job_id).await;
+    let mut reimport = build_reimport_params(job_id, existing, true);
+    reimport.limits = vec![Limit::Concurrency(ConcurrencyLimit {
+        key: "sys-test-queue".to_string(),
+        max_concurrency: 10,
+    })];
+    let r = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+
+    verify_reimport_invariants(
+        &shard,
+        "-",
+        job_id,
+        JobStatusKind::Succeeded,
+        1,
+        "conc-hold→term",
+    )
+    .await;
+}
+
+// ── Lifecycle path: Scheduled with concurrency request (at capacity) ────
+
+async fn setup_scheduled_with_concurrency_request(shard: &Arc<JobStoreShard>, job_id: &str) {
+    // Fill the concurrency slot with another job
+    let payload = test_helpers::msgpack_payload(&serde_json::json!({"filler": true}));
+    shard
+        .enqueue(
+            "-",
+            Some("sys-filler".to_string()),
+            50,
+            0,
+            None,
+            payload,
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: "sys-limited-queue".to_string(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .unwrap();
+    let dequeued = shard.dequeue("worker-1", "default", 1).await.unwrap();
+    assert_eq!(dequeued.tasks.len(), 1);
+
+    // Now import - will get a concurrency request (not a holder)
+    let mut params = base_import_params(job_id);
+    params.retry_policy = Some(default_retry_policy());
+    params.limits = vec![Limit::Concurrency(ConcurrencyLimit {
+        key: "sys-limited-queue".to_string(),
+        max_concurrency: 1,
+    })];
+    let r = shard.import_jobs("-", vec![params]).await.unwrap();
+    assert!(r[0].success);
+
+    assert!(
+        test_helpers::count_concurrency_requests(shard.db()).await > 0,
+        "should have concurrency request when at capacity"
+    );
+}
+
+#[silo::test]
+async fn reimport_transitions_concurrency_request_to_terminal() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let job_id = "sys-conc-req-to-term";
+    setup_scheduled_with_concurrency_request(&shard, job_id).await;
+
+    let existing = existing_attempts_as_imported(&shard, "-", job_id).await;
+    let mut reimport = build_reimport_params(job_id, existing, true);
+    reimport.limits = vec![Limit::Concurrency(ConcurrencyLimit {
+        key: "sys-limited-queue".to_string(),
+        max_concurrency: 1,
+    })];
+    let r = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+
+    // Use non-isolated check since filler job has active lease + holder
+    verify_reimport_invariants_inner(
+        &shard,
+        "-",
+        job_id,
+        JobStatusKind::Succeeded,
+        1,
+        "conc-req→term",
+        false,
+    )
+    .await;
+
+    // Verify our job's concurrency request was cleaned up specifically
+    // (the filler job's holder is unrelated)
+    let requests = test_helpers::count_concurrency_requests(shard.db()).await;
+    assert_eq!(
+        requests, 0,
+        "concurrency request should be removed after terminal reimport"
+    );
+}
+
+// ── Lifecycle path: Failed import (no lifecycle ops) ────────────────────
+
+async fn setup_failed_import(shard: &Arc<JobStoreShard>, job_id: &str) {
+    let mut params = base_import_params(job_id);
+    params.retry_policy = None;
+    params.attempts = vec![failed_attempt(1_700_000_001_000)];
+    let r = shard.import_jobs("-", vec![params]).await.unwrap();
+    assert!(r[0].success);
+    assert_eq!(r[0].status, JobStatusKind::Failed);
+}
+
+#[silo::test]
+async fn reimport_transitions_failed_import_to_scheduled() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let job_id = "sys-fail-imp-to-sched";
+    setup_failed_import(&shard, job_id).await;
+
+    let existing = existing_attempts_as_imported(&shard, "-", job_id).await;
+    let reimport = build_reimport_params(job_id, existing, false);
+    let r = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+
+    verify_reimport_invariants(
+        &shard,
+        "-",
+        job_id,
+        JobStatusKind::Scheduled,
+        2,
+        "fail-imp→sched",
+    )
+    .await;
+}
+
+#[silo::test]
+async fn reimport_transitions_failed_import_to_terminal() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let job_id = "sys-fail-imp-to-term";
+    setup_failed_import(&shard, job_id).await;
+
+    let existing = existing_attempts_as_imported(&shard, "-", job_id).await;
+    let reimport = build_reimport_params(job_id, existing, true);
+    let r = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+
+    verify_reimport_invariants(
+        &shard,
+        "-",
+        job_id,
+        JobStatusKind::Succeeded,
+        2,
+        "fail-imp→term",
+    )
+    .await;
+}
+
+// ── Lifecycle path: Cancelled import (no cancelled key) ─────────────────
+
+async fn setup_cancelled_import(shard: &Arc<JobStoreShard>, job_id: &str) {
+    let mut params = base_import_params(job_id);
+    params.attempts = vec![cancelled_attempt(1_700_000_001_000)];
+    let r = shard.import_jobs("-", vec![params]).await.unwrap();
+    assert!(r[0].success);
+    assert_eq!(r[0].status, JobStatusKind::Cancelled);
+    // No cancelled key — that's only from cancel_job
+    assert!(!shard.is_job_cancelled("-", job_id).await.unwrap());
+}
+
+#[silo::test]
+async fn reimport_transitions_cancelled_import_to_scheduled() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let job_id = "sys-cxl-imp-to-sched";
+    setup_cancelled_import(&shard, job_id).await;
+
+    let existing = existing_attempts_as_imported(&shard, "-", job_id).await;
+    let reimport = build_reimport_params(job_id, existing, false);
+    let r = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+
+    verify_reimport_invariants(
+        &shard,
+        "-",
+        job_id,
+        JobStatusKind::Scheduled,
+        2,
+        "cxl-imp→sched",
+    )
+    .await;
+}
+
+#[silo::test]
+async fn reimport_transitions_cancelled_import_to_terminal() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let job_id = "sys-cxl-imp-to-term";
+    setup_cancelled_import(&shard, job_id).await;
+
+    let existing = existing_attempts_as_imported(&shard, "-", job_id).await;
+    let reimport = build_reimport_params(job_id, existing, true);
+    let r = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+
+    verify_reimport_invariants(
+        &shard,
+        "-",
+        job_id,
+        JobStatusKind::Succeeded,
+        2,
+        "cxl-imp→term",
+    )
+    .await;
+}
+
+// ── Lifecycle path: Cancelled via cancel_job + concurrency holder ───────
+// Import with concurrency → Scheduled(holder) → cancel_job → Cancelled
+
+async fn setup_cancelled_with_concurrency(shard: &Arc<JobStoreShard>, job_id: &str) {
+    let mut params = base_import_params(job_id);
+    params.retry_policy = Some(default_retry_policy());
+    params.limits = vec![Limit::Concurrency(ConcurrencyLimit {
+        key: "sys-cancel-conc-q".to_string(),
+        max_concurrency: 10,
+    })];
+    let r = shard.import_jobs("-", vec![params]).await.unwrap();
+    assert!(r[0].success);
+
+    assert!(test_helpers::count_concurrency_holders(shard.db()).await > 0);
+
+    shard.cancel_job("-", job_id).await.unwrap();
+    assert!(shard.is_job_cancelled("-", job_id).await.unwrap());
+}
+
+#[silo::test]
+async fn reimport_transitions_cancel_with_concurrency_to_scheduled() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let job_id = "sys-cxl-conc-to-sched";
+    setup_cancelled_with_concurrency(&shard, job_id).await;
+
+    let existing = existing_attempts_as_imported(&shard, "-", job_id).await;
+    let mut reimport = build_reimport_params(job_id, existing, false);
+    reimport.limits = vec![Limit::Concurrency(ConcurrencyLimit {
+        key: "sys-cancel-conc-q".to_string(),
+        max_concurrency: 10,
+    })];
+    let r = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+
+    verify_reimport_invariants(
+        &shard,
+        "-",
+        job_id,
+        JobStatusKind::Scheduled,
+        1,
+        "cxl-conc→sched",
+    )
+    .await;
+}
+
+#[silo::test]
+async fn reimport_transitions_cancel_with_concurrency_to_terminal() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let job_id = "sys-cxl-conc-to-term";
+    setup_cancelled_with_concurrency(&shard, job_id).await;
+
+    let existing = existing_attempts_as_imported(&shard, "-", job_id).await;
+    let mut reimport = build_reimport_params(job_id, existing, true);
+    reimport.limits = vec![Limit::Concurrency(ConcurrencyLimit {
+        key: "sys-cancel-conc-q".to_string(),
+        max_concurrency: 10,
+    })];
+    let r = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+
+    verify_reimport_invariants(
+        &shard,
+        "-",
+        job_id,
+        JobStatusKind::Succeeded,
+        1,
+        "cxl-conc→term",
+    )
+    .await;
+}
+
+#[silo::test]
+async fn reimport_no_new_attempts_rejected() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+
+    // Import with 1 failure
+    let mut initial = base_import_params("reimp-no-new");
+    initial.retry_policy = Some(default_retry_policy());
+    initial.attempts = vec![failed_attempt(1_700_000_001_000)];
+    shard.import_jobs("-", vec![initial]).await.unwrap();
+
+    // Reimport with same attempt (no new ones)
+    let mut reimport = base_import_params("reimp-no-new");
+    reimport.retry_policy = Some(default_retry_policy());
+    reimport.attempts = vec![failed_attempt(1_700_000_001_000)];
+
+    let results = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(!results[0].success);
+    assert!(
+        results[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("at least one new attempt")
+    );
 }

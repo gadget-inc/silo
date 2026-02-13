@@ -8,14 +8,43 @@ use slatedb::config::WriteOptions;
 use tracing::debug;
 use uuid::Uuid;
 
-use crate::codec::{encode_attempt, encode_job_info};
+use crate::codec::{
+    decode_attempt, decode_concurrency_action, decode_task, encode_attempt, encode_job_info,
+};
 use crate::dst_events::{self, DstEvent};
-use crate::job::{JobInfo, JobStatus, JobStatusKind, Limit};
+use crate::fb::silo::fb;
+use crate::job::{JobInfo, JobStatus, JobStatusKind, JobView, Limit};
 use crate::job_attempt::{AttemptStatus, JobAttempt};
-use crate::job_store_shard::helpers::{TxnWriter, now_epoch_ms, retry_on_txn_conflict};
+use crate::job_store_shard::helpers::{
+    TxnWriter, decode_job_status_owned, now_epoch_ms, retry_on_txn_conflict,
+};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError, LimitTaskParams};
-use crate::keys::{attempt_key, idx_metadata_key, job_info_key};
+use crate::keys::{
+    attempt_key, attempt_prefix, concurrency_holders_queue_prefix, concurrency_request_prefix,
+    end_bound, idx_metadata_key, job_cancelled_key, job_info_key, job_status_key,
+    parse_concurrency_holder_key, parse_concurrency_request_key, parse_task_key, task_group_prefix,
+};
 use crate::retry::{RetryPolicy, retries_exhausted};
+
+/// Error returned when a job cannot be reimported.
+#[derive(Debug, Clone)]
+pub struct JobNotReimportableError {
+    pub job_id: String,
+    pub status: JobStatusKind,
+    pub reason: String,
+}
+
+impl std::fmt::Display for JobNotReimportableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot reimport job {}: {} (status: {:?})",
+            self.job_id, self.reason, self.status
+        )
+    }
+}
+
+impl std::error::Error for JobNotReimportableError {}
 
 /// Imported attempt from another system. All attempts must be terminal.
 #[derive(Debug, Clone)]
@@ -93,14 +122,11 @@ impl JobStoreShard {
         tenant: &str,
         params: ImportJobParams,
     ) -> Result<JobStatusKind, JobStoreShardError> {
-        // Validate
+        // Validate ID
         if params.id.is_empty() {
             return Err(JobStoreShardError::InvalidArgument(
                 "import job id is required".into(),
             ));
-        }
-        if let Err(msg) = validate_import_attempts(&params.attempts) {
-            return Err(JobStoreShardError::InvalidArgument(msg));
         }
 
         retry_on_txn_conflict("import_job", || self.import_job_txn(tenant, &params)).await
@@ -127,10 +153,18 @@ impl JobStoreShard {
 
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
 
-        // Check for duplicate
+        // [SILO-IMP-1] Check for duplicate - if exists, reimport instead
         let info_key = job_info_key(tenant, job_id);
-        if txn.get(&info_key).await?.is_some() {
-            return Err(JobStoreShardError::JobAlreadyExists(job_id.to_string()));
+        if let Some(existing_job_raw) = txn.get(&info_key).await? {
+            let existing_job = JobView::new(existing_job_raw)?;
+            return self
+                .reimport_job_txn(tenant, params, txn, existing_job, now_ms)
+                .await;
+        }
+
+        // Validate attempts for new import (reimport has its own validation)
+        if let Err(msg) = validate_import_attempts(&params.attempts) {
+            return Err(JobStoreShardError::InvalidArgument(msg));
         }
 
         // Write JobInfo
@@ -153,7 +187,8 @@ impl JobStoreShard {
             txn.put(&mkey, [])?;
         }
 
-        // Write imported attempt records
+        // [SILO-IMP-2] Write imported attempt records (existing statuses unchanged - vacuously true for new import)
+        // [SILO-IMP-3] All new attempts are terminal (validated by validate_import_attempts)
         let num_attempts = params.attempts.len() as u32;
         for (i, imported) in params.attempts.iter().enumerate() {
             let attempt_number = (i as u32) + 1;
@@ -194,7 +229,14 @@ impl JobStoreShard {
         let mut writer = TxnWriter(&txn);
         Self::write_job_status_with_index(&mut writer, tenant, job_id, job_status)?;
 
+        // [SILO-IMP-5] Terminal status set by determine_import_status (Succeeded/Failed/Cancelled)
+        // [SILO-IMP-6] Scheduled status set by determine_import_status when retries remain
         // For non-terminal imports, create a task for the next attempt
+        // [SILO-IMP-7] Task created in DB queue for non-terminal import
+        // [SILO-IMP-CONC-1] Queue has capacity -> try_reserve succeeds in enqueue_limit_task_at_index
+        // [SILO-IMP-CONC-2] Holder + task in DB queue when concurrency granted
+        // [SILO-IMP-CONC-3] Queue at capacity -> try_reserve fails in enqueue_limit_task_at_index
+        // [SILO-IMP-CONC-4] Request created (no task in DB) when concurrency queued
         let mut grants = Vec::new();
         if !is_terminal {
             let next_attempt = num_attempts + 1;
@@ -265,6 +307,398 @@ impl JobStoreShard {
         }
 
         debug!(job_id = %job_id, status = ?status_kind, "imported job");
+
+        Ok(status_kind)
+    }
+
+    /// Reimport an existing job with updated attempt data.
+    ///
+    /// This is called when `import_job_txn` discovers the job already exists.
+    /// It validates preconditions, writes new attempts, cleans up old scheduling state,
+    /// and creates new scheduling state as needed.
+    async fn reimport_job_txn(
+        &self,
+        tenant: &str,
+        params: &ImportJobParams,
+        txn: slatedb::DbTransaction,
+        existing_job: JobView,
+        now_ms: i64,
+    ) -> Result<JobStatusKind, JobStoreShardError> {
+        let job_id = &params.id;
+        let effective_start_at_ms = if params.start_at_ms <= 0 {
+            now_ms
+        } else {
+            params.start_at_ms
+        };
+
+        // === Validate preconditions ===
+
+        // [SILO-REIMP-1] Pre: job exists (confirmed by caller finding job_info)
+
+        // Read current status
+        let status_key = job_status_key(tenant, job_id);
+        let status_raw = txn
+            .get(&status_key)
+            .await?
+            .ok_or_else(|| JobStoreShardError::JobNotFound(job_id.to_string()))?;
+        let old_status = decode_job_status_owned(&status_raw)?;
+
+        // [SILO-REIMP-2] Pre: not Running (no active lease)
+        if old_status.kind == JobStatusKind::Running {
+            return Err(JobStoreShardError::JobNotReimportable(
+                JobNotReimportableError {
+                    job_id: job_id.to_string(),
+                    status: old_status.kind,
+                    reason: "job is currently running".to_string(),
+                },
+            ));
+        }
+
+        // [SILO-REIMP-4] Pre: not Succeeded (truly terminal)
+        if old_status.kind == JobStatusKind::Succeeded {
+            return Err(JobStoreShardError::JobNotReimportable(
+                JobNotReimportableError {
+                    job_id: job_id.to_string(),
+                    status: old_status.kind,
+                    reason: "job already succeeded".to_string(),
+                },
+            ));
+        }
+
+        // [SILO-REIMP-3] Pre: scan existing attempts, verify all terminal
+        let attempt_start = attempt_prefix(tenant, job_id);
+        let attempt_end = end_bound(&attempt_start);
+        let mut iter = txn.scan::<Vec<u8>, _>(attempt_start..attempt_end).await?;
+        let mut existing_attempts = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            let decoded = decode_attempt(kv.value.clone())?;
+            existing_attempts.push(decoded);
+        }
+
+        for (i, existing) in existing_attempts.iter().enumerate() {
+            let a = existing.fb();
+            if a.status_kind() == fb::AttemptStatusKind::Running {
+                return Err(JobStoreShardError::JobNotReimportable(
+                    JobNotReimportableError {
+                        job_id: job_id.to_string(),
+                        status: old_status.kind,
+                        reason: format!("existing attempt {} is still running", i + 1),
+                    },
+                ));
+            }
+        }
+
+        let existing_count = existing_attempts.len();
+
+        // === Validate attempt consistency ===
+
+        // Must have at least as many attempts as existing
+        if params.attempts.len() < existing_count {
+            return Err(JobStoreShardError::JobNotReimportable(
+                JobNotReimportableError {
+                    job_id: job_id.to_string(),
+                    status: old_status.kind,
+                    reason: format!(
+                        "reimport has {} attempts but job has {} existing attempts",
+                        params.attempts.len(),
+                        existing_count
+                    ),
+                },
+            ));
+        }
+
+        // Verify existing attempts match the provided ones
+        for (i, existing) in existing_attempts.iter().enumerate() {
+            let a = existing.fb();
+            let imported = &params.attempts[i];
+
+            // Validate status type + timestamps match
+            let mismatch = match (a.status_kind(), &imported.status) {
+                (fb::AttemptStatusKind::Succeeded, ImportedAttemptStatus::Succeeded { result }) => {
+                    a.finished_at_ms().unwrap_or(0) != imported.finished_at_ms
+                        || a.result().map(|v| v.bytes()).unwrap_or_default() != result.as_slice()
+                        || a.started_at_ms() != imported.started_at_ms
+                }
+                (
+                    fb::AttemptStatusKind::Failed,
+                    ImportedAttemptStatus::Failed { error_code, .. },
+                ) => {
+                    a.finished_at_ms().unwrap_or(0) != imported.finished_at_ms
+                        || a.error_code().unwrap_or_default() != error_code.as_str()
+                        || a.started_at_ms() != imported.started_at_ms
+                }
+                (fb::AttemptStatusKind::Cancelled, ImportedAttemptStatus::Cancelled) => {
+                    a.finished_at_ms().unwrap_or(0) != imported.finished_at_ms
+                        || a.started_at_ms() != imported.started_at_ms
+                }
+                _ => true, // Status type mismatch
+            };
+
+            if mismatch {
+                return Err(JobStoreShardError::JobNotReimportable(
+                    JobNotReimportableError {
+                        job_id: job_id.to_string(),
+                        status: old_status.kind,
+                        reason: format!("existing attempt {} does not match reimport data", i + 1),
+                    },
+                ));
+            }
+        }
+
+        // Must have at least one new attempt
+        if params.attempts.len() <= existing_count {
+            return Err(JobStoreShardError::JobNotReimportable(
+                JobNotReimportableError {
+                    job_id: job_id.to_string(),
+                    status: old_status.kind,
+                    reason: "reimport must include at least one new attempt".to_string(),
+                },
+            ));
+        }
+
+        // Validate new attempts (the suffix after existing ones)
+        if let Err(msg) = validate_import_attempts(&params.attempts[existing_count..]) {
+            return Err(JobStoreShardError::InvalidArgument(msg));
+        }
+
+        // === Write only new attempt records ===
+        // [SILO-IMP-2] existing attempt statuses unchanged (we don't touch them)
+        // [SILO-IMP-3] new attempts are terminal (validated above)
+        let total_attempts = params.attempts.len() as u32;
+        for i in existing_count..params.attempts.len() {
+            let imported = &params.attempts[i];
+            let attempt_number = (i as u32) + 1;
+            let task_id = Uuid::new_v4().to_string();
+
+            let status = match &imported.status {
+                ImportedAttemptStatus::Succeeded { result } => AttemptStatus::Succeeded {
+                    finished_at_ms: imported.finished_at_ms,
+                    result: result.clone(),
+                },
+                ImportedAttemptStatus::Failed { error_code, error } => AttemptStatus::Failed {
+                    finished_at_ms: imported.finished_at_ms,
+                    error_code: error_code.clone(),
+                    error: error.clone(),
+                },
+                ImportedAttemptStatus::Cancelled => AttemptStatus::Cancelled {
+                    finished_at_ms: imported.finished_at_ms,
+                },
+            };
+
+            let attempt_record = JobAttempt {
+                job_id: job_id.to_string(),
+                attempt_number,
+                relative_attempt_number: attempt_number,
+                task_id,
+                started_at_ms: imported.started_at_ms,
+                status,
+            };
+            let attempt_value = encode_attempt(&attempt_record);
+            let akey = attempt_key(tenant, job_id, attempt_number);
+            txn.put(&akey, &attempt_value)?;
+        }
+
+        // === Determine new status ===
+        let (new_job_status, status_kind, is_terminal) =
+            determine_import_status(params, total_attempts, now_ms, effective_start_at_ms);
+
+        // === Clean up old scheduling state ===
+
+        // [SILO-REIMP-5] Remove DB queue tasks for this job
+        let task_group = existing_job.task_group().to_string();
+        let task_prefix = task_group_prefix(&task_group);
+        let task_end = end_bound(&task_prefix);
+        let mut task_iter = txn.scan::<Vec<u8>, _>(task_prefix..task_end).await?;
+        let mut matched_task_keys: Vec<Vec<u8>> = Vec::new();
+        let mut old_task_ids: Vec<String> = Vec::new();
+        while let Some(kv) = task_iter.next().await? {
+            if let Some(parsed) = parse_task_key(&kv.key)
+                && parsed.job_id == *job_id
+            {
+                matched_task_keys.push(kv.key.to_vec());
+                // Decode the task value to get the task_id for concurrency cleanup
+                if let Ok(task) = decode_task(&kv.value) {
+                    match &task {
+                        crate::task::Task::RunAttempt { id, .. } => {
+                            old_task_ids.push(id.clone());
+                        }
+                        crate::task::Task::RequestTicket { request_id, .. } => {
+                            old_task_ids.push(request_id.clone());
+                        }
+                        crate::task::Task::CheckRateLimit { task_id, .. } => {
+                            old_task_ids.push(task_id.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Delete matched task keys from DB
+        for key in &matched_task_keys {
+            txn.delete(key)?;
+        }
+
+        // Concurrency cleanup: release holders and delete requests for this job
+        let old_task_id_set: std::collections::HashSet<&str> =
+            old_task_ids.iter().map(|s| s.as_str()).collect();
+        let mut released_holders: Vec<(String, String, String)> = Vec::new(); // (tenant, queue, task_id)
+        let stored_limits = existing_job.limits();
+
+        for limit in &stored_limits {
+            let queue = match limit {
+                Limit::Concurrency(cl) => &cl.key,
+                Limit::FloatingConcurrency(fl) => &fl.key,
+                Limit::RateLimit(_) => continue,
+            };
+
+            // Scan holders for this queue, find those belonging to our old tasks
+            let holder_start = concurrency_holders_queue_prefix(tenant, queue);
+            let holder_end = end_bound(&holder_start);
+            let mut holder_iter = txn.scan::<Vec<u8>, _>(holder_start..holder_end).await?;
+            while let Some(kv) = holder_iter.next().await? {
+                if let Some(parsed) = parse_concurrency_holder_key(&kv.key)
+                    && old_task_id_set.contains(parsed.task_id.as_str())
+                {
+                    txn.delete(&kv.key)?;
+                    self.concurrency
+                        .counts()
+                        .atomic_release(tenant, queue, &parsed.task_id);
+                    released_holders.push((
+                        tenant.to_string(),
+                        queue.clone(),
+                        parsed.task_id.clone(),
+                    ));
+                }
+            }
+
+            // Scan requests for this queue, find those for this job
+            let req_start = concurrency_request_prefix(tenant, queue);
+            let req_end = end_bound(&req_start);
+            let mut req_iter = txn.scan::<Vec<u8>, _>(req_start..req_end).await?;
+            while let Some(kv) = req_iter.next().await? {
+                if let Some(_parsed) = parse_concurrency_request_key(&kv.key) {
+                    // Check if the request is for this job by decoding the action
+                    if let Ok(decoded) = decode_concurrency_action(kv.value.clone()) {
+                        let a = decoded.fb();
+                        if let Some(et) = a.variant_as_enqueue_task()
+                            && et.job_id().unwrap_or_default() == job_id
+                        {
+                            txn.delete(&kv.key)?;
+                        }
+                    }
+                }
+            }
+        }
+
+        // === Update status ===
+        {
+            let mut writer = TxnWriter(&txn);
+            self.set_job_status_with_index(&mut writer, tenant, job_id, new_job_status)
+                .await?;
+        }
+
+        // === Clean up cancelled key ===
+        // cancel_job writes a separate cancelled key that blocks lease creation.
+        // Always remove it on reimport so it doesn't block future dequeue or
+        // leave stale state on terminal jobs.
+        if old_status.kind == JobStatusKind::Cancelled {
+            txn.delete(job_cancelled_key(tenant, job_id))?;
+        }
+
+        // === Create new scheduling state if non-terminal ===
+        let mut grants = Vec::new();
+        if !is_terminal {
+            let next_attempt = total_attempts + 1;
+            let new_task_id = Uuid::new_v4().to_string();
+
+            // [SILO-REIMP-8] status = Scheduled
+            // [SILO-REIMP-9] new task in DB queue, old tasks for j removed
+            // [SILO-REIMP-CONC-1/2] concurrency granted path
+            // [SILO-REIMP-CONC-3/4] concurrency queued path
+            let mut writer = TxnWriter(&txn);
+            grants = self
+                .enqueue_limit_task_at_index(
+                    &mut writer,
+                    LimitTaskParams {
+                        tenant,
+                        task_id: &new_task_id,
+                        job_id,
+                        attempt_number: next_attempt,
+                        relative_attempt_number: next_attempt,
+                        limit_index: 0,
+                        limits: &stored_limits,
+                        priority: existing_job.priority(),
+                        start_at_ms: effective_start_at_ms,
+                        now_ms,
+                        held_queues: Vec::new(),
+                        task_group: &task_group,
+                    },
+                )
+                .await?;
+        }
+        // [SILO-REIMP-7] If terminal: status is terminal, no new tasks
+
+        // === Update counters ===
+        {
+            let mut writer = TxnWriter(&txn);
+            let was_terminal = old_status.is_terminal();
+            if !was_terminal && is_terminal {
+                self.increment_completed_jobs_counter(&mut writer)?;
+            }
+            if was_terminal && !is_terminal {
+                self.decrement_completed_jobs_counter(&mut writer)?;
+            }
+            // total_jobs counter unchanged (job already counted)
+        }
+
+        // === DST events, commit ===
+        let write_op = if !is_terminal {
+            let op = dst_events::next_write_op();
+            dst_events::emit_pending(
+                DstEvent::JobEnqueued {
+                    tenant: tenant.to_string(),
+                    job_id: job_id.to_string(),
+                },
+                op,
+            );
+            Some(op)
+        } else {
+            None
+        };
+
+        if let Err(e) = txn
+            .commit_with_options(&WriteOptions {
+                await_durable: true,
+            })
+            .await
+        {
+            if let Some(op) = write_op {
+                dst_events::cancel_write(op);
+            }
+            // Rollback new grants
+            self.rollback_grants(tenant, &grants);
+            // Rollback released holders
+            for (t, q, tid) in &released_holders {
+                self.concurrency.counts().rollback_release(t, q, tid);
+            }
+            return Err(e.into());
+        }
+        if let Some(op) = write_op {
+            dst_events::confirm_write(op);
+        }
+
+        // [SILO-REIMP-6] Remove buffered tasks for this job.
+        // Must happen after commit so the scanner cannot re-buffer old tasks from DB.
+        self.broker.evict_keys(&matched_task_keys);
+
+        // For non-terminal, finish enqueue (flush + broker wakeup)
+        if !is_terminal {
+            self.finish_enqueue(job_id, effective_start_at_ms, &grants)
+                .await?;
+        }
+
+        debug!(job_id = %job_id, status = ?status_kind, "reimported job");
 
         Ok(status_kind)
     }

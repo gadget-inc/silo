@@ -420,7 +420,7 @@ impl ConcurrencyManager {
         let queue = &limit.key;
         let max_allowed = limit.max_concurrency as usize;
 
-        // [SILO-ENQ-CONC-1] Atomically check and reserve if queue has capacity
+        // [SILO-ENQ-CONC-1] [SILO-IMP-CONC-1] [SILO-REIMP-CONC-1] Atomically check and reserve if queue has capacity
         // This prevents TOCTOU races by reserving the slot before writing to DB
         // [SILO-RETRY-5-CONC] Skip try_reserve for retries: the old holder is still in-memory
         // (released post-commit), so the retry must go through the request queue. This matches
@@ -431,7 +431,7 @@ impl ConcurrencyManager {
                 .try_reserve(db, range, tenant, queue, task_id, max_allowed, job_id)
                 .await?
         {
-            // Grant immediately: [SILO-ENQ-CONC-2] create holder, [SILO-ENQ-CONC-3] create task
+            // Grant immediately: [SILO-ENQ-CONC-2] [SILO-ENQ-CONC-3] [SILO-IMP-CONC-2] [SILO-REIMP-CONC-2] create holder + task in DB queue
             // Note: in-memory slot is already reserved by try_reserve
             append_grant_edits(
                 writer,
@@ -451,8 +451,8 @@ impl ConcurrencyManager {
                 queue: queue.clone(),
             }))
         } else if start_at_ms <= now_ms {
-            // [SILO-ENQ-CONC-4] Queue is at capacity
-            // [SILO-ENQ-CONC-5] No task in DB queue
+            // [SILO-ENQ-CONC-4] [SILO-IMP-CONC-3] [SILO-REIMP-CONC-3] Queue is at capacity
+            // [SILO-ENQ-CONC-5] [SILO-IMP-CONC-4] [SILO-REIMP-CONC-4] No task in DB queue, request created
             // [SILO-ENQ-CONC-6] Create request record instead
             append_request_edits(
                 writer,
