@@ -483,6 +483,8 @@ impl JobsScanner {
             Field::new("status_kind", DataType::Utf8, true),
             Field::new("status_changed_at_ms", DataType::Int64, true),
             Field::new("task_group", DataType::Utf8, false),
+            Field::new("current_attempt", DataType::UInt32, true),
+            Field::new("next_attempt_starts_after_ms", DataType::Int64, true),
             // Arbitrary key/value metadata as Arrow Map<Utf8, Utf8>
             Field::new(
                 "metadata",
@@ -872,6 +874,28 @@ impl Scan for JobsScanner {
                                 }
                             }
                             cols.push(Arc::new(StringArray::from(task_groups)));
+                        }
+                        "current_attempt" => {
+                            let mut vals: Vec<Option<u32>> = Vec::new();
+                            for (_, id) in &existing_pairs {
+                                if let Some(status) = status_map.get(id) {
+                                    vals.push(status.current_attempt);
+                                } else {
+                                    vals.push(None);
+                                }
+                            }
+                            cols.push(Arc::new(UInt32Array::from(vals)));
+                        }
+                        "next_attempt_starts_after_ms" => {
+                            let mut vals: Vec<Option<i64>> = Vec::new();
+                            for (_, id) in &existing_pairs {
+                                if let Some(status) = status_map.get(id) {
+                                    vals.push(status.next_attempt_starts_after_ms);
+                                } else {
+                                    vals.push(None);
+                                }
+                            }
+                            cols.push(Arc::new(Int64Array::from(vals)));
                         }
                         "metadata" => {
                             use datafusion::arrow::array::{MapArray, StructArray};

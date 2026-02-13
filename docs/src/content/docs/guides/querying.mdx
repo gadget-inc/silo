@@ -60,6 +60,8 @@ The primary table containing all job data.
 | `status_kind` | String (nullable) | Current job status (see [Status Values](#status-values)) |
 | `status_changed_at_ms` | Int64 (nullable) | Unix timestamp in milliseconds of last status change |
 | `task_group` | String | Task group the job belongs to |
+| `current_attempt` | UInt32 (nullable) | Current attempt number (1-indexed). Present for `Waiting`/`Scheduled` jobs, null for `Running` and terminal statuses |
+| `next_attempt_starts_after_ms` | Int64 (nullable) | Unix timestamp in milliseconds when the next attempt is scheduled to start. Present for `Waiting`/`Scheduled` jobs, null otherwise |
 | `metadata` | Map&lt;String, String&gt; (nullable) | Key-value metadata attached to the job |
 
 ### `queues` Table
@@ -92,6 +94,8 @@ The `status_kind` column has the following values:
 
 <Aside type="note" title="Waiting vs Scheduled">
 Both `Waiting` and `Scheduled` are derived from the same internal status. The difference is timing: `Waiting` means the job's `start_time` is at or before now (it's ready to run), while `Scheduled` means `start_time` is in the future (it's not ready yet). A job that's mid-retry-backoff shows as `Scheduled` because its next attempt is scheduled for the future.
+
+Use `current_attempt` to distinguish between freshly enqueued jobs (`current_attempt = 1`) and jobs retrying after a failure (`current_attempt > 1`). The `next_attempt_starts_after_ms` column shows exactly when the next attempt will become eligible to run.
 </Aside>
 
 ## Example Queries
@@ -137,6 +141,16 @@ ORDER BY priority ASC
 SELECT id, task_group
 FROM jobs
 WHERE tenant = 'customer-123' AND status_kind = 'Scheduled'
+
+-- New future-scheduled jobs (never attempted)
+SELECT id, task_group, next_attempt_starts_after_ms
+FROM jobs
+WHERE tenant = 'customer-123' AND status_kind = 'Scheduled' AND current_attempt = 1
+
+-- Jobs waiting to retry after a failure (attempted at least once)
+SELECT id, task_group, current_attempt, next_attempt_starts_after_ms
+FROM jobs
+WHERE tenant = 'customer-123' AND status_kind = 'Scheduled' AND current_attempt > 1
 ```
 
 ### Aggregations
