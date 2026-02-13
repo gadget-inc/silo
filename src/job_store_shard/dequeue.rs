@@ -221,7 +221,8 @@ impl JobStoreShard {
             // Collect pending attempts from this iteration
             pending_attempts.append(&mut state.pending_attempts);
 
-            // [SILO-DEQ-3] Ack durable and evict from buffer; we no longer use TTL tombstones.
+            // [SILO-DEQ-3] Ack durable and evict from buffer.
+            // TaskBroker keeps scan-generation tombstones to guard against stale scan re-inserts.
             self.broker.ack_durable(&state.ack_keys);
             self.broker.evict_keys(&state.ack_keys);
             tracing::debug!(
