@@ -170,9 +170,9 @@ impl JobStoreShard {
             (
                 tasks_prefix(),
                 Box::new(|_, value| {
-                    crate::codec::decode_task(value)
+                    crate::codec::decode_task_tenant(value)
                         .ok()
-                        .map(|task| task.tenant().to_string())
+                        .map(|tenant| tenant.to_string())
                 }),
             ),
             // Lease keys - tenant is in the encoded lease value

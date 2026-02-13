@@ -1131,12 +1131,7 @@ impl Scan for QueuesScanner {
                         let job_id = if let Ok(action) =
                             crate::codec::decode_concurrency_action(&kv.value)
                         {
-                            match action.archived() {
-                                crate::task::ArchivedConcurrencyAction::EnqueueTask {
-                                    job_id,
-                                    ..
-                                } => Some(job_id.as_str().to_string()),
-                            }
+                            action.enqueue_task().map(|entry| entry.job_id.to_string())
                         } else {
                             None
                         };

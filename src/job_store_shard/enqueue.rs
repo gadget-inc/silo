@@ -5,15 +5,14 @@ use slatedb::{IsolationLevel, WriteBatch};
 use tracing::{debug, info_span};
 use uuid::Uuid;
 
-use crate::codec::{encode_job_info, encode_job_status};
+use crate::codec::{DecodedJobStatus, decode_job_status, encode_job_info, encode_job_status};
 use crate::concurrency::RequestTicketOutcome;
 use crate::dst_events::{self, DstEvent};
 use crate::job::{JobInfo, JobStatus, Limit};
 use crate::job_store_shard::JobStoreShard;
 use crate::job_store_shard::JobStoreShardError;
 use crate::job_store_shard::helpers::{
-    DbWriteBatcher, TxnWriter, WriteBatcher, decode_job_status_owned, now_epoch_ms, put_task,
-    retry_on_txn_conflict,
+    DbWriteBatcher, TxnWriter, WriteBatcher, now_epoch_ms, put_task, retry_on_txn_conflict,
 };
 use crate::keys::{
     idx_metadata_key, idx_status_time_key, job_info_key, job_status_key, status_index_timestamp,
@@ -70,6 +69,16 @@ fn record_grant_outcome(
             // Not granted - RequestTicket was created by handle_enqueue
             GrantResult::Queued
         }
+    }
+}
+
+fn status_index_timestamp_decoded(status: &DecodedJobStatus) -> i64 {
+    if matches!(status.kind(), crate::job::JobStatusKind::Scheduled) {
+        status
+            .next_attempt_starts_after_ms()
+            .unwrap_or(status.changed_at_ms())
+    } else {
+        status.changed_at_ms()
     }
 }
 
@@ -496,7 +505,7 @@ impl JobStoreShard {
                     // Try immediate grant using current max concurrency
                     let temp_cl = crate::job::ConcurrencyLimit {
                         key: fl.key.clone(),
-                        max_concurrency: state.archived().current_max_concurrency,
+                        max_concurrency: state.current_max_concurrency(),
                     };
 
                     let outcome = self
@@ -593,9 +602,9 @@ impl JobStoreShard {
     ) -> Result<(), JobStoreShardError> {
         // Delete old index entries if present
         if let Some(old_raw) = writer.get(&job_status_key(tenant, job_id)).await? {
-            let old = decode_job_status_owned(&old_raw)?;
-            let old_ts = status_index_timestamp(&old);
-            let old_time = idx_status_time_key(tenant, old.kind.as_str(), old_ts, job_id);
+            let old = decode_job_status(&old_raw)?;
+            let old_ts = status_index_timestamp_decoded(&old);
+            let old_time = idx_status_time_key(tenant, old.kind().as_str(), old_ts, job_id);
             writer.delete(&old_time)?;
         }
 

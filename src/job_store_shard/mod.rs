@@ -102,8 +102,8 @@ pub enum JobStoreShardError {
     Slate(#[from] slatedb::Error),
     #[error("json serialization error: {0}")]
     Serde(#[from] serde_json::Error),
-    #[error("rkyv serialization error: {0}")]
-    Rkyv(String),
+    #[error("serialization error: {0}")]
+    Serialization(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
     #[error("lease not found for task id {0}")]
@@ -136,7 +136,7 @@ pub enum JobStoreShardError {
 
 impl From<CodecError> for JobStoreShardError {
     fn from(e: CodecError) -> Self {
-        JobStoreShardError::Rkyv(e.to_string())
+        JobStoreShardError::Serialization(e.to_string())
     }
 }
 
@@ -144,7 +144,9 @@ impl From<crate::concurrency::ConcurrencyError> for JobStoreShardError {
     fn from(e: crate::concurrency::ConcurrencyError) -> Self {
         match e {
             crate::concurrency::ConcurrencyError::Slate(e) => JobStoreShardError::Slate(e),
-            crate::concurrency::ConcurrencyError::Encoding(s) => JobStoreShardError::Rkyv(s),
+            crate::concurrency::ConcurrencyError::Encoding(s) => {
+                JobStoreShardError::Serialization(s)
+            }
         }
     }
 }

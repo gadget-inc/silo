@@ -1,5 +1,4 @@
 //! Helper functions shared across job_store_shard submodules.
-use rkyv::Deserialize as RkyvDeserialize;
 use slatedb::bytes::Bytes;
 use slatedb::{Db, DbTransaction, WriteBatch};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -217,10 +216,8 @@ pub(crate) async fn load_job_view(
     crate::job::JobView::new(job_raw)
 }
 
-/// Decode a `JobStatus` from raw rkyv bytes into an owned value.
+/// Decode a `JobStatus` from raw flatbuffer bytes into an owned value.
 pub(crate) fn decode_job_status_owned(raw: &[u8]) -> Result<JobStatus, JobStoreShardError> {
     let decoded = decode_job_status(raw)?;
-    let mut des = rkyv::Infallible;
-    Ok(RkyvDeserialize::deserialize(decoded.archived(), &mut des)
-        .unwrap_or_else(|_| unreachable!("infallible deserialization for JobStatus")))
+    Ok(decoded.to_owned())
 }

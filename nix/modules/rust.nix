@@ -14,12 +14,16 @@
       # Create crane lib with our toolchain
       craneLib = (inputs.crane.mkLib pkgs).overrideToolchain rustToolchain;
       
-      # Source filter that includes proto files and templates alongside Rust sources
+      # Source filter that includes build-time non-Rust inputs.
       extraFilter = path: _type:
         # Proto files
         (lib.hasSuffix ".proto" path) ||
         (builtins.match ".*/proto$" path != null) ||
         (builtins.match ".*/proto/.*" path != null) ||
+        # FlatBuffers schema files
+        (lib.hasSuffix ".fbs" path) ||
+        (builtins.match ".*/schema$" path != null) ||
+        (builtins.match ".*/schema/.*" path != null) ||
         # Askama templates
         (lib.hasSuffix ".html" path) ||
         (builtins.match ".*/templates$" path != null) ||
@@ -36,7 +40,7 @@
       commonArgs = {
         inherit src;
         strictDeps = true;
-        nativeBuildInputs = [ pkgs.protobuf ];
+        nativeBuildInputs = [ pkgs.protobuf pkgs.flatbuffers ];
         # Enable frame pointers for profiling support - pprof uses frame-pointer
         # based unwinding, which requires the compiler to actually preserve them
         CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "1";  # Better inlining visibility

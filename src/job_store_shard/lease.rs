@@ -55,7 +55,7 @@ impl JobStoreShard {
         // Note: to_task() allocates, but we need owned Task for LeaseRecord
         let record = LeaseRecord {
             worker_id: current_owner.to_string(),
-            task: decoded.to_task(),
+            task: decoded.to_task()?,
             expiry_ms: now_epoch_ms() + DEFAULT_LEASE_MS,
             started_at_ms: decoded.started_at_ms(),
         };
@@ -506,13 +506,12 @@ impl JobStoreShard {
         };
 
         let decoded_state = decode_floating_limit_state(&raw)?;
-        let archived = decoded_state.archived();
 
         // Reset the state to allow a new refresh to be scheduled
         // We don't increment retry_count here - we rely on the normal periodic refresh mechanism
         let new_state = FloatingLimitState {
             refresh_task_scheduled: false,
-            ..FloatingLimitState::from_archived(archived)
+            ..decoded_state.to_owned()
         };
 
         let mut batch = WriteBatch::new();

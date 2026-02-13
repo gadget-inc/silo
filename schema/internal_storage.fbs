@@ -1,0 +1,240 @@
+namespace silo_internal;
+
+table StringPair {
+  key:string;
+  value:string;
+}
+
+table RetryPolicy {
+  retry_count:uint;
+  initial_interval_ms:long;
+  max_interval_ms:long;
+  randomize_interval:bool;
+  backoff_factor:double;
+}
+
+table ConcurrencyLimit {
+  key:string;
+  max_concurrency:uint;
+}
+
+table FloatingConcurrencyLimit {
+  key:string;
+  default_max_concurrency:uint;
+  refresh_interval_ms:long;
+  metadata:[StringPair];
+}
+
+enum GubernatorAlgorithm:ubyte {
+  TokenBucket = 0,
+  LeakyBucket = 1
+}
+
+table RateLimitRetryPolicy {
+  initial_backoff_ms:long;
+  max_backoff_ms:long;
+  backoff_multiplier:double;
+  max_retries:uint;
+}
+
+table GubernatorRateLimit {
+  name:string;
+  unique_key:string;
+  limit:long;
+  duration_ms:long;
+  hits:int;
+  algorithm:GubernatorAlgorithm = TokenBucket;
+  behavior:int;
+  retry_policy:RateLimitRetryPolicy;
+}
+
+union LimitData {
+  ConcurrencyLimit,
+  GubernatorRateLimit,
+  FloatingConcurrencyLimit
+}
+
+table Limit {
+  data:LimitData;
+}
+
+table GubernatorRateLimitData {
+  name:string;
+  unique_key:string;
+  limit:long;
+  duration_ms:long;
+  hits:int;
+  algorithm:ubyte;
+  behavior:int;
+  retry_initial_backoff_ms:long;
+  retry_max_backoff_ms:long;
+  retry_backoff_multiplier:double;
+  retry_max_retries:uint;
+}
+
+table TaskRunAttempt {
+  id:string;
+  tenant:string;
+  job_id:string;
+  attempt_number:uint;
+  relative_attempt_number:uint;
+  held_queues:[string];
+  task_group:string;
+}
+
+table TaskRequestTicket {
+  queue:string;
+  start_time_ms:long;
+  priority:ubyte;
+  tenant:string;
+  job_id:string;
+  attempt_number:uint;
+  relative_attempt_number:uint;
+  request_id:string;
+  task_group:string;
+}
+
+table TaskCheckRateLimit {
+  task_id:string;
+  tenant:string;
+  job_id:string;
+  attempt_number:uint;
+  relative_attempt_number:uint;
+  limit_index:uint;
+  rate_limit:GubernatorRateLimitData;
+  retry_count:uint;
+  started_at_ms:long;
+  priority:ubyte;
+  held_queues:[string];
+  task_group:string;
+}
+
+table TaskRefreshFloatingLimit {
+  task_id:string;
+  tenant:string;
+  queue_key:string;
+  current_max_concurrency:uint;
+  last_refreshed_at_ms:long;
+  metadata:[StringPair];
+  task_group:string;
+}
+
+union TaskData {
+  TaskRunAttempt,
+  TaskRequestTicket,
+  TaskCheckRateLimit,
+  TaskRefreshFloatingLimit
+}
+
+table Task {
+  data:TaskData;
+}
+
+table LeaseRecord {
+  worker_id:string;
+  task:Task;
+  expiry_ms:long;
+  started_at_ms:long;
+}
+
+table HolderRecord {
+  granted_at_ms:long;
+}
+
+table ConcurrencyActionEnqueueTask {
+  start_time_ms:long;
+  priority:ubyte;
+  job_id:string;
+  attempt_number:uint;
+  relative_attempt_number:uint;
+  task_group:string;
+}
+
+union ConcurrencyActionData {
+  ConcurrencyActionEnqueueTask
+}
+
+table ConcurrencyAction {
+  data:ConcurrencyActionData;
+}
+
+table AttemptRunning {}
+
+table AttemptSucceeded {
+  finished_at_ms:long;
+  result:[ubyte];
+}
+
+table AttemptFailed {
+  finished_at_ms:long;
+  error_code:string;
+  error:[ubyte];
+}
+
+table AttemptCancelled {
+  finished_at_ms:long;
+}
+
+union AttemptStatusData {
+  AttemptRunning,
+  AttemptSucceeded,
+  AttemptFailed,
+  AttemptCancelled
+}
+
+table AttemptStatus {
+  data:AttemptStatusData;
+}
+
+table JobAttempt {
+  job_id:string;
+  attempt_number:uint;
+  relative_attempt_number:uint;
+  task_id:string;
+  started_at_ms:long;
+  status:AttemptStatus;
+}
+
+table JobCancellation {
+  cancelled_at_ms:long;
+}
+
+enum JobStatusKind:ubyte {
+  Scheduled = 0,
+  Running = 1,
+  Failed = 2,
+  Cancelled = 3,
+  Succeeded = 4
+}
+
+table JobStatus {
+  kind:JobStatusKind = Scheduled;
+  changed_at_ms:long;
+  has_next_attempt_starts_after_ms:bool;
+  next_attempt_starts_after_ms:long;
+  has_current_attempt:bool;
+  current_attempt:uint;
+}
+
+table JobInfo {
+  id:string;
+  priority:ubyte;
+  enqueue_time_ms:long;
+  payload:[ubyte];
+  retry_policy:RetryPolicy;
+  metadata:[StringPair];
+  limits:[Limit];
+  task_group:string;
+}
+
+table FloatingLimitState {
+  current_max_concurrency:uint;
+  last_refreshed_at_ms:long;
+  refresh_task_scheduled:bool;
+  refresh_interval_ms:long;
+  default_max_concurrency:uint;
+  retry_count:uint;
+  has_next_retry_at_ms:bool;
+  next_retry_at_ms:long;
+  metadata:[StringPair];
+}

@@ -3,8 +3,6 @@
 //! This module contains the core task types that represent units of work
 //! in the system, along with associated records for leases and concurrency.
 
-use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
-
 use crate::job::{GubernatorRateLimit, JobView};
 use crate::job_attempt::JobAttemptView;
 
@@ -12,8 +10,7 @@ use crate::job_attempt::JobAttemptView;
 pub const DEFAULT_LEASE_MS: i64 = 10_000;
 
 /// A task is a unit of work that a worker needs to pickup and action to move the system forward.
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone)]
 pub enum Task {
     /// Execute a specific attempt for a job
     RunAttempt {
@@ -90,8 +87,7 @@ impl Task {
 }
 
 /// Serializable rate limit data stored with CheckRateLimit tasks
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone)]
 pub struct GubernatorRateLimitData {
     pub name: String,
     pub unique_key: String,
@@ -125,8 +121,7 @@ impl From<&GubernatorRateLimit> for GubernatorRateLimitData {
 }
 
 /// Stored representation for a lease record. Value at `lease/<task-id>`
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone)]
 pub struct LeaseRecord {
     pub worker_id: String,
     pub task: Task,
@@ -136,15 +131,13 @@ pub struct LeaseRecord {
 }
 
 /// Stored representation for a concurrency holder record: value at holders/<queue>/<task-id>
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone)]
 pub struct HolderRecord {
     pub granted_at_ms: i64,
 }
 
 /// Action stored at requests/<queue>/<time>/<request-id>
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone)]
 pub enum ConcurrencyAction {
     /// When ticket is granted, enqueue the specified task
     EnqueueTask {

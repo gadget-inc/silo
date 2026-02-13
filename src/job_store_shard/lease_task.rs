@@ -8,12 +8,10 @@ use slatedb::IsolationLevel;
 use slatedb::config::WriteOptions;
 use uuid::Uuid;
 
-use crate::codec::{decode_task, encode_attempt, encode_lease};
+use crate::codec::{decode_job_status, encode_attempt, encode_lease, validate_task};
 use crate::job::{JobStatusKind, JobView};
 use crate::job_attempt::{AttemptStatus, JobAttempt, JobAttemptView};
-use crate::job_store_shard::helpers::{
-    TxnWriter, decode_job_status_owned, now_epoch_ms, retry_on_txn_conflict,
-};
+use crate::job_store_shard::helpers::{TxnWriter, now_epoch_ms, retry_on_txn_conflict};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{
     attempt_key, job_cancelled_key, job_info_key, job_status_key, leased_task_key, task_key,
@@ -80,22 +78,23 @@ impl JobStoreShard {
         let Some(status_raw) = maybe_status_raw else {
             return Err(JobStoreShardError::JobNotFound(id.to_string()));
         };
-        let status = decode_job_status_owned(&status_raw)?;
+        let status = decode_job_status(&status_raw)?;
+        let status_kind = status.kind();
 
         // Validate: job must not be running
-        if status.kind == JobStatusKind::Running {
+        if status_kind == JobStatusKind::Running {
             return Err(JobStoreShardError::JobNotLeaseable(JobNotLeaseableError {
                 job_id: id.to_string(),
-                status: status.kind,
+                status: status_kind,
                 reason: "job is currently running".to_string(),
             }));
         }
 
         // Validate: job must not be in a final state
-        if status.kind.is_final() {
+        if status_kind.is_final() {
             return Err(JobStoreShardError::JobNotLeaseable(JobNotLeaseableError {
                 job_id: id.to_string(),
-                status: status.kind,
+                status: status_kind,
                 reason: "job is already in terminal state".to_string(),
             }));
         }
@@ -105,7 +104,7 @@ impl JobStoreShard {
         if txn.get(&cancelled_key).await?.is_some() {
             return Err(JobStoreShardError::JobNotLeaseable(JobNotLeaseableError {
                 job_id: id.to_string(),
-                status: status.kind,
+                status: status_kind,
                 reason: "job is cancelled".to_string(),
             }));
         }
@@ -121,17 +120,17 @@ impl JobStoreShard {
         let task_group = job_view.task_group().to_string();
 
         // Reconstruct the task key from status fields
-        let attempt_number = status.current_attempt.ok_or_else(|| {
+        let attempt_number = status.current_attempt().ok_or_else(|| {
             JobStoreShardError::JobNotLeaseable(JobNotLeaseableError {
                 job_id: id.to_string(),
-                status: status.kind,
+                status: status_kind,
                 reason: "job has no pending task".to_string(),
             })
         })?;
-        let start_time_ms = status.next_attempt_starts_after_ms.ok_or_else(|| {
+        let start_time_ms = status.next_attempt_starts_after_ms().ok_or_else(|| {
             JobStoreShardError::JobNotLeaseable(JobNotLeaseableError {
                 job_id: id.to_string(),
-                status: status.kind,
+                status: status_kind,
                 reason: "job has no pending task".to_string(),
             })
         })?;
@@ -151,7 +150,7 @@ impl JobStoreShard {
                     None => {
                         return Err(JobStoreShardError::JobNotLeaseable(JobNotLeaseableError {
                             job_id: id.to_string(),
-                            status: status.kind,
+                            status: status_kind,
                             reason: "job has no pending task in queue".to_string(),
                         }));
                     }
@@ -159,7 +158,7 @@ impl JobStoreShard {
             }
         };
         // Validate that the raw bytes decode to a valid task before replacing it
-        decode_task(&task_raw)?;
+        validate_task(&task_raw)?;
 
         // Delete the pending task (regardless of type)
         txn.delete(&old_task_key)?;

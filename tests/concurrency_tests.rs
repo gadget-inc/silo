@@ -1,6 +1,5 @@
 mod test_helpers;
 
-use rkyv::Archive;
 use silo::codec::{decode_lease, decode_task, encode_lease};
 use silo::job::{ConcurrencyLimit, Limit};
 use silo::job_attempt::{AttemptOutcome, AttemptStatus};
@@ -572,39 +571,34 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
 
     // Find the lease and rewrite expiry to the past
     let (lease_key, lease_value) = first_lease_kv(shard.db()).await.expect("lease present");
-    type ArchivedTask = <Task as Archive>::Archived;
     let decoded = decode_lease(&lease_value).expect("decode lease");
-    let archived = decoded.archived();
-    let task = match &archived.task {
-        ArchivedTask::RunAttempt {
+    let task = match decoded.to_task().expect("to task") {
+        Task::RunAttempt {
             id,
             tenant,
             job_id,
             attempt_number,
             relative_attempt_number,
-            held_queues: _,
             ..
         } => Task::RunAttempt {
-            id: id.as_str().to_string(),
-            tenant: tenant.as_str().to_string(),
-            job_id: job_id.as_str().to_string(),
-            attempt_number: *attempt_number,
-            relative_attempt_number: *relative_attempt_number,
+            id,
+            tenant,
+            job_id,
+            attempt_number,
+            relative_attempt_number,
             held_queues: Vec::new(),
             task_group: "default".to_string(),
         },
-        ArchivedTask::RequestTicket { .. } => panic!("unexpected RequestTicket in lease"),
-        ArchivedTask::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in lease"),
-        ArchivedTask::RefreshFloatingLimit { .. } => {
-            panic!("unexpected RefreshFloatingLimit in lease")
-        }
+        Task::RequestTicket { .. } => panic!("unexpected RequestTicket in lease"),
+        Task::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in lease"),
+        Task::RefreshFloatingLimit { .. } => panic!("unexpected RefreshFloatingLimit in lease"),
     };
     let expired_ms = now_ms() - 1;
     let new_record = LeaseRecord {
-        worker_id: archived.worker_id.as_str().to_string(),
+        worker_id: decoded.worker_id().to_string(),
         task,
         expiry_ms: expired_ms,
-        started_at_ms: archived.started_at_ms,
+        started_at_ms: decoded.started_at_ms(),
     };
     let new_val = encode_lease(&new_record).unwrap();
     shard
@@ -1172,11 +1166,9 @@ async fn concurrency_reap_expired_lease_releases_holder() {
 
     // Expire the lease for job 1
     let (lease_key, lease_value) = first_lease_kv(shard.db()).await.expect("lease");
-    type ArchivedTask = <Task as Archive>::Archived;
     let decoded = decode_lease(&lease_value).expect("decode lease");
-    let archived = decoded.archived();
-    let task = match &archived.task {
-        ArchivedTask::RunAttempt {
+    let task = match decoded.to_task().expect("to task") {
+        Task::RunAttempt {
             id,
             tenant,
             job_id,
@@ -1185,23 +1177,23 @@ async fn concurrency_reap_expired_lease_releases_holder() {
             held_queues,
             ..
         } => Task::RunAttempt {
-            id: id.as_str().to_string(),
-            tenant: tenant.as_str().to_string(),
-            job_id: job_id.as_str().to_string(),
-            attempt_number: *attempt_number,
-            relative_attempt_number: *relative_attempt_number,
-            held_queues: held_queues.iter().map(|s| s.as_str().to_string()).collect(),
+            id,
+            tenant,
+            job_id,
+            attempt_number,
+            relative_attempt_number,
+            held_queues,
             task_group: "default".to_string(),
         },
-        ArchivedTask::RequestTicket { .. } => panic!("unexpected RequestTicket"),
-        ArchivedTask::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit"),
-        ArchivedTask::RefreshFloatingLimit { .. } => panic!("unexpected RefreshFloatingLimit"),
+        Task::RequestTicket { .. } => panic!("unexpected RequestTicket"),
+        Task::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit"),
+        Task::RefreshFloatingLimit { .. } => panic!("unexpected RefreshFloatingLimit"),
     };
     let expired_record = LeaseRecord {
-        worker_id: archived.worker_id.as_str().to_string(),
+        worker_id: decoded.worker_id().to_string(),
         task,
         expiry_ms: now_ms() - 1,
-        started_at_ms: archived.started_at_ms,
+        started_at_ms: decoded.started_at_ms(),
     };
     let expired_val = encode_lease(&expired_record).unwrap();
     shard

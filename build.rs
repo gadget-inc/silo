@@ -2,6 +2,7 @@ fn main() {
     // Tell cargo to only rerun this build script if the proto files change
     println!("cargo:rerun-if-changed=proto/silo.proto");
     println!("cargo:rerun-if-changed=proto/gubernator.proto");
+    println!("cargo:rerun-if-changed=schema/internal_storage.fbs");
 
     let protoc = protoc_bin_vendored::protoc_bin_path().expect("protoc not found");
     // SAFETY: This is safe because the build script runs single-threaded before any
@@ -35,4 +36,16 @@ fn main() {
         .build_server(false) // We only need the client for gubernator
         .compile_protos(&["proto/gubernator.proto"], includes)
         .expect("failed to compile gubernator.proto");
+
+    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
+    let status = std::process::Command::new("flatc")
+        .arg("--rust")
+        .arg("-o")
+        .arg(&out_dir)
+        .arg("schema/internal_storage.fbs")
+        .status()
+        .expect("failed to invoke flatc");
+    if !status.success() {
+        panic!("flatc failed generating Rust bindings for schema/internal_storage.fbs");
+    }
 }

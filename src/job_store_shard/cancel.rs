@@ -2,11 +2,9 @@
 
 use slatedb::IsolationLevel;
 
-use crate::codec::{decode_job_cancellation, encode_job_cancellation};
+use crate::codec::{decode_job_cancellation, decode_job_status, encode_job_cancellation};
 use crate::job::{JobCancellation, JobStatus, JobStatusKind};
-use crate::job_store_shard::helpers::{
-    TxnWriter, decode_job_status_owned, now_epoch_ms, retry_on_txn_conflict,
-};
+use crate::job_store_shard::helpers::{TxnWriter, now_epoch_ms, retry_on_txn_conflict};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{job_cancelled_key, job_status_key};
 
@@ -50,7 +48,8 @@ impl JobStoreShard {
             return Err(JobStoreShardError::JobNotFound(id.to_string()));
         };
 
-        let status = decode_job_status_owned(&status_raw)?;
+        let status = decode_job_status(&status_raw)?;
+        let status_kind = status.kind();
 
         // Check if already cancelled within transaction
         let cancelled_key = job_cancelled_key(tenant, id);
@@ -60,10 +59,10 @@ impl JobStoreShard {
         }
 
         // Cannot cancel jobs in final states (Succeeded/Failed are truly terminal)
-        if status.kind.is_final() {
+        if status_kind.is_final() {
             return Err(JobStoreShardError::JobAlreadyTerminal(
                 id.to_string(),
-                status.kind,
+                status_kind,
             ));
         }
 
@@ -75,7 +74,7 @@ impl JobStoreShard {
         txn.put(&cancelled_key, &cancellation_value)?;
 
         // Track whether we're transitioning a scheduled job to terminal state
-        let was_scheduled = status.kind == JobStatusKind::Scheduled;
+        let was_scheduled = status_kind == JobStatusKind::Scheduled;
 
         // [SILO-CXL-3] For Scheduled jobs, update status to Cancelled immediately
         // Tasks/requests are NOT deleted here - they will be cleaned up lazily:
@@ -123,6 +122,6 @@ impl JobStoreShard {
             return Ok(None);
         };
         let decoded = decode_job_cancellation(&raw)?;
-        Ok(Some(decoded.archived().cancelled_at_ms))
+        Ok(Some(decoded.cancelled_at_ms()))
     }
 }

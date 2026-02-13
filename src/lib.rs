@@ -33,5 +33,11 @@ pub mod pb {
         include!(concat!(env!("OUT_DIR"), "/pb.gubernator.rs"));
     }
 }
+#[allow(unsafe_op_in_unsafe_fn)]
+#[allow(unused_imports)]
+#[allow(clippy::extra_unused_lifetimes)]
+pub(crate) mod flatbuf {
+    include!(concat!(env!("OUT_DIR"), "/internal_storage_generated.rs"));
+}
 pub mod server;
 pub mod siloctl;

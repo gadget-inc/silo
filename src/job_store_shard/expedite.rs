@@ -5,14 +5,13 @@
 
 use slatedb::IsolationLevel;
 
-use crate::codec::{decode_task, encode_task};
+use crate::codec::{decode_job_status, task_is_refresh_floating_limit};
 use crate::job::JobStatusKind;
 use crate::job_store_shard::helpers::{
-    TxnWriter, decode_job_status_owned, load_job_view, now_epoch_ms, retry_on_txn_conflict,
+    TxnWriter, load_job_view, now_epoch_ms, retry_on_txn_conflict,
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{job_cancelled_key, job_status_key, task_key};
-use crate::task::Task;
 
 /// Error returned when a job cannot be expedited because it's not in an expeditable state.
 #[derive(Debug, Clone)]
@@ -62,14 +61,15 @@ impl JobStoreShard {
             return Err(JobStoreShardError::JobNotFound(id.to_string()));
         };
 
-        let status = decode_job_status_owned(&status_raw)?;
+        let status = decode_job_status(&status_raw)?;
+        let status_kind = status.kind();
 
         // [SILO-EXP-2] Pre: job must NOT be in a final state
-        if status.kind.is_final() {
+        if status_kind.is_final() {
             return Err(JobStoreShardError::JobNotExpediteable(
                 JobNotExpediteableError {
                     job_id: id.to_string(),
-                    status: status.kind,
+                    status: status_kind,
                     reason: "job is already in terminal state".to_string(),
                 },
             ));
@@ -81,7 +81,7 @@ impl JobStoreShard {
             return Err(JobStoreShardError::JobNotExpediteable(
                 JobNotExpediteableError {
                     job_id: id.to_string(),
-                    status: status.kind,
+                    status: status_kind,
                     reason: "job is cancelled".to_string(),
                 },
             ));
@@ -89,11 +89,11 @@ impl JobStoreShard {
 
         // [SILO-EXP-6] Pre: job has no active lease (not currently running)
         // If status is Running, there must be an active lease
-        if status.kind == JobStatusKind::Running {
+        if status_kind == JobStatusKind::Running {
             return Err(JobStoreShardError::JobNotExpediteable(
                 JobNotExpediteableError {
                     job_id: id.to_string(),
-                    status: status.kind,
+                    status: status_kind,
                     reason: "job is currently running".to_string(),
                 },
             ));
@@ -106,17 +106,17 @@ impl JobStoreShard {
 
         // [SILO-EXP-4] Pre: task exists in DB queue for this job
         // O(1) direct key lookup using stored attempt info from JobStatus
-        let attempt_number = status.current_attempt.ok_or_else(|| {
+        let attempt_number = status.current_attempt().ok_or_else(|| {
             JobStoreShardError::JobNotExpediteable(JobNotExpediteableError {
                 job_id: id.to_string(),
-                status: status.kind,
+                status: status_kind,
                 reason: "job has no pending task to expedite".to_string(),
             })
         })?;
-        let start_time_ms = status.next_attempt_starts_after_ms.ok_or_else(|| {
+        let start_time_ms = status.next_attempt_starts_after_ms().ok_or_else(|| {
             JobStoreShardError::JobNotExpediteable(JobNotExpediteableError {
                 job_id: id.to_string(),
-                status: status.kind,
+                status: status_kind,
                 reason: "job has no pending task to expedite".to_string(),
             })
         })?;
@@ -127,12 +127,11 @@ impl JobStoreShard {
             return Err(JobStoreShardError::JobNotExpediteable(
                 JobNotExpediteableError {
                     job_id: id.to_string(),
-                    status: status.kind,
+                    status: status_kind,
                     reason: "job has no pending task to expedite".to_string(),
                 },
             ));
         };
-        let task = decode_task(&task_raw)?;
 
         // [SILO-EXP-5] Check if task is future-scheduled (timestamp > now)
         // If task timestamp <= now, it's already ready to run (may be in buffer)
@@ -140,18 +139,18 @@ impl JobStoreShard {
             return Err(JobStoreShardError::JobNotExpediteable(
                 JobNotExpediteableError {
                     job_id: id.to_string(),
-                    status: status.kind,
+                    status: status_kind,
                     reason: "task is already ready to run (not future-scheduled)".to_string(),
                 },
             ));
         }
 
         // RefreshFloatingLimit tasks cannot be expedited (they're internal system tasks)
-        if matches!(task, Task::RefreshFloatingLimit { .. }) {
+        if task_is_refresh_floating_limit(&task_raw)? {
             return Err(JobStoreShardError::JobNotExpediteable(
                 JobNotExpediteableError {
                     job_id: id.to_string(),
-                    status: status.kind,
+                    status: status_kind,
                     reason: "cannot expedite internal refresh task".to_string(),
                 },
             ));
@@ -160,10 +159,9 @@ impl JobStoreShard {
         // Delete the old task key
         txn.delete(&old_task_key)?;
 
-        // Create new task key with current timestamp
+        // Reuse the same serialized task bytes under the new key.
         let new_task_key = task_key(&task_group, now_ms, priority, id, attempt_number);
-        let task_value = encode_task(&task)?;
-        txn.put(&new_task_key, &task_value)?;
+        txn.put(&new_task_key, &task_raw)?;
 
         // Update job status with new start time (keeping same attempt number)
         let new_status = crate::job::JobStatus::scheduled(now_ms, now_ms, attempt_number);

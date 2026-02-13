@@ -1,33 +1,28 @@
-use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
-
 use crate::codec::{CodecError, DecodedJobInfo, decode_job_info};
 use crate::job_store_shard::JobStoreShardError;
 use crate::retry::RetryPolicy;
 
 /// Cancellation record stored at job_cancelled/<tenant>/<job-id>.
 /// Cancellation is tracked separately from status to allow dequeue to blindly write Running without losing cancellation info.
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone)]
 pub struct JobCancellation {
     /// Timestamp (epoch ms) when cancellation was requested
     pub cancelled_at_ms: i64,
 }
 
 fn codec_error_to_shard_error(e: CodecError) -> JobStoreShardError {
-    JobStoreShardError::Rkyv(e.to_string())
+    JobStoreShardError::Serialization(e.to_string())
 }
 
 /// Per-job concurrency limit declaration
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone)]
 pub struct ConcurrencyLimit {
     pub key: String,
     pub max_concurrency: u32,
 }
 
 /// Floating concurrency limit - max concurrency is dynamic and refreshed by workers
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone)]
 pub struct FloatingConcurrencyLimit {
     pub key: String,
     pub default_max_concurrency: u32,
@@ -36,8 +31,7 @@ pub struct FloatingConcurrencyLimit {
 }
 
 /// State of a floating concurrency limit stored in the DB
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone)]
 pub struct FloatingLimitState {
     /// Current max concurrency value in use
     pub current_max_concurrency: u32,
@@ -57,21 +51,8 @@ pub struct FloatingLimitState {
     pub metadata: Vec<(String, String)>,
 }
 
-impl FloatingLimitState {
-    /// Create an owned copy from an archived (zero-copy) view.
-    /// Callers can then mutate whichever fields they need before writing back.
-    pub fn from_archived(archived: &ArchivedFloatingLimitState) -> Self {
-        use rkyv::Deserialize as _;
-        archived
-            .deserialize(&mut rkyv::Infallible)
-            .unwrap_or_else(|_| unreachable!("infallible deserialization for FloatingLimitState"))
-    }
-}
-
 /// Rate limiting algorithm used by Gubernator
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GubernatorAlgorithm {
     TokenBucket,
     LeakyBucket,
@@ -93,8 +74,7 @@ impl GubernatorAlgorithm {
 }
 
 /// Retry policy for rate limit checks when the limit is exceeded
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone)]
 pub struct RateLimitRetryPolicy {
     /// Initial backoff time when rate limited (ms)
     pub initial_backoff_ms: i64,
@@ -118,8 +98,7 @@ impl Default for RateLimitRetryPolicy {
 }
 
 /// Gubernator-based rate limit declaration
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone)]
 pub struct GubernatorRateLimit {
     /// Name identifying this rate limit (for debugging/metrics)
     pub name: String,
@@ -161,8 +140,7 @@ impl GubernatorRateLimit {
 }
 
 /// A unified limit type that can be either a concurrency limit, rate limit, or floating concurrency limit
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone)]
 pub enum Limit {
     /// A concurrency-based limit (slot-based)
     Concurrency(ConcurrencyLimit),
@@ -173,8 +151,7 @@ pub enum Limit {
 }
 
 /// Discriminant for job status kinds
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize, PartialEq, Eq, Copy)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone, PartialEq, Eq, Copy)]
 pub enum JobStatusKind {
     Scheduled,
     Running,
@@ -203,8 +180,7 @@ impl JobStatusKind {
 }
 
 /// Job status with the last change time for secondary indexing
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone)]
 pub struct JobStatus {
     pub kind: JobStatusKind,
     pub changed_at_ms: i64,
@@ -270,7 +246,7 @@ impl JobStatus {
     }
 }
 
-/// Zero-copy view over an archived `JobInfo` backed by owned aligned data.
+/// Zero-copy view over serialized `JobInfo` bytes.
 #[derive(Clone)]
 pub struct JobView {
     decoded: DecodedJobInfo,
@@ -287,13 +263,12 @@ impl std::fmt::Debug for JobView {
     }
 }
 
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone)]
 pub struct JobInfo {
     pub id: String,
     pub priority: u8,         // 0..=99, 0 is highest priority and will run first
     pub enqueue_time_ms: i64, // epoch millis
-    pub payload: Vec<u8>,     // MessagePack bytes (opaque to rkyv)
+    pub payload: Vec<u8>,     // MessagePack bytes
     pub retry_policy: Option<RetryPolicy>,
     pub metadata: Vec<(String, String)>,
     pub limits: Vec<Limit>, // Ordered list of limits to check before execution
@@ -309,19 +284,23 @@ impl JobView {
     }
 
     pub fn id(&self) -> &str {
-        self.archived().id.as_str()
+        self.decoded.id()
     }
+
     pub fn priority(&self) -> u8 {
-        self.archived().priority
+        self.decoded.priority()
     }
+
     pub fn enqueue_time_ms(&self) -> i64 {
-        self.archived().enqueue_time_ms
+        self.decoded.enqueue_time_ms()
     }
+
     pub fn payload_bytes(&self) -> &[u8] {
-        self.archived().payload.as_ref()
+        self.decoded.payload_bytes()
     }
+
     pub fn task_group(&self) -> &str {
-        self.archived().task_group.as_str()
+        self.decoded.task_group()
     }
 
     /// Decode the payload from MessagePack bytes into a serde_json::Value for display.
@@ -336,22 +315,9 @@ impl JobView {
         rmp_serde::from_slice(self.payload_bytes())
     }
 
-    /// Accessor to the archived root (validated at construction).
-    fn archived(&self) -> &<JobInfo as Archive>::Archived {
-        self.decoded.archived()
-    }
-
-    /// Return the job's retry policy as a runtime struct, if present, by copying primitive fields from the archived view.
+    /// Return the job's retry policy as a runtime struct.
     pub fn retry_policy(&self) -> Option<RetryPolicy> {
-        let a = self.archived();
-        let pol = a.retry_policy.as_ref()?;
-        Some(RetryPolicy {
-            retry_count: pol.retry_count,
-            initial_interval_ms: pol.initial_interval_ms,
-            max_interval_ms: pol.max_interval_ms,
-            randomize_interval: pol.randomize_interval,
-            backoff_factor: pol.backoff_factor,
-        })
+        self.decoded.retry_policy()
     }
 
     /// Return declared concurrency limits extracted from the limits field
@@ -367,23 +333,11 @@ impl JobView {
 
     /// Return metadata as owned key/value string pairs
     pub fn metadata(&self) -> Vec<(String, String)> {
-        use rkyv::Deserialize as _;
-        let a = self.archived();
-        a.metadata
-            .deserialize(&mut rkyv::Infallible)
-            .unwrap_or_else(|_| unreachable!("infallible deserialization for metadata"))
+        self.decoded.metadata()
     }
 
     /// Return the ordered list of limits (concurrency, rate limits, and floating concurrency limits)
     pub fn limits(&self) -> Vec<Limit> {
-        use rkyv::Deserialize as _;
-        let a = self.archived();
-        a.limits
-            .iter()
-            .map(|lim| {
-                lim.deserialize(&mut rkyv::Infallible)
-                    .unwrap_or_else(|_| unreachable!("infallible deserialization for Limit"))
-            })
-            .collect()
+        self.decoded.limits()
     }
 }

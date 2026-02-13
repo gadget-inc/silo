@@ -1,6 +1,5 @@
 mod test_helpers;
 
-use rkyv::Archive;
 use silo::codec::{decode_lease, encode_lease};
 use silo::job::JobStatusKind;
 use silo::job_attempt::AttemptOutcome;
@@ -241,11 +240,9 @@ async fn reaper_without_retries_marks_failed_in_index() {
         .to_string();
     // Make lease expired
     let (lease_key, lease_value) = first_lease_kv(shard.db()).await.expect("lease present");
-    type ArchivedTask = <Task as Archive>::Archived;
     let decoded = decode_lease(&lease_value).expect("decode lease");
-    let archived = decoded.archived();
-    let task = match &archived.task {
-        ArchivedTask::RunAttempt {
+    let task = match decoded.to_task().expect("to task") {
+        Task::RunAttempt {
             id,
             tenant,
             job_id,
@@ -253,21 +250,21 @@ async fn reaper_without_retries_marks_failed_in_index() {
             relative_attempt_number,
             ..
         } => Task::RunAttempt {
-            id: id.as_str().to_string(),
-            tenant: tenant.as_str().to_string(),
-            job_id: job_id.as_str().to_string(),
-            attempt_number: *attempt_number,
-            relative_attempt_number: *relative_attempt_number,
+            id,
+            tenant,
+            job_id,
+            attempt_number,
+            relative_attempt_number,
             held_queues: Vec::new(),
             task_group: "default".to_string(),
         },
         _ => unreachable!(),
     };
     let expired = LeaseRecord {
-        worker_id: archived.worker_id.as_str().to_string(),
+        worker_id: decoded.worker_id().to_string(),
         task,
         expiry_ms: now_ms() - 1,
-        started_at_ms: archived.started_at_ms,
+        started_at_ms: decoded.started_at_ms(),
     };
     let new_val = encode_lease(&expired).unwrap();
     shard.db().put(&lease_key, &new_val).await.unwrap();
@@ -313,11 +310,9 @@ async fn reaper_with_retries_moves_to_scheduled_in_index() {
         .task_id()
         .to_string();
     let (lease_key, lease_value) = first_lease_kv(shard.db()).await.expect("lease present");
-    type ArchivedTask = <Task as Archive>::Archived;
     let decoded = decode_lease(&lease_value).expect("decode lease");
-    let archived = decoded.archived();
-    let task = match &archived.task {
-        ArchivedTask::RunAttempt {
+    let task = match decoded.to_task().expect("to task") {
+        Task::RunAttempt {
             id,
             tenant,
             job_id,
@@ -325,21 +320,21 @@ async fn reaper_with_retries_moves_to_scheduled_in_index() {
             relative_attempt_number,
             ..
         } => Task::RunAttempt {
-            id: id.as_str().to_string(),
-            tenant: tenant.as_str().to_string(),
-            job_id: job_id.as_str().to_string(),
-            attempt_number: *attempt_number,
-            relative_attempt_number: *relative_attempt_number,
+            id,
+            tenant,
+            job_id,
+            attempt_number,
+            relative_attempt_number,
             held_queues: Vec::new(),
             task_group: "default".to_string(),
         },
         _ => unreachable!(),
     };
     let expired = LeaseRecord {
-        worker_id: archived.worker_id.as_str().to_string(),
+        worker_id: decoded.worker_id().to_string(),
         task,
         expiry_ms: now_ms() - 1,
-        started_at_ms: archived.started_at_ms,
+        started_at_ms: decoded.started_at_ms(),
     };
     let new_val = encode_lease(&expired).unwrap();
     shard.db().put(&lease_key, &new_val).await.unwrap();

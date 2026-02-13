@@ -22,8 +22,7 @@ anyhow = "1"
 url = "2"
 serde_json = "1.0"
 uuid = { version = "1.9", features = ["v4", "serde"] }
-rkyv = { version = "0.7", features = ["validation"] }
-bytecheck = "0.6"
+flatbuffers = "25"
 bytes = "1"
 crossbeam-skiplist = "0.1"
 dashmap = "6"

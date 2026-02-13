@@ -3,7 +3,11 @@
 use slatedb::config::WriteOptions;
 use slatedb::{DbIterator, WriteBatch};
 
-use crate::codec::{decode_task, encode_attempt, encode_lease};
+use crate::codec::{
+    DecodedCheckRateLimitTask, DecodedRefreshFloatingLimitTask, DecodedRequestTicketTask,
+    DecodedRunAttemptTask, DecodedTaskKind, decode_task, decode_task_view_unchecked,
+    encode_attempt, encode_lease,
+};
 use crate::concurrency::{ReleaseGrantRollback, RequestTicketTaskOutcome};
 use crate::dst_events::{self, DstEvent};
 use crate::job::{JobStatus, JobView};
@@ -103,7 +107,15 @@ impl JobStoreShard {
             let shard_range = self.get_range();
 
             for entry in &claimed {
-                let task = &entry.task;
+                let task = match decode_task_view_unchecked(&entry.value) {
+                    Ok(task) => task,
+                    Err(_) => {
+                        // Skip malformed tasks and clean up key.
+                        state.batch.delete(&entry.key);
+                        state.ack_keys.push(entry.key.clone());
+                        continue;
+                    }
+                };
 
                 // Check if task's tenant is within shard range
                 // Tasks for tenants outside the range are defunct (from before a split)
@@ -121,11 +133,17 @@ impl JobStoreShard {
                     continue;
                 }
 
-                match task {
-                    Task::RequestTicket { .. } => {
+                match task.kind() {
+                    DecodedTaskKind::RequestTicket => {
+                        let Some(request_ticket) = task.request_ticket() else {
+                            return Err(JobStoreShardError::Serialization(
+                                "task kind/view mismatch for RequestTicket".to_string(),
+                            ));
+                        };
                         self.handle_request_ticket(
                             &mut state,
                             entry,
+                            request_ticket,
                             &shard_range,
                             worker_id,
                             now_ms,
@@ -133,22 +151,45 @@ impl JobStoreShard {
                         )
                         .await?;
                     }
-                    Task::CheckRateLimit { .. } => {
-                        self.handle_check_rate_limit(&mut state, entry, now_ms)
+                    DecodedTaskKind::CheckRateLimit => {
+                        let Some(check_rate_limit) = task.check_rate_limit() else {
+                            return Err(JobStoreShardError::Serialization(
+                                "task kind/view mismatch for CheckRateLimit".to_string(),
+                            ));
+                        };
+                        self.handle_check_rate_limit(&mut state, entry, check_rate_limit, now_ms)
                             .await?;
                     }
-                    Task::RefreshFloatingLimit { .. } => {
+                    DecodedTaskKind::RefreshFloatingLimit => {
+                        let Some(refresh) = task.refresh_floating_limit() else {
+                            return Err(JobStoreShardError::Serialization(
+                                "task kind/view mismatch for RefreshFloatingLimit".to_string(),
+                            ));
+                        };
                         self.handle_refresh_floating_limit(
                             &mut state,
                             &mut refresh_out,
                             entry,
+                            refresh,
                             worker_id,
                             expiry_ms,
                         )?;
                     }
-                    Task::RunAttempt { .. } => {
-                        self.handle_run_attempt(&mut state, entry, worker_id, now_ms, expiry_ms)
-                            .await?;
+                    DecodedTaskKind::RunAttempt => {
+                        let Some(run_attempt) = task.run_attempt() else {
+                            return Err(JobStoreShardError::Serialization(
+                                "task kind/view mismatch for RunAttempt".to_string(),
+                            ));
+                        };
+                        self.handle_run_attempt(
+                            &mut state,
+                            entry,
+                            run_attempt,
+                            worker_id,
+                            now_ms,
+                            expiry_ms,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -313,30 +354,24 @@ impl JobStoreShard {
     }
 
     /// Process a RequestTicket task: check cancellation, process concurrency ticket, maybe lease.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_request_ticket(
         &self,
         state: &mut DequeueIterationState,
         entry: &BrokerTask,
+        task: DecodedRequestTicketTask<'_>,
         shard_range: &ShardRange,
         worker_id: &str,
         now_ms: i64,
         expiry_ms: i64,
     ) -> Result<(), JobStoreShardError> {
-        let Task::RequestTicket {
-            queue,
-            tenant,
-            job_id,
-            attempt_number,
-            relative_attempt_number,
-            request_id,
-            task_group: req_task_group,
-            ..
-        } = &entry.task
-        else {
-            unreachable!()
-        };
-        let attempt_number = *attempt_number;
-        let relative_attempt_number = *relative_attempt_number;
+        let queue = task.queue();
+        let tenant = task.tenant();
+        let job_id = task.job_id();
+        let attempt_number = task.attempt_number();
+        let relative_attempt_number = task.relative_attempt_number();
+        let request_id = task.request_id();
+        let req_task_group = task.task_group();
         state.processed_internal = true;
         let tenant = tenant.to_string();
 
@@ -436,31 +471,21 @@ impl JobStoreShard {
         &self,
         state: &mut DequeueIterationState,
         entry: &BrokerTask,
+        task: DecodedCheckRateLimitTask<'_>,
         now_ms: i64,
     ) -> Result<(), JobStoreShardError> {
-        let Task::CheckRateLimit {
-            task_id: check_task_id,
-            tenant,
-            job_id,
-            attempt_number,
-            relative_attempt_number: check_relative_attempt_number,
-            limit_index,
-            rate_limit,
-            retry_count,
-            started_at_ms,
-            priority,
-            held_queues,
-            task_group: check_task_group,
-        } = &entry.task
-        else {
-            unreachable!()
-        };
-        let attempt_number = *attempt_number;
-        let check_relative_attempt_number = *check_relative_attempt_number;
-        let limit_index = *limit_index;
-        let retry_count = *retry_count;
-        let started_at_ms = *started_at_ms;
-        let priority = *priority;
+        let check_task_id = task.task_id();
+        let tenant = task.tenant();
+        let job_id = task.job_id();
+        let attempt_number = task.attempt_number();
+        let check_relative_attempt_number = task.relative_attempt_number();
+        let limit_index = task.limit_index();
+        let rate_limit = task.rate_limit()?;
+        let retry_count = task.retry_count();
+        let started_at_ms = task.started_at_ms();
+        let priority = task.priority();
+        let held_queues = task.held_queues();
+        let check_task_group = task.task_group();
         state.processed_internal = true;
         let tenant = tenant.to_string();
         state.batch.delete(&entry.key);
@@ -478,7 +503,7 @@ impl JobStoreShard {
         };
 
         // Check the rate limit via Gubernator
-        let rate_limit_result = self.check_gubernator_rate_limit(rate_limit).await;
+        let rate_limit_result = self.check_gubernator_rate_limit(&rate_limit).await;
 
         match rate_limit_result {
             Ok(result) if result.under_limit => {
@@ -497,7 +522,7 @@ impl JobStoreShard {
                             priority,
                             start_at_ms: now_ms,
                             now_ms,
-                            held_queues: held_queues.to_vec(),
+                            held_queues: held_queues.clone(),
                             task_group: check_task_group,
                         },
                     )
@@ -523,7 +548,7 @@ impl JobStoreShard {
                 }
 
                 let retry_backoff = self.calculate_rate_limit_backoff(
-                    rate_limit,
+                    &rate_limit,
                     retry_count,
                     result.reset_time_ms,
                     now_ms,
@@ -535,11 +560,11 @@ impl JobStoreShard {
                     attempt_number,
                     check_relative_attempt_number,
                     limit_index,
-                    rate_limit,
+                    &rate_limit,
                     retry_count,
                     started_at_ms,
                     priority,
-                    held_queues,
+                    &held_queues,
                     retry_backoff,
                     check_task_group,
                 )?;
@@ -554,11 +579,11 @@ impl JobStoreShard {
                     attempt_number,
                     check_relative_attempt_number,
                     limit_index,
-                    rate_limit,
+                    &rate_limit,
                     retry_count,
                     started_at_ms,
                     priority,
-                    held_queues,
+                    &held_queues,
                     retry_backoff,
                     check_task_group,
                 )?;
@@ -574,26 +599,32 @@ impl JobStoreShard {
         state: &mut DequeueIterationState,
         refresh_out: &mut Vec<LeasedRefreshTask>,
         entry: &BrokerTask,
+        task: DecodedRefreshFloatingLimitTask<'_>,
         worker_id: &str,
         expiry_ms: i64,
     ) -> Result<(), JobStoreShardError> {
-        let Task::RefreshFloatingLimit {
-            task_id,
-            tenant: task_tenant,
-            queue_key,
+        let task_id = task.task_id();
+        let task_tenant = task.tenant();
+        let queue_key = task.queue_key();
+        let current_max_concurrency = task.current_max_concurrency();
+        let last_refreshed_at_ms = task.last_refreshed_at_ms();
+        let metadata = task.metadata();
+        let refresh_task_group = task.task_group();
+
+        let refresh_task = Task::RefreshFloatingLimit {
+            task_id: task_id.to_string(),
+            tenant: task_tenant.to_string(),
+            queue_key: queue_key.to_string(),
             current_max_concurrency,
             last_refreshed_at_ms,
-            metadata,
-            task_group: refresh_task_group,
-        } = &entry.task
-        else {
-            unreachable!()
+            metadata: metadata.clone(),
+            task_group: refresh_task_group.to_string(),
         };
 
         let lease_key = leased_task_key(task_id);
         let record = LeaseRecord {
             worker_id: worker_id.to_string(),
-            task: entry.task.clone(),
+            task: refresh_task,
             expiry_ms,
             started_at_ms: 0, // Not applicable for RefreshFloatingLimit tasks
         };
@@ -605,9 +636,9 @@ impl JobStoreShard {
             task_id: task_id.to_string(),
             tenant_id: task_tenant.to_string(),
             queue_key: queue_key.to_string(),
-            current_max_concurrency: *current_max_concurrency,
-            last_refreshed_at_ms: *last_refreshed_at_ms,
-            metadata: metadata.to_vec(),
+            current_max_concurrency,
+            last_refreshed_at_ms,
+            metadata,
             task_group: refresh_task_group.to_string(),
         });
         state.ack_keys.push(entry.key.clone());
@@ -620,23 +651,16 @@ impl JobStoreShard {
         &self,
         state: &mut DequeueIterationState,
         entry: &BrokerTask,
+        task: DecodedRunAttemptTask<'_>,
         worker_id: &str,
         now_ms: i64,
         expiry_ms: i64,
     ) -> Result<(), JobStoreShardError> {
-        let Task::RunAttempt {
-            id: task_id,
-            tenant,
-            job_id,
-            attempt_number,
-            relative_attempt_number,
-            ..
-        } = &entry.task
-        else {
-            unreachable!()
-        };
-        let attempt_number = *attempt_number;
-        let relative_attempt_number = *relative_attempt_number;
+        let task_id = task.id();
+        let tenant = task.tenant();
+        let job_id = task.job_id();
+        let attempt_number = task.attempt_number();
+        let relative_attempt_number = task.relative_attempt_number();
         // [SILO-DEQ-2] Look up job info; if missing, delete the task and skip
         let job_key = job_info_key(tenant, job_id);
         let maybe_job = self.db.get(&job_key).await?;
@@ -654,11 +678,7 @@ impl JobStoreShard {
 
             // [SILO-DEQ-CXL-REL] Release any held concurrency tickets
             // This is required to maintain invariant: holders can only exist for active tasks
-            let held_queues = match &entry.task {
-                Task::RunAttempt { held_queues, .. } => held_queues.clone(),
-                Task::CheckRateLimit { held_queues, .. } => held_queues.clone(),
-                Task::RequestTicket { .. } | Task::RefreshFloatingLimit { .. } => Vec::new(),
-            };
+            let held_queues = task.held_queues();
             if !held_queues.is_empty() {
                 // release_and_grant_next updates in-memory atomically before returning
                 // Track rollback info in case DB write fails
@@ -690,11 +710,12 @@ impl JobStoreShard {
         // [SILO-DEQ-3] Delete task from task queue
         state.batch.delete(&entry.key);
 
+        let run_task = task.to_owned();
         let attempt_val = self
             .write_lease_and_attempt(
                 &mut state.batch,
                 worker_id,
-                &entry.task,
+                &run_task,
                 task_id,
                 tenant,
                 job_id,

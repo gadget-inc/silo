@@ -7,21 +7,21 @@ use std::sync::{
 use std::time::Duration;
 
 use crossbeam_skiplist::SkipMap;
+use slatedb::bytes::Bytes;
 use slatedb::{Db, WriteBatch};
 use tokio::sync::Notify;
 
-use crate::codec::decode_task;
+use crate::codec::decode_task_tenant;
 use crate::keys::{end_bound, parse_task_key, tasks_prefix};
 use crate::metrics::Metrics;
 use crate::shard_range::ShardRange;
-use crate::task::Task;
 use tracing::debug;
 
 /// A task entry stored in the in-memory broker buffer
 #[derive(Debug, Clone)]
 pub struct BrokerTask {
     pub key: Vec<u8>,
-    pub task: Task,
+    pub value: Bytes,
 }
 
 /// Lock-free in-memory task broker backed by SlateDB.
@@ -123,13 +123,10 @@ impl TaskBroker {
                 continue;
             }
 
-            let task = match decode_task(&kv.value) {
-                Ok(t) => t,
+            let task_tenant = match decode_task_tenant(&kv.value) {
+                Ok(tenant) => tenant,
                 Err(_) => continue, // Skip malformed tasks
             };
-
-            // Check if task's tenant is within shard range
-            let task_tenant = task.tenant();
 
             if !self.range.contains(task_tenant) {
                 // Task is for a tenant outside our range - mark for deletion
@@ -147,7 +144,7 @@ impl TaskBroker {
             let key_bytes = kv.key.to_vec();
             let entry = BrokerTask {
                 key: key_bytes.clone(),
-                task,
+                value: kv.value.clone(),
             };
 
             // [SILO-SCAN-2] Insert into buffer if not already present
