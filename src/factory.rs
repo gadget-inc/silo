@@ -559,36 +559,46 @@ impl ShardFactory {
 
         // For cloning to work, both parent and child must be accessible from the
         // same object store. resolve_at_root gives us the store at the storage root
-        // level, and each shard name is a relative path under that root.
-        let (resolved, _) =
+        // level, and the db_path is the root-relative path to the shard.
+        //
+        // For local FS: store is at the storage root dir, db_path is just the shard UUID
+        // For object stores (S3/GCS): store is at the bucket level, db_path is the
+        //   bucket-relative path (e.g. "silo/112381b2-...")
+        let (parent_resolved, parent_db_path) =
             Self::resolve_at_root(&self.template.backend, &self.template.path, &parent_name)?;
+        let (_, child_db_path) =
+            Self::resolve_at_root(&self.template.backend, &self.template.path, &child_name)?;
 
         tracing::debug!(
-            canonical_root = %resolved.canonical_path,
-            parent = %parent_name,
-            child = %child_name,
+            parent_db_path = %parent_db_path,
+            child_db_path = %child_db_path,
             "preparing to clone shard database"
         );
 
-        // Create an Admin for the child path (relative to the root) and clone from parent
-        let admin =
-            slatedb::admin::Admin::builder(child_name.as_str(), Arc::clone(&resolved.store))
-                .build();
+        // Create an Admin for the child path (relative to the root) and clone from parent.
+        // Both paths must be root-relative so SlateDB can find the parent's manifest
+        // and write the child's data in the correct location.
+        let admin = slatedb::admin::Admin::builder(
+            child_db_path.as_str(),
+            Arc::clone(&parent_resolved.store),
+        )
+        .build();
 
         admin
-            .create_clone(parent_name.as_str(), Some(checkpoint.id))
+            .create_clone(parent_db_path.as_str(), Some(checkpoint.id))
             .await
             .map_err(|e| {
                 ShardFactoryError::CloneError(format!(
                     "failed to clone database: {} (root={}, parent={}, child={})",
-                    e, resolved.canonical_path, parent_name, child_name
+                    e, parent_resolved.canonical_path, parent_db_path, child_db_path
                 ))
             })?;
 
         tracing::info!(
             parent_shard_id = %parent_id,
             child_shard_id = %child_id,
-            canonical_root = %resolved.canonical_path,
+            parent_db_path = %parent_db_path,
+            child_db_path = %child_db_path,
             "cloned shard database"
         );
 
