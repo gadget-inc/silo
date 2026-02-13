@@ -370,13 +370,18 @@ impl TaskBroker {
         }
     }
 
-    /// Acknowledge that these tasks are durably leased and can be removed from in-flight tracking.
-    pub fn ack_durable(&self, keys: &[Vec<u8>]) {
+    /// Acknowledge durable dequeue outcomes.
+    /// - `release_keys`: keys to release from in-flight tracking.
+    /// - `tombstone_keys`: subset of keys that were durably deleted and should be
+    ///   protected from stale-scan re-inserts.
+    pub fn ack_durable(&self, release_keys: &[Vec<u8>], tombstone_keys: &[Vec<u8>]) {
         let mut inflight = self.inflight.lock().unwrap();
         let mut tombstones = self.ack_tombstones.lock().unwrap();
         let generation = self.scan_generation_started.load(Ordering::SeqCst);
-        for k in keys {
+        for k in release_keys {
             inflight.remove(k);
+        }
+        for k in tombstone_keys {
             tombstones.insert(k.clone(), generation);
         }
     }
