@@ -73,10 +73,34 @@ describe("Shard Routing", () => {
         response: Promise.resolve({
           numShards: 4,
           shardOwners: [
-            { shardId: "00000000-0000-0000-0000-000000000001", grpcAddr: "server-a:7450", nodeId: "node-a", rangeStart: "", rangeEnd: "4" },
-            { shardId: "00000000-0000-0000-0000-000000000002", grpcAddr: "server-b:7450", nodeId: "node-b", rangeStart: "4", rangeEnd: "8" },
-            { shardId: "00000000-0000-0000-0000-000000000003", grpcAddr: "server-a:7450", nodeId: "node-a", rangeStart: "8", rangeEnd: "c" },
-            { shardId: "00000000-0000-0000-0000-000000000004", grpcAddr: "server-b:7450", nodeId: "node-b", rangeStart: "c", rangeEnd: "" },
+            {
+              shardId: "00000000-0000-0000-0000-000000000001",
+              grpcAddr: "server-a:7450",
+              nodeId: "node-a",
+              rangeStart: "",
+              rangeEnd: "4",
+            },
+            {
+              shardId: "00000000-0000-0000-0000-000000000002",
+              grpcAddr: "server-b:7450",
+              nodeId: "node-b",
+              rangeStart: "4",
+              rangeEnd: "8",
+            },
+            {
+              shardId: "00000000-0000-0000-0000-000000000003",
+              grpcAddr: "server-a:7450",
+              nodeId: "node-a",
+              rangeStart: "8",
+              rangeEnd: "c",
+            },
+            {
+              shardId: "00000000-0000-0000-0000-000000000004",
+              grpcAddr: "server-b:7450",
+              nodeId: "node-b",
+              rangeStart: "c",
+              rangeEnd: "",
+            },
           ],
           thisNodeId: "node-a",
           thisGrpcAddr: "server-a:7450",
@@ -91,10 +115,18 @@ describe("Shard Routing", () => {
 
       const topology = client.getTopology();
       expect(topology.shards.length).toBe(4);
-      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000001")).toBe("server-a:7450");
-      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000002")).toBe("server-b:7450");
-      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000003")).toBe("server-a:7450");
-      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000004")).toBe("server-b:7450");
+      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000001")).toBe(
+        "server-a:7450",
+      );
+      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000002")).toBe(
+        "server-b:7450",
+      );
+      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000003")).toBe(
+        "server-a:7450",
+      );
+      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000004")).toBe(
+        "server-b:7450",
+      );
     });
 
     it("creates connections to discovered servers", async () => {
@@ -102,8 +134,20 @@ describe("Shard Routing", () => {
         response: Promise.resolve({
           numShards: 2,
           shardOwners: [
-            { shardId: "00000000-0000-0000-0000-000000000001", grpcAddr: "server-x:7450", nodeId: "node-x", rangeStart: "", rangeEnd: "m" },
-            { shardId: "00000000-0000-0000-0000-000000000002", grpcAddr: "server-y:7450", nodeId: "node-y", rangeStart: "m", rangeEnd: "" },
+            {
+              shardId: "00000000-0000-0000-0000-000000000001",
+              grpcAddr: "server-x:7450",
+              nodeId: "node-x",
+              rangeStart: "",
+              rangeEnd: "m",
+            },
+            {
+              shardId: "00000000-0000-0000-0000-000000000002",
+              grpcAddr: "server-y:7450",
+              nodeId: "node-y",
+              rangeStart: "m",
+              rangeEnd: "",
+            },
           ],
           thisNodeId: "node-x",
           thisGrpcAddr: "server-x:7450",
@@ -144,7 +188,13 @@ describe("Shard Routing", () => {
         response: Promise.resolve({
           numShards: 1,
           shardOwners: [
-            { shardId: "00000000-0000-0000-0000-000000000001", grpcAddr: "working-server:7450", nodeId: "node-1", rangeStart: "", rangeEnd: "" },
+            {
+              shardId: "00000000-0000-0000-0000-000000000001",
+              grpcAddr: "working-server:7450",
+              nodeId: "node-1",
+              rangeStart: "",
+              rangeEnd: "",
+            },
           ],
           thisNodeId: "node-1",
           thisGrpcAddr: "working-server:7450",
@@ -155,7 +205,9 @@ describe("Shard Routing", () => {
 
       const topology = client.getTopology();
       expect(topology.shards.length).toBe(1);
-      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000001")).toBe("working-server:7450");
+      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000001")).toBe(
+        "working-server:7450",
+      );
     });
 
     it("throws if all servers fail during topology refresh after exhausting retries", async () => {
@@ -170,7 +222,7 @@ describe("Shard Routing", () => {
       conn.client.getClusterInfo = mockGetClusterInfo;
 
       await expect(client.refreshTopology()).rejects.toThrow(
-        "Failed to refresh cluster topology from any server"
+        "Failed to refresh cluster topology from any server",
       );
     });
   });
@@ -194,12 +246,12 @@ describe("Shard Routing", () => {
         const serviceConfig = JSON.parse(grpcOptions["grpc.service_config"]);
         expect(serviceConfig.methodConfig).toBeDefined();
         expect(serviceConfig.methodConfig[0].retryPolicy).toBeDefined();
-        expect(
-          serviceConfig.methodConfig[0].retryPolicy.retryableStatusCodes
-        ).toContain("UNAVAILABLE");
-        expect(
-          serviceConfig.methodConfig[0].retryPolicy.retryableStatusCodes
-        ).toContain("RESOURCE_EXHAUSTED");
+        expect(serviceConfig.methodConfig[0].retryPolicy.retryableStatusCodes).toContain(
+          "UNAVAILABLE",
+        );
+        expect(serviceConfig.methodConfig[0].retryPolicy.retryableStatusCodes).toContain(
+          "RESOURCE_EXHAUSTED",
+        );
       } finally {
         client.close();
       }
@@ -248,7 +300,12 @@ describe("Shard Routing", () => {
     // Helper to set up mock topology so shard resolution works
     const setupMockTopology = (c: SiloGRPCClient) => {
       (c as any)._shards = [
-        { shardId: "00000000-0000-0000-0000-000000000001", serverAddr: "localhost:7450", rangeStart: "", rangeEnd: "" }
+        {
+          shardId: "00000000-0000-0000-0000-000000000001",
+          serverAddr: "localhost:7450",
+          rangeStart: "",
+          rangeEnd: "",
+        },
       ];
       (c as any)._shardToServer.set("00000000-0000-0000-0000-000000000001", "localhost:7450");
     };
@@ -294,9 +351,7 @@ describe("Shard Routing", () => {
           "x-silo-shard-owner-node": "node-2",
         });
 
-        expect(error.meta?.["x-silo-shard-owner-addr"]).toBe(
-          "other-server:7450"
-        );
+        expect(error.meta?.["x-silo-shard-owner-addr"]).toBe("other-server:7450");
         expect(error.meta?.["x-silo-shard-owner-node"]).toBe("node-2");
       });
     });
@@ -347,7 +402,7 @@ describe("Shard Routing", () => {
             tenant: "test-tenant",
             payload: { test: true },
             taskGroup: "default",
-          })
+          }),
         ).rejects.toThrow("shard not found");
 
         // Initial call + 3 retries = 4 total calls
@@ -368,7 +423,7 @@ describe("Shard Routing", () => {
             tenant: "test-tenant",
             payload: { test: true },
             taskGroup: "default",
-          })
+          }),
         ).rejects.toThrow("internal server error");
 
         expect(mockEnqueue).toHaveBeenCalledTimes(1);
@@ -393,9 +448,7 @@ describe("Shard Routing", () => {
         const conn = connections.values().next().value;
         conn.client.enqueue = mockEnqueue;
 
-        const originalGetOrCreate = (client as any)._getOrCreateConnection.bind(
-          client
-        );
+        const originalGetOrCreate = (client as any)._getOrCreateConnection.bind(client);
         const getOrCreateSpy = vi.fn().mockImplementation((addr: string) => {
           const newConn = originalGetOrCreate(addr);
           newConn.client.enqueue = mockEnqueue;

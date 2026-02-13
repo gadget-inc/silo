@@ -1760,7 +1760,9 @@ where
         + tonic::transport::server::Connected,
 {
     let svc = SiloService::new(factory.clone(), coordinator, cfg, metrics.clone());
-    let server = SiloServer::new(svc);
+    let server = SiloServer::new(svc)
+        .max_decoding_message_size(128 * 1024 * 1024)
+        .max_encoding_message_size(128 * 1024 * 1024);
 
     // Create health service for gRPC health probes
     let (mut health_reporter, health_service) = health_reporter();

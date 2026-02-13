@@ -3,8 +3,19 @@ export {
   JobStatus,
   AttemptStatus,
   JobNotFoundError,
+  JobAlreadyExistsError,
   JobNotTerminalError,
   TaskNotFoundError,
+  SiloGrpcError,
+  SiloNotFoundError,
+  SiloAlreadyExistsError,
+  SiloInvalidArgumentError,
+  SiloFailedPreconditionError,
+  SiloUnauthenticatedError,
+  SiloPermissionDeniedError,
+  SiloResourceExhaustedError,
+  SiloUnavailableError,
+  SiloDeadlineExceededError,
   shardForTenant,
   GubernatorAlgorithm,
   GubernatorBehavior,
@@ -54,9 +65,4 @@ export {
   type GubernatorRateLimit,
 } from "./TaskExecution";
 export { JobHandle } from "./JobHandle";
-export type {
-  QueryResponse,
-  RetryPolicy,
-  ColumnInfo,
-  Failure,
-} from "./pb/silo";
+export type { QueryResponse, RetryPolicy, ColumnInfo, Failure } from "./pb/silo";

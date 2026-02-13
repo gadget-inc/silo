@@ -138,9 +138,7 @@ export class JobHandle {
    * const result = await handle.awaitResult({ pollIntervalMs: 100 });
    * ```
    */
-  public async awaitResult<T = unknown>(
-    options?: AwaitJobOptions
-  ): Promise<JobResult<T>> {
+  public async awaitResult<T = unknown>(options?: AwaitJobOptions): Promise<JobResult<T>> {
     const pollIntervalMs = options?.pollIntervalMs ?? 500;
     const timeoutMs = options?.timeoutMs;
     const startTime = Date.now();
@@ -159,9 +157,7 @@ export class JobHandle {
       if (timeoutMs !== undefined) {
         const elapsed = Date.now() - startTime;
         if (elapsed >= timeoutMs) {
-          throw new Error(
-            `Timeout waiting for job ${this.id} to complete after ${timeoutMs}ms`
-          );
+          throw new Error(`Timeout waiting for job ${this.id} to complete after ${timeoutMs}ms`);
         }
       }
 

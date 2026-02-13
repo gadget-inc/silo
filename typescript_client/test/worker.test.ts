@@ -16,13 +16,9 @@ function createMockClient(options?: {
   ) => Promise<{ cancelled: boolean }>;
 }): SiloGRPCClient {
   return {
-    leaseTasks:
-      options?.leaseTasks ??
-      vi.fn().mockResolvedValue({ tasks: [], refreshTasks: [] }),
-    reportOutcome:
-      options?.reportOutcome ?? vi.fn().mockResolvedValue(undefined),
-    heartbeat:
-      options?.heartbeat ?? vi.fn().mockResolvedValue({ cancelled: false }),
+    leaseTasks: options?.leaseTasks ?? vi.fn().mockResolvedValue({ tasks: [], refreshTasks: [] }),
+    reportOutcome: options?.reportOutcome ?? vi.fn().mockResolvedValue(undefined),
+    heartbeat: options?.heartbeat ?? vi.fn().mockResolvedValue({ cancelled: false }),
     cancelJob: vi.fn().mockResolvedValue(undefined),
   } as unknown as SiloGRPCClient;
 }
@@ -339,9 +335,7 @@ describe("SiloWorker", () => {
         };
       };
       expect(concurrencyLimit.limit.oneofKind).toBe("concurrency");
-      expect(concurrencyLimit.limit.concurrency.key).toBe(
-        "test-concurrency-key",
-      );
+      expect(concurrencyLimit.limit.concurrency.key).toBe("test-concurrency-key");
       expect(concurrencyLimit.limit.concurrency.maxConcurrency).toBe(5);
 
       // Check rate limit
@@ -435,14 +429,8 @@ describe("SiloWorker", () => {
 
     it("respects maxConcurrentTasks limit", async () => {
       // Create tasks that will be returned in batches
-      const batch1 = [
-        createTask("task-a", "job-a"),
-        createTask("task-b", "job-b"),
-      ];
-      const batch2 = [
-        createTask("task-c", "job-c"),
-        createTask("task-d", "job-d"),
-      ];
+      const batch1 = [createTask("task-a", "job-a"), createTask("task-b", "job-b")];
+      const batch2 = [createTask("task-c", "job-c"), createTask("task-d", "job-d")];
       const batch3 = [createTask("task-e", "job-e")];
 
       let activeTasks = 0;
@@ -611,9 +599,7 @@ describe("SiloWorker", () => {
 
   describe("error handling", () => {
     it("calls onError when polling fails", async () => {
-      const leaseTasks = vi
-        .fn()
-        .mockRejectedValue(new Error("Connection failed"));
+      const leaseTasks = vi.fn().mockRejectedValue(new Error("Connection failed"));
       const client = createMockClient({ leaseTasks });
       const onError = vi.fn();
 
@@ -647,9 +633,7 @@ describe("SiloWorker", () => {
         .mockResolvedValueOnce(tasksResult([task]))
         .mockResolvedValue(tasksResult([]));
       const reportOutcome = vi.fn().mockResolvedValue(undefined);
-      const heartbeat = vi
-        .fn()
-        .mockRejectedValue(new Error("Heartbeat failed"));
+      const heartbeat = vi.fn().mockRejectedValue(new Error("Heartbeat failed"));
       const onError = vi.fn();
       const client = createMockClient({ leaseTasks, reportOutcome, heartbeat });
 

@@ -1,10 +1,22 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
+import { RpcError } from "@protobuf-ts/runtime-rpc";
 import {
   SiloGRPCClient,
   JobStatus,
   JobNotFoundError,
+  JobAlreadyExistsError,
   JobNotTerminalError,
   TaskNotFoundError,
+  SiloGrpcError,
+  SiloNotFoundError,
+  SiloAlreadyExistsError,
+  SiloInvalidArgumentError,
+  SiloFailedPreconditionError,
+  SiloUnauthenticatedError,
+  SiloPermissionDeniedError,
+  SiloResourceExhaustedError,
+  SiloUnavailableError,
+  SiloDeadlineExceededError,
   encodeBytes,
   decodeBytes,
   type EnqueueJobOptions,
@@ -68,14 +80,12 @@ describe("decodeBytes", () => {
   });
 
   it("throws for undefined input", () => {
-    expect(() => decodeBytes(undefined, "test")).toThrow(
-      "No bytes to decode for field test"
-    );
+    expect(() => decodeBytes(undefined, "test")).toThrow("No bytes to decode for field test");
   });
 
   it("throws for empty byte array", () => {
     expect(() => decodeBytes(new Uint8Array(0), "test")).toThrow(
-      "No bytes to decode for field test"
+      "No bytes to decode for field test",
     );
   });
 });
@@ -312,6 +322,89 @@ describe("SiloGRPCClient", () => {
       });
     });
   });
+
+  describe("error mapping", () => {
+    const mockWithWrongShardRetryError = (
+      client: SiloGRPCClient,
+      code: string,
+      message: string,
+    ) => {
+      (client as any)._withWrongShardRetry = vi
+        .fn()
+        .mockRejectedValue(new RpcError(message, code, {}));
+    };
+
+    it("maps ALREADY_EXISTS on enqueue to JobAlreadyExistsError", async () => {
+      const client = createClient({
+        servers: "localhost:7450",
+        ...defaultOptions,
+      });
+      mockWithWrongShardRetryError(client, "ALREADY_EXISTS", "job already exists");
+
+      const error = await client
+        .enqueue({
+          id: "job-123",
+          tenant: "tenant-a",
+          taskGroup: "default",
+          payload: { test: true },
+        })
+        .catch((e) => e);
+
+      expect(error).toBeInstanceOf(JobAlreadyExistsError);
+      expect(error).toBeInstanceOf(SiloAlreadyExistsError);
+      expect(error.jobId).toBe("job-123");
+      expect(error.tenant).toBe("tenant-a");
+    });
+
+    it.each([
+      ["INVALID_ARGUMENT", SiloInvalidArgumentError],
+      ["FAILED_PRECONDITION", SiloFailedPreconditionError],
+      ["UNAUTHENTICATED", SiloUnauthenticatedError],
+      ["PERMISSION_DENIED", SiloPermissionDeniedError],
+      ["RESOURCE_EXHAUSTED", SiloResourceExhaustedError],
+      ["UNAVAILABLE", SiloUnavailableError],
+      ["DEADLINE_EXCEEDED", SiloDeadlineExceededError],
+      ["NOT_FOUND", SiloNotFoundError],
+      ["ALREADY_EXISTS", SiloAlreadyExistsError],
+    ] as const)(
+      "maps %s from query into a dedicated client error",
+      async (grpcCode, ErrorClass) => {
+        const client = createClient({
+          servers: "localhost:7450",
+          ...defaultOptions,
+        });
+        mockWithWrongShardRetryError(client, grpcCode, `rpc failed: ${grpcCode}`);
+
+        await expect(client.query("SELECT 1")).rejects.toThrow(ErrorClass);
+      },
+    );
+
+    it("maps NOT_FOUND on getJob to JobNotFoundError", async () => {
+      const client = createClient({
+        servers: "localhost:7450",
+        ...defaultOptions,
+      });
+      mockWithWrongShardRetryError(client, "NOT_FOUND", "job not found");
+
+      await expect(client.getJob("job-404", "tenant-abc")).rejects.toThrow(JobNotFoundError);
+    });
+
+    it("maps NOT_FOUND on heartbeat to TaskNotFoundError", async () => {
+      const client = createClient({
+        servers: "localhost:7450",
+        ...defaultOptions,
+      });
+      (client as any)._getClientForShard = vi.fn().mockReturnValue({
+        heartbeat: vi.fn().mockReturnValue({
+          response: Promise.reject(new RpcError("task not found", "NOT_FOUND", {})),
+        }),
+      });
+
+      await expect(client.heartbeat("worker-a", "task-404", "shard-1")).rejects.toThrow(
+        TaskNotFoundError,
+      );
+    });
+  });
 });
 
 describe("JobStatus enum", () => {
@@ -383,9 +476,7 @@ describe("AwaitJobOptions type", () => {
 describe("JobNotFoundError", () => {
   it("formats error message with job id and tenant", () => {
     const error = new JobNotFoundError("job-123", "tenant-abc");
-    expect(error.message).toBe(
-      'Job "job-123" not found in tenant "tenant-abc"'
-    );
+    expect(error.message).toBe('Job "job-123" not found in tenant "tenant-abc"');
     expect(error.name).toBe("JobNotFoundError");
     expect(error.code).toBe("SILO_JOB_NOT_FOUND");
     expect(error.jobId).toBe("job-123");
@@ -409,13 +500,9 @@ describe("JobNotFoundError", () => {
 
 describe("JobNotTerminalError", () => {
   it("formats error message with job id, tenant, and status", () => {
-    const error = new JobNotTerminalError(
-      "job-123",
-      "tenant-abc",
-      JobStatus.Running
-    );
+    const error = new JobNotTerminalError("job-123", "tenant-abc", JobStatus.Running);
     expect(error.message).toBe(
-      'Job "job-123" in tenant "tenant-abc" is not in a terminal state (current status: Running)'
+      'Job "job-123" in tenant "tenant-abc" is not in a terminal state (current status: Running)',
     );
     expect(error.name).toBe("JobNotTerminalError");
     expect(error.code).toBe("SILO_JOB_NOT_TERMINAL");
@@ -453,5 +540,28 @@ describe("TaskNotFoundError", () => {
     const error = new TaskNotFoundError("task-789");
     expect(error).toBeInstanceOf(Error);
     expect(error).toBeInstanceOf(TaskNotFoundError);
+  });
+});
+
+describe("JobAlreadyExistsError", () => {
+  it("formats error message with job id and tenant", () => {
+    const error = new JobAlreadyExistsError("job-123", "tenant-abc");
+    expect(error.message).toBe('Job "job-123" already exists in tenant "tenant-abc"');
+    expect(error.name).toBe("JobAlreadyExistsError");
+    expect(error.code).toBe("SILO_JOB_ALREADY_EXISTS");
+    expect(error.grpcCode).toBe("ALREADY_EXISTS");
+    expect(error.jobId).toBe("job-123");
+    expect(error.tenant).toBe("tenant-abc");
+  });
+});
+
+describe("SiloGrpcError hierarchy", () => {
+  it("stores grpc code and message on specialized errors", () => {
+    const error = new SiloUnavailableError("cluster is unavailable");
+    expect(error).toBeInstanceOf(SiloGrpcError);
+    expect(error.name).toBe("SiloUnavailableError");
+    expect(error.code).toBe("SILO_UNAVAILABLE");
+    expect(error.grpcCode).toBe("UNAVAILABLE");
+    expect(error.grpcMessage).toBe("cluster is unavailable");
   });
 });

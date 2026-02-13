@@ -1,12 +1,4 @@
-import {
-  describe,
-  it,
-  expect,
-  beforeAll,
-  afterAll,
-  beforeEach,
-  afterEach,
-} from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { SiloGRPCClient, JobStatus } from "../src/client";
 import {
   SiloWorker,
@@ -21,8 +13,7 @@ const SILO_SERVERS = (
   process.env.SILO_SERVER ||
   "localhost:7450"
 ).split(",");
-const RUN_INTEGRATION =
-  process.env.RUN_INTEGRATION === "true" || process.env.CI === "true";
+const RUN_INTEGRATION = process.env.RUN_INTEGRATION === "true" || process.env.CI === "true";
 
 /**
  * Wait until a condition becomes true, polling at intervals.
@@ -91,17 +82,12 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
   >(
     handler: TaskHandler<Payload, Metadata, Result>,
     options?: Partial<
-      Omit<
-        SiloWorkerOptions<Payload, Metadata, Result>,
-        "client" | "workerId" | "handler"
-      >
+      Omit<SiloWorkerOptions<Payload, Metadata, Result>, "client" | "workerId" | "handler">
     >,
   ): SiloWorker<Payload, Metadata, Result> {
     const worker = new SiloWorker<Payload, Metadata, Result>({
       client,
-      workerId: `test-worker-${Date.now()}-${Math.random()
-        .toString(36)
-        .slice(2)}`,
+      workerId: `test-worker-${Date.now()}-${Math.random().toString(36).slice(2)}`,
       handler,
       tenant: DEFAULT_TENANT,
       taskGroup: options?.taskGroup ?? DEFAULT_TASK_GROUP,
@@ -609,8 +595,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       // lock-step polling patterns. Use a longer timeout to account for variance.
       await waitFor(
         () =>
-          processedByWorkerA.includes("task-for-A") &&
-          processedByWorkerB.includes("task-for-B"),
+          processedByWorkerA.includes("task-for-A") && processedByWorkerB.includes("task-for-B"),
         { timeout: 10000 },
       );
 
@@ -640,9 +625,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
     ): SiloWorker<Payload, Metadata, Result> {
       const worker = new SiloWorker<Payload, Metadata, Result>({
         client,
-        workerId: `test-refresh-worker-${Date.now()}-${Math.random()
-          .toString(36)
-          .slice(2)}`,
+        workerId: `test-refresh-worker-${Date.now()}-${Math.random().toString(36).slice(2)}`,
         handler,
         refreshHandler,
         tenant: DEFAULT_TENANT,
