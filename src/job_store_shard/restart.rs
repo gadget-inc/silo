@@ -5,14 +5,13 @@
 use slatedb::IsolationLevel;
 use uuid::Uuid;
 
-use crate::codec::encode_job_status;
 use crate::dst_events::{self, DstEvent};
 use crate::job::{JobStatus, JobStatusKind};
 use crate::job_store_shard::helpers::{
-    TxnWriter, decode_job_status_owned, now_epoch_ms, retry_on_txn_conflict,
+    TxnWriter, decode_job_status_owned, load_job_view, now_epoch_ms, retry_on_txn_conflict,
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
-use crate::keys::{attempt_prefix, idx_status_time_key, job_cancelled_key, job_status_key};
+use crate::keys::{attempt_prefix, job_cancelled_key, job_status_key};
 use crate::task::Task;
 
 /// Error returned when a job cannot be restarted because it's not in a restartable state.
@@ -118,13 +117,7 @@ impl JobStoreShard {
         }
 
         // Get the job info first to know the priority and compute start_at_ms
-        let job_info_key = crate::keys::job_info_key(tenant, id);
-        let maybe_job_raw = txn.get(&job_info_key).await?;
-        let Some(job_raw) = maybe_job_raw else {
-            return Err(JobStoreShardError::JobNotFound(id.to_string()));
-        };
-
-        let job_view = crate::job::JobView::new(job_raw)?;
+        let job_view = load_job_view(&TxnWriter(&txn), tenant, id).await?;
         let priority = job_view.priority();
         let start_at_ms = job_view.enqueue_time_ms().max(now_ms);
 
@@ -140,8 +133,7 @@ impl JobStoreShard {
             // Attempt keys use storekey encoding: prefix + (tenant, job_id, attempt)
             // The attempt number is the last field encoded as u32 big-endian
             // For simplicity, decode the full key and extract attempt number
-            if kv.key.first() == Some(&0x07) {
-                // 0x07 is the ATTEMPT prefix
+            if kv.key.first() == Some(&crate::keys::prefix::ATTEMPT) {
                 let decoded: Result<(String, String, u32), _> = storekey::decode(&kv.key[1..]);
                 if let Ok((_, _, attempt_num)) = decoded {
                     max_attempt_number = max_attempt_number.max(attempt_num);
@@ -152,19 +144,10 @@ impl JobStoreShard {
         // [SILO-RESTART-5] Attempt numbers are monotonically increasing; relative attempts reset to 1 on restart
         let next_attempt_number = max_attempt_number + 1;
 
-        // Delete old status index entry
-        let old_time = idx_status_time_key(tenant, status.kind.as_str(), status.changed_at_ms, id);
-        txn.delete(&old_time)?;
-
         // [SILO-RESTART-6] Post: Set status to Scheduled with next attempt time and attempt number
         let new_status = JobStatus::scheduled(now_ms, start_at_ms, next_attempt_number);
-        let status_value = encode_job_status(&new_status)?;
-        txn.put(&status_key, &status_value)?;
-
-        // Insert new status index entry
-        let new_ts = crate::keys::status_index_timestamp(&new_status);
-        let new_time = idx_status_time_key(tenant, new_status.kind.as_str(), new_ts, id);
-        txn.put(&new_time, [])?;
+        self.set_job_status_with_index(&mut TxnWriter(&txn), tenant, id, new_status)
+            .await?;
 
         // [SILO-RESTART-5] Post: Create new task in DB queue with next attempt number
         let new_task_id = Uuid::new_v4().to_string();

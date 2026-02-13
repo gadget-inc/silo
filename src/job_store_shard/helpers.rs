@@ -60,6 +60,12 @@ pub(crate) struct DbWriteBatcher<'a> {
     pub batch: &'a mut WriteBatch,
 }
 
+impl<'a> DbWriteBatcher<'a> {
+    pub fn new(db: &'a Db, batch: &'a mut WriteBatch) -> Self {
+        Self { db, batch }
+    }
+}
+
 impl WriteBatcher for DbWriteBatcher<'_> {
     fn put<K: AsRef<[u8]>, V: AsRef<[u8]>>(
         &mut self,
@@ -193,6 +199,22 @@ where
     Err(JobStoreShardError::TransactionConflict(
         operation_name.to_string(),
     ))
+}
+
+/// Load a `JobView` for the given tenant/job from a transaction or DB reader.
+///
+/// Returns `JobNotFound` if the job info key doesn't exist.
+pub(crate) async fn load_job_view(
+    reader: &impl WriteBatcher,
+    tenant: &str,
+    id: &str,
+) -> Result<crate::job::JobView, JobStoreShardError> {
+    let job_info_key = crate::keys::job_info_key(tenant, id);
+    let maybe_job_raw = reader.get(&job_info_key).await?;
+    let Some(job_raw) = maybe_job_raw else {
+        return Err(JobStoreShardError::JobNotFound(id.to_string()));
+    };
+    crate::job::JobView::new(job_raw)
 }
 
 /// Decode a `JobStatus` from raw rkyv bytes into an owned value.

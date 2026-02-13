@@ -412,37 +412,14 @@ impl JobStoreShard {
     ) -> Result<std::collections::HashMap<String, JobView>, JobStoreShardError> {
         use std::collections::HashMap;
 
-        let mut handles = Vec::new();
+        let mut map = HashMap::with_capacity(ids.len());
         for id in ids {
-            let db = Arc::clone(&self.db);
             let key = job_info_key(tenant, id);
-            let id_clone = id.clone();
-            let handle = tokio::spawn(async move {
-                let maybe_raw = db.get(&key).await?;
-                if let Some(raw) = maybe_raw {
-                    let view = JobView::new(raw)?;
-                    Ok::<_, JobStoreShardError>(Some((id_clone, view)))
-                } else {
-                    Ok(None)
-                }
-            });
-            handles.push(handle);
-        }
-
-        let mut result = HashMap::with_capacity(ids.len());
-        for handle in handles {
-            match handle.await {
-                Ok(Ok(Some((id, view)))) => {
-                    result.insert(id, view);
-                }
-                Ok(Ok(None)) => {
-                    // Job doesn't exist, skip
-                }
-                Ok(Err(e)) => return Err(e),
-                Err(e) => return Err(JobStoreShardError::Rkyv(format!("Task join error: {}", e))),
+            if let Some(raw) = self.db.get(&key).await? {
+                map.insert(id.clone(), JobView::new(raw)?);
             }
         }
-        Ok(result)
+        Ok(map)
     }
 
     /// Fetch a job status by id as a zero-copy archived view.
@@ -469,36 +446,14 @@ impl JobStoreShard {
     ) -> Result<std::collections::HashMap<String, JobStatus>, JobStoreShardError> {
         use std::collections::HashMap;
 
-        let mut handles = Vec::new();
+        let mut map = HashMap::with_capacity(ids.len());
         for id in ids {
-            let db = Arc::clone(&self.db);
             let key = job_status_key(tenant, id);
-            let id_clone = id.clone();
-            let handle = tokio::spawn(async move {
-                let maybe_raw = db.get(&key).await?;
-                let Some(raw) = maybe_raw else {
-                    return Ok::<_, JobStoreShardError>(None);
-                };
-                let status = helpers::decode_job_status_owned(&raw)?;
-                Ok(Some((id_clone, status)))
-            });
-            handles.push(handle);
-        }
-
-        let mut result = HashMap::with_capacity(ids.len());
-        for handle in handles {
-            match handle.await {
-                Ok(Ok(Some((id, status)))) => {
-                    result.insert(id, status);
-                }
-                Ok(Ok(None)) => {
-                    // Status doesn't exist, skip
-                }
-                Ok(Err(e)) => return Err(e),
-                Err(e) => return Err(JobStoreShardError::Rkyv(format!("Task join error: {}", e))),
+            if let Some(raw) = self.db.get(&key).await? {
+                map.insert(id.clone(), helpers::decode_job_status_owned(&raw)?);
             }
         }
-        Ok(result)
+        Ok(map)
     }
 
     /// Fetch a job attempt by job id and attempt number.
@@ -597,10 +552,7 @@ impl JobStoreShard {
         batch.delete(crate::keys::job_cancelled_key(tenant, id));
 
         // Update counters in the same batch
-        let mut writer = DbWriteBatcher {
-            db: &self.db,
-            batch: &mut batch,
-        };
+        let mut writer = DbWriteBatcher::new(&self.db, &mut batch);
         self.decrement_total_jobs_counter(&mut writer)?;
         if status.is_some() {
             // Job was in terminal state (we already checked it's terminal above)

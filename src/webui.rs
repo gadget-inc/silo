@@ -1309,84 +1309,32 @@ fn array_value_to_string(array: &dyn datafusion::arrow::array::Array, index: usi
         return "NULL".to_string();
     }
 
+    // Special-case binary types to show byte length instead of raw data
     match array.data_type() {
-        DataType::Utf8 => array
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .map(|a| a.value(index).to_string())
-            .unwrap_or_default(),
-        DataType::LargeUtf8 => array
-            .as_any()
-            .downcast_ref::<LargeStringArray>()
-            .map(|a| a.value(index).to_string())
-            .unwrap_or_default(),
-        DataType::Int8 => array
-            .as_any()
-            .downcast_ref::<Int8Array>()
-            .map(|a| a.value(index).to_string())
-            .unwrap_or_default(),
-        DataType::Int16 => array
-            .as_any()
-            .downcast_ref::<Int16Array>()
-            .map(|a| a.value(index).to_string())
-            .unwrap_or_default(),
-        DataType::Int32 => array
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .map(|a| a.value(index).to_string())
-            .unwrap_or_default(),
-        DataType::Int64 => array
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .map(|a| a.value(index).to_string())
-            .unwrap_or_default(),
-        DataType::UInt8 => array
-            .as_any()
-            .downcast_ref::<UInt8Array>()
-            .map(|a| a.value(index).to_string())
-            .unwrap_or_default(),
-        DataType::UInt16 => array
-            .as_any()
-            .downcast_ref::<UInt16Array>()
-            .map(|a| a.value(index).to_string())
-            .unwrap_or_default(),
-        DataType::UInt32 => array
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .map(|a| a.value(index).to_string())
-            .unwrap_or_default(),
-        DataType::UInt64 => array
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .map(|a| a.value(index).to_string())
-            .unwrap_or_default(),
-        DataType::Float32 => array
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .map(|a| a.value(index).to_string())
-            .unwrap_or_default(),
-        DataType::Float64 => array
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .map(|a| a.value(index).to_string())
-            .unwrap_or_default(),
-        DataType::Boolean => array
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .map(|a| a.value(index).to_string())
-            .unwrap_or_default(),
-        DataType::Binary => array
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .map(|a| format!("<{} bytes>", a.value(index).len()))
-            .unwrap_or_default(),
-        DataType::LargeBinary => array
-            .as_any()
-            .downcast_ref::<LargeBinaryArray>()
-            .map(|a| format!("<{} bytes>", a.value(index).len()))
-            .unwrap_or_default(),
-        _ => format!("<{}>", array.data_type()),
+        DataType::Binary => {
+            return array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .map(|a| format!("<{} bytes>", a.value(index).len()))
+                .unwrap_or_default();
+        }
+        DataType::LargeBinary => {
+            return array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .map(|a| format!("<{} bytes>", a.value(index).len()))
+                .unwrap_or_default();
+        }
+        _ => {}
     }
+
+    // Use Arrow's built-in formatter for all other types
+    datafusion::arrow::util::display::ArrayFormatter::try_new(
+        array,
+        &datafusion::arrow::util::display::FormatOptions::default(),
+    )
+    .map(|fmt| fmt.value(index).to_string())
+    .unwrap_or_else(|_| format!("<{}>", array.data_type()))
 }
 
 async fn config_handler(State(state): State<AppState>) -> impl IntoResponse {

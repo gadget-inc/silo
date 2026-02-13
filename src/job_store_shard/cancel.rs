@@ -59,8 +59,8 @@ impl JobStoreShard {
             return Err(JobStoreShardError::JobAlreadyCancelled(id.to_string()));
         }
 
-        // Cannot cancel jobs in terminal states (Succeeded/Failed are truly terminal)
-        if status.kind == JobStatusKind::Succeeded || status.kind == JobStatusKind::Failed {
+        // Cannot cancel jobs in final states (Succeeded/Failed are truly terminal)
+        if status.kind.is_final() {
             return Err(JobStoreShardError::JobAlreadyTerminal(
                 id.to_string(),
                 status.kind,

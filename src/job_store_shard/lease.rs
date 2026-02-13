@@ -160,40 +160,32 @@ impl JobStoreShard {
             AttemptOutcome::Success { .. } => {
                 let job_status = JobStatus::succeeded(now_ms);
                 self.set_job_status_with_index(
-                    &mut DbWriteBatcher {
-                        db: &self.db,
-                        batch: &mut batch,
-                    },
+                    &mut DbWriteBatcher::new(&self.db, &mut batch),
                     &tenant,
                     &job_id,
                     job_status,
                 )
                 .await?;
                 // Job reached terminal state - include counter in batch
-                self.increment_completed_jobs_counter(&mut DbWriteBatcher {
-                    db: &self.db,
-                    batch: &mut batch,
-                })?;
+                self.increment_completed_jobs_counter(&mut DbWriteBatcher::new(
+                    &self.db, &mut batch,
+                ))?;
                 new_job_status_for_dst = Some("Succeeded".to_string());
             }
             // Worker acknowledges cancellation - set job status to Cancelled
             AttemptOutcome::Cancelled => {
                 let job_status = JobStatus::cancelled(now_ms);
                 self.set_job_status_with_index(
-                    &mut DbWriteBatcher {
-                        db: &self.db,
-                        batch: &mut batch,
-                    },
+                    &mut DbWriteBatcher::new(&self.db, &mut batch),
                     &tenant,
                     &job_id,
                     job_status,
                 )
                 .await?;
                 // Job reached terminal state - include counter in batch
-                self.increment_completed_jobs_counter(&mut DbWriteBatcher {
-                    db: &self.db,
-                    batch: &mut batch,
-                })?;
+                self.increment_completed_jobs_counter(&mut DbWriteBatcher::new(
+                    &self.db, &mut batch,
+                ))?;
                 new_job_status_for_dst = Some("Cancelled".to_string());
             }
             // Error: maybe enqueue next attempt; otherwise mark job failed
@@ -227,10 +219,7 @@ impl JobStoreShard {
                         // Track any immediate grants for rollback if DB write fails
                         retry_grants = self
                             .enqueue_limit_task_at_index(
-                                &mut DbWriteBatcher {
-                                    db: &self.db,
-                                    batch: &mut batch,
-                                },
+                                &mut DbWriteBatcher::new(&self.db, &mut batch),
                                 LimitTaskParams {
                                     tenant: &tenant,
                                     task_id: &next_task_id,
@@ -252,10 +241,7 @@ impl JobStoreShard {
                         let job_status =
                             JobStatus::scheduled(now_ms, next_time, next_attempt_number);
                         self.set_job_status_with_index(
-                            &mut DbWriteBatcher {
-                                db: &self.db,
-                                batch: &mut batch,
-                            },
+                            &mut DbWriteBatcher::new(&self.db, &mut batch),
                             &tenant,
                             &job_id,
                             job_status,
@@ -269,20 +255,16 @@ impl JobStoreShard {
                     if !scheduled_followup {
                         let job_status = JobStatus::failed(now_ms);
                         self.set_job_status_with_index(
-                            &mut DbWriteBatcher {
-                                db: &self.db,
-                                batch: &mut batch,
-                            },
+                            &mut DbWriteBatcher::new(&self.db, &mut batch),
                             &tenant,
                             &job_id,
                             job_status,
                         )
                         .await?;
                         // Job reached terminal state (failed permanently) - include counter in batch
-                        self.increment_completed_jobs_counter(&mut DbWriteBatcher {
-                            db: &self.db,
-                            batch: &mut batch,
-                        })?;
+                        self.increment_completed_jobs_counter(&mut DbWriteBatcher::new(
+                            &self.db, &mut batch,
+                        ))?;
                         new_job_status_for_dst = Some("Failed".to_string());
                     }
                 } else {
@@ -529,19 +511,8 @@ impl JobStoreShard {
         // Reset the state to allow a new refresh to be scheduled
         // We don't increment retry_count here - we rely on the normal periodic refresh mechanism
         let new_state = FloatingLimitState {
-            refresh_task_scheduled: false, // Allow new refresh to be scheduled
-            // Preserve all other fields
-            current_max_concurrency: archived.current_max_concurrency,
-            last_refreshed_at_ms: archived.last_refreshed_at_ms,
-            refresh_interval_ms: archived.refresh_interval_ms,
-            default_max_concurrency: archived.default_max_concurrency,
-            retry_count: archived.retry_count,
-            next_retry_at_ms: archived.next_retry_at_ms.as_ref().copied(),
-            metadata: archived
-                .metadata
-                .iter()
-                .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
-                .collect(),
+            refresh_task_scheduled: false,
+            ..FloatingLimitState::from_archived(archived)
         };
 
         let mut batch = WriteBatch::new();

@@ -91,8 +91,8 @@ impl JobStoreShard {
             }));
         }
 
-        // Validate: job must not be terminal
-        if status.kind == JobStatusKind::Succeeded || status.kind == JobStatusKind::Failed {
+        // Validate: job must not be in a final state
+        if status.kind.is_final() {
             return Err(JobStoreShardError::JobNotLeaseable(JobNotLeaseableError {
                 job_id: id.to_string(),
                 status: status.kind,

@@ -208,78 +208,62 @@ impl Metrics {
     /// Call this periodically (e.g., every second) to sync SlateDB's internal
     /// statistics to Prometheus gauges.
     pub fn update_slatedb_stats(&self, shard: &str, stats: &Arc<StatRegistry>) {
-        // DB stats
-        if let Some(stat) = stats.lookup(slatedb::db_stats::GET_REQUESTS) {
-            self.slatedb_get_requests
-                .with_label_values(&[shard])
-                .set(stat.get() as f64);
-        }
-        if let Some(stat) = stats.lookup(slatedb::db_stats::SCAN_REQUESTS) {
-            self.slatedb_scan_requests
-                .with_label_values(&[shard])
-                .set(stat.get() as f64);
-        }
-        if let Some(stat) = stats.lookup(slatedb::db_stats::WRITE_OPS) {
-            self.slatedb_write_ops
-                .with_label_values(&[shard])
-                .set(stat.get() as f64);
-        }
-        if let Some(stat) = stats.lookup(slatedb::db_stats::WRITE_BATCH_COUNT) {
-            self.slatedb_write_batch_count
-                .with_label_values(&[shard])
-                .set(stat.get() as f64);
-        }
-        if let Some(stat) = stats.lookup(slatedb::db_stats::BACKPRESSURE_COUNT) {
-            self.slatedb_backpressure_count
-                .with_label_values(&[shard])
-                .set(stat.get() as f64);
-        }
-        if let Some(stat) = stats.lookup(slatedb::db_stats::WAL_BUFFER_ESTIMATED_BYTES) {
-            self.slatedb_wal_buffer_estimated_bytes
-                .with_label_values(&[shard])
-                .set(stat.get() as f64);
-        }
-        if let Some(stat) = stats.lookup(slatedb::db_stats::WAL_BUFFER_FLUSHES) {
-            self.slatedb_wal_buffer_flushes
-                .with_label_values(&[shard])
-                .set(stat.get() as f64);
-        }
-        if let Some(stat) = stats.lookup(slatedb::db_stats::IMMUTABLE_MEMTABLE_FLUSHES) {
-            self.slatedb_immutable_memtable_flushes
-                .with_label_values(&[shard])
-                .set(stat.get() as f64);
-        }
-        if let Some(stat) = stats.lookup(slatedb::db_stats::SST_FILTER_POSITIVES) {
-            self.slatedb_sst_filter_positives
-                .with_label_values(&[shard])
-                .set(stat.get() as f64);
-        }
-        if let Some(stat) = stats.lookup(slatedb::db_stats::SST_FILTER_NEGATIVES) {
-            self.slatedb_sst_filter_negatives
-                .with_label_values(&[shard])
-                .set(stat.get() as f64);
-        }
-        if let Some(stat) = stats.lookup(slatedb::db_stats::SST_FILTER_FALSE_POSITIVES) {
-            self.slatedb_sst_filter_false_positives
-                .with_label_values(&[shard])
-                .set(stat.get() as f64);
-        }
+        let mappings: &[(&str, &GaugeVec)] = &[
+            // DB stats
+            (slatedb::db_stats::GET_REQUESTS, &self.slatedb_get_requests),
+            (
+                slatedb::db_stats::SCAN_REQUESTS,
+                &self.slatedb_scan_requests,
+            ),
+            (slatedb::db_stats::WRITE_OPS, &self.slatedb_write_ops),
+            (
+                slatedb::db_stats::WRITE_BATCH_COUNT,
+                &self.slatedb_write_batch_count,
+            ),
+            (
+                slatedb::db_stats::BACKPRESSURE_COUNT,
+                &self.slatedb_backpressure_count,
+            ),
+            (
+                slatedb::db_stats::WAL_BUFFER_ESTIMATED_BYTES,
+                &self.slatedb_wal_buffer_estimated_bytes,
+            ),
+            (
+                slatedb::db_stats::WAL_BUFFER_FLUSHES,
+                &self.slatedb_wal_buffer_flushes,
+            ),
+            (
+                slatedb::db_stats::IMMUTABLE_MEMTABLE_FLUSHES,
+                &self.slatedb_immutable_memtable_flushes,
+            ),
+            (
+                slatedb::db_stats::SST_FILTER_POSITIVES,
+                &self.slatedb_sst_filter_positives,
+            ),
+            (
+                slatedb::db_stats::SST_FILTER_NEGATIVES,
+                &self.slatedb_sst_filter_negatives,
+            ),
+            (
+                slatedb::db_stats::SST_FILTER_FALSE_POSITIVES,
+                &self.slatedb_sst_filter_false_positives,
+            ),
+            // Compactor stats (string literals - constants not exported in slatedb 0.10)
+            ("compactor/bytes_compacted", &self.slatedb_bytes_compacted),
+            (
+                "compactor/running_compactions",
+                &self.slatedb_running_compactions,
+            ),
+            (
+                "compactor/last_compaction_timestamp_sec",
+                &self.slatedb_last_compaction_ts_sec,
+            ),
+        ];
 
-        // Compactor stats (using string literals as the constants are not exported in slatedb 0.10)
-        if let Some(stat) = stats.lookup("compactor/bytes_compacted") {
-            self.slatedb_bytes_compacted
-                .with_label_values(&[shard])
-                .set(stat.get() as f64);
-        }
-        if let Some(stat) = stats.lookup("compactor/running_compactions") {
-            self.slatedb_running_compactions
-                .with_label_values(&[shard])
-                .set(stat.get() as f64);
-        }
-        if let Some(stat) = stats.lookup("compactor/last_compaction_timestamp_sec") {
-            self.slatedb_last_compaction_ts_sec
-                .with_label_values(&[shard])
-                .set(stat.get() as f64);
+        for (stat_name, gauge) in mappings {
+            if let Some(stat) = stats.lookup(stat_name) {
+                gauge.with_label_values(&[shard]).set(stat.get() as f64);
+            }
         }
     }
 }

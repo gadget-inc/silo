@@ -8,7 +8,7 @@ use slatedb::IsolationLevel;
 use crate::codec::{decode_task, encode_task};
 use crate::job::JobStatusKind;
 use crate::job_store_shard::helpers::{
-    decode_job_status_owned, now_epoch_ms, retry_on_txn_conflict,
+    TxnWriter, decode_job_status_owned, load_job_view, now_epoch_ms, retry_on_txn_conflict,
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{job_cancelled_key, job_status_key, task_key};
@@ -64,8 +64,8 @@ impl JobStoreShard {
 
         let status = decode_job_status_owned(&status_raw)?;
 
-        // [SILO-EXP-2] Pre: job must NOT be terminal
-        if status.kind == JobStatusKind::Succeeded || status.kind == JobStatusKind::Failed {
+        // [SILO-EXP-2] Pre: job must NOT be in a final state
+        if status.kind.is_final() {
             return Err(JobStoreShardError::JobNotExpediteable(
                 JobNotExpediteableError {
                     job_id: id.to_string(),
@@ -100,12 +100,7 @@ impl JobStoreShard {
         }
 
         // Load job info to get task_group and priority
-        let job_info_key = crate::keys::job_info_key(tenant, id);
-        let maybe_job_raw = txn.get(&job_info_key).await?;
-        let Some(job_raw) = maybe_job_raw else {
-            return Err(JobStoreShardError::JobNotFound(id.to_string()));
-        };
-        let job_view = crate::job::JobView::new(job_raw)?;
+        let job_view = load_job_view(&TxnWriter(&txn), tenant, id).await?;
         let priority = job_view.priority();
         let task_group = job_view.task_group().to_string();
 
@@ -172,18 +167,8 @@ impl JobStoreShard {
 
         // Update job status with new start time (keeping same attempt number)
         let new_status = crate::job::JobStatus::scheduled(now_ms, now_ms, attempt_number);
-        let new_status_value = crate::codec::encode_job_status(&new_status)?;
-        txn.put(&status_key, &new_status_value)?;
-
-        // Update status/time index
-        let old_ts = crate::keys::status_index_timestamp(&status);
-        let old_time_key =
-            crate::keys::idx_status_time_key(tenant, status.kind.as_str(), old_ts, id);
-        txn.delete(&old_time_key)?;
-        let new_ts = crate::keys::status_index_timestamp(&new_status);
-        let new_time_key =
-            crate::keys::idx_status_time_key(tenant, new_status.kind.as_str(), new_ts, id);
-        txn.put(&new_time_key, [])?;
+        self.set_job_status_with_index(&mut TxnWriter(&txn), tenant, id, new_status)
+            .await?;
 
         // Commit the transaction
         txn.commit().await?;
