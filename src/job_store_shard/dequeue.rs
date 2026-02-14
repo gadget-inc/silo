@@ -4,8 +4,8 @@ use slatedb::config::WriteOptions;
 use slatedb::{DbIterator, WriteBatch};
 
 use crate::codec::{
-    decode_task, decode_task_validated, encode_attempt, encode_lease, encode_lease_from_task_bytes,
-    DecodedTask,
+    DecodedTask, decode_task, decode_task_validated, encode_attempt, encode_lease,
+    encode_lease_from_task_bytes,
 };
 use crate::concurrency::{ReleaseGrantRollback, RequestTicketTaskOutcome};
 use crate::dst_events::{self, DstEvent};
@@ -317,8 +317,7 @@ impl JobStoreShard {
     ) -> Result<Vec<u8>, JobStoreShardError> {
         // [SILO-DEQ-4] Create lease record from raw task bytes (zero-copy)
         let lease_key = leased_task_key(task_id);
-        let leased_value =
-            encode_lease_from_task_bytes(worker_id, task_bytes, expiry_ms, now_ms)?;
+        let leased_value = encode_lease_from_task_bytes(worker_id, task_bytes, expiry_ms, now_ms)?;
         batch.put(&lease_key, &leased_value);
 
         // [SILO-DEQ-6] Mark job as running
@@ -727,9 +726,9 @@ impl JobStoreShard {
         now_ms: i64,
         expiry_ms: i64,
     ) -> Result<(), JobStoreShardError> {
-        let ra = decoded.as_run_attempt().ok_or_else(|| {
-            JobStoreShardError::Codec("expected RunAttempt variant".to_string())
-        })?;
+        let ra = decoded
+            .as_run_attempt()
+            .ok_or_else(|| JobStoreShardError::Codec("expected RunAttempt variant".to_string()))?;
         let task_id = ra.id().unwrap_or_default();
         let tenant = ra.tenant().unwrap_or_default();
         let job_id = ra.job_id().unwrap_or_default();

@@ -2,9 +2,9 @@ use silo::codec::{
     decode_attempt, decode_cancellation_at_ms, decode_concurrency_action,
     decode_floating_limit_state, decode_holder_granted_at_ms, decode_job_info,
     decode_job_status_owned, decode_lease, decode_task, decode_task_validated, encode_attempt,
-    encode_concurrency_action, encode_floating_limit_state, encode_holder,
-    encode_job_cancellation, encode_job_info, encode_job_status, encode_lease,
-    encode_lease_from_task_bytes, encode_lease_with_new_expiry, encode_task,
+    encode_concurrency_action, encode_floating_limit_state, encode_holder, encode_job_cancellation,
+    encode_job_info, encode_job_status, encode_lease, encode_lease_from_task_bytes,
+    encode_lease_with_new_expiry, encode_task,
 };
 use silo::job::{FloatingLimitState, JobCancellation, JobInfo, JobStatus, JobStatusKind};
 use silo::job_attempt::{AttemptStatus, JobAttempt};
@@ -706,8 +706,7 @@ fn test_encode_lease_from_task_bytes_check_rate_limit() {
     };
     let task_bytes = encode_task(&task);
 
-    let lease_bytes =
-        encode_lease_from_task_bytes("w-crl", &task_bytes, 77777, 33333).unwrap();
+    let lease_bytes = encode_lease_from_task_bytes("w-crl", &task_bytes, 77777, 33333).unwrap();
     let decoded = decode_lease(lease_bytes).unwrap();
 
     assert_eq!(decoded.worker_id(), "w-crl");

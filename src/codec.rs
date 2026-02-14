@@ -438,10 +438,7 @@ fn build_task_union_from_fb_table<'a, A: flatbuffers::Allocator + 'a>(
                     task_group: Some(task_group),
                 },
             );
-            Ok((
-                fb::TaskVariant::RefreshFloatingLimit,
-                off.as_union_value(),
-            ))
+            Ok((fb::TaskVariant::RefreshFloatingLimit, off.as_union_value()))
         }
         _ => Err(CodecError::Flatbuffer(format!(
             "unknown task variant type: {:?}",
@@ -484,8 +481,8 @@ pub fn encode_lease_from_task_bytes(
     expiry_ms: i64,
     started_at_ms: i64,
 ) -> Result<Vec<u8>, CodecError> {
-    let fb_task =
-        flatbuffers::root::<fb::Task>(task_bytes).map_err(|e| CodecError::Flatbuffer(e.to_string()))?;
+    let fb_task = flatbuffers::root::<fb::Task>(task_bytes)
+        .map_err(|e| CodecError::Flatbuffer(e.to_string()))?;
     let mut builder = FlatBufferBuilder::with_capacity(256);
     let worker_id_off = builder.create_string(worker_id);
     let (vtype, voff) = build_task_union_from_fb_task(&mut builder, fb_task)?;
