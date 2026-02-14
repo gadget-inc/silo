@@ -35,4 +35,15 @@ fn main() {
         .build_server(false) // We only need the client for gubernator
         .compile_protos(&["proto/gubernator.proto"], includes)
         .expect("failed to compile gubernator.proto");
+
+    // Compile FlatBuffers schema for internal storage codec
+    println!("cargo:rerun-if-changed=schema/internal_storage.fbs");
+    let flatc_status = std::process::Command::new("flatc")
+        .arg("--rust")
+        .arg("-o")
+        .arg(out_dir.as_os_str())
+        .arg("schema/internal_storage.fbs")
+        .status()
+        .expect("failed to run flatc - ensure flatbuffers is installed (available via nix devshell)");
+    assert!(flatc_status.success(), "flatc failed to compile schema");
 }

@@ -1,21 +1,15 @@
-use rkyv::{AlignedVec, Archive};
+use flatbuffers::FlatBufferBuilder;
 
-use crate::job::{JobCancellation, JobInfo, JobStatus};
-use crate::job_attempt::JobAttempt;
+use crate::fb::silo::fb;
+use crate::job::{FloatingLimitState, JobCancellation, JobInfo, JobStatus, JobStatusKind, Limit};
+use crate::job_attempt::{AttemptStatus, JobAttempt};
 use crate::task::{ConcurrencyAction, GubernatorRateLimitData, HolderRecord, LeaseRecord, Task};
 
-/// Error type for versioned codec operations
+/// Error type for codec operations
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum CodecError {
-    /// Data is too short to contain a version header
-    #[error("data too short to contain version header")]
-    TooShort,
-    /// Version byte doesn't match expected version
-    #[error("unsupported version: expected {expected}, found {found}")]
-    UnsupportedVersion { expected: u8, found: u8 },
-    /// Underlying rkyv serialization/deserialization error
-    #[error("rkyv error: {0}")]
-    Rkyv(String),
+    #[error("flatbuffer error: {0}")]
+    Flatbuffer(String),
 }
 
 impl From<CodecError> for String {
@@ -24,71 +18,20 @@ impl From<CodecError> for String {
     }
 }
 
-// Version constants for each serializable type.
-// When evolving schemas, bump these and add migration logic in the decode functions.
+// ---------------------------------------------------------------------------
+// Encode helpers
+// ---------------------------------------------------------------------------
 
-/// Version for Task serialization format
-pub const TASK_VERSION: u8 = 1;
-/// Version for LeaseRecord serialization format
-pub const LEASE_RECORD_VERSION: u8 = 1;
-/// Version for JobAttempt serialization format
-pub const JOB_ATTEMPT_VERSION: u8 = 1;
-/// Version for JobInfo serialization format
-pub const JOB_INFO_VERSION: u8 = 1;
-/// Version for JobStatus serialization format
-pub const JOB_STATUS_VERSION: u8 = 1;
-/// Version for HolderRecord serialization format
-pub const HOLDER_RECORD_VERSION: u8 = 1;
-/// Version for ConcurrencyAction serialization format
-pub const CONCURRENCY_ACTION_VERSION: u8 = 1;
-/// Version for JobCancellation serialization format
-pub const JOB_CANCELLATION_VERSION: u8 = 1;
-
-/// Size of the version header - just a single byte.
-/// Alignment is handled at decode time by copying into an AlignedVec.
-const VERSION_HEADER_SIZE: usize = 1;
-
-/// Prepend a single version byte to the rkyv-serialized data.
-#[inline]
-fn prepend_version(version: u8, data: AlignedVec) -> Vec<u8> {
-    let mut result = Vec::with_capacity(VERSION_HEADER_SIZE + data.len());
-    result.push(version);
-    result.extend_from_slice(&data);
-    result
-}
-
-/// Strip the version byte and return the remaining data, validating the version matches.
-/// Copies into an AlignedVec to ensure proper alignment for rkyv deserialization.
-#[inline]
-fn strip_version(expected: u8, data: &[u8]) -> Result<AlignedVec, CodecError> {
-    if data.len() < VERSION_HEADER_SIZE {
-        return Err(CodecError::TooShort);
-    }
-    let found = data[0];
-    if found != expected {
-        return Err(CodecError::UnsupportedVersion { expected, found });
-    }
-    // Copy into an AlignedVec to ensure proper alignment for rkyv
-    let rkyv_data = &data[VERSION_HEADER_SIZE..];
-    let mut aligned = AlignedVec::with_capacity(rkyv_data.len());
-    aligned.extend_from_slice(rkyv_data);
-    Ok(aligned)
-}
-
-#[inline]
-pub fn encode_task(task: &Task) -> Result<Vec<u8>, CodecError> {
-    let data = rkyv::to_bytes::<Task, 256>(task).map_err(|e| CodecError::Rkyv(e.to_string()))?;
-    Ok(prepend_version(TASK_VERSION, data))
-}
-
-#[inline]
-pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
-    let data = strip_version(TASK_VERSION, bytes)?;
-    type ArchivedTask = <Task as Archive>::Archived;
-    let archived: &ArchivedTask =
-        rkyv::check_archived_root::<Task>(&data).map_err(|e| CodecError::Rkyv(e.to_string()))?;
-    Ok(match archived {
-        ArchivedTask::RunAttempt {
+/// Build a Task union (TaskVariant) into the builder. Returns (type, offset).
+fn build_task_union<'a, A: flatbuffers::Allocator + 'a>(
+    builder: &mut FlatBufferBuilder<'a, A>,
+    task: &Task,
+) -> (
+    fb::TaskVariant,
+    flatbuffers::WIPOffset<flatbuffers::UnionWIPOffset>,
+) {
+    match task {
+        Task::RunAttempt {
             id,
             tenant,
             job_id,
@@ -96,19 +39,31 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
             relative_attempt_number,
             held_queues,
             task_group,
-        } => Task::RunAttempt {
-            id: id.as_str().to_string(),
-            tenant: tenant.as_str().to_string(),
-            job_id: job_id.as_str().to_string(),
-            attempt_number: *attempt_number,
-            relative_attempt_number: *relative_attempt_number,
-            held_queues: held_queues
+        } => {
+            let id = builder.create_string(id);
+            let tenant = builder.create_string(tenant);
+            let job_id = builder.create_string(job_id);
+            let hq: Vec<_> = held_queues
                 .iter()
-                .map(|s| s.as_str().to_string())
-                .collect::<Vec<String>>(),
-            task_group: task_group.as_str().to_string(),
-        },
-        ArchivedTask::RequestTicket {
+                .map(|s| builder.create_string(s))
+                .collect();
+            let held_queues = builder.create_vector(&hq);
+            let task_group = builder.create_string(task_group);
+            let ra = fb::RunAttempt::create(
+                builder,
+                &fb::RunAttemptArgs {
+                    id: Some(id),
+                    tenant: Some(tenant),
+                    job_id: Some(job_id),
+                    attempt_number: *attempt_number,
+                    relative_attempt_number: *relative_attempt_number,
+                    held_queues: Some(held_queues),
+                    task_group: Some(task_group),
+                },
+            );
+            (fb::TaskVariant::RunAttempt, ra.as_union_value())
+        }
+        Task::RequestTicket {
             queue,
             start_time_ms,
             priority,
@@ -118,18 +73,29 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
             relative_attempt_number,
             request_id,
             task_group,
-        } => Task::RequestTicket {
-            queue: queue.as_str().to_string(),
-            start_time_ms: *start_time_ms,
-            priority: *priority,
-            tenant: tenant.as_str().to_string(),
-            job_id: job_id.as_str().to_string(),
-            attempt_number: *attempt_number,
-            relative_attempt_number: *relative_attempt_number,
-            request_id: request_id.as_str().to_string(),
-            task_group: task_group.as_str().to_string(),
-        },
-        ArchivedTask::CheckRateLimit {
+        } => {
+            let queue = builder.create_string(queue);
+            let tenant = builder.create_string(tenant);
+            let job_id = builder.create_string(job_id);
+            let request_id = builder.create_string(request_id);
+            let task_group = builder.create_string(task_group);
+            let rt = fb::RequestTicket::create(
+                builder,
+                &fb::RequestTicketArgs {
+                    queue: Some(queue),
+                    start_time_ms: *start_time_ms,
+                    priority: *priority,
+                    tenant: Some(tenant),
+                    job_id: Some(job_id),
+                    attempt_number: *attempt_number,
+                    relative_attempt_number: *relative_attempt_number,
+                    request_id: Some(request_id),
+                    task_group: Some(task_group),
+                },
+            );
+            (fb::TaskVariant::RequestTicket, rt.as_union_value())
+        }
+        Task::CheckRateLimit {
             task_id,
             tenant,
             job_id,
@@ -142,255 +108,17 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
             priority,
             held_queues,
             task_group,
-        } => Task::CheckRateLimit {
-            task_id: task_id.as_str().to_string(),
-            tenant: tenant.as_str().to_string(),
-            job_id: job_id.as_str().to_string(),
-            attempt_number: *attempt_number,
-            relative_attempt_number: *relative_attempt_number,
-            limit_index: *limit_index,
-            rate_limit: GubernatorRateLimitData {
-                name: rate_limit.name.as_str().to_string(),
-                unique_key: rate_limit.unique_key.as_str().to_string(),
-                limit: rate_limit.limit,
-                duration_ms: rate_limit.duration_ms,
-                hits: rate_limit.hits,
-                algorithm: rate_limit.algorithm,
-                behavior: rate_limit.behavior,
-                retry_initial_backoff_ms: rate_limit.retry_initial_backoff_ms,
-                retry_max_backoff_ms: rate_limit.retry_max_backoff_ms,
-                retry_backoff_multiplier: rate_limit.retry_backoff_multiplier,
-                retry_max_retries: rate_limit.retry_max_retries,
-            },
-            retry_count: *retry_count,
-            started_at_ms: *started_at_ms,
-            priority: *priority,
-            held_queues: held_queues
-                .iter()
-                .map(|s| s.as_str().to_string())
-                .collect::<Vec<String>>(),
-            task_group: task_group.as_str().to_string(),
-        },
-        ArchivedTask::RefreshFloatingLimit {
-            task_id,
-            tenant,
-            queue_key,
-            current_max_concurrency,
-            last_refreshed_at_ms,
-            metadata,
-            task_group,
-        } => Task::RefreshFloatingLimit {
-            task_id: task_id.as_str().to_string(),
-            tenant: tenant.as_str().to_string(),
-            queue_key: queue_key.as_str().to_string(),
-            current_max_concurrency: *current_max_concurrency,
-            last_refreshed_at_ms: *last_refreshed_at_ms,
-            metadata: metadata
-                .iter()
-                .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
-                .collect(),
-            task_group: task_group.as_str().to_string(),
-        },
-    })
-}
-
-#[inline]
-pub fn encode_lease(record: &LeaseRecord) -> Result<Vec<u8>, CodecError> {
-    let data =
-        rkyv::to_bytes::<LeaseRecord, 256>(record).map_err(|e| CodecError::Rkyv(e.to_string()))?;
-    Ok(prepend_version(LEASE_RECORD_VERSION, data))
-}
-
-/// Decoded lease record that owns its aligned data
-#[derive(Clone)]
-pub struct DecodedLease {
-    data: AlignedVec,
-}
-
-type ArchivedTask = <Task as Archive>::Archived;
-
-impl DecodedLease {
-    pub fn archived(&self) -> &<LeaseRecord as Archive>::Archived {
-        // SAFETY: data was validated at construction in decode_lease
-        unsafe { rkyv::archived_root::<LeaseRecord>(&self.data) }
-    }
-
-    /// Get the worker_id from this lease (zero-copy)
-    pub fn worker_id(&self) -> &str {
-        self.archived().worker_id.as_str()
-    }
-
-    /// Get the expiry time from this lease
-    pub fn expiry_ms(&self) -> i64 {
-        self.archived().expiry_ms
-    }
-
-    /// Get started_at_ms from this lease (when the attempt started)
-    pub fn started_at_ms(&self) -> i64 {
-        self.archived().started_at_ms
-    }
-
-    /// Get a reference to the archived task (zero-copy)
-    pub fn archived_task(&self) -> &ArchivedTask {
-        &self.archived().task
-    }
-
-    /// Extract task_id from the leased task (zero-copy). Only valid for RunAttempt tasks.
-    pub fn task_id(&self) -> Option<&str> {
-        match self.archived_task() {
-            ArchivedTask::RunAttempt { id, .. } => Some(id.as_str()),
-            _ => None,
-        }
-    }
-
-    /// Extract refresh floating limit task info (zero-copy). Returns (task_id, queue_key) if this is a RefreshFloatingLimit task.
-    pub fn refresh_floating_limit_info(&self) -> Option<(&str, &str)> {
-        match self.archived_task() {
-            ArchivedTask::RefreshFloatingLimit {
-                task_id, queue_key, ..
-            } => Some((task_id.as_str(), queue_key.as_str())),
-            _ => None,
-        }
-    }
-
-    /// Extract tenant from the leased task (zero-copy).
-    pub fn tenant(&self) -> &str {
-        match self.archived_task() {
-            ArchivedTask::RunAttempt { tenant, .. } => tenant.as_str(),
-            ArchivedTask::RequestTicket { tenant, .. } => tenant.as_str(),
-            ArchivedTask::CheckRateLimit { tenant, .. } => tenant.as_str(),
-            ArchivedTask::RefreshFloatingLimit { tenant, .. } => tenant.as_str(),
-        }
-    }
-
-    /// Extract job_id from the leased task (zero-copy). Returns empty string for RefreshFloatingLimit.
-    pub fn job_id(&self) -> &str {
-        match self.archived_task() {
-            ArchivedTask::RunAttempt { job_id, .. } => job_id.as_str(),
-            ArchivedTask::RequestTicket { job_id, .. } => job_id.as_str(),
-            ArchivedTask::CheckRateLimit { job_id, .. } => job_id.as_str(),
-            ArchivedTask::RefreshFloatingLimit { .. } => "",
-        }
-    }
-
-    /// Extract attempt_number from the leased task (zero-copy). Returns 0 for RefreshFloatingLimit.
-    pub fn attempt_number(&self) -> u32 {
-        match self.archived_task() {
-            ArchivedTask::RunAttempt { attempt_number, .. } => *attempt_number,
-            ArchivedTask::RequestTicket { attempt_number, .. } => *attempt_number,
-            ArchivedTask::CheckRateLimit { attempt_number, .. } => *attempt_number,
-            ArchivedTask::RefreshFloatingLimit { .. } => 0,
-        }
-    }
-
-    /// Extract relative_attempt_number from the leased task (zero-copy). Returns 0 for RefreshFloatingLimit.
-    pub fn relative_attempt_number(&self) -> u32 {
-        match self.archived_task() {
-            ArchivedTask::RunAttempt {
-                relative_attempt_number,
-                ..
-            } => *relative_attempt_number,
-            ArchivedTask::RequestTicket {
-                relative_attempt_number,
-                ..
-            } => *relative_attempt_number,
-            ArchivedTask::CheckRateLimit {
-                relative_attempt_number,
-                ..
-            } => *relative_attempt_number,
-            ArchivedTask::RefreshFloatingLimit { .. } => 0,
-        }
-    }
-
-    /// Extract held_queues from the leased task as owned strings (allocation required)
-    pub fn held_queues(&self) -> Vec<String> {
-        match self.archived_task() {
-            ArchivedTask::RunAttempt { held_queues, .. } => {
-                held_queues.iter().map(|s| s.as_str().to_string()).collect()
-            }
-            ArchivedTask::CheckRateLimit { held_queues, .. } => {
-                held_queues.iter().map(|s| s.as_str().to_string()).collect()
-            }
-            ArchivedTask::RequestTicket { .. } | ArchivedTask::RefreshFloatingLimit { .. } => {
-                Vec::new()
-            }
-        }
-    }
-
-    /// Extract task_group from the leased task (zero-copy).
-    pub fn task_group(&self) -> &str {
-        match self.archived_task() {
-            ArchivedTask::RunAttempt { task_group, .. } => task_group.as_str(),
-            ArchivedTask::RequestTicket { task_group, .. } => task_group.as_str(),
-            ArchivedTask::CheckRateLimit { task_group, .. } => task_group.as_str(),
-            ArchivedTask::RefreshFloatingLimit { task_group, .. } => task_group.as_str(),
-        }
-    }
-
-    /// Convert to an owned Task - only call when you need to create a new record
-    pub fn to_task(&self) -> Task {
-        match self.archived_task() {
-            ArchivedTask::RunAttempt {
-                id,
-                tenant,
-                job_id,
-                attempt_number,
-                relative_attempt_number,
-                held_queues,
-                task_group,
-            } => Task::RunAttempt {
-                id: id.as_str().to_string(),
-                tenant: tenant.as_str().to_string(),
-                job_id: job_id.as_str().to_string(),
-                attempt_number: *attempt_number,
-                relative_attempt_number: *relative_attempt_number,
-                held_queues: held_queues.iter().map(|s| s.as_str().to_string()).collect(),
-                task_group: task_group.as_str().to_string(),
-            },
-            ArchivedTask::RequestTicket {
-                queue,
-                start_time_ms,
-                priority,
-                tenant,
-                job_id,
-                attempt_number,
-                relative_attempt_number,
-                request_id,
-                task_group,
-            } => Task::RequestTicket {
-                queue: queue.as_str().to_string(),
-                start_time_ms: *start_time_ms,
-                priority: *priority,
-                tenant: tenant.as_str().to_string(),
-                job_id: job_id.as_str().to_string(),
-                attempt_number: *attempt_number,
-                relative_attempt_number: *relative_attempt_number,
-                request_id: request_id.as_str().to_string(),
-                task_group: task_group.as_str().to_string(),
-            },
-            ArchivedTask::CheckRateLimit {
-                task_id,
-                tenant,
-                job_id,
-                attempt_number,
-                relative_attempt_number,
-                limit_index,
-                rate_limit,
-                retry_count,
-                started_at_ms,
-                priority,
-                held_queues,
-                task_group,
-            } => Task::CheckRateLimit {
-                task_id: task_id.as_str().to_string(),
-                tenant: tenant.as_str().to_string(),
-                job_id: job_id.as_str().to_string(),
-                attempt_number: *attempt_number,
-                relative_attempt_number: *relative_attempt_number,
-                limit_index: *limit_index,
-                rate_limit: GubernatorRateLimitData {
-                    name: rate_limit.name.as_str().to_string(),
-                    unique_key: rate_limit.unique_key.as_str().to_string(),
+        } => {
+            let task_id_s = builder.create_string(task_id);
+            let tenant = builder.create_string(tenant);
+            let job_id = builder.create_string(job_id);
+            let rl_name = builder.create_string(&rate_limit.name);
+            let rl_unique_key = builder.create_string(&rate_limit.unique_key);
+            let rl = fb::GubernatorRateLimitData::create(
+                builder,
+                &fb::GubernatorRateLimitDataArgs {
+                    name: Some(rl_name),
+                    unique_key: Some(rl_unique_key),
                     limit: rate_limit.limit,
                     duration_ms: rate_limit.duration_ms,
                     hits: rate_limit.hits,
@@ -401,253 +129,960 @@ impl DecodedLease {
                     retry_backoff_multiplier: rate_limit.retry_backoff_multiplier,
                     retry_max_retries: rate_limit.retry_max_retries,
                 },
-                retry_count: *retry_count,
-                started_at_ms: *started_at_ms,
-                priority: *priority,
-                held_queues: held_queues.iter().map(|s| s.as_str().to_string()).collect(),
-                task_group: task_group.as_str().to_string(),
-            },
-            ArchivedTask::RefreshFloatingLimit {
-                task_id,
-                tenant,
-                queue_key,
-                current_max_concurrency,
-                last_refreshed_at_ms,
-                metadata,
-                task_group,
-            } => Task::RefreshFloatingLimit {
-                task_id: task_id.as_str().to_string(),
-                tenant: tenant.as_str().to_string(),
-                queue_key: queue_key.as_str().to_string(),
-                current_max_concurrency: *current_max_concurrency,
-                last_refreshed_at_ms: *last_refreshed_at_ms,
-                metadata: metadata
-                    .iter()
-                    .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
-                    .collect(),
-                task_group: task_group.as_str().to_string(),
-            },
+            );
+            let hq: Vec<_> = held_queues
+                .iter()
+                .map(|s| builder.create_string(s))
+                .collect();
+            let held_queues = builder.create_vector(&hq);
+            let task_group = builder.create_string(task_group);
+            let crl = fb::CheckRateLimit::create(
+                builder,
+                &fb::CheckRateLimitArgs {
+                    task_id: Some(task_id_s),
+                    tenant: Some(tenant),
+                    job_id: Some(job_id),
+                    attempt_number: *attempt_number,
+                    relative_attempt_number: *relative_attempt_number,
+                    limit_index: *limit_index,
+                    rate_limit: Some(rl),
+                    retry_count: *retry_count,
+                    started_at_ms: *started_at_ms,
+                    priority: *priority,
+                    held_queues: Some(held_queues),
+                    task_group: Some(task_group),
+                },
+            );
+            (fb::TaskVariant::CheckRateLimit, crl.as_union_value())
         }
+        Task::RefreshFloatingLimit {
+            task_id,
+            tenant,
+            queue_key,
+            current_max_concurrency,
+            last_refreshed_at_ms,
+            metadata,
+            task_group,
+        } => {
+            let task_id_s = builder.create_string(task_id);
+            let tenant = builder.create_string(tenant);
+            let queue_key = builder.create_string(queue_key);
+            let md: Vec<_> = metadata
+                .iter()
+                .map(|(k, v)| {
+                    let k = builder.create_string(k);
+                    let v = builder.create_string(v);
+                    fb::KeyValuePair::create(
+                        builder,
+                        &fb::KeyValuePairArgs {
+                            key: Some(k),
+                            value: Some(v),
+                        },
+                    )
+                })
+                .collect();
+            let metadata = builder.create_vector(&md);
+            let task_group = builder.create_string(task_group);
+            let rfl = fb::RefreshFloatingLimit::create(
+                builder,
+                &fb::RefreshFloatingLimitArgs {
+                    task_id: Some(task_id_s),
+                    tenant: Some(tenant),
+                    queue_key: Some(queue_key),
+                    current_max_concurrency: *current_max_concurrency,
+                    last_refreshed_at_ms: *last_refreshed_at_ms,
+                    metadata: Some(metadata),
+                    task_group: Some(task_group),
+                },
+            );
+            (fb::TaskVariant::RefreshFloatingLimit, rfl.as_union_value())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Encode functions
+// ---------------------------------------------------------------------------
+
+#[inline]
+pub fn encode_task(task: &Task) -> Result<Vec<u8>, CodecError> {
+    let mut builder = FlatBufferBuilder::with_capacity(256);
+    let (vtype, voff) = build_task_union(&mut builder, task);
+    let root = fb::Task::create(
+        &mut builder,
+        &fb::TaskArgs {
+            variant_type: vtype,
+            variant: Some(voff),
+        },
+    );
+    builder.finish(root, None);
+    Ok(builder.finished_data().to_vec())
+}
+
+#[inline]
+pub fn encode_lease(record: &LeaseRecord) -> Result<Vec<u8>, CodecError> {
+    let mut builder = FlatBufferBuilder::with_capacity(256);
+    let worker_id = builder.create_string(&record.worker_id);
+    let (vtype, voff) = build_task_union(&mut builder, &record.task);
+    let root = fb::LeaseRecord::create(
+        &mut builder,
+        &fb::LeaseRecordArgs {
+            worker_id: Some(worker_id),
+            task_type: vtype,
+            task: Some(voff),
+            expiry_ms: record.expiry_ms,
+            started_at_ms: record.started_at_ms,
+        },
+    );
+    builder.finish(root, None);
+    Ok(builder.finished_data().to_vec())
+}
+
+#[inline]
+pub fn encode_attempt(attempt: &JobAttempt) -> Result<Vec<u8>, CodecError> {
+    let mut builder = FlatBufferBuilder::with_capacity(256);
+    let job_id = builder.create_string(&attempt.job_id);
+    let task_id = builder.create_string(&attempt.task_id);
+
+    let (status_kind, finished_at_ms, result, error_code, error) = match &attempt.status {
+        AttemptStatus::Running => (fb::AttemptStatusKind::Running, None, None, None, None),
+        AttemptStatus::Succeeded {
+            finished_at_ms,
+            result,
+        } => {
+            let r = builder.create_vector(result);
+            (
+                fb::AttemptStatusKind::Succeeded,
+                Some(*finished_at_ms),
+                Some(r),
+                None,
+                None,
+            )
+        }
+        AttemptStatus::Failed {
+            finished_at_ms,
+            error_code,
+            error,
+        } => {
+            let ec = builder.create_string(error_code);
+            let e = builder.create_vector(error);
+            (
+                fb::AttemptStatusKind::Failed,
+                Some(*finished_at_ms),
+                None,
+                Some(ec),
+                Some(e),
+            )
+        }
+        AttemptStatus::Cancelled { finished_at_ms } => (
+            fb::AttemptStatusKind::Cancelled,
+            Some(*finished_at_ms),
+            None,
+            None,
+            None,
+        ),
+    };
+
+    let root = fb::JobAttempt::create(
+        &mut builder,
+        &fb::JobAttemptArgs {
+            job_id: Some(job_id),
+            attempt_number: attempt.attempt_number,
+            relative_attempt_number: attempt.relative_attempt_number,
+            task_id: Some(task_id),
+            started_at_ms: attempt.started_at_ms,
+            status_kind,
+            finished_at_ms,
+            result,
+            error_code,
+            error,
+        },
+    );
+    builder.finish(root, None);
+    Ok(builder.finished_data().to_vec())
+}
+
+#[inline]
+pub fn encode_job_info(job: &JobInfo) -> Result<Vec<u8>, CodecError> {
+    let mut builder = FlatBufferBuilder::with_capacity(512);
+    let id = builder.create_string(&job.id);
+    let payload = builder.create_vector(&job.payload);
+    let task_group = builder.create_string(&job.task_group);
+
+    let retry_policy = job.retry_policy.as_ref().map(|rp| {
+        fb::RetryPolicy::create(
+            &mut builder,
+            &fb::RetryPolicyArgs {
+                retry_count: rp.retry_count,
+                initial_interval_ms: rp.initial_interval_ms,
+                max_interval_ms: rp.max_interval_ms,
+                randomize_interval: rp.randomize_interval,
+                backoff_factor: rp.backoff_factor,
+            },
+        )
+    });
+
+    let md: Vec<_> = job
+        .metadata
+        .iter()
+        .map(|(k, v)| {
+            let k = builder.create_string(k);
+            let v = builder.create_string(v);
+            fb::KeyValuePair::create(
+                &mut builder,
+                &fb::KeyValuePairArgs {
+                    key: Some(k),
+                    value: Some(v),
+                },
+            )
+        })
+        .collect();
+    let metadata = builder.create_vector(&md);
+
+    let limits: Vec<_> = job
+        .limits
+        .iter()
+        .map(|lim| {
+            let (vtype, voff) = match lim {
+                Limit::Concurrency(cl) => {
+                    let key = builder.create_string(&cl.key);
+                    let entry = fb::ConcurrencyLimitEntry::create(
+                        &mut builder,
+                        &fb::ConcurrencyLimitEntryArgs {
+                            key: Some(key),
+                            max_concurrency: cl.max_concurrency,
+                        },
+                    );
+                    (
+                        fb::LimitVariant::ConcurrencyLimitEntry,
+                        entry.as_union_value(),
+                    )
+                }
+                Limit::RateLimit(rl) => {
+                    let name = builder.create_string(&rl.name);
+                    let unique_key = builder.create_string(&rl.unique_key);
+                    let rp = fb::RateLimitRetryPolicy::create(
+                        &mut builder,
+                        &fb::RateLimitRetryPolicyArgs {
+                            initial_backoff_ms: rl.retry_policy.initial_backoff_ms,
+                            max_backoff_ms: rl.retry_policy.max_backoff_ms,
+                            backoff_multiplier: rl.retry_policy.backoff_multiplier,
+                            max_retries: rl.retry_policy.max_retries,
+                        },
+                    );
+                    let entry = fb::RateLimitEntry::create(
+                        &mut builder,
+                        &fb::RateLimitEntryArgs {
+                            name: Some(name),
+                            unique_key: Some(unique_key),
+                            limit: rl.limit,
+                            duration_ms: rl.duration_ms,
+                            hits: rl.hits,
+                            algorithm: rl.algorithm.as_u8(),
+                            behavior: rl.behavior,
+                            retry_policy: Some(rp),
+                        },
+                    );
+                    (fb::LimitVariant::RateLimitEntry, entry.as_union_value())
+                }
+                Limit::FloatingConcurrency(fl) => {
+                    let key = builder.create_string(&fl.key);
+                    let md: Vec<_> = fl
+                        .metadata
+                        .iter()
+                        .map(|(k, v)| {
+                            let k = builder.create_string(k);
+                            let v = builder.create_string(v);
+                            fb::KeyValuePair::create(
+                                &mut builder,
+                                &fb::KeyValuePairArgs {
+                                    key: Some(k),
+                                    value: Some(v),
+                                },
+                            )
+                        })
+                        .collect();
+                    let metadata = builder.create_vector(&md);
+                    let entry = fb::FloatingConcurrencyLimitEntry::create(
+                        &mut builder,
+                        &fb::FloatingConcurrencyLimitEntryArgs {
+                            key: Some(key),
+                            default_max_concurrency: fl.default_max_concurrency,
+                            refresh_interval_ms: fl.refresh_interval_ms,
+                            metadata: Some(metadata),
+                        },
+                    );
+                    (
+                        fb::LimitVariant::FloatingConcurrencyLimitEntry,
+                        entry.as_union_value(),
+                    )
+                }
+            };
+            fb::LimitEntry::create(
+                &mut builder,
+                &fb::LimitEntryArgs {
+                    variant_type: vtype,
+                    variant: Some(voff),
+                },
+            )
+        })
+        .collect();
+    let limits = builder.create_vector(&limits);
+
+    let root = fb::JobInfo::create(
+        &mut builder,
+        &fb::JobInfoArgs {
+            id: Some(id),
+            priority: job.priority,
+            enqueue_time_ms: job.enqueue_time_ms,
+            payload: Some(payload),
+            retry_policy,
+            metadata: Some(metadata),
+            limits: Some(limits),
+            task_group: Some(task_group),
+        },
+    );
+    builder.finish(root, None);
+    Ok(builder.finished_data().to_vec())
+}
+
+#[inline]
+pub fn encode_job_status(status: &JobStatus) -> Result<Vec<u8>, CodecError> {
+    let mut builder = FlatBufferBuilder::with_capacity(64);
+    let kind = match status.kind {
+        JobStatusKind::Scheduled => fb::JobStatusKind::Scheduled,
+        JobStatusKind::Running => fb::JobStatusKind::Running,
+        JobStatusKind::Failed => fb::JobStatusKind::Failed,
+        JobStatusKind::Cancelled => fb::JobStatusKind::Cancelled,
+        JobStatusKind::Succeeded => fb::JobStatusKind::Succeeded,
+    };
+    let root = fb::JobStatus::create(
+        &mut builder,
+        &fb::JobStatusArgs {
+            kind,
+            changed_at_ms: status.changed_at_ms,
+            next_attempt_starts_after_ms: status.next_attempt_starts_after_ms,
+            current_attempt: status.current_attempt,
+        },
+    );
+    builder.finish(root, None);
+    Ok(builder.finished_data().to_vec())
+}
+
+#[inline]
+pub fn encode_holder(holder: &HolderRecord) -> Result<Vec<u8>, CodecError> {
+    let mut builder = FlatBufferBuilder::with_capacity(32);
+    let root = fb::HolderRecord::create(
+        &mut builder,
+        &fb::HolderRecordArgs {
+            granted_at_ms: holder.granted_at_ms,
+        },
+    );
+    builder.finish(root, None);
+    Ok(builder.finished_data().to_vec())
+}
+
+#[inline]
+pub fn encode_concurrency_action(action: &ConcurrencyAction) -> Result<Vec<u8>, CodecError> {
+    let mut builder = FlatBufferBuilder::with_capacity(128);
+    match action {
+        ConcurrencyAction::EnqueueTask {
+            start_time_ms,
+            priority,
+            job_id,
+            attempt_number,
+            relative_attempt_number,
+            task_group,
+        } => {
+            let job_id = builder.create_string(job_id);
+            let task_group = builder.create_string(task_group);
+            let et = fb::EnqueueTask::create(
+                &mut builder,
+                &fb::EnqueueTaskArgs {
+                    start_time_ms: *start_time_ms,
+                    priority: *priority,
+                    job_id: Some(job_id),
+                    attempt_number: *attempt_number,
+                    relative_attempt_number: *relative_attempt_number,
+                    task_group: Some(task_group),
+                },
+            );
+            let root = fb::ConcurrencyAction::create(
+                &mut builder,
+                &fb::ConcurrencyActionArgs {
+                    variant_type: fb::ConcurrencyActionVariant::EnqueueTask,
+                    variant: Some(et.as_union_value()),
+                },
+            );
+            builder.finish(root, None);
+        }
+    }
+    Ok(builder.finished_data().to_vec())
+}
+
+#[inline]
+pub fn encode_job_cancellation(cancellation: &JobCancellation) -> Result<Vec<u8>, CodecError> {
+    let mut builder = FlatBufferBuilder::with_capacity(32);
+    let root = fb::JobCancellation::create(
+        &mut builder,
+        &fb::JobCancellationArgs {
+            cancelled_at_ms: cancellation.cancelled_at_ms,
+        },
+    );
+    builder.finish(root, None);
+    Ok(builder.finished_data().to_vec())
+}
+
+#[inline]
+pub fn encode_floating_limit_state(state: &FloatingLimitState) -> Result<Vec<u8>, CodecError> {
+    let mut builder = FlatBufferBuilder::with_capacity(128);
+    let md: Vec<_> = state
+        .metadata
+        .iter()
+        .map(|(k, v)| {
+            let k = builder.create_string(k);
+            let v = builder.create_string(v);
+            fb::KeyValuePair::create(
+                &mut builder,
+                &fb::KeyValuePairArgs {
+                    key: Some(k),
+                    value: Some(v),
+                },
+            )
+        })
+        .collect();
+    let metadata = builder.create_vector(&md);
+    let root = fb::FloatingLimitState::create(
+        &mut builder,
+        &fb::FloatingLimitStateArgs {
+            current_max_concurrency: state.current_max_concurrency,
+            last_refreshed_at_ms: state.last_refreshed_at_ms,
+            refresh_task_scheduled: state.refresh_task_scheduled,
+            refresh_interval_ms: state.refresh_interval_ms,
+            default_max_concurrency: state.default_max_concurrency,
+            retry_count: state.retry_count,
+            next_retry_at_ms: state.next_retry_at_ms,
+            metadata: Some(metadata),
+        },
+    );
+    builder.finish(root, None);
+    Ok(builder.finished_data().to_vec())
+}
+
+// ---------------------------------------------------------------------------
+// Decode helpers - materialize a Task from a FlatBuffer TaskVariant union
+// ---------------------------------------------------------------------------
+
+fn task_from_fb_variant(
+    vtype: fb::TaskVariant,
+    table: flatbuffers::Table<'_>,
+) -> Result<Task, CodecError> {
+    match vtype {
+        fb::TaskVariant::RunAttempt => {
+            // SAFETY: union type was verified by flatbuffers
+            let ra = unsafe { fb::RunAttempt::init_from_table(table) };
+            Ok(Task::RunAttempt {
+                id: ra.id().unwrap_or_default().to_string(),
+                tenant: ra.tenant().unwrap_or_default().to_string(),
+                job_id: ra.job_id().unwrap_or_default().to_string(),
+                attempt_number: ra.attempt_number(),
+                relative_attempt_number: ra.relative_attempt_number(),
+                held_queues: ra
+                    .held_queues()
+                    .map(|v| v.iter().map(|s| s.to_string()).collect())
+                    .unwrap_or_default(),
+                task_group: ra.task_group().unwrap_or_default().to_string(),
+            })
+        }
+        fb::TaskVariant::RequestTicket => {
+            let rt = unsafe { fb::RequestTicket::init_from_table(table) };
+            Ok(Task::RequestTicket {
+                queue: rt.queue().unwrap_or_default().to_string(),
+                start_time_ms: rt.start_time_ms(),
+                priority: rt.priority(),
+                tenant: rt.tenant().unwrap_or_default().to_string(),
+                job_id: rt.job_id().unwrap_or_default().to_string(),
+                attempt_number: rt.attempt_number(),
+                relative_attempt_number: rt.relative_attempt_number(),
+                request_id: rt.request_id().unwrap_or_default().to_string(),
+                task_group: rt.task_group().unwrap_or_default().to_string(),
+            })
+        }
+        fb::TaskVariant::CheckRateLimit => {
+            let crl = unsafe { fb::CheckRateLimit::init_from_table(table) };
+            let rl = crl.rate_limit();
+            let rate_limit = match rl {
+                Some(rl) => GubernatorRateLimitData {
+                    name: rl.name().unwrap_or_default().to_string(),
+                    unique_key: rl.unique_key().unwrap_or_default().to_string(),
+                    limit: rl.limit(),
+                    duration_ms: rl.duration_ms(),
+                    hits: rl.hits(),
+                    algorithm: rl.algorithm(),
+                    behavior: rl.behavior(),
+                    retry_initial_backoff_ms: rl.retry_initial_backoff_ms(),
+                    retry_max_backoff_ms: rl.retry_max_backoff_ms(),
+                    retry_backoff_multiplier: rl.retry_backoff_multiplier(),
+                    retry_max_retries: rl.retry_max_retries(),
+                },
+                None => {
+                    return Err(CodecError::Flatbuffer(
+                        "missing rate_limit in CheckRateLimit".to_string(),
+                    ));
+                }
+            };
+            Ok(Task::CheckRateLimit {
+                task_id: crl.task_id().unwrap_or_default().to_string(),
+                tenant: crl.tenant().unwrap_or_default().to_string(),
+                job_id: crl.job_id().unwrap_or_default().to_string(),
+                attempt_number: crl.attempt_number(),
+                relative_attempt_number: crl.relative_attempt_number(),
+                limit_index: crl.limit_index(),
+                rate_limit,
+                retry_count: crl.retry_count(),
+                started_at_ms: crl.started_at_ms(),
+                priority: crl.priority(),
+                held_queues: crl
+                    .held_queues()
+                    .map(|v| v.iter().map(|s| s.to_string()).collect())
+                    .unwrap_or_default(),
+                task_group: crl.task_group().unwrap_or_default().to_string(),
+            })
+        }
+        fb::TaskVariant::RefreshFloatingLimit => {
+            let rfl = unsafe { fb::RefreshFloatingLimit::init_from_table(table) };
+            Ok(Task::RefreshFloatingLimit {
+                task_id: rfl.task_id().unwrap_or_default().to_string(),
+                tenant: rfl.tenant().unwrap_or_default().to_string(),
+                queue_key: rfl.queue_key().unwrap_or_default().to_string(),
+                current_max_concurrency: rfl.current_max_concurrency(),
+                last_refreshed_at_ms: rfl.last_refreshed_at_ms(),
+                metadata: rfl
+                    .metadata()
+                    .map(|v| {
+                        v.iter()
+                            .map(|kv| {
+                                (
+                                    kv.key().unwrap_or_default().to_string(),
+                                    kv.value().unwrap_or_default().to_string(),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                task_group: rfl.task_group().unwrap_or_default().to_string(),
+            })
+        }
+        _ => Err(CodecError::Flatbuffer(format!(
+            "unknown task variant type: {:?}",
+            vtype
+        ))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decode: Task (fully materialized)
+// ---------------------------------------------------------------------------
+
+#[inline]
+pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
+    let t =
+        flatbuffers::root::<fb::Task>(bytes).map_err(|e| CodecError::Flatbuffer(e.to_string()))?;
+    let vtype = t.variant_type();
+    let table = t
+        .variant()
+        .ok_or_else(|| CodecError::Flatbuffer("missing task variant".to_string()))?;
+    task_from_fb_variant(vtype, table)
+}
+
+// ---------------------------------------------------------------------------
+// Decode: Lease (zero-copy wrapper)
+// ---------------------------------------------------------------------------
+
+/// Decoded lease record that owns its data for zero-copy access.
+#[derive(Clone)]
+pub struct DecodedLease {
+    data: Vec<u8>,
+}
+
+impl DecodedLease {
+    fn fb(&self) -> fb::LeaseRecord<'_> {
+        // SAFETY: data was validated at construction in decode_lease
+        unsafe { flatbuffers::root_unchecked::<fb::LeaseRecord>(&self.data) }
+    }
+
+    pub fn worker_id(&self) -> &str {
+        self.fb().worker_id().unwrap_or_default()
+    }
+
+    pub fn expiry_ms(&self) -> i64 {
+        self.fb().expiry_ms()
+    }
+
+    pub fn started_at_ms(&self) -> i64 {
+        self.fb().started_at_ms()
+    }
+
+    pub fn tenant(&self) -> &str {
+        let lr = self.fb();
+        let vtype = lr.task_type();
+        match vtype {
+            fb::TaskVariant::RunAttempt => lr
+                .task_as_run_attempt()
+                .and_then(|r| r.tenant())
+                .unwrap_or_default(),
+            fb::TaskVariant::RequestTicket => lr
+                .task_as_request_ticket()
+                .and_then(|r| r.tenant())
+                .unwrap_or_default(),
+            fb::TaskVariant::CheckRateLimit => lr
+                .task_as_check_rate_limit()
+                .and_then(|r| r.tenant())
+                .unwrap_or_default(),
+            fb::TaskVariant::RefreshFloatingLimit => lr
+                .task_as_refresh_floating_limit()
+                .and_then(|r| r.tenant())
+                .unwrap_or_default(),
+            _ => "",
+        }
+    }
+
+    pub fn job_id(&self) -> &str {
+        let lr = self.fb();
+        match lr.task_type() {
+            fb::TaskVariant::RunAttempt => lr
+                .task_as_run_attempt()
+                .and_then(|r| r.job_id())
+                .unwrap_or_default(),
+            fb::TaskVariant::RequestTicket => lr
+                .task_as_request_ticket()
+                .and_then(|r| r.job_id())
+                .unwrap_or_default(),
+            fb::TaskVariant::CheckRateLimit => lr
+                .task_as_check_rate_limit()
+                .and_then(|r| r.job_id())
+                .unwrap_or_default(),
+            fb::TaskVariant::RefreshFloatingLimit => "",
+            _ => "",
+        }
+    }
+
+    pub fn attempt_number(&self) -> u32 {
+        let lr = self.fb();
+        match lr.task_type() {
+            fb::TaskVariant::RunAttempt => lr
+                .task_as_run_attempt()
+                .map(|r| r.attempt_number())
+                .unwrap_or(0),
+            fb::TaskVariant::RequestTicket => lr
+                .task_as_request_ticket()
+                .map(|r| r.attempt_number())
+                .unwrap_or(0),
+            fb::TaskVariant::CheckRateLimit => lr
+                .task_as_check_rate_limit()
+                .map(|r| r.attempt_number())
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    pub fn relative_attempt_number(&self) -> u32 {
+        let lr = self.fb();
+        match lr.task_type() {
+            fb::TaskVariant::RunAttempt => lr
+                .task_as_run_attempt()
+                .map(|r| r.relative_attempt_number())
+                .unwrap_or(0),
+            fb::TaskVariant::RequestTicket => lr
+                .task_as_request_ticket()
+                .map(|r| r.relative_attempt_number())
+                .unwrap_or(0),
+            fb::TaskVariant::CheckRateLimit => lr
+                .task_as_check_rate_limit()
+                .map(|r| r.relative_attempt_number())
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    pub fn task_id(&self) -> Option<&str> {
+        let lr = self.fb();
+        match lr.task_type() {
+            fb::TaskVariant::RunAttempt => lr.task_as_run_attempt().and_then(|r| r.id()),
+            _ => None,
+        }
+    }
+
+    pub fn refresh_floating_limit_info(&self) -> Option<(&str, &str)> {
+        let lr = self.fb();
+        if lr.task_type() == fb::TaskVariant::RefreshFloatingLimit {
+            let rfl = lr.task_as_refresh_floating_limit()?;
+            Some((rfl.task_id()?, rfl.queue_key()?))
+        } else {
+            None
+        }
+    }
+
+    pub fn held_queues(&self) -> Vec<String> {
+        let lr = self.fb();
+        match lr.task_type() {
+            fb::TaskVariant::RunAttempt => lr
+                .task_as_run_attempt()
+                .and_then(|r| r.held_queues())
+                .map(|v| v.iter().map(|s| s.to_string()).collect())
+                .unwrap_or_default(),
+            fb::TaskVariant::CheckRateLimit => lr
+                .task_as_check_rate_limit()
+                .and_then(|r| r.held_queues())
+                .map(|v| v.iter().map(|s| s.to_string()).collect())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn task_group(&self) -> &str {
+        let lr = self.fb();
+        match lr.task_type() {
+            fb::TaskVariant::RunAttempt => lr
+                .task_as_run_attempt()
+                .and_then(|r| r.task_group())
+                .unwrap_or_default(),
+            fb::TaskVariant::RequestTicket => lr
+                .task_as_request_ticket()
+                .and_then(|r| r.task_group())
+                .unwrap_or_default(),
+            fb::TaskVariant::CheckRateLimit => lr
+                .task_as_check_rate_limit()
+                .and_then(|r| r.task_group())
+                .unwrap_or_default(),
+            fb::TaskVariant::RefreshFloatingLimit => lr
+                .task_as_refresh_floating_limit()
+                .and_then(|r| r.task_group())
+                .unwrap_or_default(),
+            _ => "",
+        }
+    }
+
+    /// Convert to an owned Task
+    pub fn to_task(&self) -> Task {
+        let lr = self.fb();
+        let vtype = lr.task_type();
+        let table = lr.task().expect("validated at decode");
+        task_from_fb_variant(vtype, table).expect("validated at decode")
     }
 }
 
 #[inline]
 pub fn decode_lease(bytes: &[u8]) -> Result<DecodedLease, CodecError> {
-    let data = strip_version(LEASE_RECORD_VERSION, bytes)?;
-    // Validate the data
-    let _ = rkyv::check_archived_root::<LeaseRecord>(&data)
-        .map_err(|e| CodecError::Rkyv(e.to_string()))?;
-    Ok(DecodedLease { data })
+    // Validate
+    flatbuffers::root::<fb::LeaseRecord>(bytes)
+        .map_err(|e| CodecError::Flatbuffer(e.to_string()))?;
+    Ok(DecodedLease {
+        data: bytes.to_vec(),
+    })
 }
 
-#[inline]
-pub fn encode_attempt(attempt: &JobAttempt) -> Result<Vec<u8>, CodecError> {
-    let data =
-        rkyv::to_bytes::<JobAttempt, 256>(attempt).map_err(|e| CodecError::Rkyv(e.to_string()))?;
-    Ok(prepend_version(JOB_ATTEMPT_VERSION, data))
-}
+// ---------------------------------------------------------------------------
+// Decode: JobAttempt (zero-copy wrapper)
+// ---------------------------------------------------------------------------
 
-/// Decoded job attempt that owns its aligned data
 #[derive(Clone)]
 pub struct DecodedAttempt {
-    data: AlignedVec,
+    data: Vec<u8>,
 }
 
 impl DecodedAttempt {
-    pub fn archived(&self) -> &<JobAttempt as Archive>::Archived {
-        // SAFETY: data was validated at construction in decode_attempt
-        unsafe { rkyv::archived_root::<JobAttempt>(&self.data) }
+    pub fn fb(&self) -> fb::JobAttempt<'_> {
+        unsafe { flatbuffers::root_unchecked::<fb::JobAttempt>(&self.data) }
     }
 }
 
 #[inline]
 pub fn decode_attempt(bytes: &[u8]) -> Result<DecodedAttempt, CodecError> {
-    let data = strip_version(JOB_ATTEMPT_VERSION, bytes)?;
-    // Validate the data
-    let _ = rkyv::check_archived_root::<JobAttempt>(&data)
-        .map_err(|e| CodecError::Rkyv(e.to_string()))?;
-    Ok(DecodedAttempt { data })
+    flatbuffers::root::<fb::JobAttempt>(bytes)
+        .map_err(|e| CodecError::Flatbuffer(e.to_string()))?;
+    Ok(DecodedAttempt {
+        data: bytes.to_vec(),
+    })
 }
 
-#[inline]
-pub fn encode_job_info(job: &JobInfo) -> Result<Vec<u8>, CodecError> {
-    let data = rkyv::to_bytes::<JobInfo, 256>(job).map_err(|e| CodecError::Rkyv(e.to_string()))?;
-    Ok(prepend_version(JOB_INFO_VERSION, data))
-}
+// ---------------------------------------------------------------------------
+// Decode: JobInfo (zero-copy wrapper)
+// ---------------------------------------------------------------------------
 
-/// Decoded job info that owns its aligned data
 #[derive(Clone)]
 pub struct DecodedJobInfo {
-    data: AlignedVec,
+    data: Vec<u8>,
 }
 
 impl DecodedJobInfo {
-    pub fn archived(&self) -> &<JobInfo as Archive>::Archived {
-        // SAFETY: data was validated at construction in decode_job_info
-        unsafe { rkyv::archived_root::<JobInfo>(&self.data) }
+    pub fn fb(&self) -> fb::JobInfo<'_> {
+        unsafe { flatbuffers::root_unchecked::<fb::JobInfo>(&self.data) }
     }
 }
 
 #[inline]
 pub fn decode_job_info(bytes: &[u8]) -> Result<DecodedJobInfo, CodecError> {
-    let data = strip_version(JOB_INFO_VERSION, bytes)?;
-    // Validate the data
-    let _ =
-        rkyv::check_archived_root::<JobInfo>(&data).map_err(|e| CodecError::Rkyv(e.to_string()))?;
-    Ok(DecodedJobInfo { data })
+    flatbuffers::root::<fb::JobInfo>(bytes).map_err(|e| CodecError::Flatbuffer(e.to_string()))?;
+    Ok(DecodedJobInfo {
+        data: bytes.to_vec(),
+    })
 }
+
+// ---------------------------------------------------------------------------
+// Decode: JobStatus (directly to owned)
+// ---------------------------------------------------------------------------
 
 #[inline]
-pub fn encode_job_status(status: &JobStatus) -> Result<Vec<u8>, CodecError> {
-    let data =
-        rkyv::to_bytes::<JobStatus, 256>(status).map_err(|e| CodecError::Rkyv(e.to_string()))?;
-    Ok(prepend_version(JOB_STATUS_VERSION, data))
+pub fn decode_job_status_owned(bytes: &[u8]) -> Result<JobStatus, CodecError> {
+    let s = flatbuffers::root::<fb::JobStatus>(bytes)
+        .map_err(|e| CodecError::Flatbuffer(e.to_string()))?;
+    let kind = match s.kind() {
+        fb::JobStatusKind::Scheduled => JobStatusKind::Scheduled,
+        fb::JobStatusKind::Running => JobStatusKind::Running,
+        fb::JobStatusKind::Failed => JobStatusKind::Failed,
+        fb::JobStatusKind::Cancelled => JobStatusKind::Cancelled,
+        fb::JobStatusKind::Succeeded => JobStatusKind::Succeeded,
+        _ => {
+            return Err(CodecError::Flatbuffer(format!(
+                "unknown status kind: {:?}",
+                s.kind()
+            )));
+        }
+    };
+    Ok(JobStatus {
+        kind,
+        changed_at_ms: s.changed_at_ms(),
+        next_attempt_starts_after_ms: s.next_attempt_starts_after_ms(),
+        current_attempt: s.current_attempt(),
+    })
 }
 
-/// Decoded job status that owns its aligned data
-#[derive(Clone)]
-pub struct DecodedJobStatus {
-    data: AlignedVec,
-}
-
-impl DecodedJobStatus {
-    pub fn archived(&self) -> &<JobStatus as Archive>::Archived {
-        // SAFETY: data was validated at construction in decode_job_status
-        unsafe { rkyv::archived_root::<JobStatus>(&self.data) }
-    }
-}
+// ---------------------------------------------------------------------------
+// Decode: HolderRecord (direct scalar extraction)
+// ---------------------------------------------------------------------------
 
 #[inline]
-pub fn decode_job_status(bytes: &[u8]) -> Result<DecodedJobStatus, CodecError> {
-    let data = strip_version(JOB_STATUS_VERSION, bytes)?;
-    // Validate the data
-    let _ = rkyv::check_archived_root::<JobStatus>(&data)
-        .map_err(|e| CodecError::Rkyv(e.to_string()))?;
-    Ok(DecodedJobStatus { data })
+pub fn decode_holder_granted_at_ms(bytes: &[u8]) -> Result<i64, CodecError> {
+    let h = flatbuffers::root::<fb::HolderRecord>(bytes)
+        .map_err(|e| CodecError::Flatbuffer(e.to_string()))?;
+    Ok(h.granted_at_ms())
 }
 
-#[inline]
-pub fn encode_holder(holder: &HolderRecord) -> Result<Vec<u8>, CodecError> {
-    let data =
-        rkyv::to_bytes::<HolderRecord, 256>(holder).map_err(|e| CodecError::Rkyv(e.to_string()))?;
-    Ok(prepend_version(HOLDER_RECORD_VERSION, data))
-}
+// ---------------------------------------------------------------------------
+// Decode: ConcurrencyAction (zero-copy wrapper)
+// ---------------------------------------------------------------------------
 
-/// Decoded holder record that owns its aligned data
-#[derive(Clone)]
-pub struct DecodedHolder {
-    data: AlignedVec,
-}
-
-impl DecodedHolder {
-    pub fn archived(&self) -> &<HolderRecord as Archive>::Archived {
-        // SAFETY: data was validated at construction in decode_holder
-        unsafe { rkyv::archived_root::<HolderRecord>(&self.data) }
-    }
-
-    /// Get the granted_at time from this holder record
-    pub fn granted_at_ms(&self) -> i64 {
-        self.archived().granted_at_ms
-    }
-}
-
-#[inline]
-pub fn decode_holder(bytes: &[u8]) -> Result<DecodedHolder, CodecError> {
-    let data = strip_version(HOLDER_RECORD_VERSION, bytes)?;
-    // Validate the data
-    let _ = rkyv::check_archived_root::<HolderRecord>(&data)
-        .map_err(|e| CodecError::Rkyv(e.to_string()))?;
-    Ok(DecodedHolder { data })
-}
-
-#[inline]
-pub fn encode_concurrency_action(action: &ConcurrencyAction) -> Result<Vec<u8>, CodecError> {
-    let data = rkyv::to_bytes::<ConcurrencyAction, 256>(action)
-        .map_err(|e| CodecError::Rkyv(e.to_string()))?;
-    Ok(prepend_version(CONCURRENCY_ACTION_VERSION, data))
-}
-
-/// Decoded concurrency action that owns its aligned data
 #[derive(Clone)]
 pub struct DecodedConcurrencyAction {
-    data: AlignedVec,
+    data: Vec<u8>,
 }
 
 impl DecodedConcurrencyAction {
-    pub fn archived(&self) -> &<ConcurrencyAction as Archive>::Archived {
-        // SAFETY: data was validated at construction in decode_concurrency_action
-        unsafe { rkyv::archived_root::<ConcurrencyAction>(&self.data) }
+    pub fn fb(&self) -> fb::ConcurrencyAction<'_> {
+        unsafe { flatbuffers::root_unchecked::<fb::ConcurrencyAction>(&self.data) }
     }
 }
 
 #[inline]
 pub fn decode_concurrency_action(bytes: &[u8]) -> Result<DecodedConcurrencyAction, CodecError> {
-    let data = strip_version(CONCURRENCY_ACTION_VERSION, bytes)?;
-    // Validate the data
-    let _ = rkyv::check_archived_root::<ConcurrencyAction>(&data)
-        .map_err(|e| CodecError::Rkyv(e.to_string()))?;
-    Ok(DecodedConcurrencyAction { data })
+    flatbuffers::root::<fb::ConcurrencyAction>(bytes)
+        .map_err(|e| CodecError::Flatbuffer(e.to_string()))?;
+    Ok(DecodedConcurrencyAction {
+        data: bytes.to_vec(),
+    })
 }
+
+// ---------------------------------------------------------------------------
+// Decode: JobCancellation (direct scalar extraction)
+// ---------------------------------------------------------------------------
 
 #[inline]
-pub fn encode_job_cancellation(cancellation: &JobCancellation) -> Result<Vec<u8>, CodecError> {
-    let data = rkyv::to_bytes::<JobCancellation, 64>(cancellation)
-        .map_err(|e| CodecError::Rkyv(e.to_string()))?;
-    Ok(prepend_version(JOB_CANCELLATION_VERSION, data))
+pub fn decode_cancellation_at_ms(bytes: &[u8]) -> Result<i64, CodecError> {
+    let c = flatbuffers::root::<fb::JobCancellation>(bytes)
+        .map_err(|e| CodecError::Flatbuffer(e.to_string()))?;
+    Ok(c.cancelled_at_ms())
 }
 
-/// Decoded job cancellation that owns its aligned data
-#[derive(Clone)]
-pub struct DecodedJobCancellation {
-    data: AlignedVec,
-}
+// ---------------------------------------------------------------------------
+// Decode: FloatingLimitState (zero-copy wrapper with field accessors)
+// ---------------------------------------------------------------------------
 
-impl DecodedJobCancellation {
-    pub fn archived(&self) -> &<JobCancellation as Archive>::Archived {
-        // SAFETY: data was validated at construction in decode_job_cancellation
-        unsafe { rkyv::archived_root::<JobCancellation>(&self.data) }
-    }
-}
-
-#[inline]
-pub fn decode_job_cancellation(bytes: &[u8]) -> Result<DecodedJobCancellation, CodecError> {
-    let data = strip_version(JOB_CANCELLATION_VERSION, bytes)?;
-    // Validate the data
-    let _ = rkyv::check_archived_root::<JobCancellation>(&data)
-        .map_err(|e| CodecError::Rkyv(e.to_string()))?;
-    Ok(DecodedJobCancellation { data })
-}
-
-use crate::job::FloatingLimitState;
-
-/// Version for FloatingLimitState serialization format
-pub const FLOATING_LIMIT_STATE_VERSION: u8 = 1;
-
-#[inline]
-pub fn encode_floating_limit_state(state: &FloatingLimitState) -> Result<Vec<u8>, CodecError> {
-    let data = rkyv::to_bytes::<FloatingLimitState, 256>(state)
-        .map_err(|e| CodecError::Rkyv(e.to_string()))?;
-    Ok(prepend_version(FLOATING_LIMIT_STATE_VERSION, data))
-}
-
-/// Decoded floating limit state that owns its aligned data
 #[derive(Clone)]
 pub struct DecodedFloatingLimitState {
-    data: AlignedVec,
+    data: Vec<u8>,
 }
 
 impl DecodedFloatingLimitState {
-    pub fn archived(&self) -> &<FloatingLimitState as Archive>::Archived {
-        // SAFETY: data was validated at construction in decode_floating_limit_state
-        unsafe { rkyv::archived_root::<FloatingLimitState>(&self.data) }
+    fn fb(&self) -> fb::FloatingLimitState<'_> {
+        unsafe { flatbuffers::root_unchecked::<fb::FloatingLimitState>(&self.data) }
+    }
+
+    pub fn current_max_concurrency(&self) -> u32 {
+        self.fb().current_max_concurrency()
+    }
+
+    pub fn last_refreshed_at_ms(&self) -> i64 {
+        self.fb().last_refreshed_at_ms()
+    }
+
+    pub fn refresh_task_scheduled(&self) -> bool {
+        self.fb().refresh_task_scheduled()
+    }
+
+    pub fn refresh_interval_ms(&self) -> i64 {
+        self.fb().refresh_interval_ms()
+    }
+
+    pub fn default_max_concurrency(&self) -> u32 {
+        self.fb().default_max_concurrency()
+    }
+
+    pub fn retry_count(&self) -> u32 {
+        self.fb().retry_count()
+    }
+
+    pub fn next_retry_at_ms(&self) -> Option<i64> {
+        self.fb().next_retry_at_ms()
+    }
+
+    pub fn metadata(&self) -> Vec<(String, String)> {
+        self.fb()
+            .metadata()
+            .map(|v| {
+                v.iter()
+                    .map(|kv| {
+                        (
+                            kv.key().unwrap_or_default().to_string(),
+                            kv.value().unwrap_or_default().to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Materialize an owned FloatingLimitState from the FlatBuffer data.
+    pub fn to_owned(&self) -> FloatingLimitState {
+        let f = self.fb();
+        FloatingLimitState {
+            current_max_concurrency: f.current_max_concurrency(),
+            last_refreshed_at_ms: f.last_refreshed_at_ms(),
+            refresh_task_scheduled: f.refresh_task_scheduled(),
+            refresh_interval_ms: f.refresh_interval_ms(),
+            default_max_concurrency: f.default_max_concurrency(),
+            retry_count: f.retry_count(),
+            next_retry_at_ms: f.next_retry_at_ms(),
+            metadata: self.metadata(),
+        }
     }
 }
 
 #[inline]
 pub fn decode_floating_limit_state(bytes: &[u8]) -> Result<DecodedFloatingLimitState, CodecError> {
-    let data = strip_version(FLOATING_LIMIT_STATE_VERSION, bytes)?;
-    // Validate the data
-    let _ = rkyv::check_archived_root::<FloatingLimitState>(&data)
-        .map_err(|e| CodecError::Rkyv(e.to_string()))?;
-    Ok(DecodedFloatingLimitState { data })
+    flatbuffers::root::<fb::FloatingLimitState>(bytes)
+        .map_err(|e| CodecError::Flatbuffer(e.to_string()))?;
+    Ok(DecodedFloatingLimitState {
+        data: bytes.to_vec(),
+    })
 }

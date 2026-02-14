@@ -506,13 +506,12 @@ impl JobStoreShard {
         };
 
         let decoded_state = decode_floating_limit_state(&raw)?;
-        let archived = decoded_state.archived();
 
         // Reset the state to allow a new refresh to be scheduled
         // We don't increment retry_count here - we rely on the normal periodic refresh mechanism
         let new_state = FloatingLimitState {
             refresh_task_scheduled: false,
-            ..FloatingLimitState::from_archived(archived)
+            ..decoded_state.to_owned()
         };
 
         let mut batch = WriteBatch::new();

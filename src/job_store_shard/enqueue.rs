@@ -496,7 +496,7 @@ impl JobStoreShard {
                     // Try immediate grant using current max concurrency
                     let temp_cl = crate::job::ConcurrencyLimit {
                         key: fl.key.clone(),
-                        max_concurrency: state.archived().current_max_concurrency,
+                        max_concurrency: state.current_max_concurrency(),
                     };
 
                     let outcome = self

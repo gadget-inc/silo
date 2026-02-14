@@ -600,20 +600,17 @@ impl ConcurrencyManager {
             let mut granted_job_id: Option<String> = None;
 
             while let Some(kv) = iter.next().await? {
-                type ArchivedAction = <ConcurrencyAction as rkyv::Archive>::Archived;
                 let decoded = decode_concurrency_action(&kv.value)?;
-                let a: &ArchivedAction = decoded.archived();
-                match a {
-                    ArchivedAction::EnqueueTask {
-                        start_time_ms,
-                        priority,
-                        job_id,
-                        attempt_number,
-                        relative_attempt_number,
-                        task_group,
-                    } => {
-                        let job_id_str = job_id.as_str();
-                        let task_group_str = task_group.as_str();
+                let a = decoded.fb();
+                let et = a.variant_as_enqueue_task();
+                if let Some(et) = et {
+                    {
+                        let start_time_ms = et.start_time_ms();
+                        let priority = et.priority();
+                        let job_id_str = et.job_id().unwrap_or_default();
+                        let attempt_number = et.attempt_number();
+                        let relative_attempt_number = et.relative_attempt_number();
+                        let task_group_str = et.task_group().unwrap_or_default();
 
                         // [SILO-GRANT-CXL] Check if job is cancelled - if so, delete request and continue
                         let cancelled_key = job_cancelled_key(tenant, job_id_str);
@@ -656,7 +653,7 @@ impl ConcurrencyManager {
                         };
                         let request_id = parsed_req.request_id;
 
-                        if *start_time_ms > now_ms {
+                        if start_time_ms > now_ms {
                             // Not ready yet; leave request for later and stop searching
                             // (requests are ordered by time, so subsequent ones are also not ready)
                             break;
@@ -677,8 +674,8 @@ impl ConcurrencyManager {
                             id: request_id.clone(),
                             tenant: tenant.to_string(),
                             job_id: job_id_str.to_string(),
-                            attempt_number: *attempt_number,
-                            relative_attempt_number: *relative_attempt_number,
+                            attempt_number,
+                            relative_attempt_number,
                             held_queues: vec![queue.clone()],
                             task_group: task_group_str.to_string(),
                         };
@@ -686,10 +683,10 @@ impl ConcurrencyManager {
                         batch.put(
                             task_key(
                                 task_group_str,
-                                *start_time_ms,
-                                *priority,
+                                start_time_ms,
+                                priority,
                                 job_id_str,
-                                *attempt_number,
+                                attempt_number,
                             ),
                             &tval,
                         );

@@ -1,8 +1,5 @@
-use rkyv::Archive;
-use rkyv::Deserialize as RkyvDeserialize;
-use rkyv::Serialize as RkyvSerialize;
-
 use crate::codec::{CodecError, DecodedAttempt, decode_attempt};
+use crate::fb::silo::fb;
 use crate::job_store_shard::JobStoreShardError;
 
 fn codec_error_to_shard_error(e: CodecError) -> JobStoreShardError {
@@ -25,8 +22,7 @@ pub enum AttemptOutcome {
 }
 
 /// Attempt status lifecycle
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone)]
 pub enum AttemptStatus {
     Running,
     Succeeded {
@@ -45,8 +41,7 @@ pub enum AttemptStatus {
 }
 
 /// Stored representation of a job attempt
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone)]
 pub struct JobAttempt {
     pub job_id: String,
     /// Total attempt number (monotonically increasing, 1-based)
@@ -60,7 +55,7 @@ pub struct JobAttempt {
     pub status: AttemptStatus,
 }
 
-/// Zero-copy view alias over an archived `JobAttempt` backed by owned aligned data.
+/// Zero-copy view alias over a FlatBuffer `JobAttempt` backed by owned data.
 #[derive(Clone)]
 pub struct JobAttemptView {
     decoded: DecodedAttempt,
@@ -83,49 +78,43 @@ impl JobAttemptView {
         Ok(Self { decoded })
     }
 
-    pub(crate) fn archived(&self) -> &<JobAttempt as Archive>::Archived {
-        self.decoded.archived()
+    fn fb(&self) -> fb::JobAttempt<'_> {
+        self.decoded.fb()
     }
 
     pub fn job_id(&self) -> &str {
-        self.archived().job_id.as_str()
+        self.fb().job_id().unwrap_or_default()
     }
     pub fn attempt_number(&self) -> u32 {
-        self.archived().attempt_number
+        self.fb().attempt_number()
     }
     pub fn relative_attempt_number(&self) -> u32 {
-        self.archived().relative_attempt_number
+        self.fb().relative_attempt_number()
     }
     pub fn task_id(&self) -> &str {
-        self.archived().task_id.as_str()
+        self.fb().task_id().unwrap_or_default()
     }
     pub fn started_at_ms(&self) -> i64 {
-        self.archived().started_at_ms
+        self.fb().started_at_ms()
     }
 
     pub fn state(&self) -> AttemptStatus {
-        pub(crate) type ArchivedAttemptState = <AttemptStatus as Archive>::Archived;
-        match &self.archived().status {
-            ArchivedAttemptState::Running => AttemptStatus::Running,
-            ArchivedAttemptState::Succeeded {
-                finished_at_ms,
-                result,
-            } => AttemptStatus::Succeeded {
-                finished_at_ms: *finished_at_ms,
-                result: result.to_vec(),
+        let a = self.fb();
+        match a.status_kind() {
+            fb::AttemptStatusKind::Running => AttemptStatus::Running,
+            fb::AttemptStatusKind::Succeeded => AttemptStatus::Succeeded {
+                finished_at_ms: a.finished_at_ms().unwrap_or(0),
+                result: a.result().map(|v| v.bytes().to_vec()).unwrap_or_default(),
             },
-            ArchivedAttemptState::Failed {
-                finished_at_ms,
-                error_code,
-                error,
-            } => AttemptStatus::Failed {
-                finished_at_ms: *finished_at_ms,
-                error_code: error_code.as_str().to_string(),
-                error: error.to_vec(),
+            fb::AttemptStatusKind::Failed => AttemptStatus::Failed {
+                finished_at_ms: a.finished_at_ms().unwrap_or(0),
+                error_code: a.error_code().unwrap_or_default().to_string(),
+                error: a.error().map(|v| v.bytes().to_vec()).unwrap_or_default(),
             },
-            ArchivedAttemptState::Cancelled { finished_at_ms } => AttemptStatus::Cancelled {
-                finished_at_ms: *finished_at_ms,
+            fb::AttemptStatusKind::Cancelled => AttemptStatus::Cancelled {
+                finished_at_ms: a.finished_at_ms().unwrap_or(0),
             },
+            _ => AttemptStatus::Running, // fallback for unknown variants
         }
     }
 }

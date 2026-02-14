@@ -1,11 +1,10 @@
 mod test_helpers;
 
-use rkyv::Archive;
 use silo::codec::{decode_lease, encode_lease};
 use silo::job::JobStatusKind;
 use silo::job_attempt::{AttemptOutcome, AttemptStatus};
 use silo::job_store_shard::JobStoreShardError;
-use silo::task::{LeaseRecord, Task};
+use silo::task::LeaseRecord;
 
 use test_helpers::*;
 
@@ -329,39 +328,13 @@ async fn reap_expired_lease_cancelled_job_sets_cancelled_status() {
 
         // Find the lease and rewrite expiry to the past (simulate worker crash)
         let (lease_key, lease_value) = first_lease_kv(shard.db()).await.expect("lease present");
-        type ArchivedTask = <Task as Archive>::Archived;
         let decoded = decode_lease(&lease_value).expect("decode lease");
-        let archived = decoded.archived();
-        let task = match &archived.task {
-            ArchivedTask::RunAttempt {
-                id,
-                tenant,
-                job_id,
-                attempt_number,
-                relative_attempt_number,
-                held_queues: _,
-                ..
-            } => Task::RunAttempt {
-                id: id.as_str().to_string(),
-                tenant: tenant.as_str().to_string(),
-                job_id: job_id.as_str().to_string(),
-                attempt_number: *attempt_number,
-                relative_attempt_number: *relative_attempt_number,
-                held_queues: Vec::new(),
-                task_group: "default".to_string(),
-            },
-            ArchivedTask::RequestTicket { .. } => panic!("unexpected RequestTicket in lease"),
-            ArchivedTask::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in lease"),
-            ArchivedTask::RefreshFloatingLimit { .. } => {
-                panic!("unexpected RefreshFloatingLimit in lease")
-            }
-        };
         let expired_ms = now_ms() - 1;
         let new_record = LeaseRecord {
-            worker_id: archived.worker_id.as_str().to_string(),
-            task,
+            worker_id: decoded.worker_id().to_string(),
+            task: decoded.to_task(),
             expiry_ms: expired_ms,
-            started_at_ms: archived.started_at_ms,
+            started_at_ms: decoded.started_at_ms(),
         };
         let new_val = encode_lease(&new_record).unwrap();
         shard

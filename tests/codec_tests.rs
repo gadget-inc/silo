@@ -1,10 +1,7 @@
-use rkyv::Deserialize as RkyvDeserialize;
 use silo::codec::{
-    CONCURRENCY_ACTION_VERSION, CodecError, FLOATING_LIMIT_STATE_VERSION, HOLDER_RECORD_VERSION,
-    JOB_ATTEMPT_VERSION, JOB_CANCELLATION_VERSION, JOB_INFO_VERSION, JOB_STATUS_VERSION,
-    LEASE_RECORD_VERSION, TASK_VERSION, decode_attempt, decode_concurrency_action,
-    decode_floating_limit_state, decode_holder, decode_job_cancellation, decode_job_info,
-    decode_job_status, decode_lease, decode_task, encode_attempt, encode_concurrency_action,
+    decode_attempt, decode_cancellation_at_ms, decode_concurrency_action,
+    decode_floating_limit_state, decode_holder_granted_at_ms, decode_job_info,
+    decode_job_status_owned, decode_lease, decode_task, encode_attempt, encode_concurrency_action,
     encode_floating_limit_state, encode_holder, encode_job_cancellation, encode_job_info,
     encode_job_status, encode_lease, encode_task,
 };
@@ -24,7 +21,6 @@ fn test_task_roundtrip() {
         task_group: "default".to_string(),
     };
     let encoded = encode_task(&task).unwrap();
-    assert_eq!(encoded[0], TASK_VERSION);
     let decoded = decode_task(&encoded).unwrap();
     match decoded {
         Task::RunAttempt {
@@ -49,32 +45,15 @@ fn test_task_roundtrip() {
 }
 
 #[silo::test]
-fn test_version_mismatch() {
-    let task = Task::RunAttempt {
-        id: "task-1".to_string(),
-        tenant: "-".to_string(),
-        job_id: "job-1".to_string(),
-        attempt_number: 1,
-        relative_attempt_number: 1,
-        held_queues: vec![],
-        task_group: "default".to_string(),
-    };
-    let mut encoded = encode_task(&task).unwrap();
-    encoded[0] = 99; // Wrong version
-    let result = decode_task(&encoded);
-    assert!(matches!(
-        result,
-        Err(CodecError::UnsupportedVersion {
-            expected: 1,
-            found: 99
-        })
-    ));
+fn test_invalid_data() {
+    let result = decode_task(&[0xFF, 0xFF]);
+    assert!(result.is_err());
 }
 
 #[silo::test]
 fn test_empty_data() {
     let result = decode_task(&[]);
-    assert!(matches!(result, Err(CodecError::TooShort)));
+    assert!(result.is_err());
 }
 
 #[silo::test]
@@ -94,11 +73,10 @@ fn test_lease_roundtrip() {
         started_at_ms: 10000,
     };
     let encoded = encode_lease(&lease).unwrap();
-    assert_eq!(encoded[0], LEASE_RECORD_VERSION);
     let decoded = decode_lease(&encoded).unwrap();
-    let archived = decoded.archived();
-    assert_eq!(archived.worker_id.as_str(), "worker-1");
-    assert_eq!(archived.expiry_ms, 12345);
+    assert_eq!(decoded.worker_id(), "worker-1");
+    assert_eq!(decoded.expiry_ms(), 12345);
+    assert_eq!(decoded.started_at_ms(), 10000);
 }
 
 #[silo::test]
@@ -112,26 +90,19 @@ fn test_job_attempt_roundtrip() {
         status: AttemptStatus::Running,
     };
     let encoded = encode_attempt(&attempt).unwrap();
-    assert_eq!(encoded[0], JOB_ATTEMPT_VERSION);
     let decoded = decode_attempt(&encoded).unwrap();
-    let archived = decoded.archived();
-    assert_eq!(archived.job_id.as_str(), "job-1");
-    assert_eq!(archived.attempt_number, 1);
+    let fb = decoded.fb();
+    assert_eq!(fb.job_id().unwrap(), "job-1");
+    assert_eq!(fb.attempt_number(), 1);
 }
 
 #[silo::test]
 fn test_job_status_roundtrip() {
     let status = JobStatus::running(5000);
     let encoded = encode_job_status(&status).unwrap();
-    assert_eq!(encoded[0], JOB_STATUS_VERSION);
-    let decoded = decode_job_status(&encoded).unwrap();
-    let archived = decoded.archived();
-    // Use deserialize to get back the original type for comparison
-    let mut des = rkyv::Infallible;
-    let deserialized: JobStatus = RkyvDeserialize::deserialize(archived, &mut des)
-        .unwrap_or_else(|_| unreachable!("infallible deserialization for JobStatus"));
-    assert_eq!(deserialized.kind, JobStatusKind::Running);
-    assert_eq!(deserialized.changed_at_ms, 5000i64);
+    let decoded = decode_job_status_owned(&encoded).unwrap();
+    assert_eq!(decoded.kind, JobStatusKind::Running);
+    assert_eq!(decoded.changed_at_ms, 5000i64);
 }
 
 #[silo::test]
@@ -140,9 +111,8 @@ fn test_holder_roundtrip() {
         granted_at_ms: 9999,
     };
     let encoded = encode_holder(&holder).unwrap();
-    assert_eq!(encoded[0], HOLDER_RECORD_VERSION);
-    let decoded = decode_holder(&encoded).unwrap();
-    assert_eq!(decoded.archived().granted_at_ms, 9999);
+    let granted_at_ms = decode_holder_granted_at_ms(&encoded).unwrap();
+    assert_eq!(granted_at_ms, 9999);
 }
 
 #[silo::test]
@@ -156,25 +126,14 @@ fn test_concurrency_action_roundtrip() {
         task_group: "default".to_string(),
     };
     let encoded = encode_concurrency_action(&action).unwrap();
-    assert_eq!(encoded[0], CONCURRENCY_ACTION_VERSION);
     let decoded = decode_concurrency_action(&encoded).unwrap();
-    match decoded.archived() {
-        silo::task::ArchivedConcurrencyAction::EnqueueTask {
-            start_time_ms,
-            priority,
-            job_id,
-            attempt_number,
-            relative_attempt_number,
-            task_group,
-        } => {
-            assert_eq!(*start_time_ms, 1000);
-            assert_eq!(*priority, 5);
-            assert_eq!(job_id.as_str(), "job-1");
-            assert_eq!(*attempt_number, 1);
-            assert_eq!(*relative_attempt_number, 1);
-            assert_eq!(task_group.as_str(), "default");
-        }
-    }
+    let et = decoded.fb().variant_as_enqueue_task().unwrap();
+    assert_eq!(et.start_time_ms(), 1000);
+    assert_eq!(et.priority(), 5);
+    assert_eq!(et.job_id().unwrap(), "job-1");
+    assert_eq!(et.attempt_number(), 1);
+    assert_eq!(et.relative_attempt_number(), 1);
+    assert_eq!(et.task_group().unwrap(), "default");
 }
 
 #[silo::test]
@@ -191,7 +150,6 @@ fn test_request_ticket_roundtrip() {
         task_group: "fast".to_string(),
     };
     let encoded = encode_task(&task).unwrap();
-    assert_eq!(encoded[0], TASK_VERSION);
     let decoded = decode_task(&encoded).unwrap();
     match decoded {
         Task::RequestTicket {
@@ -248,7 +206,6 @@ fn test_check_rate_limit_roundtrip() {
         task_group: "default".to_string(),
     };
     let encoded = encode_task(&task).unwrap();
-    assert_eq!(encoded[0], TASK_VERSION);
     let decoded = decode_task(&encoded).unwrap();
     match decoded {
         Task::CheckRateLimit {
@@ -307,7 +264,6 @@ fn test_refresh_floating_limit_roundtrip() {
         task_group: "workers".to_string(),
     };
     let encoded = encode_task(&task).unwrap();
-    assert_eq!(encoded[0], TASK_VERSION);
     let decoded = decode_task(&encoded).unwrap();
     match decoded {
         Task::RefreshFloatingLimit {
@@ -346,15 +302,14 @@ fn test_job_info_roundtrip() {
         task_group: "default".to_string(),
     };
     let encoded = encode_job_info(&job_info).unwrap();
-    assert_eq!(encoded[0], JOB_INFO_VERSION);
     let decoded = decode_job_info(&encoded).unwrap();
-    let archived = decoded.archived();
-    assert_eq!(archived.id.as_str(), "job-info-1");
-    assert_eq!(archived.priority, 42);
-    assert_eq!(archived.enqueue_time_ms, 1700000000000);
-    assert_eq!(archived.payload.as_slice(), &[1, 2, 3, 4]);
-    assert_eq!(archived.metadata.len(), 1);
-    assert_eq!(archived.task_group.as_str(), "default");
+    let fb = decoded.fb();
+    assert_eq!(fb.id().unwrap(), "job-info-1");
+    assert_eq!(fb.priority(), 42);
+    assert_eq!(fb.enqueue_time_ms(), 1700000000000);
+    assert_eq!(fb.payload().unwrap().bytes(), &[1, 2, 3, 4]);
+    assert_eq!(fb.metadata().unwrap().len(), 1);
+    assert_eq!(fb.task_group().unwrap(), "default");
 }
 
 #[silo::test]
@@ -363,10 +318,8 @@ fn test_job_cancellation_roundtrip() {
         cancelled_at_ms: 9999999,
     };
     let encoded = encode_job_cancellation(&cancellation).unwrap();
-    assert_eq!(encoded[0], JOB_CANCELLATION_VERSION);
-    let decoded = decode_job_cancellation(&encoded).unwrap();
-    let archived = decoded.archived();
-    assert_eq!(archived.cancelled_at_ms, 9999999);
+    let cancelled_at_ms = decode_cancellation_at_ms(&encoded).unwrap();
+    assert_eq!(cancelled_at_ms, 9999999);
 }
 
 #[silo::test]
@@ -382,16 +335,14 @@ fn test_floating_limit_state_roundtrip() {
         metadata: vec![("source".to_string(), "api".to_string())],
     };
     let encoded = encode_floating_limit_state(&state).unwrap();
-    assert_eq!(encoded[0], FLOATING_LIMIT_STATE_VERSION);
     let decoded = decode_floating_limit_state(&encoded).unwrap();
-    let archived = decoded.archived();
-    assert_eq!(archived.current_max_concurrency, 10);
-    assert_eq!(archived.last_refreshed_at_ms, 5000);
-    assert_eq!(archived.refresh_task_scheduled, true);
-    assert_eq!(archived.refresh_interval_ms, 30000);
-    assert_eq!(archived.default_max_concurrency, 5);
-    assert_eq!(archived.retry_count, 2);
-    assert_eq!(archived.metadata.len(), 1);
+    assert_eq!(decoded.current_max_concurrency(), 10);
+    assert_eq!(decoded.last_refreshed_at_ms(), 5000);
+    assert_eq!(decoded.refresh_task_scheduled(), true);
+    assert_eq!(decoded.refresh_interval_ms(), 30000);
+    assert_eq!(decoded.default_max_concurrency(), 5);
+    assert_eq!(decoded.retry_count(), 2);
+    assert_eq!(decoded.metadata().len(), 1);
 }
 
 #[silo::test]
