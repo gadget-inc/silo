@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::codec::{
     decode_floating_limit_state, decode_lease, encode_attempt, encode_floating_limit_state,
-    encode_lease_with_new_expiry,
+    encode_lease,
 };
 use crate::dst_events::{self, DstEvent};
 use crate::job::{FloatingLimitState, JobStatus, JobView};
@@ -52,9 +52,15 @@ impl JobStoreShard {
         let job_id = decoded.job_id().to_string();
 
         // [SILO-HB-3] Renew by creating new record with updated expiry
-        // Zero-copy: reads all fields from existing lease FlatBuffer, only changes expiry_ms
         let new_expiry_ms = now_epoch_ms() + DEFAULT_LEASE_MS;
-        let value = encode_lease_with_new_expiry(&decoded, new_expiry_ms)?;
+        let task = decoded.to_task()?;
+        let record = crate::task::LeaseRecord {
+            worker_id: worker_id.to_string(),
+            task,
+            expiry_ms: new_expiry_ms,
+            started_at_ms: decoded.started_at_ms(),
+        };
+        let value = encode_lease(&record);
 
         let mut batch = WriteBatch::new();
         batch.put(&key, &value);

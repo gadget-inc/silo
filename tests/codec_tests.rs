@@ -3,8 +3,7 @@ use silo::codec::{
     decode_floating_limit_state, decode_holder_granted_at_ms, decode_job_info,
     decode_job_status_owned, decode_lease, decode_task, decode_task_validated, encode_attempt,
     encode_concurrency_action, encode_floating_limit_state, encode_holder, encode_job_cancellation,
-    encode_job_info, encode_job_status, encode_lease, encode_lease_from_task_bytes,
-    encode_lease_with_new_expiry, encode_task,
+    encode_job_info, encode_job_status, encode_lease, encode_task,
 };
 use silo::job::{FloatingLimitState, JobCancellation, JobInfo, JobStatus, JobStatusKind};
 use silo::job_attempt::{AttemptStatus, JobAttempt};
@@ -343,7 +342,27 @@ fn test_floating_limit_state_roundtrip() {
     assert_eq!(decoded.refresh_interval_ms(), 30000);
     assert_eq!(decoded.default_max_concurrency(), 5);
     assert_eq!(decoded.retry_count(), 2);
+    assert_eq!(decoded.next_retry_at_ms(), Some(8000));
     assert_eq!(decoded.metadata().len(), 1);
+}
+
+#[silo::test]
+fn test_floating_limit_state_roundtrip_none_retry() {
+    let state = FloatingLimitState {
+        current_max_concurrency: 5,
+        last_refreshed_at_ms: 1000,
+        refresh_task_scheduled: false,
+        refresh_interval_ms: 30000,
+        default_max_concurrency: 5,
+        retry_count: 0,
+        next_retry_at_ms: None,
+        metadata: vec![],
+    };
+    let encoded = encode_floating_limit_state(&state);
+    let decoded = decode_floating_limit_state(encoded).unwrap();
+    assert_eq!(decoded.next_retry_at_ms(), None);
+    assert_eq!(decoded.retry_count(), 0);
+    assert!(decoded.metadata().is_empty());
 }
 
 #[silo::test]
@@ -570,154 +589,5 @@ fn test_decoded_task_as_bytes_passthrough() {
 #[silo::test]
 fn test_decoded_task_invalid_data() {
     let result = decode_task_validated(vec![0xFF, 0xFF]);
-    assert!(result.is_err());
-}
-
-// ---------------------------------------------------------------------------
-// encode_lease_with_new_expiry tests
-// ---------------------------------------------------------------------------
-
-#[silo::test]
-fn test_encode_lease_with_new_expiry() {
-    let lease = LeaseRecord {
-        worker_id: "w-exp".to_string(),
-        task: Task::RunAttempt {
-            id: "t-exp".to_string(),
-            tenant: "tenant-exp".to_string(),
-            job_id: "j-exp".to_string(),
-            attempt_number: 2,
-            relative_attempt_number: 1,
-            held_queues: vec!["hq1".to_string()],
-            task_group: "grp".to_string(),
-        },
-        expiry_ms: 10000,
-        started_at_ms: 5000,
-    };
-    let encoded = encode_lease(&lease);
-    let decoded = decode_lease(encoded).unwrap();
-
-    // Encode with new expiry
-    let new_encoded = encode_lease_with_new_expiry(&decoded, 99999).unwrap();
-    let re_decoded = decode_lease(new_encoded).unwrap();
-
-    // Verify only expiry changed
-    assert_eq!(re_decoded.worker_id(), "w-exp");
-    assert_eq!(re_decoded.expiry_ms(), 99999);
-    assert_eq!(re_decoded.started_at_ms(), 5000);
-    assert_eq!(re_decoded.tenant(), "tenant-exp");
-    assert_eq!(re_decoded.job_id(), "j-exp");
-    assert_eq!(re_decoded.attempt_number(), 2);
-    assert_eq!(re_decoded.relative_attempt_number(), 1);
-    assert_eq!(re_decoded.held_queues(), vec!["hq1"]);
-    assert_eq!(re_decoded.task_group(), "grp");
-    assert_eq!(re_decoded.task_id(), Some("t-exp"));
-}
-
-#[silo::test]
-fn test_encode_lease_with_new_expiry_refresh_floating_limit() {
-    let lease = LeaseRecord {
-        worker_id: "w-rfl".to_string(),
-        task: Task::RefreshFloatingLimit {
-            task_id: "rfl-exp".to_string(),
-            tenant: "t-rfl-exp".to_string(),
-            queue_key: "qk-exp".to_string(),
-            current_max_concurrency: 42,
-            last_refreshed_at_ms: 3000,
-            metadata: vec![("a".to_string(), "b".to_string())],
-            task_group: "workers".to_string(),
-        },
-        expiry_ms: 20000,
-        started_at_ms: 0,
-    };
-    let encoded = encode_lease(&lease);
-    let decoded = decode_lease(encoded).unwrap();
-
-    let new_encoded = encode_lease_with_new_expiry(&decoded, 55555).unwrap();
-    let re_decoded = decode_lease(new_encoded).unwrap();
-
-    assert_eq!(re_decoded.worker_id(), "w-rfl");
-    assert_eq!(re_decoded.expiry_ms(), 55555);
-    assert_eq!(re_decoded.tenant(), "t-rfl-exp");
-    let (task_id, queue_key) = re_decoded.refresh_floating_limit_info().unwrap();
-    assert_eq!(task_id, "rfl-exp");
-    assert_eq!(queue_key, "qk-exp");
-}
-
-// ---------------------------------------------------------------------------
-// encode_lease_from_task_bytes tests
-// ---------------------------------------------------------------------------
-
-#[silo::test]
-fn test_encode_lease_from_task_bytes() {
-    let task = Task::RunAttempt {
-        id: "t-from".to_string(),
-        tenant: "tenant-from".to_string(),
-        job_id: "j-from".to_string(),
-        attempt_number: 3,
-        relative_attempt_number: 2,
-        held_queues: vec!["hq-a".to_string(), "hq-b".to_string()],
-        task_group: "default".to_string(),
-    };
-    let task_bytes = encode_task(&task);
-
-    let lease_bytes =
-        encode_lease_from_task_bytes("worker-from", &task_bytes, 88888, 44444).unwrap();
-    let decoded = decode_lease(lease_bytes).unwrap();
-
-    assert_eq!(decoded.worker_id(), "worker-from");
-    assert_eq!(decoded.expiry_ms(), 88888);
-    assert_eq!(decoded.started_at_ms(), 44444);
-    assert_eq!(decoded.tenant(), "tenant-from");
-    assert_eq!(decoded.job_id(), "j-from");
-    assert_eq!(decoded.attempt_number(), 3);
-    assert_eq!(decoded.relative_attempt_number(), 2);
-    assert_eq!(decoded.held_queues(), vec!["hq-a", "hq-b"]);
-    assert_eq!(decoded.task_group(), "default");
-    assert_eq!(decoded.task_id(), Some("t-from"));
-}
-
-#[silo::test]
-fn test_encode_lease_from_task_bytes_check_rate_limit() {
-    let task = Task::CheckRateLimit {
-        task_id: "crl-from".to_string(),
-        tenant: "t-crl-from".to_string(),
-        job_id: "j-crl-from".to_string(),
-        attempt_number: 1,
-        relative_attempt_number: 1,
-        limit_index: 2,
-        rate_limit: GubernatorRateLimitData {
-            name: "rl-n".to_string(),
-            unique_key: "uk-n".to_string(),
-            limit: 50,
-            duration_ms: 30000,
-            hits: 2,
-            algorithm: 1,
-            behavior: 3,
-            retry_initial_backoff_ms: 200,
-            retry_max_backoff_ms: 10000,
-            retry_backoff_multiplier: 1.5,
-            retry_max_retries: 10,
-        },
-        retry_count: 3,
-        started_at_ms: 7777,
-        priority: 4,
-        held_queues: vec!["hq-x".to_string()],
-        task_group: "fast".to_string(),
-    };
-    let task_bytes = encode_task(&task);
-
-    let lease_bytes = encode_lease_from_task_bytes("w-crl", &task_bytes, 77777, 33333).unwrap();
-    let decoded = decode_lease(lease_bytes).unwrap();
-
-    assert_eq!(decoded.worker_id(), "w-crl");
-    assert_eq!(decoded.expiry_ms(), 77777);
-    assert_eq!(decoded.started_at_ms(), 33333);
-    assert_eq!(decoded.tenant(), "t-crl-from");
-    assert_eq!(decoded.task_group(), "fast");
-}
-
-#[silo::test]
-fn test_encode_lease_from_task_bytes_invalid() {
-    let result = encode_lease_from_task_bytes("w", &[0xFF, 0xFF], 0, 0);
     assert!(result.is_err());
 }

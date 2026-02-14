@@ -1,4 +1,4 @@
-use crate::codec::{CodecError, DecodedJobInfo, decode_job_info};
+use crate::codec::{CodecError, DecodedJobInfo, decode_job_info, fb_kv_pairs_to_owned};
 use crate::fb::silo::fb;
 use crate::job_store_shard::JobStoreShardError;
 use crate::retry::RetryPolicy;
@@ -341,19 +341,7 @@ impl JobView {
 
     /// Return metadata as owned key/value string pairs
     pub fn metadata(&self) -> Vec<(String, String)> {
-        self.fb()
-            .metadata()
-            .map(|v| {
-                v.iter()
-                    .map(|kv| {
-                        (
-                            kv.key().unwrap_or_default().to_string(),
-                            kv.value().unwrap_or_default().to_string(),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        fb_kv_pairs_to_owned(self.fb().metadata())
     }
 
     /// Return the ordered list of limits (concurrency, rate limits, and floating concurrency limits)
@@ -402,19 +390,7 @@ impl JobView {
                                 key: fl.key().unwrap_or_default().to_string(),
                                 default_max_concurrency: fl.default_max_concurrency(),
                                 refresh_interval_ms: fl.refresh_interval_ms(),
-                                metadata: fl
-                                    .metadata()
-                                    .map(|v| {
-                                        v.iter()
-                                            .map(|kv| {
-                                                (
-                                                    kv.key().unwrap_or_default().to_string(),
-                                                    kv.value().unwrap_or_default().to_string(),
-                                                )
-                                            })
-                                            .collect()
-                                    })
-                                    .unwrap_or_default(),
+                                metadata: fb_kv_pairs_to_owned(fl.metadata()),
                             }))
                         }
                         _ => None,

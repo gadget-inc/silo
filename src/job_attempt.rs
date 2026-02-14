@@ -114,7 +114,10 @@ impl JobAttemptView {
             fb::AttemptStatusKind::Cancelled => AttemptStatus::Cancelled {
                 finished_at_ms: a.finished_at_ms().unwrap_or(0),
             },
-            _ => AttemptStatus::Running, // fallback for unknown variants
+            other => {
+                tracing::warn!(kind = ?other, "unknown attempt status kind, treating as Running");
+                AttemptStatus::Running
+            }
         }
     }
 }
