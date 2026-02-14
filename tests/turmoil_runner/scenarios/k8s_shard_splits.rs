@@ -820,7 +820,7 @@ pub fn run() {
                         }
                     }
                 };
-                
+
                 // Remember shards we've seen for stale shard testing
                 for sid in &shard_ids {
                     if !seen_shards.contains(sid) {
@@ -839,39 +839,40 @@ pub fn run() {
                         continue;
                     }
                 };
-                
+
                 // Decide whether to intentionally use a stale shard
                 // This tests wrong-shard routing and error handling
-                let use_stale_shard = !seen_shards.is_empty() 
-                    && seen_shards.len() > shard_ids.len()  // Only if we've seen shards that no longer exist
+                let use_stale_shard = !seen_shards.is_empty()
+                    && seen_shards.len() > shard_ids.len() // Only if we've seen shards that no longer exist
                     && rng.random_bool(stale_shard_probability);
-                
+
                 let is_stale_send: bool;
 
                 // Find a shard with an owner, retrying if needed (e.g., during split transitions)
                 let (shard_id, tenant, target_node) = if use_stale_shard {
                     // Find a shard we've seen before that is NOT in current shard_ids (stale/split parent)
-                    let stale_shards: Vec<_> = seen_shards.iter()
+                    let stale_shards: Vec<_> = seen_shards
+                        .iter()
                         .filter(|sid| !shard_ids.contains(sid))
                         .collect();
-                    
+
                     if let Some(stale_shard) = stale_shards.first() {
                         is_stale_send = true;
                         producer_stale_sends.fetch_add(1, Ordering::SeqCst);
-                        
+
                         // Generate a random tenant (may not be valid for this shard)
                         let tenant = format!("stale-tenant-{}", i);
-                        
+
                         // Pick a random node to send to
                         let target_node = rng.random_range(0..num_nodes);
-                        
+
                         tracing::debug!(
                             job_id = %job_id,
                             stale_shard = %stale_shard,
                             target_node = target_node,
                             "intentionally using stale shard"
                         );
-                        
+
                         (**stale_shard, tenant, target_node)
                     } else {
                         // Fallback to normal path

@@ -915,8 +915,8 @@ async fn execute_split_abandons_on_clone_failure() {
     let num_shards: u32 = 1;
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
 
-    // Use a noop factory that doesn't support cloning - clone_shard will fail
-    // because no shards are actually open in the factory.
+    // Use a noop factory - reconciliation will open in-memory shards, but we
+    // close them before splitting so the split fails when the parent is not found.
     let factory = Arc::new(ShardFactory::new_noop());
 
     let (c1, h1) = EtcdCoordinator::start(
@@ -926,7 +926,7 @@ async fn execute_split_abandons_on_clone_failure() {
         "http://127.0.0.1:7450",
         num_shards,
         10,
-        factory,
+        Arc::clone(&factory),
         Vec::new(),
     )
     .await
@@ -937,6 +937,9 @@ async fn execute_split_abandons_on_clone_failure() {
     let shards = c1.owned_shards().await;
     let shard_id = shards[0];
 
+    // Close the shard so the split will fail when trying to find the parent
+    factory.close(&shard_id).await.unwrap();
+
     let splitter = ShardSplitter::new(Arc::new(c1.clone()));
 
     // Request a split
@@ -945,7 +948,7 @@ async fn execute_split_abandons_on_clone_failure() {
         .await
         .expect("request split should succeed");
 
-    // Execute should fail because clone_shard will fail
+    // Execute should fail because parent shard is not open in factory
     let result = splitter
         .execute_split(shard_id, || c1.get_shard_owner_map())
         .await;
@@ -1391,7 +1394,7 @@ mod splitter_unit_tests {
     async fn test_execute_split_abandons_on_clone_failure() {
         let shard_map = Arc::new(Mutex::new(ShardMap::create_initial(4).unwrap()));
         let owned = Arc::new(Mutex::new(HashSet::new()));
-        // noop factory has no open shards, so clone_shard will fail with ShardNotOpen
+        // noop factory has no open shards, so clone_closed_shard will fail
         let factory = Arc::new(ShardFactory::new_noop());
 
         let mock = Arc::new(MockSplitBackend::new(
@@ -1410,7 +1413,7 @@ mod splitter_unit_tests {
             .await
             .unwrap();
 
-        // execute_split should fail because clone_shard will fail (no open shards)
+        // execute_split should fail because clone_closed_shard will fail (no open shards)
         let result = splitter
             .execute_split(shard_id, || async {
                 Ok(ShardOwnerMap {

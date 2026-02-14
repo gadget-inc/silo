@@ -191,14 +191,15 @@ async fn reset_with_wal_config() {
     assert_eq!(counters.total_jobs, 0);
 }
 
-// --- clone_shard tests ---
+// --- clone_closed_shard tests ---
 
 #[silo::test]
-async fn clone_shard_creates_copy() {
+async fn clone_closed_shard_creates_copies() {
     let tmp = tempfile::tempdir().unwrap();
     let factory = make_fs_factory(&tmp);
     let parent_id = ShardId::new();
-    let child_id = ShardId::new();
+    let left_child_id = ShardId::new();
+    let right_child_id = ShardId::new();
 
     let parent = factory
         .open(&parent_id, &ShardRange::full())
@@ -221,50 +222,50 @@ async fn clone_shard_creates_copy() {
         .await
         .expect("enqueue to parent");
 
-    // Flush parent to ensure data is on disk
-    parent.db().flush().await.expect("flush parent");
+    // Close parent (clone_closed_shard expects it to be closed)
+    parent.close().await.expect("close parent");
 
-    // Clone the shard
+    // Clone the shard to both children
     factory
-        .clone_shard(&parent_id, &child_id)
+        .clone_closed_shard(&parent_id, &left_child_id, &right_child_id)
         .await
-        .expect("clone shard");
+        .expect("clone closed shard");
 
-    // Open the child and verify it has the same data
-    let child = factory
-        .open(&child_id, &ShardRange::full())
+    // Open the left child and verify it has the same data
+    let left_child = factory
+        .open(&left_child_id, &ShardRange::full())
         .await
-        .expect("open child");
+        .expect("open left child");
 
-    let child_counters = child.get_counters().await.expect("get child counters");
+    let left_counters = left_child
+        .get_counters()
+        .await
+        .expect("get left child counters");
     assert_eq!(
-        child_counters.total_jobs, 1,
-        "cloned shard should have the parent's job"
+        left_counters.total_jobs, 1,
+        "left child should have the parent's job"
     );
 
-    // Verify we can read the specific job
-    let job = child
+    // Verify we can read the specific job from the left child
+    let job = left_child
         .get_job("test-tenant", "cloned-job")
         .await
-        .expect("get job from child");
-    assert!(job.is_some(), "cloned shard should contain the job");
-}
+        .expect("get job from left child");
+    assert!(job.is_some(), "left child should contain the job");
 
-#[silo::test]
-async fn clone_shard_parent_not_open() {
-    let tmp = tempfile::tempdir().unwrap();
-    let factory = make_fs_factory(&tmp);
-    let parent_id = ShardId::new();
-    let child_id = ShardId::new();
+    // Open the right child and verify it also has the data
+    let right_child = factory
+        .open(&right_child_id, &ShardRange::full())
+        .await
+        .expect("open right child");
 
-    // Clone without opening parent should fail
-    let result = factory.clone_shard(&parent_id, &child_id).await;
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert!(
-        matches!(err, silo::factory::ShardFactoryError::ShardNotOpen(_)),
-        "expected ShardNotOpen, got {:?}",
-        err
+    let right_counters = right_child
+        .get_counters()
+        .await
+        .expect("get right child counters");
+    assert_eq!(
+        right_counters.total_jobs, 1,
+        "right child should have the parent's job"
     );
 }
 
