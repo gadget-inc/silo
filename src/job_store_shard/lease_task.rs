@@ -8,7 +8,7 @@ use slatedb::IsolationLevel;
 use slatedb::config::WriteOptions;
 use uuid::Uuid;
 
-use crate::codec::{decode_job_status, decode_task, encode_attempt, encode_lease};
+use crate::codec::{decode_job_status, encode_attempt, encode_lease, validate_task};
 use crate::job::{JobStatusKind, JobView};
 use crate::job_attempt::{AttemptStatus, JobAttempt, JobAttemptView};
 use crate::job_store_shard::helpers::{TxnWriter, now_epoch_ms, retry_on_txn_conflict};
@@ -79,7 +79,7 @@ impl JobStoreShard {
             return Err(JobStoreShardError::JobNotFound(id.to_string()));
         };
         let status = decode_job_status(&status_raw)?;
-        let status_kind = status.kind();
+        let status_kind = status.kind;
 
         // Validate: job must not be running
         if status_kind == JobStatusKind::Running {
@@ -120,14 +120,14 @@ impl JobStoreShard {
         let task_group = job_view.task_group().to_string();
 
         // Reconstruct the task key from status fields
-        let attempt_number = status.current_attempt().ok_or_else(|| {
+        let attempt_number = status.current_attempt.ok_or_else(|| {
             JobStoreShardError::JobNotLeaseable(JobNotLeaseableError {
                 job_id: id.to_string(),
                 status: status_kind,
                 reason: "job has no pending task".to_string(),
             })
         })?;
-        let start_time_ms = status.next_attempt_starts_after_ms().ok_or_else(|| {
+        let start_time_ms = status.next_attempt_starts_after_ms.ok_or_else(|| {
             JobStoreShardError::JobNotLeaseable(JobNotLeaseableError {
                 job_id: id.to_string(),
                 status: status_kind,
@@ -158,7 +158,7 @@ impl JobStoreShard {
             }
         };
         // Validate that the raw bytes decode to a valid task before replacing it.
-        let _ = decode_task(&task_raw)?;
+        validate_task(&task_raw)?;
 
         // Delete the pending task (regardless of type)
         txn.delete(&old_task_key)?;

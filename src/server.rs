@@ -93,18 +93,18 @@ fn proto_limit_to_job_limit(proto: Limit) -> Option<crate::job::Limit> {
 }
 
 /// Convert a job::Limit to a proto Limit
-pub fn job_limit_to_proto_limit(job_limit: crate::job::Limit) -> Limit {
+pub fn job_limit_to_proto_limit(job_limit: &crate::job::Limit) -> Limit {
     match job_limit {
         crate::job::Limit::Concurrency(c) => Limit {
             limit: Some(limit::Limit::Concurrency(ConcurrencyLimit {
-                key: c.key,
+                key: c.key.clone(),
                 max_concurrency: c.max_concurrency,
             })),
         },
         crate::job::Limit::RateLimit(r) => Limit {
             limit: Some(limit::Limit::RateLimit(crate::pb::GubernatorRateLimit {
-                name: r.name,
-                unique_key: r.unique_key,
+                name: r.name.clone(),
+                unique_key: r.unique_key.clone(),
                 limit: r.limit,
                 duration_ms: r.duration_ms,
                 hits: r.hits,
@@ -121,10 +121,14 @@ pub fn job_limit_to_proto_limit(job_limit: crate::job::Limit) -> Limit {
         crate::job::Limit::FloatingConcurrency(f) => Limit {
             limit: Some(limit::Limit::FloatingConcurrency(
                 crate::pb::FloatingConcurrencyLimit {
-                    key: f.key,
+                    key: f.key.clone(),
                     default_max_concurrency: f.default_max_concurrency,
                     refresh_interval_ms: f.refresh_interval_ms,
-                    metadata: f.metadata.into_iter().collect(),
+                    metadata: f
+                        .metadata
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
                 },
             )),
         },
@@ -220,11 +224,7 @@ fn leased_task_to_proto(lt: &crate::task::LeasedTask, shard_id: &str) -> Task {
         tenant_id,
         is_last_attempt,
         metadata: job.metadata().into_iter().collect(),
-        limits: job
-            .limits()
-            .into_iter()
-            .map(job_limit_to_proto_limit)
-            .collect(),
+        limits: job.limits().iter().map(job_limit_to_proto_limit).collect(),
         relative_attempt_number,
     }
 }
@@ -834,11 +834,7 @@ impl Silo for SiloService {
                 )),
             }),
             retry_policy,
-            limits: view
-                .limits()
-                .into_iter()
-                .map(job_limit_to_proto_limit)
-                .collect(),
+            limits: view.limits().iter().map(job_limit_to_proto_limit).collect(),
             metadata: view.metadata().into_iter().collect(),
             status: status.into(),
             status_changed_at_ms,

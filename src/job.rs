@@ -1,8 +1,7 @@
-use bytes::Bytes;
-
-use crate::codec::{DecodedJobInfo, decode_job_info_bytes};
-use crate::job_store_shard::JobStoreShardError;
 use crate::retry::RetryPolicy;
+
+// Re-export the codec's zero-copy JobView directly.
+pub use crate::codec::JobView;
 
 /// Cancellation record stored at job_cancelled/<tenant>/<job-id>.
 /// Cancellation is tracked separately from status to allow dequeue to blindly write Running without losing cancellation info.
@@ -244,23 +243,6 @@ impl JobStatus {
     }
 }
 
-/// Zero-copy view over serialized `JobInfo` bytes.
-#[derive(Clone)]
-pub struct JobView {
-    decoded: DecodedJobInfo,
-}
-
-impl std::fmt::Debug for JobView {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JobView")
-            .field("id", &self.id())
-            .field("priority", &self.priority())
-            .field("enqueue_time_ms", &self.enqueue_time_ms())
-            .field("task_group", &self.task_group())
-            .finish()
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct JobInfo {
     pub id: String,
@@ -271,71 +253,4 @@ pub struct JobInfo {
     pub metadata: Vec<(String, String)>,
     pub limits: Vec<Limit>, // Ordered list of limits to check before execution
     pub task_group: String, // Task group for organizing tasks. Immutable after enqueue.
-}
-
-impl JobView {
-    /// Validate bytes and construct a zero-copy view.
-    pub fn new(bytes: impl Into<Bytes>) -> Result<Self, JobStoreShardError> {
-        // Validate and decode up front; reject invalid data early.
-        let decoded = decode_job_info_bytes(bytes.into())?;
-        Ok(Self { decoded })
-    }
-
-    pub fn id(&self) -> &str {
-        self.decoded.id()
-    }
-
-    pub fn priority(&self) -> u8 {
-        self.decoded.priority()
-    }
-
-    pub fn enqueue_time_ms(&self) -> i64 {
-        self.decoded.enqueue_time_ms()
-    }
-
-    pub fn payload_bytes(&self) -> &[u8] {
-        self.decoded.payload_bytes()
-    }
-
-    pub fn task_group(&self) -> &str {
-        self.decoded.task_group()
-    }
-
-    /// Decode the payload from MessagePack bytes into a serde_json::Value for display.
-    pub fn payload_as_json(&self) -> Result<serde_json::Value, rmp_serde::decode::Error> {
-        rmp_serde::from_slice(self.payload_bytes())
-    }
-
-    /// Decode the payload from MessagePack bytes into a typed value.
-    pub fn payload_msgpack<T: serde::de::DeserializeOwned>(
-        &self,
-    ) -> Result<T, rmp_serde::decode::Error> {
-        rmp_serde::from_slice(self.payload_bytes())
-    }
-
-    /// Return the job's retry policy as a runtime struct.
-    pub fn retry_policy(&self) -> Option<RetryPolicy> {
-        self.decoded.retry_policy()
-    }
-
-    /// Return declared concurrency limits extracted from the limits field
-    pub fn concurrency_limits(&self) -> Vec<ConcurrencyLimit> {
-        self.limits()
-            .into_iter()
-            .filter_map(|l| match l {
-                Limit::Concurrency(c) => Some(c),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Return metadata as owned key/value string pairs
-    pub fn metadata(&self) -> Vec<(String, String)> {
-        self.decoded.metadata()
-    }
-
-    /// Return the ordered list of limits (concurrency, rate limits, and floating concurrency limits)
-    pub fn limits(&self) -> Vec<Limit> {
-        self.decoded.limits()
-    }
 }

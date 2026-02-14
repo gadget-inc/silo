@@ -632,7 +632,7 @@ impl ConcurrencyManager {
                             tracing::debug!(
                                 job_id = %job_id_str,
                                 queue = %queue,
-                                status = ?status.kind(),
+                                status = ?status.kind,
                                 "grant_next: skipping request for terminal job"
                             );
                             continue;

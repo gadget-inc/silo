@@ -5,8 +5,9 @@ use slatedb::{DbIterator, WriteBatch};
 use uuid::Uuid;
 
 use crate::codec::{
-    decode_floating_limit_state_bytes, decode_lease, encode_attempt, encode_floating_limit_state,
-    encode_lease, encode_lease_from_run_attempt,
+    DecodedTask, decode_floating_limit_state_bytes, decode_lease, encode_attempt,
+    encode_floating_limit_state, encode_lease, encode_lease_from_refresh_floating_limit,
+    encode_lease_from_run_attempt,
 };
 use crate::dst_events::{self, DstEvent};
 use crate::job::{FloatingLimitState, JobStatus, JobView};
@@ -53,22 +54,26 @@ impl JobStoreShard {
 
         // [SILO-HB-3] Renew by creating new record with updated expiry
         let expiry_ms = now_epoch_ms() + DEFAULT_LEASE_MS;
-        let value = if let Some(run_attempt) = decoded.run_attempt_task() {
-            encode_lease_from_run_attempt(
+        let value = match decoded.task() {
+            DecodedTask::RunAttempt(ra) => encode_lease_from_run_attempt(
                 current_owner,
-                run_attempt,
+                ra,
                 expiry_ms,
                 decoded.started_at_ms(),
-            )?
-        } else {
-            // Fallback for non-RunAttempt leases (for example refresh tasks).
-            let record = LeaseRecord {
-                worker_id: current_owner.to_string(),
-                task: decoded.to_task()?,
-                expiry_ms,
-                started_at_ms: decoded.started_at_ms(),
-            };
-            encode_lease(&record)?
+            )?,
+            DecodedTask::RefreshFloatingLimit(rf) => {
+                encode_lease_from_refresh_floating_limit(current_owner, rf, expiry_ms)?
+            }
+            _ => {
+                // Fallback for other lease types (e.g. CheckRateLimit, RequestTicket).
+                let record = LeaseRecord {
+                    worker_id: current_owner.to_string(),
+                    task: decoded.to_task()?,
+                    expiry_ms,
+                    started_at_ms: decoded.started_at_ms(),
+                };
+                encode_lease(&record)?
+            }
         };
 
         let mut batch = WriteBatch::new();
@@ -237,7 +242,7 @@ impl JobStoreShard {
                                     attempt_number: next_attempt_number,
                                     relative_attempt_number: next_relative_attempt_number,
                                     limit_index: 0,
-                                    limits: &limits,
+                                    limits,
                                     priority,
                                     start_at_ms: next_time,
                                     now_ms,

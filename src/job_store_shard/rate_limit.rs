@@ -2,19 +2,20 @@
 
 use uuid::Uuid;
 
+use crate::codec::encode_check_rate_limit_retry_from_task;
+use crate::flatbuf::silo_internal as fb;
 use crate::gubernator::{GubernatorError, RateLimitResult};
 use crate::job_store_shard::helpers::WriteBatcher;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::task_key;
 use crate::task::GubernatorRateLimitData;
-use crate::{codec::DecodedCheckRateLimitTask, codec::encode_check_rate_limit_retry_from_task};
 
 impl JobStoreShard {
     /// Schedule a rate-limit retry from a decoded task without materializing `Task::CheckRateLimit`.
     pub(crate) fn schedule_rate_limit_retry_from_task<W: WriteBatcher>(
         &self,
         writer: &mut W,
-        task: DecodedCheckRateLimitTask<'_>,
+        task: fb::TaskCheckRateLimit<'_>,
         retry_at_ms: i64,
     ) -> Result<(), JobStoreShardError> {
         let retry_task_id = Uuid::new_v4().to_string();
@@ -22,10 +23,10 @@ impl JobStoreShard {
             encode_check_rate_limit_retry_from_task(task, &retry_task_id, task.retry_count() + 1)?;
         writer.put(
             task_key(
-                task.task_group(),
+                task.task_group().unwrap_or_default(),
                 retry_at_ms,
                 task.priority(),
-                task.job_id(),
+                task.job_id().unwrap_or_default(),
                 task.attempt_number(),
             ),
             &value,

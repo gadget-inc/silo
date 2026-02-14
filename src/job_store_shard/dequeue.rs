@@ -4,19 +4,20 @@ use slatedb::config::WriteOptions;
 use slatedb::{DbIterator, WriteBatch};
 
 use crate::codec::{
-    DecodedCheckRateLimitTask, DecodedRefreshFloatingLimitTask, DecodedRequestTicketTask,
-    DecodedRunAttemptTask, DecodedTaskKind, decode_task, decode_task_view, encode_attempt,
-    encode_lease, encode_lease_from_request_ticket_grant, encode_lease_from_run_attempt,
+    CodecError, DecodedTask, decode_task, decode_task_view, encode_attempt,
+    encode_lease_from_refresh_floating_limit, encode_lease_from_request_ticket_grant,
+    encode_lease_from_run_attempt,
 };
 use crate::concurrency::{ReleaseGrantRollback, RequestTicketTaskOutcome};
 use crate::dst_events::{self, DstEvent};
+use crate::flatbuf::silo_internal as fb;
 use crate::job::{JobStatus, JobView};
 use crate::job_attempt::{AttemptStatus, JobAttempt, JobAttemptView};
 use crate::job_store_shard::helpers::{DbWriteBatcher, now_epoch_ms};
 use crate::job_store_shard::{DequeueResult, JobStoreShard, JobStoreShardError, LimitTaskParams};
 use crate::keys::{attempt_key, job_info_key, leased_task_key};
 use crate::shard_range::ShardRange;
-use crate::task::{DEFAULT_LEASE_MS, LeaseRecord, LeasedRefreshTask, LeasedTask, Task};
+use crate::task::{DEFAULT_LEASE_MS, LeasedRefreshTask, LeasedTask, Task};
 use crate::task_broker::BrokerTask;
 
 /// Mutable accumulators for a single dequeue iteration.
@@ -133,13 +134,8 @@ impl JobStoreShard {
                     continue;
                 }
 
-                match task.kind() {
-                    DecodedTaskKind::RequestTicket => {
-                        let Some(request_ticket) = task.request_ticket() else {
-                            return Err(JobStoreShardError::Serialization(
-                                "task kind/view mismatch for RequestTicket".to_string(),
-                            ));
-                        };
+                match task {
+                    DecodedTask::RequestTicket(request_ticket) => {
                         self.handle_request_ticket(
                             &mut state,
                             entry,
@@ -151,21 +147,11 @@ impl JobStoreShard {
                         )
                         .await?;
                     }
-                    DecodedTaskKind::CheckRateLimit => {
-                        let Some(check_rate_limit) = task.check_rate_limit() else {
-                            return Err(JobStoreShardError::Serialization(
-                                "task kind/view mismatch for CheckRateLimit".to_string(),
-                            ));
-                        };
+                    DecodedTask::CheckRateLimit(check_rate_limit) => {
                         self.handle_check_rate_limit(&mut state, entry, check_rate_limit, now_ms)
                             .await?;
                     }
-                    DecodedTaskKind::RefreshFloatingLimit => {
-                        let Some(refresh) = task.refresh_floating_limit() else {
-                            return Err(JobStoreShardError::Serialization(
-                                "task kind/view mismatch for RefreshFloatingLimit".to_string(),
-                            ));
-                        };
+                    DecodedTask::RefreshFloatingLimit(refresh) => {
                         self.handle_refresh_floating_limit(
                             &mut state,
                             &mut refresh_out,
@@ -175,12 +161,7 @@ impl JobStoreShard {
                             expiry_ms,
                         )?;
                     }
-                    DecodedTaskKind::RunAttempt => {
-                        let Some(run_attempt) = task.run_attempt() else {
-                            return Err(JobStoreShardError::Serialization(
-                                "task kind/view mismatch for RunAttempt".to_string(),
-                            ));
-                        };
+                    DecodedTask::RunAttempt(run_attempt) => {
                         self.handle_run_attempt(
                             &mut state,
                             entry,
@@ -350,18 +331,18 @@ impl JobStoreShard {
         &self,
         state: &mut DequeueIterationState,
         entry: &BrokerTask,
-        task: DecodedRequestTicketTask<'_>,
+        task: fb::TaskRequestTicket<'_>,
         shard_range: &ShardRange,
         worker_id: &str,
         now_ms: i64,
         expiry_ms: i64,
     ) -> Result<(), JobStoreShardError> {
-        let queue = task.queue();
-        let tenant = task.tenant();
-        let job_id = task.job_id();
+        let queue = task.queue().unwrap_or_default();
+        let tenant = task.tenant().unwrap_or_default();
+        let job_id = task.job_id().unwrap_or_default();
         let attempt_number = task.attempt_number();
         let relative_attempt_number = task.relative_attempt_number();
-        let request_id = task.request_id();
+        let request_id = task.request_id().unwrap_or_default();
         state.processed_internal = true;
         let tenant = tenant.to_string();
 
@@ -450,20 +431,23 @@ impl JobStoreShard {
         &self,
         state: &mut DequeueIterationState,
         entry: &BrokerTask,
-        task: DecodedCheckRateLimitTask<'_>,
+        task: fb::TaskCheckRateLimit<'_>,
         now_ms: i64,
     ) -> Result<(), JobStoreShardError> {
-        let check_task_id = task.task_id();
-        let tenant = task.tenant();
-        let job_id = task.job_id();
+        let check_task_id = task.task_id().unwrap_or_default();
+        let tenant = task.tenant().unwrap_or_default();
+        let job_id = task.job_id().unwrap_or_default();
         let attempt_number = task.attempt_number();
         let check_relative_attempt_number = task.relative_attempt_number();
         let limit_index = task.limit_index();
-        let rate_limit = task.rate_limit()?;
+        let fb_rate_limit = task
+            .rate_limit()
+            .ok_or(CodecError::MissingField("task.check_rate_limit.rate_limit"))?;
+        let rate_limit = crate::codec::parse_gubernator_rate_limit_data(fb_rate_limit)?;
         let retry_count = task.retry_count();
         let priority = task.priority();
-        let held_queues = task.held_queues();
-        let check_task_group = task.task_group();
+        let held_queues = crate::codec::parse_string_values(task.held_queues());
+        let check_task_group = task.task_group().unwrap_or_default();
         state.processed_internal = true;
         let tenant = tenant.to_string();
         state.batch.delete(&entry.key);
@@ -496,7 +480,7 @@ impl JobStoreShard {
                             attempt_number,
                             relative_attempt_number: check_relative_attempt_number,
                             limit_index: (limit_index + 1) as usize,
-                            limits: &job_view.limits(),
+                            limits: job_view.limits(),
                             priority,
                             start_at_ms: now_ms,
                             now_ms,
@@ -557,36 +541,19 @@ impl JobStoreShard {
         state: &mut DequeueIterationState,
         refresh_out: &mut Vec<LeasedRefreshTask>,
         entry: &BrokerTask,
-        task: DecodedRefreshFloatingLimitTask<'_>,
+        task: fb::TaskRefreshFloatingLimit<'_>,
         worker_id: &str,
         expiry_ms: i64,
     ) -> Result<(), JobStoreShardError> {
-        let task_id = task.task_id();
-        let task_tenant = task.tenant();
-        let queue_key = task.queue_key();
+        let task_id = task.task_id().unwrap_or_default();
+        let task_tenant = task.tenant().unwrap_or_default();
+        let queue_key = task.queue_key().unwrap_or_default();
         let current_max_concurrency = task.current_max_concurrency();
         let last_refreshed_at_ms = task.last_refreshed_at_ms();
-        let metadata = task.metadata();
-        let refresh_task_group = task.task_group();
-
-        let refresh_task = Task::RefreshFloatingLimit {
-            task_id: task_id.to_string(),
-            tenant: task_tenant.to_string(),
-            queue_key: queue_key.to_string(),
-            current_max_concurrency,
-            last_refreshed_at_ms,
-            metadata: metadata.clone(),
-            task_group: refresh_task_group.to_string(),
-        };
+        let refresh_task_group = task.task_group().unwrap_or_default();
 
         let lease_key = leased_task_key(task_id);
-        let record = LeaseRecord {
-            worker_id: worker_id.to_string(),
-            task: refresh_task,
-            expiry_ms,
-            started_at_ms: 0, // Not applicable for RefreshFloatingLimit tasks
-        };
-        let leased_value = encode_lease(&record)?;
+        let leased_value = encode_lease_from_refresh_floating_limit(worker_id, task, expiry_ms)?;
         state.batch.put(&lease_key, &leased_value);
         state.batch.delete(&entry.key);
 
@@ -596,7 +563,7 @@ impl JobStoreShard {
             queue_key: queue_key.to_string(),
             current_max_concurrency,
             last_refreshed_at_ms,
-            metadata,
+            metadata: crate::codec::parse_string_pairs(task.metadata()),
             task_group: refresh_task_group.to_string(),
         });
         state.ack_keys.push(entry.key.clone());
@@ -609,14 +576,14 @@ impl JobStoreShard {
         &self,
         state: &mut DequeueIterationState,
         entry: &BrokerTask,
-        task: DecodedRunAttemptTask<'_>,
+        task: fb::TaskRunAttempt<'_>,
         worker_id: &str,
         now_ms: i64,
         expiry_ms: i64,
     ) -> Result<(), JobStoreShardError> {
-        let task_id = task.id();
-        let tenant = task.tenant();
-        let job_id = task.job_id();
+        let task_id = task.id().unwrap_or_default();
+        let tenant = task.tenant().unwrap_or_default();
+        let job_id = task.job_id().unwrap_or_default();
         let attempt_number = task.attempt_number();
         let relative_attempt_number = task.relative_attempt_number();
         // [SILO-DEQ-2] Look up job info; if missing, delete the task and skip
@@ -636,7 +603,7 @@ impl JobStoreShard {
 
             // [SILO-DEQ-CXL-REL] Release any held concurrency tickets
             // This is required to maintain invariant: holders can only exist for active tasks
-            let held_queues = task.held_queues();
+            let held_queues = crate::codec::parse_string_values(task.held_queues());
             if !held_queues.is_empty() {
                 // release_and_grant_next updates in-memory atomically before returning
                 // Track rollback info in case DB write fails

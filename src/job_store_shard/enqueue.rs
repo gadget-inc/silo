@@ -5,7 +5,7 @@ use slatedb::{IsolationLevel, WriteBatch};
 use tracing::{debug, info_span};
 use uuid::Uuid;
 
-use crate::codec::{DecodedJobStatus, decode_job_status, encode_job_info, encode_job_status};
+use crate::codec::{decode_job_status, encode_job_info, encode_job_status};
 use crate::concurrency::RequestTicketOutcome;
 use crate::dst_events::{self, DstEvent};
 use crate::job::{JobInfo, JobStatus, Limit};
@@ -69,16 +69,6 @@ fn record_grant_outcome(
             // Not granted - RequestTicket was created by handle_enqueue
             GrantResult::Queued
         }
-    }
-}
-
-fn status_index_timestamp_decoded(status: &DecodedJobStatus<'_>) -> i64 {
-    if matches!(status.kind(), crate::job::JobStatusKind::Scheduled) {
-        status
-            .next_attempt_starts_after_ms()
-            .unwrap_or(status.changed_at_ms())
-    } else {
-        status.changed_at_ms()
     }
 }
 
@@ -603,8 +593,8 @@ impl JobStoreShard {
         // Delete old index entries if present
         if let Some(old_raw) = writer.get(&job_status_key(tenant, job_id)).await? {
             let old = decode_job_status(&old_raw)?;
-            let old_ts = status_index_timestamp_decoded(&old);
-            let old_time = idx_status_time_key(tenant, old.kind().as_str(), old_ts, job_id);
+            let old_ts = status_index_timestamp(&old);
+            let old_time = idx_status_time_key(tenant, old.kind.as_str(), old_ts, job_id);
             writer.delete(&old_time)?;
         }
 

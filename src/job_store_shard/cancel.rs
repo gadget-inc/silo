@@ -49,7 +49,7 @@ impl JobStoreShard {
         };
 
         let status = decode_job_status(&status_raw)?;
-        let status_kind = status.kind();
+        let status_kind = status.kind;
 
         // Check if already cancelled within transaction
         let cancelled_key = job_cancelled_key(tenant, id);
@@ -122,6 +122,6 @@ impl JobStoreShard {
             return Ok(None);
         };
         let decoded = decode_job_cancellation(&raw)?;
-        Ok(Some(decoded.cancelled_at_ms()))
+        Ok(Some(decoded.cancelled_at_ms))
     }
 }

@@ -594,7 +594,7 @@ impl ClusterClient {
                 retry_policy,
                 limits: job_view
                     .limits()
-                    .into_iter()
+                    .iter()
                     .map(crate::server::job_limit_to_proto_limit)
                     .collect(),
                 metadata: job_view.metadata().into_iter().collect(),

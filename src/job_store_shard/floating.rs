@@ -170,8 +170,8 @@ impl JobStoreShard {
         let refresh_task = decoded.refresh_floating_limit_task().ok_or_else(|| {
             JobStoreShardError::Serialization("task is not a RefreshFloatingLimit".to_string())
         })?;
-        let tenant = refresh_task.tenant();
-        let queue_key = refresh_task.queue_key().to_string();
+        let tenant = refresh_task.tenant().unwrap_or_default();
+        let queue_key = refresh_task.queue_key().unwrap_or_default().to_string();
 
         let now_ms = now_epoch_ms();
         let state_key = floating_limit_state_key(tenant, &queue_key);
@@ -231,12 +231,12 @@ impl JobStoreShard {
         let refresh_task = decoded.refresh_floating_limit_task().ok_or_else(|| {
             JobStoreShardError::Serialization("task is not a RefreshFloatingLimit".to_string())
         })?;
-        let tenant = refresh_task.tenant().to_string();
-        let queue_key = refresh_task.queue_key().to_string();
+        let tenant = refresh_task.tenant().unwrap_or_default().to_string();
+        let queue_key = refresh_task.queue_key().unwrap_or_default().to_string();
         let current_max_concurrency = refresh_task.current_max_concurrency();
         let last_refreshed_at_ms = refresh_task.last_refreshed_at_ms();
-        let metadata = refresh_task.metadata();
-        let task_group = refresh_task.task_group().to_string();
+        let metadata = crate::codec::parse_string_pairs(refresh_task.metadata());
+        let task_group = refresh_task.task_group().unwrap_or_default().to_string();
 
         let now_ms = now_epoch_ms();
         let state_key = floating_limit_state_key(&tenant, &queue_key);

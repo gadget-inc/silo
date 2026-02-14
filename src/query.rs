@@ -1091,7 +1091,7 @@ impl Scan for QueuesScanner {
                         }
                         let timestamp_ms =
                             if let Ok(holder) = crate::codec::decode_holder(&kv.value) {
-                                holder.granted_at_ms()
+                                holder.granted_at_ms
                             } else {
                                 0
                             };

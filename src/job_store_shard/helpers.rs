@@ -3,8 +3,7 @@ use slatedb::bytes::Bytes;
 use slatedb::{Db, DbTransaction, WriteBatch};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::codec::{decode_job_status, encode_task};
-use crate::job::JobStatus;
+use crate::codec::encode_task;
 use crate::job_store_shard::JobStoreShardError;
 use crate::keys::task_key;
 use crate::task::Task;
@@ -213,11 +212,5 @@ pub(crate) async fn load_job_view(
     let Some(job_raw) = maybe_job_raw else {
         return Err(JobStoreShardError::JobNotFound(id.to_string()));
     };
-    crate::job::JobView::new(job_raw)
-}
-
-/// Decode a `JobStatus` from raw flatbuffer bytes into an owned value.
-pub(crate) fn decode_job_status_owned(raw: &[u8]) -> Result<JobStatus, JobStoreShardError> {
-    let decoded = decode_job_status(raw)?;
-    Ok(decoded.to_owned())
+    Ok(crate::job::JobView::new(job_raw)?)
 }

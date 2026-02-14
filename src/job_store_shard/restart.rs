@@ -82,7 +82,7 @@ impl JobStoreShard {
 
         // [SILO-RESTART-1][SILO-RESTART-2] Pre: job must be in a restartable state
         // Only Cancelled or Failed jobs can be restarted
-        match status.kind() {
+        match status.kind {
             JobStatusKind::Cancelled => {
                 // Cancelled job - proceed with restart
             }
@@ -94,7 +94,7 @@ impl JobStoreShard {
                 return Err(JobStoreShardError::JobNotRestartable(
                     JobNotRestartableError {
                         job_id: id.to_string(),
-                        status: status.kind(),
+                        status: status.kind,
                         reason: "job already succeeded".to_string(),
                     },
                 ));
@@ -105,7 +105,7 @@ impl JobStoreShard {
                 return Err(JobStoreShardError::JobNotRestartable(
                     JobNotRestartableError {
                         job_id: id.to_string(),
-                        status: status.kind(),
+                        status: status.kind,
                         reason: "job is still in progress".to_string(),
                     },
                 ));

@@ -436,7 +436,7 @@ impl JobStoreShard {
             return Ok(None);
         };
 
-        Ok(Some(helpers::decode_job_status_owned(&raw)?))
+        Ok(Some(crate::codec::decode_job_status(&raw)?))
     }
 
     /// Fetch multiple job statuses by id concurrently. Returns a map of job_id -> JobStatus.
@@ -452,7 +452,7 @@ impl JobStoreShard {
         for id in ids {
             let key = job_status_key(tenant, id);
             if let Some(raw) = self.db.get(&key).await? {
-                map.insert(id.clone(), helpers::decode_job_status_owned(&raw)?);
+                map.insert(id.clone(), crate::codec::decode_job_status(&raw)?);
             }
         }
         Ok(map)

@@ -144,6 +144,16 @@ fn test_task_roundtrip_check_rate_limit() {
             assert_eq!(relative_attempt_number, 2);
             assert_eq!(limit_index, 1);
             assert_eq!(rate_limit.name, "rl-name");
+            assert_eq!(rate_limit.unique_key, "rl-key");
+            assert_eq!(rate_limit.limit, 100);
+            assert_eq!(rate_limit.duration_ms, 60_000);
+            assert_eq!(rate_limit.hits, 1);
+            assert_eq!(rate_limit.algorithm, 0);
+            assert_eq!(rate_limit.behavior, 1);
+            assert_eq!(rate_limit.retry_initial_backoff_ms, 100);
+            assert_eq!(rate_limit.retry_max_backoff_ms, 30_000);
+            assert_eq!(rate_limit.retry_backoff_multiplier, 2.0);
+            assert_eq!(rate_limit.retry_max_retries, 5);
             assert_eq!(retry_count, 1);
             assert_eq!(started_at_ms, 1234);
             assert_eq!(priority, 7);
@@ -252,12 +262,11 @@ fn test_job_status_roundtrip() {
     let status = JobStatus::running(5000);
     let encoded = encode_job_status(&status).expect("encode status");
     let decoded = decode_job_status(&encoded).expect("decode status");
-    let owned = decoded.to_owned();
 
-    assert_eq!(owned.kind, JobStatusKind::Running);
-    assert_eq!(owned.changed_at_ms, 5000);
-    assert_eq!(owned.next_attempt_starts_after_ms, None);
-    assert_eq!(owned.current_attempt, None);
+    assert_eq!(decoded.kind, JobStatusKind::Running);
+    assert_eq!(decoded.changed_at_ms, 5000);
+    assert_eq!(decoded.next_attempt_starts_after_ms, None);
+    assert_eq!(decoded.current_attempt, None);
 }
 
 #[silo::test]
@@ -267,7 +276,7 @@ fn test_holder_roundtrip() {
     };
     let encoded = encode_holder(&holder).expect("encode holder");
     let decoded = decode_holder(&encoded).expect("decode holder");
-    assert_eq!(decoded.granted_at_ms(), 9999);
+    assert_eq!(decoded.granted_at_ms, 9999);
 }
 
 #[silo::test]
@@ -326,7 +335,7 @@ fn test_job_cancellation_roundtrip() {
     let encoded = encode_job_cancellation(&cancellation).expect("encode cancellation");
     let decoded = decode_job_cancellation(&encoded).expect("decode cancellation");
 
-    assert_eq!(decoded.cancelled_at_ms(), 9_999_999);
+    assert_eq!(decoded.cancelled_at_ms, 9_999_999);
 }
 
 #[silo::test]
@@ -419,16 +428,17 @@ fn test_decoded_lease_accessors_refresh_task() {
     assert_eq!(queue_key, "queue-a");
 
     let refresh = decoded.refresh_floating_limit_task().expect("refresh task");
-    assert_eq!(refresh.task_id(), "rf-1");
-    assert_eq!(refresh.tenant(), "t2");
-    assert_eq!(refresh.queue_key(), "queue-a");
+    assert_eq!(refresh.task_id(), Some("rf-1"));
+    assert_eq!(refresh.tenant(), Some("t2"));
+    assert_eq!(refresh.queue_key(), Some("queue-a"));
     assert_eq!(refresh.current_max_concurrency(), 8);
     assert_eq!(refresh.last_refreshed_at_ms(), 123);
-    assert_eq!(refresh.task_group(), "workers");
-    assert_eq!(
-        refresh.metadata(),
-        vec![("region".to_string(), "us".to_string())]
-    );
+    assert_eq!(refresh.task_group(), Some("workers"));
+    let metadata = refresh.metadata().expect("metadata");
+    assert_eq!(metadata.len(), 1);
+    let pair = metadata.get(0);
+    assert_eq!(pair.key(), Some("region"));
+    assert_eq!(pair.value(), Some("us"));
 }
 
 #[silo::test]
@@ -471,10 +481,10 @@ fn test_decoded_job_status_accessors() {
     let encoded = encode_job_status(&status).expect("encode status");
     let decoded = decode_job_status(&encoded).expect("decode status");
 
-    assert_eq!(decoded.kind(), JobStatusKind::Scheduled);
-    assert_eq!(decoded.changed_at_ms(), 1234);
-    assert_eq!(decoded.next_attempt_starts_after_ms(), Some(5678));
-    assert_eq!(decoded.current_attempt(), Some(9));
+    assert_eq!(decoded.kind, JobStatusKind::Scheduled);
+    assert_eq!(decoded.changed_at_ms, 1234);
+    assert_eq!(decoded.next_attempt_starts_after_ms, Some(5678));
+    assert_eq!(decoded.current_attempt, Some(9));
     assert!(!decoded.is_terminal());
 
     let cancelled = JobStatus::cancelled(42);

@@ -62,7 +62,7 @@ impl JobStoreShard {
         };
 
         let status = decode_job_status(&status_raw)?;
-        let status_kind = status.kind();
+        let status_kind = status.kind;
 
         // [SILO-EXP-2] Pre: job must NOT be in a final state
         if status_kind.is_final() {
@@ -106,14 +106,14 @@ impl JobStoreShard {
 
         // [SILO-EXP-4] Pre: task exists in DB queue for this job
         // O(1) direct key lookup using stored attempt info from JobStatus
-        let attempt_number = status.current_attempt().ok_or_else(|| {
+        let attempt_number = status.current_attempt.ok_or_else(|| {
             JobStoreShardError::JobNotExpediteable(JobNotExpediteableError {
                 job_id: id.to_string(),
                 status: status_kind,
                 reason: "job has no pending task to expedite".to_string(),
             })
         })?;
-        let start_time_ms = status.next_attempt_starts_after_ms().ok_or_else(|| {
+        let start_time_ms = status.next_attempt_starts_after_ms.ok_or_else(|| {
             JobStoreShardError::JobNotExpediteable(JobNotExpediteableError {
                 job_id: id.to_string(),
                 status: status_kind,
