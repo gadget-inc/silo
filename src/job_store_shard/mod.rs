@@ -293,10 +293,7 @@ impl JobStoreShard {
     /// This ensures all data is durably stored in object storage before closing,
     /// allowing the shard to be safely reopened elsewhere (e.g., on a different node).
     pub async fn close(&self) -> Result<(), JobStoreShardError> {
-        tracing::trace!(shard = %self.name, "shard.close: signaling cancellation for background tasks");
         self.cancellation.cancel();
-
-        tracing::trace!(shard = %self.name, "shard.close: stopping broker");
         self.broker.stop();
 
         // If we have a local WAL with flush_on_close enabled, flush memtable to SSTs first
