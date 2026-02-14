@@ -1,8 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::str;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 
@@ -36,6 +36,12 @@ pub struct TaskBroker {
     buffer: Arc<SkipMap<Vec<u8>, BrokerTask>>,
     // The set of tasks already read out of the DB and claimed by a worker but not yet durably leased. Required so that the scanner doesn't re-add tasks that are in the middle of being dequeued to the buffer.
     inflight: Arc<Mutex<HashSet<Vec<u8>>>>,
+    // Tombstones for task keys that were durably acked, keyed by the most recent
+    // scan generation where that key should be suppressed.
+    ack_tombstones: Arc<Mutex<HashMap<Vec<u8>, u64>>>,
+    // Monotonic generation numbers for scanner iterations.
+    scan_generation_started: Arc<AtomicU64>,
+    scan_generation_completed: Arc<AtomicU64>,
     // Whether the background scanner is running
     running: Arc<AtomicBool>,
     // A notify object to wake up the background scanner when a task is claimed
@@ -55,6 +61,10 @@ pub struct TaskBroker {
 }
 
 impl TaskBroker {
+    // Keep ack tombstones for a bounded number of completed scan generations and
+    // refresh the tombstone generation whenever a stale key is observed again.
+    const ACK_TOMBSTONE_RETAIN_GENERATIONS: u64 = 64;
+
     pub fn new(
         db: Arc<Db>,
         shard_name: String,
@@ -65,6 +75,9 @@ impl TaskBroker {
             db,
             buffer: Arc::new(SkipMap::new()),
             inflight: Arc::new(Mutex::new(HashSet::new())),
+            ack_tombstones: Arc::new(Mutex::new(HashMap::new())),
+            scan_generation_started: Arc::new(AtomicU64::new(0)),
+            scan_generation_completed: Arc::new(AtomicU64::new(0)),
             running: Arc::new(AtomicBool::new(false)),
             notify: Arc::new(Notify::new()),
             scan_requested: Arc::new(AtomicBool::new(false)),
@@ -89,8 +102,22 @@ impl TaskBroker {
         self.inflight.lock().unwrap().len()
     }
 
+    fn begin_scan_generation(&self) -> u64 {
+        self.scan_generation_started.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn complete_scan_generation(&self, generation: u64) {
+        self.scan_generation_completed
+            .store(generation, Ordering::SeqCst);
+        let mut tombstones = self.ack_tombstones.lock().unwrap();
+        tombstones.retain(|_, last_seen_generation| {
+            generation.saturating_sub(*last_seen_generation)
+                <= Self::ACK_TOMBSTONE_RETAIN_GENERATIONS
+        });
+    }
+
     /// Scan tasks from DB and insert into buffer, skipping future tasks and inflight ones.
-    async fn scan_tasks(&self, now_ms: i64) -> usize {
+    async fn scan_tasks(&self, now_ms: i64, generation: u64) -> usize {
         // [SILO-SCAN-1] Tasks use binary storekey encoding with prefix byte
         let start = tasks_prefix();
         let end = end_bound(&start);
@@ -118,8 +145,25 @@ impl TaskBroker {
                 continue;
             }
 
+            let key_bytes = kv.key.to_vec();
+
             // [SILO-SCAN-3] Skip inflight tasks
-            if self.inflight.lock().unwrap().contains(&kv.key.to_vec()) {
+            if self.inflight.lock().unwrap().contains(&key_bytes) {
+                continue;
+            }
+
+            // Skip keys that were recently durably acked to avoid stale scan re-inserts.
+            // Refresh generation so persistent stale observations extend suppression.
+            let suppress_due_to_tombstone = {
+                let mut tombstones = self.ack_tombstones.lock().unwrap();
+                if let Some(last_seen_generation) = tombstones.get_mut(&key_bytes) {
+                    *last_seen_generation = generation;
+                    true
+                } else {
+                    false
+                }
+            };
+            if suppress_due_to_tombstone {
                 continue;
             }
 
@@ -144,7 +188,6 @@ impl TaskBroker {
                 continue;
             }
 
-            let key_bytes = kv.key.to_vec();
             let entry = BrokerTask {
                 key: key_bytes.clone(),
                 task,
@@ -211,7 +254,9 @@ impl TaskBroker {
                 // Scan for ready tasks
                 let now_ms = crate::job_store_shard::now_epoch_ms();
                 let scan_start = std::time::Instant::now();
-                let inserted = broker.scan_tasks(now_ms).await;
+                let generation = broker.begin_scan_generation();
+                let inserted = broker.scan_tasks(now_ms, generation).await;
+                broker.complete_scan_generation(generation);
                 if let Some(ref m) = broker.metrics {
                     m.record_broker_scan_duration(
                         &broker.shard_name,
@@ -317,17 +362,27 @@ impl TaskBroker {
     /// Requeue tasks back into the buffer after a failed durable write.
     pub fn requeue(&self, tasks: Vec<BrokerTask>) {
         let mut inflight = self.inflight.lock().unwrap();
+        let mut tombstones = self.ack_tombstones.lock().unwrap();
         for entry in tasks {
             inflight.remove(&entry.key);
+            tombstones.remove(&entry.key);
             self.buffer.insert(entry.key.clone(), entry);
         }
     }
 
-    /// Acknowledge that these tasks are durably leased and can be removed from in-flight tracking.
-    pub fn ack_durable(&self, keys: &[Vec<u8>]) {
+    /// Acknowledge durable dequeue outcomes.
+    /// - `release_keys`: keys to release from in-flight tracking.
+    /// - `tombstone_keys`: subset of keys that were durably deleted and should be
+    ///   protected from stale-scan re-inserts.
+    pub fn ack_durable(&self, release_keys: &[Vec<u8>], tombstone_keys: &[Vec<u8>]) {
         let mut inflight = self.inflight.lock().unwrap();
-        for k in keys {
+        let mut tombstones = self.ack_tombstones.lock().unwrap();
+        let generation = self.scan_generation_started.load(Ordering::SeqCst);
+        for k in release_keys {
             inflight.remove(k);
+        }
+        for k in tombstone_keys {
+            tombstones.insert(k.clone(), generation);
         }
     }
 

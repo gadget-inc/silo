@@ -627,10 +627,7 @@ impl MockK8sState {
         namespace: &str,
         cluster_prefix: &str,
     ) -> std::collections::HashMap<silo::shard_range::ShardId, String> {
-        let label_selector = format!(
-            "silo.dev/type=shard,silo.dev/cluster={}",
-            cluster_prefix
-        );
+        let label_selector = format!("silo.dev/type=shard,silo.dev/cluster={}", cluster_prefix);
         let leases = self.leases.lock().await;
         let Some(ns_leases) = leases.get(namespace) else {
             return std::collections::HashMap::new();
@@ -652,10 +649,7 @@ impl MockK8sState {
                 && let Some(id_part) = name.strip_prefix(&prefix)
                 && let Ok(uuid) = uuid::Uuid::parse_str(id_part)
             {
-                result.insert(
-                    silo::shard_range::ShardId::from_uuid(uuid),
-                    holder.clone(),
-                );
+                result.insert(silo::shard_range::ShardId::from_uuid(uuid), holder.clone());
             }
         }
         result

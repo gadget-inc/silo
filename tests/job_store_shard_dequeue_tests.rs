@@ -1,11 +1,12 @@
 mod test_helpers;
 
 use rkyv::Archive;
-use silo::codec::decode_lease;
+use silo::codec::{decode_lease, encode_task};
 use silo::job::JobStatusKind;
 use silo::job_attempt::{AttemptOutcome, AttemptStatus};
 use silo::job_store_shard::JobStoreShardError;
 use silo::task::Task;
+use slatedb::WriteBatch;
 
 use test_helpers::*;
 
@@ -586,5 +587,76 @@ async fn enqueue_with_start_at_ms_now_is_leasable() {
 
         assert_eq!(result.tasks.len(), 1);
         assert_eq!(result.tasks[0].job().id(), "test-job-now");
+    });
+}
+
+/// Regression test for duplicate leasing: if a stale scan re-sees a task key that was already
+/// durably acked, the broker must suppress it.
+#[silo::test]
+async fn dequeue_ignores_recently_acked_task_keys() {
+    with_timeout!(20000, {
+        let (_tmp, shard) = open_temp_shard().await;
+        let payload = msgpack_payload(&serde_json::json!({"k": "v"}));
+
+        let job_id = shard
+            .enqueue(
+                "-",
+                Some("acked-key-regression".to_string()),
+                1,
+                0,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+
+        let first = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("first dequeue");
+        assert_eq!(
+            first.tasks.len(),
+            1,
+            "expected first dequeue to return a task"
+        );
+
+        let task_id = first.tasks[0].attempt().task_id().to_string();
+
+        // Reinsert the same task key to emulate a stale scanner snapshot that still sees
+        // a key that was already durably acked.
+        let reinjected = Task::RunAttempt {
+            id: task_id,
+            tenant: "-".to_string(),
+            job_id: job_id.clone(),
+            attempt_number: 1,
+            relative_attempt_number: 1,
+            held_queues: vec![],
+            task_group: "default".to_string(),
+        };
+        let task_bytes = encode_task(&reinjected).expect("encode reinjected task");
+        let task_key = silo::keys::task_key("default", 0, 1, &job_id, 1);
+
+        let mut batch = WriteBatch::new();
+        batch.put(&task_key, &task_bytes);
+        shard
+            .db()
+            .write(batch)
+            .await
+            .expect("write reinjected task");
+        shard.db().flush().await.expect("flush reinjected task");
+
+        // A duplicate lease should never be produced for this key.
+        let second = shard
+            .dequeue("worker-2", "default", 1)
+            .await
+            .expect("second dequeue");
+        assert!(
+            second.tasks.is_empty(),
+            "expected no tasks from second dequeue; got duplicate lease for job {}",
+            job_id
+        );
     });
 }

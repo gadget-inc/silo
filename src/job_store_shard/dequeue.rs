@@ -20,7 +20,8 @@ use crate::task_broker::BrokerTask;
 /// keeping handler signatures clean.
 struct DequeueIterationState {
     batch: WriteBatch,
-    ack_keys: Vec<Vec<u8>>,
+    release_keys: Vec<Vec<u8>>,
+    tombstone_keys: Vec<Vec<u8>>,
     grants_to_rollback: Vec<(String, String, String)>,
     release_grants_to_rollback: Vec<ReleaseGrantRollback>,
     leased_tasks_for_dst: Vec<(String, String, String)>,
@@ -32,13 +33,23 @@ impl DequeueIterationState {
     fn new(claimed_len: usize) -> Self {
         Self {
             batch: WriteBatch::new(),
-            ack_keys: Vec::with_capacity(claimed_len),
+            release_keys: Vec::with_capacity(claimed_len),
+            tombstone_keys: Vec::with_capacity(claimed_len),
             grants_to_rollback: Vec::new(),
             release_grants_to_rollback: Vec::new(),
             leased_tasks_for_dst: Vec::new(),
             pending_attempts: Vec::new(),
             processed_internal: false,
         }
+    }
+
+    fn ack_release(&mut self, key: &Vec<u8>) {
+        self.release_keys.push(key.clone());
+    }
+
+    fn ack_deleted(&mut self, key: &Vec<u8>) {
+        self.release_keys.push(key.clone());
+        self.tombstone_keys.push(key.clone());
     }
 }
 
@@ -112,7 +123,7 @@ impl JobStoreShard {
                 if !shard_range.contains(task_tenant) {
                     // Task is for a tenant outside our range - delete and skip
                     state.batch.delete(&entry.key);
-                    state.ack_keys.push(entry.key.clone());
+                    state.ack_deleted(&entry.key);
                     tracing::debug!(
                         tenant = %task_tenant,
                         range = %shard_range,
@@ -221,11 +232,15 @@ impl JobStoreShard {
             // Collect pending attempts from this iteration
             pending_attempts.append(&mut state.pending_attempts);
 
-            // [SILO-DEQ-3] Ack durable and evict from buffer; we no longer use TTL tombstones.
-            self.broker.ack_durable(&state.ack_keys);
-            self.broker.evict_keys(&state.ack_keys);
+            // [SILO-DEQ-3] Ack durable and evict from buffer.
+            // TaskBroker tracks all release keys for inflight cleanup, but only
+            // installs tombstones for keys that were durably deleted.
+            self.broker
+                .ack_durable(&state.release_keys, &state.tombstone_keys);
+            self.broker.evict_keys(&state.release_keys);
             tracing::debug!(
-                ack_keys = state.ack_keys.len(),
+                release_keys = state.release_keys.len(),
+                tombstone_keys = state.tombstone_keys.len(),
                 pending_attempts = pending_attempts.len(),
                 buffer_size = self.broker.buffer_len(),
                 inflight = self.broker.inflight_len(),
@@ -343,7 +358,7 @@ impl JobStoreShard {
         // [SILO-DEQ-CXL] Check if job is cancelled - if so, skip and clean up task
         if self.is_job_cancelled(&tenant, job_id).await? {
             state.batch.delete(&entry.key);
-            state.ack_keys.push(entry.key.clone());
+            state.ack_deleted(&entry.key);
             tracing::debug!(job_id = %job_id, "dequeue: skipping cancelled job RequestTicket");
             return Ok(());
         }
@@ -410,7 +425,7 @@ impl JobStoreShard {
                 state
                     .pending_attempts
                     .push((tenant.clone(), view, attempt_val));
-                state.ack_keys.push(entry.key.clone());
+                state.ack_deleted(&entry.key);
 
                 // Track for DST event emission after commit
                 state
@@ -422,9 +437,14 @@ impl JobStoreShard {
                     m.record_concurrency_ticket_granted();
                 }
             }
-            RequestTicketTaskOutcome::Requested | RequestTicketTaskOutcome::JobMissing => {
-                // Release inflight, task will be picked up later or cleaned up
-                state.ack_keys.push(entry.key.clone());
+            RequestTicketTaskOutcome::Requested => {
+                // Release inflight only; task key remains in DB and must be eligible
+                // for future scans when capacity is available.
+                state.ack_release(&entry.key);
+            }
+            RequestTicketTaskOutcome::JobMissing => {
+                // process_ticket_request_task deleted the task key.
+                state.ack_deleted(&entry.key);
             }
         }
 
@@ -464,7 +484,7 @@ impl JobStoreShard {
         state.processed_internal = true;
         let tenant = tenant.to_string();
         state.batch.delete(&entry.key);
-        state.ack_keys.push(entry.key.clone());
+        state.ack_deleted(&entry.key);
 
         // Load job info to get the full limits list
         let job_key = job_info_key(&tenant, job_id);
@@ -610,7 +630,7 @@ impl JobStoreShard {
             metadata: metadata.to_vec(),
             task_group: refresh_task_group.to_string(),
         });
-        state.ack_keys.push(entry.key.clone());
+        state.ack_deleted(&entry.key);
 
         Ok(())
     }
@@ -643,14 +663,14 @@ impl JobStoreShard {
         let Some(job_bytes) = maybe_job else {
             // If job missing, delete task key to clean up
             state.batch.delete(&entry.key);
-            state.ack_keys.push(entry.key.clone());
+            state.ack_deleted(&entry.key);
             return Ok(());
         };
 
         // [SILO-DEQ-CXL] Check if job is cancelled - if so, skip and clean up task
         if self.is_job_cancelled(tenant, job_id).await? {
             state.batch.delete(&entry.key);
-            state.ack_keys.push(entry.key.clone());
+            state.ack_deleted(&entry.key);
 
             // [SILO-DEQ-CXL-REL] Release any held concurrency tickets
             // This is required to maintain invariant: holders can only exist for active tasks
@@ -709,7 +729,7 @@ impl JobStoreShard {
         state
             .pending_attempts
             .push((tenant.to_string(), view, attempt_val));
-        state.ack_keys.push(entry.key.clone());
+        state.ack_deleted(&entry.key);
 
         // Track for DST event emission after commit
         state.leased_tasks_for_dst.push((
