@@ -467,17 +467,22 @@ impl ShardSplitter {
                     // dequeues) and all data is flushed. By reopening just the raw SlateDB
                     // database for the checkpoint, we ensure the snapshotter is the only
                     // thing working on the shard -- no writes can land after the checkpoint.
-                    if let Some(parent_shard) = self.ctx.factory.get(&parent_shard_id) {
-                        parent_shard.close().await.map_err(|e| {
-                            SplitExecutionError::PreCommit(CoordinationError::BackendError(
-                                format!("failed to close parent shard before cloning: {}", e),
-                            ))
-                        })?;
-                        info!(
-                            parent_shard_id = %parent_shard_id,
-                            "closed parent shard before cloning"
-                        );
-                    }
+                    let parent_shard = self.ctx.factory.get(&parent_shard_id).ok_or_else(|| {
+                        SplitExecutionError::PreCommit(CoordinationError::BackendError(format!(
+                            "parent shard {} not open in factory",
+                            parent_shard_id
+                        )))
+                    })?;
+                    parent_shard.close().await.map_err(|e| {
+                        SplitExecutionError::PreCommit(CoordinationError::BackendError(format!(
+                            "failed to close parent shard before cloning: {}",
+                            e
+                        )))
+                    })?;
+                    info!(
+                        parent_shard_id = %parent_shard_id,
+                        "closed parent shard before cloning"
+                    );
 
                     // Clone the closed parent's database for both children. This reopens
                     // just the raw SlateDB database, creates a checkpoint, clones to both

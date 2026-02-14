@@ -627,22 +627,32 @@ impl ShardFactory {
         // Resolve paths relative to storage root
         let (parent_resolved, parent_db_path) =
             Self::resolve_at_root(&self.template.backend, &self.template.path, &parent_name)?;
-        let (_, left_child_db_path) =
-            Self::resolve_at_root(&self.template.backend, &self.template.path, &left_child_name)?;
-        let (_, right_child_db_path) =
-            Self::resolve_at_root(&self.template.backend, &self.template.path, &right_child_name)?;
+        let (_, left_child_db_path) = Self::resolve_at_root(
+            &self.template.backend,
+            &self.template.path,
+            &left_child_name,
+        )?;
+        let (_, right_child_db_path) = Self::resolve_at_root(
+            &self.template.backend,
+            &self.template.path,
+            &right_child_name,
+        )?;
 
         // Open a raw SlateDB database at the parent's path. The parent shard has been
-        // fully closed (data flushed, WAL cleaned up), so we don't need a WAL or merge operator.
-        let db = slatedb::DbBuilder::new(parent_db_path.as_str(), Arc::clone(&parent_resolved.store))
-            .build()
-            .await
-            .map_err(|e| {
-                ShardFactoryError::CloneError(format!(
-                    "failed to reopen parent DB for cloning: {}",
-                    e
-                ))
-            })?;
+        // fully closed (data flushed, WAL cleaned up), so we don't need a WAL. We still
+        // need the merge operator because the parent may contain counter merge entries
+        // that haven't been fully compacted yet.
+        let db =
+            slatedb::DbBuilder::new(parent_db_path.as_str(), Arc::clone(&parent_resolved.store))
+                .with_merge_operator(crate::job_store_shard::counter_merge_operator())
+                .build()
+                .await
+                .map_err(|e| {
+                    ShardFactoryError::CloneError(format!(
+                        "failed to reopen parent DB for cloning: {}",
+                        e
+                    ))
+                })?;
 
         // Flush to ensure all data is in object storage before checkpointing
         db.flush().await.map_err(|e| {
