@@ -5,14 +5,7 @@ import type { RpcOptions } from "@protobuf-ts/runtime-rpc";
 import { RpcError } from "@protobuf-ts/runtime-rpc";
 import { pack, unpack } from "msgpackr";
 import { SiloClient } from "./pb/silo.client";
-import type {
-  Limit,
-  SerializedBytes,
-  QueryResponse,
-  RetryPolicy,
-  Task,
-  ShardOwner,
-} from "./pb/silo";
+import type { Limit, SerializedBytes, RetryPolicy, Task, ShardOwner } from "./pb/silo";
 import {
   GubernatorAlgorithm,
   GubernatorBehavior,
@@ -21,7 +14,7 @@ import {
 } from "./pb/silo";
 import type { JobAttempt as ProtoJobAttempt } from "./pb/silo";
 import { JobHandle } from "./JobHandle";
-export type { QueryResponse, RetryPolicy, ShardOwner };
+export type { RetryPolicy, ShardOwner };
 export { GubernatorAlgorithm, GubernatorBehavior };
 
 /**
@@ -297,6 +290,24 @@ export function shardForTenant(
   }
 
   return result;
+}
+
+/** Column metadata from a query result */
+export interface QueryColumnInfo {
+  /** Column name */
+  name: string;
+  /** Arrow/DataFusion type as string (e.g., "Utf8", "Int64") */
+  dataType: string;
+}
+
+/** Deserialized query result */
+export interface QueryResult<Row = Record<string, unknown>> {
+  /** Schema information for the result columns */
+  columns: QueryColumnInfo[];
+  /** Deserialized rows */
+  rows: Row[];
+  /** Total number of rows returned */
+  rowCount: number;
 }
 
 /** gRPC metadata key for shard owner address on redirect */
@@ -1864,9 +1875,12 @@ export class SiloGRPCClient {
    * Execute a SQL query against the shard data.
    * @param sql    The SQL query to execute.
    * @param tenant Tenant ID for routing to the correct shard. Uses default tenant if not provided.
-   * @returns The query results.
+   * @returns The query results with deserialized rows.
    */
-  public async query(sql: string, tenant?: string): Promise<QueryResponse> {
+  public async query<Row = Record<string, unknown>>(
+    sql: string,
+    tenant?: string,
+  ): Promise<QueryResult<Row>> {
     try {
       return await this._withWrongShardRetry(tenant, async (client, shard) => {
         const call = client.query(
@@ -1878,7 +1892,21 @@ export class SiloGRPCClient {
           this._rpcOptions(),
         );
 
-        return await call.response;
+        const response = await call.response;
+
+        const columns: QueryColumnInfo[] = response.columns.map((c) => ({
+          name: c.name,
+          dataType: c.dataType,
+        }));
+
+        const rows: Row[] = response.rows.map((row, index) => {
+          if (row.encoding.oneofKind === "msgpack") {
+            return decodeBytes<Row>(row.encoding.msgpack, `row[${index}]`);
+          }
+          throw new Error(`Unsupported encoding for row[${index}]: ${row.encoding.oneofKind}`);
+        });
+
+        return { columns, rows, rowCount: response.rowCount };
       });
     } catch (error) {
       throwMappedRpcError(error, { operation: "query", tenant });

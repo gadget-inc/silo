@@ -12,17 +12,39 @@ Silo includes a built-in SQL query engine powered by [Apache DataFusion](https:/
 ### From the TypeScript Client
 
 ```typescript
+// Rows are automatically deserialized from MessagePack — no manual decoding needed.
 const result = await client.query(
   "SELECT id, status_kind, priority FROM jobs WHERE tenant = 'customer-123' LIMIT 10",
   "customer-123"  // tenant for shard routing
 );
 
 for (const row of result.rows) {
-  console.log(row);
+  console.log(row);  // { id: "job-abc", status_kind: "Running", priority: 10 }
+}
+
+// You can pass a generic type parameter for typed rows:
+interface JobRow {
+  id: string;
+  status_kind: string;
+  count: number;
+}
+
+const typed = await client.query<JobRow>(
+  "SELECT id, status_kind, COUNT(*) as count FROM jobs GROUP BY id, status_kind",
+  "customer-123"
+);
+
+for (const row of typed.rows) {
+  console.log(row.id, row.status_kind, row.count);  // fully typed
 }
 ```
 
 The second argument is the tenant used for routing the query to the correct shard. If you're not using multi-tenancy, you can omit it.
+
+The result includes:
+- `columns` — schema information (`name` and `dataType` for each column)
+- `rows` — deserialized JavaScript objects, one per row
+- `rowCount` — total number of rows returned
 
 ### From siloctl
 

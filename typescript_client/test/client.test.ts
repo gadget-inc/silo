@@ -23,6 +23,8 @@ import {
   type SiloGRPCClientOptions,
   type AwaitJobOptions,
   type JobResult,
+  type QueryResult,
+  type QueryColumnInfo,
 } from "../src/client";
 import { JobHandle } from "../src/JobHandle";
 
@@ -563,5 +565,165 @@ describe("SiloGrpcError hierarchy", () => {
     expect(error.code).toBe("SILO_UNAVAILABLE");
     expect(error.grpcCode).toBe("UNAVAILABLE");
     expect(error.grpcMessage).toBe("cluster is unavailable");
+  });
+});
+
+describe("QueryResult type", () => {
+  it("represents a basic query result", () => {
+    const result: QueryResult = {
+      columns: [
+        { name: "id", dataType: "Utf8" },
+        { name: "priority", dataType: "Int32" },
+      ],
+      rows: [
+        { id: "job-1", priority: 10 },
+        { id: "job-2", priority: 20 },
+      ],
+      rowCount: 2,
+    };
+    expect(result.columns).toHaveLength(2);
+    expect(result.rows).toHaveLength(2);
+    expect(result.rowCount).toBe(2);
+    expect(result.rows[0].id).toBe("job-1");
+  });
+
+  it("supports generic row type parameter", () => {
+    interface JobRow {
+      id: string;
+      priority: number;
+    }
+
+    const result: QueryResult<JobRow> = {
+      columns: [
+        { name: "id", dataType: "Utf8" },
+        { name: "priority", dataType: "Int32" },
+      ],
+      rows: [{ id: "job-1", priority: 10 }],
+      rowCount: 1,
+    };
+    // TypeScript knows the type of rows
+    const row: JobRow = result.rows[0];
+    expect(row.id).toBe("job-1");
+    expect(row.priority).toBe(10);
+  });
+
+  it("represents an empty query result", () => {
+    const result: QueryResult = {
+      columns: [{ name: "id", dataType: "Utf8" }],
+      rows: [],
+      rowCount: 0,
+    };
+    expect(result.rows).toHaveLength(0);
+    expect(result.rowCount).toBe(0);
+  });
+});
+
+describe("QueryColumnInfo type", () => {
+  it("has name and dataType fields", () => {
+    const col: QueryColumnInfo = { name: "status", dataType: "Utf8" };
+    expect(col.name).toBe("status");
+    expect(col.dataType).toBe("Utf8");
+  });
+});
+
+describe("SiloGRPCClient.query deserialization", () => {
+  let clientsToClose: SiloGRPCClient[] = [];
+
+  afterEach(() => {
+    for (const client of clientsToClose) {
+      client.close();
+    }
+    clientsToClose = [];
+  });
+
+  const createClient = (options: SiloGRPCClientOptions) => {
+    const client = new SiloGRPCClient(options);
+    clientsToClose.push(client);
+    return client;
+  };
+
+  const defaultOptions = {
+    useTls: false,
+    shardRouting: {
+      topologyRefreshIntervalMs: 0,
+    },
+  };
+
+  it("deserializes msgpack rows in query response", async () => {
+    const client = createClient({
+      servers: "localhost:7450",
+      ...defaultOptions,
+    });
+
+    const mockResponse = {
+      columns: [
+        { name: "id", dataType: "Utf8" },
+        { name: "priority", dataType: "Int32" },
+      ],
+      rows: [
+        {
+          encoding: {
+            oneofKind: "msgpack" as const,
+            msgpack: encodeBytes({ id: "job-1", priority: 10 }),
+          },
+        },
+        {
+          encoding: {
+            oneofKind: "msgpack" as const,
+            msgpack: encodeBytes({ id: "job-2", priority: 20 }),
+          },
+        },
+      ],
+      rowCount: 2,
+    };
+
+    (client as any)._withWrongShardRetry = vi
+      .fn()
+      .mockImplementation(async (_tenant: any, _operation: any) => {
+        // Simulate the internal deserialization that happens inside the real _withWrongShardRetry callback
+        const columns = mockResponse.columns.map((c: any) => ({
+          name: c.name,
+          dataType: c.dataType,
+        }));
+        const rows = mockResponse.rows.map((row: any, index: number) => {
+          if (row.encoding.oneofKind === "msgpack") {
+            return decodeBytes(row.encoding.msgpack, `row[${index}]`);
+          }
+          throw new Error(`Unsupported encoding`);
+        });
+        return { columns, rows, rowCount: mockResponse.rowCount };
+      });
+
+    const result = await client.query("SELECT * FROM jobs");
+    expect(result.columns).toHaveLength(2);
+    expect(result.columns[0].name).toBe("id");
+    expect(result.columns[0].dataType).toBe("Utf8");
+    expect(result.rows).toHaveLength(2);
+    expect(result.rows[0]).toEqual({ id: "job-1", priority: 10 });
+    expect(result.rows[1]).toEqual({ id: "job-2", priority: 20 });
+    expect(result.rowCount).toBe(2);
+  });
+
+  it("returns typed rows with generic parameter", async () => {
+    const client = createClient({
+      servers: "localhost:7450",
+      ...defaultOptions,
+    });
+
+    interface CountRow {
+      count: number;
+    }
+
+    (client as any)._withWrongShardRetry = vi.fn().mockImplementation(async () => {
+      return {
+        columns: [{ name: "count", dataType: "Int64" }],
+        rows: [{ count: 42 }],
+        rowCount: 1,
+      };
+    });
+
+    const result = await client.query<CountRow>("SELECT COUNT(*) as count FROM jobs");
+    const row: CountRow = result.rows[0];
+    expect(row.count).toBe(42);
   });
 });

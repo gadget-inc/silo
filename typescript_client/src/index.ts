@@ -47,6 +47,8 @@ export {
   type ShardRoutingConfig,
   type ShardOwner,
   type ShardInfoWithRange,
+  type QueryResult,
+  type QueryColumnInfo,
 } from "./client";
 export {
   SiloWorker,
@@ -65,4 +67,4 @@ export {
   type GubernatorRateLimit,
 } from "./TaskExecution";
 export { JobHandle } from "./JobHandle";
-export type { QueryResponse, RetryPolicy, ColumnInfo, Failure } from "./pb/silo";
+export type { RetryPolicy, Failure } from "./pb/silo";

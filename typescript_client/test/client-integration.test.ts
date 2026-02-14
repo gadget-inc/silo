@@ -720,6 +720,11 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       expect(result.columns.length).toBeGreaterThan(0);
       expect(result.columns.some((c) => c.name === "id")).toBe(true);
       expect(result.columns.some((c) => c.name === "priority")).toBe(true);
+
+      // Rows should be deserialized objects
+      expect(result.rows.length).toBeGreaterThanOrEqual(3);
+      const row = result.rows[0] as Record<string, unknown>;
+      expect(typeof row.id).toBe("string");
     });
 
     it("queries with WHERE clause", async () => {
@@ -738,6 +743,12 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         tenant,
       );
       expect(result.columns.length).toBe(2);
+
+      // Rows should be deserialized with only the selected columns
+      expect(result.rows.length).toBeGreaterThanOrEqual(1);
+      const row = result.rows[0] as Record<string, unknown>;
+      expect(typeof row.id).toBe("string");
+      expect(typeof row.priority).toBe("number");
     });
 
     it("queries with aggregation", async () => {
@@ -750,17 +761,41 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         payload: { test: true },
       });
 
-      const result = await client.query("SELECT COUNT(*) as count FROM jobs", tenant);
+      const result = await client.query<{ count: number }>(
+        "SELECT COUNT(*) as count FROM jobs",
+        tenant,
+      );
       expect(result.rowCount).toBe(1);
       expect(result.columns.some((c) => c.name === "count")).toBe(true);
 
-      const row = decodeBytes<{ count: number }>(
-        result.rows[0]?.encoding.oneofKind === "msgpack"
-          ? result.rows[0].encoding.msgpack
-          : undefined,
-        "row",
+      // Rows are already deserialized
+      expect(typeof result.rows[0].count).toBe("number");
+    });
+
+    it("supports generic row type parameter", async () => {
+      const tenant = "query-typed-tenant";
+
+      await client.enqueue({
+        tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
+        payload: { test: true },
+        priority: 42,
+      });
+
+      interface JobRow {
+        id: string;
+        priority: number;
+      }
+
+      const result = await client.query<JobRow>(
+        "SELECT id, priority FROM jobs WHERE priority = 42",
+        tenant,
       );
-      expect(typeof row?.count).toBe("number");
+      expect(result.rows.length).toBeGreaterThanOrEqual(1);
+      // TypeScript knows these are typed
+      const row: JobRow = result.rows[0];
+      expect(typeof row.id).toBe("string");
+      expect(row.priority).toBe(42);
     });
   });
 
