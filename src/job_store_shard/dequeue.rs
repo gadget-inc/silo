@@ -43,13 +43,13 @@ impl DequeueIterationState {
         }
     }
 
-    fn ack_release(&mut self, key: &Vec<u8>) {
-        self.release_keys.push(key.clone());
+    fn ack_release(&mut self, key: &[u8]) {
+        self.release_keys.push(key.to_owned());
     }
 
-    fn ack_deleted(&mut self, key: &Vec<u8>) {
-        self.release_keys.push(key.clone());
-        self.tombstone_keys.push(key.clone());
+    fn ack_deleted(&mut self, key: &[u8]) {
+        self.release_keys.push(key.to_owned());
+        self.tombstone_keys.push(key.to_owned());
     }
 }
 

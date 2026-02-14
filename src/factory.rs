@@ -79,7 +79,7 @@ impl ShardFactory {
     /// Create a no-op factory for testing splitter logic without real shards.
     ///
     /// This factory cannot actually open shards; it's only useful for tests that
-    /// need a factory reference but don't call `open()` or `clone_shard()`.
+    /// need a factory reference but don't call `open()` or `clone_closed_shard()`.
     #[doc(hidden)]
     pub fn new_noop() -> Self {
         use crate::gubernator::NullGubernatorClient;
@@ -509,102 +509,6 @@ impl ShardFactory {
         }
     }
 
-    /// Clone a shard to create a child shard for splitting.
-    ///
-    /// This creates a point-in-time clone of the parent shard's database using
-    /// SlateDB's checkpoint and clone functionality. The clone shares SST files with the parent via object storage, so only metadata is copied.
-    ///
-    /// Returns an error if:
-    /// - The parent shard is not open
-    /// - The clone operation fails
-    pub async fn clone_shard(
-        &self,
-        parent_id: &ShardId,
-        child_id: &ShardId,
-    ) -> Result<(), ShardFactoryError> {
-        let parent_name = parent_id.to_string();
-        let child_name = child_id.to_string();
-
-        // Get the parent shard (must be open)
-        let parent_shard = self
-            .instances
-            .get(parent_id)
-            .and_then(|entry| entry.get())
-            .ok_or_else(|| ShardFactoryError::ShardNotOpen(*parent_id))?;
-
-        // Ensure all data is flushed to object storage before creating checkpoint. This is required for SlateDB cloning to work correctly
-        parent_shard.db().flush().await.map_err(|e| {
-            ShardFactoryError::CloneError(format!("failed to flush before checkpoint: {}", e))
-        })?;
-
-        // Create a checkpoint in the parent database
-        let checkpoint_options = slatedb::config::CheckpointOptions {
-            lifetime: Some(Duration::from_secs(300)), // 5 minutes should be enough for the clone
-            ..Default::default()
-        };
-        let checkpoint = parent_shard
-            .db()
-            .create_checkpoint(slatedb::config::CheckpointScope::All, &checkpoint_options)
-            .await
-            .map_err(|e| {
-                ShardFactoryError::CloneError(format!("failed to create checkpoint: {}", e))
-            })?;
-
-        tracing::info!(
-            parent_shard_id = %parent_id,
-            child_shard_id = %child_id,
-            checkpoint_id = ?checkpoint.id,
-            "created checkpoint for shard cloning"
-        );
-
-        // For cloning to work, both parent and child must be accessible from the
-        // same object store. resolve_at_root gives us the store at the storage root
-        // level, and the db_path is the root-relative path to the shard.
-        //
-        // For local FS: store is at the storage root dir, db_path is just the shard UUID
-        // For object stores (S3/GCS): store is at the bucket level, db_path is the
-        //   bucket-relative path (e.g. "silo/112381b2-...")
-        let (parent_resolved, parent_db_path) =
-            Self::resolve_at_root(&self.template.backend, &self.template.path, &parent_name)?;
-        let (_, child_db_path) =
-            Self::resolve_at_root(&self.template.backend, &self.template.path, &child_name)?;
-
-        tracing::debug!(
-            parent_db_path = %parent_db_path,
-            child_db_path = %child_db_path,
-            "preparing to clone shard database"
-        );
-
-        // Create an Admin for the child path (relative to the root) and clone from parent.
-        // Both paths must be root-relative so SlateDB can find the parent's manifest
-        // and write the child's data in the correct location.
-        let admin = slatedb::admin::Admin::builder(
-            child_db_path.as_str(),
-            Arc::clone(&parent_resolved.store),
-        )
-        .build();
-
-        admin
-            .create_clone(parent_db_path.as_str(), Some(checkpoint.id))
-            .await
-            .map_err(|e| {
-                ShardFactoryError::CloneError(format!(
-                    "failed to clone database: {} (root={}, parent={}, child={})",
-                    e, parent_resolved.canonical_path, parent_db_path, child_db_path
-                ))
-            })?;
-
-        tracing::info!(
-            parent_shard_id = %parent_id,
-            child_shard_id = %child_id,
-            parent_db_path = %parent_db_path,
-            child_db_path = %child_db_path,
-            "cloned shard database"
-        );
-
-        Ok(())
-    }
-
     /// Clone a closed shard's database to create child shards for splitting.
     ///
     /// This is used during shard splits after the parent shard has been fully closed.
@@ -659,9 +563,11 @@ impl ShardFactory {
             ShardFactoryError::CloneError(format!("failed to flush before checkpoint: {}", e))
         })?;
 
-        // Create a single checkpoint shared by both children
+        // Create a single checkpoint shared by both children. Use no lifetime so
+        // the checkpoint persists until the children have fully compacted away their
+        // dependency on the parent's SSTs.
         let checkpoint_options = slatedb::config::CheckpointOptions {
-            lifetime: Some(Duration::from_secs(300)),
+            lifetime: None,
             ..Default::default()
         };
         let checkpoint = db
@@ -754,9 +660,6 @@ impl std::fmt::Display for CloseAllError {
 /// Errors that can occur during shard factory operations.
 #[derive(Debug, Error)]
 pub enum ShardFactoryError {
-    #[error("shard not open: {0}")]
-    ShardNotOpen(ShardId),
-
     #[error("clone error: {0}")]
     CloneError(String),
 
