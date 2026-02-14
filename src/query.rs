@@ -1149,7 +1149,7 @@ impl Scan for QueuesScanner {
                             continue;
                         }
                         let job_id = if let Ok(action) =
-                            crate::codec::decode_concurrency_action(&kv.value)
+                            crate::codec::decode_concurrency_action(kv.value.clone())
                         {
                             action
                                 .fb()

@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::codec::{
     decode_floating_limit_state, decode_lease, encode_attempt, encode_floating_limit_state,
-    encode_lease,
+    encode_lease_with_new_expiry,
 };
 use crate::dst_events::{self, DstEvent};
 use crate::job::{FloatingLimitState, JobStatus, JobView};
@@ -14,7 +14,7 @@ use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt};
 use crate::job_store_shard::helpers::{DbWriteBatcher, now_epoch_ms};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError, LimitTaskParams};
 use crate::keys::{attempt_key, floating_limit_state_key, job_info_key, leased_task_key};
-use crate::task::{DEFAULT_LEASE_MS, HeartbeatResult, LeaseRecord};
+use crate::task::{DEFAULT_LEASE_MS, HeartbeatResult};
 use tracing::{debug, info_span};
 
 impl JobStoreShard {
@@ -35,7 +35,7 @@ impl JobStoreShard {
             return Err(JobStoreShardError::LeaseNotFound(task_id.to_string()));
         };
 
-        let decoded = decode_lease(&value_bytes)?;
+        let decoded = decode_lease(value_bytes)?;
 
         // [SILO-HB-1] Check worker id matches
         let current_owner = decoded.worker_id();
@@ -52,14 +52,9 @@ impl JobStoreShard {
         let job_id = decoded.job_id().to_string();
 
         // [SILO-HB-3] Renew by creating new record with updated expiry
-        // Note: to_task() allocates, but we need owned Task for LeaseRecord
-        let record = LeaseRecord {
-            worker_id: current_owner.to_string(),
-            task: decoded.to_task(),
-            expiry_ms: now_epoch_ms() + DEFAULT_LEASE_MS,
-            started_at_ms: decoded.started_at_ms(),
-        };
-        let value = encode_lease(&record)?;
+        // Zero-copy: reads all fields from existing lease FlatBuffer, only changes expiry_ms
+        let new_expiry_ms = now_epoch_ms() + DEFAULT_LEASE_MS;
+        let value = encode_lease_with_new_expiry(&decoded, new_expiry_ms)?;
 
         let mut batch = WriteBatch::new();
         batch.put(&key, &value);
@@ -96,7 +91,7 @@ impl JobStoreShard {
             return Err(JobStoreShardError::LeaseNotFound(task_id.to_string()));
         };
 
-        let decoded = decode_lease(&value_bytes)?;
+        let decoded = decode_lease(value_bytes)?;
 
         // Extract fields using zero-copy accessors
         let tenant = decoded.tenant().to_string();
@@ -139,7 +134,7 @@ impl JobStoreShard {
             started_at_ms,
             status: attempt_status,
         };
-        let attempt_val = encode_attempt(&attempt)?;
+        let attempt_val = encode_attempt(&attempt);
 
         // Atomically update attempt and remove lease
         let mut batch = WriteBatch::new();
@@ -384,7 +379,7 @@ impl JobStoreShard {
         let mut defunct_keys: Vec<Vec<u8>> = Vec::new();
 
         while let Some(kv) = iter.next().await? {
-            let decoded = match decode_lease(&kv.value) {
+            let decoded = match decode_lease(kv.value.clone()) {
                 Ok(l) => l,
                 Err(_) => continue,
             };
@@ -505,7 +500,7 @@ impl JobStoreShard {
             return Ok(());
         };
 
-        let decoded_state = decode_floating_limit_state(&raw)?;
+        let decoded_state = decode_floating_limit_state(raw)?;
 
         // Reset the state to allow a new refresh to be scheduled
         // We don't increment retry_count here - we rely on the normal periodic refresh mechanism
@@ -515,7 +510,7 @@ impl JobStoreShard {
         };
 
         let mut batch = WriteBatch::new();
-        let state_value = encode_floating_limit_state(&new_state)?;
+        let state_value = encode_floating_limit_state(&new_state);
         batch.put(&state_key, &state_value);
         batch.delete(&lease_key);
 

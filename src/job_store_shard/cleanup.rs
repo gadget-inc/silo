@@ -170,16 +170,16 @@ impl JobStoreShard {
             (
                 tasks_prefix(),
                 Box::new(|_, value| {
-                    crate::codec::decode_task(value)
+                    crate::codec::decode_task_validated(bytes::Bytes::copy_from_slice(value))
                         .ok()
-                        .map(|task| task.tenant().to_string())
+                        .map(|d| d.tenant().to_string())
                 }),
             ),
             // Lease keys - tenant is in the encoded lease value
             (
                 vec![prefix::LEASE],
                 Box::new(|_, value| {
-                    crate::codec::decode_lease(value)
+                    crate::codec::decode_lease(bytes::Bytes::copy_from_slice(value))
                         .ok()
                         .map(|lease| lease.tenant().to_string())
                 }),

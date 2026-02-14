@@ -8,7 +8,7 @@ use slatedb::IsolationLevel;
 use slatedb::config::WriteOptions;
 use uuid::Uuid;
 
-use crate::codec::{decode_task, encode_attempt, encode_lease};
+use crate::codec::{decode_task_validated, encode_attempt, encode_lease};
 use crate::job::{JobStatusKind, JobView};
 use crate::job_attempt::{AttemptStatus, JobAttempt, JobAttemptView};
 use crate::job_store_shard::helpers::{
@@ -159,7 +159,7 @@ impl JobStoreShard {
             }
         };
         // Validate that the raw bytes decode to a valid task before replacing it
-        decode_task(&task_raw)?;
+        decode_task_validated(task_raw.clone())?;
 
         // Delete the pending task (regardless of type)
         txn.delete(&old_task_key)?;
@@ -185,7 +185,7 @@ impl JobStoreShard {
             expiry_ms,
             started_at_ms: now_ms,
         };
-        let leased_value = encode_lease(&record)?;
+        let leased_value = encode_lease(&record);
         txn.put(&lease_key, &leased_value)?;
 
         // Write attempt record
@@ -197,7 +197,7 @@ impl JobStoreShard {
             started_at_ms: now_ms,
             status: AttemptStatus::Running,
         };
-        let attempt_val = encode_attempt(&attempt)?;
+        let attempt_val = encode_attempt(&attempt);
         let akey = attempt_key(tenant, id, attempt_number);
         txn.put(&akey, &attempt_val)?;
 
@@ -222,7 +222,7 @@ impl JobStoreShard {
         self.broker.wakeup();
 
         // Build and return the LeasedTask
-        let attempt_view = JobAttemptView::new(&attempt_val)?;
+        let attempt_view = JobAttemptView::new(attempt_val)?;
         Ok(LeasedTask::new(tenant.to_string(), job_view, attempt_view))
     }
 }

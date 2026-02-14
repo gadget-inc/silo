@@ -152,7 +152,7 @@ pub(crate) fn put_task<W: WriteBatcher>(
     attempt: u32,
     task: &Task,
 ) -> Result<(), JobStoreShardError> {
-    let task_value = encode_task(task)?;
+    let task_value = encode_task(task);
     writer.put(
         task_key(task_group, time_ms, priority, job_id, attempt),
         &task_value,

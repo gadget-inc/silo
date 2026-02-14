@@ -61,9 +61,9 @@ async fn dequeue_moves_tasks_to_leased_with_uuid() {
         // Binary keys start with prefix 0x06 for leases
         assert_eq!(lease_key[0], 0x06, "lease key should have lease prefix");
 
-        let decoded = decode_lease(&kv_value).expect("decode lease");
+        let decoded = decode_lease(kv_value).expect("decode lease");
         assert_eq!(decoded.worker_id(), "worker-1");
-        let task = decoded.to_task();
+        let task = decoded.to_task().unwrap();
         match &task {
             Task::RunAttempt {
                 id,
@@ -120,7 +120,7 @@ async fn heartbeat_renews_lease_when_worker_matches() {
         let (old_key, old_value) = first_lease_kv(shard.db()).await.expect("scan lease");
         let parsed_old = silo::keys::parse_lease_key(&old_key).expect("parse lease key");
         assert_eq!(parsed_old.task_id, task_id);
-        let decoded_first = decode_lease(&old_value).expect("decode lease");
+        let decoded_first = decode_lease(old_value).expect("decode lease");
         let old_expiry = decoded_first.expiry_ms() as u64;
 
         // Heartbeat to renew
@@ -133,7 +133,7 @@ async fn heartbeat_renews_lease_when_worker_matches() {
         let (new_key, new_value) = first_lease_kv(shard.db()).await.expect("scan lease 2");
         let parsed_new = silo::keys::parse_lease_key(&new_key).expect("parse lease key 2");
         assert_eq!(parsed_new.task_id, task_id);
-        let decoded_second = decode_lease(&new_value).expect("decode lease 2");
+        let decoded_second = decode_lease(new_value).expect("decode lease 2");
         let new_expiry = decoded_second.expiry_ms() as u64;
         assert!(new_expiry > old_expiry, "new expiry should be greater");
 
@@ -630,7 +630,7 @@ async fn dequeue_ignores_recently_acked_task_keys() {
             held_queues: vec![],
             task_group: "default".to_string(),
         };
-        let task_bytes = encode_task(&reinjected).expect("encode reinjected task");
+        let task_bytes = encode_task(&reinjected);
         let task_key = silo::keys::task_key("default", 0, 1, &job_id, 1);
 
         let mut batch = WriteBatch::new();

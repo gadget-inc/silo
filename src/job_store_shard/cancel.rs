@@ -71,7 +71,7 @@ impl JobStoreShard {
         let cancellation = JobCancellation {
             cancelled_at_ms: now_ms,
         };
-        let cancellation_value = encode_job_cancellation(&cancellation)?;
+        let cancellation_value = encode_job_cancellation(&cancellation);
         txn.put(&cancelled_key, &cancellation_value)?;
 
         // Track whether we're transitioning a scheduled job to terminal state

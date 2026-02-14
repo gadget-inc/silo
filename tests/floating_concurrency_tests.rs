@@ -148,7 +148,7 @@ async fn floating_limit_state_shared_across_task_groups() {
         .await
         .expect("db get")
         .expect("state should exist");
-    let decoded = silo::codec::decode_floating_limit_state(&state_raw).expect("decode state");
+    let decoded = silo::codec::decode_floating_limit_state(state_raw).expect("decode state");
     assert_eq!(decoded.current_max_concurrency(), 5);
 
     // Enqueue from task_group "beta" with the same queue key
@@ -182,7 +182,7 @@ async fn floating_limit_state_shared_across_task_groups() {
         .await
         .expect("db get")
         .expect("state should exist");
-    let decoded = silo::codec::decode_floating_limit_state(&state_raw).expect("decode state");
+    let decoded = silo::codec::decode_floating_limit_state(state_raw).expect("decode state");
     assert_eq!(
         decoded.current_max_concurrency(),
         5,
@@ -284,7 +284,7 @@ async fn floating_limit_refresh_applies_to_all_task_groups() {
         .await
         .expect("db get")
         .expect("state should exist");
-    let decoded = silo::codec::decode_floating_limit_state(&state_raw).expect("decode state");
+    let decoded = silo::codec::decode_floating_limit_state(state_raw).expect("decode state");
     assert_eq!(
         decoded.current_max_concurrency(),
         3,
@@ -437,7 +437,7 @@ async fn floating_concurrency_limit_creates_state_on_enqueue() {
         .expect("db get")
         .expect("state should exist");
 
-    let decoded = silo::codec::decode_floating_limit_state(&state_raw).expect("decode state");
+    let decoded = silo::codec::decode_floating_limit_state(state_raw).expect("decode state");
 
     assert_eq!(decoded.current_max_concurrency(), 5);
     assert_eq!(decoded.default_max_concurrency(), 5);
@@ -900,7 +900,7 @@ async fn floating_limit_refresh_success_updates_state() {
         .expect("db get")
         .expect("state should exist");
 
-    let decoded = silo::codec::decode_floating_limit_state(&state_raw).expect("decode state");
+    let decoded = silo::codec::decode_floating_limit_state(state_raw).expect("decode state");
 
     assert_eq!(
         decoded.current_max_concurrency(),
@@ -996,7 +996,7 @@ async fn floating_limit_refresh_failure_triggers_backoff() {
         .expect("db get")
         .expect("state should exist");
 
-    let decoded = silo::codec::decode_floating_limit_state(&state_raw).expect("decode state");
+    let decoded = silo::codec::decode_floating_limit_state(state_raw).expect("decode state");
 
     // Should still have old concurrency value
     assert_eq!(decoded.current_max_concurrency(), 1);
@@ -1110,7 +1110,7 @@ async fn floating_limit_refresh_failure_skips_retry_without_waiters() {
         .await
         .expect("db get")
         .expect("state should exist");
-    let decoded = silo::codec::decode_floating_limit_state(&state_raw).expect("decode state");
+    let decoded = silo::codec::decode_floating_limit_state(state_raw).expect("decode state");
 
     assert!(
         !decoded.refresh_task_scheduled(),
@@ -1436,7 +1436,7 @@ async fn floating_limit_multiple_retries_increase_backoff() {
         .await
         .expect("get")
         .expect("state");
-    let decoded = silo::codec::decode_floating_limit_state(&state_raw).expect("decode");
+    let decoded = silo::codec::decode_floating_limit_state(state_raw).expect("decode");
     let first_retry = decoded.next_retry_at_ms().unwrap_or(0);
     assert_eq!(decoded.retry_count(), 1);
 
@@ -1462,7 +1462,7 @@ async fn floating_limit_multiple_retries_increase_backoff() {
             .await
             .expect("get")
             .expect("state");
-        let decoded = silo::codec::decode_floating_limit_state(&state_raw).expect("decode");
+        let decoded = silo::codec::decode_floating_limit_state(state_raw).expect("decode");
         let second_retry = decoded.next_retry_at_ms().unwrap_or(0);
         assert_eq!(decoded.retry_count(), 2);
         // Backoff should be longer for the second retry
@@ -1548,7 +1548,7 @@ async fn floating_limit_successful_refresh_resets_backoff() {
         .await
         .expect("get")
         .expect("state");
-    let decoded = silo::codec::decode_floating_limit_state(&state_raw).expect("decode");
+    let decoded = silo::codec::decode_floating_limit_state(state_raw).expect("decode");
     assert_eq!(decoded.retry_count(), 1);
 
     // Advance time and succeed
@@ -1572,7 +1572,7 @@ async fn floating_limit_successful_refresh_resets_backoff() {
             .await
             .expect("get")
             .expect("state");
-        let decoded = silo::codec::decode_floating_limit_state(&state_raw).expect("decode");
+        let decoded = silo::codec::decode_floating_limit_state(state_raw).expect("decode");
         assert_eq!(decoded.retry_count(), 0);
         assert_eq!(decoded.current_max_concurrency(), 8);
         assert!(decoded.next_retry_at_ms().is_none());
@@ -1664,22 +1664,22 @@ async fn floating_limit_refresh_task_lease_expiry_allows_rescheduling() {
         .await
         .expect("db get")
         .expect("state should exist");
-    let decoded = silo::codec::decode_floating_limit_state(&state_raw).expect("decode");
+    let decoded = silo::codec::decode_floating_limit_state(state_raw).expect("decode");
     assert!(
         decoded.refresh_task_scheduled(),
         "refresh_task_scheduled should be true after dequeue"
     );
 
     // Manually mutate the lease to make it expired (this is how other tests handle lease expiry)
-    let decoded_lease = decode_lease(&lease_raw).expect("decode lease");
+    let decoded_lease = decode_lease(lease_raw).expect("decode lease");
     let expired_ms = now_ms() - 1; // Set expiry to the past
     let new_record = LeaseRecord {
         worker_id: decoded_lease.worker_id().to_string(),
-        task: decoded_lease.to_task(),
+        task: decoded_lease.to_task().unwrap(),
         expiry_ms: expired_ms,
         started_at_ms: decoded_lease.started_at_ms(),
     };
-    let new_val = encode_lease(&new_record).expect("encode lease");
+    let new_val = encode_lease(&new_record);
     shard
         .db()
         .put(&lease_key, &new_val)
@@ -1702,7 +1702,7 @@ async fn floating_limit_refresh_task_lease_expiry_allows_rescheduling() {
         .await
         .expect("db get")
         .expect("state should still exist");
-    let decoded = silo::codec::decode_floating_limit_state(&state_raw).expect("decode");
+    let decoded = silo::codec::decode_floating_limit_state(state_raw).expect("decode");
     assert!(
         !decoded.refresh_task_scheduled(),
         "refresh_task_scheduled should be false after reaping"
@@ -1828,7 +1828,7 @@ async fn floating_limit_refresh_task_lease_expiry_preserves_state() {
         .await
         .expect("get")
         .expect("state");
-    let decoded = silo::codec::decode_floating_limit_state(&state_raw).expect("decode");
+    let decoded = silo::codec::decode_floating_limit_state(state_raw).expect("decode");
     assert!(decoded.refresh_task_scheduled());
     assert_eq!(decoded.current_max_concurrency(), 1);
     assert_eq!(decoded.default_max_concurrency(), 1);
@@ -1843,15 +1843,15 @@ async fn floating_limit_refresh_task_lease_expiry_preserves_state() {
         .await
         .expect("db get")
         .expect("lease should exist");
-    let decoded_lease = decode_lease(&lease_raw).expect("decode lease");
+    let decoded_lease = decode_lease(lease_raw).expect("decode lease");
     let expired_ms = now_ms() - 1; // Set expiry to the past
     let new_record = LeaseRecord {
         worker_id: decoded_lease.worker_id().to_string(),
-        task: decoded_lease.to_task(),
+        task: decoded_lease.to_task().unwrap(),
         expiry_ms: expired_ms,
         started_at_ms: decoded_lease.started_at_ms(),
     };
-    let new_val = encode_lease(&new_record).expect("encode lease");
+    let new_val = encode_lease(&new_record);
     shard
         .db()
         .put(&lease_key, &new_val)
@@ -1870,7 +1870,7 @@ async fn floating_limit_refresh_task_lease_expiry_preserves_state() {
         .await
         .expect("get")
         .expect("state");
-    let decoded = silo::codec::decode_floating_limit_state(&state_raw).expect("decode");
+    let decoded = silo::codec::decode_floating_limit_state(state_raw).expect("decode");
 
     assert!(
         !decoded.refresh_task_scheduled(),

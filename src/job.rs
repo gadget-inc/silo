@@ -12,7 +12,7 @@ pub struct JobCancellation {
 }
 
 fn codec_error_to_shard_error(e: CodecError) -> JobStoreShardError {
-    JobStoreShardError::Rkyv(e.to_string())
+    JobStoreShardError::Codec(e.to_string())
 }
 
 /// Per-job concurrency limit declaration
@@ -278,9 +278,9 @@ pub struct JobInfo {
 
 impl JobView {
     /// Validate bytes and construct a zero-copy view.
-    pub fn new(bytes: impl AsRef<[u8]>) -> Result<Self, JobStoreShardError> {
+    pub fn new(bytes: impl Into<bytes::Bytes>) -> Result<Self, JobStoreShardError> {
         // Validate and decode up front; reject invalid data early.
-        let decoded = decode_job_info(bytes.as_ref()).map_err(codec_error_to_shard_error)?;
+        let decoded = decode_job_info(bytes.into()).map_err(codec_error_to_shard_error)?;
         Ok(Self { decoded })
     }
 

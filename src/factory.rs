@@ -214,7 +214,7 @@ impl ShardFactory {
             .or_else(|| template_path.find("{shard}"));
 
         let pos = placeholder_pos.ok_or_else(|| {
-            JobStoreShardError::Rkyv(format!(
+            JobStoreShardError::Codec(format!(
                 "database template path must contain a shard placeholder (%shard% or {{shard}}), got: {}",
                 template_path
             ))
@@ -224,7 +224,7 @@ impl ShardFactory {
         if pos > 0 {
             let char_before = template_path.chars().nth(pos - 1);
             if char_before != Some('/') {
-                return Err(JobStoreShardError::Rkyv(format!(
+                return Err(JobStoreShardError::Codec(format!(
                     "shard placeholder in database template path must be preceded by '/' for correct path handling. \
                      Got: '{}'. Change to something like '/data/%shard%' where the shard ID is a directory name.",
                     template_path
@@ -325,7 +325,7 @@ impl ShardFactory {
                             "factory.close: shard.close() timed out (object store may be unreachable), re-inserting into instances"
                         );
                         self.instances.insert(id, entry);
-                        return Err(JobStoreShardError::Rkyv(format!(
+                        return Err(JobStoreShardError::Codec(format!(
                             "shard close timed out after {}s",
                             self.close_timeout.as_secs()
                         )));
@@ -397,7 +397,7 @@ impl ShardFactory {
                 .try_collect()
                 .await
                 .map_err(|e| {
-                    JobStoreShardError::Rkyv(format!("failed to list objects for deletion: {}", e))
+                    JobStoreShardError::Codec(format!("failed to list objects for deletion: {}", e))
                 })?;
 
             let count = objects.len();
@@ -447,7 +447,7 @@ impl ShardFactory {
                 .try_collect()
                 .await
                 .map_err(|e| {
-                    JobStoreShardError::Rkyv(format!(
+                    JobStoreShardError::Codec(format!(
                         "failed to list WAL objects for deletion: {}",
                         e
                     ))

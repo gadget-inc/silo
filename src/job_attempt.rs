@@ -3,7 +3,7 @@ use crate::fb::silo::fb;
 use crate::job_store_shard::JobStoreShardError;
 
 fn codec_error_to_shard_error(e: CodecError) -> JobStoreShardError {
-    JobStoreShardError::Rkyv(e.to_string())
+    JobStoreShardError::Codec(e.to_string())
 }
 
 /// Outcome passed by callers when reporting an attempt's completion.
@@ -72,9 +72,9 @@ impl std::fmt::Debug for JobAttemptView {
 }
 
 impl JobAttemptView {
-    pub fn new(bytes: impl AsRef<[u8]>) -> Result<Self, JobStoreShardError> {
+    pub fn new(bytes: impl Into<bytes::Bytes>) -> Result<Self, JobStoreShardError> {
         // Validate and decode up front; reject invalid data early.
-        let decoded = decode_attempt(bytes.as_ref()).map_err(codec_error_to_shard_error)?;
+        let decoded = decode_attempt(bytes.into()).map_err(codec_error_to_shard_error)?;
         Ok(Self { decoded })
     }
 

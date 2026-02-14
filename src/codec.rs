@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use flatbuffers::FlatBufferBuilder;
 
 use crate::fb::silo::fb;
@@ -21,6 +22,27 @@ impl From<CodecError> for String {
 // ---------------------------------------------------------------------------
 // Encode helpers
 // ---------------------------------------------------------------------------
+
+/// Build a vector of KeyValuePair offsets from string pairs.
+fn build_kv_pair_offsets<'a, A: flatbuffers::Allocator + 'a>(
+    builder: &mut FlatBufferBuilder<'a, A>,
+    pairs: &[(String, String)],
+) -> Vec<flatbuffers::WIPOffset<fb::KeyValuePair<'a>>> {
+    pairs
+        .iter()
+        .map(|(k, v)| {
+            let k = builder.create_string(k);
+            let v = builder.create_string(v);
+            fb::KeyValuePair::create(
+                builder,
+                &fb::KeyValuePairArgs {
+                    key: Some(k),
+                    value: Some(v),
+                },
+            )
+        })
+        .collect()
+}
 
 /// Build a Task union (TaskVariant) into the builder. Returns (type, offset).
 fn build_task_union<'a, A: flatbuffers::Allocator + 'a>(
@@ -167,20 +189,7 @@ fn build_task_union<'a, A: flatbuffers::Allocator + 'a>(
             let task_id_s = builder.create_string(task_id);
             let tenant = builder.create_string(tenant);
             let queue_key = builder.create_string(queue_key);
-            let md: Vec<_> = metadata
-                .iter()
-                .map(|(k, v)| {
-                    let k = builder.create_string(k);
-                    let v = builder.create_string(v);
-                    fb::KeyValuePair::create(
-                        builder,
-                        &fb::KeyValuePairArgs {
-                            key: Some(k),
-                            value: Some(v),
-                        },
-                    )
-                })
-                .collect();
+            let md = build_kv_pair_offsets(builder, metadata);
             let metadata = builder.create_vector(&md);
             let task_group = builder.create_string(task_group);
             let rfl = fb::RefreshFloatingLimit::create(
@@ -205,7 +214,7 @@ fn build_task_union<'a, A: flatbuffers::Allocator + 'a>(
 // ---------------------------------------------------------------------------
 
 #[inline]
-pub fn encode_task(task: &Task) -> Result<Vec<u8>, CodecError> {
+pub fn encode_task(task: &Task) -> Vec<u8> {
     let mut builder = FlatBufferBuilder::with_capacity(256);
     let (vtype, voff) = build_task_union(&mut builder, task);
     let root = fb::Task::create(
@@ -216,11 +225,11 @@ pub fn encode_task(task: &Task) -> Result<Vec<u8>, CodecError> {
         },
     );
     builder.finish(root, None);
-    Ok(builder.finished_data().to_vec())
+    builder.finished_data().to_vec()
 }
 
 #[inline]
-pub fn encode_lease(record: &LeaseRecord) -> Result<Vec<u8>, CodecError> {
+pub fn encode_lease(record: &LeaseRecord) -> Vec<u8> {
     let mut builder = FlatBufferBuilder::with_capacity(256);
     let worker_id = builder.create_string(&record.worker_id);
     let (vtype, voff) = build_task_union(&mut builder, &record.task);
@@ -235,11 +244,267 @@ pub fn encode_lease(record: &LeaseRecord) -> Result<Vec<u8>, CodecError> {
         },
     );
     builder.finish(root, None);
+    builder.finished_data().to_vec()
+}
+
+// ---------------------------------------------------------------------------
+// Encode helpers: rebuild task union from existing FlatBuffers (zero-copy)
+// ---------------------------------------------------------------------------
+
+/// Rebuild the task union in a FlatBufferBuilder by reading fields from an
+/// existing FlatBuffer LeaseRecord. This avoids materializing an owned Task.
+fn build_task_union_from_fb_lease<'a, A: flatbuffers::Allocator + 'a>(
+    builder: &mut FlatBufferBuilder<'a, A>,
+    lr: fb::LeaseRecord<'_>,
+) -> Result<
+    (
+        fb::TaskVariant,
+        flatbuffers::WIPOffset<flatbuffers::UnionWIPOffset>,
+    ),
+    CodecError,
+> {
+    let vtype = lr.task_type();
+    let table = lr
+        .task()
+        .ok_or_else(|| CodecError::Flatbuffer("missing task variant in lease".to_string()))?;
+    build_task_union_from_fb_table(builder, vtype, table)
+}
+
+/// Rebuild the task union in a FlatBufferBuilder by reading fields from an
+/// existing FlatBuffer Task. This avoids materializing an owned Task.
+fn build_task_union_from_fb_task<'a, A: flatbuffers::Allocator + 'a>(
+    builder: &mut FlatBufferBuilder<'a, A>,
+    t: fb::Task<'_>,
+) -> Result<
+    (
+        fb::TaskVariant,
+        flatbuffers::WIPOffset<flatbuffers::UnionWIPOffset>,
+    ),
+    CodecError,
+> {
+    let vtype = t.variant_type();
+    let table = t
+        .variant()
+        .ok_or_else(|| CodecError::Flatbuffer("missing task variant".to_string()))?;
+    build_task_union_from_fb_table(builder, vtype, table)
+}
+
+/// Core helper: rebuild task union from a raw FlatBuffer table + variant type.
+fn build_task_union_from_fb_table<'a, A: flatbuffers::Allocator + 'a>(
+    builder: &mut FlatBufferBuilder<'a, A>,
+    vtype: fb::TaskVariant,
+    table: flatbuffers::Table<'_>,
+) -> Result<
+    (
+        fb::TaskVariant,
+        flatbuffers::WIPOffset<flatbuffers::UnionWIPOffset>,
+    ),
+    CodecError,
+> {
+    match vtype {
+        fb::TaskVariant::RunAttempt => {
+            let ra = unsafe { fb::RunAttempt::init_from_table(table) };
+            let id = builder.create_string(ra.id().unwrap_or_default());
+            let tenant = builder.create_string(ra.tenant().unwrap_or_default());
+            let job_id = builder.create_string(ra.job_id().unwrap_or_default());
+            let hq: Vec<_> = ra
+                .held_queues()
+                .map(|v| v.iter().map(|s| builder.create_string(s)).collect())
+                .unwrap_or_default();
+            let held_queues = builder.create_vector(&hq);
+            let task_group = builder.create_string(ra.task_group().unwrap_or_default());
+            let off = fb::RunAttempt::create(
+                builder,
+                &fb::RunAttemptArgs {
+                    id: Some(id),
+                    tenant: Some(tenant),
+                    job_id: Some(job_id),
+                    attempt_number: ra.attempt_number(),
+                    relative_attempt_number: ra.relative_attempt_number(),
+                    held_queues: Some(held_queues),
+                    task_group: Some(task_group),
+                },
+            );
+            Ok((fb::TaskVariant::RunAttempt, off.as_union_value()))
+        }
+        fb::TaskVariant::RequestTicket => {
+            let rt = unsafe { fb::RequestTicket::init_from_table(table) };
+            let queue = builder.create_string(rt.queue().unwrap_or_default());
+            let tenant = builder.create_string(rt.tenant().unwrap_or_default());
+            let job_id = builder.create_string(rt.job_id().unwrap_or_default());
+            let request_id = builder.create_string(rt.request_id().unwrap_or_default());
+            let task_group = builder.create_string(rt.task_group().unwrap_or_default());
+            let off = fb::RequestTicket::create(
+                builder,
+                &fb::RequestTicketArgs {
+                    queue: Some(queue),
+                    start_time_ms: rt.start_time_ms(),
+                    priority: rt.priority(),
+                    tenant: Some(tenant),
+                    job_id: Some(job_id),
+                    attempt_number: rt.attempt_number(),
+                    relative_attempt_number: rt.relative_attempt_number(),
+                    request_id: Some(request_id),
+                    task_group: Some(task_group),
+                },
+            );
+            Ok((fb::TaskVariant::RequestTicket, off.as_union_value()))
+        }
+        fb::TaskVariant::CheckRateLimit => {
+            let crl = unsafe { fb::CheckRateLimit::init_from_table(table) };
+            let task_id = builder.create_string(crl.task_id().unwrap_or_default());
+            let tenant = builder.create_string(crl.tenant().unwrap_or_default());
+            let job_id = builder.create_string(crl.job_id().unwrap_or_default());
+            let rl = crl.rate_limit().ok_or_else(|| {
+                CodecError::Flatbuffer("missing rate_limit in CheckRateLimit".to_string())
+            })?;
+            let rl_name = builder.create_string(rl.name().unwrap_or_default());
+            let rl_unique_key = builder.create_string(rl.unique_key().unwrap_or_default());
+            let rl_off = fb::GubernatorRateLimitData::create(
+                builder,
+                &fb::GubernatorRateLimitDataArgs {
+                    name: Some(rl_name),
+                    unique_key: Some(rl_unique_key),
+                    limit: rl.limit(),
+                    duration_ms: rl.duration_ms(),
+                    hits: rl.hits(),
+                    algorithm: rl.algorithm(),
+                    behavior: rl.behavior(),
+                    retry_initial_backoff_ms: rl.retry_initial_backoff_ms(),
+                    retry_max_backoff_ms: rl.retry_max_backoff_ms(),
+                    retry_backoff_multiplier: rl.retry_backoff_multiplier(),
+                    retry_max_retries: rl.retry_max_retries(),
+                },
+            );
+            let hq: Vec<_> = crl
+                .held_queues()
+                .map(|v| v.iter().map(|s| builder.create_string(s)).collect())
+                .unwrap_or_default();
+            let held_queues = builder.create_vector(&hq);
+            let task_group = builder.create_string(crl.task_group().unwrap_or_default());
+            let off = fb::CheckRateLimit::create(
+                builder,
+                &fb::CheckRateLimitArgs {
+                    task_id: Some(task_id),
+                    tenant: Some(tenant),
+                    job_id: Some(job_id),
+                    attempt_number: crl.attempt_number(),
+                    relative_attempt_number: crl.relative_attempt_number(),
+                    limit_index: crl.limit_index(),
+                    rate_limit: Some(rl_off),
+                    retry_count: crl.retry_count(),
+                    started_at_ms: crl.started_at_ms(),
+                    priority: crl.priority(),
+                    held_queues: Some(held_queues),
+                    task_group: Some(task_group),
+                },
+            );
+            Ok((fb::TaskVariant::CheckRateLimit, off.as_union_value()))
+        }
+        fb::TaskVariant::RefreshFloatingLimit => {
+            let rfl = unsafe { fb::RefreshFloatingLimit::init_from_table(table) };
+            let task_id = builder.create_string(rfl.task_id().unwrap_or_default());
+            let tenant = builder.create_string(rfl.tenant().unwrap_or_default());
+            let queue_key = builder.create_string(rfl.queue_key().unwrap_or_default());
+            let md: Vec<_> = rfl
+                .metadata()
+                .map(|v| {
+                    v.iter()
+                        .map(|kv| {
+                            let k = builder.create_string(kv.key().unwrap_or_default());
+                            let v = builder.create_string(kv.value().unwrap_or_default());
+                            fb::KeyValuePair::create(
+                                builder,
+                                &fb::KeyValuePairArgs {
+                                    key: Some(k),
+                                    value: Some(v),
+                                },
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let metadata = builder.create_vector(&md);
+            let task_group = builder.create_string(rfl.task_group().unwrap_or_default());
+            let off = fb::RefreshFloatingLimit::create(
+                builder,
+                &fb::RefreshFloatingLimitArgs {
+                    task_id: Some(task_id),
+                    tenant: Some(tenant),
+                    queue_key: Some(queue_key),
+                    current_max_concurrency: rfl.current_max_concurrency(),
+                    last_refreshed_at_ms: rfl.last_refreshed_at_ms(),
+                    metadata: Some(metadata),
+                    task_group: Some(task_group),
+                },
+            );
+            Ok((
+                fb::TaskVariant::RefreshFloatingLimit,
+                off.as_union_value(),
+            ))
+        }
+        _ => Err(CodecError::Flatbuffer(format!(
+            "unknown task variant type: {:?}",
+            vtype
+        ))),
+    }
+}
+
+/// Build a lease FlatBuffer by copying task union fields from an existing
+/// DecodedLease, only changing the expiry. Avoids materializing an owned Task.
+#[inline]
+pub fn encode_lease_with_new_expiry(
+    existing: &DecodedLease,
+    new_expiry_ms: i64,
+) -> Result<Vec<u8>, CodecError> {
+    let lr = existing.fb();
+    let mut builder = FlatBufferBuilder::with_capacity(256);
+    let worker_id = builder.create_string(lr.worker_id().unwrap_or_default());
+    let (vtype, voff) = build_task_union_from_fb_lease(&mut builder, lr)?;
+    let root = fb::LeaseRecord::create(
+        &mut builder,
+        &fb::LeaseRecordArgs {
+            worker_id: Some(worker_id),
+            task_type: vtype,
+            task: Some(voff),
+            expiry_ms: new_expiry_ms,
+            started_at_ms: lr.started_at_ms(),
+        },
+    );
+    builder.finish(root, None);
+    Ok(builder.finished_data().to_vec())
+}
+
+/// Build a lease FlatBuffer by reading task data from raw FlatBuffer task bytes.
+/// Used when creating a lease from a broker task without materializing an owned Task.
+#[inline]
+pub fn encode_lease_from_task_bytes(
+    worker_id: &str,
+    task_bytes: &[u8],
+    expiry_ms: i64,
+    started_at_ms: i64,
+) -> Result<Vec<u8>, CodecError> {
+    let fb_task =
+        flatbuffers::root::<fb::Task>(task_bytes).map_err(|e| CodecError::Flatbuffer(e.to_string()))?;
+    let mut builder = FlatBufferBuilder::with_capacity(256);
+    let worker_id_off = builder.create_string(worker_id);
+    let (vtype, voff) = build_task_union_from_fb_task(&mut builder, fb_task)?;
+    let root = fb::LeaseRecord::create(
+        &mut builder,
+        &fb::LeaseRecordArgs {
+            worker_id: Some(worker_id_off),
+            task_type: vtype,
+            task: Some(voff),
+            expiry_ms,
+            started_at_ms,
+        },
+    );
+    builder.finish(root, None);
     Ok(builder.finished_data().to_vec())
 }
 
 #[inline]
-pub fn encode_attempt(attempt: &JobAttempt) -> Result<Vec<u8>, CodecError> {
+pub fn encode_attempt(attempt: &JobAttempt) -> Vec<u8> {
     let mut builder = FlatBufferBuilder::with_capacity(256);
     let job_id = builder.create_string(&attempt.job_id);
     let task_id = builder.create_string(&attempt.task_id);
@@ -299,11 +564,11 @@ pub fn encode_attempt(attempt: &JobAttempt) -> Result<Vec<u8>, CodecError> {
         },
     );
     builder.finish(root, None);
-    Ok(builder.finished_data().to_vec())
+    builder.finished_data().to_vec()
 }
 
 #[inline]
-pub fn encode_job_info(job: &JobInfo) -> Result<Vec<u8>, CodecError> {
+pub fn encode_job_info(job: &JobInfo) -> Vec<u8> {
     let mut builder = FlatBufferBuilder::with_capacity(512);
     let id = builder.create_string(&job.id);
     let payload = builder.create_vector(&job.payload);
@@ -322,21 +587,7 @@ pub fn encode_job_info(job: &JobInfo) -> Result<Vec<u8>, CodecError> {
         )
     });
 
-    let md: Vec<_> = job
-        .metadata
-        .iter()
-        .map(|(k, v)| {
-            let k = builder.create_string(k);
-            let v = builder.create_string(v);
-            fb::KeyValuePair::create(
-                &mut builder,
-                &fb::KeyValuePairArgs {
-                    key: Some(k),
-                    value: Some(v),
-                },
-            )
-        })
-        .collect();
+    let md = build_kv_pair_offsets(&mut builder, &job.metadata);
     let metadata = builder.create_vector(&md);
 
     let limits: Vec<_> = job
@@ -387,21 +638,7 @@ pub fn encode_job_info(job: &JobInfo) -> Result<Vec<u8>, CodecError> {
                 }
                 Limit::FloatingConcurrency(fl) => {
                     let key = builder.create_string(&fl.key);
-                    let md: Vec<_> = fl
-                        .metadata
-                        .iter()
-                        .map(|(k, v)| {
-                            let k = builder.create_string(k);
-                            let v = builder.create_string(v);
-                            fb::KeyValuePair::create(
-                                &mut builder,
-                                &fb::KeyValuePairArgs {
-                                    key: Some(k),
-                                    value: Some(v),
-                                },
-                            )
-                        })
-                        .collect();
+                    let md = build_kv_pair_offsets(&mut builder, &fl.metadata);
                     let metadata = builder.create_vector(&md);
                     let entry = fb::FloatingConcurrencyLimitEntry::create(
                         &mut builder,
@@ -443,11 +680,11 @@ pub fn encode_job_info(job: &JobInfo) -> Result<Vec<u8>, CodecError> {
         },
     );
     builder.finish(root, None);
-    Ok(builder.finished_data().to_vec())
+    builder.finished_data().to_vec()
 }
 
 #[inline]
-pub fn encode_job_status(status: &JobStatus) -> Result<Vec<u8>, CodecError> {
+pub fn encode_job_status(status: &JobStatus) -> Vec<u8> {
     let mut builder = FlatBufferBuilder::with_capacity(64);
     let kind = match status.kind {
         JobStatusKind::Scheduled => fb::JobStatusKind::Scheduled,
@@ -466,11 +703,11 @@ pub fn encode_job_status(status: &JobStatus) -> Result<Vec<u8>, CodecError> {
         },
     );
     builder.finish(root, None);
-    Ok(builder.finished_data().to_vec())
+    builder.finished_data().to_vec()
 }
 
 #[inline]
-pub fn encode_holder(holder: &HolderRecord) -> Result<Vec<u8>, CodecError> {
+pub fn encode_holder(holder: &HolderRecord) -> Vec<u8> {
     let mut builder = FlatBufferBuilder::with_capacity(32);
     let root = fb::HolderRecord::create(
         &mut builder,
@@ -479,11 +716,11 @@ pub fn encode_holder(holder: &HolderRecord) -> Result<Vec<u8>, CodecError> {
         },
     );
     builder.finish(root, None);
-    Ok(builder.finished_data().to_vec())
+    builder.finished_data().to_vec()
 }
 
 #[inline]
-pub fn encode_concurrency_action(action: &ConcurrencyAction) -> Result<Vec<u8>, CodecError> {
+pub fn encode_concurrency_action(action: &ConcurrencyAction) -> Vec<u8> {
     let mut builder = FlatBufferBuilder::with_capacity(128);
     match action {
         ConcurrencyAction::EnqueueTask {
@@ -517,11 +754,11 @@ pub fn encode_concurrency_action(action: &ConcurrencyAction) -> Result<Vec<u8>, 
             builder.finish(root, None);
         }
     }
-    Ok(builder.finished_data().to_vec())
+    builder.finished_data().to_vec()
 }
 
 #[inline]
-pub fn encode_job_cancellation(cancellation: &JobCancellation) -> Result<Vec<u8>, CodecError> {
+pub fn encode_job_cancellation(cancellation: &JobCancellation) -> Vec<u8> {
     let mut builder = FlatBufferBuilder::with_capacity(32);
     let root = fb::JobCancellation::create(
         &mut builder,
@@ -530,27 +767,13 @@ pub fn encode_job_cancellation(cancellation: &JobCancellation) -> Result<Vec<u8>
         },
     );
     builder.finish(root, None);
-    Ok(builder.finished_data().to_vec())
+    builder.finished_data().to_vec()
 }
 
 #[inline]
-pub fn encode_floating_limit_state(state: &FloatingLimitState) -> Result<Vec<u8>, CodecError> {
+pub fn encode_floating_limit_state(state: &FloatingLimitState) -> Vec<u8> {
     let mut builder = FlatBufferBuilder::with_capacity(128);
-    let md: Vec<_> = state
-        .metadata
-        .iter()
-        .map(|(k, v)| {
-            let k = builder.create_string(k);
-            let v = builder.create_string(v);
-            fb::KeyValuePair::create(
-                &mut builder,
-                &fb::KeyValuePairArgs {
-                    key: Some(k),
-                    value: Some(v),
-                },
-            )
-        })
-        .collect();
+    let md = build_kv_pair_offsets(&mut builder, &state.metadata);
     let metadata = builder.create_vector(&md);
     let root = fb::FloatingLimitState::create(
         &mut builder,
@@ -566,12 +789,30 @@ pub fn encode_floating_limit_state(state: &FloatingLimitState) -> Result<Vec<u8>
         },
     );
     builder.finish(root, None);
-    Ok(builder.finished_data().to_vec())
+    builder.finished_data().to_vec()
 }
 
 // ---------------------------------------------------------------------------
-// Decode helpers - materialize a Task from a FlatBuffer TaskVariant union
+// Decode helpers
 // ---------------------------------------------------------------------------
+
+/// Convert FlatBuffer KeyValuePair vector to owned Vec<(String, String)>.
+pub(crate) fn fb_kv_pairs_to_owned(
+    pairs: Option<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<fb::KeyValuePair<'_>>>>,
+) -> Vec<(String, String)> {
+    pairs
+        .map(|v| {
+            v.iter()
+                .map(|kv| {
+                    (
+                        kv.key().unwrap_or_default().to_string(),
+                        kv.value().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 fn task_from_fb_variant(
     vtype: fb::TaskVariant,
@@ -610,9 +851,17 @@ fn task_from_fb_variant(
         }
         fb::TaskVariant::CheckRateLimit => {
             let crl = unsafe { fb::CheckRateLimit::init_from_table(table) };
-            let rl = crl.rate_limit();
-            let rate_limit = match rl {
-                Some(rl) => GubernatorRateLimitData {
+            let rl = crl.rate_limit().ok_or_else(|| {
+                CodecError::Flatbuffer("missing rate_limit in CheckRateLimit".to_string())
+            })?;
+            Ok(Task::CheckRateLimit {
+                task_id: crl.task_id().unwrap_or_default().to_string(),
+                tenant: crl.tenant().unwrap_or_default().to_string(),
+                job_id: crl.job_id().unwrap_or_default().to_string(),
+                attempt_number: crl.attempt_number(),
+                relative_attempt_number: crl.relative_attempt_number(),
+                limit_index: crl.limit_index(),
+                rate_limit: GubernatorRateLimitData {
                     name: rl.name().unwrap_or_default().to_string(),
                     unique_key: rl.unique_key().unwrap_or_default().to_string(),
                     limit: rl.limit(),
@@ -625,20 +874,6 @@ fn task_from_fb_variant(
                     retry_backoff_multiplier: rl.retry_backoff_multiplier(),
                     retry_max_retries: rl.retry_max_retries(),
                 },
-                None => {
-                    return Err(CodecError::Flatbuffer(
-                        "missing rate_limit in CheckRateLimit".to_string(),
-                    ));
-                }
-            };
-            Ok(Task::CheckRateLimit {
-                task_id: crl.task_id().unwrap_or_default().to_string(),
-                tenant: crl.tenant().unwrap_or_default().to_string(),
-                job_id: crl.job_id().unwrap_or_default().to_string(),
-                attempt_number: crl.attempt_number(),
-                relative_attempt_number: crl.relative_attempt_number(),
-                limit_index: crl.limit_index(),
-                rate_limit,
                 retry_count: crl.retry_count(),
                 started_at_ms: crl.started_at_ms(),
                 priority: crl.priority(),
@@ -657,19 +892,7 @@ fn task_from_fb_variant(
                 queue_key: rfl.queue_key().unwrap_or_default().to_string(),
                 current_max_concurrency: rfl.current_max_concurrency(),
                 last_refreshed_at_ms: rfl.last_refreshed_at_ms(),
-                metadata: rfl
-                    .metadata()
-                    .map(|v| {
-                        v.iter()
-                            .map(|kv| {
-                                (
-                                    kv.key().unwrap_or_default().to_string(),
-                                    kv.value().unwrap_or_default().to_string(),
-                                )
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                metadata: fb_kv_pairs_to_owned(rfl.metadata()),
                 task_group: rfl.task_group().unwrap_or_default().to_string(),
             })
         }
@@ -696,17 +919,172 @@ pub fn decode_task(bytes: &[u8]) -> Result<Task, CodecError> {
 }
 
 // ---------------------------------------------------------------------------
-// Decode: Lease (zero-copy wrapper)
+// Decode: zero-copy wrappers with Bytes storage
 // ---------------------------------------------------------------------------
 
-/// Decoded lease record that owns its data for zero-copy access.
+/// Simple decoded wrapper: validates at construction, provides zero-copy fb() accessor.
+macro_rules! decoded_wrapper {
+    ($name:ident, $fb_type:ident) => {
+        #[derive(Clone)]
+        pub struct $name {
+            data: Bytes,
+        }
+
+        impl $name {
+            pub fn fb(&self) -> fb::$fb_type<'_> {
+                // SAFETY: data was validated at construction
+                unsafe { flatbuffers::root_unchecked::<fb::$fb_type>(&self.data) }
+            }
+        }
+    };
+}
+
+/// Decode function that validates and wraps bytes in a zero-copy wrapper.
+macro_rules! decode_fn {
+    ($fn_name:ident, $wrapper:ident, $fb_type:ident) => {
+        #[inline]
+        pub fn $fn_name(bytes: impl Into<Bytes>) -> Result<$wrapper, CodecError> {
+            let data: Bytes = bytes.into();
+            flatbuffers::root::<fb::$fb_type>(&data)
+                .map_err(|e| CodecError::Flatbuffer(e.to_string()))?;
+            Ok($wrapper { data })
+        }
+    };
+}
+
+decoded_wrapper!(DecodedAttempt, JobAttempt);
+decode_fn!(decode_attempt, DecodedAttempt, JobAttempt);
+
+decoded_wrapper!(DecodedJobInfo, JobInfo);
+decode_fn!(decode_job_info, DecodedJobInfo, JobInfo);
+
+decoded_wrapper!(DecodedConcurrencyAction, ConcurrencyAction);
+decode_fn!(
+    decode_concurrency_action,
+    DecodedConcurrencyAction,
+    ConcurrencyAction
+);
+
+// ---------------------------------------------------------------------------
+// Decode: Task (zero-copy wrapper with Bytes storage)
+// ---------------------------------------------------------------------------
+
+/// Zero-copy wrapper around serialized Task FlatBuffer bytes.
+///
+/// Validates the FlatBuffer at construction time, then provides zero-copy
+/// accessors for fields without materializing an owned `Task` struct.
+/// Use `to_task()` only when a fully owned `Task` is needed.
+#[derive(Clone)]
+pub struct DecodedTask {
+    data: Bytes,
+}
+
+/// Macro to extract a string field from whichever task variant is present.
+macro_rules! task_str_field {
+    ($self:ident, $field:ident, $($variant:ident => $accessor:ident),+ $(,)?) => {{
+        let t = $self.fb();
+        match t.variant_type() {
+            $(fb::TaskVariant::$variant => t.$accessor().and_then(|r| r.$field()).unwrap_or_default(),)+
+            _ => "",
+        }
+    }};
+}
+
+impl DecodedTask {
+    pub fn fb(&self) -> fb::Task<'_> {
+        // SAFETY: data was validated at construction in decode_task_validated
+        unsafe { flatbuffers::root_unchecked::<fb::Task>(&self.data) }
+    }
+
+    pub fn variant_type(&self) -> fb::TaskVariant {
+        self.fb().variant_type()
+    }
+
+    pub fn tenant(&self) -> &str {
+        task_str_field!(self, tenant,
+            RunAttempt => variant_as_run_attempt,
+            RequestTicket => variant_as_request_ticket,
+            CheckRateLimit => variant_as_check_rate_limit,
+            RefreshFloatingLimit => variant_as_refresh_floating_limit,
+        )
+    }
+
+    pub fn task_group(&self) -> &str {
+        task_str_field!(self, task_group,
+            RunAttempt => variant_as_run_attempt,
+            RequestTicket => variant_as_request_ticket,
+            CheckRateLimit => variant_as_check_rate_limit,
+            RefreshFloatingLimit => variant_as_refresh_floating_limit,
+        )
+    }
+
+    pub fn as_run_attempt(&self) -> Option<fb::RunAttempt<'_>> {
+        self.fb().variant_as_run_attempt()
+    }
+
+    pub fn as_request_ticket(&self) -> Option<fb::RequestTicket<'_>> {
+        self.fb().variant_as_request_ticket()
+    }
+
+    pub fn as_check_rate_limit(&self) -> Option<fb::CheckRateLimit<'_>> {
+        self.fb().variant_as_check_rate_limit()
+    }
+
+    pub fn as_refresh_floating_limit(&self) -> Option<fb::RefreshFloatingLimit<'_>> {
+        self.fb().variant_as_refresh_floating_limit()
+    }
+
+    /// Materialize a fully-owned Task from the FlatBuffer data.
+    pub fn to_task(&self) -> Result<Task, CodecError> {
+        let t = self.fb();
+        let vtype = t.variant_type();
+        let table = t
+            .variant()
+            .ok_or_else(|| CodecError::Flatbuffer("missing task variant".to_string()))?;
+        task_from_fb_variant(vtype, table)
+    }
+
+    /// Access the raw underlying bytes (for pass-through writes).
+    pub fn as_bytes(&self) -> &Bytes {
+        &self.data
+    }
+}
+
+decode_fn!(decode_task_validated, DecodedTask, Task);
+
+// ---------------------------------------------------------------------------
+// Decode: Lease (zero-copy wrapper with task variant dispatch)
+// ---------------------------------------------------------------------------
+
+/// Extract a string field from whichever task variant is present in a lease.
+macro_rules! lease_str_field {
+    ($self:ident, $field:ident, $($variant:ident => $accessor:ident),+ $(,)?) => {{
+        let lr = $self.fb();
+        match lr.task_type() {
+            $(fb::TaskVariant::$variant => lr.$accessor().and_then(|r| r.$field()).unwrap_or_default(),)+
+            _ => "",
+        }
+    }};
+}
+
+/// Extract a u32 field from whichever task variant is present in a lease.
+macro_rules! lease_u32_field {
+    ($self:ident, $field:ident, $($variant:ident => $accessor:ident),+ $(,)?) => {{
+        let lr = $self.fb();
+        match lr.task_type() {
+            $(fb::TaskVariant::$variant => lr.$accessor().map(|r| r.$field()).unwrap_or(0),)+
+            _ => 0,
+        }
+    }};
+}
+
 #[derive(Clone)]
 pub struct DecodedLease {
-    data: Vec<u8>,
+    data: Bytes,
 }
 
 impl DecodedLease {
-    fn fb(&self) -> fb::LeaseRecord<'_> {
+    pub fn fb(&self) -> fb::LeaseRecord<'_> {
         // SAFETY: data was validated at construction in decode_lease
         unsafe { flatbuffers::root_unchecked::<fb::LeaseRecord>(&self.data) }
     }
@@ -724,93 +1102,40 @@ impl DecodedLease {
     }
 
     pub fn tenant(&self) -> &str {
-        let lr = self.fb();
-        let vtype = lr.task_type();
-        match vtype {
-            fb::TaskVariant::RunAttempt => lr
-                .task_as_run_attempt()
-                .and_then(|r| r.tenant())
-                .unwrap_or_default(),
-            fb::TaskVariant::RequestTicket => lr
-                .task_as_request_ticket()
-                .and_then(|r| r.tenant())
-                .unwrap_or_default(),
-            fb::TaskVariant::CheckRateLimit => lr
-                .task_as_check_rate_limit()
-                .and_then(|r| r.tenant())
-                .unwrap_or_default(),
-            fb::TaskVariant::RefreshFloatingLimit => lr
-                .task_as_refresh_floating_limit()
-                .and_then(|r| r.tenant())
-                .unwrap_or_default(),
-            _ => "",
-        }
+        lease_str_field!(self, tenant,
+            RunAttempt => task_as_run_attempt,
+            RequestTicket => task_as_request_ticket,
+            CheckRateLimit => task_as_check_rate_limit,
+            RefreshFloatingLimit => task_as_refresh_floating_limit,
+        )
     }
 
     pub fn job_id(&self) -> &str {
-        let lr = self.fb();
-        match lr.task_type() {
-            fb::TaskVariant::RunAttempt => lr
-                .task_as_run_attempt()
-                .and_then(|r| r.job_id())
-                .unwrap_or_default(),
-            fb::TaskVariant::RequestTicket => lr
-                .task_as_request_ticket()
-                .and_then(|r| r.job_id())
-                .unwrap_or_default(),
-            fb::TaskVariant::CheckRateLimit => lr
-                .task_as_check_rate_limit()
-                .and_then(|r| r.job_id())
-                .unwrap_or_default(),
-            fb::TaskVariant::RefreshFloatingLimit => "",
-            _ => "",
-        }
+        lease_str_field!(self, job_id,
+            RunAttempt => task_as_run_attempt,
+            RequestTicket => task_as_request_ticket,
+            CheckRateLimit => task_as_check_rate_limit,
+        )
     }
 
     pub fn attempt_number(&self) -> u32 {
-        let lr = self.fb();
-        match lr.task_type() {
-            fb::TaskVariant::RunAttempt => lr
-                .task_as_run_attempt()
-                .map(|r| r.attempt_number())
-                .unwrap_or(0),
-            fb::TaskVariant::RequestTicket => lr
-                .task_as_request_ticket()
-                .map(|r| r.attempt_number())
-                .unwrap_or(0),
-            fb::TaskVariant::CheckRateLimit => lr
-                .task_as_check_rate_limit()
-                .map(|r| r.attempt_number())
-                .unwrap_or(0),
-            _ => 0,
-        }
+        lease_u32_field!(self, attempt_number,
+            RunAttempt => task_as_run_attempt,
+            RequestTicket => task_as_request_ticket,
+            CheckRateLimit => task_as_check_rate_limit,
+        )
     }
 
     pub fn relative_attempt_number(&self) -> u32 {
-        let lr = self.fb();
-        match lr.task_type() {
-            fb::TaskVariant::RunAttempt => lr
-                .task_as_run_attempt()
-                .map(|r| r.relative_attempt_number())
-                .unwrap_or(0),
-            fb::TaskVariant::RequestTicket => lr
-                .task_as_request_ticket()
-                .map(|r| r.relative_attempt_number())
-                .unwrap_or(0),
-            fb::TaskVariant::CheckRateLimit => lr
-                .task_as_check_rate_limit()
-                .map(|r| r.relative_attempt_number())
-                .unwrap_or(0),
-            _ => 0,
-        }
+        lease_u32_field!(self, relative_attempt_number,
+            RunAttempt => task_as_run_attempt,
+            RequestTicket => task_as_request_ticket,
+            CheckRateLimit => task_as_check_rate_limit,
+        )
     }
 
     pub fn task_id(&self) -> Option<&str> {
-        let lr = self.fb();
-        match lr.task_type() {
-            fb::TaskVariant::RunAttempt => lr.task_as_run_attempt().and_then(|r| r.id()),
-            _ => None,
-        }
+        self.fb().task_as_run_attempt().and_then(|r| r.id())
     }
 
     pub fn refresh_floating_limit_info(&self) -> Option<(&str, &str)> {
@@ -841,93 +1166,26 @@ impl DecodedLease {
     }
 
     pub fn task_group(&self) -> &str {
-        let lr = self.fb();
-        match lr.task_type() {
-            fb::TaskVariant::RunAttempt => lr
-                .task_as_run_attempt()
-                .and_then(|r| r.task_group())
-                .unwrap_or_default(),
-            fb::TaskVariant::RequestTicket => lr
-                .task_as_request_ticket()
-                .and_then(|r| r.task_group())
-                .unwrap_or_default(),
-            fb::TaskVariant::CheckRateLimit => lr
-                .task_as_check_rate_limit()
-                .and_then(|r| r.task_group())
-                .unwrap_or_default(),
-            fb::TaskVariant::RefreshFloatingLimit => lr
-                .task_as_refresh_floating_limit()
-                .and_then(|r| r.task_group())
-                .unwrap_or_default(),
-            _ => "",
-        }
+        lease_str_field!(self, task_group,
+            RunAttempt => task_as_run_attempt,
+            RequestTicket => task_as_request_ticket,
+            CheckRateLimit => task_as_check_rate_limit,
+            RefreshFloatingLimit => task_as_refresh_floating_limit,
+        )
     }
 
-    /// Convert to an owned Task
-    pub fn to_task(&self) -> Task {
+    /// Convert to an owned Task.
+    pub fn to_task(&self) -> Result<Task, CodecError> {
         let lr = self.fb();
         let vtype = lr.task_type();
-        let table = lr.task().expect("validated at decode");
-        task_from_fb_variant(vtype, table).expect("validated at decode")
+        let table = lr
+            .task()
+            .ok_or_else(|| CodecError::Flatbuffer("missing task variant in lease".to_string()))?;
+        task_from_fb_variant(vtype, table)
     }
 }
 
-#[inline]
-pub fn decode_lease(bytes: &[u8]) -> Result<DecodedLease, CodecError> {
-    // Validate
-    flatbuffers::root::<fb::LeaseRecord>(bytes)
-        .map_err(|e| CodecError::Flatbuffer(e.to_string()))?;
-    Ok(DecodedLease {
-        data: bytes.to_vec(),
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Decode: JobAttempt (zero-copy wrapper)
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-pub struct DecodedAttempt {
-    data: Vec<u8>,
-}
-
-impl DecodedAttempt {
-    pub fn fb(&self) -> fb::JobAttempt<'_> {
-        unsafe { flatbuffers::root_unchecked::<fb::JobAttempt>(&self.data) }
-    }
-}
-
-#[inline]
-pub fn decode_attempt(bytes: &[u8]) -> Result<DecodedAttempt, CodecError> {
-    flatbuffers::root::<fb::JobAttempt>(bytes)
-        .map_err(|e| CodecError::Flatbuffer(e.to_string()))?;
-    Ok(DecodedAttempt {
-        data: bytes.to_vec(),
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Decode: JobInfo (zero-copy wrapper)
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-pub struct DecodedJobInfo {
-    data: Vec<u8>,
-}
-
-impl DecodedJobInfo {
-    pub fn fb(&self) -> fb::JobInfo<'_> {
-        unsafe { flatbuffers::root_unchecked::<fb::JobInfo>(&self.data) }
-    }
-}
-
-#[inline]
-pub fn decode_job_info(bytes: &[u8]) -> Result<DecodedJobInfo, CodecError> {
-    flatbuffers::root::<fb::JobInfo>(bytes).map_err(|e| CodecError::Flatbuffer(e.to_string()))?;
-    Ok(DecodedJobInfo {
-        data: bytes.to_vec(),
-    })
-}
+decode_fn!(decode_lease, DecodedLease, LeaseRecord);
 
 // ---------------------------------------------------------------------------
 // Decode: JobStatus (directly to owned)
@@ -970,30 +1228,6 @@ pub fn decode_holder_granted_at_ms(bytes: &[u8]) -> Result<i64, CodecError> {
 }
 
 // ---------------------------------------------------------------------------
-// Decode: ConcurrencyAction (zero-copy wrapper)
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-pub struct DecodedConcurrencyAction {
-    data: Vec<u8>,
-}
-
-impl DecodedConcurrencyAction {
-    pub fn fb(&self) -> fb::ConcurrencyAction<'_> {
-        unsafe { flatbuffers::root_unchecked::<fb::ConcurrencyAction>(&self.data) }
-    }
-}
-
-#[inline]
-pub fn decode_concurrency_action(bytes: &[u8]) -> Result<DecodedConcurrencyAction, CodecError> {
-    flatbuffers::root::<fb::ConcurrencyAction>(bytes)
-        .map_err(|e| CodecError::Flatbuffer(e.to_string()))?;
-    Ok(DecodedConcurrencyAction {
-        data: bytes.to_vec(),
-    })
-}
-
-// ---------------------------------------------------------------------------
 // Decode: JobCancellation (direct scalar extraction)
 // ---------------------------------------------------------------------------
 
@@ -1010,7 +1244,7 @@ pub fn decode_cancellation_at_ms(bytes: &[u8]) -> Result<i64, CodecError> {
 
 #[derive(Clone)]
 pub struct DecodedFloatingLimitState {
-    data: Vec<u8>,
+    data: Bytes,
 }
 
 impl DecodedFloatingLimitState {
@@ -1047,19 +1281,7 @@ impl DecodedFloatingLimitState {
     }
 
     pub fn metadata(&self) -> Vec<(String, String)> {
-        self.fb()
-            .metadata()
-            .map(|v| {
-                v.iter()
-                    .map(|kv| {
-                        (
-                            kv.key().unwrap_or_default().to_string(),
-                            kv.value().unwrap_or_default().to_string(),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        fb_kv_pairs_to_owned(self.fb().metadata())
     }
 
     /// Materialize an owned FloatingLimitState from the FlatBuffer data.
@@ -1078,11 +1300,8 @@ impl DecodedFloatingLimitState {
     }
 }
 
-#[inline]
-pub fn decode_floating_limit_state(bytes: &[u8]) -> Result<DecodedFloatingLimitState, CodecError> {
-    flatbuffers::root::<fb::FloatingLimitState>(bytes)
-        .map_err(|e| CodecError::Flatbuffer(e.to_string()))?;
-    Ok(DecodedFloatingLimitState {
-        data: bytes.to_vec(),
-    })
-}
+decode_fn!(
+    decode_floating_limit_state,
+    DecodedFloatingLimitState,
+    FloatingLimitState
+);

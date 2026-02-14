@@ -240,14 +240,14 @@ async fn reaper_without_retries_marks_failed_in_index() {
         .to_string();
     // Make lease expired
     let (lease_key, lease_value) = first_lease_kv(shard.db()).await.expect("lease present");
-    let decoded = decode_lease(&lease_value).expect("decode lease");
+    let decoded = decode_lease(lease_value).expect("decode lease");
     let expired = LeaseRecord {
         worker_id: decoded.worker_id().to_string(),
-        task: decoded.to_task(),
+        task: decoded.to_task().unwrap(),
         expiry_ms: now_ms() - 1,
         started_at_ms: decoded.started_at_ms(),
     };
-    let new_val = encode_lease(&expired).unwrap();
+    let new_val = encode_lease(&expired);
     shard.db().put(&lease_key, &new_val).await.unwrap();
     shard.db().flush().await.unwrap();
     // Reap
@@ -291,14 +291,14 @@ async fn reaper_with_retries_moves_to_scheduled_in_index() {
         .task_id()
         .to_string();
     let (lease_key, lease_value) = first_lease_kv(shard.db()).await.expect("lease present");
-    let decoded = decode_lease(&lease_value).expect("decode lease");
+    let decoded = decode_lease(lease_value).expect("decode lease");
     let expired = LeaseRecord {
         worker_id: decoded.worker_id().to_string(),
-        task: decoded.to_task(),
+        task: decoded.to_task().unwrap(),
         expiry_ms: now_ms() - 1,
         started_at_ms: decoded.started_at_ms(),
     };
-    let new_val = encode_lease(&expired).unwrap();
+    let new_val = encode_lease(&expired);
     shard.db().put(&lease_key, &new_val).await.unwrap();
     shard.db().flush().await.unwrap();
     // Reap
