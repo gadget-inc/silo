@@ -89,7 +89,7 @@ impl ShardFactory {
             instances: DashMap::new(),
             template: DatabaseTemplate {
                 backend: Backend::Memory,
-                path: "/noop/%shard%".to_string(),
+                path: "/noop".to_string(),
                 wal: None,
                 apply_wal_on_close: false,
                 slatedb: None,
