@@ -47,6 +47,42 @@ processes:
       restart: always
       backoff_seconds: 1
 
+  # Toxiproxy server for network fault injection testing
+  toxiproxy:
+    command: toxiproxy-server -host 127.0.0.1 -port 8474
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        port: 8474
+        path: /version
+      initial_delay_seconds: 1
+      period_seconds: 2
+    shutdown:
+      timeout_seconds: 1
+    availability:
+      restart: always
+      backoff_seconds: 1
+
+  # Create toxiproxy proxies for silo instances after both are ready
+  toxiproxy-setup:
+    command: |
+      curl -s -X POST http://127.0.0.1:8474/proxies \
+        -H 'Content-Type: application/json' \
+        -d '{"name":"silo-1","listen":"127.0.0.1:17450","upstream":"127.0.0.1:7450"}'
+      curl -s -X POST http://127.0.0.1:8474/proxies \
+        -H 'Content-Type: application/json' \
+        -d '{"name":"silo-2","listen":"127.0.0.1:17451","upstream":"127.0.0.1:7451"}'
+      echo "Toxiproxy proxies created successfully"
+    depends_on:
+      toxiproxy:
+        condition: process_healthy
+      silo-1:
+        condition: process_started
+      silo-2:
+        condition: process_started
+    availability:
+      restart: "no"
+
   # Silo instance 1 - watchexec restarts cargo run on source changes
   silo-1:
     command: |

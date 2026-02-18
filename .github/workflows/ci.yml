@@ -221,7 +221,7 @@ jobs:
         shell: bash
         run: |
           process-compose up --tui=false &
-          sleep 2
+          sleep 5
       - name: Build typescript package
         shell: bash
         working-directory: typescript_client
@@ -232,6 +232,8 @@ jobs:
         env:
           CI: "true"
           SILO_SERVERS: "localhost:7450,localhost:7451"
+          TOXIPROXY_SILO_SERVERS: "localhost:17450,localhost:17451"
+          TOXIPROXY_API_URL: "http://127.0.0.1:8474"
         run: pnpm test
 
   build-docker:
