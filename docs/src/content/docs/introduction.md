@@ -58,8 +58,8 @@ Silo partitions data across **shards**. Each shard is backed by its own SlateDB 
 
 ## Next Steps
 
-- [Enqueueing Jobs](/guides/enqueueing) — learn how to create jobs with payloads, priorities, scheduling, and limits
-- [Running Workers](/guides/running-workers) — set up workers to process jobs
-- [Concurrency Limits](/guides/concurrency-limits) — control job execution with concurrency and rate limits
-- [Deployment](/guides/deployment) — configure Silo for production with object storage and clustering
-- [Server Configuration](/reference/server-configuration) — full reference for all configuration options
+- [Enqueueing Jobs](/silo/guides/enqueueing) — learn how to create jobs with payloads, priorities, scheduling, and limits
+- [Running Workers](/silo/guides/running-workers) — set up workers to process jobs
+- [Concurrency Limits](/silo/guides/concurrency-limits) — control job execution with concurrency and rate limits
+- [Deployment](/silo/guides/deployment) — configure Silo for production with object storage and clustering
+- [Server Configuration](/silo/reference/server-configuration) — full reference for all configuration options
