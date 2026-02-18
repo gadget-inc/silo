@@ -1428,4 +1428,63 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       expect(signalAborted).toBe(false);
     });
   });
+
+  describe("enqueue-to-pickup latency", () => {
+    it("measures delay between enqueue and worker picking up the task", async () => {
+      const delays: number[] = [];
+
+      const handler: TaskHandler<{ enqueueTime: number }> = async (ctx) => {
+        const pickupTime = performance.now();
+        const delay = pickupTime - ctx.task.payload.enqueueTime;
+        delays.push(delay);
+        return { type: "success", result: { delayMs: delay } };
+      };
+
+      // Use a fast poll interval to measure the best-case short polling latency
+      const worker = createWorker(handler, {
+        pollIntervalMs: 50,
+        maxConcurrentTasks: 1,
+      });
+      worker.start();
+
+      // Run multiple iterations to get a representative sample
+      const iterations = 10;
+      for (let i = 0; i < iterations; i++) {
+        const enqueueTime = performance.now();
+        await client.enqueue({
+          tenant: DEFAULT_TENANT,
+          taskGroup: DEFAULT_TASK_GROUP,
+          payload: { enqueueTime },
+          priority: 1,
+        });
+
+        // Wait for this task to be picked up before enqueuing the next
+        await waitFor(() => delays.length > i, { timeout: 10000 });
+      }
+
+      // Report results
+      const avg = delays.reduce((a, b) => a + b, 0) / delays.length;
+      const min = Math.min(...delays);
+      const max = Math.max(...delays);
+      const sorted = [...delays].sort((a, b) => a - b);
+      const p50 = sorted[Math.floor(sorted.length * 0.5)];
+      const p95 = sorted[Math.floor(sorted.length * 0.95)];
+
+      console.log(`\n--- Enqueue-to-Pickup Latency (short polling, pollIntervalMs=50) ---`);
+      console.log(`  Iterations: ${iterations}`);
+      console.log(`  Min:  ${min.toFixed(1)}ms`);
+      console.log(`  Max:  ${max.toFixed(1)}ms`);
+      console.log(`  Avg:  ${avg.toFixed(1)}ms`);
+      console.log(`  P50:  ${p50.toFixed(1)}ms`);
+      console.log(`  P95:  ${p95.toFixed(1)}ms`);
+      console.log(`  All:  [${delays.map((d) => d.toFixed(1)).join(", ")}]ms`);
+      console.log(`-------------------------------------------------------------------\n`);
+
+      // Sanity check: all delays should be positive and reasonable
+      for (const delay of delays) {
+        expect(delay).toBeGreaterThan(0);
+        expect(delay).toBeLessThan(10000);
+      }
+    }, 30000);
+  });
 });
