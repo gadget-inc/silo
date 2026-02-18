@@ -46,6 +46,8 @@ pub struct TaskBroker {
     running: Arc<AtomicBool>,
     // A notify object to wake up the background scanner when a task is claimed
     notify: Arc<Notify>,
+    // Notifies long-polling workers when new tasks are inserted into the buffer
+    task_available: Arc<Notify>,
     // Whether the background scanner should be woken up
     scan_requested: Arc<AtomicBool>,
     // The target buffer size
@@ -80,6 +82,7 @@ impl TaskBroker {
             scan_generation_completed: Arc::new(AtomicU64::new(0)),
             running: Arc::new(AtomicBool::new(false)),
             notify: Arc::new(Notify::new()),
+            task_available: Arc::new(Notify::new()),
             scan_requested: Arc::new(AtomicBool::new(false)),
             target_buffer: 4096,
             scan_batch: 1024,
@@ -203,6 +206,11 @@ impl TaskBroker {
                     tokio::task::yield_now().await;
                 }
             }
+        }
+
+        // Notify long-polling workers that new tasks are available
+        if inserted > 0 {
+            self.task_available.notify_waiters();
         }
 
         // Delete defunct tasks from the database
@@ -397,6 +405,12 @@ impl TaskBroker {
     pub fn wakeup(&self) {
         self.scan_requested.store(true, Ordering::SeqCst);
         self.notify.notify_one();
+    }
+
+    /// Returns a future that completes when new tasks are inserted into the buffer.
+    /// Used by long-polling to wait for task availability.
+    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.task_available.notified()
     }
 }
 

@@ -708,6 +708,16 @@ export interface LeaseTasksOptions {
   shard?: string;
 }
 
+export interface LeaseTasksLongPollOptions extends LeaseTasksOptions {
+  /**
+   * Maximum time in ms to wait for tasks on the server.
+   * The server will block until tasks are available or this timeout is reached.
+   * Server caps this at 60000ms. 0 = immediate (same as leaseTasks).
+   * @default 30000
+   */
+  timeoutMs?: number;
+}
+
 /** Outcome for reporting task success */
 export interface SuccessOutcome<Result = unknown> {
   type: "success";
@@ -1730,6 +1740,69 @@ export class SiloGRPCClient {
       };
     } catch (error) {
       throwMappedRpcError(error, { operation: "leaseTasks" });
+    }
+  }
+
+  /**
+   * Long-poll variant of leaseTasks.
+   *
+   * Blocks on the server until tasks are available or the timeout is reached.
+   * Returns immediately if tasks are already available.
+   * Avoids the latency overhead of short-polling intervals.
+   *
+   * @param options The options for the long-poll lease request.
+   * @param serverIndex Optional index for server selection (for per-worker round-robin).
+   * @returns Object containing both job tasks and refresh tasks.
+   */
+  public async leaseTasksLongPoll(
+    options: LeaseTasksLongPollOptions,
+    serverIndex?: number,
+  ): Promise<LeaseTasksResult> {
+    try {
+      const client =
+        options.shard !== undefined
+          ? this._getClientForShard(options.shard)
+          : serverIndex !== undefined
+            ? this._getClientAtIndex(serverIndex)
+            : this._getAnyClient();
+
+      const timeoutMs = options.timeoutMs ?? 30000;
+
+      // Set a longer RPC deadline to accommodate server-side blocking.
+      // Add buffer to prevent client timeout racing with server timeout.
+      const rpcDeadline = new Date(Date.now() + timeoutMs + 5000);
+      const rpcOptions = { ...this._rpcOptions(), deadline: rpcDeadline };
+
+      const call = client.leaseTasksLongPoll(
+        {
+          shard: options.shard,
+          workerId: options.workerId,
+          maxTasks: options.maxTasks,
+          taskGroup: options.taskGroup,
+          timeoutMs,
+        },
+        rpcOptions,
+      );
+
+      const response = await call.response;
+
+      const refreshTasks: RefreshTask[] = response.refreshTasks.map((rt) => ({
+        id: rt.id,
+        queueKey: rt.queueKey,
+        currentMaxConcurrency: rt.currentMaxConcurrency,
+        lastRefreshedAtMs: rt.lastRefreshedAtMs,
+        metadata: { ...rt.metadata },
+        leaseMs: rt.leaseMs,
+        shard: rt.shard,
+        taskGroup: rt.taskGroup,
+      }));
+
+      return {
+        tasks: response.tasks,
+        refreshTasks,
+      };
+    } catch (error) {
+      throwMappedRpcError(error, { operation: "leaseTasksLongPoll" });
     }
   }
 
