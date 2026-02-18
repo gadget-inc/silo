@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
 import { SiloGRPCClient } from "../src/client";
-import http from "node:http";
+import { Toxiproxy, Proxy, type Latency, type Bandwidth, type Timeout, type Slicer, type Slowclose } from "toxiproxy-node-client";
 
 // Direct silo servers (for setup/verification)
 const SILO_SERVERS = (process.env.SILO_SERVERS || process.env.SILO_SERVER || "localhost:7450").split(
@@ -18,139 +18,36 @@ const RUN_INTEGRATION = process.env.RUN_INTEGRATION === "true" || process.env.CI
 
 const DEFAULT_TASK_GROUP = "toxiproxy-test-group";
 
-// ─── Toxiproxy HTTP API helpers ─────────────────────────────────────────────
-
-interface ToxicAttributes {
-  latency?: number;
-  jitter?: number;
-  rate?: number;
-  bytes?: number;
-  timeout?: number;
-  delay?: number;
-  size_variation?: number;
-  average_size?: number;
-}
-
-interface Toxic {
-  name: string;
-  type: string;
-  stream: "upstream" | "downstream";
-  toxicity: number;
-  attributes: ToxicAttributes;
-}
-
-function toxiproxyRequest(
-  method: string,
-  path: string,
-  body?: Record<string, unknown>,
-): Promise<{ status: number; data: unknown }> {
-  return new Promise((resolve, reject) => {
-    const url = new URL(path, TOXIPROXY_API_URL);
-    const payload = body ? JSON.stringify(body) : undefined;
-
-    const req = http.request(
-      {
-        hostname: url.hostname,
-        port: url.port,
-        path: url.pathname,
-        method,
-        headers: {
-          "Content-Type": "application/json",
-          ...(payload ? { "Content-Length": Buffer.byteLength(payload) } : {}),
-        },
-      },
-      (res) => {
-        let data = "";
-        res.on("data", (chunk: string) => (data += chunk));
-        res.on("end", () => {
-          try {
-            resolve({ status: res.statusCode!, data: data ? JSON.parse(data) : null });
-          } catch {
-            resolve({ status: res.statusCode!, data });
-          }
-        });
-      },
-    );
-
-    req.on("error", reject);
-    if (payload) req.write(payload);
-    req.end();
-  });
-}
-
-async function addToxic(
-  proxyName: string,
-  toxic: {
-    name: string;
-    type: string;
-    stream?: "upstream" | "downstream";
-    toxicity?: number;
-    attributes: ToxicAttributes;
-  },
-): Promise<Toxic> {
-  const res = await toxiproxyRequest("POST", `/proxies/${proxyName}/toxics`, {
-    name: toxic.name,
-    type: toxic.type,
-    stream: toxic.stream ?? "downstream",
-    toxicity: toxic.toxicity ?? 1.0,
-    attributes: toxic.attributes,
-  });
-  if (res.status !== 200) {
-    throw new Error(`Failed to add toxic: ${JSON.stringify(res.data)}`);
-  }
-  return res.data as Toxic;
-}
-
-async function removeToxic(proxyName: string, toxicName: string): Promise<void> {
-  const res = await toxiproxyRequest("DELETE", `/proxies/${proxyName}/toxics/${toxicName}`);
-  if (res.status !== 204 && res.status !== 200) {
-    throw new Error(`Failed to remove toxic "${toxicName}": ${JSON.stringify(res.data)}`);
-  }
-}
-
-async function resetToxiproxy(): Promise<void> {
-  const res = await toxiproxyRequest("POST", "/reset");
-  if (res.status !== 204 && res.status !== 200) {
-    throw new Error(`Failed to reset toxiproxy: ${JSON.stringify(res.data)}`);
-  }
-}
-
-async function disableProxy(proxyName: string): Promise<void> {
-  const res = await toxiproxyRequest("POST", `/proxies/${proxyName}`, { enabled: false });
-  if (res.status !== 200) {
-    throw new Error(`Failed to disable proxy "${proxyName}": ${JSON.stringify(res.data)}`);
-  }
-}
-
-async function enableProxy(proxyName: string): Promise<void> {
-  const res = await toxiproxyRequest("POST", `/proxies/${proxyName}`, { enabled: true });
-  if (res.status !== 200) {
-    throw new Error(`Failed to enable proxy "${proxyName}": ${JSON.stringify(res.data)}`);
-  }
-}
+const toxiproxy = new Toxiproxy(TOXIPROXY_API_URL);
 
 async function isToxiproxyAvailable(): Promise<boolean> {
   try {
-    const res = await toxiproxyRequest("GET", "/version");
-    return res.status === 200;
+    await toxiproxy.getVersion();
+    return true;
   } catch {
     return false;
   }
 }
 
-async function ensureProxies(): Promise<void> {
-  const proxies = [
+/**
+ * Ensure the toxiproxy proxies for silo exist, creating them if needed.
+ */
+async function ensureProxies(): Promise<{ silo1: Proxy; silo2: Proxy }> {
+  const proxyConfigs = [
     { name: "silo-1", listen: "127.0.0.1:17450", upstream: "127.0.0.1:7450" },
     { name: "silo-2", listen: "127.0.0.1:17451", upstream: "127.0.0.1:7451" },
   ];
-  for (const proxy of proxies) {
-    const existing = await toxiproxyRequest("GET", `/proxies/${proxy.name}`);
-    if (existing.status === 200) continue;
-    const res = await toxiproxyRequest("POST", "/proxies", proxy);
-    if (res.status !== 201 && res.status !== 200) {
-      throw new Error(`Failed to create proxy "${proxy.name}": ${JSON.stringify(res.data)}`);
+
+  const proxies: Proxy[] = [];
+  for (const config of proxyConfigs) {
+    try {
+      proxies.push(await toxiproxy.get(config.name));
+    } catch {
+      proxies.push(await toxiproxy.createProxy(config));
     }
   }
+
+  return { silo1: proxies[0], silo2: proxies[1] };
 }
 
 async function waitForClusterConvergence(
@@ -170,9 +67,8 @@ async function waitForClusterConvergence(
 
       if (hasShards && allShardsHaveOwners) {
         // Verify cluster is truly ready by attempting a test enqueue
-        const testTenant = `convergence-check-${Date.now()}`;
         await client.enqueue({
-          tenant: testTenant,
+          tenant: `convergence-check-${Date.now()}`,
           taskGroup: "convergence-check",
           payload: { check: true },
         });
@@ -190,13 +86,6 @@ async function waitForClusterConvergence(
   }
 }
 
-/**
- * Create a SiloGRPCClient that routes through toxiproxy.
- *
- * The silo servers are configured with advertised_grpc_addr pointing to the
- * toxiproxy listen addresses, so topology discovery will return the proxy
- * addresses and all subsequent connections will go through the proxy.
- */
 function createProxyClient(): SiloGRPCClient {
   return new SiloGRPCClient({
     servers: TOXIPROXY_SILO_SERVERS,
@@ -210,6 +99,8 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
   let proxyClient: SiloGRPCClient;
   let directClient: SiloGRPCClient;
+  let silo1: Proxy;
+  let silo2: Proxy;
   let toxiproxyAvailable: boolean;
 
   beforeAll(async () => {
@@ -219,10 +110,12 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
       return;
     }
 
-    await ensureProxies();
-    await resetToxiproxy();
+    const proxies = await ensureProxies();
+    silo1 = proxies.silo1;
+    silo2 = proxies.silo2;
+    await toxiproxy.reset();
 
-    // Direct client to verify cluster is ready before running proxy tests
+    // Direct client to verify cluster is ready
     directClient = new SiloGRPCClient({
       servers: SILO_SERVERS,
       useTls: false,
@@ -230,8 +123,8 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
     });
     await waitForClusterConvergence(directClient);
 
-    // Proxy client — the silo servers advertise their toxiproxy addresses, so after
-    // topology discovery the client routes all traffic through the proxy.
+    // Proxy client — silo servers advertise toxiproxy addresses via process-compose env,
+    // so after topology discovery the client routes all traffic through the proxy.
     proxyClient = createProxyClient();
     await waitForClusterConvergence(proxyClient);
   }, 60_000);
@@ -243,7 +136,7 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
 
   afterEach(async () => {
     if (toxiproxyAvailable) {
-      await resetToxiproxy();
+      await toxiproxy.reset();
     }
   });
 
@@ -251,16 +144,18 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
     it("operations succeed with added latency", async () => {
       if (!toxiproxyAvailable) return;
 
-      await addToxic("silo-1", {
+      await silo1.addToxic<Latency>({
         name: "latency-downstream",
         type: "latency",
         stream: "downstream",
+        toxicity: 1.0,
         attributes: { latency: 200, jitter: 50 },
       });
-      await addToxic("silo-2", {
+      await silo2.addToxic<Latency>({
         name: "latency-downstream",
         type: "latency",
         stream: "downstream",
+        toxicity: 1.0,
         attributes: { latency: 200, jitter: 50 },
       });
 
@@ -285,16 +180,18 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
     it("operations succeed with upstream latency", async () => {
       if (!toxiproxyAvailable) return;
 
-      await addToxic("silo-1", {
+      await silo1.addToxic<Latency>({
         name: "latency-upstream",
         type: "latency",
         stream: "upstream",
+        toxicity: 1.0,
         attributes: { latency: 150, jitter: 0 },
       });
-      await addToxic("silo-2", {
+      await silo2.addToxic<Latency>({
         name: "latency-upstream",
         type: "latency",
         stream: "upstream",
+        toxicity: 1.0,
         attributes: { latency: 150, jitter: 0 },
       });
 
@@ -318,16 +215,18 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
     it("operations succeed with bandwidth limitation", async () => {
       if (!toxiproxyAvailable) return;
 
-      await addToxic("silo-1", {
+      await silo1.addToxic<Bandwidth>({
         name: "bandwidth-limit",
         type: "bandwidth",
         stream: "downstream",
+        toxicity: 1.0,
         attributes: { rate: 10 },
       });
-      await addToxic("silo-2", {
+      await silo2.addToxic<Bandwidth>({
         name: "bandwidth-limit",
         type: "bandwidth",
         stream: "downstream",
+        toxicity: 1.0,
         attributes: { rate: 10 },
       });
 
@@ -359,23 +258,25 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
       });
       expect(handle.id).toBeTruthy();
 
-      await addToxic("silo-1", {
+      const toxic1 = await silo1.addToxic<Timeout>({
         name: "timeout",
         type: "timeout",
         stream: "downstream",
+        toxicity: 1.0,
         attributes: { timeout: 100 },
       });
-      await addToxic("silo-2", {
+      const toxic2 = await silo2.addToxic<Timeout>({
         name: "timeout",
         type: "timeout",
         stream: "downstream",
+        toxicity: 1.0,
         attributes: { timeout: 100 },
       });
 
       await expect(proxyClient.getJob(handle.id, tenant)).rejects.toThrow();
 
-      await removeToxic("silo-1", "timeout");
-      await removeToxic("silo-2", "timeout");
+      await toxic1.remove();
+      await toxic2.remove();
 
       // Give gRPC a moment to reconnect
       await sleep(1000);
@@ -398,13 +299,13 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
       });
       expect(handle.id).toBeTruthy();
 
-      await disableProxy("silo-1");
-      await disableProxy("silo-2");
+      await silo1.update({ enabled: false, listen: silo1.listen, upstream: silo1.upstream });
+      await silo2.update({ enabled: false, listen: silo2.listen, upstream: silo2.upstream });
 
       await expect(proxyClient.getJob(handle.id, tenant)).rejects.toThrow();
 
-      await enableProxy("silo-1");
-      await enableProxy("silo-2");
+      await silo1.update({ enabled: true, listen: silo1.listen, upstream: silo1.upstream });
+      await silo2.update({ enabled: true, listen: silo2.listen, upstream: silo2.upstream });
 
       await sleep(1000);
 
@@ -417,16 +318,18 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
     it("operations succeed when TCP packets are sliced", async () => {
       if (!toxiproxyAvailable) return;
 
-      await addToxic("silo-1", {
+      await silo1.addToxic<Slicer>({
         name: "slicer",
         type: "slicer",
         stream: "downstream",
+        toxicity: 1.0,
         attributes: { average_size: 50, size_variation: 20, delay: 5 },
       });
-      await addToxic("silo-2", {
+      await silo2.addToxic<Slicer>({
         name: "slicer",
         type: "slicer",
         stream: "downstream",
+        toxicity: 1.0,
         attributes: { average_size: 50, size_variation: 20, delay: 5 },
       });
 
@@ -450,11 +353,11 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
     it("operations succeed when only one proxy is degraded", async () => {
       if (!toxiproxyAvailable) return;
 
-      // Only add latency to silo-1, silo-2 stays healthy
-      await addToxic("silo-1", {
+      await silo1.addToxic<Latency>({
         name: "latency-heavy",
         type: "latency",
         stream: "downstream",
+        toxicity: 1.0,
         attributes: { latency: 500, jitter: 0 },
       });
 
@@ -475,7 +378,7 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
     it("can enqueue and retrieve multiple jobs with one proxy disabled", async () => {
       if (!toxiproxyAvailable) return;
 
-      await disableProxy("silo-1");
+      await silo1.update({ enabled: false, listen: silo1.listen, upstream: silo1.upstream });
 
       const results: string[] = [];
       const errors: Error[] = [];
@@ -496,7 +399,7 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
 
       expect(results.length + errors.length).toBe(5);
 
-      await enableProxy("silo-1");
+      await silo1.update({ enabled: true, listen: silo1.listen, upstream: silo1.upstream });
     });
   });
 
@@ -504,16 +407,18 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
     it("operations complete despite slow connection closing", async () => {
       if (!toxiproxyAvailable) return;
 
-      await addToxic("silo-1", {
+      await silo1.addToxic<Slowclose>({
         name: "slow-close",
         type: "slow_close",
         stream: "downstream",
+        toxicity: 1.0,
         attributes: { delay: 500 },
       });
-      await addToxic("silo-2", {
+      await silo2.addToxic<Slowclose>({
         name: "slow-close",
         type: "slow_close",
         stream: "downstream",
+        toxicity: 1.0,
         attributes: { delay: 500 },
       });
 
@@ -536,17 +441,19 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
     it("operations succeed with latency + bandwidth combination", async () => {
       if (!toxiproxyAvailable) return;
 
-      for (const proxy of ["silo-1", "silo-2"]) {
-        await addToxic(proxy, {
+      for (const proxy of [silo1, silo2]) {
+        await proxy.addToxic<Latency>({
           name: "latency-combined",
           type: "latency",
           stream: "downstream",
+          toxicity: 1.0,
           attributes: { latency: 100, jitter: 25 },
         });
-        await addToxic(proxy, {
+        await proxy.addToxic<Bandwidth>({
           name: "bandwidth-combined",
           type: "bandwidth",
           stream: "downstream",
+          toxicity: 1.0,
           attributes: { rate: 20 },
         });
       }
@@ -568,17 +475,19 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
     it("operations succeed with slicer + latency combination", async () => {
       if (!toxiproxyAvailable) return;
 
-      for (const proxy of ["silo-1", "silo-2"]) {
-        await addToxic(proxy, {
+      for (const proxy of [silo1, silo2]) {
+        await proxy.addToxic<Slicer>({
           name: "slicer-combined",
           type: "slicer",
           stream: "downstream",
+          toxicity: 1.0,
           attributes: { average_size: 100, size_variation: 50, delay: 2 },
         });
-        await addToxic(proxy, {
+        await proxy.addToxic<Latency>({
           name: "latency-combined",
           type: "latency",
           stream: "upstream",
+          toxicity: 1.0,
           attributes: { latency: 50, jitter: 10 },
         });
       }
@@ -602,16 +511,15 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
     it("topology refresh fails when proxies are disabled", async () => {
       if (!toxiproxyAvailable) return;
 
-      // Create a fresh client that only knows proxy addresses
       const freshClient = createProxyClient();
 
-      await disableProxy("silo-1");
-      await disableProxy("silo-2");
+      await silo1.update({ enabled: false, listen: silo1.listen, upstream: silo1.upstream });
+      await silo2.update({ enabled: false, listen: silo2.listen, upstream: silo2.upstream });
 
       await expect(freshClient.refreshTopology()).rejects.toThrow();
 
-      await enableProxy("silo-1");
-      await enableProxy("silo-2");
+      await silo1.update({ enabled: true, listen: silo1.listen, upstream: silo1.upstream });
+      await silo2.update({ enabled: true, listen: silo2.listen, upstream: silo2.upstream });
 
       freshClient.close();
     });
@@ -619,14 +527,14 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
     it("topology refresh works with high latency", async () => {
       if (!toxiproxyAvailable) return;
 
-      // Create a fresh client that only knows proxy addresses
       const freshClient = createProxyClient();
 
-      for (const proxy of ["silo-1", "silo-2"]) {
-        await addToxic(proxy, {
+      for (const proxy of [silo1, silo2]) {
+        await proxy.addToxic<Latency>({
           name: "high-latency",
           type: "latency",
           stream: "downstream",
+          toxicity: 1.0,
           attributes: { latency: 300, jitter: 100 },
         });
       }

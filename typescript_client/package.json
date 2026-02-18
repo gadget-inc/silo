@@ -43,6 +43,7 @@
     "oxfmt": "^0.16.0",
     "oxlint": "^1.31.0",
     "oxlint-tsgolint": "^0.8.3",
+    "toxiproxy-node-client": "^4.0.0",
     "typescript": "^5.9.3",
     "vitest": "^4.0.14"
   },

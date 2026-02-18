@@ -97,6 +97,8 @@ processes:
         --ignore tmp \
         --ignore '*.lock' \
         -- cargo run --bin silo -- -c example_configs/dev-node1.toml
+    environment:
+      - SILO_ADVERTISED_GRPC_ADDR=127.0.0.1:17450
     depends_on:
       etcd:
         condition: process_healthy
@@ -128,6 +130,8 @@ processes:
         --ignore tmp \
         --ignore '*.lock' \
         -- cargo run --bin silo -- -c example_configs/dev-node2.toml
+    environment:
+      - SILO_ADVERTISED_GRPC_ADDR=127.0.0.1:17451
     depends_on:
       etcd:
         condition: process_healthy

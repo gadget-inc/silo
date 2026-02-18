@@ -7,8 +7,7 @@ dev_mode = true
 [coordination]
 backend = "etcd"
 cluster_prefix = "silo-dev"
-# Advertise toxiproxy address so the TS client routes all traffic through the proxy for fault injection testing
-advertised_grpc_addr = "127.0.0.1:17450"
+advertised_grpc_addr = "${SILO_ADVERTISED_GRPC_ADDR:-127.0.0.1:7450}"
 lease_ttl_secs = 10
 num_shards = 8
 etcd_endpoints = ["http://127.0.0.1:2379"]
