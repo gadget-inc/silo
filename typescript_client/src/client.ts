@@ -1159,9 +1159,8 @@ export class SiloGRPCClient {
 
   /**
    * Resolve the shard ID (string UUID) from tenant using range-based lookup.
-   * @internal
    */
-  private _resolveShard(tenant: string | undefined): string {
+  public resolveShard(tenant: string | undefined): string {
     const tenantId = tenant ?? DEFAULT_TENANT;
     if (this._shards.length === 0) {
       throw new Error("Cluster topology not discovered yet. Call refreshTopology() first.");
@@ -1226,7 +1225,7 @@ export class SiloGRPCClient {
     client: SiloClient;
     shard: string;
   } {
-    const shardId = this._resolveShard(tenant);
+    const shardId = this.resolveShard(tenant);
     return {
       client: this._getClientForShard(shardId),
       shard: shardId,
@@ -2003,7 +2002,7 @@ export class SiloGRPCClient {
    * @returns The shard ID (UUID string) or undefined if no shard found
    */
   public getShardForTenant(tenant: string): string {
-    return this._resolveShard(tenant);
+    return this.resolveShard(tenant);
   }
 
   /**

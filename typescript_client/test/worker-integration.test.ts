@@ -1443,16 +1443,17 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       });
       console.log(`\n  Drain: ${emptyResult.tasks.length} stale tasks`);
 
+      // Resolve which shard owns this tenant so we long-poll the correct server
+      const shard = client.resolveShard(DEFAULT_TENANT);
+
       // --- Enqueue #1: start long-poll, then enqueue ---
-      const lp1 = client.leaseTasksLongPoll(
-        {
-          workerId: "test-lp",
-          maxTasks: 1,
-          taskGroup: DEFAULT_TASK_GROUP,
-          timeoutMs: 10000,
-        },
-        0,
-      );
+      const lp1 = client.leaseTasksLongPoll({
+        workerId: "test-lp",
+        maxTasks: 1,
+        taskGroup: DEFAULT_TASK_GROUP,
+        timeoutMs: 10000,
+        shard,
+      });
 
       await new Promise((r) => setTimeout(r, 200));
 
@@ -1470,15 +1471,13 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       expect(r1.tasks.length).toBe(1);
 
       // --- Enqueue #2: start another long-poll, then enqueue ---
-      const lp2 = client.leaseTasksLongPoll(
-        {
-          workerId: "test-lp",
-          maxTasks: 1,
-          taskGroup: DEFAULT_TASK_GROUP,
-          timeoutMs: 10000,
-        },
-        0,
-      );
+      const lp2 = client.leaseTasksLongPoll({
+        workerId: "test-lp",
+        maxTasks: 1,
+        taskGroup: DEFAULT_TASK_GROUP,
+        timeoutMs: 10000,
+        shard,
+      });
 
       await new Promise((r) => setTimeout(r, 200));
 

@@ -1138,8 +1138,7 @@ impl Silo for SiloService {
         // Cap timeout at 60 seconds
         let timeout_ms = (r.timeout_ms as u64).min(60_000);
 
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_millis(timeout_ms);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
 
         // Resolve shards once outside the loop
         let shards_to_poll: Vec<(crate::shard_range::ShardId, Arc<JobStoreShard>)> =
