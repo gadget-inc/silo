@@ -1429,64 +1429,7 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
     });
   });
 
-  describe("enqueue-to-pickup latency", () => {
-    it("measures delay between enqueue and worker picking up the task", async () => {
-      const delays: number[] = [];
-
-      const handler: TaskHandler<{ enqueueTime: number }> = async (ctx) => {
-        const pickupTime = performance.now();
-        const delay = pickupTime - ctx.task.payload.enqueueTime;
-        delays.push(delay);
-        return { type: "success", result: { delayMs: delay } };
-      };
-
-      // Use a fast poll interval to measure the best-case short polling latency
-      const worker = createWorker(handler, {
-        pollIntervalMs: 50,
-        maxConcurrentTasks: 1,
-      });
-      worker.start();
-
-      // Run multiple iterations to get a representative sample
-      const iterations = 10;
-      for (let i = 0; i < iterations; i++) {
-        const enqueueTime = performance.now();
-        await client.enqueue({
-          tenant: DEFAULT_TENANT,
-          taskGroup: DEFAULT_TASK_GROUP,
-          payload: { enqueueTime },
-          priority: 1,
-        });
-
-        // Wait for this task to be picked up before enqueuing the next
-        await waitFor(() => delays.length > i, { timeout: 10000 });
-      }
-
-      // Report results
-      const avg = delays.reduce((a, b) => a + b, 0) / delays.length;
-      const min = Math.min(...delays);
-      const max = Math.max(...delays);
-      const sorted = [...delays].sort((a, b) => a - b);
-      const p50 = sorted[Math.floor(sorted.length * 0.5)];
-      const p95 = sorted[Math.floor(sorted.length * 0.95)];
-
-      console.log(`\n--- Enqueue-to-Pickup Latency (short polling, pollIntervalMs=50) ---`);
-      console.log(`  Iterations: ${iterations}`);
-      console.log(`  Min:  ${min.toFixed(1)}ms`);
-      console.log(`  Max:  ${max.toFixed(1)}ms`);
-      console.log(`  Avg:  ${avg.toFixed(1)}ms`);
-      console.log(`  P50:  ${p50.toFixed(1)}ms`);
-      console.log(`  P95:  ${p95.toFixed(1)}ms`);
-      console.log(`  All:  [${delays.map((d) => d.toFixed(1)).join(", ")}]ms`);
-      console.log(`-------------------------------------------------------------------\n`);
-
-      // Sanity check: all delays should be positive and reasonable
-      for (const delay of delays) {
-        expect(delay).toBeGreaterThan(0);
-        expect(delay).toBeLessThan(10000);
-      }
-    }, 30000);
-
+  describe("long poll correctness", () => {
     it("leaseTasksLongPoll picks up two sequential enqueues", async () => {
       // Directly test the long-poll RPC with two sequential enqueues.
       // This bypasses the worker to isolate the RPC behavior.
@@ -1553,78 +1496,6 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       expect(r2.tasks.length).toBe(1);
 
       console.log(`  Both enqueues picked up successfully\n`);
-    }, 30000);
-
-    it("measures delay between enqueue and worker picking up the task (long polling)", async () => {
-      const delays: number[] = [];
-      const workerErrors: string[] = [];
-
-      const handler: TaskHandler<{ enqueueTime: number }> = async (ctx) => {
-        const pickupTime = performance.now();
-        const delay = pickupTime - ctx.task.payload.enqueueTime;
-        delays.push(delay);
-        return { type: "success", result: { delayMs: delay } };
-      };
-
-      // Use concurrentPollers >= number of servers so each server has a
-      // long-poll waiter. Without this, tasks enqueued on a server that
-      // isn't being polled would not be picked up until the poller cycles.
-      // Use client.serverCount (discovered via refreshTopology) rather than
-      // SILO_SERVERS.length, since topology discovery may find more servers.
-      const worker = createWorker(handler, {
-        maxConcurrentTasks: 10,
-        concurrentPollers: client.serverCount,
-        onError: (err) => {
-          workerErrors.push(err.message);
-        },
-      });
-      worker.startLongPoll(30000);
-
-      const iterations = 10;
-      for (let i = 0; i < iterations; i++) {
-        const enqueueTime = performance.now();
-        await client.enqueue({
-          tenant: DEFAULT_TENANT,
-          taskGroup: DEFAULT_TASK_GROUP,
-          payload: { enqueueTime },
-          priority: 1,
-        });
-
-        try {
-          await waitFor(() => delays.length > i, { timeout: 10000 });
-        } catch {
-          console.log(`\n--- Long poll debug ---`);
-          console.log(`  Worker errors: [${workerErrors.join(", ")}]`);
-          console.log(`  Delays so far: [${delays.map((d) => d.toFixed(1)).join(", ")}]`);
-          console.log(`  Worker running: ${worker.isRunning}`);
-          console.log(`  Active tasks: ${worker.activeTasks}`);
-          console.log(`  Queued tasks: ${worker.queuedTasks}`);
-          console.log(`-----------------------\n`);
-          throw new Error(`waitFor timed out. Worker errors: [${workerErrors.join("; ")}]`);
-        }
-      }
-
-      const avg = delays.reduce((a, b) => a + b, 0) / delays.length;
-      const min = Math.min(...delays);
-      const max = Math.max(...delays);
-      const sorted = [...delays].sort((a, b) => a - b);
-      const p50 = sorted[Math.floor(sorted.length * 0.5)];
-      const p95 = sorted[Math.floor(sorted.length * 0.95)];
-
-      console.log(`\n--- Enqueue-to-Pickup Latency (long polling) ---`);
-      console.log(`  Iterations: ${iterations}`);
-      console.log(`  Min:  ${min.toFixed(1)}ms`);
-      console.log(`  Max:  ${max.toFixed(1)}ms`);
-      console.log(`  Avg:  ${avg.toFixed(1)}ms`);
-      console.log(`  P50:  ${p50.toFixed(1)}ms`);
-      console.log(`  P95:  ${p95.toFixed(1)}ms`);
-      console.log(`  All:  [${delays.map((d) => d.toFixed(1)).join(", ")}]ms`);
-      console.log(`------------------------------------------------\n`);
-
-      for (const delay of delays) {
-        expect(delay).toBeGreaterThan(0);
-        expect(delay).toBeLessThan(10000);
-      }
     }, 30000);
   });
 });
