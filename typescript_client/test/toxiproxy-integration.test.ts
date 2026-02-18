@@ -86,11 +86,19 @@ async function waitForClusterConvergence(
   }
 }
 
+// Map real server addresses → toxiproxy addresses so topology-discovered
+// connections are routed through the proxy without changing server config.
+const ADDRESS_MAP: Record<string, string> = {
+  "127.0.0.1:7450": "127.0.0.1:17450",
+  "127.0.0.1:7451": "127.0.0.1:17451",
+};
+
 function createProxyClient(): SiloGRPCClient {
   return new SiloGRPCClient({
     servers: TOXIPROXY_SILO_SERVERS,
     useTls: false,
     shardRouting: { topologyRefreshIntervalMs: 0 },
+    addressMap: ADDRESS_MAP,
   });
 }
 
@@ -123,8 +131,8 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
     });
     await waitForClusterConvergence(directClient);
 
-    // Proxy client — silo servers advertise toxiproxy addresses via process-compose env,
-    // so after topology discovery the client routes all traffic through the proxy.
+    // Proxy client — uses addressMap to remap topology-discovered server addresses
+    // through toxiproxy, so all client traffic goes through the proxy.
     proxyClient = createProxyClient();
     await waitForClusterConvergence(proxyClient);
   }, 60_000);

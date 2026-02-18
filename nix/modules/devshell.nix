@@ -36,6 +36,12 @@
         };
       };
 
+      # Toxiproxy proxy definitions for dev (silo servers behind proxy ports)
+      toxiproxyConfig = pkgs.writeText "toxiproxy-config.json" (builtins.toJSON [
+        { name = "silo-1"; listen = "127.0.0.1:17450"; upstream = "127.0.0.1:7450"; enabled = true; }
+        { name = "silo-2"; listen = "127.0.0.1:17451"; upstream = "127.0.0.1:7451"; enabled = true; }
+      ]);
+
       # Script to run development services via process-compose
       devScript = pkgs.writeShellScriptBin "dev" ''
         # Find the project root by looking for the process-compose.yml file
@@ -81,6 +87,7 @@
         shellHook = ''
           export SILO_PROJECT_ROOT="$(pwd)"
           export RUSTFLAGS="-C force-frame-pointers=yes"
+          export TOXIPROXY_CONFIG="${toxiproxyConfig}"
         '';
       };
     };

@@ -384,6 +384,17 @@ export interface SiloGRPCClientOptions {
    * Configuration for shard routing.
    */
   shardRouting?: ShardRoutingConfig;
+
+  /**
+   * A map of server addresses to replace during topology discovery.
+   * Keys are the addresses returned by the cluster (e.g. "127.0.0.1:7450"),
+   * values are the addresses the client should connect to instead (e.g. "127.0.0.1:17450").
+   *
+   * This is useful for routing client traffic through a proxy (e.g. toxiproxy)
+   * without modifying the server's advertised address, which would also affect
+   * inter-node communication.
+   */
+  addressMap?: Record<string, string>;
 }
 
 /** Concurrency limit configuration */
@@ -1017,6 +1028,9 @@ export class SiloGRPCClient {
   /** @internal */
   private _initialServers: string[];
 
+  /** @internal Address remapping for proxy routing */
+  private readonly _addressMap: Record<string, string>;
+
   /**
    * Create a new Silo gRPC client.
    *
@@ -1092,6 +1106,9 @@ export class SiloGRPCClient {
     // Parse initial servers
     this._initialServers = this._parseServers(options.servers);
 
+    // Address remapping (e.g. for routing through toxiproxy)
+    this._addressMap = options.addressMap ?? {};
+
     // Create initial connections
     for (const address of this._initialServers) {
       this._getOrCreateConnection(address);
@@ -1126,6 +1143,14 @@ export class SiloGRPCClient {
       return servers.map((s) => (typeof s === "string" ? s : `${s.host}:${s.port}`));
     }
     return [`${servers.host}:${servers.port}`];
+  }
+
+  /**
+   * Remap a server address using the addressMap, or return it unchanged.
+   * @internal
+   */
+  private _mapAddress(address: string): string {
+    return this._addressMap[address] ?? address;
   }
 
   /**
@@ -1246,8 +1271,9 @@ export class SiloGRPCClient {
           const redirectAddr = extractRedirectAddress(error);
           if (redirectAddr) {
             // Update routing and create connection to new server
-            this._shardToServer.set(shard, redirectAddr);
-            const conn = this._getOrCreateConnection(redirectAddr);
+            const mappedAddr = this._mapAddress(redirectAddr);
+            this._shardToServer.set(shard, mappedAddr);
+            const conn = this._getOrCreateConnection(mappedAddr);
             client = conn.client;
           } else {
             // No redirect info, try refreshing topology
@@ -1296,15 +1322,16 @@ export class SiloGRPCClient {
           if (!owner.grpcAddr) {
             continue;
           }
-          this._shardToServer.set(owner.shardId, owner.grpcAddr);
+          const addr = this._mapAddress(owner.grpcAddr);
+          this._shardToServer.set(owner.shardId, addr);
           shards.push({
             shardId: owner.shardId,
-            serverAddr: owner.grpcAddr,
+            serverAddr: addr,
             rangeStart: owner.rangeStart,
             rangeEnd: owner.rangeEnd,
           });
           // Ensure we have a connection to this server
-          this._getOrCreateConnection(owner.grpcAddr);
+          this._getOrCreateConnection(addr);
         }
 
         // Sort shards by rangeStart for efficient binary search lookup

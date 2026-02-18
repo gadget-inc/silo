@@ -7,7 +7,6 @@ dev_mode = true
 [coordination]
 backend = "etcd"
 cluster_prefix = "silo-dev"
-advertised_grpc_addr = "${SILO_ADVERTISED_GRPC_ADDR:-127.0.0.1:7451}"
 lease_ttl_secs = 10
 num_shards = 8
 etcd_endpoints = ["http://127.0.0.1:2379"]
