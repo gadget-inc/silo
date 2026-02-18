@@ -122,7 +122,7 @@ When using a local WAL with cloud object storage:
 - Writes are faster because they go to local disk first
 - On graceful shard close (or node shutdown), WAL is flushed to object storage to ensure durability
 - The local WAL directory is deleted after successful flush
-- On crash, shard leases are permanent and persist until the node restarts and recovers the WAL. Set `node_id` to a stable value (e.g., `"${POD_NAME}"`) to enable automatic WAL recovery after restarts. See the [Internals guide](/guides/internals/#permanent-shard-leases) for details.
+- On crash, shard leases are permanent and persist until the node restarts and recovers the WAL. Set `node_id` to a stable value (e.g., `"${POD_NAME}"`) to enable automatic WAL recovery after restarts. See the [Internals guide](/silo/guides/internals/#permanent-shard-leases) for details.
 
 #### `apply_wal_on_close`
 
@@ -232,7 +232,7 @@ lease_ttl_secs = 10
 | `num_shards` | number | `8` | Total number of shards in the cluster |
 | `lease_ttl_secs` | number | `10` | TTL for the **membership** lease in seconds. This controls how quickly the cluster detects a node has crashed. Shard ownership leases are permanent and not affected by this TTL. |
 | `advertised_grpc_addr` | string | (none) | Address other nodes use to connect to this node |
-| `node_id` | string | (random UUID) | Stable node identity for this instance. If set, the node will reclaim shard leases from a previous run on startup, enabling WAL recovery after crashes. See [Permanent shard leases](/guides/internals/#permanent-shard-leases). |
+| `node_id` | string | (random UUID) | Stable node identity for this instance. If set, the node will reclaim shard leases from a previous run on startup, enabling WAL recovery after crashes. See [Permanent shard leases](/silo/guides/internals/#permanent-shard-leases). |
 
 ### Coordination Backends
 
@@ -348,7 +348,7 @@ addr = "127.0.0.1:9090"
 | `enabled` | bool | `true` | Enable the Prometheus metrics endpoint |
 | `addr` | string | `"127.0.0.1:9090"` | Address and port for the metrics server |
 
-Metrics are exposed in Prometheus format at `/metrics`. See the [Observability Guide](/guides/observability) for available metrics.
+Metrics are exposed in Prometheus format at `/metrics`. See the [Observability Guide](/silo/guides/observability) for available metrics.
 
 ---
 

@@ -105,7 +105,7 @@ Task groups allow you to:
 - **Isolate workloads**: Slow jobs in one task group won't block jobs in another
 
 <Aside type="tip" title="Choosing task groups">
-You must run separate workers for each task group. You can make as many task groups as you want, but the resources you need to run all the workers might be high if you create a lot of task groups. For high-cardinality concurrency management, use [concurrent limits](/guides/concurrency-limits) instead.
+You must run separate workers for each task group. You can make as many task groups as you want, but the resources you need to run all the workers might be high if you create a lot of task groups. For high-cardinality concurrency management, use [concurrent limits](/silo/guides/concurrency-limits) instead.
 </Aside>
 
 Task group names must be:
@@ -364,6 +364,6 @@ const handle = client.handle("job-456", "customer-123");
 ## Next Steps
 
 After enqueueing jobs, you'll need to:
-1. [Run workers](/guides/running-workers) to process the jobs
-2. Set up [observability](/guides/observability) to monitor job execution
-3. Configure [server settings](/reference/server-configuration) for production
+1. [Run workers](/silo/guides/running-workers) to process the jobs
+2. Set up [observability](/silo/guides/observability) to monitor job execution
+3. Configure [server settings](/silo/reference/server-configuration) for production

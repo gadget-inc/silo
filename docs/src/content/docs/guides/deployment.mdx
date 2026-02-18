@@ -91,7 +91,7 @@ The cache is enabled when `root_folder` is set. Key options:
 - **`max_cache_size_bytes`**: Maximum total size of the cache on disk. When exceeded, older entries are evicted.
 - **`cache_puts`**: When `true`, data written to object storage is also written to the local cache, warming it for subsequent reads.
 
-All other options use SlateDB's sensible defaults when omitted. See the [Server Configuration reference](/reference/server-configuration/#slatedb-configuration) for more details on SlateDB tuning.
+All other options use SlateDB's sensible defaults when omitted. See the [Server Configuration reference](/silo/reference/server-configuration/#slatedb-configuration) for more details on SlateDB tuning.
 
 The cache directory does not need to be durable — if it is lost, reads will simply fall back to object storage and the cache will be rebuilt over time. This makes it a good fit for ephemeral local disks or instance storage.
 
@@ -132,7 +132,7 @@ advertised_grpc_addr = "10.0.1.5:7450"
 node_id = "silo-node-1"
 ```
 
-See the [Server Configuration reference](/reference/server-configuration/#coordination-configuration) for the full list of coordination options.
+See the [Server Configuration reference](/silo/reference/server-configuration/#coordination-configuration) for the full list of coordination options.
 
 ## Using Kubernetes for cluster membership
 
