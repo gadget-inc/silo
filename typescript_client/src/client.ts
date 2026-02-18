@@ -1332,6 +1332,14 @@ export class SiloGRPCClient {
   }
 
   /**
+   * The number of servers this client is connected to.
+   * Updated by refreshTopology() when new servers are discovered.
+   */
+  public get serverCount(): number {
+    return this._connections.size;
+  }
+
+  /**
    * Close the underlying GRPC connections.
    */
   public close(): void {
@@ -1757,6 +1765,7 @@ export class SiloGRPCClient {
   public async leaseTasksLongPoll(
     options: LeaseTasksLongPollOptions,
     serverIndex?: number,
+    abort?: AbortSignal,
   ): Promise<LeaseTasksResult> {
     try {
       const client =
@@ -1768,10 +1777,11 @@ export class SiloGRPCClient {
 
       const timeoutMs = options.timeoutMs ?? 30000;
 
-      // Set a longer RPC deadline to accommodate server-side blocking.
-      // Add buffer to prevent client timeout racing with server timeout.
-      const rpcDeadline = new Date(Date.now() + timeoutMs + 5000);
-      const rpcOptions = { ...this._rpcOptions(), deadline: rpcDeadline };
+      // Set a longer RPC timeout to accommodate server-side blocking.
+      // protobuf-ts GrpcTransport reads `timeout` (not `deadline`) from RpcOptions.
+      // A Date value is used directly as the gRPC call deadline.
+      const rpcTimeout = new Date(Date.now() + timeoutMs + 5000);
+      const rpcOptions = { ...this._rpcOptions(), timeout: rpcTimeout, abort };
 
       const call = client.leaseTasksLongPoll(
         {

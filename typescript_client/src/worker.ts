@@ -334,9 +334,11 @@ export class SiloWorker<
     // Reset the queue in case we're restarting
     this._taskQueue = new PQueue({ concurrency: this._maxConcurrentTasks });
 
-    // Start long-poll loops
+    // Start long-poll loops, each pinned to a specific server index.
+    // Unlike short polling (which cycles rapidly), long-poll requests block
+    // for the full timeout, so each poller must be dedicated to one server.
     for (let i = 0; i < this._concurrentPollers; i++) {
-      this._pollerPromises.push(this._longPollLoop(longPollTimeoutMs));
+      this._pollerPromises.push(this._longPollLoop(longPollTimeoutMs, i));
     }
   }
 
@@ -401,10 +403,10 @@ export class SiloWorker<
    * The main polling loop for long-poll mode.
    * No sleep between polls since the server handles the waiting.
    */
-  private async _longPollLoop(timeoutMs: number): Promise<void> {
+  private async _longPollLoop(timeoutMs: number, serverIndex: number): Promise<void> {
     while (this._running) {
       try {
-        await this._longPoll(timeoutMs);
+        await this._longPoll(timeoutMs, serverIndex);
       } catch (error) {
         if (this._running) {
           this._onError(error instanceof Error ? error : new Error(String(error)));
@@ -471,7 +473,7 @@ export class SiloWorker<
   /**
    * Long-poll variant: blocks on the server until tasks are available.
    */
-  private async _longPoll(timeoutMs: number): Promise<void> {
+  private async _longPoll(timeoutMs: number, serverIndex: number): Promise<void> {
     // Wait if the queue is too full
     while (this._running && this._taskQueue.size >= this._maxConcurrentTasks) {
       await this._sleep(this._pollIntervalMs / 2);
@@ -487,7 +489,6 @@ export class SiloWorker<
     }
 
     const tasksToRequest = Math.min(availableQueueSlots, this._tasksPerPoll);
-    const serverIndex = this._pollCounter++;
     const result = await this._client.leaseTasksLongPoll(
       {
         workerId: this._workerId,
@@ -496,6 +497,7 @@ export class SiloWorker<
         timeoutMs,
       },
       serverIndex,
+      this._abortController?.signal,
     );
 
     for (const task of result.tasks) {

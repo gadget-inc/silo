@@ -1141,24 +1141,32 @@ impl Silo for SiloService {
         let deadline = tokio::time::Instant::now()
             + std::time::Duration::from_millis(timeout_ms);
 
-        loop {
-            // Determine which shards to poll (same logic as lease_tasks)
-            let shards_to_poll: Vec<(crate::shard_range::ShardId, Arc<JobStoreShard>)> =
-                if let Some(ref shard_filter) = r.shard {
-                    let shard_id = Self::parse_shard_id(shard_filter)?;
-                    let shard = self.shard_with_redirect(&shard_id).await?;
-                    vec![(shard_id, shard)]
-                } else {
-                    let mut shards: Vec<_> = self
-                        .factory
-                        .instances()
-                        .iter()
-                        .map(|(id, shard)| (*id, shard.clone()))
-                        .collect();
-                    shards.shuffle(&mut rand::rng());
-                    shards
-                };
+        // Resolve shards once outside the loop
+        let shards_to_poll: Vec<(crate::shard_range::ShardId, Arc<JobStoreShard>)> =
+            if let Some(ref shard_filter) = r.shard {
+                let shard_id = Self::parse_shard_id(shard_filter)?;
+                let shard = self.shard_with_redirect(&shard_id).await?;
+                vec![(shard_id, shard)]
+            } else {
+                let mut shards: Vec<_> = self
+                    .factory
+                    .instances()
+                    .iter()
+                    .map(|(id, shard)| (*id, shard.clone()))
+                    .collect();
+                shards.shuffle(&mut rand::rng());
+                shards
+            };
 
+        // Subscribe to task availability notifications from all shards.
+        // Using watch channels avoids lost wakeups: any send between
+        // subscribe() and changed().await is captured.
+        let mut receivers: Vec<_> = shards_to_poll
+            .iter()
+            .map(|(_, shard)| shard.broker.subscribe_task_available())
+            .collect();
+
+        loop {
             let mut all_tasks = Vec::new();
             let mut all_refresh_tasks = Vec::new();
             let mut remaining = max_tasks;
@@ -1238,29 +1246,23 @@ impl Silo for SiloService {
                 }));
             }
 
-            // Wait for any shard's broker to signal new tasks, or timeout.
-            // Register notified futures for all shards before checking deadline.
-            let notified_futures: Vec<_> = shards_to_poll
-                .iter()
-                .map(|(_, shard)| shard.broker.notified())
-                .collect();
-
-            // Wait until any broker signals or deadline
+            // Wait until any broker signals or deadline.
+            // Watch receivers capture any send between subscribe/last-changed and
+            // the changed().await call, so there are no lost wakeups.
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => {
-                    // Timeout reached, return empty
                     return Ok(Response::new(LeaseTasksLongPollResponse {
                         tasks: Vec::new(),
                         refresh_tasks: Vec::new(),
                     }));
                 }
                 _ = async {
-                    // Wait for any shard broker to signal
-                    futures::future::select_all(
-                        notified_futures.into_iter().map(|n| Box::pin(n))
-                    ).await;
+                    // Wait for any shard broker to signal new tasks
+                    let futs: Vec<_> = receivers.iter_mut()
+                        .map(|rx| Box::pin(rx.changed()))
+                        .collect();
+                    let _ = futures::future::select_all(futs).await;
                 } => {
-                    // A broker signaled new tasks available, loop back to try dequeue
                     continue;
                 }
             }

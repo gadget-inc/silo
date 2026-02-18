@@ -1486,5 +1486,145 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
         expect(delay).toBeLessThan(10000);
       }
     }, 30000);
+
+    it("leaseTasksLongPoll picks up two sequential enqueues", async () => {
+      // Directly test the long-poll RPC with two sequential enqueues.
+      // This bypasses the worker to isolate the RPC behavior.
+
+      // First: long-poll with short timeout should return empty (drain any stale tasks)
+      const emptyResult = await client.leaseTasksLongPoll({
+        workerId: "test-lp",
+        maxTasks: 10,
+        taskGroup: DEFAULT_TASK_GROUP,
+        timeoutMs: 500,
+      });
+      console.log(`\n  Drain: ${emptyResult.tasks.length} stale tasks`);
+
+      // --- Enqueue #1: start long-poll, then enqueue ---
+      const lp1 = client.leaseTasksLongPoll(
+        {
+          workerId: "test-lp",
+          maxTasks: 1,
+          taskGroup: DEFAULT_TASK_GROUP,
+          timeoutMs: 10000,
+        },
+        0,
+      );
+
+      await new Promise((r) => setTimeout(r, 200));
+
+      const t1 = performance.now();
+      await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
+        payload: { seq: 1 },
+        priority: 1,
+      });
+
+      const r1 = await lp1;
+      const d1 = performance.now() - t1;
+      console.log(`  Enqueue #1: ${d1.toFixed(1)}ms, tasks: ${r1.tasks.length}`);
+      expect(r1.tasks.length).toBe(1);
+
+      // --- Enqueue #2: start another long-poll, then enqueue ---
+      const lp2 = client.leaseTasksLongPoll(
+        {
+          workerId: "test-lp",
+          maxTasks: 1,
+          taskGroup: DEFAULT_TASK_GROUP,
+          timeoutMs: 10000,
+        },
+        0,
+      );
+
+      await new Promise((r) => setTimeout(r, 200));
+
+      const t2 = performance.now();
+      await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
+        payload: { seq: 2 },
+        priority: 1,
+      });
+
+      const r2 = await lp2;
+      const d2 = performance.now() - t2;
+      console.log(`  Enqueue #2: ${d2.toFixed(1)}ms, tasks: ${r2.tasks.length}`);
+      expect(r2.tasks.length).toBe(1);
+
+      console.log(`  Both enqueues picked up successfully\n`);
+    }, 30000);
+
+    it("measures delay between enqueue and worker picking up the task (long polling)", async () => {
+      const delays: number[] = [];
+      const workerErrors: string[] = [];
+
+      const handler: TaskHandler<{ enqueueTime: number }> = async (ctx) => {
+        const pickupTime = performance.now();
+        const delay = pickupTime - ctx.task.payload.enqueueTime;
+        delays.push(delay);
+        return { type: "success", result: { delayMs: delay } };
+      };
+
+      // Use concurrentPollers >= number of servers so each server has a
+      // long-poll waiter. Without this, tasks enqueued on a server that
+      // isn't being polled would not be picked up until the poller cycles.
+      // Use client.serverCount (discovered via refreshTopology) rather than
+      // SILO_SERVERS.length, since topology discovery may find more servers.
+      const worker = createWorker(handler, {
+        maxConcurrentTasks: 10,
+        concurrentPollers: client.serverCount,
+        onError: (err) => {
+          workerErrors.push(err.message);
+        },
+      });
+      worker.startLongPoll(30000);
+
+      const iterations = 10;
+      for (let i = 0; i < iterations; i++) {
+        const enqueueTime = performance.now();
+        await client.enqueue({
+          tenant: DEFAULT_TENANT,
+          taskGroup: DEFAULT_TASK_GROUP,
+          payload: { enqueueTime },
+          priority: 1,
+        });
+
+        try {
+          await waitFor(() => delays.length > i, { timeout: 10000 });
+        } catch {
+          console.log(`\n--- Long poll debug ---`);
+          console.log(`  Worker errors: [${workerErrors.join(", ")}]`);
+          console.log(`  Delays so far: [${delays.map((d) => d.toFixed(1)).join(", ")}]`);
+          console.log(`  Worker running: ${worker.isRunning}`);
+          console.log(`  Active tasks: ${worker.activeTasks}`);
+          console.log(`  Queued tasks: ${worker.queuedTasks}`);
+          console.log(`-----------------------\n`);
+          throw new Error(`waitFor timed out. Worker errors: [${workerErrors.join("; ")}]`);
+        }
+      }
+
+      const avg = delays.reduce((a, b) => a + b, 0) / delays.length;
+      const min = Math.min(...delays);
+      const max = Math.max(...delays);
+      const sorted = [...delays].sort((a, b) => a - b);
+      const p50 = sorted[Math.floor(sorted.length * 0.5)];
+      const p95 = sorted[Math.floor(sorted.length * 0.95)];
+
+      console.log(`\n--- Enqueue-to-Pickup Latency (long polling) ---`);
+      console.log(`  Iterations: ${iterations}`);
+      console.log(`  Min:  ${min.toFixed(1)}ms`);
+      console.log(`  Max:  ${max.toFixed(1)}ms`);
+      console.log(`  Avg:  ${avg.toFixed(1)}ms`);
+      console.log(`  P50:  ${p50.toFixed(1)}ms`);
+      console.log(`  P95:  ${p95.toFixed(1)}ms`);
+      console.log(`  All:  [${delays.map((d) => d.toFixed(1)).join(", ")}]ms`);
+      console.log(`------------------------------------------------\n`);
+
+      for (const delay of delays) {
+        expect(delay).toBeGreaterThan(0);
+        expect(delay).toBeLessThan(10000);
+      }
+    }, 30000);
   });
 });

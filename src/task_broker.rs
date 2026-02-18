@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use crossbeam_skiplist::SkipMap;
 use slatedb::{Db, WriteBatch};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 use crate::codec::decode_task;
 use crate::keys::{end_bound, parse_task_key, tasks_prefix};
@@ -46,8 +46,9 @@ pub struct TaskBroker {
     running: Arc<AtomicBool>,
     // A notify object to wake up the background scanner when a task is claimed
     notify: Arc<Notify>,
-    // Notifies long-polling workers when new tasks are inserted into the buffer
-    task_available: Arc<Notify>,
+    // Watch channel for notifying long-polling workers when new tasks are inserted.
+    // Sender increments the generation; receivers subscribe and wait for changes.
+    task_available_tx: watch::Sender<u64>,
     // Whether the background scanner should be woken up
     scan_requested: Arc<AtomicBool>,
     // The target buffer size
@@ -82,7 +83,7 @@ impl TaskBroker {
             scan_generation_completed: Arc::new(AtomicU64::new(0)),
             running: Arc::new(AtomicBool::new(false)),
             notify: Arc::new(Notify::new()),
-            task_available: Arc::new(Notify::new()),
+            task_available_tx: watch::Sender::new(0),
             scan_requested: Arc::new(AtomicBool::new(false)),
             target_buffer: 4096,
             scan_batch: 1024,
@@ -210,7 +211,7 @@ impl TaskBroker {
 
         // Notify long-polling workers that new tasks are available
         if inserted > 0 {
-            self.task_available.notify_waiters();
+            self.task_available_tx.send_modify(|v| *v += 1);
         }
 
         // Delete defunct tasks from the database
@@ -407,10 +408,11 @@ impl TaskBroker {
         self.notify.notify_one();
     }
 
-    /// Returns a future that completes when new tasks are inserted into the buffer.
-    /// Used by long-polling to wait for task availability.
-    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
-        self.task_available.notified()
+    /// Subscribe to task availability notifications.
+    /// Returns a watch receiver that can be used to wait for new tasks.
+    /// The caller should call `changed().await` to wait for the next notification.
+    pub fn subscribe_task_available(&self) -> watch::Receiver<u64> {
+        self.task_available_tx.subscribe()
     }
 }
 
