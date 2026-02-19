@@ -104,6 +104,49 @@ function createProxyClient(): SiloGRPCClient {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Retry an operation until it succeeds, instead of using a fixed sleep. */
+async function retryUntilSuccess<T>(fn: () => Promise<T>, maxAttempts = 30, delayMs = 100): Promise<T> {
+  let lastError: unknown;
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastError = e;
+      await sleep(delayMs);
+    }
+  }
+  throw lastError;
+}
+
+/** Service config with aggressive timeouts for tests that need fast failure detection. */
+const fastFailServiceConfig = JSON.stringify({
+  methodConfig: [
+    {
+      name: [{ service: "silo.v1.Silo" }],
+      retryPolicy: {
+        maxAttempts: 2,
+        initialBackoff: "0.05s",
+        maxBackoff: "0.5s",
+        backoffMultiplier: 2,
+        retryableStatusCodes: ["UNAVAILABLE", "RESOURCE_EXHAUSTED"],
+      },
+    },
+  ],
+});
+
+function createFastFailProxyClient(): SiloGRPCClient {
+  return new SiloGRPCClient({
+    servers: TOXIPROXY_SILO_SERVERS,
+    useTls: false,
+    shardRouting: { topologyRefreshIntervalMs: 0 },
+    addressMap: ADDRESS_MAP,
+    rpcOptions: { timeout: 1000 },
+    grpcClientOptions: {
+      "grpc.service_config": fastFailServiceConfig,
+    },
+  });
+}
+
 describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
   let proxyClient: SiloGRPCClient;
   let directClient: SiloGRPCClient;
@@ -277,10 +320,8 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
       await toxic1.remove();
       await toxic2.remove();
 
-      // Give gRPC a moment to reconnect
-      await sleep(1000);
-
-      const job = await proxyClient.getJob(handle.id, tenant);
+      // Retry until gRPC reconnects instead of a fixed sleep
+      const job = await retryUntilSuccess(() => proxyClient.getJob(handle.id, tenant));
       expect(job?.id).toBe(handle.id);
     });
   });
@@ -304,9 +345,8 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
       await silo1.update({ enabled: true, listen: silo1.listen, upstream: silo1.upstream });
       await silo2.update({ enabled: true, listen: silo2.listen, upstream: silo2.upstream });
 
-      await sleep(1000);
-
-      const job = await proxyClient.getJob(handle.id, tenant);
+      // Retry until gRPC reconnects instead of a fixed sleep
+      const job = await retryUntilSuccess(() => proxyClient.getJob(handle.id, tenant));
       expect(job?.id).toBe(handle.id);
     });
   });
@@ -369,6 +409,11 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
     });
 
     it("can enqueue and retrieve multiple jobs with one proxy disabled", async () => {
+      // Use a fast-fail client so calls routed to the disabled proxy fail quickly
+      // instead of exhausting the default retry policy (~3s per failed call)
+      const fastClient = createFastFailProxyClient();
+      await fastClient.refreshTopology();
+
       await silo1.update({ enabled: false, listen: silo1.listen, upstream: silo1.upstream });
 
       const results: string[] = [];
@@ -377,7 +422,7 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
       for (let i = 0; i < 5; i++) {
         const tenant = `partial-multi-${Date.now()}-${i}`;
         try {
-          const handle = await proxyClient.enqueue({
+          const handle = await fastClient.enqueue({
             tenant,
             taskGroup: DEFAULT_TASK_GROUP,
             payload: { test: "partial-multi", index: i },
@@ -391,6 +436,7 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
       expect(results.length + errors.length).toBe(5);
 
       await silo1.update({ enabled: true, listen: silo1.listen, upstream: silo1.upstream });
+      fastClient.close();
     });
   });
 
@@ -494,7 +540,9 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
 
   describe("topology refresh under network issues", () => {
     it("topology refresh fails when proxies are disabled", async () => {
-      const freshClient = createProxyClient();
+      // Use a fast-fail client so the topology refresh fails quickly
+      // instead of retrying each server with full backoff (~3s per server)
+      const freshClient = createFastFailProxyClient();
 
       await silo1.update({ enabled: false, listen: silo1.listen, upstream: silo1.upstream });
       await silo2.update({ enabled: false, listen: silo2.listen, upstream: silo2.upstream });
