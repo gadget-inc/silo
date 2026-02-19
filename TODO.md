@@ -4,7 +4,7 @@
 - [x] attempt failure/success reporting
 - [x] lease expiry
 - [x] deleting a job deletes the tasks for it (should this be a scan or another index?)
-- [ ] performance improvement to add attempt view, task view, so we're not deserializing into structs
+- [x] performance improvement to add attempt view, task view, so we're not deserializing into structs
 - [x] GRPC layer for invoking functions
 - [ ] limits on payload, error, result size
 - [x] cancel api
@@ -24,7 +24,7 @@
   - [x] integration tests of some sort
   - [x] only run one reconcile loop at once
   - [ ] think through if failing open when control plane is down is ok with write fencing
-  - [ ] add new coordination mode for persistent disk wal storage and k8s restarts
+  - [X] add new coordination mode for persistent disk wal storage and k8s restarts
     - if using persistent disk for the wal, the wal only exists there, and we dont have full compute/storage separation. instead, let's expect any crashed nodes to come back, and rely on cloud provider persistent disk implementations to make that disk available elsewhere. the lease must thusly _not_ expire when a pod goes away, and instead must be explicitly released when it is ready to release it.
   - [x] figure out how to balance shards, placement engine?
 - [x] floating concurrency limits
@@ -49,8 +49,8 @@
 - [x] once transaction support, make enqueue idempotency not a read-then-write but some sort of conditional write
 - [x] validate that concurrency queues can reach 0
 - [ ] validate GRPC typescript client retry configuration with toxiproxy
-- [ ] waiting state? that matches the gadget ui, but we dont have it modeled because it changes in time without anything else changing
-  - [ ] do we need to be able to query for it in the SQL layer? probably
+- [X] waiting state? that matches the gadget ui, but we dont have it modeled because it changes in time without anything else changing
+  - [x] do we need to be able to query for it in the SQL layer? probably
 - [ ] worker <=> server GRPC auth
 - [x] much more simulation testing
 - [x] rust best practices review
