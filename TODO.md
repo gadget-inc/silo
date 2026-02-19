@@ -48,7 +48,7 @@
     - [x] fancy sql api
 - [x] once transaction support, make enqueue idempotency not a read-then-write but some sort of conditional write
 - [x] validate that concurrency queues can reach 0
-- [ ] validate GRPC typescript client retry configuration with toxiproxy
+- [x] validate GRPC typescript client retry configuration with toxiproxy
 - [X] waiting state? that matches the gadget ui, but we dont have it modeled because it changes in time without anything else changing
   - [x] do we need to be able to query for it in the SQL layer? probably
 - [ ] worker <=> server GRPC auth
