@@ -8,7 +8,7 @@ version = "0.1.0"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-clap = { version = "4.3.14", features = ["derive"] }
+clap = { version = "4.3.14", features = ["derive", "env"] }
 futures = "0.3"
 slatedb = { git = "https://github.com/slatedb/slatedb.git", branch = "main" }
 object_store = { version = "0.12", features = ["gcp"] }

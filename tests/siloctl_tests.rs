@@ -27,6 +27,7 @@ fn opts_for_addr(addr: &std::net::SocketAddr) -> GlobalOptions {
         address: format!("http://{}", addr),
         tenant: None,
         json: false,
+        auth_token: None,
     }
 }
 
@@ -35,6 +36,7 @@ fn opts_for_addr_json(addr: &std::net::SocketAddr) -> GlobalOptions {
         address: format!("http://{}", addr),
         tenant: None,
         json: true,
+        auth_token: None,
     }
 }
 
@@ -737,6 +739,7 @@ async fn siloctl_connection_error() -> anyhow::Result<()> {
         address: "http://127.0.0.1:59999".to_string(),
         tenant: None,
         json: false,
+        auth_token: None,
     };
     let mut output = Vec::new();
     let result = siloctl::cluster_info(&opts, &mut output).await;
