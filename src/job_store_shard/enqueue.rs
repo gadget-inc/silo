@@ -318,7 +318,7 @@ impl JobStoreShard {
             limits,
             task_group: task_group.to_string(),
         };
-        let job_value = encode_job_info(&job)?;
+        let job_value = encode_job_info(&job);
 
         let first_task_id = Uuid::new_v4().to_string();
         let effective_start_at_ms = if start_at_ms <= 0 {
@@ -496,7 +496,7 @@ impl JobStoreShard {
                     // Try immediate grant using current max concurrency
                     let temp_cl = crate::job::ConcurrencyLimit {
                         key: fl.key.clone(),
-                        max_concurrency: state.archived().current_max_concurrency,
+                        max_concurrency: state.current_max_concurrency(),
                     };
 
                     let outcome = self
@@ -610,7 +610,7 @@ impl JobStoreShard {
         new_status: JobStatus,
     ) -> Result<(), JobStoreShardError> {
         // Write new status value
-        let job_status_value = encode_job_status(&new_status)?;
+        let job_status_value = encode_job_status(&new_status);
         writer.put(job_status_key(tenant, job_id), &job_status_value)?;
 
         // Insert new index entries

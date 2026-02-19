@@ -5,14 +5,14 @@
 
 use slatedb::IsolationLevel;
 
-use crate::codec::{decode_task, encode_task};
+use crate::codec::decode_task_validated;
+use crate::fb::silo::fb;
 use crate::job::JobStatusKind;
 use crate::job_store_shard::helpers::{
     TxnWriter, decode_job_status_owned, load_job_view, now_epoch_ms, retry_on_txn_conflict,
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{job_cancelled_key, job_status_key, task_key};
-use crate::task::Task;
 
 /// Error returned when a job cannot be expedited because it's not in an expeditable state.
 #[derive(Debug, Clone)]
@@ -132,7 +132,7 @@ impl JobStoreShard {
                 },
             ));
         };
-        let task = decode_task(&task_raw)?;
+        let decoded = decode_task_validated(task_raw)?;
 
         // [SILO-EXP-5] Check if task is future-scheduled (timestamp > now)
         // If task timestamp <= now, it's already ready to run (may be in buffer)
@@ -147,7 +147,7 @@ impl JobStoreShard {
         }
 
         // RefreshFloatingLimit tasks cannot be expedited (they're internal system tasks)
-        if matches!(task, Task::RefreshFloatingLimit { .. }) {
+        if decoded.variant_type() == fb::TaskVariant::RefreshFloatingLimit {
             return Err(JobStoreShardError::JobNotExpediteable(
                 JobNotExpediteableError {
                     job_id: id.to_string(),
@@ -161,9 +161,9 @@ impl JobStoreShard {
         txn.delete(&old_task_key)?;
 
         // Create new task key with current timestamp
+        // Raw byte passthrough: task data is identical, only the key changes
         let new_task_key = task_key(&task_group, now_ms, priority, id, attempt_number);
-        let task_value = encode_task(&task)?;
-        txn.put(&new_task_key, &task_value)?;
+        txn.put(&new_task_key, decoded.as_bytes())?;
 
         // Update job status with new start time (keeping same attempt number)
         let new_status = crate::job::JobStatus::scheduled(now_ms, now_ms, attempt_number);

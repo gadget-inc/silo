@@ -20,21 +20,18 @@ impl JobStoreShard {
         state: &DecodedFloatingLimitState,
         now_ms: i64,
     ) -> bool {
-        let archived = state.archived();
-
-        if archived.refresh_task_scheduled {
+        if state.refresh_task_scheduled() {
             return false;
         }
 
-        let next_refresh_due = archived.last_refreshed_at_ms + archived.refresh_interval_ms;
+        let next_refresh_due = state.last_refreshed_at_ms() + state.refresh_interval_ms();
         if now_ms < next_refresh_due {
             return false;
         }
 
-        let in_backoff = archived
-            .next_retry_at_ms
-            .as_ref()
-            .map(|&t| now_ms < t)
+        let in_backoff = state
+            .next_retry_at_ms()
+            .map(|t| now_ms < t)
             .unwrap_or(false);
 
         !in_backoff
@@ -64,7 +61,7 @@ impl JobStoreShard {
 
         if let Some(raw) = writer.get(&state_key).await? {
             // Hot path: state exists, return zero-copy decoded view
-            return Ok(decode_floating_limit_state(&raw)?);
+            return Ok(decode_floating_limit_state(raw)?);
         }
 
         // Cold path: first time seeing this queue key, create and write new state
@@ -79,11 +76,11 @@ impl JobStoreShard {
             metadata: fl.metadata.clone(),
         };
 
-        let state_bytes = encode_floating_limit_state(&state)?;
+        let state_bytes = encode_floating_limit_state(&state);
         writer.put(&state_key, &state_bytes)?;
 
         // Decode what we just encoded so we return the same type
-        Ok(decode_floating_limit_state(&state_bytes)?)
+        Ok(decode_floating_limit_state(state_bytes)?)
     }
 
     /// Check if a floating limit refresh is needed and schedule it if so.
@@ -99,22 +96,19 @@ impl JobStoreShard {
         task_group: &str,
         has_waiters: bool,
     ) -> Result<(), JobStoreShardError> {
-        let archived = state.archived();
-
         // Check if refresh is already scheduled
-        if archived.refresh_task_scheduled {
+        if state.refresh_task_scheduled() {
             return Ok(());
         }
 
         // Check if we need to refresh based on interval
-        let next_refresh_due = archived.last_refreshed_at_ms + archived.refresh_interval_ms;
+        let next_refresh_due = state.last_refreshed_at_ms() + state.refresh_interval_ms();
         let should_refresh = now_ms >= next_refresh_due;
 
         // Also check if we're in backoff from a failed refresh
-        let in_backoff = archived
-            .next_retry_at_ms
-            .as_ref()
-            .map(|&t| now_ms < t)
+        let in_backoff = state
+            .next_retry_at_ms()
+            .map(|t| now_ms < t)
             .unwrap_or(false);
 
         if !should_refresh || in_backoff || !has_waiters {
@@ -127,18 +121,14 @@ impl JobStoreShard {
             task_id: task_id.clone(),
             tenant: tenant.to_string(),
             queue_key: fl.key.clone(),
-            current_max_concurrency: archived.current_max_concurrency,
-            last_refreshed_at_ms: archived.last_refreshed_at_ms,
-            metadata: archived
-                .metadata
-                .iter()
-                .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
-                .collect(),
+            current_max_concurrency: state.current_max_concurrency(),
+            last_refreshed_at_ms: state.last_refreshed_at_ms(),
+            metadata: state.metadata(),
             task_group: task_group.to_string(),
         };
 
         // Use a synthetic task key with a special job_id format for floating refresh tasks
-        let task_value = encode_task(&refresh_task)?;
+        let task_value = encode_task(&refresh_task);
         let synthetic_job_id = format!("floating_refresh:{}", fl.key);
         let task_key_bytes = crate::keys::task_key(
             task_group,
@@ -152,16 +142,16 @@ impl JobStoreShard {
         // Update state to mark refresh as scheduled
         let new_state = FloatingLimitState {
             refresh_task_scheduled: true,
-            ..FloatingLimitState::from_archived(archived)
+            ..state.to_owned()
         };
         let state_key = floating_limit_state_key(tenant, &fl.key);
-        let state_value = encode_floating_limit_state(&new_state)?;
+        let state_value = encode_floating_limit_state(&new_state);
         writer.put(&state_key, &state_value)?;
 
         tracing::debug!(
             queue_key = %fl.key,
-            current_max = archived.current_max_concurrency,
-            last_refreshed = archived.last_refreshed_at_ms,
+            current_max = state.current_max_concurrency(),
+            last_refreshed = state.last_refreshed_at_ms(),
             "scheduled floating limit refresh task"
         );
 
@@ -182,30 +172,24 @@ impl JobStoreShard {
             return Err(JobStoreShardError::LeaseNotFound(task_id.to_string()));
         };
 
-        let decoded = decode_lease(&value_bytes)?;
+        let decoded = decode_lease(value_bytes)?;
         let tenant = decoded.tenant();
-        let queue_key = match decoded.to_task() {
-            Task::RefreshFloatingLimit { queue_key, .. } => queue_key,
-            _ => {
-                return Err(JobStoreShardError::Rkyv(
-                    "task is not a RefreshFloatingLimit".to_string(),
-                ));
-            }
-        };
+        let (_, queue_key) = decoded.refresh_floating_limit_info().ok_or_else(|| {
+            JobStoreShardError::Codec("task is not a RefreshFloatingLimit".to_string())
+        })?;
 
         let now_ms = now_epoch_ms();
-        let state_key = floating_limit_state_key(tenant, &queue_key);
+        let state_key = floating_limit_state_key(tenant, queue_key);
 
-        // Load state and construct new state with updates (zero-copy read from archived)
+        // Load state and construct new state with updates
         let maybe_state = self.db.get(&state_key).await?;
         let Some(raw) = maybe_state else {
-            return Err(JobStoreShardError::Rkyv(format!(
+            return Err(JobStoreShardError::Codec(format!(
                 "floating limit state not found for queue {}",
                 queue_key
             )));
         };
-        let decoded = decode_floating_limit_state(&raw)?;
-        let archived = decoded.archived();
+        let decoded_state = decode_floating_limit_state(raw)?;
 
         let new_state = FloatingLimitState {
             current_max_concurrency: new_max_concurrency,
@@ -213,11 +197,11 @@ impl JobStoreShard {
             refresh_task_scheduled: false,
             retry_count: 0,
             next_retry_at_ms: None,
-            ..FloatingLimitState::from_archived(archived)
+            ..decoded_state.to_owned()
         };
 
         let mut batch = WriteBatch::new();
-        let state_value = encode_floating_limit_state(&new_state)?;
+        let state_value = encode_floating_limit_state(&new_state);
         batch.put(&state_key, &state_value);
         batch.delete(&lease_key);
 
@@ -248,53 +232,39 @@ impl JobStoreShard {
             return Err(JobStoreShardError::LeaseNotFound(task_id.to_string()));
         };
 
-        let decoded = decode_lease(&value_bytes)?;
+        let decoded = decode_lease(value_bytes)?;
         let tenant = decoded.tenant().to_string();
-        let (queue_key, current_max_concurrency, last_refreshed_at_ms, metadata, task_group) =
-            match decoded.to_task() {
-                Task::RefreshFloatingLimit {
-                    queue_key,
-                    current_max_concurrency,
-                    last_refreshed_at_ms,
-                    metadata,
-                    task_group,
-                    ..
-                } => (
-                    queue_key,
-                    current_max_concurrency,
-                    last_refreshed_at_ms,
-                    metadata,
-                    task_group,
-                ),
-                _ => {
-                    return Err(JobStoreShardError::Rkyv(
-                        "task is not a RefreshFloatingLimit".to_string(),
-                    ));
-                }
-            };
+        let fb_lr = decoded.fb();
+        let rfl = fb_lr.task_as_refresh_floating_limit().ok_or_else(|| {
+            JobStoreShardError::Codec("task is not a RefreshFloatingLimit".to_string())
+        })?;
+        let queue_key = rfl.queue_key().unwrap_or_default().to_string();
+        let current_max_concurrency = rfl.current_max_concurrency();
+        let last_refreshed_at_ms = rfl.last_refreshed_at_ms();
+        let metadata = crate::codec::fb_kv_pairs_to_owned(rfl.metadata());
+        let task_group = rfl.task_group().unwrap_or_default().to_string();
 
         let now_ms = now_epoch_ms();
         let state_key = floating_limit_state_key(&tenant, &queue_key);
 
-        // Load state (zero-copy read from archived)
+        // Load state
         let maybe_state = self.db.get(&state_key).await?;
         let Some(raw) = maybe_state else {
-            return Err(JobStoreShardError::Rkyv(format!(
+            return Err(JobStoreShardError::Codec(format!(
                 "floating limit state not found for queue {}",
                 queue_key
             )));
         };
-        let decoded = decode_floating_limit_state(&raw)?;
-        let archived = decoded.archived();
+        let decoded_state = decode_floating_limit_state(raw)?;
 
-        // Calculate exponential backoff using archived retry_count
+        // Calculate exponential backoff
         const INITIAL_BACKOFF_MS: i64 = 1000; // 1 second
         const MAX_BACKOFF_MS: i64 = 60_000; // 1 minute
         const BACKOFF_MULTIPLIER: f64 = 2.0;
 
-        let new_retry_count = archived.retry_count + 1;
+        let new_retry_count = decoded_state.retry_count() + 1;
         let backoff_ms = ((INITIAL_BACKOFF_MS as f64)
-            * BACKOFF_MULTIPLIER.powi(archived.retry_count as i32))
+            * BACKOFF_MULTIPLIER.powi(decoded_state.retry_count() as i32))
         .round() as i64;
         let capped_backoff_ms = backoff_ms.min(MAX_BACKOFF_MS);
         let next_retry_at = now_ms + capped_backoff_ms;
@@ -307,11 +277,11 @@ impl JobStoreShard {
             retry_count: new_retry_count,
             next_retry_at_ms: Some(next_retry_at),
             refresh_task_scheduled: has_waiters,
-            ..FloatingLimitState::from_archived(archived)
+            ..decoded_state.to_owned()
         };
 
         let mut batch = WriteBatch::new();
-        let state_value = encode_floating_limit_state(&new_state)?;
+        let state_value = encode_floating_limit_state(&new_state);
         batch.put(&state_key, &state_value);
         if has_waiters {
             // Schedule a new refresh task
@@ -326,7 +296,7 @@ impl JobStoreShard {
                 task_group: task_group.clone(),
             };
 
-            let task_value = encode_task(&refresh_task)?;
+            let task_value = encode_task(&refresh_task);
             let synthetic_job_id = format!("floating_refresh:{}", queue_key);
             let task_key_bytes = crate::keys::task_key(
                 &task_group,

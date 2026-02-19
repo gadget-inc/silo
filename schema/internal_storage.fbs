@@ -1,0 +1,271 @@
+// FlatBuffers schema for Silo internal storage codec.
+// All types that are serialized into SlateDB values are defined here.
+
+namespace silo.fb;
+
+// ============================================================
+// Enums
+// ============================================================
+
+enum JobStatusKind: byte {
+  Scheduled = 0,
+  Running = 1,
+  Failed = 2,
+  Cancelled = 3,
+  Succeeded = 4,
+}
+
+enum AttemptStatusKind: byte {
+  Running = 0,
+  Succeeded = 1,
+  Failed = 2,
+  Cancelled = 3,
+}
+
+// ============================================================
+// Shared helper types
+// ============================================================
+
+table KeyValuePair {
+  key: string;
+  value: string;
+}
+
+table RetryPolicy {
+  retry_count: uint32;
+  initial_interval_ms: int64;
+  max_interval_ms: int64;
+  randomize_interval: bool;
+  backoff_factor: float64;
+}
+
+table RateLimitRetryPolicy {
+  initial_backoff_ms: int64;
+  max_backoff_ms: int64;
+  backoff_multiplier: float64;
+  max_retries: uint32;
+}
+
+// ============================================================
+// Rate limit data (stored in CheckRateLimit tasks)
+// ============================================================
+
+table GubernatorRateLimitData {
+  name: string;
+  unique_key: string;
+  limit: int64;
+  duration_ms: int64;
+  hits: int32;
+  algorithm: ubyte;
+  behavior: int32;
+  retry_initial_backoff_ms: int64;
+  retry_max_backoff_ms: int64;
+  retry_backoff_multiplier: float64;
+  retry_max_retries: uint32;
+}
+
+// ============================================================
+// Task variants (union)
+// ============================================================
+
+table RunAttempt {
+  id: string;
+  tenant: string;
+  job_id: string;
+  attempt_number: uint32;
+  relative_attempt_number: uint32;
+  held_queues: [string];
+  task_group: string;
+}
+
+table RequestTicket {
+  queue: string;
+  start_time_ms: int64;
+  priority: ubyte;
+  tenant: string;
+  job_id: string;
+  attempt_number: uint32;
+  relative_attempt_number: uint32;
+  request_id: string;
+  task_group: string;
+}
+
+table CheckRateLimit {
+  task_id: string;
+  tenant: string;
+  job_id: string;
+  attempt_number: uint32;
+  relative_attempt_number: uint32;
+  limit_index: uint32;
+  rate_limit: GubernatorRateLimitData;
+  retry_count: uint32;
+  started_at_ms: int64;
+  priority: ubyte;
+  held_queues: [string];
+  task_group: string;
+}
+
+table RefreshFloatingLimit {
+  task_id: string;
+  tenant: string;
+  queue_key: string;
+  current_max_concurrency: uint32;
+  last_refreshed_at_ms: int64;
+  metadata: [KeyValuePair];
+  task_group: string;
+}
+
+union TaskVariant {
+  RunAttempt,
+  RequestTicket,
+  CheckRateLimit,
+  RefreshFloatingLimit,
+}
+
+table Task {
+  variant: TaskVariant;
+}
+
+// ============================================================
+// Lease record
+// ============================================================
+
+table LeaseRecord {
+  worker_id: string;
+  task: TaskVariant;
+  expiry_ms: int64;
+  started_at_ms: int64;
+}
+
+// ============================================================
+// Job attempt (with flattened AttemptStatus)
+// ============================================================
+
+table JobAttempt {
+  job_id: string;
+  attempt_number: uint32;
+  relative_attempt_number: uint32;
+  task_id: string;
+  started_at_ms: int64;
+  // Flattened AttemptStatus
+  status_kind: AttemptStatusKind;
+  finished_at_ms: int64 = null;
+  result: [ubyte];
+  error_code: string;
+  error: [ubyte];
+}
+
+// ============================================================
+// Limit variants (union, stored in JobInfo)
+// ============================================================
+
+table ConcurrencyLimitEntry {
+  key: string;
+  max_concurrency: uint32;
+}
+
+table RateLimitEntry {
+  name: string;
+  unique_key: string;
+  limit: int64;
+  duration_ms: int64;
+  hits: int32;
+  algorithm: ubyte;
+  behavior: int32;
+  retry_policy: RateLimitRetryPolicy;
+}
+
+table FloatingConcurrencyLimitEntry {
+  key: string;
+  default_max_concurrency: uint32;
+  refresh_interval_ms: int64;
+  metadata: [KeyValuePair];
+}
+
+union LimitVariant {
+  ConcurrencyLimitEntry,
+  RateLimitEntry,
+  FloatingConcurrencyLimitEntry,
+}
+
+table LimitEntry {
+  variant: LimitVariant;
+}
+
+// ============================================================
+// Job info
+// ============================================================
+
+table JobInfo {
+  id: string;
+  priority: ubyte;
+  enqueue_time_ms: int64;
+  payload: [ubyte];
+  retry_policy: RetryPolicy;
+  metadata: [KeyValuePair];
+  limits: [LimitEntry];
+  task_group: string;
+}
+
+// ============================================================
+// Job status
+// ============================================================
+
+table JobStatus {
+  kind: JobStatusKind;
+  changed_at_ms: int64;
+  next_attempt_starts_after_ms: int64 = null;
+  current_attempt: uint32 = null;
+}
+
+// ============================================================
+// Holder record
+// ============================================================
+
+table HolderRecord {
+  granted_at_ms: int64;
+}
+
+// ============================================================
+// Concurrency action (union)
+// ============================================================
+
+table EnqueueTask {
+  start_time_ms: int64;
+  priority: ubyte;
+  job_id: string;
+  attempt_number: uint32;
+  relative_attempt_number: uint32;
+  task_group: string;
+}
+
+union ConcurrencyActionVariant {
+  EnqueueTask,
+}
+
+table ConcurrencyAction {
+  variant: ConcurrencyActionVariant;
+}
+
+// ============================================================
+// Job cancellation
+// ============================================================
+
+table JobCancellation {
+  cancelled_at_ms: int64;
+}
+
+// ============================================================
+// Floating limit state
+// ============================================================
+
+table FloatingLimitState {
+  current_max_concurrency: uint32;
+  last_refreshed_at_ms: int64;
+  refresh_task_scheduled: bool;
+  refresh_interval_ms: int64;
+  default_max_concurrency: uint32;
+  retry_count: uint32;
+  next_retry_at_ms: int64 = null;
+  metadata: [KeyValuePair];
+}

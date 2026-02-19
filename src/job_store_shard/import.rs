@@ -144,7 +144,7 @@ impl JobStoreShard {
             limits: params.limits.clone(),
             task_group: params.task_group.clone(),
         };
-        let job_value = encode_job_info(&job)?;
+        let job_value = encode_job_info(&job);
         txn.put(&info_key, &job_value)?;
 
         // Write metadata secondary index
@@ -182,7 +182,7 @@ impl JobStoreShard {
                 started_at_ms: imported.started_at_ms,
                 status,
             };
-            let attempt_value = encode_attempt(&attempt_record)?;
+            let attempt_value = encode_attempt(&attempt_record);
             let akey = attempt_key(tenant, job_id, attempt_number);
             txn.put(&akey, &attempt_value)?;
         }

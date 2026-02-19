@@ -495,7 +495,7 @@ impl ConcurrencyManager {
                 request_id: request_id.clone(),
                 task_group: task_group.to_string(),
             };
-            let ticket_value = encode_task(&ticket)?;
+            let ticket_value = encode_task(&ticket);
             writer.put(
                 task_key(task_group, start_at_ms, priority, job_id, attempt_number),
                 &ticket_value,
@@ -559,7 +559,7 @@ impl ConcurrencyManager {
         let holder = HolderRecord {
             granted_at_ms: now_ms,
         };
-        let hval = encode_holder(&holder)?;
+        let hval = encode_holder(&holder);
         batch.put(concurrency_holder_key(tenant, queue, request_id), &hval);
         batch.delete(task_key);
 
@@ -600,108 +600,109 @@ impl ConcurrencyManager {
             let mut granted_job_id: Option<String> = None;
 
             while let Some(kv) = iter.next().await? {
-                type ArchivedAction = <ConcurrencyAction as rkyv::Archive>::Archived;
-                let decoded = decode_concurrency_action(&kv.value)?;
-                let a: &ArchivedAction = decoded.archived();
-                match a {
-                    ArchivedAction::EnqueueTask {
-                        start_time_ms,
-                        priority,
-                        job_id,
-                        attempt_number,
-                        relative_attempt_number,
-                        task_group,
-                    } => {
-                        let job_id_str = job_id.as_str();
-                        let task_group_str = task_group.as_str();
+                let decoded = decode_concurrency_action(kv.value.clone())?;
+                let a = decoded.fb();
+                let et = a.variant_as_enqueue_task();
+                let Some(et) = et else {
+                    tracing::warn!(
+                        queue = %queue,
+                        "grant_next: unknown concurrency action variant, deleting"
+                    );
+                    batch.delete(&kv.key);
+                    continue;
+                };
 
-                        // [SILO-GRANT-CXL] Check if job is cancelled - if so, delete request and continue
-                        let cancelled_key = job_cancelled_key(tenant, job_id_str);
-                        let is_cancelled = db.get(&cancelled_key).await?.is_some();
+                let start_time_ms = et.start_time_ms();
+                let priority = et.priority();
+                let job_id_str = et.job_id().unwrap_or_default();
+                let attempt_number = et.attempt_number();
+                let relative_attempt_number = et.relative_attempt_number();
+                let task_group_str = et.task_group().unwrap_or_default();
 
-                        if is_cancelled {
-                            // [SILO-GRANT-CXL-2] Delete the cancelled request without granting
-                            batch.delete(&kv.key);
-                            tracing::debug!(
-                                job_id = %job_id_str,
-                                queue = %queue,
-                                "grant_next: skipping cancelled job request"
-                            );
-                            continue;
-                        }
+                // [SILO-GRANT-CXL] Check if job is cancelled - if so, delete request and continue
+                let cancelled_key = job_cancelled_key(tenant, job_id_str);
+                let is_cancelled = db.get(&cancelled_key).await?.is_some();
 
-                        // Check if job has already reached a terminal state (Succeeded/Failed) -
-                        // if so, delete the stale request without granting. This can happen when
-                        // a job succeeds via one attempt while a pending concurrency request from
-                        // a restart or retry is still in the DB.
-                        let status_key = job_status_key(tenant, job_id_str);
-                        if let Some(status_raw) = db.get(&status_key).await? {
-                            let status =
-                                decode_job_status_owned(&status_raw).map_err(|e| e.to_string())?;
-                            if status.is_terminal() {
-                                batch.delete(&kv.key);
-                                tracing::debug!(
-                                    job_id = %job_id_str,
-                                    queue = %queue,
-                                    status = ?status.kind,
-                                    "grant_next: skipping request for terminal job"
-                                );
-                                continue;
-                            }
-                        }
+                if is_cancelled {
+                    // [SILO-GRANT-CXL-2] Delete the cancelled request without granting
+                    batch.delete(&kv.key);
+                    tracing::debug!(
+                        job_id = %job_id_str,
+                        queue = %queue,
+                        "grant_next: skipping cancelled job request"
+                    );
+                    continue;
+                }
 
-                        // Parse request key to extract request_id
-                        let Some(parsed_req) = parse_concurrency_request_key(&kv.key) else {
-                            continue;
-                        };
-                        let request_id = parsed_req.request_id;
-
-                        if *start_time_ms > now_ms {
-                            // Not ready yet; leave request for later and stop searching
-                            // (requests are ordered by time, so subsequent ones are also not ready)
-                            break;
-                        }
-
-                        // [SILO-GRANT-3] Create holder for this task/queue in DB
-                        let holder = HolderRecord {
-                            granted_at_ms: now_ms,
-                        };
-                        let holder_val = encode_holder(&holder)?;
-                        batch.put(
-                            concurrency_holder_key(tenant, queue, &request_id),
-                            &holder_val,
-                        );
-
-                        // [SILO-GRANT-4] Create RunAttempt task in DB queue
-                        let task = Task::RunAttempt {
-                            id: request_id.clone(),
-                            tenant: tenant.to_string(),
-                            job_id: job_id_str.to_string(),
-                            attempt_number: *attempt_number,
-                            relative_attempt_number: *relative_attempt_number,
-                            held_queues: vec![queue.clone()],
-                            task_group: task_group_str.to_string(),
-                        };
-                        let tval = encode_task(&task)?;
-                        batch.put(
-                            task_key(
-                                task_group_str,
-                                *start_time_ms,
-                                *priority,
-                                job_id_str,
-                                *attempt_number,
-                            ),
-                            &tval,
-                        );
+                // Check if job has already reached a terminal state (Succeeded/Failed) -
+                // if so, delete the stale request without granting. This can happen when
+                // a job succeeds via one attempt while a pending concurrency request from
+                // a restart or retry is still in the DB.
+                let status_key = job_status_key(tenant, job_id_str);
+                if let Some(status_raw) = db.get(&status_key).await? {
+                    let status = decode_job_status_owned(&status_raw).map_err(|e| e.to_string())?;
+                    if status.is_terminal() {
                         batch.delete(&kv.key);
-
-                        granted_task_id = Some(request_id);
-                        granted_job_id = Some(job_id_str.to_string());
-
-                        // Only grant one request per release
-                        break;
+                        tracing::debug!(
+                            job_id = %job_id_str,
+                            queue = %queue,
+                            status = ?status.kind,
+                            "grant_next: skipping request for terminal job"
+                        );
+                        continue;
                     }
                 }
+
+                // Parse request key to extract request_id
+                let Some(parsed_req) = parse_concurrency_request_key(&kv.key) else {
+                    continue;
+                };
+                let request_id = parsed_req.request_id;
+
+                if start_time_ms > now_ms {
+                    // Not ready yet; leave request for later and stop searching
+                    // (requests are ordered by time, so subsequent ones are also not ready)
+                    break;
+                }
+
+                // [SILO-GRANT-3] Create holder for this task/queue in DB
+                let holder = HolderRecord {
+                    granted_at_ms: now_ms,
+                };
+                let holder_val = encode_holder(&holder);
+                batch.put(
+                    concurrency_holder_key(tenant, queue, &request_id),
+                    &holder_val,
+                );
+
+                // [SILO-GRANT-4] Create RunAttempt task in DB queue
+                let task = Task::RunAttempt {
+                    id: request_id.clone(),
+                    tenant: tenant.to_string(),
+                    job_id: job_id_str.to_string(),
+                    attempt_number,
+                    relative_attempt_number,
+                    held_queues: vec![queue.clone()],
+                    task_group: task_group_str.to_string(),
+                };
+                let tval = encode_task(&task);
+                batch.put(
+                    task_key(
+                        task_group_str,
+                        start_time_ms,
+                        priority,
+                        job_id_str,
+                        attempt_number,
+                    ),
+                    &tval,
+                );
+                batch.delete(&kv.key);
+
+                granted_task_id = Some(request_id);
+                granted_job_id = Some(job_id_str.to_string());
+
+                // Only grant one request per release
+                break;
             }
 
             // Update in-memory counts ATOMICALLY before returning
@@ -769,7 +770,7 @@ fn append_grant_edits<W: WriteBatcher>(
     let holder = HolderRecord {
         granted_at_ms: now_ms,
     };
-    let holder_val = encode_holder(&holder)?;
+    let holder_val = encode_holder(&holder);
     writer.put(concurrency_holder_key(tenant, queue, task_id), &holder_val)?;
 
     let task = Task::RunAttempt {
@@ -781,7 +782,7 @@ fn append_grant_edits<W: WriteBatcher>(
         held_queues: vec![queue.to_string()],
         task_group: task_group.to_string(),
     };
-    let task_value = encode_task(&task)?;
+    let task_value = encode_task(&task);
     writer.put(
         task_key(task_group, start_time_ms, priority, job_id, attempt_number),
         &task_value,
@@ -810,7 +811,7 @@ fn append_request_edits<W: WriteBatcher>(
         relative_attempt_number,
         task_group: task_group.to_string(),
     };
-    let action_val = encode_concurrency_action(&action)?;
+    let action_val = encode_concurrency_action(&action);
     let req_key = concurrency_request_key(
         tenant,
         queue,

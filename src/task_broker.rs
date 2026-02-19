@@ -10,18 +10,21 @@ use crossbeam_skiplist::SkipMap;
 use slatedb::{Db, WriteBatch};
 use tokio::sync::Notify;
 
-use crate::codec::decode_task;
+use crate::codec::{DecodedTask, decode_task_validated};
 use crate::keys::{end_bound, parse_task_key, tasks_prefix};
 use crate::metrics::Metrics;
 use crate::shard_range::ShardRange;
-use crate::task::Task;
 use tracing::debug;
 
-/// A task entry stored in the in-memory broker buffer
+/// A task entry stored in the in-memory broker buffer.
+///
+/// Stores a pre-validated `DecodedTask` (wraps `Bytes`) instead of raw bytes.
+/// Validation happens once during scan; callers can access zero-copy
+/// FlatBuffer accessors without re-parsing.
 #[derive(Debug, Clone)]
 pub struct BrokerTask {
     pub key: Vec<u8>,
-    pub task: Task,
+    pub decoded: DecodedTask,
 }
 
 /// Lock-free in-memory task broker backed by SlateDB.
@@ -167,13 +170,13 @@ impl TaskBroker {
                 continue;
             }
 
-            let task = match decode_task(&kv.value) {
+            let decoded = match decode_task_validated(kv.value.clone()) {
                 Ok(t) => t,
                 Err(_) => continue, // Skip malformed tasks
             };
 
             // Check if task's tenant is within shard range
-            let task_tenant = task.tenant();
+            let task_tenant = decoded.tenant();
 
             if !self.range.contains(task_tenant) {
                 // Task is for a tenant outside our range - mark for deletion
@@ -190,7 +193,7 @@ impl TaskBroker {
 
             let entry = BrokerTask {
                 key: key_bytes.clone(),
-                task,
+                decoded,
             };
 
             // [SILO-SCAN-2] Insert into buffer if not already present

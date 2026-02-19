@@ -1,6 +1,5 @@
 mod test_helpers;
 
-use rkyv::Archive;
 use silo::codec::{decode_lease, encode_task};
 use silo::job::JobStatusKind;
 use silo::job_attempt::{AttemptOutcome, AttemptStatus};
@@ -62,26 +61,21 @@ async fn dequeue_moves_tasks_to_leased_with_uuid() {
         // Binary keys start with prefix 0x06 for leases
         assert_eq!(lease_key[0], 0x06, "lease key should have lease prefix");
 
-        type ArchivedTask = <Task as Archive>::Archived;
-        let decoded = decode_lease(&kv_value).expect("decode lease");
-        let archived = decoded.archived();
-        assert_eq!(archived.worker_id.as_str(), "worker-1");
-        match &archived.task {
-            ArchivedTask::RunAttempt {
+        let decoded = decode_lease(kv_value).expect("decode lease");
+        assert_eq!(decoded.worker_id(), "worker-1");
+        let task = decoded.to_task().unwrap();
+        match &task {
+            Task::RunAttempt {
                 id,
                 job_id: jid,
                 attempt_number,
                 ..
             } => {
-                assert_eq!(id.as_str(), leased_task_id);
-                assert_eq!(jid.as_str(), job_id);
+                assert_eq!(id, &leased_task_id);
+                assert_eq!(jid, &job_id);
                 assert_eq!(*attempt_number, 1);
             }
-            ArchivedTask::RequestTicket { .. } => panic!("unexpected RequestTicket in lease"),
-            ArchivedTask::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in lease"),
-            ArchivedTask::RefreshFloatingLimit { .. } => {
-                panic!("unexpected RefreshFloatingLimit in lease")
-            }
+            _ => panic!("unexpected task variant in lease"),
         }
 
         // Ensure original task queue is empty now
@@ -126,8 +120,8 @@ async fn heartbeat_renews_lease_when_worker_matches() {
         let (old_key, old_value) = first_lease_kv(shard.db()).await.expect("scan lease");
         let parsed_old = silo::keys::parse_lease_key(&old_key).expect("parse lease key");
         assert_eq!(parsed_old.task_id, task_id);
-        let decoded_first = decode_lease(&old_value).expect("decode lease");
-        let old_expiry = decoded_first.archived().expiry_ms as u64;
+        let decoded_first = decode_lease(old_value).expect("decode lease");
+        let old_expiry = decoded_first.expiry_ms() as u64;
 
         // Heartbeat to renew
         shard
@@ -139,12 +133,12 @@ async fn heartbeat_renews_lease_when_worker_matches() {
         let (new_key, new_value) = first_lease_kv(shard.db()).await.expect("scan lease 2");
         let parsed_new = silo::keys::parse_lease_key(&new_key).expect("parse lease key 2");
         assert_eq!(parsed_new.task_id, task_id);
-        let decoded_second = decode_lease(&new_value).expect("decode lease 2");
-        let new_expiry = decoded_second.archived().expiry_ms as u64;
+        let decoded_second = decode_lease(new_value).expect("decode lease 2");
+        let new_expiry = decoded_second.expiry_ms() as u64;
         assert!(new_expiry > old_expiry, "new expiry should be greater");
 
         // Validate owner remains the same
-        assert_eq!(decoded_second.archived().worker_id.as_str(), "worker-1");
+        assert_eq!(decoded_second.worker_id(), "worker-1");
     });
 }
 
@@ -636,7 +630,7 @@ async fn dequeue_ignores_recently_acked_task_keys() {
             held_queues: vec![],
             task_group: "default".to_string(),
         };
-        let task_bytes = encode_task(&reinjected).expect("encode reinjected task");
+        let task_bytes = encode_task(&reinjected);
         let task_key = silo::keys::task_key("default", 0, 1, &job_id, 1);
 
         let mut batch = WriteBatch::new();

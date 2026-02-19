@@ -1113,12 +1113,8 @@ impl Scan for QueuesScanner {
                         {
                             continue;
                         }
-                        let timestamp_ms =
-                            if let Ok(holder) = crate::codec::decode_holder(&kv.value) {
-                                holder.granted_at_ms()
-                            } else {
-                                0
-                            };
+                        let timestamp_ms = crate::codec::decode_holder_granted_at_ms(&kv.value)
+                            .unwrap_or_default();
                         entries.push(QueueEntry {
                             tenant: parsed.tenant,
                             queue_name: parsed.queue,
@@ -1153,14 +1149,12 @@ impl Scan for QueuesScanner {
                             continue;
                         }
                         let job_id = if let Ok(action) =
-                            crate::codec::decode_concurrency_action(&kv.value)
+                            crate::codec::decode_concurrency_action(kv.value.clone())
                         {
-                            match action.archived() {
-                                crate::task::ArchivedConcurrencyAction::EnqueueTask {
-                                    job_id,
-                                    ..
-                                } => Some(job_id.as_str().to_string()),
-                            }
+                            action
+                                .fb()
+                                .variant_as_enqueue_task()
+                                .and_then(|et| et.job_id().map(|s| s.to_string()))
                         } else {
                             None
                         };

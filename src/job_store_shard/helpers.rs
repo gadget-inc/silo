@@ -1,10 +1,9 @@
 //! Helper functions shared across job_store_shard submodules.
-use rkyv::Deserialize as RkyvDeserialize;
 use slatedb::bytes::Bytes;
 use slatedb::{Db, DbTransaction, WriteBatch};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::codec::{decode_job_status, encode_task};
+use crate::codec::encode_task;
 use crate::job::JobStatus;
 use crate::job_store_shard::JobStoreShardError;
 use crate::keys::task_key;
@@ -153,7 +152,7 @@ pub(crate) fn put_task<W: WriteBatcher>(
     attempt: u32,
     task: &Task,
 ) -> Result<(), JobStoreShardError> {
-    let task_value = encode_task(task)?;
+    let task_value = encode_task(task);
     writer.put(
         task_key(task_group, time_ms, priority, job_id, attempt),
         &task_value,
@@ -217,10 +216,7 @@ pub(crate) async fn load_job_view(
     crate::job::JobView::new(job_raw)
 }
 
-/// Decode a `JobStatus` from raw rkyv bytes into an owned value.
+/// Decode a `JobStatus` from raw bytes into an owned value.
 pub(crate) fn decode_job_status_owned(raw: &[u8]) -> Result<JobStatus, JobStoreShardError> {
-    let decoded = decode_job_status(raw)?;
-    let mut des = rkyv::Infallible;
-    Ok(RkyvDeserialize::deserialize(decoded.archived(), &mut des)
-        .unwrap_or_else(|_| unreachable!("infallible deserialization for JobStatus")))
+    Ok(crate::codec::decode_job_status_owned(raw)?)
 }

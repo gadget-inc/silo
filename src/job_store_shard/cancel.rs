@@ -2,7 +2,7 @@
 
 use slatedb::IsolationLevel;
 
-use crate::codec::{decode_job_cancellation, encode_job_cancellation};
+use crate::codec::{decode_cancellation_at_ms, encode_job_cancellation};
 use crate::job::{JobCancellation, JobStatus, JobStatusKind};
 use crate::job_store_shard::helpers::{
     TxnWriter, decode_job_status_owned, now_epoch_ms, retry_on_txn_conflict,
@@ -71,7 +71,7 @@ impl JobStoreShard {
         let cancellation = JobCancellation {
             cancelled_at_ms: now_ms,
         };
-        let cancellation_value = encode_job_cancellation(&cancellation)?;
+        let cancellation_value = encode_job_cancellation(&cancellation);
         txn.put(&cancelled_key, &cancellation_value)?;
 
         // Track whether we're transitioning a scheduled job to terminal state
@@ -122,7 +122,6 @@ impl JobStoreShard {
         let Some(raw) = self.db.get(&key).await? else {
             return Ok(None);
         };
-        let decoded = decode_job_cancellation(&raw)?;
-        Ok(Some(decoded.archived().cancelled_at_ms))
+        Ok(Some(decode_cancellation_at_ms(&raw)?))
     }
 }

@@ -3,9 +3,10 @@
 use slatedb::config::WriteOptions;
 use slatedb::{DbIterator, WriteBatch};
 
-use crate::codec::{decode_task, encode_attempt, encode_lease};
+use crate::codec::{DecodedTask, decode_task, encode_attempt, encode_lease};
 use crate::concurrency::{ReleaseGrantRollback, RequestTicketTaskOutcome};
 use crate::dst_events::{self, DstEvent};
+use crate::fb::silo::fb;
 use crate::job::{JobStatus, JobView};
 use crate::job_attempt::{AttemptStatus, JobAttempt, JobAttemptView};
 use crate::job_store_shard::helpers::{DbWriteBatcher, now_epoch_ms};
@@ -44,12 +45,12 @@ impl DequeueIterationState {
     }
 
     fn ack_release(&mut self, key: &[u8]) {
-        self.release_keys.push(key.to_owned());
+        self.release_keys.push(key.to_vec());
     }
 
     fn ack_deleted(&mut self, key: &[u8]) {
-        self.release_keys.push(key.to_owned());
-        self.tombstone_keys.push(key.to_owned());
+        self.release_keys.push(key.to_vec());
+        self.tombstone_keys.push(key.to_vec());
     }
 }
 
@@ -114,11 +115,11 @@ impl JobStoreShard {
             let shard_range = self.get_range();
 
             for entry in &claimed {
-                let task = &entry.task;
+                let decoded = &entry.decoded;
 
                 // Check if task's tenant is within shard range
                 // Tasks for tenants outside the range are defunct (from before a split)
-                let task_tenant = task.tenant();
+                let task_tenant = decoded.tenant();
 
                 if !shard_range.contains(task_tenant) {
                     // Task is for a tenant outside our range - delete and skip
@@ -132,11 +133,12 @@ impl JobStoreShard {
                     continue;
                 }
 
-                match task {
-                    Task::RequestTicket { .. } => {
+                match decoded.variant_type() {
+                    fb::TaskVariant::RequestTicket => {
                         self.handle_request_ticket(
                             &mut state,
-                            entry,
+                            &entry.key,
+                            decoded,
                             &shard_range,
                             worker_id,
                             now_ms,
@@ -144,22 +146,31 @@ impl JobStoreShard {
                         )
                         .await?;
                     }
-                    Task::CheckRateLimit { .. } => {
-                        self.handle_check_rate_limit(&mut state, entry, now_ms)
+                    fb::TaskVariant::CheckRateLimit => {
+                        self.handle_check_rate_limit(&mut state, &entry.key, decoded, now_ms)
                             .await?;
                     }
-                    Task::RefreshFloatingLimit { .. } => {
+                    fb::TaskVariant::RefreshFloatingLimit => {
                         self.handle_refresh_floating_limit(
                             &mut state,
                             &mut refresh_out,
-                            entry,
+                            &entry.key,
+                            decoded,
                             worker_id,
                             expiry_ms,
                         )?;
                     }
-                    Task::RunAttempt { .. } => {
-                        self.handle_run_attempt(&mut state, entry, worker_id, now_ms, expiry_ms)
-                            .await?;
+                    fb::TaskVariant::RunAttempt => {
+                        self.handle_run_attempt(
+                            &mut state, &entry.key, decoded, worker_id, now_ms, expiry_ms,
+                        )
+                        .await?;
+                    }
+                    other => {
+                        return Err(JobStoreShardError::Codec(format!(
+                            "unexpected task variant {:?}",
+                            other
+                        )));
                     }
                 }
             }
@@ -259,7 +270,7 @@ impl JobStoreShard {
 
         // Build LeasedTask results from pending_attempts using pre-encoded bytes
         for (tenant, job_view, attempt_bytes) in pending_attempts.into_iter() {
-            let attempt_view = JobAttemptView::new(&attempt_bytes)?;
+            let attempt_view = JobAttemptView::new(attempt_bytes)?;
             out.push(LeasedTask::new(tenant, job_view, attempt_view));
         }
         tracing::debug!(
@@ -298,7 +309,7 @@ impl JobStoreShard {
             expiry_ms,
             started_at_ms: now_ms,
         };
-        let leased_value = encode_lease(&record)?;
+        let leased_value = encode_lease(&record);
         batch.put(&lease_key, &leased_value);
 
         // [SILO-DEQ-6] Mark job as running
@@ -320,7 +331,7 @@ impl JobStoreShard {
             started_at_ms: now_ms,
             status: AttemptStatus::Running,
         };
-        let attempt_val = encode_attempt(&attempt)?;
+        let attempt_val = encode_attempt(&attempt);
         let akey = attempt_key(tenant, job_id, attempt_number);
         batch.put(&akey, &attempt_val);
 
@@ -328,37 +339,34 @@ impl JobStoreShard {
     }
 
     /// Process a RequestTicket task: check cancellation, process concurrency ticket, maybe lease.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_request_ticket(
         &self,
         state: &mut DequeueIterationState,
-        entry: &BrokerTask,
+        task_key: &[u8],
+        decoded: &DecodedTask,
         shard_range: &ShardRange,
         worker_id: &str,
         now_ms: i64,
         expiry_ms: i64,
     ) -> Result<(), JobStoreShardError> {
-        let Task::RequestTicket {
-            queue,
-            tenant,
-            job_id,
-            attempt_number,
-            relative_attempt_number,
-            request_id,
-            task_group: req_task_group,
-            ..
-        } = &entry.task
-        else {
-            unreachable!()
-        };
-        let attempt_number = *attempt_number;
-        let relative_attempt_number = *relative_attempt_number;
+        let rt = decoded.as_request_ticket().ok_or_else(|| {
+            JobStoreShardError::Codec("expected RequestTicket variant".to_string())
+        })?;
+        let queue = rt.queue().unwrap_or_default();
+        let tenant = rt.tenant().unwrap_or_default();
+        let job_id = rt.job_id().unwrap_or_default();
+        let attempt_number = rt.attempt_number();
+        let relative_attempt_number = rt.relative_attempt_number();
+        let request_id = rt.request_id().unwrap_or_default();
+        let req_task_group = rt.task_group().unwrap_or_default();
         state.processed_internal = true;
         let tenant = tenant.to_string();
 
         // [SILO-DEQ-CXL] Check if job is cancelled - if so, skip and clean up task
         if self.is_job_cancelled(&tenant, job_id).await? {
-            state.batch.delete(&entry.key);
-            state.ack_deleted(&entry.key);
+            state.batch.delete(task_key);
+            state.ack_deleted(task_key);
             tracing::debug!(job_id = %job_id, "dequeue: skipping cancelled job RequestTicket");
             return Ok(());
         }
@@ -377,7 +385,7 @@ impl JobStoreShard {
                 &self.db,
                 shard_range,
                 &mut state.batch,
-                &entry.key,
+                task_key,
                 &tenant,
                 queue,
                 request_id,
@@ -395,7 +403,7 @@ impl JobStoreShard {
                     .grants_to_rollback
                     .push((tenant.clone(), queue.clone(), request_id.clone()));
 
-                // Create RunAttempt task for the lease
+                // Create RunAttempt task for the lease (new Task, not a copy)
                 let run = Task::RunAttempt {
                     id: request_id.clone(),
                     tenant: tenant.clone(),
@@ -421,11 +429,16 @@ impl JobStoreShard {
                     )
                     .await?;
 
-                let view = job_view.unwrap();
+                let view = job_view.ok_or_else(|| {
+                    JobStoreShardError::Codec(format!(
+                        "job view missing for granted ticket, job_id={}",
+                        job_id
+                    ))
+                })?;
                 state
                     .pending_attempts
                     .push((tenant.clone(), view, attempt_val));
-                state.ack_deleted(&entry.key);
+                state.ack_deleted(task_key);
 
                 // Track for DST event emission after commit
                 state
@@ -440,11 +453,11 @@ impl JobStoreShard {
             RequestTicketTaskOutcome::Requested => {
                 // Release inflight only; task key remains in DB and must be eligible
                 // for future scans when capacity is available.
-                state.ack_release(&entry.key);
+                state.ack_release(task_key);
             }
             RequestTicketTaskOutcome::JobMissing => {
                 // process_ticket_request_task deleted the task key.
-                state.ack_deleted(&entry.key);
+                state.ack_deleted(task_key);
             }
         }
 
@@ -455,39 +468,37 @@ impl JobStoreShard {
     async fn handle_check_rate_limit(
         &self,
         state: &mut DequeueIterationState,
-        entry: &BrokerTask,
+        task_key: &[u8],
+        decoded: &DecodedTask,
         now_ms: i64,
     ) -> Result<(), JobStoreShardError> {
+        // Materialize the full task since we need most fields for the Gubernator call
         let Task::CheckRateLimit {
-            task_id: check_task_id,
-            tenant,
-            job_id,
+            task_id: ref check_task_id,
+            ref tenant,
+            ref job_id,
             attempt_number,
             relative_attempt_number: check_relative_attempt_number,
             limit_index,
-            rate_limit,
+            ref rate_limit,
             retry_count,
             started_at_ms,
             priority,
-            held_queues,
-            task_group: check_task_group,
-        } = &entry.task
+            ref held_queues,
+            task_group: ref check_task_group,
+        } = decoded.to_task()?
         else {
-            unreachable!()
+            return Err(JobStoreShardError::Codec(
+                "expected CheckRateLimit variant".to_string(),
+            ));
         };
-        let attempt_number = *attempt_number;
-        let check_relative_attempt_number = *check_relative_attempt_number;
-        let limit_index = *limit_index;
-        let retry_count = *retry_count;
-        let started_at_ms = *started_at_ms;
-        let priority = *priority;
+
         state.processed_internal = true;
-        let tenant = tenant.to_string();
-        state.batch.delete(&entry.key);
-        state.ack_deleted(&entry.key);
+        state.batch.delete(task_key);
+        state.ack_deleted(task_key);
 
         // Load job info to get the full limits list
-        let job_key = job_info_key(&tenant, job_id);
+        let job_key = job_info_key(tenant, job_id);
         let maybe_job = self.db.get(&job_key).await?;
         let job_view = match maybe_job {
             Some(bytes) => match JobView::new(bytes) {
@@ -507,7 +518,7 @@ impl JobStoreShard {
                     .enqueue_limit_task_at_index(
                         &mut DbWriteBatcher::new(&self.db, &mut state.batch),
                         LimitTaskParams {
-                            tenant: &tenant,
+                            tenant,
                             task_id: check_task_id,
                             job_id,
                             attempt_number,
@@ -517,7 +528,7 @@ impl JobStoreShard {
                             priority,
                             start_at_ms: now_ms,
                             now_ms,
-                            held_queues: held_queues.to_vec(),
+                            held_queues: held_queues.clone(),
                             task_group: check_task_group,
                         },
                     )
@@ -550,7 +561,7 @@ impl JobStoreShard {
                 );
                 self.schedule_rate_limit_retry(
                     &mut DbWriteBatcher::new(&self.db, &mut state.batch),
-                    &tenant,
+                    tenant,
                     job_id,
                     attempt_number,
                     check_relative_attempt_number,
@@ -569,7 +580,7 @@ impl JobStoreShard {
                 let retry_backoff = now_ms + rate_limit.retry_initial_backoff_ms;
                 self.schedule_rate_limit_retry(
                     &mut DbWriteBatcher::new(&self.db, &mut state.batch),
-                    &tenant,
+                    tenant,
                     job_id,
                     attempt_number,
                     check_relative_attempt_number,
@@ -593,44 +604,42 @@ impl JobStoreShard {
         &self,
         state: &mut DequeueIterationState,
         refresh_out: &mut Vec<LeasedRefreshTask>,
-        entry: &BrokerTask,
+        task_key: &[u8],
+        decoded: &DecodedTask,
         worker_id: &str,
         expiry_ms: i64,
     ) -> Result<(), JobStoreShardError> {
-        let Task::RefreshFloatingLimit {
-            task_id,
-            tenant: task_tenant,
-            queue_key,
-            current_max_concurrency,
-            last_refreshed_at_ms,
-            metadata,
-            task_group: refresh_task_group,
-        } = &entry.task
-        else {
-            unreachable!()
-        };
+        let rfl = decoded.as_refresh_floating_limit().ok_or_else(|| {
+            JobStoreShardError::Codec("expected RefreshFloatingLimit variant".to_string())
+        })?;
+        let task_id = rfl.task_id().unwrap_or_default();
 
+        // Build lease from the task
         let lease_key = leased_task_key(task_id);
+        let task = decoded.to_task()?;
         let record = LeaseRecord {
             worker_id: worker_id.to_string(),
-            task: entry.task.clone(),
+            task,
             expiry_ms,
-            started_at_ms: 0, // Not applicable for RefreshFloatingLimit tasks
+            started_at_ms: 0, // not applicable for RefreshFloatingLimit tasks
         };
-        let leased_value = encode_lease(&record)?;
+        let leased_value = encode_lease(&record);
         state.batch.put(&lease_key, &leased_value);
-        state.batch.delete(&entry.key);
+        state.batch.delete(task_key);
+
+        // Materialize fields needed for the response
+        let metadata = crate::codec::fb_kv_pairs_to_owned(rfl.metadata());
 
         refresh_out.push(LeasedRefreshTask {
             task_id: task_id.to_string(),
-            tenant_id: task_tenant.to_string(),
-            queue_key: queue_key.to_string(),
-            current_max_concurrency: *current_max_concurrency,
-            last_refreshed_at_ms: *last_refreshed_at_ms,
-            metadata: metadata.to_vec(),
-            task_group: refresh_task_group.to_string(),
+            tenant_id: rfl.tenant().unwrap_or_default().to_string(),
+            queue_key: rfl.queue_key().unwrap_or_default().to_string(),
+            current_max_concurrency: rfl.current_max_concurrency(),
+            last_refreshed_at_ms: rfl.last_refreshed_at_ms(),
+            metadata,
+            task_group: rfl.task_group().unwrap_or_default().to_string(),
         });
-        state.ack_deleted(&entry.key);
+        state.ack_deleted(task_key);
 
         Ok(())
     }
@@ -639,46 +648,42 @@ impl JobStoreShard {
     async fn handle_run_attempt(
         &self,
         state: &mut DequeueIterationState,
-        entry: &BrokerTask,
+        task_key: &[u8],
+        decoded: &DecodedTask,
         worker_id: &str,
         now_ms: i64,
         expiry_ms: i64,
     ) -> Result<(), JobStoreShardError> {
-        let Task::RunAttempt {
-            id: task_id,
-            tenant,
-            job_id,
-            attempt_number,
-            relative_attempt_number,
-            ..
-        } = &entry.task
-        else {
-            unreachable!()
-        };
-        let attempt_number = *attempt_number;
-        let relative_attempt_number = *relative_attempt_number;
+        let ra = decoded
+            .as_run_attempt()
+            .ok_or_else(|| JobStoreShardError::Codec("expected RunAttempt variant".to_string()))?;
+        let task_id = ra.id().unwrap_or_default();
+        let tenant = ra.tenant().unwrap_or_default();
+        let job_id = ra.job_id().unwrap_or_default();
+        let attempt_number = ra.attempt_number();
+        let relative_attempt_number = ra.relative_attempt_number();
+
         // [SILO-DEQ-2] Look up job info; if missing, delete the task and skip
         let job_key = job_info_key(tenant, job_id);
         let maybe_job = self.db.get(&job_key).await?;
         let Some(job_bytes) = maybe_job else {
             // If job missing, delete task key to clean up
-            state.batch.delete(&entry.key);
-            state.ack_deleted(&entry.key);
+            state.batch.delete(task_key);
+            state.ack_deleted(task_key);
             return Ok(());
         };
 
         // [SILO-DEQ-CXL] Check if job is cancelled - if so, skip and clean up task
         if self.is_job_cancelled(tenant, job_id).await? {
-            state.batch.delete(&entry.key);
-            state.ack_deleted(&entry.key);
+            state.batch.delete(task_key);
+            state.ack_deleted(task_key);
 
             // [SILO-DEQ-CXL-REL] Release any held concurrency tickets
             // This is required to maintain invariant: holders can only exist for active tasks
-            let held_queues = match &entry.task {
-                Task::RunAttempt { held_queues, .. } => held_queues.clone(),
-                Task::CheckRateLimit { held_queues, .. } => held_queues.clone(),
-                Task::RequestTicket { .. } | Task::RefreshFloatingLimit { .. } => Vec::new(),
-            };
+            let held_queues: Vec<String> = ra
+                .held_queues()
+                .map(|v| v.iter().map(|s| s.to_string()).collect())
+                .unwrap_or_default();
             if !held_queues.is_empty() {
                 // release_and_grant_next updates in-memory atomically before returning
                 // Track rollback info in case DB write fails
@@ -708,13 +713,14 @@ impl JobStoreShard {
         // is granted (at enqueue or grant_next), with held_queues populated.
 
         // [SILO-DEQ-3] Delete task from task queue
-        state.batch.delete(&entry.key);
+        state.batch.delete(task_key);
 
+        let task = decoded.to_task()?;
         let attempt_val = self
             .write_lease_and_attempt(
                 &mut state.batch,
                 worker_id,
-                &entry.task,
+                &task,
                 task_id,
                 tenant,
                 job_id,
@@ -729,7 +735,7 @@ impl JobStoreShard {
         state
             .pending_attempts
             .push((tenant.to_string(), view, attempt_val));
-        state.ack_deleted(&entry.key);
+        state.ack_deleted(task_key);
 
         // Track for DST event emission after commit
         state.leased_tasks_for_dst.push((

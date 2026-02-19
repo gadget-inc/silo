@@ -61,6 +61,7 @@
           bacon
           etcd
           protobuf # provides protoc binary
+          flatbuffers # provides flatc binary for FlatBuffers schema compilation
           bzip2 # required by slatedb dependencies for compression
           alloy6 # Alloy verification language for formal specs
           process-compose

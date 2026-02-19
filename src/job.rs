@@ -1,33 +1,29 @@
-use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
-
-use crate::codec::{CodecError, DecodedJobInfo, decode_job_info};
+use crate::codec::{CodecError, DecodedJobInfo, decode_job_info, fb_kv_pairs_to_owned};
+use crate::fb::silo::fb;
 use crate::job_store_shard::JobStoreShardError;
 use crate::retry::RetryPolicy;
 
 /// Cancellation record stored at job_cancelled/<tenant>/<job-id>.
 /// Cancellation is tracked separately from status to allow dequeue to blindly write Running without losing cancellation info.
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone)]
 pub struct JobCancellation {
     /// Timestamp (epoch ms) when cancellation was requested
     pub cancelled_at_ms: i64,
 }
 
 fn codec_error_to_shard_error(e: CodecError) -> JobStoreShardError {
-    JobStoreShardError::Rkyv(e.to_string())
+    JobStoreShardError::Codec(e.to_string())
 }
 
 /// Per-job concurrency limit declaration
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone)]
 pub struct ConcurrencyLimit {
     pub key: String,
     pub max_concurrency: u32,
 }
 
 /// Floating concurrency limit - max concurrency is dynamic and refreshed by workers
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone)]
 pub struct FloatingConcurrencyLimit {
     pub key: String,
     pub default_max_concurrency: u32,
@@ -36,8 +32,7 @@ pub struct FloatingConcurrencyLimit {
 }
 
 /// State of a floating concurrency limit stored in the DB
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone)]
 pub struct FloatingLimitState {
     /// Current max concurrency value in use
     pub current_max_concurrency: u32,
@@ -57,21 +52,8 @@ pub struct FloatingLimitState {
     pub metadata: Vec<(String, String)>,
 }
 
-impl FloatingLimitState {
-    /// Create an owned copy from an archived (zero-copy) view.
-    /// Callers can then mutate whichever fields they need before writing back.
-    pub fn from_archived(archived: &ArchivedFloatingLimitState) -> Self {
-        use rkyv::Deserialize as _;
-        archived
-            .deserialize(&mut rkyv::Infallible)
-            .unwrap_or_else(|_| unreachable!("infallible deserialization for FloatingLimitState"))
-    }
-}
-
 /// Rate limiting algorithm used by Gubernator
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GubernatorAlgorithm {
     TokenBucket,
     LeakyBucket,
@@ -93,8 +75,7 @@ impl GubernatorAlgorithm {
 }
 
 /// Retry policy for rate limit checks when the limit is exceeded
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone)]
 pub struct RateLimitRetryPolicy {
     /// Initial backoff time when rate limited (ms)
     pub initial_backoff_ms: i64,
@@ -118,8 +99,7 @@ impl Default for RateLimitRetryPolicy {
 }
 
 /// Gubernator-based rate limit declaration
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone)]
 pub struct GubernatorRateLimit {
     /// Name identifying this rate limit (for debugging/metrics)
     pub name: String,
@@ -161,8 +141,7 @@ impl GubernatorRateLimit {
 }
 
 /// A unified limit type that can be either a concurrency limit, rate limit, or floating concurrency limit
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone)]
 pub enum Limit {
     /// A concurrency-based limit (slot-based)
     Concurrency(ConcurrencyLimit),
@@ -173,8 +152,7 @@ pub enum Limit {
 }
 
 /// Discriminant for job status kinds
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize, PartialEq, Eq, Copy)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone, PartialEq, Eq, Copy)]
 pub enum JobStatusKind {
     Scheduled,
     Running,
@@ -203,8 +181,7 @@ impl JobStatusKind {
 }
 
 /// Job status with the last change time for secondary indexing
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone)]
 pub struct JobStatus {
     pub kind: JobStatusKind,
     pub changed_at_ms: i64,
@@ -270,7 +247,7 @@ impl JobStatus {
     }
 }
 
-/// Zero-copy view over an archived `JobInfo` backed by owned aligned data.
+/// Zero-copy view over a FlatBuffer `JobInfo` backed by owned data.
 #[derive(Clone)]
 pub struct JobView {
     decoded: DecodedJobInfo,
@@ -287,13 +264,12 @@ impl std::fmt::Debug for JobView {
     }
 }
 
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone)]
 pub struct JobInfo {
     pub id: String,
     pub priority: u8,         // 0..=99, 0 is highest priority and will run first
     pub enqueue_time_ms: i64, // epoch millis
-    pub payload: Vec<u8>,     // MessagePack bytes (opaque to rkyv)
+    pub payload: Vec<u8>,     // MessagePack bytes (opaque to codec)
     pub retry_policy: Option<RetryPolicy>,
     pub metadata: Vec<(String, String)>,
     pub limits: Vec<Limit>, // Ordered list of limits to check before execution
@@ -302,26 +278,30 @@ pub struct JobInfo {
 
 impl JobView {
     /// Validate bytes and construct a zero-copy view.
-    pub fn new(bytes: impl AsRef<[u8]>) -> Result<Self, JobStoreShardError> {
+    pub fn new(bytes: impl Into<bytes::Bytes>) -> Result<Self, JobStoreShardError> {
         // Validate and decode up front; reject invalid data early.
-        let decoded = decode_job_info(bytes.as_ref()).map_err(codec_error_to_shard_error)?;
+        let decoded = decode_job_info(bytes.into()).map_err(codec_error_to_shard_error)?;
         Ok(Self { decoded })
     }
 
+    fn fb(&self) -> fb::JobInfo<'_> {
+        self.decoded.fb()
+    }
+
     pub fn id(&self) -> &str {
-        self.archived().id.as_str()
+        self.fb().id().unwrap_or_default()
     }
     pub fn priority(&self) -> u8 {
-        self.archived().priority
+        self.fb().priority()
     }
     pub fn enqueue_time_ms(&self) -> i64 {
-        self.archived().enqueue_time_ms
+        self.fb().enqueue_time_ms()
     }
     pub fn payload_bytes(&self) -> &[u8] {
-        self.archived().payload.as_ref()
+        self.fb().payload().map(|v| v.bytes()).unwrap_or_default()
     }
     pub fn task_group(&self) -> &str {
-        self.archived().task_group.as_str()
+        self.fb().task_group().unwrap_or_default()
     }
 
     /// Decode the payload from MessagePack bytes into a serde_json::Value for display.
@@ -336,21 +316,15 @@ impl JobView {
         rmp_serde::from_slice(self.payload_bytes())
     }
 
-    /// Accessor to the archived root (validated at construction).
-    fn archived(&self) -> &<JobInfo as Archive>::Archived {
-        self.decoded.archived()
-    }
-
-    /// Return the job's retry policy as a runtime struct, if present, by copying primitive fields from the archived view.
+    /// Return the job's retry policy as a runtime struct, if present.
     pub fn retry_policy(&self) -> Option<RetryPolicy> {
-        let a = self.archived();
-        let pol = a.retry_policy.as_ref()?;
+        let rp = self.fb().retry_policy()?;
         Some(RetryPolicy {
-            retry_count: pol.retry_count,
-            initial_interval_ms: pol.initial_interval_ms,
-            max_interval_ms: pol.max_interval_ms,
-            randomize_interval: pol.randomize_interval,
-            backoff_factor: pol.backoff_factor,
+            retry_count: rp.retry_count(),
+            initial_interval_ms: rp.initial_interval_ms(),
+            max_interval_ms: rp.max_interval_ms(),
+            randomize_interval: rp.randomize_interval(),
+            backoff_factor: rp.backoff_factor(),
         })
     }
 
@@ -367,23 +341,62 @@ impl JobView {
 
     /// Return metadata as owned key/value string pairs
     pub fn metadata(&self) -> Vec<(String, String)> {
-        use rkyv::Deserialize as _;
-        let a = self.archived();
-        a.metadata
-            .deserialize(&mut rkyv::Infallible)
-            .unwrap_or_else(|_| unreachable!("infallible deserialization for metadata"))
+        fb_kv_pairs_to_owned(self.fb().metadata())
     }
 
     /// Return the ordered list of limits (concurrency, rate limits, and floating concurrency limits)
     pub fn limits(&self) -> Vec<Limit> {
-        use rkyv::Deserialize as _;
-        let a = self.archived();
-        a.limits
-            .iter()
-            .map(|lim| {
-                lim.deserialize(&mut rkyv::Infallible)
-                    .unwrap_or_else(|_| unreachable!("infallible deserialization for Limit"))
+        self.fb()
+            .limits()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| match entry.variant_type() {
+                        fb::LimitVariant::ConcurrencyLimitEntry => {
+                            let cl = entry.variant_as_concurrency_limit_entry()?;
+                            Some(Limit::Concurrency(ConcurrencyLimit {
+                                key: cl.key().unwrap_or_default().to_string(),
+                                max_concurrency: cl.max_concurrency(),
+                            }))
+                        }
+                        fb::LimitVariant::RateLimitEntry => {
+                            let rl = entry.variant_as_rate_limit_entry()?;
+                            let rp = rl.retry_policy();
+                            Some(Limit::RateLimit(GubernatorRateLimit {
+                                name: rl.name().unwrap_or_default().to_string(),
+                                unique_key: rl.unique_key().unwrap_or_default().to_string(),
+                                limit: rl.limit(),
+                                duration_ms: rl.duration_ms(),
+                                hits: rl.hits(),
+                                algorithm: if rl.algorithm() == 1 {
+                                    GubernatorAlgorithm::LeakyBucket
+                                } else {
+                                    GubernatorAlgorithm::TokenBucket
+                                },
+                                behavior: rl.behavior(),
+                                retry_policy: rp
+                                    .map(|p| RateLimitRetryPolicy {
+                                        initial_backoff_ms: p.initial_backoff_ms(),
+                                        max_backoff_ms: p.max_backoff_ms(),
+                                        backoff_multiplier: p.backoff_multiplier(),
+                                        max_retries: p.max_retries(),
+                                    })
+                                    .unwrap_or_default(),
+                            }))
+                        }
+                        fb::LimitVariant::FloatingConcurrencyLimitEntry => {
+                            let fl = entry.variant_as_floating_concurrency_limit_entry()?;
+                            Some(Limit::FloatingConcurrency(FloatingConcurrencyLimit {
+                                key: fl.key().unwrap_or_default().to_string(),
+                                default_max_concurrency: fl.default_max_concurrency(),
+                                refresh_interval_ms: fl.refresh_interval_ms(),
+                                metadata: fb_kv_pairs_to_owned(fl.metadata()),
+                            }))
+                        }
+                        _ => None,
+                    })
+                    .collect()
             })
-            .collect()
+            .unwrap_or_default()
     }
 }

@@ -1,8 +1,5 @@
-use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
-
 /// Retry policy for a job's attempts
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-#[archive(check_bytes)]
+#[derive(Debug, Clone)]
 pub struct RetryPolicy {
     pub retry_count: u32,
     pub initial_interval_ms: i64,
