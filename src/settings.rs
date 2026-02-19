@@ -226,6 +226,12 @@ pub struct ServerConfig {
     /// Defaults to 5000ms (5s). Set to 0 to disable statement timeout.
     #[serde(default = "default_statement_timeout_ms")]
     pub statement_timeout_ms: Option<u64>,
+    /// Shared secret for gRPC authentication. When set, all incoming gRPC
+    /// requests must include this token as a Bearer token in the `authorization`
+    /// metadata header. When unset (default), authentication is disabled.
+    /// Supports environment variable expansion, e.g. `${SILO_AUTH_TOKEN}`.
+    #[serde(default)]
+    pub auth_token: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -234,6 +240,7 @@ impl Default for ServerConfig {
             grpc_addr: default_grpc_addr(),
             dev_mode: false,
             statement_timeout_ms: default_statement_timeout_ms(),
+            auth_token: None,
         }
     }
 }
@@ -523,6 +530,7 @@ impl AppConfig {
                 grpc_addr: default_grpc_addr(),
                 dev_mode: false,
                 statement_timeout_ms: default_statement_timeout_ms(),
+                auth_token: None,
             },
             coordination: CoordinationConfig::default(),
             tenancy: TenancyConfig { enabled: false },

@@ -14,7 +14,9 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use futures::future::join_all;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, Endpoint};
+use tonic::{Request, Status, metadata::MetadataValue};
 use tracing::{debug, trace, warn};
 
 use crate::coordination::{Coordinator, ShardOwnerMap, SplitCleanupStatus};
@@ -49,6 +51,9 @@ pub struct ClientConfig {
     /// Base delay for exponential backoff between retries.
     /// Default: 50ms. Actual delays are base * 2^attempt, capped at 16x base.
     pub retry_backoff_base: Duration,
+    /// Shared secret for gRPC authentication. When set, outgoing requests will
+    /// include this token as a `authorization: Bearer <token>` metadata header.
+    pub auth_token: Option<String>,
 }
 
 impl Default for ClientConfig {
@@ -60,6 +65,7 @@ impl Default for ClientConfig {
             keepalive_timeout: Duration::from_secs(5),
             max_retries: 3,
             retry_backoff_base: Duration::from_millis(50),
+            auth_token: None,
         }
     }
 }
@@ -75,6 +81,7 @@ impl ClientConfig {
             keepalive_timeout: Duration::from_secs(3),
             max_retries: 10,
             retry_backoff_base: Duration::from_millis(50),
+            auth_token: None,
         }
     }
 
@@ -88,6 +95,7 @@ impl ClientConfig {
             keepalive_timeout: Duration::from_secs(1),
             max_retries: 3,
             retry_backoff_base: Duration::from_millis(50),
+            auth_token: None,
         }
     }
 
@@ -118,6 +126,33 @@ pub fn ensure_http_scheme(addr: &str) -> String {
     }
 }
 
+/// Client-side gRPC interceptor that injects a Bearer auth token into outgoing requests.
+/// When `token` is `None`, this is a no-op pass-through.
+#[derive(Clone)]
+pub struct AuthInterceptor {
+    token: Option<String>,
+}
+
+impl AuthInterceptor {
+    pub fn new(token: Option<String>) -> Self {
+        Self { token }
+    }
+}
+
+impl tonic::service::Interceptor for AuthInterceptor {
+    fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
+        if let Some(ref token) = self.token {
+            let val: MetadataValue<tonic::metadata::Ascii> =
+                format!("Bearer {}", token).parse().unwrap();
+            req.metadata_mut().insert("authorization", val);
+        }
+        Ok(req)
+    }
+}
+
+/// Type alias for a SiloClient with auth interceptor applied.
+pub type InterceptedSiloClient = SiloClient<InterceptedService<Channel, AuthInterceptor>>;
+
 /// Helper to create a SiloClient with proper timeout and retry configuration.
 ///
 /// This function creates a gRPC client with configurable timeouts and automatic retry logic with exponential backoff. Retries are attempted when the initial connection fails.
@@ -138,7 +173,7 @@ pub fn ensure_http_scheme(addr: &str) -> String {
 pub async fn create_silo_client(
     uri: &str,
     config: &ClientConfig,
-) -> Result<SiloClient<Channel>, ClusterClientError> {
+) -> Result<InterceptedSiloClient, ClusterClientError> {
     let full_uri = ensure_http_scheme(uri);
 
     let endpoint = config
@@ -155,7 +190,8 @@ pub async fn create_silo_client(
 
         match connect_result {
             Ok(Ok(channel)) => {
-                return Ok(SiloClient::new(channel)
+                let interceptor = AuthInterceptor::new(config.auth_token.clone());
+                return Ok(SiloClient::with_interceptor(channel, interceptor)
                     .max_decoding_message_size(128 * 1024 * 1024)
                     .max_encoding_message_size(128 * 1024 * 1024));
             }
@@ -287,7 +323,7 @@ pub struct ClusterClient {
     /// Coordinator for getting shard ownership information
     coordinator: Option<Arc<dyn Coordinator>>,
     /// Cache of gRPC client connections to peer nodes
-    connections: DashMap<String, SiloClient<Channel>>,
+    connections: DashMap<String, InterceptedSiloClient>,
     /// Client configuration for timeouts and connection behavior
     config: ClientConfig,
 }
@@ -313,7 +349,7 @@ impl ClusterClient {
     }
 
     /// Get or create a gRPC client connection to a remote node
-    async fn get_client(&self, addr: &str) -> Result<SiloClient<Channel>, ClusterClientError> {
+    async fn get_client(&self, addr: &str) -> Result<InterceptedSiloClient, ClusterClientError> {
         let full_addr = ensure_http_scheme(addr);
 
         // Check cache first
