@@ -1079,13 +1079,39 @@ async fn do_reimport(
         results[0].error
     );
 
+    let initial_status = results[0].status;
+    let tasks_before = test_helpers::count_task_keys(shard.db()).await;
+    if initial_status == JobStatusKind::Scheduled {
+        assert!(
+            tasks_before >= 1,
+            "expected at least 1 task after initial import of Scheduled job, got {tasks_before}"
+        );
+    }
+
     let results = shard.import_jobs(tenant, vec![reimport]).await.unwrap();
     assert!(
         results[0].success,
         "reimport failed: {:?}",
         results[0].error
     );
-    results[0].status
+
+    let reimport_status = results[0].status;
+    let tasks_after = test_helpers::count_task_keys(shard.db()).await;
+    if reimport_status == JobStatusKind::Scheduled {
+        // Non-terminal reimport: old task removed, new task created
+        assert!(
+            tasks_after >= 1,
+            "expected at least 1 task after non-terminal reimport, got {tasks_after}"
+        );
+    } else {
+        // Terminal reimport: old task removed, no new task created
+        assert_eq!(
+            tasks_after, 0,
+            "expected 0 tasks after terminal reimport, got {tasks_after}"
+        );
+    }
+
+    reimport_status
 }
 
 // =========================================================================

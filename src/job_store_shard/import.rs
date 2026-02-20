@@ -8,9 +8,7 @@ use slatedb::config::WriteOptions;
 use tracing::debug;
 use uuid::Uuid;
 
-use crate::codec::{
-    decode_attempt, decode_concurrency_action, decode_task, encode_attempt, encode_job_info,
-};
+use crate::codec::{decode_attempt, decode_task, encode_attempt, encode_job_info};
 use crate::dst_events::{self, DstEvent};
 use crate::fb::silo::fb;
 use crate::job::{JobInfo, JobStatus, JobStatusKind, JobView, Limit};
@@ -20,11 +18,11 @@ use crate::job_store_shard::helpers::{
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError, LimitTaskParams};
 use crate::keys::{
-    attempt_key, attempt_prefix, concurrency_holders_queue_prefix, concurrency_request_prefix,
-    end_bound, idx_metadata_key, job_cancelled_key, job_info_key, job_status_key,
-    parse_concurrency_holder_key, parse_concurrency_request_key, parse_task_key, task_group_prefix,
+    attempt_key, attempt_prefix, concurrency_holder_key, end_bound, idx_metadata_key,
+    job_cancelled_key, job_info_key, job_status_key, task_key,
 };
 use crate::retry::{RetryPolicy, retries_exhausted};
+use crate::task::Task;
 
 /// Error returned when a job cannot be reimported.
 #[derive(Debug, Clone)]
@@ -504,109 +502,85 @@ impl JobStoreShard {
 
         // === Clean up old scheduling state ===
 
-        // [SILO-REIMP-5] Remove DB queue tasks for this job
+        // [SILO-REIMP-5] Remove DB queue tasks for this job.
+        // Only Scheduled jobs have tasks/concurrency state to clean up.
+        // Failed and Cancelled jobs are already terminal with no pending tasks.
         let task_group = existing_job.task_group().to_string();
-        let task_prefix = task_group_prefix(&task_group);
-        let task_end = end_bound(&task_prefix);
-        let mut task_iter = txn.scan::<Vec<u8>, _>(task_prefix..task_end).await?;
-        let mut matched_task_keys: Vec<Vec<u8>> = Vec::new();
-        let mut old_task_ids: Vec<String> = Vec::new();
-        while let Some(kv) = task_iter.next().await? {
-            if let Some(parsed) = parse_task_key(&kv.key)
-                && parsed.job_id == *job_id
-            {
-                matched_task_keys.push(kv.key.to_vec());
-                // Decode the task value to get the task_id for concurrency cleanup
-                if let Ok(task) = decode_task(&kv.value) {
-                    match &task {
-                        crate::task::Task::RunAttempt { id, .. } => {
-                            old_task_ids.push(id.clone());
-                        }
-                        crate::task::Task::RequestTicket { request_id, .. } => {
-                            old_task_ids.push(request_id.clone());
-                        }
-                        crate::task::Task::CheckRateLimit { task_id, .. } => {
-                            old_task_ids.push(task_id.clone());
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        // Delete matched task keys from DB
-        for key in &matched_task_keys {
-            txn.delete(key)?;
-        }
-
-        // Concurrency cleanup: release holders and delete requests for this job
-        let old_task_id_set: std::collections::HashSet<&str> =
-            old_task_ids.iter().map(|s| s.as_str()).collect();
-        let mut released_holders: Vec<(String, String, String)> = Vec::new(); // (tenant, queue, task_id)
+        let priority = existing_job.priority();
         let stored_limits = existing_job.limits();
+        let mut matched_task_keys: Vec<Vec<u8>> = Vec::new();
+        let mut released_holders: Vec<(String, String, String)> = Vec::new();
 
-        for limit in &stored_limits {
-            let queue = match limit {
-                Limit::Concurrency(cl) => &cl.key,
-                Limit::FloatingConcurrency(fl) => &fl.key,
-                Limit::RateLimit(_) => continue,
+        if old_status.kind == JobStatusKind::Scheduled {
+            // O(1) task key reconstruction from status fields (same pattern as cancel/expedite/lease)
+            let attempt_number = old_status.current_attempt.unwrap_or(1);
+            let start_time_ms = old_status.next_attempt_starts_after_ms.unwrap_or(0);
+            let computed_key =
+                task_key(&task_group, start_time_ms, priority, job_id, attempt_number);
+            let task_found = match txn.get(&computed_key).await? {
+                Some(raw) => Some((computed_key, raw)),
+                None => {
+                    // Fallback: try with time=0 (immediate scheduling case)
+                    let zero_key = task_key(&task_group, 0, priority, job_id, attempt_number);
+                    txn.get(&zero_key).await?.map(|raw| (zero_key, raw))
+                }
             };
 
-            // Scan holders for this queue, find those belonging to our old tasks
-            let holder_start = concurrency_holders_queue_prefix(tenant, queue);
-            let holder_end = end_bound(&holder_start);
-            let mut holder_iter = txn.scan::<Vec<u8>, _>(holder_start..holder_end).await?;
-            while let Some(kv) = holder_iter.next().await? {
-                if let Some(parsed) = parse_concurrency_holder_key(&kv.key)
-                    && old_task_id_set.contains(parsed.task_id.as_str())
-                {
-                    txn.delete(&kv.key)?;
-                    self.concurrency
-                        .counts()
-                        .atomic_release(tenant, queue, &parsed.task_id);
-                    released_holders.push((
-                        tenant.to_string(),
-                        queue.clone(),
-                        parsed.task_id.clone(),
-                    ));
-                }
-            }
+            if let Some((found_key, task_raw)) = task_found {
+                let decoded = decode_task(&task_raw).map_err(|e| {
+                    JobStoreShardError::Codec(format!("reimport task decode: {e}"))
+                })?;
 
-            // Scan requests for this queue, find those for this job
-            let req_start = concurrency_request_prefix(tenant, queue);
-            let req_end = end_bound(&req_start);
-            let mut req_iter = txn.scan::<Vec<u8>, _>(req_start..req_end).await?;
-            while let Some(kv) = req_iter.next().await? {
-                if let Some(_parsed) = parse_concurrency_request_key(&kv.key) {
-                    // Check if the request is for this job by decoding the action
-                    if let Ok(decoded) = decode_concurrency_action(kv.value.clone()) {
-                        let a = decoded.fb();
-                        if let Some(et) = a.variant_as_enqueue_task()
-                            && et.job_id().unwrap_or_default() == job_id
-                        {
-                            txn.delete(&kv.key)?;
+                txn.delete(&found_key)?;
+                matched_task_keys.push(found_key);
+
+                match decoded {
+                    Task::RunAttempt {
+                        id: tid,
+                        held_queues,
+                        ..
+                    } => {
+                        // Delete concurrency holders for each held queue
+                        for queue in &held_queues {
+                            let holder_key = concurrency_holder_key(tenant, queue, &tid);
+                            txn.delete(&holder_key)?;
+                            self.concurrency
+                                .counts()
+                                .atomic_release(tenant, queue, &tid);
+                            released_holders.push((
+                                tenant.to_string(),
+                                queue.clone(),
+                                tid.clone(),
+                            ));
                         }
                     }
+                    Task::RequestTicket { .. } => {
+                        // FutureRequestTaskWritten case: deleting the task is sufficient.
+                    }
+                    _ => {}
                 }
+            } else {
+                // No task found - TicketRequested case (request record exists but no task
+                // in DB queue). Delete concurrency requests for this job.
+                self.delete_concurrency_requests_for_job(&txn, tenant, job_id, &stored_limits)
+                    .await?;
             }
         }
 
-        // === Update status ===
-        {
-            let mut writer = TxnWriter(&txn);
-            self.set_job_status_with_index(&mut writer, tenant, job_id, new_job_status)
-                .await?;
-        }
+        // === Update status, scheduling state, and counters ===
+        let mut writer = TxnWriter(&txn);
 
-        // === Clean up cancelled key ===
-        // cancel_job writes a separate cancelled key that blocks lease creation.
-        // Always remove it on reimport so it doesn't block future dequeue or
-        // leave stale state on terminal jobs.
+        self.set_job_status_with_index(&mut writer, tenant, job_id, new_job_status)
+            .await?;
+
+        // Clean up cancelled key: cancel_job writes a separate cancelled key that blocks
+        // lease creation. Always remove it on reimport so it doesn't block future dequeue
+        // or leave stale state on terminal jobs.
         if old_status.kind == JobStatusKind::Cancelled {
             txn.delete(job_cancelled_key(tenant, job_id))?;
         }
 
-        // === Create new scheduling state if non-terminal ===
+        // Create new scheduling state if non-terminal
         let mut grants = Vec::new();
         if !is_terminal {
             let next_attempt = total_attempts + 1;
@@ -616,7 +590,6 @@ impl JobStoreShard {
             // [SILO-REIMP-9] new task in DB queue, old tasks for j removed
             // [SILO-REIMP-CONC-1/2] concurrency granted path
             // [SILO-REIMP-CONC-3/4] concurrency queued path
-            let mut writer = TxnWriter(&txn);
             grants = self
                 .enqueue_limit_task_at_index(
                     &mut writer,
@@ -628,7 +601,7 @@ impl JobStoreShard {
                         relative_attempt_number: next_attempt,
                         limit_index: 0,
                         limits: &stored_limits,
-                        priority: existing_job.priority(),
+                        priority,
                         start_at_ms: effective_start_at_ms,
                         now_ms,
                         held_queues: Vec::new(),
@@ -639,18 +612,15 @@ impl JobStoreShard {
         }
         // [SILO-REIMP-7] If terminal: status is terminal, no new tasks
 
-        // === Update counters ===
-        {
-            let mut writer = TxnWriter(&txn);
-            let was_terminal = old_status.is_terminal();
-            if !was_terminal && is_terminal {
-                self.increment_completed_jobs_counter(&mut writer)?;
-            }
-            if was_terminal && !is_terminal {
-                self.decrement_completed_jobs_counter(&mut writer)?;
-            }
-            // total_jobs counter unchanged (job already counted)
+        // Update counters
+        let was_terminal = old_status.is_terminal();
+        if !was_terminal && is_terminal {
+            self.increment_completed_jobs_counter(&mut writer)?;
         }
+        if was_terminal && !is_terminal {
+            self.decrement_completed_jobs_counter(&mut writer)?;
+        }
+        // total_jobs counter unchanged (job already counted)
 
         // === DST events, commit ===
         let write_op = if !is_terminal {
