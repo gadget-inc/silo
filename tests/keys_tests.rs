@@ -68,6 +68,29 @@ fn test_concurrency_request_key_roundtrip() {
 }
 
 #[test]
+fn test_concurrency_request_key_old_format_fallback() {
+    // Construct a key in the old 5-element format: (tenant, queue, start_time_ms, priority, request_id)
+    let old_request_id = "550e8400-e29b-41d4-a716-446655440000";
+    let mut key = vec![0x08u8]; // CONCURRENCY_REQUEST prefix
+    key.extend(
+        storekey::encode_vec(&("tenant1", "queue1", 5000u64, 25u8, old_request_id))
+            .expect("encode should succeed"),
+    );
+
+    let parsed = parse_concurrency_request_key(&key).unwrap();
+    assert_eq!(parsed.tenant, "tenant1");
+    assert_eq!(parsed.queue, "queue1");
+    assert_eq!(parsed.start_time_ms, 5000);
+    assert_eq!(parsed.priority, 25);
+    // Old format: job_id is empty, suffix contains the original request_id
+    assert_eq!(parsed.job_id, "");
+    assert_eq!(parsed.attempt_number, 0);
+    assert_eq!(parsed.suffix, old_request_id);
+    // request_id() returns the original UUID, not ":0:<uuid>"
+    assert_eq!(parsed.request_id(), old_request_id);
+}
+
+#[test]
 fn test_concurrency_holder_key_roundtrip() {
     let key = concurrency_holder_key("tenant1", "queue1", "task123");
     let parsed = parse_concurrency_holder_key(&key).unwrap();

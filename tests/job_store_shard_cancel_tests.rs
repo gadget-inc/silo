@@ -830,6 +830,83 @@ async fn cancel_scheduled_job_with_concurrency_removes_request() {
     });
 }
 
+/// Test that cancel with start_at_ms=0 correctly finds and deletes concurrency requests.
+/// When start_at_ms <= 0, the status stores next_attempt_starts_after_ms = now_ms,
+/// but the concurrency request key uses start_time_ms = 0 (via .max(0)).
+/// The cancel path must fall back to scanning with start_time_ms=0 to find the request.
+#[tokio::test]
+async fn cancel_concurrency_request_with_zero_start_time() {
+    with_timeout!(20000, {
+        let (_tmp, shard) = open_temp_shard().await;
+
+        let queue = "q-zero-start".to_string();
+
+        // First job takes the slot (use start_at_ms=0)
+        let _j1 = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                0, // start_at_ms = 0
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+                vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue.clone(),
+                    max_concurrency: 1,
+                })],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue j1");
+        let tasks1 = shard.dequeue("w1", "default", 1).await.expect("deq1").tasks;
+        assert_eq!(tasks1.len(), 1);
+
+        // Second job with start_at_ms=0 queues a request (slot is full)
+        let j2 = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                0, // start_at_ms = 0
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+                vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue.clone(),
+                    max_concurrency: 1,
+                })],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue j2");
+
+        // Cancel j2 - must find and delete the concurrency request via fallback scan
+        shard.cancel_job("-", &j2).await.expect("cancel j2");
+
+        let status = shard
+            .get_job_status("-", &j2)
+            .await
+            .expect("get status")
+            .expect("exists");
+        assert_eq!(status.kind, JobStatusKind::Cancelled);
+
+        // Complete j1 - should NOT grant to cancelled j2
+        let t1 = tasks1[0].attempt().task_id().to_string();
+        shard
+            .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
+            .await
+            .expect("report1");
+
+        // No tasks should be ready (j2's request was deleted by cancel)
+        let tasks2 = shard.dequeue("w2", "default", 1).await.expect("deq2").tasks;
+        assert!(
+            tasks2.is_empty(),
+            "cancelled job's request should not be granted after start_time=0 fallback"
+        );
+    });
+}
+
 /// Test that cancel eagerly removes RunAttempt tasks from the queue.
 /// Dequeue only sees the non-cancelled job.
 

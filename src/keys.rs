@@ -405,8 +405,14 @@ pub struct ParsedConcurrencyRequestKey {
 
 impl ParsedConcurrencyRequestKey {
     /// Compose the request_id used downstream (holder keys, task IDs).
+    /// For old-format keys (where job_id is empty), returns the suffix directly
+    /// since it contains the original UUID request_id.
     pub fn request_id(&self) -> String {
-        format!("{}:{}:{}", self.job_id, self.attempt_number, self.suffix)
+        if self.job_id.is_empty() {
+            self.suffix.clone()
+        } else {
+            format!("{}:{}:{}", self.job_id, self.attempt_number, self.suffix)
+        }
     }
 }
 
