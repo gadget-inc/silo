@@ -894,12 +894,14 @@ pred cancelJob[j: Job, t: Time, tnext: Time] {
     -- Post: Status stays the same (cancellation is orthogonal to status)
     statusAt[j, tnext] = statusAt[j, t]
 
-    -- [SILO-CXL-3] Eagerly remove tasks for this job from DB queue and buffer
+    -- [SILO-CXL-3] Eagerly remove tasks for this job from DB queue
+    -- Buffer is NOT cleaned atomically: evict_keys is post-commit and best-effort,
+    -- so a stale copy may remain if fillBuffer races with cancel.
     all tid: TaskId | dbQueuedAt[tid, t] = j implies no dbQueuedAt[tid, tnext]
     all tid: TaskId | dbQueuedAt[tid, t] != j implies dbQueuedAt[tid, tnext] = dbQueuedAt[tid, t]
 
-    all tid: TaskId | bufferedAt[tid, t] = j implies no bufferedAt[tid, tnext]
-    all tid: TaskId | bufferedAt[tid, t] != j implies bufferedAt[tid, tnext] = bufferedAt[tid, t]
+    -- Buffer unchanged (evict_keys is post-commit best-effort, may miss stale entries)
+    all tid: TaskId | bufferedAt[tid, tnext] = bufferedAt[tid, t]
 
     -- Leases unchanged - worker will discover cancellation on heartbeat
     all tid: TaskId | {
@@ -916,9 +918,9 @@ pred cancelJob[j: Job, t: Time, tnext: Time] {
     attemptExistsAt[tnext] = attemptExistsAt[t]
     all a: attemptExistsAt[t] | attemptStatusAt[a, tnext] = attemptStatusAt[a, t]
 
-    -- Concurrency cleanup: release holders for cancelled job's tasks (being removed from queue)
+    -- Concurrency cleanup: release holders for cancelled job's tasks (removed from DB queue)
     -- and delete requests for cancelled job
-    all q: Queue | holdersAt[q, tnext] = { tid: holdersAt[q, t] | dbQueuedAt[tid, t] != j and bufferedAt[tid, t] != j }
+    all q: Queue | holdersAt[q, tnext] = { tid: holdersAt[q, t] | dbQueuedAt[tid, t] != j }
     all q: Queue | requestTasksAt[q, tnext] = { tid: requestTasksAt[q, t] |
         no r: TicketRequest | r.tr_job = j and r.tr_queue = q and r.tr_task = tid and r.tr_time = t }
 }
@@ -1469,9 +1471,10 @@ pred examplePermanentFailureWithRetry {
     some j: Job | j in jobExistsAt[last] and statusAt[j, last] = Failed and #{a: attemptExistsAt[last] | attemptJob[a] = j} > 1
 }
 
-/** 
+/**
  * Scenario: Stale Buffer
- * Job is cancelled while task is in buffer.
+ * Job is cancelled while task is in buffer. Cancel removes from DB queue
+ * but buffer eviction is best-effort, so a stale copy may remain.
  */
 pred exampleStaleBuffer {
     some tid: TaskId, j: Job, t: Time | {
@@ -1482,7 +1485,7 @@ pred exampleStaleBuffer {
 
 /**
  * Scenario: Cancellation with eager cleanup
- * Job is cancelled, tasks are immediately removed from DB queue and buffer.
+ * Job is cancelled, tasks are immediately removed from DB queue.
  * No dequeue cleanup step needed.
  */
 pred exampleCancellationEagerCleanup {
@@ -1497,7 +1500,7 @@ pred exampleCancellationEagerCleanup {
         -- t2: job cancelled, task eagerly removed from DB queue
         isCancelledAt[j, t2]
         no dbQueuedAt[tid, t2]    -- Eagerly cleaned up by cancelJob
-        no bufferedAt[tid, t2]    -- Eagerly cleaned up by cancelJob
+        -- Note: buffer may or may not still have a stale copy (evict_keys is best-effort)
         no l: Lease | l.ljob = j and l.ltime = t2  -- No lease created
         statusAt[j, t2] = Scheduled  -- Status never changed to Running
     }
