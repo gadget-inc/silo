@@ -1,11 +1,11 @@
 use silo::keys::{
-    attempt_key, attempt_prefix, concurrency_holder_key, concurrency_request_key, end_bound,
-    floating_limit_state_key, idx_metadata_key, idx_status_time_key, idx_status_time_prefix,
-    job_cancelled_key, job_info_key, job_info_prefix, job_status_key, leased_task_key,
-    parse_attempt_key, parse_concurrency_holder_key, parse_concurrency_request_key,
-    parse_floating_limit_key, parse_job_cancelled_key, parse_job_info_key, parse_job_status_key,
-    parse_lease_key, parse_metadata_index_key, parse_status_time_index_key, parse_task_key,
-    task_group_prefix, task_key,
+    attempt_key, attempt_prefix, concurrency_holder_key, concurrency_request_job_prefix,
+    concurrency_request_key, end_bound, floating_limit_state_key, idx_metadata_key,
+    idx_status_time_key, idx_status_time_prefix, job_cancelled_key, job_info_key, job_info_prefix,
+    job_status_key, leased_task_key, parse_attempt_key, parse_concurrency_holder_key,
+    parse_concurrency_request_key, parse_floating_limit_key, parse_job_cancelled_key,
+    parse_job_info_key, parse_job_status_key, parse_lease_key, parse_metadata_index_key,
+    parse_status_time_index_key, parse_task_key, task_group_prefix, task_key,
 };
 
 #[test]
@@ -55,13 +55,16 @@ fn test_status_time_index_ordering() {
 
 #[test]
 fn test_concurrency_request_key_roundtrip() {
-    let key = concurrency_request_key("tenant1", "queue1", 5000, 25, "req123");
+    let key = concurrency_request_key("tenant1", "queue1", 5000, 25, "job42", 3, "a1b2c3d4");
     let parsed = parse_concurrency_request_key(&key).unwrap();
     assert_eq!(parsed.tenant, "tenant1");
     assert_eq!(parsed.queue, "queue1");
     assert_eq!(parsed.start_time_ms, 5000);
     assert_eq!(parsed.priority, 25);
-    assert_eq!(parsed.request_id, "req123");
+    assert_eq!(parsed.job_id, "job42");
+    assert_eq!(parsed.attempt_number, 3);
+    assert_eq!(parsed.suffix, "a1b2c3d4");
+    assert_eq!(parsed.request_id(), "job42:3:a1b2c3d4");
 }
 
 #[test]
@@ -348,15 +351,46 @@ fn test_special_characters_comprehensive() {
 
 #[test]
 fn test_concurrency_request_ordering() {
-    // Requests should sort by start_time, then priority
-    let key1 = concurrency_request_key("t", "q", 1000, 10, "req1");
-    let key2 = concurrency_request_key("t", "q", 2000, 10, "req2");
-    let key3 = concurrency_request_key("t", "q", 1000, 20, "req3");
+    // Requests should sort by start_time, then priority, then job_id, then attempt, then suffix
+    let key1 = concurrency_request_key("t", "q", 1000, 10, "job1", 1, "aaaa");
+    let key2 = concurrency_request_key("t", "q", 2000, 10, "job2", 1, "bbbb");
+    let key3 = concurrency_request_key("t", "q", 1000, 20, "job3", 1, "cccc");
 
     // Earlier time comes first
     assert!(key1 < key2);
     // Same time, lower priority comes first
     assert!(key1 < key3);
+}
+
+#[test]
+fn test_concurrency_request_job_prefix_scanning() {
+    // Keys for the same job should share a job prefix
+    let key1 = concurrency_request_key("t", "q", 1000, 10, "job1", 1, "aaaa0000");
+    let key2 = concurrency_request_key("t", "q", 1000, 10, "job1", 1, "bbbb1111");
+    let prefix = concurrency_request_job_prefix("t", "q", 1000, 10, "job1", 1);
+
+    assert!(
+        key1.starts_with(&prefix),
+        "key1 should start with job prefix"
+    );
+    assert!(
+        key2.starts_with(&prefix),
+        "key2 should start with job prefix"
+    );
+
+    // Different job should NOT match
+    let key3 = concurrency_request_key("t", "q", 1000, 10, "job2", 1, "cccc2222");
+    assert!(
+        !key3.starts_with(&prefix),
+        "key3 (different job) should NOT start with job1 prefix"
+    );
+
+    // Different attempt should NOT match
+    let key4 = concurrency_request_key("t", "q", 1000, 10, "job1", 2, "dddd3333");
+    assert!(
+        !key4.starts_with(&prefix),
+        "key4 (different attempt) should NOT start with attempt 1 prefix"
+    );
 }
 
 #[test]

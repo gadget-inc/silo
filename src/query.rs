@@ -1214,21 +1214,27 @@ impl Scan for QueuesScanner {
                         {
                             continue;
                         }
-                        let job_id = if let Ok(action) =
-                            crate::codec::decode_concurrency_action(kv.value.clone())
-                        {
-                            action
-                                .fb()
-                                .variant_as_enqueue_task()
-                                .and_then(|et| et.job_id().map(|s| s.to_string()))
+                        let job_id = if parsed.job_id.is_empty() {
+                            // Old key format: job_id not in key, decode from value
+                            if let Ok(action) =
+                                crate::codec::decode_concurrency_action(kv.value.clone())
+                            {
+                                action
+                                    .fb()
+                                    .variant_as_enqueue_task()
+                                    .and_then(|et| et.job_id().map(|s| s.to_string()))
+                            } else {
+                                None
+                            }
                         } else {
-                            None
+                            Some(parsed.job_id.clone())
                         };
+                        let task_id = parsed.request_id();
                         entries.push(QueueEntry {
                             tenant: parsed.tenant,
                             queue_name: parsed.queue,
                             entry_type: "requester".to_string(),
-                            task_id: parsed.request_id,
+                            task_id,
                             job_id,
                             priority: Some(parsed.priority),
                             timestamp_ms: parsed.start_time_ms as i64,
