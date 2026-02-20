@@ -47,6 +47,22 @@ processes:
       restart: always
       backoff_seconds: 1
 
+  # Toxiproxy server for network fault injection testing
+  toxiproxy:
+    command: toxiproxy-server -host 127.0.0.1 -port 8474 -config $TOXIPROXY_CONFIG
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        port: 8474
+        path: /version
+      initial_delay_seconds: 1
+      period_seconds: 2
+    shutdown:
+      timeout_seconds: 1
+    availability:
+      restart: always
+      backoff_seconds: 1
+
   # Silo instance 1 - watchexec restarts cargo run on source changes
   silo-1:
     command: |
