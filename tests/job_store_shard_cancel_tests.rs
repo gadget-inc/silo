@@ -77,15 +77,14 @@ async fn cancel_scheduled_job_sets_cancelled_and_removes_task() {
             "job should be marked as cancelled"
         );
 
-        // Task is still in DB queue (lazy cleanup), but will be cleaned up on dequeue
-        // The broker buffer might have it, so dequeue will skip and delete it
-        let task_still_in_db = first_task_kv(shard.db()).await;
+        // Task should be eagerly removed from DB queue by cancel (not lazily on dequeue)
+        let none_left = first_task_kv(shard.db()).await;
         assert!(
-            task_still_in_db.is_some(),
-            "task should still be in DB (lazy cleanup)"
+            none_left.is_none(),
+            "task should be removed from queue immediately by cancel"
         );
 
-        // Dequeue should skip the cancelled task and clean it up
+        // Dequeue should return empty (no tasks remain)
         let dequeued = shard
             .dequeue("w1", "default", 10)
             .await
@@ -93,14 +92,65 @@ async fn cancel_scheduled_job_sets_cancelled_and_removes_task() {
             .tasks;
         assert!(
             dequeued.is_empty(),
-            "dequeue should return empty for cancelled job"
+            "dequeue should return empty after cancel"
         );
+    });
+}
 
-        // Now task should be removed from queue
-        let none_left = first_task_kv(shard.db()).await;
-        assert!(
-            none_left.is_none(),
-            "task should be removed from queue after dequeue"
+/// Cancel preserves scheduling fields (current_attempt, next_attempt_starts_after_ms)
+/// in the Cancelled status so task keys can always be reconstructed O(1).
+
+#[tokio::test]
+async fn cancel_preserves_scheduling_fields_in_status() {
+    with_timeout!(20000, {
+        let (_tmp, shard) = open_temp_shard().await;
+
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
+        let priority = 10u8;
+        let now = now_ms();
+
+        let job_id = shard
+            .enqueue(
+                "-",
+                None,
+                priority,
+                now,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+
+        // Get the scheduled status to see original scheduling fields
+        let status_before = shard
+            .get_job_status("-", &job_id)
+            .await
+            .expect("get status")
+            .expect("exists");
+        assert_eq!(status_before.kind, JobStatusKind::Scheduled);
+        let original_attempt = status_before.current_attempt;
+        let original_starts_after = status_before.next_attempt_starts_after_ms;
+
+        // Cancel the job
+        shard.cancel_job("-", &job_id).await.expect("cancel_job");
+
+        // Verify status is Cancelled with scheduling fields preserved
+        let status_after = shard
+            .get_job_status("-", &job_id)
+            .await
+            .expect("get status")
+            .expect("exists");
+        assert_eq!(status_after.kind, JobStatusKind::Cancelled);
+        assert_eq!(
+            status_after.current_attempt, original_attempt,
+            "current_attempt should be preserved in Cancelled status"
+        );
+        assert_eq!(
+            status_after.next_attempt_starts_after_ms, original_starts_after,
+            "next_attempt_starts_after_ms should be preserved in Cancelled status"
         );
     });
 }
@@ -702,7 +752,8 @@ async fn delete_cancelled_job_succeeds() {
     });
 }
 
-/// Cancel job with concurrency limits removes from request queue
+/// Cancel job with concurrency limits eagerly removes request from queue.
+/// When the slot opens, there's nothing to grant.
 
 #[tokio::test]
 async fn cancel_scheduled_job_with_concurrency_removes_request() {
@@ -779,11 +830,11 @@ async fn cancel_scheduled_job_with_concurrency_removes_request() {
     });
 }
 
-/// Test that dequeue skips cancelled jobs and cleans up their tasks
-/// This specifically tests the RunAttempt task path
+/// Test that cancel eagerly removes RunAttempt tasks from the queue.
+/// Dequeue only sees the non-cancelled job.
 
 #[tokio::test]
-async fn dequeue_skips_cancelled_run_attempt_tasks() {
+async fn cancel_eagerly_removes_run_attempt_tasks() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
@@ -820,10 +871,16 @@ async fn dequeue_skips_cancelled_run_attempt_tasks() {
             .await
             .expect("enqueue j2");
 
-        // Cancel j1
+        // Both tasks should be in the queue
+        assert_eq!(count_task_keys(shard.db()).await, 2);
+
+        // Cancel j1 - should eagerly remove its task
         shard.cancel_job("-", &j1).await.expect("cancel j1");
 
-        // Dequeue should skip j1 and return j2
+        // Only j2's task should remain
+        assert_eq!(count_task_keys(shard.db()).await, 1);
+
+        // Dequeue returns j2 only
         let tasks = shard
             .dequeue("w1", "default", 10)
             .await
@@ -835,26 +892,14 @@ async fn dequeue_skips_cancelled_run_attempt_tasks() {
             j2,
             "should return j2, not cancelled j1"
         );
-
-        // j1's task should have been cleaned up from the DB
-        // Check that no task keys contain j1's id
-        let task_for_j1 = first_task_kv(shard.db()).await;
-        // If there's a task, it shouldn't be for j1 (j2 was already dequeued so should be leased)
-        if let Some((task_key, _value)) = task_for_j1 {
-            let parsed = silo::keys::parse_task_key(&task_key).expect("parse task key");
-            assert!(
-                parsed.job_id != j1,
-                "j1's task should be cleaned up, found task for job: {}",
-                parsed.job_id
-            );
-        }
     });
 }
 
-/// Test that dequeue skips cancelled RequestTicket tasks
+/// Test that cancel eagerly removes RequestTicket tasks from the queue.
+/// When the slot opens, j3 gets granted instead of cancelled j2.
 
 #[tokio::test]
-async fn dequeue_skips_cancelled_request_ticket_tasks() {
+async fn cancel_eagerly_removes_request_ticket_tasks() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
@@ -921,7 +966,7 @@ async fn dequeue_skips_cancelled_request_ticket_tasks() {
             .await
             .expect("enqueue j3");
 
-        // Cancel j2
+        // Cancel j2 - should eagerly remove its RequestTicket task
         shard.cancel_job("-", &j2).await.expect("cancel j2");
 
         // Complete j1 to release the slot
@@ -934,7 +979,7 @@ async fn dequeue_skips_cancelled_request_ticket_tasks() {
         // Wait for the future time to pass
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-        // Dequeue should skip j2's RequestTicket and process j3's
+        // Dequeue should return j3 (j2's task was deleted by cancel)
         let tasks = shard
             .dequeue("w2", "default", 10)
             .await
@@ -948,7 +993,7 @@ async fn dequeue_skips_cancelled_request_ticket_tasks() {
     });
 }
 
-/// Test that grant-on-release skips multiple cancelled requests to find a valid one
+/// Test that cancel eagerly removes requests, so grant-on-release finds valid requests directly
 
 #[tokio::test]
 async fn grant_on_release_skips_multiple_cancelled_requests() {
@@ -1075,7 +1120,7 @@ async fn grant_on_release_skips_multiple_cancelled_requests() {
     });
 }
 
-/// Test that cancellation check on dequeue doesn't interfere with normal operation
+/// Test that dequeue works normally when no jobs are cancelled
 
 #[tokio::test]
 async fn dequeue_works_normally_without_cancellation() {
@@ -1125,10 +1170,11 @@ async fn dequeue_works_normally_without_cancellation() {
     });
 }
 
-/// Test that cancelled requests are cleaned up from the request queue
+/// Test that cancel eagerly cleans up concurrency requests from the request queue.
+/// The request is deleted at cancel time, not lazily during grant-next.
 
 #[tokio::test]
-async fn cancelled_requests_are_cleaned_up_on_grant() {
+async fn cancel_eagerly_cleans_up_concurrency_requests() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
 
@@ -1180,28 +1226,14 @@ async fn cancelled_requests_are_cleaned_up_on_grant() {
         let requests_before = first_concurrency_request_kv(shard.db()).await;
         assert!(requests_before.is_some(), "request should exist");
 
-        // Cancel j2
+        // Cancel j2 - should eagerly delete the request
         shard.cancel_job("-", &j2).await.expect("cancel j2");
 
-        // Request still exists (lazy cleanup)
+        // Request should be gone immediately after cancel (eager cleanup)
         let requests_after_cancel = first_concurrency_request_kv(shard.db()).await;
         assert!(
-            requests_after_cancel.is_some(),
-            "request should still exist before release"
-        );
-
-        // Complete j1 to trigger grant-next (which should skip and delete j2's request)
-        let t1_id = t1[0].attempt().task_id().to_string();
-        shard
-            .report_attempt_outcome(&t1_id, AttemptOutcome::Success { result: vec![] })
-            .await
-            .expect("report j1 success");
-
-        // Now request should be cleaned up
-        let requests_after_release = first_concurrency_request_kv(shard.db()).await;
-        assert!(
-            requests_after_release.is_none(),
-            "cancelled request should be cleaned up after release"
+            requests_after_cancel.is_none(),
+            "request should be deleted immediately by cancel"
         );
     });
 }

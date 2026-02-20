@@ -17,14 +17,13 @@
 //!
 //! # Cancellation Semantics
 //!
-//! - Requests for cancelled jobs are skipped during grant_next.
-//!   When release_and_grant_next scans for the next request to grant, it checks if the job is cancelled and deletes the request without granting.
+//! - When a job is cancelled, cancel_job eagerly deletes any pending requests and
+//!   releases holders for tasks in the queue. This avoids relying on lazy cleanup.
 //!
-//! - Requests for terminal jobs (Succeeded/Failed/Cancelled) are also skipped during grant_next.
-//!   This handles the case where a job succeeds via one attempt while a pending concurrency request from a restart or retry is still in the DB.
-//!
-//! - Holders for cancelled tasks are released at dequeue cleanup.
-//!   When dequeue encounters a cancelled job's task, it releases any held tickets.
+//! - Requests for terminal jobs (Succeeded/Failed/Cancelled) are skipped during grant_next.
+//!   This handles the case where a job succeeds via one attempt while a pending concurrency
+//!   request from a restart or retry is still in the DB. Since Cancelled is terminal,
+//!   this also catches any stale cancelled requests.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -41,8 +40,8 @@ use crate::job::{ConcurrencyLimit, JobView};
 use crate::job_store_shard::helpers::decode_job_status_owned;
 use crate::keys::{
     concurrency_counts_key, concurrency_holder_key, concurrency_holders_queue_prefix,
-    concurrency_request_key, concurrency_request_prefix, end_bound, job_cancelled_key,
-    job_status_key, parse_concurrency_holder_key, parse_concurrency_request_key, task_key,
+    concurrency_request_key, concurrency_request_prefix, end_bound, job_status_key,
+    parse_concurrency_holder_key, parse_concurrency_request_key, task_key,
 };
 use crate::shard_range::ShardRange;
 use crate::task::{ConcurrencyAction, HolderRecord, Task};
@@ -619,22 +618,11 @@ impl ConcurrencyManager {
                 let relative_attempt_number = et.relative_attempt_number();
                 let task_group_str = et.task_group().unwrap_or_default();
 
-                // [SILO-GRANT-CXL] Check if job is cancelled - if so, delete request and continue
-                let cancelled_key = job_cancelled_key(tenant, job_id_str);
-                let is_cancelled = db.get(&cancelled_key).await?.is_some();
+                // Note: No cancelled check here. Cancelled jobs' requests are eagerly removed
+                // by cancel_job. The terminal status check below catches any stale requests
+                // since Cancelled is a terminal status.
 
-                if is_cancelled {
-                    // [SILO-GRANT-CXL-2] Delete the cancelled request without granting
-                    batch.delete(&kv.key);
-                    tracing::debug!(
-                        job_id = %job_id_str,
-                        queue = %queue,
-                        "grant_next: skipping cancelled job request"
-                    );
-                    continue;
-                }
-
-                // Check if job has already reached a terminal state (Succeeded/Failed) -
+                // Check if job has already reached a terminal state (Succeeded/Failed/Cancelled) -
                 // if so, delete the stale request without granting. This can happen when
                 // a job succeeds via one attempt while a pending concurrency request from
                 // a restart or retry is still in the DB.

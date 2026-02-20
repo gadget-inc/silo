@@ -859,7 +859,7 @@ async fn grpc_get_job_next_attempt_after_retry() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Test that cancelled jobs do not have next_attempt_starts_after_ms
+/// Test that cancelled jobs preserve next_attempt_starts_after_ms (for O(1) task key reconstruction)
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_get_job_next_attempt_cancelled() -> anyhow::Result<()> {
     let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
@@ -908,7 +908,7 @@ async fn grpc_get_job_next_attempt_cancelled() -> anyhow::Result<()> {
             })
             .await?;
 
-        // Cancelled job should NOT have next_attempt_starts_after_ms
+        // Cancelled job preserves scheduling fields for O(1) task key reconstruction
         let cancelled_job = client
             .get_job(GetJobRequest {
                 shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
@@ -920,9 +920,10 @@ async fn grpc_get_job_next_attempt_cancelled() -> anyhow::Result<()> {
             .into_inner();
 
         assert_eq!(cancelled_job.status, JobStatus::Cancelled as i32);
+        // Cancelled status preserves scheduling fields for O(1) task key reconstruction
         assert!(
-            cancelled_job.next_attempt_starts_after_ms.is_none(),
-            "cancelled job should NOT have next_attempt_starts_after_ms"
+            cancelled_job.next_attempt_starts_after_ms.is_some(),
+            "cancelled job should preserve next_attempt_starts_after_ms"
         );
 
         shutdown_server(shutdown_tx, server).await?;
