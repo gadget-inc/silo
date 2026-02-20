@@ -363,13 +363,9 @@ impl JobStoreShard {
         state.processed_internal = true;
         let tenant = tenant.to_string();
 
-        // [SILO-DEQ-CXL] Check if job is cancelled - if so, skip and clean up task
-        if self.is_job_cancelled(&tenant, job_id).await? {
-            state.batch.delete(task_key);
-            state.ack_deleted(task_key);
-            tracing::debug!(job_id = %job_id, "dequeue: skipping cancelled job RequestTicket");
-            return Ok(());
-        }
+        // Note: No cancelled check here. Cancelled jobs' tasks are eagerly removed
+        // by cancel_job. If a stale task appears (e.g., retry after cancel), it will
+        // be processed normally and the worker discovers cancellation via heartbeat.
 
         // Load job info
         let job_key = job_info_key(&tenant, job_id);
@@ -673,38 +669,9 @@ impl JobStoreShard {
             return Ok(());
         };
 
-        // [SILO-DEQ-CXL] Check if job is cancelled - if so, skip and clean up task
-        if self.is_job_cancelled(tenant, job_id).await? {
-            state.batch.delete(task_key);
-            state.ack_deleted(task_key);
-
-            // [SILO-DEQ-CXL-REL] Release any held concurrency tickets
-            // This is required to maintain invariant: holders can only exist for active tasks
-            let held_queues: Vec<String> = ra
-                .held_queues()
-                .map(|v| v.iter().map(|s| s.to_string()).collect())
-                .unwrap_or_default();
-            if !held_queues.is_empty() {
-                // release_and_grant_next updates in-memory atomically before returning
-                // Track rollback info in case DB write fails
-                let release_rollbacks = self
-                    .concurrency
-                    .release_and_grant_next(
-                        &self.db,
-                        &mut state.batch,
-                        tenant,
-                        &held_queues,
-                        task_id,
-                        now_ms,
-                    )
-                    .await?;
-                state.release_grants_to_rollback.extend(release_rollbacks);
-                tracing::debug!(job_id = %job_id, queues = ?held_queues, "dequeue: released tickets for cancelled job task");
-            }
-
-            tracing::debug!(job_id = %job_id, "dequeue: skipping cancelled job task");
-            return Ok(());
-        }
+        // Note: No cancelled check here. Cancelled jobs' tasks are eagerly removed
+        // by cancel_job. If a stale task appears (e.g., retry after cancel), it will
+        // be leased normally and the worker discovers cancellation via heartbeat.
 
         let view = JobView::new(job_bytes)?;
 
