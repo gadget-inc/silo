@@ -527,9 +527,8 @@ impl JobStoreShard {
             };
 
             if let Some((found_key, task_raw)) = task_found {
-                let decoded = decode_task(&task_raw).map_err(|e| {
-                    JobStoreShardError::Codec(format!("reimport task decode: {e}"))
-                })?;
+                let decoded = decode_task(&task_raw)
+                    .map_err(|e| JobStoreShardError::Codec(format!("reimport task decode: {e}")))?;
 
                 txn.delete(&found_key)?;
                 matched_task_keys.push(found_key);
@@ -547,11 +546,7 @@ impl JobStoreShard {
                             self.concurrency
                                 .counts()
                                 .atomic_release(tenant, queue, &tid);
-                            released_holders.push((
-                                tenant.to_string(),
-                                queue.clone(),
-                                tid.clone(),
-                            ));
+                            released_holders.push((tenant.to_string(), queue.clone(), tid.clone()));
                         }
                     }
                     Task::RequestTicket { .. } => {
