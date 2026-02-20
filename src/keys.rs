@@ -405,57 +405,31 @@ pub struct ParsedConcurrencyRequestKey {
 
 impl ParsedConcurrencyRequestKey {
     /// Compose the request_id used downstream (holder keys, task IDs).
-    /// For old-format keys (where job_id is empty), returns the suffix directly
-    /// since it contains the original UUID request_id.
     pub fn request_id(&self) -> String {
-        if self.job_id.is_empty() {
-            self.suffix.clone()
-        } else {
-            format!("{}:{}:{}", self.job_id, self.attempt_number, self.suffix)
-        }
+        format!("{}:{}:{}", self.job_id, self.attempt_number, self.suffix)
     }
 }
 
 /// Parse a concurrency request key back to its components.
-/// Tries 7-element (new) format first, falls back to 5-element (old) format for rolling deployment safety.
+/// Decodes 7 fields using nested tuples (storekey supports tuples up to 6 elements,
+/// but nested tuples encode identically to flat tuples since encoding is sequential).
 #[allow(clippy::type_complexity)]
 pub fn parse_concurrency_request_key(key: &[u8]) -> Option<ParsedConcurrencyRequestKey> {
     if key.first() != Some(&prefix::CONCURRENCY_REQUEST) {
         return None;
     }
-    // Try new 7-element format using nested tuples (storekey only supports up to 6-element tuples,
-    // but nested tuples encode identically to flat tuples since encoding is sequential).
-    let new_format: Result<((String, String, u64, u8), (String, u32, String)), _> =
-        decode(&key[1..]);
-    if let Ok(((tenant, queue, start_time_ms, priority), (job_id, attempt_number, suffix))) =
-        new_format
-    {
-        return Some(ParsedConcurrencyRequestKey {
-            tenant,
-            queue,
-            start_time_ms,
-            priority,
-            job_id,
-            attempt_number,
-            suffix,
-        });
-    }
-    // Fallback: old 5-element format (tenant, queue, start_time_ms, priority, request_id)
-    let (tenant, queue, start_time_ms, priority, old_request_id): (
-        String,
-        String,
-        u64,
-        u8,
-        String,
+    let ((tenant, queue, start_time_ms, priority), (job_id, attempt_number, suffix)): (
+        (String, String, u64, u8),
+        (String, u32, String),
     ) = decode(&key[1..]).ok()?;
     Some(ParsedConcurrencyRequestKey {
         tenant,
         queue,
         start_time_ms,
         priority,
-        job_id: String::new(),
-        attempt_number: 0,
-        suffix: old_request_id,
+        job_id,
+        attempt_number,
+        suffix,
     })
 }
 
