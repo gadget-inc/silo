@@ -670,6 +670,7 @@ impl ConcurrencyManager {
         }
 
         let now_ms = crate::job_store_shard::now_epoch_ms();
+        // [SILO-GRANT-2] Pre: Scan for pending requests for this queue
         let start = concurrency_request_prefix(tenant, queue);
         let end_key = end_bound(&start);
         let mut iter = match db.scan::<Vec<u8>, _>(start..end_key).await {
@@ -775,7 +776,7 @@ impl ConcurrencyManager {
                 }
             };
 
-            // Try to reserve in-memory slot
+            // [SILO-GRANT-1] Pre: Queue has capacity — try to atomically reserve a slot
             if !self
                 .counts
                 .try_reserve_internal(tenant, queue, &request_id, limit, job_id_str)

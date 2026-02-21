@@ -1092,10 +1092,14 @@ async fn floating_limit_refresh_failure_skips_retry_without_waiters() {
         .report_attempt_outcome(&run_task_id, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report success");
-    assert!(
-        first_concurrency_request_kv(shard.db()).await.is_none(),
-        "waiting requests should be cleared"
-    );
+    // The grant scanner processes requests asynchronously, so poll until cleared
+    let cleared = poll_until(
+        || async { first_concurrency_request_kv(shard.db()).await.is_none() },
+        |&is_none| is_none,
+        5000,
+    )
+    .await;
+    assert!(cleared, "waiting requests should be cleared");
 
     // Report failed refresh - no retry should be scheduled without waiters
     shard
@@ -1282,14 +1286,22 @@ async fn floating_limit_uses_dynamic_max_concurrency() {
         .await
         .expect("report j1 success");
 
-    // j2 should now have a RunAttempt task
-    let tasks = shard.peek_tasks("default", 10).await.expect("peek tasks");
-    let has_j2_run = tasks.iter().any(|t| {
-        matches!(
-            t,
-            Task::RunAttempt { job_id, .. } if job_id == &j2
-        )
-    });
+    // j2 should now have a RunAttempt task.
+    // Grants happen asynchronously via the background scanner, so poll.
+    let has_j2_run = poll_until(
+        || async {
+            let tasks = shard.peek_tasks("default", 10).await.expect("peek tasks");
+            tasks.iter().any(|t| {
+                matches!(
+                    t,
+                    Task::RunAttempt { job_id, .. } if job_id == &j2
+                )
+            })
+        },
+        |&found| found,
+        5000,
+    )
+    .await;
     assert!(
         has_j2_run,
         "j2 should have RunAttempt task after j1 completes"
