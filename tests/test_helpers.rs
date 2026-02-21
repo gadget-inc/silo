@@ -287,3 +287,24 @@ pub async fn count_concurrency_holders_for_tenant(db: &Db, tenant: &str) -> usiz
 pub fn msgpack_payload(value: &serde_json::Value) -> Vec<u8> {
     rmp_serde::to_vec(value).expect("failed to encode payload as messagepack")
 }
+
+/// Poll an async function until the predicate returns true, or timeout.
+/// Returns the last value produced by `f`.
+pub async fn poll_until<F, Fut, T, P>(mut f: F, predicate: P, timeout_ms: u64) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = T>,
+    P: Fn(&T) -> bool,
+{
+    let start = std::time::Instant::now();
+    loop {
+        let value = f().await;
+        if predicate(&value) {
+            return value;
+        }
+        if start.elapsed() > Duration::from_millis(timeout_ms) {
+            return value;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}

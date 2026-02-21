@@ -1,7 +1,6 @@
 //! Job cancellation operations.
 
-use slatedb::config::WriteOptions;
-use slatedb::{DbIterator, IsolationLevel, WriteBatch};
+use slatedb::{DbIterator, IsolationLevel};
 
 use crate::codec::{decode_cancellation_at_ms, decode_task, encode_job_cancellation};
 use crate::job::{JobCancellation, JobStatus, JobStatusKind, JobView, Limit};
@@ -194,45 +193,14 @@ impl JobStoreShard {
             self.broker.evict_keys(std::slice::from_ref(key));
         }
 
-        // Release concurrency holders from in-memory counts and trigger grant-next
+        // Release concurrency holders from in-memory counts and signal grant scanner
         if !held_queues_to_release.is_empty() {
             let finished_task_id = task_id_for_release.as_deref().unwrap_or_default();
-
-            // Use a separate WriteBatch for grant-next (post-commit operation).
-            // release_and_grant_next will: re-delete holder (idempotent), scan for next
-            // request, grant if valid, and update in-memory counts atomically.
-            let mut grant_batch = WriteBatch::new();
-            let release_rollbacks = self
-                .concurrency
-                .release_and_grant_next(
-                    &self.db,
-                    &mut grant_batch,
-                    tenant,
-                    &held_queues_to_release,
-                    finished_task_id,
-                    now_ms,
-                )
-                .await
-                .map_err(|e| JobStoreShardError::Codec(e.to_string()))?;
-
-            if let Err(e) = self
-                .db
-                .write_with_options(
-                    grant_batch,
-                    &WriteOptions {
-                        await_durable: true,
-                    },
-                )
-                .await
-            {
-                // Rollback in-memory concurrency state on DB write failure
-                self.concurrency.rollback_release_grants(&release_rollbacks);
-                tracing::warn!(error = %e, "cancel: grant-next write failed, rolled back in-memory state");
-                // Don't fail the cancel - the holder was already deleted in the txn.
-                // The next release_and_grant_next call for this queue will grant correctly.
-            } else {
-                // Wake broker to pick up any newly granted tasks
-                self.broker.wakeup();
+            for queue in &held_queues_to_release {
+                self.concurrency
+                    .counts()
+                    .atomic_release(tenant, queue, finished_task_id);
+                self.concurrency.request_grant(tenant, queue);
             }
         }
 

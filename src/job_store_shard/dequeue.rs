@@ -4,7 +4,7 @@ use slatedb::config::WriteOptions;
 use slatedb::{DbIterator, WriteBatch};
 
 use crate::codec::{DecodedTask, decode_task, encode_attempt, encode_lease};
-use crate::concurrency::{ReleaseGrantRollback, RequestTicketTaskOutcome};
+use crate::concurrency::RequestTicketTaskOutcome;
 use crate::dst_events::{self, DstEvent};
 use crate::fb::silo::fb;
 use crate::job::{JobStatus, JobView};
@@ -24,7 +24,6 @@ struct DequeueIterationState {
     release_keys: Vec<Vec<u8>>,
     tombstone_keys: Vec<Vec<u8>>,
     grants_to_rollback: Vec<(String, String, String)>,
-    release_grants_to_rollback: Vec<ReleaseGrantRollback>,
     leased_tasks_for_dst: Vec<(String, String, String)>,
     pending_attempts: Vec<(String, JobView, Vec<u8>)>,
     processed_internal: bool,
@@ -37,7 +36,6 @@ impl DequeueIterationState {
             release_keys: Vec::with_capacity(claimed_len),
             tombstone_keys: Vec::with_capacity(claimed_len),
             grants_to_rollback: Vec::new(),
-            release_grants_to_rollback: Vec::new(),
             leased_tasks_for_dst: Vec::new(),
             pending_attempts: Vec::new(),
             processed_internal: false,
@@ -83,8 +81,6 @@ impl JobStoreShard {
         // Track grants made during this dequeue for rollback on failure
         // Format: (tenant, queue, task_id)
         let mut grants_to_rollback: Vec<(String, String, String)> = Vec::new();
-        // Track release-and-grant operations for rollback on failure
-        let mut release_grants_to_rollback: Vec<ReleaseGrantRollback> = Vec::new();
         // Track leased tasks for DST event emission after commit
         // Format: (tenant, job_id, task_id)
         let mut leased_tasks_for_dst: Vec<(String, String, String)> = Vec::new();
@@ -177,7 +173,6 @@ impl JobStoreShard {
 
             // Merge iteration state into outer accumulators
             grants_to_rollback.append(&mut state.grants_to_rollback);
-            release_grants_to_rollback.append(&mut state.release_grants_to_rollback);
 
             // Two-phase DST events: emit before write for correct causal ordering,
             // confirm after write succeeds, cancel if write fails.
@@ -222,23 +217,14 @@ impl JobStoreShard {
                 for (tenant, queue, task_id) in &grants_to_rollback {
                     self.concurrency.rollback_grant(tenant, queue, task_id);
                 }
-                // Rollback all release-and-grant operations
-                self.concurrency
-                    .rollback_release_grants(&release_grants_to_rollback);
                 // Put back all claimed entries since we didn't lease them durably
                 self.broker.requeue(claimed);
                 return Err(JobStoreShardError::Slate(e));
             }
             dst_events::confirm_write(write_op);
 
-            // Wake broker for any release-grants that happened (before clearing)
-            if !release_grants_to_rollback.is_empty() {
-                self.broker.wakeup();
-            }
-
             // DB write succeeded - clear rollback lists for next iteration
             grants_to_rollback.clear();
-            release_grants_to_rollback.clear();
 
             // Collect pending attempts from this iteration
             pending_attempts.append(&mut state.pending_attempts);

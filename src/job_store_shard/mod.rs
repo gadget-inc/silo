@@ -252,8 +252,16 @@ impl JobStoreShard {
         // Note: concurrency counts are hydrated lazily on first access to each queue.
         // This avoids blocking shard startup while scanning potentially large holder sets.
 
-        let broker = TaskBroker::new(Arc::clone(&db), name.clone(), metrics.clone(), range);
+        let broker = TaskBroker::new(
+            Arc::clone(&db),
+            name.clone(),
+            metrics.clone(),
+            range.clone(),
+        );
         broker.start();
+
+        // Start the grant scanner after both ConcurrencyManager and TaskBroker are ready
+        concurrency.start_grant_scanner(Arc::clone(&db), Arc::clone(&broker), range);
 
         let shard = Arc::new(Self {
             name,
@@ -295,6 +303,7 @@ impl JobStoreShard {
     pub async fn close(&self) -> Result<(), JobStoreShardError> {
         self.cancellation.cancel();
         self.broker.stop();
+        self.concurrency.stop_grant_scanner();
 
         // If we have a local WAL with flush_on_close enabled, flush memtable to SSTs first
         if let Some(ref wal_config) = self.wal_close_config

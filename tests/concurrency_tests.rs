@@ -123,8 +123,9 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
         .await
         .expect("report1");
 
-    // Now there should be a new task for the queued request
-    let some = first_task_kv(shard.db()).await;
+    // Now there should be a new task for the queued request.
+    // Grants happen asynchronously via the background scanner, so poll.
+    let some = poll_until(|| first_task_kv(shard.db()), |r| r.is_some(), 5000).await;
     assert!(some.is_some(), "task should be enqueued for next requester");
 }
 
@@ -525,12 +526,12 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
         }
     }
 
-    // Release first; only one new task should appear immediately
+    // Release first; one new task should appear after the background grant scanner runs
     shard
         .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report1");
-    let after = first_task_kv(shard.db()).await;
+    let after = poll_until(|| first_task_kv(shard.db()), |r| r.is_some(), 5000).await;
     assert!(after.is_some(), "one task should be enqueued after release");
 }
 
@@ -721,8 +722,13 @@ async fn concurrency_multiple_holders_max_greater_than_one() {
         .await
         .expect("report1");
 
-    // Still 3 holders (released 1, granted 1)
-    let holders_after = count_concurrency_holders(shard.db()).await;
+    // Still 3 holders (released 1, granted 1). Grant happens asynchronously, so poll.
+    let holders_after = poll_until(
+        || count_concurrency_holders(shard.db()),
+        |&count| count == 3,
+        5000,
+    )
+    .await;
     assert_eq!(holders_after, 3, "should maintain 3 concurrent holders");
 
     // Complete all
@@ -1164,28 +1170,29 @@ async fn concurrency_reap_expired_lease_releases_holder() {
     let reaped = shard.reap_expired_leases("-").await.expect("reap");
     assert_eq!(reaped, 1);
 
-    // Job 2 should now be granted (holder released from job 1)
-    let t2_vec = shard.dequeue("w", "default", 1).await.expect("deq2").tasks;
-    assert_eq!(t2_vec.len(), 1, "job 2 should be granted after reap");
-
-    // Job 1 retry should also be scheduled
-    let j1_attempt2 = shard
-        .get_job_attempt("-", &j1, 2)
-        .await
-        .expect("get attempt 2");
-    assert!(
-        j1_attempt2.is_none(),
-        "attempt 2 not created yet (only task scheduled)"
+    // After reap releases the holder, either job 2's pending request or job 1's retry
+    // RequestTicket can be granted. With the async grant scanner, the ordering is
+    // non-deterministic. The key invariant is that a new task becomes available.
+    let next_task = poll_until(
+        || async { shard.dequeue("w", "default", 1).await.expect("deq2").tasks },
+        |tasks| !tasks.is_empty(),
+        5000,
+    )
+    .await;
+    assert_eq!(
+        next_task.len(),
+        1,
+        "a task should be granted after reap releases the holder"
     );
 
     // Cleanup
     shard
         .report_attempt_outcome(
-            t2_vec[0].attempt().task_id(),
+            next_task[0].attempt().task_id(),
             AttemptOutcome::Success { result: vec![] },
         )
         .await
-        .expect("report2");
+        .expect("report cleanup");
 }
 
 #[silo::test]
