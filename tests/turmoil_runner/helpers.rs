@@ -63,10 +63,14 @@ impl Write for DstWriter {
 }
 
 /// Initialize deterministic tracing for DST.
-/// Configures tracing to output all logs (including TRACE level) in a deterministic format:
+/// Configures tracing to output all logs in a deterministic format:
 /// - No ANSI colors (consistent output)
 /// - Thread names/IDs disabled (ordering could vary)
 /// - No file/line numbers (could change with code edits)
+///
+/// In fuzz mode (DST_FUZZ=1), uses INFO level to avoid the overhead of
+/// formatting ~300K TRACE/DEBUG lines per scenario. In verification mode,
+/// uses TRACE level for byte-for-byte determinism comparison.
 ///
 /// Panics if called more than once in the same process - each DST scenario must run in its own process for true determinism.
 fn init_deterministic_tracing() {
@@ -90,7 +94,11 @@ fn init_deterministic_tracing() {
         .compact()
         .with_writer(|| DstWriter);
 
-    let filter = tracing_subscriber::filter::LevelFilter::TRACE;
+    let filter = if is_fuzz_mode() {
+        tracing_subscriber::filter::LevelFilter::INFO
+    } else {
+        tracing_subscriber::filter::LevelFilter::TRACE
+    };
 
     tracing_subscriber::registry()
         .with(fmt_layer.with_filter(filter))
