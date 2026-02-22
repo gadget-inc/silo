@@ -168,18 +168,56 @@ function getLogFilePath(scenario, seed) {
 }
 
 /**
+ * Build the test binary and return its path.
+ * Uses cargo's JSON output to discover the binary location.
+ */
+function buildAndGetBinaryPath() {
+  console.log("Building test binary...");
+  const buildResult = spawnSync(
+    "cargo",
+    ["test", "--features", "dst", "--test", "turmoil_runner", "--no-run", "--message-format=json"],
+    { stdio: ["ignore", "pipe", "inherit"] }
+  );
+  if (buildResult.status !== 0) {
+    console.error("Failed to build test binary");
+    process.exit(1);
+  }
+
+  const lines = buildResult.stdout.toString().split("\n").filter(Boolean);
+  let binaryPath = null;
+  for (const line of lines) {
+    try {
+      const msg = JSON.parse(line);
+      if (msg.reason === "compiler-artifact" && msg.executable && msg.target?.name === "turmoil_runner") {
+        binaryPath = msg.executable;
+      }
+    } catch {
+      // Skip non-JSON lines
+    }
+  }
+
+  if (!binaryPath) {
+    console.error("Could not find test binary path from cargo output");
+    process.exit(1);
+  }
+
+  console.log(`Test binary: ${binaryPath}`);
+  return binaryPath;
+}
+
+/**
  * Run a single scenario with a specific seed in fuzz mode.
- * Each scenario runs in its own subprocess for determinism.
+ * Invokes the pre-built test binary directly (no cargo overhead).
  * Writes output directly to a log file to avoid OOM when running many seeds.
  */
-function runScenarioWithSeed(scenario, seed) {
+function runScenarioWithSeed(binaryPath, scenario, seed) {
   return new Promise((resolve) => {
     const logFile = getLogFilePath(scenario, seed);
     const logStream = createWriteStream(logFile);
 
     const proc = spawn(
-      "cargo",
-      ["test", "--features", "dst", "--test", "turmoil_runner", scenario, "--", "--exact", "--nocapture"],
+      binaryPath,
+      [scenario, "--exact", "--nocapture"],
       {
         env: { ...process.env, DST_SEED: String(seed), DST_FUZZ: "1" },
         stdio: ["ignore", "pipe", "pipe"],
@@ -220,7 +258,7 @@ function runScenarioWithSeed(scenario, seed) {
  * Run tests in parallel using a worker pool pattern.
  * Processes results via callback to avoid accumulating them in memory.
  */
-async function runTestsInParallel(tasks, parallelism, onResult) {
+async function runTestsInParallel(binaryPath, tasks, parallelism, onResult) {
   const pending = [...tasks];
   const running = new Map(); // Map<Promise, {task, promise}>
   let completed = 0;
@@ -231,7 +269,7 @@ async function runTestsInParallel(tasks, parallelism, onResult) {
     while (running.size < parallelism && pending.length > 0) {
       const task = pending.shift();
       const id = promiseId++;
-      const promise = runScenarioWithSeed(task.scenario, task.seed).then((result) => ({
+      const promise = runScenarioWithSeed(binaryPath, task.scenario, task.seed).then((result) => ({
         id,
         result,
       }));
@@ -254,12 +292,13 @@ async function main() {
 
   // If a specific seed is set, run that seed with output visible
   if (SPECIFIC_SEED !== null) {
+    const binaryPath = buildAndGetBinaryPath();
     // Use specific scenario if provided, otherwise deterministically select based on seed
     const scenario = SPECIFIC_SCENARIO || selectScenarioFromSeed(SPECIFIC_SEED, SCENARIOS);
-    console.log(`Running scenario '${scenario}' with seed: ${SPECIFIC_SEED}\n`);
+    console.log(`\nRunning scenario '${scenario}' with seed: ${SPECIFIC_SEED}\n`);
     const result = spawnSync(
-      "cargo",
-      ["test", "--features", "dst", "--test", "turmoil_runner", scenario, "--", "--exact", "--nocapture"],
+      binaryPath,
+      [scenario, "--exact", "--nocapture"],
       {
         env: { ...process.env, DST_SEED: String(SPECIFIC_SEED), DST_FUZZ: "1" },
         stdio: "inherit",
@@ -287,15 +326,8 @@ async function main() {
   console.log("");
   console.log("----------------------------------------------");
 
-  // Build test binary first
-  console.log("Building test binary...");
-  const buildResult = spawnSync("cargo", ["test", "--features", "dst", "--test", "turmoil_runner", "--no-run"], {
-    stdio: "inherit",
-  });
-  if (buildResult.status !== 0) {
-    console.error("Failed to build test binary");
-    process.exit(1);
-  }
+  // Build test binary and get its path for direct invocation
+  const binaryPath = buildAndGetBinaryPath();
   console.log("");
 
   // Clean and create logs directory
@@ -314,9 +346,10 @@ async function main() {
   const failures = [];
   let totalPassed = 0;
   let totalFailed = 0;
+  const startTime = Date.now();
 
-  // Run tests in parallel
-  await runTestsInParallel(tasks, PARALLELISM, (result, completed, total) => {
+  // Run tests in parallel, invoking the binary directly (no cargo overhead)
+  await runTestsInParallel(binaryPath, tasks, PARALLELISM, (result, completed, total) => {
     const { passed, scenario, seed } = result;
     const padSeed = String(seed).padEnd(10);
     const progress = `(${String(completed).padStart(3)}/${total})`;
@@ -331,9 +364,13 @@ async function main() {
     }
   });
 
+  const elapsedSecs = ((Date.now() - startTime) / 1000).toFixed(1);
+  const perSeedSecs = ((Date.now() - startTime) / 1000 / NUM_SEEDS).toFixed(2);
+
   console.log("");
   console.log("==============================================");
   console.log(`Results: ${totalPassed} passed, ${totalFailed} failed`);
+  console.log(`Elapsed: ${elapsedSecs}s total, ${perSeedSecs}s per seed (wall clock / seeds)`);
   console.log("==============================================");
 
   if (failures.length > 0) {
