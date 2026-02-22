@@ -113,6 +113,14 @@ harness = false
 name = "query_performance"
 harness = false
 
+[[bench]]
+name = "big_shard_operations"
+harness = false
+
+[[bench]]
+name = "query_profile"
+harness = false
+
 [[test]]
 name = "turmoil_runner"
 path = "tests/turmoil_runner/main.rs"

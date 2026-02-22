@@ -122,6 +122,11 @@ pub fn idx_status_time_prefix_with_time(
     )
 }
 
+/// Prefix for scanning all status/time index entries for a single tenant (all statuses).
+pub fn idx_status_time_tenant_prefix(tenant: &str) -> Vec<u8> {
+    encode_with_prefix(prefix::IDX_STATUS_TIME, &(tenant,))
+}
+
 /// Prefix for scanning all status index entries (cross-tenant).
 pub fn idx_status_time_all_prefix() -> Vec<u8> {
     vec![prefix::IDX_STATUS_TIME]
