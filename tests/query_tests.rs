@@ -2,7 +2,7 @@ mod test_helpers;
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, StringArray};
+use datafusion::arrow::array::{Array, Int64Array, StringArray};
 use datafusion::arrow::record_batch::RecordBatch;
 use silo::job_store_shard::JobStoreShard;
 use silo::query::ShardQueryEngine;
@@ -2922,4 +2922,307 @@ async fn explain_bench_metadata_count() {
             value: "us-east-1".to_string(),
         }
     );
+}
+
+// ── Opt 1 regression: COUNT(*) via status-index stays correct through lifecycle ─────────────
+//
+// Opt 1 routes COUNT(*) (empty projection + FullScan) through the status/time index instead
+// of scanning job_info KVs.  The count is correct only if the index has exactly one entry per
+// job at all times.  This test exercises every status transition that modifies the index
+// (Scheduled → Running → Succeeded, Scheduled → Running → Failed) and asserts that COUNT(*)
+// returns N after each step.
+#[silo::test]
+async fn count_via_status_index_stable_through_lifecycle() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    // j-hi has priority 1 so it is always dequeued first, j-mid second.
+    // No retry policy on either so the first failure is terminal.
+    shard
+        .enqueue(
+            "-",
+            Some("j-hi".to_string()),
+            1,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue j-hi");
+    shard
+        .enqueue(
+            "-",
+            Some("j-mid".to_string()),
+            5,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue j-mid");
+    enqueue_job(&shard, "j-lo", 10, now).await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+
+    macro_rules! count_jobs {
+        ($label:expr) => {{
+            let batches = sql
+                .sql("SELECT COUNT(*) FROM jobs WHERE tenant = '-'")
+                .await
+                .expect("sql")
+                .collect()
+                .await
+                .expect("collect");
+            let n = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("count column")
+                .value(0);
+            assert_eq!(n, 3, $label);
+        }};
+    }
+
+    // Phase 1: all freshly enqueued (Scheduled) → count must be 3
+    count_jobs!("all Scheduled");
+
+    // Phase 2: dequeue j-hi → Running.  Status-index entry moves from
+    // Scheduled bucket to Running bucket.  Total entries unchanged.
+    let tasks = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    let tid_hi = tasks[0].attempt().task_id().to_string();
+    count_jobs!("j-hi Running");
+
+    // Phase 3: complete j-hi → Succeeded.  Entry moves to Succeeded bucket.
+    shard
+        .report_attempt_outcome(
+            &tid_hi,
+            silo::job_attempt::AttemptOutcome::Success { result: vec![] },
+        )
+        .await
+        .expect("succeed j-hi");
+    count_jobs!("j-hi Succeeded");
+
+    // Phase 4: dequeue j-mid → Running, then fail → Failed.
+    let tasks = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    let tid_mid = tasks[0].attempt().task_id().to_string();
+    count_jobs!("j-mid Running");
+
+    shard
+        .report_attempt_outcome(
+            &tid_mid,
+            silo::job_attempt::AttemptOutcome::Error {
+                error_code: "ERR".to_string(),
+                error: vec![],
+            },
+        )
+        .await
+        .expect("fail j-mid");
+    count_jobs!("j-mid Failed");
+
+    // Final state: Succeeded(j-hi), Failed(j-mid), Scheduled(j-lo) → still 3
+    count_jobs!("final mixed statuses");
+}
+
+// ── Opt 1 regression: status-index scan returns the complete set of job IDs ─────────────────
+//
+// SELECT id FROM jobs WHERE tenant='t' now scans the status/time index rather than
+// job_info.  The index is partitioned by status: Scheduled, Running, Succeeded, …
+// all occupy separate lexicographic regions.  A scan without LIMIT must return ids
+// from ALL status buckets, not just the first one it encounters.
+#[silo::test]
+async fn status_index_id_scan_returns_complete_set_across_status_buckets() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    // Enqueue five jobs; give each unique priorities so dequeue order is predictable.
+    for (id, prio) in [
+        ("job-a", 1u8),
+        ("job-b", 2),
+        ("job-c", 10),
+        ("job-d", 15),
+        ("job-e", 20),
+    ] {
+        shard
+            .enqueue(
+                "-",
+                Some(id.to_string()),
+                prio,
+                now,
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({})),
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+    }
+
+    // Transition job-a → Succeeded and job-b → Failed so the index now spans
+    // Failed, Scheduled, and Succeeded buckets (alphabetical order in the index).
+    let tasks = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    let t = tasks[0].attempt().task_id().to_string();
+    shard
+        .report_attempt_outcome(
+            &t,
+            silo::job_attempt::AttemptOutcome::Success { result: vec![] },
+        )
+        .await
+        .expect("succeed job-a");
+
+    let tasks = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    let t = tasks[0].attempt().task_id().to_string();
+    shard
+        .report_attempt_outcome(
+            &t,
+            silo::job_attempt::AttemptOutcome::Error {
+                error_code: "ERR".to_string(),
+                error: vec![],
+            },
+        )
+        .await
+        .expect("fail job-b");
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+
+    // This query uses the status-index path (Opt 1): id is not a job_info or
+    // status-point-lookup column, so use_status_index_path = true.
+    // ORDER BY id so DataFusion sorts the results regardless of scan order.
+    let mut got = query_ids(&sql, "SELECT id FROM jobs WHERE tenant = '-' ORDER BY id").await;
+    got.sort();
+
+    assert_eq!(
+        got,
+        vec!["job-a", "job-b", "job-c", "job-d", "job-e"],
+        "status-index scan must return ids from all status buckets"
+    );
+}
+
+// ── Opt 3 regression: combined range scan pairs job_info and status correctly ────────────────
+//
+// Queries that need both job_info columns (enqueue_time_ms, payload) and status columns
+// (status_kind) are routed through stream_via_fullscan_range, which concurrently runs
+// scan_jobs_with_views + scan_jobs_status_records and joins them by job_id.  This test
+// verifies that after status transitions the correct status is reported for each job and
+// that the job_info data (enqueue_time_ms) is not swapped between jobs.
+#[silo::test]
+async fn fullscan_range_correctly_pairs_info_and_status() {
+    let (_tmp, shard) = open_temp_shard().await;
+    // j1: start_at in the past → Waiting (eligible for dequeue).
+    // j2, j3: start_at far in the future → Scheduled (not yet eligible).
+    // Using distinct timestamps so we can verify enqueue_time_ms is correctly paired per job.
+    let t_past = now_ms() - 1_000;
+    let t_future1 = now_ms() + 3_600_000; // 1 hour from now
+    let t_future2 = now_ms() + 7_200_000; // 2 hours from now
+
+    for (id, prio, ts) in [
+        ("j1", 1u8, t_past),
+        ("j2", 10, t_future1),
+        ("j3", 20, t_future2),
+    ] {
+        shard
+            .enqueue(
+                "-",
+                Some(id.to_string()),
+                prio,
+                ts,
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({})),
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+    }
+
+    // Move j1 → Running → Succeeded so it occupies a different status bucket.
+    let tasks = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    let tid = tasks[0].attempt().task_id().to_string();
+    shard
+        .report_attempt_outcome(
+            &tid,
+            silo::job_attempt::AttemptOutcome::Success { result: vec![] },
+        )
+        .await
+        .expect("succeed j1");
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+
+    // enqueue_time_ms ∈ job_info  +  status_kind ∈ status  → stream_via_fullscan_range (Opt 3).
+    // ORDER BY id so row order is deterministic.
+    let batches = sql
+        .sql(
+            "SELECT id, enqueue_time_ms, status_kind \
+             FROM jobs WHERE tenant = '-' ORDER BY id",
+        )
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3, "should return all 3 jobs");
+
+    let ids = extract_string_column(&batches, 0);
+    let enqueue_times: Vec<i64> = batches
+        .iter()
+        .flat_map(|b| {
+            let col = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 enqueue_time_ms");
+            (0..col.len()).map(|i| col.value(i)).collect::<Vec<_>>()
+        })
+        .collect();
+    let statuses = extract_string_column(&batches, 2);
+
+    // Rows are ORDER BY id: j1, j2, j3
+    assert_eq!(ids, vec!["j1", "j2", "j3"]);
+
+    // enqueue_time_ms must match what was written — not swapped between jobs.
+    // This is the core of what Opt 3 could break: if scan_jobs_with_views and
+    // scan_jobs_status_records are mismatched, the wrong enqueue_time_ms would
+    // appear next to the wrong status_kind.
+    assert_eq!(enqueue_times[0], t_past, "j1 enqueue_time_ms");
+    assert_eq!(enqueue_times[1], t_future1, "j2 enqueue_time_ms");
+    assert_eq!(enqueue_times[2], t_future2, "j3 enqueue_time_ms");
+
+    // status_kind must reflect actual current status after transition.
+    // j1: Succeeded (was dequeued and marked successful above)
+    // j2, j3: Scheduled (future start_at, not yet eligible)
+    assert_eq!(
+        statuses[0], "Succeeded",
+        "j1 should be Succeeded after completion"
+    );
+    assert_eq!(statuses[1], "Scheduled", "j2 should still be Scheduled");
+    assert_eq!(statuses[2], "Scheduled", "j3 should still be Scheduled");
 }
