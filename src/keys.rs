@@ -329,22 +329,26 @@ pub fn parse_attempt_key(key: &[u8]) -> Option<ParsedAttemptKey> {
 }
 
 /// Concurrency request queue key.
-/// Ordered by start time (when job should run), then priority (lower = higher), then request ID.
+/// Ordered by start time (when job should run), then priority (lower = higher), then (job_id, attempt_number, suffix).
+/// The composed request_id used downstream is `{job_id}:{attempt_number}:{suffix}`.
+///
+/// Uses nested tuples to encode 7 fields (storekey supports tuples up to 6 elements).
+/// Since storekey encodes tuple elements sequentially, the nested encoding is byte-identical
+/// to a flat 7-element encoding.
 pub fn concurrency_request_key(
     tenant: &str,
     queue: &str,
     start_time_ms: i64,
     priority: u8,
-    request_id: &str,
+    job_id: &str,
+    attempt_number: u32,
+    suffix: &str,
 ) -> Vec<u8> {
     encode_with_prefix(
         prefix::CONCURRENCY_REQUEST,
         &(
-            tenant,
-            queue,
-            start_time_ms.max(0) as u64,
-            priority,
-            request_id,
+            (tenant, queue, start_time_ms.max(0) as u64, priority),
+            (job_id, attempt_number, suffix),
         ),
     )
 }
@@ -359,6 +363,29 @@ pub fn concurrency_request_tenant_prefix(tenant: &str) -> Vec<u8> {
     encode_with_prefix(prefix::CONCURRENCY_REQUEST, &(tenant,))
 }
 
+/// Prefix for scanning a specific job's concurrency requests within a (tenant, queue, start_time, priority) bucket.
+/// Enables narrow O(1) prefix scan instead of scanning the entire queue.
+pub fn concurrency_request_job_prefix(
+    tenant: &str,
+    queue: &str,
+    start_time_ms: i64,
+    priority: u8,
+    job_id: &str,
+    attempt_number: u32,
+) -> Vec<u8> {
+    encode_with_prefix(
+        prefix::CONCURRENCY_REQUEST,
+        &(
+            tenant,
+            queue,
+            start_time_ms.max(0) as u64,
+            priority,
+            job_id,
+            attempt_number,
+        ),
+    )
+}
+
 /// Prefix for scanning all concurrency requests (cross-tenant).
 pub fn concurrency_requests_prefix() -> Vec<u8> {
     vec![prefix::CONCURRENCY_REQUEST]
@@ -371,22 +398,38 @@ pub struct ParsedConcurrencyRequestKey {
     pub queue: String,
     pub start_time_ms: u64,
     pub priority: u8,
-    pub request_id: String,
+    pub job_id: String,
+    pub attempt_number: u32,
+    pub suffix: String,
+}
+
+impl ParsedConcurrencyRequestKey {
+    /// Compose the request_id used downstream (holder keys, task IDs).
+    pub fn request_id(&self) -> String {
+        format!("{}:{}:{}", self.job_id, self.attempt_number, self.suffix)
+    }
 }
 
 /// Parse a concurrency request key back to its components.
+/// Decodes 7 fields using nested tuples (storekey supports tuples up to 6 elements,
+/// but nested tuples encode identically to flat tuples since encoding is sequential).
+#[allow(clippy::type_complexity)]
 pub fn parse_concurrency_request_key(key: &[u8]) -> Option<ParsedConcurrencyRequestKey> {
     if key.first() != Some(&prefix::CONCURRENCY_REQUEST) {
         return None;
     }
-    let (tenant, queue, start_time_ms, priority, request_id): (String, String, u64, u8, String) =
-        decode(&key[1..]).ok()?;
+    let ((tenant, queue, start_time_ms, priority), (job_id, attempt_number, suffix)): (
+        (String, String, u64, u8),
+        (String, u32, String),
+    ) = decode(&key[1..]).ok()?;
     Some(ParsedConcurrencyRequestKey {
         tenant,
         queue,
         start_time_ms,
         priority,
-        request_id,
+        job_id,
+        attempt_number,
+        suffix,
     })
 }
 

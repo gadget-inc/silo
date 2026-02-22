@@ -10,8 +10,8 @@ use crate::job_store_shard::helpers::{
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{
-    concurrency_holder_key, concurrency_request_prefix, end_bound, job_cancelled_key, job_info_key,
-    job_status_key, task_key,
+    concurrency_holder_key, concurrency_request_job_prefix, end_bound, job_cancelled_key,
+    job_info_key, job_status_key, task_key,
 };
 use crate::task::Task;
 
@@ -162,8 +162,16 @@ impl JobStoreShard {
                 } else {
                     // No task found - check for TicketRequested case (request record
                     // exists but no task in DB queue). Scan for requests for this job.
-                    self.delete_concurrency_requests_for_job(&txn, tenant, id, &limits)
-                        .await?;
+                    self.delete_concurrency_requests_for_job(
+                        &txn,
+                        tenant,
+                        id,
+                        &limits,
+                        attempt_number,
+                        start_time_ms,
+                        priority,
+                    )
+                    .await?;
                 }
             }
         }
@@ -233,12 +241,20 @@ impl JobStoreShard {
 
     /// Delete concurrency request records for a specific job across all its concurrency queues.
     /// Used in the TicketRequested case where no task exists but request records do.
+    ///
+    /// Uses a narrow prefix scan targeting exactly this job's requests, rather than scanning
+    /// all requests for the queue. Falls back to start_time_ms=0 if no requests found
+    /// (same pattern as task key reconstruction fallback).
+    #[expect(clippy::too_many_arguments)]
     async fn delete_concurrency_requests_for_job(
         &self,
         txn: &slatedb::DbTransaction,
         tenant: &str,
         job_id: &str,
         limits: &[Limit],
+        attempt_number: u32,
+        start_time_ms: i64,
+        priority: u8,
     ) -> Result<(), JobStoreShardError> {
         for limit in limits {
             let queue_key = match limit {
@@ -247,28 +263,70 @@ impl JobStoreShard {
                 Limit::RateLimit(_) => continue,
             };
 
-            let prefix = concurrency_request_prefix(tenant, queue_key);
-            let end = end_bound(&prefix);
-            let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(prefix..end).await?;
+            let deleted = self
+                .delete_concurrency_requests_with_prefix(
+                    txn,
+                    tenant,
+                    job_id,
+                    queue_key,
+                    attempt_number,
+                    start_time_ms,
+                    priority,
+                )
+                .await?;
 
-            while let Some(kv) = iter.next().await? {
-                // Decode the request value to check if it's for our job
-                let decoded = crate::codec::decode_concurrency_action(kv.value.clone())
-                    .map_err(|e| JobStoreShardError::Codec(e.to_string()))?;
-                let action = decoded.fb();
-                if let Some(et) = action.variant_as_enqueue_task()
-                    && et.job_id().unwrap_or_default() == job_id
-                {
-                    txn.delete(&kv.key)?;
-                    tracing::debug!(
-                        job_id = %job_id,
-                        queue = %queue_key,
-                        "cancel: deleted concurrency request for cancelled job"
-                    );
-                }
+            if !deleted {
+                // Fallback: try with start_time_ms=0 (immediate scheduling case)
+                self.delete_concurrency_requests_with_prefix(
+                    txn,
+                    tenant,
+                    job_id,
+                    queue_key,
+                    attempt_number,
+                    0,
+                    priority,
+                )
+                .await?;
             }
         }
         Ok(())
+    }
+
+    /// Scan a narrow prefix for this job's concurrency requests and delete them.
+    /// Returns true if any requests were deleted.
+    #[expect(clippy::too_many_arguments)]
+    async fn delete_concurrency_requests_with_prefix(
+        &self,
+        txn: &slatedb::DbTransaction,
+        tenant: &str,
+        job_id: &str,
+        queue_key: &str,
+        attempt_number: u32,
+        start_time_ms: i64,
+        priority: u8,
+    ) -> Result<bool, JobStoreShardError> {
+        let prefix = concurrency_request_job_prefix(
+            tenant,
+            queue_key,
+            start_time_ms,
+            priority,
+            job_id,
+            attempt_number,
+        );
+        let end = end_bound(&prefix);
+        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(prefix..end).await?;
+
+        let mut deleted_any = false;
+        while let Some(kv) = iter.next().await? {
+            txn.delete(&kv.key)?;
+            deleted_any = true;
+            tracing::debug!(
+                job_id = %job_id,
+                queue = %queue_key,
+                "cancel: deleted concurrency request for cancelled job"
+            );
+        }
+        Ok(deleted_any)
     }
 
     /// Check if a job has been cancelled.

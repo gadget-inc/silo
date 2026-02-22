@@ -482,7 +482,8 @@ impl ConcurrencyManager {
             }))
         } else {
             // Job scheduled for future: queue as RequestTicket task
-            let request_id = uuid::Uuid::new_v4().to_string();
+            let suffix = format!("{:08x}", rand::random::<u32>());
+            let request_id = format!("{job_id}:{attempt_number}:{suffix}");
             let ticket = Task::RequestTicket {
                 queue: queue.clone(),
                 start_time_ms: start_at_ms,
@@ -645,7 +646,7 @@ impl ConcurrencyManager {
                 let Some(parsed_req) = parse_concurrency_request_key(&kv.key) else {
                     continue;
                 };
-                let request_id = parsed_req.request_id;
+                let request_id = parsed_req.request_id();
 
                 if start_time_ms > now_ms {
                     // Not ready yet; leave request for later and stop searching
@@ -800,12 +801,15 @@ fn append_request_edits<W: WriteBatcher>(
         task_group: task_group.to_string(),
     };
     let action_val = encode_concurrency_action(&action);
+    let suffix = format!("{:08x}", rand::random::<u32>());
     let req_key = concurrency_request_key(
         tenant,
         queue,
         start_time_ms,
         priority,
-        &uuid::Uuid::new_v4().to_string(),
+        job_id,
+        attempt_number,
+        &suffix,
     );
     writer.put(&req_key, &action_val)?;
     Ok(())
