@@ -748,7 +748,7 @@ impl ConcurrencyManager {
             let Some(parsed_req) = parse_concurrency_request_key(&kv.key) else {
                 continue;
             };
-            let request_id = parsed_req.request_id;
+            let request_id = parsed_req.request_id();
 
             // Get max_concurrency (cached per queue from first successful lookup)
             let limit = match max_concurrency {
