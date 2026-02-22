@@ -550,11 +550,11 @@ fn analyze_projection(projection: &SchemaRef, strategy: &JobsScanStrategy) -> Pr
             "current_attempt" | "next_attempt_starts_after_ms"
         )
     });
-    // When only fields encoded in the status/time index key are needed, we can scan that
-    // index once and skip all get_jobs_batch / get_jobs_status_batch point-lookups.
+    // When no job_info fields or status point-lookup fields are needed (including the
+    // empty-projection case for COUNT(*)), scan the status/time index directly and skip
+    // all get_jobs_batch / get_jobs_status_batch point-lookups.
     // Only valid for FullScan — other strategies already have a bounded pair list.
-    let use_status_index_path = need_status_index_fields
-        && !need_job_info
+    let use_status_index_path = !need_job_info
         && !need_status_point_lookup
         && matches!(strategy, JobsScanStrategy::FullScan { .. });
     // ExactId with a tenant synthesises the pair without scanning the DB, so we must
@@ -738,12 +738,29 @@ async fn stream_via_job_pairs(
     limit: Option<usize>,
     tx: &mpsc::Sender<DfResult<RecordBatch>>,
 ) -> DfResult<()> {
+    // Fast path: FullScan + need_job_info — use combined range scans to avoid the
+    // double-read that would occur from scan_jobs (discards values) + get_jobs_batch
+    // (re-reads same KVs). Status records are also fetched via a sequential range scan
+    // instead of 79K+ random point-lookups.
+    if needs.need_job_info && matches!(strategy, JobsScanStrategy::FullScan { .. }) {
+        return stream_via_fullscan_range(
+            shard, projection, strategy, needs, batch_size, limit, tx,
+        )
+        .await;
+    }
+
+    // Standard path: collect (tenant, job_id) pairs then batch-fetch.
+    // Cap fetch batches so DataFusion can stop early for LIMIT queries.
+    // Full scans pay nearly identical total I/O (same ops, more smaller batches).
+    const POINT_LOOKUP_BATCH: usize = 256;
+    let fetch_batch_size = batch_size.min(POINT_LOOKUP_BATCH);
+
     let job_pairs = collect_job_pairs(shard, strategy, limit).await?;
     let shard_id = shard.name().to_string();
     let mut sent = 0usize;
     let mut i = 0usize;
     while i < job_pairs.len() && limit.is_none_or(|l| sent < l) {
-        let end = (i + batch_size).min(job_pairs.len());
+        let end = (i + fetch_batch_size).min(job_pairs.len());
         let batch_pairs = &job_pairs[i..end];
         let (jobs_map, status_map) = fetch_batch_data(shard, batch_pairs, needs).await?;
         // When we fetched job_info, use the map as the authoritative presence check.
@@ -769,6 +786,92 @@ async fn stream_via_job_pairs(
             if tx.send(Ok(batch)).await.is_err() {
                 return Ok(());
             }
+        }
+        i = end;
+    }
+    Ok(())
+}
+
+/// Fast path for FullScan + need_job_info: runs combined range scans to read each KV
+/// exactly once. Concurrently scans job_info and status ranges, builds in-memory maps,
+/// then emits batches without any point-lookups.
+async fn stream_via_fullscan_range(
+    shard: &Arc<JobStoreShard>,
+    projection: &SchemaRef,
+    strategy: &JobsScanStrategy,
+    needs: &ProjectionNeeds,
+    batch_size: usize,
+    limit: Option<usize>,
+    tx: &mpsc::Sender<DfResult<RecordBatch>>,
+) -> DfResult<()> {
+    let tenant = if let JobsScanStrategy::FullScan { tenant } = strategy {
+        tenant.as_deref()
+    } else {
+        return Ok(()); // unreachable: caller guards on FullScan
+    };
+
+    // Concurrently scan job_info values and (optionally) status records.
+    let (jobs_result, status_result) = tokio::join!(
+        async {
+            match tenant {
+                Some(t) => shard.scan_jobs_with_views(t, limit).await.map(|v| {
+                    v.into_iter()
+                        .map(|(id, view)| (t.to_string(), id, view))
+                        .collect::<Vec<_>>()
+                }),
+                None => shard.scan_all_jobs_with_views(limit).await,
+            }
+            .map_err(|e: crate::job_store_shard::JobStoreShardError| {
+                DataFusionError::Execution(e.to_string())
+            })
+        },
+        async {
+            if needs.need_any_status() {
+                match tenant {
+                    Some(t) => shard
+                        .scan_jobs_status_records(t, limit)
+                        .await
+                        .map(|v| v.into_iter().collect::<HashMap<_, _>>()),
+                    None => shard.scan_all_jobs_status_records(limit).await.map(|v| {
+                        v.into_iter()
+                            .map(|(_, id, s)| (id, s))
+                            .collect::<HashMap<_, _>>()
+                    }),
+                }
+                .map_err(|e: crate::job_store_shard::JobStoreShardError| {
+                    DataFusionError::Execution(e.to_string())
+                })
+            } else {
+                Ok(HashMap::new())
+            }
+        }
+    );
+
+    let jobs_with_tenant: Vec<(String, String, JobView)> = jobs_result?;
+    let status_map: HashMap<String, JobStatus> = status_result?;
+
+    // Build the (tenant, job_id) pairs and jobs_map from the range scan results.
+    // Range scans skip tombstones, so all returned entries are live jobs.
+    let job_pairs: Vec<(String, String)> = jobs_with_tenant
+        .iter()
+        .map(|(t, id, _)| (t.clone(), id.clone()))
+        .collect();
+    let jobs_map: HashMap<String, JobView> = jobs_with_tenant
+        .into_iter()
+        .map(|(_, id, view)| (id, view))
+        .collect();
+
+    let shard_id = shard.name().to_string();
+    let mut sent = 0usize;
+    let mut i = 0usize;
+    while i < job_pairs.len() && limit.is_none_or(|l| sent < l) {
+        let end = (i + batch_size).min(job_pairs.len());
+        let batch_pairs: Vec<&(String, String)> = job_pairs[i..end].iter().collect();
+        let batch =
+            build_job_pairs_batch(projection, &shard_id, &batch_pairs, &jobs_map, &status_map)?;
+        sent += batch.num_rows();
+        if tx.send(Ok(batch)).await.is_err() {
+            return Ok(());
         }
         i = end;
     }
