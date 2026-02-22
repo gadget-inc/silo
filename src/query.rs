@@ -883,22 +883,32 @@ async fn fetch_batch_data(
             .push(job_id.clone());
     }
     for (tenant, ids) in &by_tenant {
-        if needs.need_job_info || needs.needs_existence_check {
-            jobs_map.extend(
-                shard
-                    .get_jobs_batch(tenant, ids)
-                    .await
-                    .map_err(|e| DataFusionError::Execution(e.to_string()))?,
-            );
-        }
-        if needs.need_any_status() {
-            status_map.extend(
-                shard
-                    .get_jobs_status_batch(tenant, ids)
-                    .await
-                    .map_err(|e| DataFusionError::Execution(e.to_string()))?,
-            );
-        }
+        let need_jobs = needs.need_job_info || needs.needs_existence_check;
+        let need_status = needs.need_any_status();
+        let (jobs_result, status_result) = tokio::join!(
+            async {
+                if need_jobs {
+                    shard
+                        .get_jobs_batch(tenant, ids)
+                        .await
+                        .map_err(|e| DataFusionError::Execution(e.to_string()))
+                } else {
+                    Ok(HashMap::new())
+                }
+            },
+            async {
+                if need_status {
+                    shard
+                        .get_jobs_status_batch(tenant, ids)
+                        .await
+                        .map_err(|e| DataFusionError::Execution(e.to_string()))
+                } else {
+                    Ok(HashMap::new())
+                }
+            }
+        );
+        jobs_map.extend(jobs_result?);
+        status_map.extend(status_result?);
     }
     Ok((jobs_map, status_map))
 }

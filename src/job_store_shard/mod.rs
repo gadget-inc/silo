@@ -407,12 +407,19 @@ impl JobStoreShard {
         tenant: &str,
         ids: &[String],
     ) -> Result<std::collections::HashMap<String, JobView>, JobStoreShardError> {
+        use futures::future::try_join_all;
         use std::collections::HashMap;
 
-        let mut map = HashMap::with_capacity(ids.len());
-        for id in ids {
+        let results = try_join_all(ids.iter().map(|id| async move {
             let key = job_info_key(tenant, id);
-            if let Some(raw) = self.db.get(&key).await? {
+            let maybe_raw = self.db.get(&key).await?;
+            Ok::<_, JobStoreShardError>((id, maybe_raw))
+        }))
+        .await?;
+
+        let mut map = HashMap::with_capacity(ids.len());
+        for (id, maybe_raw) in results {
+            if let Some(raw) = maybe_raw {
                 map.insert(id.clone(), JobView::new(raw)?);
             }
         }
@@ -441,12 +448,19 @@ impl JobStoreShard {
         tenant: &str,
         ids: &[String],
     ) -> Result<std::collections::HashMap<String, JobStatus>, JobStoreShardError> {
+        use futures::future::try_join_all;
         use std::collections::HashMap;
 
-        let mut map = HashMap::with_capacity(ids.len());
-        for id in ids {
+        let results = try_join_all(ids.iter().map(|id| async move {
             let key = job_status_key(tenant, id);
-            if let Some(raw) = self.db.get(&key).await? {
+            let maybe_raw = self.db.get(&key).await?;
+            Ok::<_, JobStoreShardError>((id, maybe_raw))
+        }))
+        .await?;
+
+        let mut map = HashMap::with_capacity(ids.len());
+        for (id, maybe_raw) in results {
+            if let Some(raw) = maybe_raw {
                 map.insert(id.clone(), helpers::decode_job_status_owned(&raw)?);
             }
         }
