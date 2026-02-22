@@ -172,11 +172,15 @@ function getLogFilePath(scenario, seed) {
  * Uses cargo's JSON output to discover the binary location.
  */
 function buildAndGetBinaryPath() {
-  console.log("Building test binary...");
+  console.log("Building test binary (opt-level=1)...");
+  // Use opt-level=1 for DST tests: debug builds (opt-level=0) are ~6x slower,
+  // which dominates CI runtime. opt-level=1 adds basic optimizations (inlining,
+  // dead code elimination) with negligible extra compile time.
+  const buildEnv = { ...process.env, CARGO_PROFILE_TEST_OPT_LEVEL: "1" };
   const buildResult = spawnSync(
     "cargo",
     ["test", "--features", "dst", "--test", "turmoil_runner", "--no-run", "--message-format=json"],
-    { stdio: ["ignore", "pipe", "inherit"] }
+    { stdio: ["ignore", "pipe", "inherit"], env: buildEnv }
   );
   if (buildResult.status !== 0) {
     console.error("Failed to build test binary");
@@ -214,6 +218,7 @@ function runScenarioWithSeed(binaryPath, scenario, seed) {
   return new Promise((resolve) => {
     const logFile = getLogFilePath(scenario, seed);
     const logStream = createWriteStream(logFile);
+    const startTime = Date.now();
 
     const proc = spawn(
       binaryPath,
@@ -230,6 +235,7 @@ function runScenarioWithSeed(binaryPath, scenario, seed) {
 
     proc.on("close", (code) => {
       // End the log stream and clean up
+      const durationSec = (Date.now() - startTime) / 1000;
       logStream.end(() => {
         const passed = code === 0;
 
@@ -240,16 +246,17 @@ function runScenarioWithSeed(binaryPath, scenario, seed) {
           } catch {
             // Ignore deletion errors
           }
-          resolve({ passed, logFile: null, exitCode: code, scenario, seed });
+          resolve({ passed, logFile: null, exitCode: code, scenario, seed, durationSec });
         } else {
-          resolve({ passed, logFile, exitCode: code, scenario, seed });
+          resolve({ passed, logFile, exitCode: code, scenario, seed, durationSec });
         }
       });
     });
 
     proc.on("error", (err) => {
       logStream.end();
-      resolve({ passed: false, logFile, exitCode: -1, scenario, seed, error: err.message });
+      const durationSec = (Date.now() - startTime) / 1000;
+      resolve({ passed: false, logFile, exitCode: -1, scenario, seed, durationSec, error: err.message });
     });
   });
 }
@@ -349,16 +356,21 @@ async function main() {
   const startTime = Date.now();
 
   // Run tests in parallel, invoking the binary directly (no cargo overhead)
+  const scenarioDurations = {};
   await runTestsInParallel(binaryPath, tasks, PARALLELISM, (result, completed, total) => {
-    const { passed, scenario, seed } = result;
+    const { passed, scenario, seed, durationSec } = result;
     const padSeed = String(seed).padEnd(10);
     const progress = `(${String(completed).padStart(3)}/${total})`;
+    const durStr = `${durationSec.toFixed(1)}s`;
+
+    if (!scenarioDurations[scenario]) scenarioDurations[scenario] = [];
+    scenarioDurations[scenario].push(durationSec);
 
     if (passed) {
-      console.log(`Seed ${padSeed} ${progress} [${scenario}]: ✓`);
+      console.log(`Seed ${padSeed} ${progress} [${scenario}]: ✓ (${durStr})`);
       totalPassed += 1;
     } else {
-      console.log(`Seed ${padSeed} ${progress} [${scenario}]: FAILED`);
+      console.log(`Seed ${padSeed} ${progress} [${scenario}]: FAILED (${durStr})`);
       totalFailed += 1;
       failures.push(result);
     }
@@ -371,6 +383,19 @@ async function main() {
   console.log("==============================================");
   console.log(`Results: ${totalPassed} passed, ${totalFailed} failed`);
   console.log(`Elapsed: ${elapsedSecs}s total, ${perSeedSecs}s per seed (wall clock / seeds)`);
+  console.log("");
+  console.log("Per-scenario timing:");
+  const scenarioStats = Object.entries(scenarioDurations)
+    .map(([name, times]) => ({
+      name,
+      avg: times.reduce((a, b) => a + b, 0) / times.length,
+      max: Math.max(...times),
+      count: times.length,
+    }))
+    .sort((a, b) => b.avg - a.avg);
+  for (const s of scenarioStats) {
+    console.log(`  ${s.name.padEnd(28)} avg=${s.avg.toFixed(1).padStart(6)}s  max=${s.max.toFixed(1).padStart(6)}s  (n=${s.count})`);
+  }
   console.log("==============================================");
 
   if (failures.length > 0) {
