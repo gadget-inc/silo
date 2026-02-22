@@ -1479,6 +1479,7 @@ pub fn run() {
                 // 2. When a shard splits, SlateDB clones all data to both children
                 // 3. Nodes watch the shard map and immediately reconcile when splits occur
                 // 4. The tenant routing ensures the job is found in the correct child shard
+                // 5. Post-split cleanup removes data from the wrong child shard
                 assert_eq!(
                     completed, enqueued,
                     "All jobs should complete: completed={}, enqueued={}, rate={:.1}%",

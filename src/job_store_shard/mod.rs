@@ -557,7 +557,6 @@ impl JobStoreShard {
         }
 
         self.db.write(batch).await?;
-        self.db.flush().await?;
 
         Ok(())
     }

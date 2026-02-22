@@ -83,8 +83,12 @@ pub fn run() {
                         tracing::trace!(job_id = %job_id, "enqueue_failed");
                         consecutive_failures += 1;
 
-                        // Reconnect after failures - HTTP/2 connection may be corrupted
-                        if consecutive_failures >= 1 {
+                        // Reconnect after repeated failures - HTTP/2 connection may be corrupted.
+                        // Under high message loss, individual request failures are common but
+                        // don't always mean the connection is broken. Each reconnection is
+                        // expensive (TCP+HTTP/2 handshake which can also fail under loss), so
+                        // only reconnect after several consecutive failures.
+                        if consecutive_failures >= 3 {
                             tracing::trace!("reconnecting after failure");
                             if let Ok(new_client) =
                                 create_turmoil_client("http://server:9904", &producer_config).await
@@ -110,11 +114,10 @@ pub fn run() {
             let mut consecutive_failures = 0u32;
 
             let mut completed = 0;
-            for _ in 0..50 {
-                // Exit early if verifier has finished
-                if worker_done_flag.load(Ordering::SeqCst) {
-                    break;
-                }
+            // Run until the verifier signals done. Under high message loss, a fixed
+            // iteration count can be exhausted before any jobs complete, leaving no
+            // worker to make progress for the rest of the scenario.
+            while !worker_done_flag.load(Ordering::SeqCst) {
                 match client
                     .lease_tasks(tonic::Request::new(LeaseTasksRequest {
                         shard: Some(TEST_SHARD_ID.to_string()),
@@ -159,8 +162,12 @@ pub fn run() {
                         tracing::trace!("lease_failed");
                         consecutive_failures += 1;
 
-                        // Reconnect after failures - HTTP/2 connection may be corrupted
-                        if consecutive_failures >= 1 {
+                        // Reconnect after repeated failures - HTTP/2 connection may be corrupted.
+                        // Under high message loss, individual request failures are common but
+                        // don't always mean the connection is broken. Each reconnection is
+                        // expensive (TCP+HTTP/2 handshake which can also fail under loss), so
+                        // only reconnect after several consecutive failures.
+                        if consecutive_failures >= 3 {
                             tracing::trace!("reconnecting after lease failure");
                             if let Ok(new_client) =
                                 create_turmoil_client("http://server:9904", &worker_config).await
