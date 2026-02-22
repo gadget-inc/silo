@@ -21,13 +21,16 @@
 .claude/rules
 .claude/settings.json
 .claude/skills/fix-ci
+.claude/skills/fix-dst
 .codex/config.toml
 .codex/skills/fix-ci
+.codex/skills/fix-dst
 .cursor/cli.json
 .cursor/mcp.json
 .cursor/rules/alloy.mdc
 .cursor/rules/dst.mdc
 .cursor/skills/fix-ci
+.cursor/skills/fix-dst
 AGENTS.md
 tests/turmoil/AGENTS.md
 # end lnai-generated
