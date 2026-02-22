@@ -5,12 +5,13 @@ use std::ops::ControlFlow;
 use slatedb::Db;
 
 use crate::job::JobStatusKind;
+use crate::job::{JobStatus, JobView};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{
     end_bound, idx_metadata_key_only_prefix, idx_metadata_prefix, idx_status_time_all_prefix,
     idx_status_time_prefix, idx_status_time_prefix_with_time, idx_status_time_tenant_prefix,
-    job_info_prefix, jobs_prefix, parse_job_info_key, parse_metadata_index_key,
-    parse_status_time_index_key,
+    job_info_prefix, job_status_prefix, jobs_prefix, jobs_status_prefix, parse_job_info_key,
+    parse_job_status_key, parse_metadata_index_key, parse_status_time_index_key,
 };
 
 /// Shared scan-and-collect loop: opens a range iterator, applies a per-key
@@ -283,6 +284,132 @@ impl JobStoreShard {
             )
         })
         .await
+    }
+
+    /// Range scan returning (job_id, JobView) pairs for a tenant.
+    /// Reads each job_info KV exactly once — the value IS the job data.
+    /// Avoids the double-read that would occur from scan_jobs + get_jobs_batch.
+    pub async fn scan_jobs_with_views(
+        &self,
+        tenant: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<(String, JobView)>, JobStoreShardError> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        let start = job_info_prefix(tenant);
+        let end = end_bound(&start);
+        let mut iter = self.db.scan::<Vec<u8>, _>(start..end).await?;
+        let capacity = limit.unwrap_or(1024).min(1024);
+        let mut out = Vec::with_capacity(capacity);
+        loop {
+            if limit.is_some_and(|l| out.len() >= l) {
+                break;
+            }
+            let Some(kv) = iter.next().await? else {
+                break;
+            };
+            let Some(p) = parse_job_info_key(&kv.key).filter(|p| !p.job_id.is_empty()) else {
+                continue;
+            };
+            out.push((p.job_id, JobView::new(kv.value)?));
+        }
+        Ok(out)
+    }
+
+    /// Range scan returning (tenant, job_id, JobView) across ALL tenants.
+    /// Replaces scan_all_jobs + get_jobs_batch for full-cluster scans.
+    pub async fn scan_all_jobs_with_views(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<Vec<(String, String, JobView)>, JobStoreShardError> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        let start = jobs_prefix();
+        let end = end_bound(&start);
+        let mut iter = self.db.scan::<Vec<u8>, _>(start..end).await?;
+        let capacity = limit.unwrap_or(1024).min(1024);
+        let mut out = Vec::with_capacity(capacity);
+        loop {
+            if limit.is_some_and(|l| out.len() >= l) {
+                break;
+            }
+            let Some(kv) = iter.next().await? else {
+                break;
+            };
+            let Some(p) = parse_job_info_key(&kv.key).filter(|p| !p.job_id.is_empty()) else {
+                continue;
+            };
+            out.push((p.tenant, p.job_id, JobView::new(kv.value)?));
+        }
+        Ok(out)
+    }
+
+    /// Range scan returning (job_id, JobStatus) for a tenant's status records.
+    /// Replaces batched get_jobs_status_batch point-lookups for full-tenant scans.
+    pub async fn scan_jobs_status_records(
+        &self,
+        tenant: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<(String, JobStatus)>, JobStoreShardError> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        let start = job_status_prefix(tenant);
+        let end = end_bound(&start);
+        let mut iter = self.db.scan::<Vec<u8>, _>(start..end).await?;
+        let capacity = limit.unwrap_or(1024).min(1024);
+        let mut out = Vec::with_capacity(capacity);
+        loop {
+            if limit.is_some_and(|l| out.len() >= l) {
+                break;
+            }
+            let Some(kv) = iter.next().await? else {
+                break;
+            };
+            let Some(p) = parse_job_status_key(&kv.key).filter(|p| !p.job_id.is_empty()) else {
+                continue;
+            };
+            out.push((
+                p.job_id,
+                crate::job_store_shard::helpers::decode_job_status_owned(&kv.value)?,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Range scan returning (tenant, job_id, JobStatus) across ALL tenants.
+    /// Replaces batched get_jobs_status_batch point-lookups for full-cluster scans.
+    pub async fn scan_all_jobs_status_records(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<Vec<(String, String, JobStatus)>, JobStoreShardError> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        let start = jobs_status_prefix();
+        let end = end_bound(&start);
+        let mut iter = self.db.scan::<Vec<u8>, _>(start..end).await?;
+        let capacity = limit.unwrap_or(1024).min(1024);
+        let mut out = Vec::with_capacity(capacity);
+        loop {
+            if limit.is_some_and(|l| out.len() >= l) {
+                break;
+            }
+            let Some(kv) = iter.next().await? else {
+                break;
+            };
+            let Some(p) = parse_job_status_key(&kv.key).filter(|p| !p.job_id.is_empty()) else {
+                continue;
+            };
+            out.push((
+                p.tenant,
+                p.job_id,
+                crate::job_store_shard::helpers::decode_job_status_owned(&kv.value)?,
+            ));
+        }
+        Ok(out)
     }
 
     /// Scan jobs by metadata key with a value prefix. Returns jobs where the metadata

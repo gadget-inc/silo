@@ -77,6 +77,16 @@ pub fn job_status_key(tenant: &str, job_id: &str) -> Vec<u8> {
     encode_with_prefix(prefix::JOB_STATUS, &(tenant, job_id))
 }
 
+/// Prefix for scanning all status records for a tenant.
+pub fn job_status_prefix(tenant: &str) -> Vec<u8> {
+    encode_with_prefix(prefix::JOB_STATUS, &(tenant,))
+}
+
+/// Prefix for scanning all status records across all tenants.
+pub fn jobs_status_prefix() -> Vec<u8> {
+    vec![prefix::JOB_STATUS]
+}
+
 /// Parsed job status key components (same structure as job info).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedJobStatusKey {
