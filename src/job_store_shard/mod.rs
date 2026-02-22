@@ -407,13 +407,39 @@ impl JobStoreShard {
         tenant: &str,
         ids: &[String],
     ) -> Result<std::collections::HashMap<String, JobView>, JobStoreShardError> {
+        use futures::StreamExt;
         use std::collections::HashMap;
 
+        // Bound concurrency to avoid thundering-herd on the object-store I/O
+        // layer (local-disk: spawn_blocking thread explosion; GCS: connection
+        // pool saturation).  64 in-flight gets gives ~3x wall-clock speedup on
+        // warm block-cache while keeping cold-start I/O manageable.
+        const CONCURRENCY: usize = 64;
+
+        // Pre-build (id, key) pairs with owned data so the per-future async
+        // blocks are 'static and work cleanly with buffer_unordered.
+        let keyed: Vec<(String, Vec<u8>)> = ids
+            .iter()
+            .map(|id| (id.clone(), job_info_key(tenant, id)))
+            .collect();
+        let db = Arc::clone(&self.db);
+
+        let results: Vec<_> = futures::stream::iter(keyed.into_iter().map(|(id, key)| {
+            let db = Arc::clone(&db);
+            async move {
+                let maybe_raw = db.get(&key).await?;
+                Ok::<_, JobStoreShardError>((id, maybe_raw))
+            }
+        }))
+        .buffer_unordered(CONCURRENCY)
+        .collect()
+        .await;
+
         let mut map = HashMap::with_capacity(ids.len());
-        for id in ids {
-            let key = job_info_key(tenant, id);
-            if let Some(raw) = self.db.get(&key).await? {
-                map.insert(id.clone(), JobView::new(raw)?);
+        for item in results {
+            let (id, maybe_raw) = item?;
+            if let Some(raw) = maybe_raw {
+                map.insert(id, JobView::new(raw)?);
             }
         }
         Ok(map)
@@ -441,13 +467,33 @@ impl JobStoreShard {
         tenant: &str,
         ids: &[String],
     ) -> Result<std::collections::HashMap<String, JobStatus>, JobStoreShardError> {
+        use futures::StreamExt;
         use std::collections::HashMap;
 
+        const CONCURRENCY: usize = 64;
+
+        let keyed: Vec<(String, Vec<u8>)> = ids
+            .iter()
+            .map(|id| (id.clone(), job_status_key(tenant, id)))
+            .collect();
+        let db = Arc::clone(&self.db);
+
+        let results: Vec<_> = futures::stream::iter(keyed.into_iter().map(|(id, key)| {
+            let db = Arc::clone(&db);
+            async move {
+                let maybe_raw = db.get(&key).await?;
+                Ok::<_, JobStoreShardError>((id, maybe_raw))
+            }
+        }))
+        .buffer_unordered(CONCURRENCY)
+        .collect()
+        .await;
+
         let mut map = HashMap::with_capacity(ids.len());
-        for id in ids {
-            let key = job_status_key(tenant, id);
-            if let Some(raw) = self.db.get(&key).await? {
-                map.insert(id.clone(), helpers::decode_job_status_owned(&raw)?);
+        for item in results {
+            let (id, maybe_raw) = item?;
+            if let Some(raw) = maybe_raw {
+                map.insert(id, helpers::decode_job_status_owned(&raw)?);
             }
         }
         Ok(map)
