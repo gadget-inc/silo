@@ -73,6 +73,7 @@ async fn grpc_server_lease_tasks_multi_shard() -> anyhow::Result<()> {
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
             wal: None,
             apply_wal_on_close: true,
+            concurrency_reconcile_interval_ms: 5000,
             slatedb: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
@@ -736,6 +737,7 @@ async fn grpc_server_reset_shards_clears_fs_backend_data() -> anyhow::Result<()>
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
             wal: None,
             apply_wal_on_close: true,
+            concurrency_reconcile_interval_ms: 5000,
             slatedb: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
@@ -918,6 +920,7 @@ async fn grpc_server_reset_shards_with_relative_path() -> anyhow::Result<()> {
             path: format!("{}/%shard%", relative_path),
             wal: None,
             apply_wal_on_close: true,
+            concurrency_reconcile_interval_ms: 5000,
             slatedb: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
@@ -1042,6 +1045,7 @@ async fn grpc_server_reset_shards_clears_memory_backend_data() -> anyhow::Result
             path: "test-memory-%shard%".to_string(),
             wal: None,
             apply_wal_on_close: true,
+            concurrency_reconcile_interval_ms: 5000,
             slatedb: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
@@ -1163,6 +1167,7 @@ async fn setup_test_server_production_path(
         path: tmp.path().join("%shard%").to_string_lossy().to_string(),
         wal: None,
         apply_wal_on_close: true,
+        concurrency_reconcile_interval_ms: 5000,
         slatedb: None,
     };
     let rate_limiter = MockGubernatorClient::new_arc();

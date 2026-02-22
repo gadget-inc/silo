@@ -559,7 +559,7 @@ impl ConcurrencyManager {
         let mgr = Arc::clone(self);
         tokio::spawn(async move {
             // Startup: scan for existing pending requests
-            mgr.scan_pending_requests_on_startup(&db, &range).await;
+            mgr.reconcile_pending_requests(&db, &range).await;
 
             loop {
                 mgr.grant_notify.notified().await;
@@ -602,14 +602,20 @@ impl ConcurrencyManager {
         self.grant_notify.notify_one();
     }
 
-    /// Scan all pending concurrency requests on startup and trigger grants.
-    async fn scan_pending_requests_on_startup(&self, db: &Db, range: &ShardRange) {
+    /// Scan all pending concurrency requests and trigger grants for each queue.
+    ///
+    /// This is used at grant-scanner startup and by the shard's periodic
+    /// reconciliation task to self-heal from missed notifications.
+    pub async fn reconcile_pending_requests(&self, db: &Db, range: &ShardRange) {
         let start = concurrency_requests_prefix();
         let end = end_bound(&start);
         let mut iter = match db.scan::<Vec<u8>, _>(start..end).await {
             Ok(i) => i,
             Err(e) => {
-                tracing::warn!(error = %e, "grant scanner: failed to scan requests on startup");
+                tracing::warn!(
+                    error = %e,
+                    "grant scanner: failed to scan requests during reconciliation"
+                );
                 return;
             }
         };
@@ -621,7 +627,10 @@ impl ConcurrencyManager {
                 Ok(Some(kv)) => kv,
                 Ok(None) => break,
                 Err(e) => {
-                    tracing::warn!(error = %e, "grant scanner: startup scan iteration error");
+                    tracing::warn!(
+                        error = %e,
+                        "grant scanner: reconciliation scan iteration error"
+                    );
                     break;
                 }
             };

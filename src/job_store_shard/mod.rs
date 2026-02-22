@@ -27,6 +27,7 @@ pub use helpers::now_epoch_ms;
 
 use slatedb::Db;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -68,6 +69,8 @@ pub struct OpenShardOptions {
     pub rate_limiter: Arc<dyn RateLimitClient>,
     /// Optional metrics collector
     pub metrics: Option<Metrics>,
+    /// Interval for periodic concurrency request reconciliation.
+    pub concurrency_reconcile_interval: Duration,
 }
 
 /// Result of a dequeue operation - contains both job tasks and floating limit refresh tasks
@@ -89,6 +92,8 @@ pub struct JobStoreShard {
     wal_close_config: Option<WalCloseConfig>,
     /// Optional metrics for recording shard-level stats
     pub(crate) metrics: Option<Metrics>,
+    /// Interval for periodic concurrency request reconciliation.
+    concurrency_reconcile_interval: Duration,
     /// Cancellation token for background tasks like cleanup.
     /// Signaled when the shard is closing.
     cancellation: CancellationToken,
@@ -194,6 +199,9 @@ impl JobStoreShard {
                 slatedb_settings,
                 rate_limiter,
                 metrics,
+                concurrency_reconcile_interval: Duration::from_millis(
+                    crate::settings::DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS.max(1),
+                ),
             },
             range,
         )
@@ -228,6 +236,7 @@ impl JobStoreShard {
             slatedb_settings,
             rate_limiter,
             metrics,
+            concurrency_reconcile_interval,
         } = options;
 
         let mut db_builder = slatedb::DbBuilder::new(db_path, store)
@@ -261,7 +270,7 @@ impl JobStoreShard {
         broker.start();
 
         // Start the grant scanner after both ConcurrencyManager and TaskBroker are ready
-        concurrency.start_grant_scanner(Arc::clone(&db), Arc::clone(&broker), range);
+        concurrency.start_grant_scanner(Arc::clone(&db), Arc::clone(&broker), range.clone());
 
         let shard = Arc::new(Self {
             name,
@@ -272,8 +281,13 @@ impl JobStoreShard {
             rate_limiter,
             wal_close_config,
             metrics,
+            concurrency_reconcile_interval,
             cancellation: CancellationToken::new(),
         });
+
+        // Periodically reconcile pending concurrency requests to self-heal from
+        // missed in-memory notifications or transient scanner failures.
+        shard.spawn_concurrency_reconcile_task(range.clone());
 
         // Set the shard creation timestamp if this is the first time opening
         shard.set_created_at_ms_if_unset().await?;
@@ -376,6 +390,36 @@ impl JobStoreShard {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    fn spawn_concurrency_reconcile_task(self: &Arc<Self>, range: ShardRange) {
+        let shard = Arc::clone(self);
+        let cancellation = self.cancellation.clone();
+        let shard_name = self.name.clone();
+        let reconcile_interval = self.concurrency_reconcile_interval;
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(reconcile_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        tracing::debug!(
+                            shard = %shard_name,
+                            "stopping periodic concurrency reconciliation (shard closing)"
+                        );
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        shard
+                            .concurrency
+                            .reconcile_pending_requests(shard.db.as_ref(), &range)
+                            .await;
+                    }
+                }
+            }
+        });
     }
 
     pub fn db(&self) -> &Db {

@@ -13,6 +13,7 @@ fn make_test_factory() -> Arc<ShardFactory> {
             path: "unused".to_string(),
             wal: None,
             apply_wal_on_close: true,
+            concurrency_reconcile_interval_ms: 5000,
             slatedb: None,
         },
         MockGubernatorClient::new_arc(),

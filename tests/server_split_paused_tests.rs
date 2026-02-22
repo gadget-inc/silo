@@ -185,6 +185,7 @@ async fn create_test_service(paused: bool) -> (SiloService, Arc<MockPausedCoordi
             path: tmpdir.join("%shard%").to_string_lossy().to_string(),
             wal: None,
             apply_wal_on_close: true,
+            concurrency_reconcile_interval_ms: 5000,
             slatedb: None,
         },
         MockGubernatorClient::new_arc(),

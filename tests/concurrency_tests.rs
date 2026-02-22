@@ -1,12 +1,12 @@
 mod test_helpers;
 
-use silo::codec::{decode_lease, decode_task, encode_lease};
+use silo::codec::{decode_lease, decode_task, encode_concurrency_action, encode_lease};
 use silo::job::{ConcurrencyLimit, Limit};
 use silo::job_attempt::{AttemptOutcome, AttemptStatus};
-use silo::keys::concurrency_holder_key;
+use silo::keys::{concurrency_holder_key, concurrency_request_key};
 use silo::retry::RetryPolicy;
-use silo::task::{LeaseRecord, Task};
-use slatedb::DbIterator;
+use silo::task::{ConcurrencyAction, LeaseRecord, Task};
+use slatedb::{DbIterator, WriteBatch};
 
 use test_helpers::*;
 
@@ -127,6 +127,87 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
     // Grants happen asynchronously via the background scanner, so poll.
     let some = poll_until(|| first_task_kv(shard.db()), |r| r.is_some(), 5000).await;
     assert!(some.is_some(), "task should be enqueued for next requester");
+}
+
+#[silo::test]
+async fn periodic_reconcile_grants_pending_request_without_signal() {
+    let (_tmp, shard) = open_temp_shard_with_reconcile_interval_ms(50).await;
+    let now = now_ms();
+    let tenant = "-";
+    let queue = "reconcile-q".to_string();
+
+    // Create a real job record that the grant scanner can resolve when granting.
+    // Use a future start time so no ready task exists for this job yet.
+    let job_id = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now + 60_000,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"reconcile": true})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue");
+
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        0,
+        "no holders before injecting request"
+    );
+
+    // Manually inject a pending request directly in DB without calling request_grant.
+    // This simulates a crash/bug window where durable request exists but in-memory
+    // scanner notification was missed.
+    let action = ConcurrencyAction::EnqueueTask {
+        start_time_ms: now,
+        priority: 10,
+        job_id: job_id.clone(),
+        attempt_number: 1,
+        relative_attempt_number: 1,
+        task_group: "default".to_string(),
+    };
+    let request_key = concurrency_request_key(tenant, &queue, now, 10, &job_id, 1, "manual");
+    let request_value = encode_concurrency_action(&action);
+    let mut batch = WriteBatch::new();
+    batch.put(&request_key, &request_value);
+    shard
+        .db()
+        .write(batch)
+        .await
+        .expect("write pending concurrency request");
+
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        1,
+        "request should be present before reconciliation"
+    );
+
+    // Periodic reconciliation should discover the orphaned request and grant it.
+    let holders = poll_until(
+        || count_concurrency_holders(shard.db()),
+        |count| *count == 1,
+        2_000,
+    )
+    .await;
+    assert_eq!(
+        holders, 1,
+        "periodic reconciliation should grant request and create holder"
+    );
+
+    let requests_left = poll_until(
+        || count_concurrency_requests(shard.db()),
+        |count| *count == 0,
+        2_000,
+    )
+    .await;
+    assert_eq!(
+        requests_left, 0,
+        "request should be consumed after reconciliation grant"
+    );
 }
 
 #[silo::test]

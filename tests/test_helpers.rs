@@ -1,9 +1,10 @@
 #![allow(dead_code)]
 
 use silo::gubernator::{MockGubernatorClient, RateLimitClient};
-use silo::job_store_shard::JobStoreShard;
+use silo::job_store_shard::{JobStoreShard, OpenShardOptions};
 use silo::settings::{Backend, DatabaseConfig};
 use silo::shard_range::ShardRange;
+use silo::storage::resolve_object_store;
 use slatedb::{Db, DbIterator};
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,6 +52,33 @@ pub fn parse_time_from_binary_task_key(key: &[u8]) -> Option<u64> {
 pub async fn open_temp_shard() -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>) {
     let rate_limiter = MockGubernatorClient::new_arc();
     open_temp_shard_with_rate_limiter(rate_limiter).await
+}
+
+/// Open a temp shard with a custom periodic concurrency reconciliation interval.
+pub async fn open_temp_shard_with_reconcile_interval_ms(
+    interval_ms: u64,
+) -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>) {
+    let rate_limiter = MockGubernatorClient::new_arc();
+    let tmp = tempfile::tempdir().unwrap();
+    let resolved = resolve_object_store(&Backend::Fs, tmp.path().to_string_lossy().as_ref())
+        .expect("resolve fs object store");
+    let shard = JobStoreShard::open_with_resolved_store(
+        "test".to_string(),
+        &resolved.canonical_path,
+        OpenShardOptions {
+            store: resolved.store,
+            wal_store: None,
+            wal_close_config: None,
+            slatedb_settings: Some(fast_flush_slatedb_settings()),
+            rate_limiter,
+            metrics: None,
+            concurrency_reconcile_interval: Duration::from_millis(interval_ms.max(1)),
+        },
+        ShardRange::full(),
+    )
+    .await
+    .expect("open shard");
+    (tmp, shard)
 }
 
 /// Open a temp shard with a specific range (useful for testing split-aware behavior)

@@ -26,3 +26,5 @@ backend = "fs"
 # %shard% placeholder will be replaced with the shard ID
 # NOTE: %shard% must be at a directory boundary (after /) for split/clone to work correctly
 path = "/var/lib/silo/%shard%"
+# Optional: periodic self-healing scan for pending concurrency requests (default: 5000)
+# concurrency_reconcile_interval_ms = 5000

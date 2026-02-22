@@ -34,6 +34,7 @@ async fn open_fs_db_from_config() {
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
             wal: None,
             apply_wal_on_close: true,
+            concurrency_reconcile_interval_ms: 5000,
             slatedb: None,
         },
     };
@@ -303,6 +304,7 @@ async fn factory_close_all_flushes_all_shards_wal() {
             path: wal_dir.path().join("%shard%").to_string_lossy().to_string(),
         }),
         apply_wal_on_close: true,
+        concurrency_reconcile_interval_ms: 5000,
         slatedb: None,
     };
 
@@ -551,6 +553,23 @@ path = "/tmp/silo-%shard%"
 
     // slatedb should be None when not specified
     assert!(cfg.database.slatedb.is_none());
+    assert_eq!(
+        cfg.database.concurrency_reconcile_interval_ms, 5000,
+        "missing concurrency_reconcile_interval_ms should use default"
+    );
+}
+
+#[silo::test]
+fn parse_toml_with_custom_concurrency_reconcile_interval() {
+    let toml_str = r#"
+[database]
+backend = "fs"
+path = "/tmp/silo-%shard%"
+concurrency_reconcile_interval_ms = 25
+"#;
+
+    let cfg: AppConfig = toml::from_str(toml_str).expect("parse TOML");
+    assert_eq!(cfg.database.concurrency_reconcile_interval_ms, 25);
 }
 
 #[silo::test]
@@ -635,6 +654,7 @@ async fn factory_passes_slatedb_settings_to_shards() {
         path: tmp.path().join("%shard%").to_string_lossy().to_string(),
         wal: None,
         apply_wal_on_close: true,
+        concurrency_reconcile_interval_ms: 5000,
         slatedb: Some(slatedb::config::Settings {
             flush_interval: Some(std::time::Duration::from_millis(25)),
             l0_sst_size_bytes: 16777216, // 16MB
