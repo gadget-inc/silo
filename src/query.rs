@@ -1,7 +1,10 @@
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, ArrayRef, Int64Array, StringArray, UInt8Array, UInt32Array};
+use datafusion::arrow::array::{
+    Array, ArrayRef, Int64Array, StringArray, UInt8Array, UInt32Array, new_null_array,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session as CatalogSession;
@@ -23,6 +26,7 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::job::{JobStatus, JobView};
 use crate::job_store_shard::JobStoreShard;
 
 /// Shared utility to get the EXPLAIN plan for a query.
@@ -506,6 +510,71 @@ impl JobsScanner {
     }
 }
 
+/// Captures what columns the DataFusion projection requires, so we can pick
+/// the most efficient scan path and skip fetches we don't need.
+struct ProjectionNeeds {
+    /// Needs fields only in job_info: priority, enqueue_time_ms, payload, task_group, metadata
+    need_job_info: bool,
+    /// Needs fields available from the status/time index key: status_kind, status_changed_at_ms
+    need_status_index_fields: bool,
+    /// Needs fields only in the status record: current_attempt, next_attempt_starts_after_ms
+    need_status_point_lookup: bool,
+    /// Fast path: scan status/time index directly, no point-lookups required
+    use_status_index_path: bool,
+    /// ExactId with a tenant: must verify existence even without job_info columns
+    needs_existence_check: bool,
+}
+
+impl ProjectionNeeds {
+    fn need_any_status(&self) -> bool {
+        self.need_status_index_fields || self.need_status_point_lookup
+    }
+}
+
+fn analyze_projection(projection: &SchemaRef, strategy: &JobsScanStrategy) -> ProjectionNeeds {
+    let need_job_info = projection.fields().iter().any(|f| {
+        matches!(
+            f.name().as_str(),
+            "priority" | "enqueue_time_ms" | "payload" | "task_group" | "metadata"
+        )
+    });
+    // status_kind and status_changed_at_ms are encoded in the status/time index key, so
+    // they can be read without an extra point-lookup into the status record.
+    let need_status_index_fields = projection
+        .fields()
+        .iter()
+        .any(|f| matches!(f.name().as_str(), "status_kind" | "status_changed_at_ms"));
+    let need_status_point_lookup = projection.fields().iter().any(|f| {
+        matches!(
+            f.name().as_str(),
+            "current_attempt" | "next_attempt_starts_after_ms"
+        )
+    });
+    // When only fields encoded in the status/time index key are needed, we can scan that
+    // index once and skip all get_jobs_batch / get_jobs_status_batch point-lookups.
+    // Only valid for FullScan — other strategies already have a bounded pair list.
+    let use_status_index_path = need_status_index_fields
+        && !need_job_info
+        && !need_status_point_lookup
+        && matches!(strategy, JobsScanStrategy::FullScan { .. });
+    // ExactId with a tenant synthesises the pair without scanning the DB, so we must
+    // verify existence via get_jobs_batch even when job_info columns aren't projected.
+    let needs_existence_check = matches!(
+        strategy,
+        JobsScanStrategy::ExactId {
+            tenant: Some(_),
+            ..
+        }
+    );
+    ProjectionNeeds {
+        need_job_info,
+        need_status_index_fields,
+        need_status_point_lookup,
+        use_status_index_path,
+        needs_existence_check,
+    }
+}
+
 impl Scan for JobsScanner {
     fn describe(&self, filters: &[Expr], limit: Option<usize>) -> String {
         let strategy = parse_jobs_scan_strategy(filters);
@@ -520,486 +589,473 @@ impl Scan for JobsScanner {
         limit: Option<usize>,
     ) -> SendableRecordBatchStream {
         let strategy = parse_jobs_scan_strategy(filters);
-
         let (tx, rx) = mpsc::channel::<DfResult<RecordBatch>>(2);
         let shard = Arc::clone(&self.shard);
-        let proj_for_stream = Arc::clone(&projection);
+        let proj = Arc::clone(&projection);
         tokio::spawn(async move {
-            let mut sent: usize = 0;
-
-            // Dispatch based on parsed scan strategy to get (tenant, job_id) pairs
-            let job_pairs: Vec<(String, String)> = match strategy {
-                JobsScanStrategy::ExactId { tenant, id } => {
-                    if let Some(t) = tenant {
-                        vec![(t, id)]
-                    } else {
-                        match shard.scan_all_jobs(limit).await {
-                            Ok(all) => all.into_iter().filter(|(_, jid)| jid == &id).collect(),
-                            Err(e) => {
-                                let _ = tx
-                                    .send(Err(DataFusionError::Execution(e.to_string())))
-                                    .await;
-                                return;
-                            }
-                        }
-                    }
-                }
-                JobsScanStrategy::MetadataExact { tenant, key, value } => {
-                    if let Some(ref t) = tenant {
-                        match shard.scan_jobs_by_metadata(t, &key, &value, limit).await {
-                            Ok(v) => v.into_iter().map(|id| (t.clone(), id)).collect(),
-                            Err(e) => {
-                                let _ = tx
-                                    .send(Err(DataFusionError::Execution(e.to_string())))
-                                    .await;
-                                return;
-                            }
-                        }
-                    } else {
-                        match shard.scan_all_jobs(limit).await {
-                            Ok(v) => v,
-                            Err(e) => {
-                                let _ = tx
-                                    .send(Err(DataFusionError::Execution(e.to_string())))
-                                    .await;
-                                return;
-                            }
-                        }
-                    }
-                }
-                JobsScanStrategy::MetadataPrefix {
-                    tenant,
-                    key,
-                    prefix,
-                } => {
-                    if let Some(ref t) = tenant {
-                        match shard
-                            .scan_jobs_by_metadata_prefix(t, &key, &prefix, limit)
-                            .await
-                        {
-                            Ok(v) => v.into_iter().map(|id| (t.clone(), id)).collect(),
-                            Err(e) => {
-                                let _ = tx
-                                    .send(Err(DataFusionError::Execution(e.to_string())))
-                                    .await;
-                                return;
-                            }
-                        }
-                    } else {
-                        match shard.scan_all_jobs(limit).await {
-                            Ok(v) => v,
-                            Err(e) => {
-                                let _ = tx
-                                    .send(Err(DataFusionError::Execution(e.to_string())))
-                                    .await;
-                                return;
-                            }
-                        }
-                    }
-                }
-                JobsScanStrategy::Status { tenant, status } => {
-                    let now_ms = crate::job_store_shard::helpers::now_epoch_ms();
-                    match status {
-                        QueryStatusFilter::Waiting => {
-                            if let Some(ref t) = tenant {
-                                match shard.scan_jobs_waiting(t.as_str(), now_ms, limit).await {
-                                    Ok(v) => v.into_iter().map(|id| (t.clone(), id)).collect(),
-                                    Err(e) => {
-                                        let _ = tx
-                                            .send(Err(DataFusionError::Execution(e.to_string())))
-                                            .await;
-                                        return;
-                                    }
-                                }
-                            } else {
-                                match shard.scan_all_jobs_waiting(now_ms, limit).await {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        let _ = tx
-                                            .send(Err(DataFusionError::Execution(e.to_string())))
-                                            .await;
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                        QueryStatusFilter::FutureScheduled => {
-                            if let Some(ref t) = tenant {
-                                match shard
-                                    .scan_jobs_future_scheduled(t.as_str(), now_ms, limit)
-                                    .await
-                                {
-                                    Ok(v) => v.into_iter().map(|id| (t.clone(), id)).collect(),
-                                    Err(e) => {
-                                        let _ = tx
-                                            .send(Err(DataFusionError::Execution(e.to_string())))
-                                            .await;
-                                        return;
-                                    }
-                                }
-                            } else {
-                                match shard.scan_all_jobs_future_scheduled(now_ms, limit).await {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        let _ = tx
-                                            .send(Err(DataFusionError::Execution(e.to_string())))
-                                            .await;
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                        QueryStatusFilter::Stored(kind) => {
-                            if let Some(ref t) = tenant {
-                                match shard.scan_jobs_by_status(t.as_str(), kind, limit).await {
-                                    Ok(v) => v.into_iter().map(|id| (t.clone(), id)).collect(),
-                                    Err(e) => {
-                                        let _ = tx
-                                            .send(Err(DataFusionError::Execution(e.to_string())))
-                                            .await;
-                                        return;
-                                    }
-                                }
-                            } else {
-                                match shard.scan_all_jobs_by_status(kind, limit).await {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        let _ = tx
-                                            .send(Err(DataFusionError::Execution(e.to_string())))
-                                            .await;
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                JobsScanStrategy::FullScan { tenant } => {
-                    if let Some(ref t) = tenant {
-                        match shard.scan_jobs(t, limit).await {
-                            Ok(v) => v.into_iter().map(|id| (t.clone(), id)).collect(),
-                            Err(e) => {
-                                let _ = tx
-                                    .send(Err(DataFusionError::Execution(e.to_string())))
-                                    .await;
-                                return;
-                            }
-                        }
-                    } else {
-                        match shard.scan_all_jobs(limit).await {
-                            Ok(v) => v,
-                            Err(e) => {
-                                let _ = tx
-                                    .send(Err(DataFusionError::Execution(e.to_string())))
-                                    .await;
-                                return;
-                            }
-                        }
-                    }
-                }
-            };
-
-            let mut i: usize = 0;
-            while i < job_pairs.len() && limit.is_none_or(|l| sent < l) {
-                let start = i;
-                let end = std::cmp::min(job_pairs.len(), start + batch_size);
-
-                // Group by tenant to batch fetch
-                let batch_pairs = &job_pairs[start..end];
-                let mut jobs_map: std::collections::HashMap<String, crate::job::JobView> =
-                    std::collections::HashMap::new();
-                let mut status_map: std::collections::HashMap<String, crate::job::JobStatus> =
-                    std::collections::HashMap::new();
-
-                // Group IDs by tenant for batch fetching
-                let mut by_tenant: std::collections::HashMap<String, Vec<String>> =
-                    std::collections::HashMap::new();
-                for (tenant, job_id) in batch_pairs {
-                    by_tenant
-                        .entry(tenant.clone())
-                        .or_default()
-                        .push(job_id.clone());
-                }
-
-                // Fetch jobs and statuses for each tenant
-                for (tenant, ids) in &by_tenant {
-                    match shard.get_jobs_batch(tenant.as_str(), ids).await {
-                        Ok(m) => jobs_map.extend(m),
-                        Err(e) => {
-                            let _ = tx
-                                .send(Err(DataFusionError::Execution(e.to_string())))
-                                .await;
-                            return;
-                        }
-                    }
-                    match shard.get_jobs_status_batch(tenant.as_str(), ids).await {
-                        Ok(m) => status_map.extend(m),
-                        Err(e) => {
-                            let _ = tx
-                                .send(Err(DataFusionError::Execution(e.to_string())))
-                                .await;
-                            return;
-                        }
-                    }
-                }
-
-                // Filter to only include IDs that actually have jobs
-                let existing_pairs: Vec<&(String, String)> = batch_pairs
-                    .iter()
-                    .filter(|(_, id)| jobs_map.contains_key(id))
-                    .collect();
-
-                // Skip this batch if no jobs exist
-                if existing_pairs.is_empty() {
-                    i = end;
-                    continue;
-                }
-
-                // Handle empty projection (when DataFusion just needs row count)
-                if proj_for_stream.fields().is_empty() {
-                    // Create an empty RecordBatch with the correct number of rows
-                    let batch = match RecordBatch::try_new_with_options(
-                        Arc::clone(&proj_for_stream),
-                        vec![],
-                        &datafusion::arrow::record_batch::RecordBatchOptions::new()
-                            .with_row_count(Some(existing_pairs.len())),
-                    ) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            let _ = tx
-                                .send(Err(DataFusionError::Execution(e.to_string())))
-                                .await;
-                            return;
-                        }
-                    };
-                    sent += batch.num_rows();
-                    if tx.send(Ok(batch)).await.is_err() {
-                        return;
-                    }
-                    i = end;
-                    continue;
-                }
-
-                // Get shard_id from shard name (now a UUID string)
-                let shard_id = shard.name().to_string();
-
-                let mut cols: Vec<ArrayRef> = Vec::with_capacity(proj_for_stream.fields().len());
-                for f in proj_for_stream.fields() {
-                    match f.name().as_str() {
-                        "shard_id" => {
-                            let vals: Vec<&str> = vec![&shard_id; existing_pairs.len()];
-                            cols.push(Arc::new(StringArray::from(vals)));
-                        }
-                        "tenant" => {
-                            let vals: Vec<String> =
-                                existing_pairs.iter().map(|(t, _)| t.clone()).collect();
-                            cols.push(Arc::new(StringArray::from(vals)));
-                        }
-                        "id" => {
-                            let mut out: Vec<String> = Vec::with_capacity(existing_pairs.len());
-                            for (_, id) in &existing_pairs {
-                                out.push((*id).clone());
-                            }
-                            cols.push(Arc::new(StringArray::from(out)));
-                        }
-                        "priority" | "enqueue_time_ms" | "payload" => {
-                            let mut prio: Vec<u8> = Vec::new();
-                            let mut enq: Vec<i64> = Vec::new();
-                            let mut payloads: Vec<Option<String>> = Vec::new();
-                            let need_prio = f.name() == "priority";
-                            let need_enq = f.name() == "enqueue_time_ms";
-                            let need_payload = f.name() == "payload";
-                            for (_, id) in &existing_pairs {
-                                if let Some(view) = jobs_map.get(id) {
-                                    if need_prio {
-                                        prio.push(view.priority());
-                                    }
-                                    if need_enq {
-                                        enq.push(view.enqueue_time_ms());
-                                    }
-                                    if need_payload {
-                                        match view.payload_as_json() {
-                                            Ok(v) => payloads.push(Some(v.to_string())),
-                                            Err(_) => payloads.push(None),
-                                        }
-                                    }
-                                }
-                            }
-                            if need_prio {
-                                cols.push(Arc::new(UInt8Array::from(prio)));
-                            }
-                            if need_enq {
-                                cols.push(Arc::new(Int64Array::from(enq)));
-                            }
-                            if need_payload {
-                                cols.push(Arc::new(StringArray::from(payloads)));
-                            }
-                        }
-                        "status_kind" | "status_changed_at_ms" => {
-                            let mut kinds: Vec<Option<String>> = Vec::new();
-                            let mut changed: Vec<Option<i64>> = Vec::new();
-                            let need_kind = f.name() == "status_kind";
-                            let need_changed = f.name() == "status_changed_at_ms";
-                            for (_, id) in &existing_pairs {
-                                if let Some(status) = status_map.get(id) {
-                                    if need_kind {
-                                        kinds.push(Some(display_status_kind(status)));
-                                    }
-                                    if need_changed {
-                                        changed.push(Some(status.changed_at_ms));
-                                    }
-                                } else {
-                                    if need_kind {
-                                        kinds.push(None);
-                                    }
-                                    if need_changed {
-                                        changed.push(None);
-                                    }
-                                }
-                            }
-                            if need_kind {
-                                cols.push(Arc::new(StringArray::from(kinds)));
-                            }
-                            if need_changed {
-                                cols.push(Arc::new(Int64Array::from(changed)));
-                            }
-                        }
-                        "task_group" => {
-                            let mut task_groups: Vec<String> = Vec::new();
-                            for (_, id) in &existing_pairs {
-                                if let Some(view) = jobs_map.get(id) {
-                                    task_groups.push(view.task_group().to_string());
-                                } else {
-                                    task_groups.push(String::new());
-                                }
-                            }
-                            cols.push(Arc::new(StringArray::from(task_groups)));
-                        }
-                        "current_attempt" => {
-                            let mut vals: Vec<Option<u32>> = Vec::new();
-                            for (_, id) in &existing_pairs {
-                                if let Some(status) = status_map.get(id) {
-                                    vals.push(status.current_attempt);
-                                } else {
-                                    vals.push(None);
-                                }
-                            }
-                            cols.push(Arc::new(UInt32Array::from(vals)));
-                        }
-                        "next_attempt_starts_after_ms" => {
-                            let mut vals: Vec<Option<i64>> = Vec::new();
-                            for (_, id) in &existing_pairs {
-                                if let Some(status) = status_map.get(id) {
-                                    vals.push(status.next_attempt_starts_after_ms);
-                                } else {
-                                    vals.push(None);
-                                }
-                            }
-                            cols.push(Arc::new(Int64Array::from(vals)));
-                        }
-                        "metadata" => {
-                            use datafusion::arrow::array::{MapArray, StructArray};
-
-                            // Build the metadata map arrays
-                            let mut all_metadata: Vec<Vec<(String, String)>> = Vec::new();
-                            for (_, id) in &existing_pairs {
-                                if let Some(view) = jobs_map.get(id) {
-                                    all_metadata.push(view.metadata());
-                                } else {
-                                    all_metadata.push(Vec::new());
-                                }
-                            }
-
-                            // Build keys and values arrays
-                            let mut keys_builder = datafusion::arrow::array::StringBuilder::new();
-                            let mut values_builder = datafusion::arrow::array::StringBuilder::new();
-                            let mut offsets: Vec<i32> = Vec::with_capacity(all_metadata.len() + 1);
-                            offsets.push(0);
-
-                            let mut total_entries = 0i32;
-                            for metadata in &all_metadata {
-                                for (k, v) in metadata {
-                                    keys_builder.append_value(k);
-                                    values_builder.append_value(v);
-                                    total_entries += 1;
-                                }
-                                offsets.push(total_entries);
-                            }
-
-                            let keys_array = Arc::new(keys_builder.finish());
-                            let values_array = Arc::new(values_builder.finish());
-
-                            // Create struct array for the entries
-                            let struct_array = StructArray::try_new(
-                                Fields::from(vec![
-                                    Field::new("key", DataType::Utf8, false),
-                                    Field::new("value", DataType::Utf8, true),
-                                ]),
-                                vec![keys_array, values_array],
-                                None,
-                            )
-                            .map_err(|e| DataFusionError::Execution(e.to_string()));
-
-                            let struct_array = match struct_array {
-                                Ok(a) => a,
-                                Err(e) => {
-                                    let _ = tx.send(Err(e)).await;
-                                    return;
-                                }
-                            };
-
-                            // Create map array
-                            let map_array = MapArray::new(
-                                Arc::new(Field::new(
-                                    "entries",
-                                    DataType::Struct(Fields::from(vec![
-                                        Field::new("key", DataType::Utf8, false),
-                                        Field::new("value", DataType::Utf8, true),
-                                    ])),
-                                    false,
-                                )),
-                                datafusion::arrow::buffer::OffsetBuffer::new(offsets.into()),
-                                struct_array,
-                                None,
-                                false,
-                            );
-
-                            cols.push(Arc::new(map_array));
-                        }
-                        other => {
-                            let _ = tx
-                                .send(Err(DataFusionError::Execution(format!(
-                                    "unknown column {}",
-                                    other
-                                ))))
-                                .await;
-                            return;
-                        }
-                    }
-                }
-
-                let batch = match RecordBatch::try_new(Arc::clone(&proj_for_stream), cols) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(DataFusionError::Execution(e.to_string())))
-                            .await;
-                        return;
-                    }
-                };
-                sent += batch.num_rows();
-                if tx.send(Ok(batch)).await.is_err() {
-                    return;
-                }
-                i = end;
+            if let Err(e) = stream_jobs(&shard, &proj, &strategy, batch_size, limit, &tx).await {
+                let _ = tx.send(Err(e)).await;
             }
         });
-
         Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&projection),
             ReceiverStream::new(rx).map(|r| r),
         ))
     }
+}
+
+/// Top-level driver: picks the status-index fast path or the standard job-pairs path.
+async fn stream_jobs(
+    shard: &Arc<JobStoreShard>,
+    projection: &SchemaRef,
+    strategy: &JobsScanStrategy,
+    batch_size: usize,
+    limit: Option<usize>,
+    tx: &mpsc::Sender<DfResult<RecordBatch>>,
+) -> DfResult<()> {
+    let needs = analyze_projection(projection, strategy);
+    if needs.use_status_index_path {
+        stream_via_status_index(shard, projection, strategy, batch_size, limit, tx).await
+    } else {
+        stream_via_job_pairs(shard, projection, strategy, &needs, batch_size, limit, tx).await
+    }
+}
+
+/// Scans the status/time index and emits RecordBatches without any point-lookups.
+/// Used when the projection only needs tenant, id, status_kind, or status_changed_at_ms.
+async fn stream_via_status_index(
+    shard: &Arc<JobStoreShard>,
+    projection: &SchemaRef,
+    strategy: &JobsScanStrategy,
+    batch_size: usize,
+    limit: Option<usize>,
+    tx: &mpsc::Sender<DfResult<RecordBatch>>,
+) -> DfResult<()> {
+    let tenant = if let JobsScanStrategy::FullScan { tenant } = strategy {
+        tenant.as_deref()
+    } else {
+        None
+    };
+    let indexed = collect_status_index_data(shard, tenant, limit).await?;
+    let shard_id = shard.name().to_string();
+    let mut sent = 0usize;
+    let mut i = 0usize;
+    while i < indexed.len() && limit.is_none_or(|l| sent < l) {
+        let row_count = if let Some(l) = limit {
+            batch_size
+                .min(indexed.len() - i)
+                .min(l.saturating_sub(sent))
+        } else {
+            batch_size.min(indexed.len() - i)
+        };
+        let chunk = &indexed[i..i + row_count];
+        let batch = build_status_index_batch(projection, &shard_id, chunk)?;
+        sent += batch.num_rows();
+        if tx.send(Ok(batch)).await.is_err() {
+            return Ok(());
+        }
+        i += row_count;
+    }
+    Ok(())
+}
+
+/// Gather all (tenant, job_id, status_kind, changed_at_ms) tuples from the status/time index.
+async fn collect_status_index_data(
+    shard: &JobStoreShard,
+    tenant: Option<&str>,
+    limit: Option<usize>,
+) -> DfResult<Vec<(String, String, String, i64)>> {
+    match tenant {
+        Some(t) => shard
+            .scan_jobs_with_status_kind(t, limit)
+            .await
+            .map(|v| {
+                v.into_iter()
+                    .map(|(id, sk, ts)| (t.to_string(), id, sk, ts))
+                    .collect()
+            })
+            .map_err(|e| DataFusionError::Execution(e.to_string())),
+        None => shard
+            .scan_all_jobs_with_status_kind(limit)
+            .await
+            .map_err(|e| DataFusionError::Execution(e.to_string())),
+    }
+}
+
+/// Build a RecordBatch for the status-index fast path from a chunk of index entries.
+fn build_status_index_batch(
+    projection: &SchemaRef,
+    shard_id: &str,
+    chunk: &[(String, String, String, i64)],
+) -> DfResult<RecordBatch> {
+    let n = chunk.len();
+    if projection.fields().is_empty() {
+        return make_empty_projection_batch(projection, n);
+    }
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(projection.fields().len());
+    for f in projection.fields() {
+        let col: ArrayRef = match f.name().as_str() {
+            "shard_id" => Arc::new(StringArray::from(vec![shard_id; n])),
+            "tenant" => Arc::new(StringArray::from(
+                chunk
+                    .iter()
+                    .map(|(t, _, _, _)| t.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            "id" => Arc::new(StringArray::from(
+                chunk
+                    .iter()
+                    .map(|(_, id, _, _)| id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            "status_kind" => Arc::new(StringArray::from(
+                chunk
+                    .iter()
+                    .map(|(_, _, sk, _)| Some(sk.as_str()))
+                    .collect::<Vec<_>>(),
+            )),
+            "status_changed_at_ms" => Arc::new(Int64Array::from(
+                chunk
+                    .iter()
+                    .map(|(_, _, _, ts)| Some(*ts))
+                    .collect::<Vec<_>>(),
+            )),
+            _ => new_null_array(f.data_type(), n),
+        };
+        cols.push(col);
+    }
+    RecordBatch::try_new(Arc::clone(projection), cols)
+        .map_err(|e| DataFusionError::Execution(e.to_string()))
+}
+
+/// Resolves (tenant, job_id) pairs from the appropriate index, then batch-fetches job data.
+async fn stream_via_job_pairs(
+    shard: &Arc<JobStoreShard>,
+    projection: &SchemaRef,
+    strategy: &JobsScanStrategy,
+    needs: &ProjectionNeeds,
+    batch_size: usize,
+    limit: Option<usize>,
+    tx: &mpsc::Sender<DfResult<RecordBatch>>,
+) -> DfResult<()> {
+    let job_pairs = collect_job_pairs(shard, strategy, limit).await?;
+    let shard_id = shard.name().to_string();
+    let mut sent = 0usize;
+    let mut i = 0usize;
+    while i < job_pairs.len() && limit.is_none_or(|l| sent < l) {
+        let end = (i + batch_size).min(job_pairs.len());
+        let batch_pairs = &job_pairs[i..end];
+        let (jobs_map, status_map) = fetch_batch_data(shard, batch_pairs, needs).await?;
+        // When we fetched job_info, use the map as the authoritative presence check.
+        // Otherwise the index scan is the source of truth (LSM scans skip tombstones).
+        let existing_pairs: Vec<&(String, String)> =
+            if needs.need_job_info || needs.needs_existence_check {
+                batch_pairs
+                    .iter()
+                    .filter(|(_, id)| jobs_map.contains_key(id))
+                    .collect()
+            } else {
+                batch_pairs.iter().collect()
+            };
+        if !existing_pairs.is_empty() {
+            let batch = build_job_pairs_batch(
+                projection,
+                &shard_id,
+                &existing_pairs,
+                &jobs_map,
+                &status_map,
+            )?;
+            sent += batch.num_rows();
+            if tx.send(Ok(batch)).await.is_err() {
+                return Ok(());
+            }
+        }
+        i = end;
+    }
+    Ok(())
+}
+
+/// Dispatch to the appropriate index scan to resolve (tenant, job_id) pairs.
+async fn collect_job_pairs(
+    shard: &JobStoreShard,
+    strategy: &JobsScanStrategy,
+    limit: Option<usize>,
+) -> DfResult<Vec<(String, String)>> {
+    let result = match strategy {
+        JobsScanStrategy::ExactId { tenant, id } => {
+            if let Some(t) = tenant {
+                Ok(vec![(t.clone(), id.clone())])
+            } else {
+                shard
+                    .scan_all_jobs(limit)
+                    .await
+                    .map(|all| all.into_iter().filter(|(_, jid)| jid == id).collect())
+            }
+        }
+        JobsScanStrategy::MetadataExact { tenant, key, value } => {
+            if let Some(t) = tenant {
+                shard
+                    .scan_jobs_by_metadata(t, key, value, limit)
+                    .await
+                    .map(|v| v.into_iter().map(|id| (t.clone(), id)).collect())
+            } else {
+                shard.scan_all_jobs(limit).await
+            }
+        }
+        JobsScanStrategy::MetadataPrefix {
+            tenant,
+            key,
+            prefix,
+        } => {
+            if let Some(t) = tenant {
+                shard
+                    .scan_jobs_by_metadata_prefix(t, key, prefix, limit)
+                    .await
+                    .map(|v| v.into_iter().map(|id| (t.clone(), id)).collect())
+            } else {
+                shard.scan_all_jobs(limit).await
+            }
+        }
+        JobsScanStrategy::Status { tenant, status } => {
+            collect_job_pairs_by_status(shard, tenant.as_deref(), *status, limit).await
+        }
+        JobsScanStrategy::FullScan { tenant } => {
+            if let Some(t) = tenant {
+                shard
+                    .scan_jobs(t, limit)
+                    .await
+                    .map(|v| v.into_iter().map(|id| (t.clone(), id)).collect())
+            } else {
+                shard.scan_all_jobs(limit).await
+            }
+        }
+    };
+    result.map_err(|e| DataFusionError::Execution(e.to_string()))
+}
+
+/// Resolve (tenant, job_id) pairs for status-filtered queries.
+async fn collect_job_pairs_by_status(
+    shard: &JobStoreShard,
+    tenant: Option<&str>,
+    status: QueryStatusFilter,
+    limit: Option<usize>,
+) -> Result<Vec<(String, String)>, crate::job_store_shard::JobStoreShardError> {
+    let now_ms = crate::job_store_shard::helpers::now_epoch_ms();
+    match (status, tenant) {
+        (QueryStatusFilter::Waiting, Some(t)) => shard
+            .scan_jobs_waiting(t, now_ms, limit)
+            .await
+            .map(|v| v.into_iter().map(|id| (t.to_string(), id)).collect()),
+        (QueryStatusFilter::Waiting, None) => shard.scan_all_jobs_waiting(now_ms, limit).await,
+        (QueryStatusFilter::FutureScheduled, Some(t)) => shard
+            .scan_jobs_future_scheduled(t, now_ms, limit)
+            .await
+            .map(|v| v.into_iter().map(|id| (t.to_string(), id)).collect()),
+        (QueryStatusFilter::FutureScheduled, None) => {
+            shard.scan_all_jobs_future_scheduled(now_ms, limit).await
+        }
+        (QueryStatusFilter::Stored(kind), Some(t)) => shard
+            .scan_jobs_by_status(t, kind, limit)
+            .await
+            .map(|v| v.into_iter().map(|id| (t.to_string(), id)).collect()),
+        (QueryStatusFilter::Stored(kind), None) => shard.scan_all_jobs_by_status(kind, limit).await,
+    }
+}
+
+/// Batch-fetch job_info and/or status records for the given pairs.
+/// Only fetches what the projection actually needs.
+async fn fetch_batch_data(
+    shard: &JobStoreShard,
+    pairs: &[(String, String)],
+    needs: &ProjectionNeeds,
+) -> DfResult<(HashMap<String, JobView>, HashMap<String, JobStatus>)> {
+    let mut jobs_map: HashMap<String, JobView> = HashMap::new();
+    let mut status_map: HashMap<String, JobStatus> = HashMap::new();
+    if !needs.need_job_info && !needs.need_any_status() && !needs.needs_existence_check {
+        return Ok((jobs_map, status_map));
+    }
+    // Group job IDs by tenant so we can issue one batch call per tenant.
+    let mut by_tenant: HashMap<String, Vec<String>> = HashMap::new();
+    for (tenant, job_id) in pairs {
+        by_tenant
+            .entry(tenant.clone())
+            .or_default()
+            .push(job_id.clone());
+    }
+    for (tenant, ids) in &by_tenant {
+        if needs.need_job_info || needs.needs_existence_check {
+            jobs_map.extend(
+                shard
+                    .get_jobs_batch(tenant, ids)
+                    .await
+                    .map_err(|e| DataFusionError::Execution(e.to_string()))?,
+            );
+        }
+        if needs.need_any_status() {
+            status_map.extend(
+                shard
+                    .get_jobs_status_batch(tenant, ids)
+                    .await
+                    .map_err(|e| DataFusionError::Execution(e.to_string()))?,
+            );
+        }
+    }
+    Ok((jobs_map, status_map))
+}
+
+/// Build a RecordBatch for the standard path, reading columns from jobs_map and status_map.
+fn build_job_pairs_batch(
+    projection: &SchemaRef,
+    shard_id: &str,
+    pairs: &[&(String, String)],
+    jobs_map: &HashMap<String, JobView>,
+    status_map: &HashMap<String, JobStatus>,
+) -> DfResult<RecordBatch> {
+    let n = pairs.len();
+    if projection.fields().is_empty() {
+        return make_empty_projection_batch(projection, n);
+    }
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(projection.fields().len());
+    for f in projection.fields() {
+        let col: ArrayRef = match f.name().as_str() {
+            "shard_id" => Arc::new(StringArray::from(vec![shard_id; n])),
+            "tenant" => Arc::new(StringArray::from(
+                pairs.iter().map(|p| p.0.as_str()).collect::<Vec<_>>(),
+            )),
+            "id" => Arc::new(StringArray::from(
+                pairs.iter().map(|p| p.1.as_str()).collect::<Vec<_>>(),
+            )),
+            "priority" => Arc::new(UInt8Array::from(
+                pairs
+                    .iter()
+                    .map(|p| jobs_map.get(&p.1).map_or(0, |v| v.priority()))
+                    .collect::<Vec<u8>>(),
+            )),
+            "enqueue_time_ms" => Arc::new(Int64Array::from(
+                pairs
+                    .iter()
+                    .map(|p| jobs_map.get(&p.1).map_or(0, |v| v.enqueue_time_ms()))
+                    .collect::<Vec<i64>>(),
+            )),
+            "payload" => Arc::new(StringArray::from(
+                pairs
+                    .iter()
+                    .map(|p| {
+                        jobs_map
+                            .get(&p.1)
+                            .and_then(|v| v.payload_as_json().ok().map(|j| j.to_string()))
+                    })
+                    .collect::<Vec<Option<String>>>(),
+            )),
+            "task_group" => Arc::new(StringArray::from(
+                pairs
+                    .iter()
+                    .map(|p| {
+                        jobs_map
+                            .get(&p.1)
+                            .map_or_else(String::new, |v| v.task_group().to_string())
+                    })
+                    .collect::<Vec<String>>(),
+            )),
+            "status_kind" => Arc::new(StringArray::from(
+                pairs
+                    .iter()
+                    .map(|p| status_map.get(&p.1).map(display_status_kind))
+                    .collect::<Vec<Option<String>>>(),
+            )),
+            "status_changed_at_ms" => Arc::new(Int64Array::from(
+                pairs
+                    .iter()
+                    .map(|p| status_map.get(&p.1).map(|s| s.changed_at_ms))
+                    .collect::<Vec<Option<i64>>>(),
+            )),
+            "current_attempt" => Arc::new(UInt32Array::from(
+                pairs
+                    .iter()
+                    .map(|p| status_map.get(&p.1).and_then(|s| s.current_attempt))
+                    .collect::<Vec<Option<u32>>>(),
+            )),
+            "next_attempt_starts_after_ms" => Arc::new(Int64Array::from(
+                pairs
+                    .iter()
+                    .map(|p| {
+                        status_map
+                            .get(&p.1)
+                            .and_then(|s| s.next_attempt_starts_after_ms)
+                    })
+                    .collect::<Vec<Option<i64>>>(),
+            )),
+            "metadata" => build_metadata_column(pairs, jobs_map)?,
+            other => {
+                return Err(DataFusionError::Execution(format!(
+                    "unknown column {}",
+                    other
+                )));
+            }
+        };
+        cols.push(col);
+    }
+    RecordBatch::try_new(Arc::clone(projection), cols)
+        .map_err(|e| DataFusionError::Execution(e.to_string()))
+}
+
+/// Build the Arrow `Map<Utf8, Utf8>` column for job metadata key/value pairs.
+fn build_metadata_column(
+    pairs: &[&(String, String)],
+    jobs_map: &HashMap<String, JobView>,
+) -> DfResult<ArrayRef> {
+    use datafusion::arrow::array::{MapArray, StructArray};
+    let mut keys_builder = datafusion::arrow::array::StringBuilder::new();
+    let mut values_builder = datafusion::arrow::array::StringBuilder::new();
+    let mut offsets: Vec<i32> = Vec::with_capacity(pairs.len() + 1);
+    offsets.push(0);
+    let mut total = 0i32;
+    for p in pairs {
+        let metadata = jobs_map.get(&p.1).map_or_else(Vec::new, |v| v.metadata());
+        for (k, v) in &metadata {
+            keys_builder.append_value(k);
+            values_builder.append_value(v);
+            total += 1;
+        }
+        offsets.push(total);
+    }
+    let struct_array = StructArray::try_new(
+        Fields::from(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]),
+        vec![
+            Arc::new(keys_builder.finish()) as ArrayRef,
+            Arc::new(values_builder.finish()) as ArrayRef,
+        ],
+        None,
+    )
+    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    Ok(Arc::new(MapArray::new(
+        Arc::new(Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Utf8, true),
+            ])),
+            false,
+        )),
+        datafusion::arrow::buffer::OffsetBuffer::new(offsets.into()),
+        struct_array,
+        None,
+        false,
+    )))
+}
+
+/// Build a zero-column RecordBatch with the given row count.
+/// Used for COUNT(*) and similar queries where DataFusion only needs a row tally.
+fn make_empty_projection_batch(projection: &SchemaRef, row_count: usize) -> DfResult<RecordBatch> {
+    RecordBatch::try_new_with_options(
+        Arc::clone(projection),
+        vec![],
+        &datafusion::arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(row_count)),
+    )
+    .map_err(|e| DataFusionError::Execution(e.to_string()))
 }
 
 /// Scanner for the queues table - reads concurrency queue data from a single shard.

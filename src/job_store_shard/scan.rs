@@ -8,8 +8,9 @@ use crate::job::JobStatusKind;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{
     end_bound, idx_metadata_key_only_prefix, idx_metadata_prefix, idx_status_time_all_prefix,
-    idx_status_time_prefix, idx_status_time_prefix_with_time, job_info_prefix, jobs_prefix,
-    parse_job_info_key, parse_metadata_index_key, parse_status_time_index_key,
+    idx_status_time_prefix, idx_status_time_prefix_with_time, idx_status_time_tenant_prefix,
+    job_info_prefix, jobs_prefix, parse_job_info_key, parse_metadata_index_key,
+    parse_status_time_index_key,
 };
 
 /// Shared scan-and-collect loop: opens a range iterator, applies a per-key
@@ -122,6 +123,51 @@ impl JobStoreShard {
                 parse_status_time_index_key(key)
                     .filter(|p| p.status == status_str && !p.job_id.is_empty())
                     .map(|p| (p.tenant, p.job_id)),
+            )
+        })
+        .await
+    }
+
+    /// Scan the status/time index for a single tenant, returning (job_id, status_kind, changed_at_ms)
+    /// for every job without any point-lookup round-trips.  Used for index-only query scans
+    /// when the projection only needs status fields (not job_info fields like payload or priority).
+    pub async fn scan_jobs_with_status_kind(
+        &self,
+        tenant: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<(String, String, i64)>, JobStoreShardError> {
+        let start = idx_status_time_tenant_prefix(tenant);
+        let end = end_bound(&start);
+        scan_collect(&self.db, start, end, limit, |key| {
+            ControlFlow::Continue(
+                parse_status_time_index_key(key)
+                    .filter(|p| !p.job_id.is_empty())
+                    .map(|p| (p.job_id.clone(), p.status.clone(), p.changed_at_ms())),
+            )
+        })
+        .await
+    }
+
+    /// Scan the status/time index for ALL tenants, returning (tenant, job_id, status_kind, changed_at_ms)
+    /// for every job without any point-lookup round-trips.  Used for cross-tenant index-only scans.
+    pub async fn scan_all_jobs_with_status_kind(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<Vec<(String, String, String, i64)>, JobStoreShardError> {
+        let start = idx_status_time_all_prefix();
+        let end = end_bound(&start);
+        scan_collect(&self.db, start, end, limit, |key| {
+            ControlFlow::Continue(
+                parse_status_time_index_key(key)
+                    .filter(|p| !p.job_id.is_empty())
+                    .map(|p| {
+                        (
+                            p.tenant.clone(),
+                            p.job_id.clone(),
+                            p.status.clone(),
+                            p.changed_at_ms(),
+                        )
+                    }),
             )
         })
         .await

@@ -114,15 +114,24 @@ jobs:
   benchmark:
     name: Run benchmarks
     runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-test-env
         with:
           cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - uses: Swatinem/rust-cache@v2
+      - name: Cache golden bench shard
+        uses: actions/cache@v4
+        with:
+          path: tmp/golden-bench-shard
+          key: golden-bench-shard-v1-${{ hashFiles('benches/bench_helpers.rs') }}
       - name: Run throughput benchmark
         shell: bash
         run: cargo bench --bench job_shard_throughput
+      - name: Run big shard operations benchmark
+        shell: bash
+        run: cargo bench --bench big_shard_operations
 
   alloy-changes:
     name: Detect Alloy changes
