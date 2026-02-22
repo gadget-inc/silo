@@ -361,15 +361,13 @@ impl JobStoreShard {
     }
 
     /// Complete an enqueue after successful write/commit and DST event emission.
-    /// Flushes to disk, logs grants, and wakes up the broker.
+    /// Logs grants and wakes up the broker.
     pub(crate) async fn finish_enqueue(
         &self,
         job_id: &str,
         start_at_ms: i64,
         grants: &[(String, String)],
     ) -> Result<(), JobStoreShardError> {
-        self.db.flush().await?;
-
         for (queue, task_id) in grants {
             let span = info_span!("concurrency.grant", queue = %queue, task_id = %task_id, job_id = %job_id, attempt = 1u32, source = "immediate");
             let _g = span.enter();
