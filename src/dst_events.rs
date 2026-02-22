@@ -93,6 +93,8 @@ mod dst_impl {
         /// Running count of terminal status events (Succeeded/Failed/Cancelled) for convergence checking.
         /// Counts all events including pending ones, since this is used as a heuristic, not for correctness.
         static TERMINAL_COUNT: Cell<usize> = const { Cell::new(0) };
+        /// Running count of all emitted events for progress detection.
+        static TOTAL_EVENT_COUNT: Cell<usize> = const { Cell::new(0) };
     }
 
     fn is_terminal_event(event: &DstEvent) -> bool {
@@ -113,6 +115,7 @@ mod dst_impl {
         if is_terminal_event(&event) {
             TERMINAL_COUNT.with(|c| c.set(c.get() + 1));
         }
+        TOTAL_EVENT_COUNT.with(|c| c.set(c.get() + 1));
         DST_EVENTS.with(|events| {
             events.borrow_mut().push(EmittedEvent {
                 event,
@@ -128,6 +131,7 @@ mod dst_impl {
         if is_terminal_event(&event) {
             TERMINAL_COUNT.with(|c| c.set(c.get() + 1));
         }
+        TOTAL_EVENT_COUNT.with(|c| c.set(c.get() + 1));
         DST_EVENTS.with(|events| {
             events.borrow_mut().push(EmittedEvent {
                 event,
@@ -176,10 +180,18 @@ mod dst_impl {
         TERMINAL_COUNT.with(|c| c.get())
     }
 
+    /// Get the total count of all emitted DST events.
+    /// Useful for detecting that the system is making progress even when
+    /// no terminal events have occurred yet (e.g., lease reaping and rescheduling).
+    pub fn total_event_count() -> usize {
+        TOTAL_EVENT_COUNT.with(|c| c.get())
+    }
+
     /// Clear all events and reset counters.
     pub fn clear_events() {
         DST_EVENTS.with(|events| events.borrow_mut().clear());
         TERMINAL_COUNT.with(|c| c.set(0));
+        TOTAL_EVENT_COUNT.with(|c| c.set(0));
     }
 }
 
@@ -218,6 +230,12 @@ pub fn take_all_confirmed() -> Vec<DstEvent> {
 #[cfg(not(feature = "dst"))]
 #[inline(always)]
 pub fn terminal_event_count() -> usize {
+    0
+}
+
+#[cfg(not(feature = "dst"))]
+#[inline(always)]
+pub fn total_event_count() -> usize {
     0
 }
 
