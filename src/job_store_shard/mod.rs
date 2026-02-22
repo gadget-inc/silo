@@ -440,6 +440,16 @@ impl JobStoreShard {
         self.broker.get_range()
     }
 
+    /// Run one pass of pending concurrency-request reconciliation.
+    ///
+    /// Intended for diagnostics/benchmarking of the periodic reconciler path.
+    pub async fn reconcile_pending_concurrency_requests_once(&self) {
+        let range = self.get_range();
+        self.concurrency
+            .reconcile_pending_requests(self.db.as_ref(), &range)
+            .await;
+    }
+
     /// Fetch a job by id as a zero-copy archived view.
     pub async fn get_job(
         &self,

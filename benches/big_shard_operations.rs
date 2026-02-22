@@ -273,6 +273,28 @@ async fn bench_dequeue_heavy_concurrency(metadata: &GoldenShardMetadata) {
     println!();
 }
 
+async fn bench_concurrency_reconcile_once(metadata: &GoldenShardMetadata) {
+    println!("--- concurrency reconciler (one pass over pending requests) ---");
+    let (_guard, shard) = clone_golden_shard("reconcile-once", metadata).await;
+
+    let r = bench_op(
+        "concurrency_reconcile_once",
+        0, // run exactly one reconciliation pass
+        1,
+        || {
+            let shard = Arc::clone(&shard);
+            async move {
+                shard.reconcile_pending_concurrency_requests_once().await;
+            }
+        },
+    )
+    .await;
+    r.print();
+
+    shard.close().await.expect("close");
+    println!();
+}
+
 async fn bench_cancel_no_limit(metadata: &GoldenShardMetadata) {
     println!("--- cancel_job (no limits) ---");
     let (_guard, shard) = clone_golden_shard("cancel-no-limit", metadata).await;
@@ -529,6 +551,7 @@ async fn main() {
     bench_enqueue_heavy_concurrency(&metadata).await;
     bench_dequeue_no_limit(&metadata).await;
     bench_dequeue_heavy_concurrency(&metadata).await;
+    bench_concurrency_reconcile_once(&metadata).await;
     bench_cancel_no_limit(&metadata).await;
     bench_cancel_with_concurrency(&metadata).await;
     bench_expedite_scheduled(&metadata).await;
