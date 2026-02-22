@@ -206,7 +206,6 @@ impl JobStoreShard {
         batch.delete(&lease_key);
 
         self.db.write(batch).await?;
-        self.db.flush().await?;
 
         tracing::debug!(
             queue_key = %queue_key,
@@ -310,7 +309,6 @@ impl JobStoreShard {
         batch.delete(&lease_key);
 
         self.db.write(batch).await?;
-        self.db.flush().await?;
 
         if has_waiters {
             tracing::warn!(

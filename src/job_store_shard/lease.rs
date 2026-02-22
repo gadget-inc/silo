@@ -502,7 +502,6 @@ impl JobStoreShard {
             let mut batch = WriteBatch::new();
             batch.delete(&lease_key);
             self.db.write(batch).await?;
-            self.db.flush().await?;
             return Ok(());
         };
 
@@ -521,7 +520,6 @@ impl JobStoreShard {
         batch.delete(&lease_key);
 
         self.db.write(batch).await?;
-        self.db.flush().await?;
 
         tracing::error!(
             tenant = %tenant,
