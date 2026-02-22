@@ -132,6 +132,9 @@ jobs:
       - name: Run big shard operations benchmark
         shell: bash
         run: cargo bench --bench big_shard_operations
+      - name: Run query profile benchmark
+        shell: bash
+        run: cargo bench --bench query_profile
 
   alloy-changes:
     name: Detect Alloy changes
