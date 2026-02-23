@@ -35,7 +35,7 @@ async function buildAndLoad(): Promise<void> {
         "--workdir", "/workspace",
         "nixos/nix",
         "sh", "-c",
-        "echo 'experimental-features = nix-command flakes' >> /etc/nix/nix.conf && IMAGE=$(nix build .#silo-docker --no-link --print-out-paths) && cat \"$IMAGE\"",
+        "echo 'experimental-features = nix-command flakes' >> /etc/nix/nix.conf && IMAGE=$(nix build .#silo-docker-dev --no-link --print-out-paths) && cat \"$IMAGE\"",
       ],
       { cwd: root, stdio: ["ignore", "pipe", "inherit"] }
     );
