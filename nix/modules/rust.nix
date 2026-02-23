@@ -49,15 +49,29 @@
       
       # Build dependencies separately for caching
       cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-      
+
       # Main package
       silo = craneLib.buildPackage (commonArgs // {
         inherit cargoArtifacts;
         doCheck = false; # Tests require external services, CI runs them separately
       });
+
+      # Debug build (fast to compile, no optimizations)
+      debugArgs = {
+        inherit src;
+        strictDeps = true;
+        nativeBuildInputs = [ pkgs.protobuf pkgs.flatbuffers ];
+        CARGO_PROFILE = "dev";
+      };
+      cargoArtifactsDebug = craneLib.buildDepsOnly debugArgs;
+      silo-debug = craneLib.buildPackage (debugArgs // {
+        cargoArtifacts = cargoArtifactsDebug;
+        doCheck = false;
+      });
     in
     {
       packages.default = silo;
       packages.silo = silo;
+      packages.silo-debug = silo-debug;
     };
 }

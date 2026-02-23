@@ -29,7 +29,8 @@
         devEnv = pkgs.buildEnv {
           name = "silo-dev-env";
           paths = [
-            self'.packages.silo
+            # use debug silo for faster builds
+            self'.packages.silo-debug
             pkgs.cacert
             # Shell and core utilities
             pkgs.bashInteractive
