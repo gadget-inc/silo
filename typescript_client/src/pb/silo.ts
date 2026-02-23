@@ -761,6 +761,50 @@ export interface LeaseTasksResponse {
     refreshTasks: RefreshFloatingLimitTask[]; // Floating limit refresh tasks.
 }
 /**
+ * Long-poll variant of LeaseTasksRequest.
+ * Blocks until tasks are available or timeout is reached.
+ * Avoids the latency overhead of short-polling intervals.
+ *
+ * @generated from protobuf message silo.v1.LeaseTasksLongPollRequest
+ */
+export interface LeaseTasksLongPollRequest {
+    /**
+     * @generated from protobuf field: optional string shard = 1
+     */
+    shard?: string; // optional filter - if set, only lease from this shard (UUID)
+    /**
+     * @generated from protobuf field: string worker_id = 2
+     */
+    workerId: string;
+    /**
+     * @generated from protobuf field: uint32 max_tasks = 3
+     */
+    maxTasks: number;
+    /**
+     * @generated from protobuf field: string task_group = 4
+     */
+    taskGroup: string; // Required. Task group to poll tasks from.
+    /**
+     * @generated from protobuf field: uint32 timeout_ms = 5
+     */
+    timeoutMs: number; // Max time to wait for tasks (ms). Server caps at 60000. 0 = immediate (same as LeaseTasks).
+}
+/**
+ * Response for long-poll lease. Same shape as LeaseTasksResponse.
+ *
+ * @generated from protobuf message silo.v1.LeaseTasksLongPollResponse
+ */
+export interface LeaseTasksLongPollResponse {
+    /**
+     * @generated from protobuf field: repeated silo.v1.Task tasks = 1
+     */
+    tasks: Task[]; // Job execution tasks.
+    /**
+     * @generated from protobuf field: repeated silo.v1.RefreshFloatingLimitTask refresh_tasks = 2
+     */
+    refreshTasks: RefreshFloatingLimitTask[]; // Floating limit refresh tasks.
+}
+/**
  * Request to report the outcome of a completed task.
  * Note: tenant is determined from the task lease, not from the request.
  *
@@ -3816,6 +3860,139 @@ class LeaseTasksResponse$Type extends MessageType<LeaseTasksResponse> {
  */
 export const LeaseTasksResponse = new LeaseTasksResponse$Type();
 // @generated message type with reflection information, may provide speed optimized methods
+class LeaseTasksLongPollRequest$Type extends MessageType<LeaseTasksLongPollRequest> {
+    constructor() {
+        super("silo.v1.LeaseTasksLongPollRequest", [
+            { no: 1, name: "shard", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "worker_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 3, name: "max_tasks", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
+            { no: 4, name: "task_group", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 5, name: "timeout_ms", kind: "scalar", T: 13 /*ScalarType.UINT32*/ }
+        ]);
+    }
+    create(value?: PartialMessage<LeaseTasksLongPollRequest>): LeaseTasksLongPollRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.workerId = "";
+        message.maxTasks = 0;
+        message.taskGroup = "";
+        message.timeoutMs = 0;
+        if (value !== undefined)
+            reflectionMergePartial<LeaseTasksLongPollRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: LeaseTasksLongPollRequest): LeaseTasksLongPollRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* optional string shard */ 1:
+                    message.shard = reader.string();
+                    break;
+                case /* string worker_id */ 2:
+                    message.workerId = reader.string();
+                    break;
+                case /* uint32 max_tasks */ 3:
+                    message.maxTasks = reader.uint32();
+                    break;
+                case /* string task_group */ 4:
+                    message.taskGroup = reader.string();
+                    break;
+                case /* uint32 timeout_ms */ 5:
+                    message.timeoutMs = reader.uint32();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: LeaseTasksLongPollRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* optional string shard = 1; */
+        if (message.shard !== undefined)
+            writer.tag(1, WireType.LengthDelimited).string(message.shard);
+        /* string worker_id = 2; */
+        if (message.workerId !== "")
+            writer.tag(2, WireType.LengthDelimited).string(message.workerId);
+        /* uint32 max_tasks = 3; */
+        if (message.maxTasks !== 0)
+            writer.tag(3, WireType.Varint).uint32(message.maxTasks);
+        /* string task_group = 4; */
+        if (message.taskGroup !== "")
+            writer.tag(4, WireType.LengthDelimited).string(message.taskGroup);
+        /* uint32 timeout_ms = 5; */
+        if (message.timeoutMs !== 0)
+            writer.tag(5, WireType.Varint).uint32(message.timeoutMs);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.LeaseTasksLongPollRequest
+ */
+export const LeaseTasksLongPollRequest = new LeaseTasksLongPollRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class LeaseTasksLongPollResponse$Type extends MessageType<LeaseTasksLongPollResponse> {
+    constructor() {
+        super("silo.v1.LeaseTasksLongPollResponse", [
+            { no: 1, name: "tasks", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => Task },
+            { no: 2, name: "refresh_tasks", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => RefreshFloatingLimitTask }
+        ]);
+    }
+    create(value?: PartialMessage<LeaseTasksLongPollResponse>): LeaseTasksLongPollResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.tasks = [];
+        message.refreshTasks = [];
+        if (value !== undefined)
+            reflectionMergePartial<LeaseTasksLongPollResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: LeaseTasksLongPollResponse): LeaseTasksLongPollResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* repeated silo.v1.Task tasks */ 1:
+                    message.tasks.push(Task.internalBinaryRead(reader, reader.uint32(), options));
+                    break;
+                case /* repeated silo.v1.RefreshFloatingLimitTask refresh_tasks */ 2:
+                    message.refreshTasks.push(RefreshFloatingLimitTask.internalBinaryRead(reader, reader.uint32(), options));
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: LeaseTasksLongPollResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* repeated silo.v1.Task tasks = 1; */
+        for (let i = 0; i < message.tasks.length; i++)
+            Task.internalBinaryWrite(message.tasks[i], writer.tag(1, WireType.LengthDelimited).fork(), options).join();
+        /* repeated silo.v1.RefreshFloatingLimitTask refresh_tasks = 2; */
+        for (let i = 0; i < message.refreshTasks.length; i++)
+            RefreshFloatingLimitTask.internalBinaryWrite(message.refreshTasks[i], writer.tag(2, WireType.LengthDelimited).fork(), options).join();
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.LeaseTasksLongPollResponse
+ */
+export const LeaseTasksLongPollResponse = new LeaseTasksLongPollResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
 class ReportOutcomeRequest$Type extends MessageType<ReportOutcomeRequest> {
     constructor() {
         super("silo.v1.ReportOutcomeRequest", [
@@ -6191,6 +6368,7 @@ export const Silo = new ServiceType("silo.v1.Silo", [
     { name: "ExpediteJob", options: {}, I: ExpediteJobRequest, O: ExpediteJobResponse },
     { name: "LeaseTask", options: {}, I: LeaseTaskRequest, O: LeaseTaskResponse },
     { name: "LeaseTasks", options: {}, I: LeaseTasksRequest, O: LeaseTasksResponse },
+    { name: "LeaseTasksLongPoll", options: {}, I: LeaseTasksLongPollRequest, O: LeaseTasksLongPollResponse },
     { name: "ReportOutcome", options: {}, I: ReportOutcomeRequest, O: ReportOutcomeResponse },
     { name: "ReportRefreshOutcome", options: {}, I: ReportRefreshOutcomeRequest, O: ReportRefreshOutcomeResponse },
     { name: "Heartbeat", options: {}, I: HeartbeatRequest, O: HeartbeatResponse },

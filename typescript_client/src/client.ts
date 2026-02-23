@@ -719,6 +719,16 @@ export interface LeaseTasksOptions {
   shard?: string;
 }
 
+export interface LeaseTasksLongPollOptions extends LeaseTasksOptions {
+  /**
+   * Maximum time in ms to wait for tasks on the server.
+   * The server will block until tasks are available or this timeout is reached.
+   * Server caps this at 60000ms. 0 = immediate (same as leaseTasks).
+   * @default 30000
+   */
+  timeoutMs?: number;
+}
+
 /** Outcome for reporting task success */
 export interface SuccessOutcome<Result = unknown> {
   type: "success";
@@ -1174,9 +1184,8 @@ export class SiloGRPCClient {
 
   /**
    * Resolve the shard ID (string UUID) from tenant using range-based lookup.
-   * @internal
    */
-  private _resolveShard(tenant: string | undefined): string {
+  public resolveShard(tenant: string | undefined): string {
     const tenantId = tenant ?? DEFAULT_TENANT;
     if (this._shards.length === 0) {
       throw new Error("Cluster topology not discovered yet. Call refreshTopology() first.");
@@ -1241,7 +1250,7 @@ export class SiloGRPCClient {
     client: SiloClient;
     shard: string;
   } {
-    const shardId = this._resolveShard(tenant);
+    const shardId = this.resolveShard(tenant);
     return {
       client: this._getClientForShard(shardId),
       shard: shardId,
@@ -1346,6 +1355,14 @@ export class SiloGRPCClient {
     }
 
     throw new Error("Failed to refresh cluster topology from any server");
+  }
+
+  /**
+   * The number of servers this client is connected to.
+   * Updated by refreshTopology() when new servers are discovered.
+   */
+  public get serverCount(): number {
+    return this._connections.size;
   }
 
   /**
@@ -1761,6 +1778,71 @@ export class SiloGRPCClient {
   }
 
   /**
+   * Long-poll variant of leaseTasks.
+   *
+   * Blocks on the server until tasks are available or the timeout is reached.
+   * Returns immediately if tasks are already available.
+   * Avoids the latency overhead of short-polling intervals.
+   *
+   * @param options The options for the long-poll lease request.
+   * @param serverIndex Optional index for server selection (for per-worker round-robin).
+   * @returns Object containing both job tasks and refresh tasks.
+   */
+  public async leaseTasksLongPoll(
+    options: LeaseTasksLongPollOptions,
+    serverIndex?: number,
+    abort?: AbortSignal,
+  ): Promise<LeaseTasksResult> {
+    try {
+      const client =
+        options.shard !== undefined
+          ? this._getClientForShard(options.shard)
+          : serverIndex !== undefined
+            ? this._getClientAtIndex(serverIndex)
+            : this._getAnyClient();
+
+      const timeoutMs = options.timeoutMs ?? 30000;
+
+      // Set a longer RPC timeout to accommodate server-side blocking.
+      // protobuf-ts GrpcTransport reads `timeout` (not `deadline`) from RpcOptions.
+      // A Date value is used directly as the gRPC call deadline.
+      const rpcTimeout = new Date(Date.now() + timeoutMs + 5000);
+      const rpcOptions = { ...this._rpcOptions(), timeout: rpcTimeout, abort };
+
+      const call = client.leaseTasksLongPoll(
+        {
+          shard: options.shard,
+          workerId: options.workerId,
+          maxTasks: options.maxTasks,
+          taskGroup: options.taskGroup,
+          timeoutMs,
+        },
+        rpcOptions,
+      );
+
+      const response = await call.response;
+
+      const refreshTasks: RefreshTask[] = response.refreshTasks.map((rt) => ({
+        id: rt.id,
+        queueKey: rt.queueKey,
+        currentMaxConcurrency: rt.currentMaxConcurrency,
+        lastRefreshedAtMs: rt.lastRefreshedAtMs,
+        metadata: { ...rt.metadata },
+        leaseMs: rt.leaseMs,
+        shard: rt.shard,
+        taskGroup: rt.taskGroup,
+      }));
+
+      return {
+        tasks: response.tasks,
+        refreshTasks,
+      };
+    } catch (error) {
+      throwMappedRpcError(error, { operation: "leaseTasksLongPoll" });
+    }
+  }
+
+  /**
    * Report the outcome of a task.
    * @param options The options for reporting the outcome.
    * @throws TaskNotFoundError if the task (lease) doesn't exist.
@@ -1947,7 +2029,7 @@ export class SiloGRPCClient {
    * @returns The shard ID (UUID string) or undefined if no shard found
    */
   public getShardForTenant(tenant: string): string {
-    return this._resolveShard(tenant);
+    return this.resolveShard(tenant);
   }
 
   /**

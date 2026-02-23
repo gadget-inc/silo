@@ -1124,6 +1124,150 @@ impl Silo for SiloService {
         }))
     }
 
+    async fn lease_tasks_long_poll(
+        &self,
+        req: Request<LeaseTasksLongPollRequest>,
+    ) -> Result<Response<LeaseTasksLongPollResponse>, Status> {
+        let r = req.into_inner();
+        let max_tasks = r.max_tasks as usize;
+
+        if r.task_group.is_empty() {
+            return Err(Status::invalid_argument("task_group is required"));
+        }
+
+        // Cap timeout at 60 seconds
+        let timeout_ms = (r.timeout_ms as u64).min(60_000);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+
+        // Resolve shards once outside the loop
+        let shards_to_poll: Vec<(crate::shard_range::ShardId, Arc<JobStoreShard>)> =
+            if let Some(ref shard_filter) = r.shard {
+                let shard_id = Self::parse_shard_id(shard_filter)?;
+                let shard = self.shard_with_redirect(&shard_id).await?;
+                vec![(shard_id, shard)]
+            } else {
+                let mut shards: Vec<_> = self
+                    .factory
+                    .instances()
+                    .iter()
+                    .map(|(id, shard)| (*id, shard.clone()))
+                    .collect();
+                shards.shuffle(&mut rand::rng());
+                shards
+            };
+
+        // Subscribe to task availability notifications from all shards.
+        // Using watch channels avoids lost wakeups: any send between
+        // subscribe() and changed().await is captured.
+        let mut receivers: Vec<_> = shards_to_poll
+            .iter()
+            .map(|(_, shard)| shard.broker.subscribe_task_available())
+            .collect();
+
+        loop {
+            let mut all_tasks = Vec::new();
+            let mut all_refresh_tasks = Vec::new();
+            let mut remaining = max_tasks;
+
+            for (shard_id, shard) in &shards_to_poll {
+                if remaining == 0 {
+                    break;
+                }
+
+                let result = shard
+                    .dequeue(&r.worker_id, &r.task_group, remaining)
+                    .await
+                    .map_err(map_err)?;
+
+                let tasks_added = result.tasks.len();
+                let shard_str = shard_id.to_string();
+                let now_ms = crate::job_store_shard::now_epoch_ms();
+
+                for lt in result.tasks {
+                    if let Some(ref m) = self.metrics {
+                        let job = lt.job();
+                        let task_group = job.task_group();
+                        let relative_attempt_number = lt.attempt().relative_attempt_number();
+                        m.record_attempt(&shard_str, task_group, relative_attempt_number > 1);
+
+                        let wait_time_secs =
+                            (now_ms - job.enqueue_time_ms()).max(0) as f64 / 1000.0;
+                        m.record_job_wait_time(&shard_str, task_group, wait_time_secs);
+                        m.inc_task_leases_active(&shard_str, task_group);
+                    }
+
+                    all_tasks.push(leased_task_to_proto(&lt, &shard_str));
+                }
+
+                for rt in result.refresh_tasks {
+                    let tenant_id = if rt.tenant_id == "-" {
+                        None
+                    } else {
+                        Some(rt.tenant_id)
+                    };
+
+                    all_refresh_tasks.push(RefreshFloatingLimitTask {
+                        id: rt.task_id,
+                        queue_key: rt.queue_key,
+                        current_max_concurrency: rt.current_max_concurrency,
+                        last_refreshed_at_ms: rt.last_refreshed_at_ms,
+                        metadata: rt.metadata.into_iter().collect(),
+                        lease_ms: DEFAULT_LEASE_MS,
+                        shard: shard_id.to_string(),
+                        task_group: rt.task_group,
+                        tenant_id,
+                    });
+                }
+
+                if let Some(ref m) = self.metrics
+                    && tasks_added > 0
+                {
+                    m.record_dequeue(&shard_str, &r.task_group, tasks_added as u64);
+                }
+
+                remaining = remaining.saturating_sub(tasks_added);
+            }
+
+            // If we got tasks, return immediately
+            if !all_tasks.is_empty() || !all_refresh_tasks.is_empty() {
+                return Ok(Response::new(LeaseTasksLongPollResponse {
+                    tasks: all_tasks,
+                    refresh_tasks: all_refresh_tasks,
+                }));
+            }
+
+            // No tasks found. If timeout is 0 or deadline passed, return empty.
+            if timeout_ms == 0 || tokio::time::Instant::now() >= deadline {
+                return Ok(Response::new(LeaseTasksLongPollResponse {
+                    tasks: Vec::new(),
+                    refresh_tasks: Vec::new(),
+                }));
+            }
+
+            // Wait until any broker signals or deadline.
+            // Watch receivers capture any send between subscribe/last-changed and
+            // the changed().await call, so there are no lost wakeups.
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Ok(Response::new(LeaseTasksLongPollResponse {
+                        tasks: Vec::new(),
+                        refresh_tasks: Vec::new(),
+                    }));
+                }
+                _ = async {
+                    // Wait for any shard broker to signal new tasks
+                    let futs: Vec<_> = receivers.iter_mut()
+                        .map(|rx| Box::pin(rx.changed()))
+                        .collect();
+                    let _ = futures::future::select_all(futs).await;
+                } => {
+                    continue;
+                }
+            }
+        }
+    }
+
     async fn report_outcome(
         &self,
         req: Request<ReportOutcomeRequest>,

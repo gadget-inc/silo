@@ -1428,4 +1428,73 @@ describe.skipIf(!RUN_INTEGRATION)("SiloWorker integration", () => {
       expect(signalAborted).toBe(false);
     });
   });
+
+  describe("long poll correctness", () => {
+    it("leaseTasksLongPoll picks up two sequential enqueues", async () => {
+      // Directly test the long-poll RPC with two sequential enqueues.
+      // This bypasses the worker to isolate the RPC behavior.
+
+      // First: long-poll with short timeout should return empty (drain any stale tasks)
+      const emptyResult = await client.leaseTasksLongPoll({
+        workerId: "test-lp",
+        maxTasks: 10,
+        taskGroup: DEFAULT_TASK_GROUP,
+        timeoutMs: 500,
+      });
+      console.log(`\n  Drain: ${emptyResult.tasks.length} stale tasks`);
+
+      // Resolve which shard owns this tenant so we long-poll the correct server
+      const shard = client.resolveShard(DEFAULT_TENANT);
+
+      // --- Enqueue #1: start long-poll, then enqueue ---
+      const lp1 = client.leaseTasksLongPoll({
+        workerId: "test-lp",
+        maxTasks: 1,
+        taskGroup: DEFAULT_TASK_GROUP,
+        timeoutMs: 10000,
+        shard,
+      });
+
+      await new Promise((r) => setTimeout(r, 200));
+
+      const t1 = performance.now();
+      await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
+        payload: { seq: 1 },
+        priority: 1,
+      });
+
+      const r1 = await lp1;
+      const d1 = performance.now() - t1;
+      console.log(`  Enqueue #1: ${d1.toFixed(1)}ms, tasks: ${r1.tasks.length}`);
+      expect(r1.tasks.length).toBe(1);
+
+      // --- Enqueue #2: start another long-poll, then enqueue ---
+      const lp2 = client.leaseTasksLongPoll({
+        workerId: "test-lp",
+        maxTasks: 1,
+        taskGroup: DEFAULT_TASK_GROUP,
+        timeoutMs: 10000,
+        shard,
+      });
+
+      await new Promise((r) => setTimeout(r, 200));
+
+      const t2 = performance.now();
+      await client.enqueue({
+        tenant: DEFAULT_TENANT,
+        taskGroup: DEFAULT_TASK_GROUP,
+        payload: { seq: 2 },
+        priority: 1,
+      });
+
+      const r2 = await lp2;
+      const d2 = performance.now() - t2;
+      console.log(`  Enqueue #2: ${d2.toFixed(1)}ms, tasks: ${r2.tasks.length}`);
+      expect(r2.tasks.length).toBe(1);
+
+      console.log(`  Both enqueues picked up successfully\n`);
+    }, 30000);
+  });
 });

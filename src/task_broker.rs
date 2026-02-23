@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use crossbeam_skiplist::SkipMap;
 use slatedb::{Db, WriteBatch};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 use crate::codec::{DecodedTask, decode_task_validated};
 use crate::keys::{end_bound, parse_task_key, tasks_prefix};
@@ -49,6 +49,9 @@ pub struct TaskBroker {
     running: Arc<AtomicBool>,
     // A notify object to wake up the background scanner when a task is claimed
     notify: Arc<Notify>,
+    // Watch channel for notifying long-polling workers when new tasks are inserted.
+    // Sender increments the generation; receivers subscribe and wait for changes.
+    task_available_tx: watch::Sender<u64>,
     // Whether the background scanner should be woken up
     scan_requested: Arc<AtomicBool>,
     // The target buffer size
@@ -83,6 +86,7 @@ impl TaskBroker {
             scan_generation_completed: Arc::new(AtomicU64::new(0)),
             running: Arc::new(AtomicBool::new(false)),
             notify: Arc::new(Notify::new()),
+            task_available_tx: watch::Sender::new(0),
             scan_requested: Arc::new(AtomicBool::new(false)),
             target_buffer: 4096,
             scan_batch: 1024,
@@ -206,6 +210,11 @@ impl TaskBroker {
                     tokio::task::yield_now().await;
                 }
             }
+        }
+
+        // Notify long-polling workers that new tasks are available
+        if inserted > 0 {
+            self.task_available_tx.send_modify(|v| *v += 1);
         }
 
         // Delete defunct tasks from the database
@@ -400,6 +409,13 @@ impl TaskBroker {
     pub fn wakeup(&self) {
         self.scan_requested.store(true, Ordering::SeqCst);
         self.notify.notify_one();
+    }
+
+    /// Subscribe to task availability notifications.
+    /// Returns a watch receiver that can be used to wait for new tasks.
+    /// The caller should call `changed().await` to wait for the next notification.
+    pub fn subscribe_task_available(&self) -> watch::Receiver<u64> {
+        self.task_available_tx.subscribe()
     }
 }
 
