@@ -15,6 +15,17 @@
 //!
 //! To prevent time-of-check-time-of-use races, in-memory concurrency counts are updated BEFORE the DB write. If the DB write fails, callers must use rollback methods to revert the in-memory state. This ensures no window exists where capacity appears available between check and grant.
 //!
+//! # Grant Broker
+//!
+//! Granting pending requests is decoupled from releasing holders. When a holder is released
+//! (via report_attempt_outcome or cancel_job), the caller deletes the holder in its own batch,
+//! updates in-memory counts, and signals the grant scanner via `request_grant`. A single
+//! background scanner task processes all pending grants, eliminating the race condition where
+//! concurrent release_and_grant_next calls would both scan and grant the same pending request.
+//!
+//! This matches the Alloy model which defines `releaseHolder` and `grantNextRequest` as
+//! separate, independent transitions.
+//!
 //! # Cancellation Semantics
 //!
 //! - When a job is cancelled, cancel_job eagerly deletes any pending requests and
@@ -26,25 +37,30 @@
 //!   this also catches any stale cancelled requests.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
+use slatedb::config::WriteOptions;
 use slatedb::{Db, DbIterator, WriteBatch};
 
 use crate::job_store_shard::helpers::WriteBatcher;
 
 use crate::codec::{
-    decode_concurrency_action, encode_concurrency_action, encode_holder, encode_task,
+    decode_concurrency_action, decode_floating_limit_state, encode_concurrency_action,
+    encode_holder, encode_task,
 };
 use crate::dst_events::{self, DstEvent};
-use crate::job::{ConcurrencyLimit, JobView};
+use crate::job::{ConcurrencyLimit, JobView, Limit};
 use crate::job_store_shard::helpers::decode_job_status_owned;
 use crate::keys::{
     concurrency_counts_key, concurrency_holder_key, concurrency_holders_queue_prefix,
-    concurrency_request_key, concurrency_request_prefix, end_bound, job_status_key,
-    parse_concurrency_holder_key, parse_concurrency_request_key, task_key,
+    concurrency_request_key, concurrency_request_prefix, concurrency_requests_prefix, end_bound,
+    floating_limit_state_key, job_status_key, parse_concurrency_holder_key,
+    parse_concurrency_request_key, task_key,
 };
 use crate::shard_range::ShardRange;
 use crate::task::{ConcurrencyAction, HolderRecord, Task};
+use crate::task_broker::TaskBroker;
 
 /// Error type for concurrency operations that can fail due to storage or encoding errors.
 #[derive(Debug, thiserror::Error)]
@@ -65,16 +81,6 @@ impl From<crate::codec::CodecError> for ConcurrencyError {
     fn from(e: crate::codec::CodecError) -> Self {
         ConcurrencyError::Encoding(e.to_string())
     }
-}
-
-/// Information needed to rollback a release_and_grant operation if DB write fails.
-#[derive(Debug, Clone)]
-pub struct ReleaseGrantRollback {
-    pub tenant: String,
-    pub queue: String,
-    pub released_task_id: String,
-    /// If Some, a grant was made to this task_id
-    pub granted_task_id: Option<String>,
 }
 
 /// Result of attempting to enqueue a job with concurrency limits
@@ -231,7 +237,7 @@ impl ConcurrencyCounts {
 
     /// Internal method that performs the atomic reservation without hydration check.
     /// Used by try_reserve after hydration, and for testing the in-memory logic.
-    fn try_reserve_internal(
+    pub(crate) fn try_reserve_internal(
         &self,
         tenant: &str,
         queue: &str,
@@ -299,41 +305,8 @@ impl ConcurrencyCounts {
         }
     }
 
-    /// Atomically release one task and reserve another in a single mutex acquisition.
-    /// This prevents a race window where capacity appears available between release and grant.
-    /// Used by release_and_grant_next to keep in-memory counts consistent.
-    pub fn atomic_release_and_reserve(
-        &self,
-        tenant: &str,
-        queue: &str,
-        release_task_id: &str,
-        reserve_task_id: &str,
-        reserve_job_id: &str,
-    ) {
-        let key = concurrency_counts_key(tenant, queue);
-        {
-            let mut h = self.holders.lock().unwrap();
-            let set = h.entry(key).or_default();
-            set.remove(release_task_id);
-            set.insert(reserve_task_id.to_string());
-        }
-
-        // Emit DST events for instrumentation
-        dst_events::emit(DstEvent::ConcurrencyTicketReleased {
-            tenant: tenant.to_string(),
-            queue: queue.to_string(),
-            task_id: release_task_id.to_string(),
-        });
-        dst_events::emit(DstEvent::ConcurrencyTicketGranted {
-            tenant: tenant.to_string(),
-            queue: queue.to_string(),
-            task_id: reserve_task_id.to_string(),
-            job_id: reserve_job_id.to_string(),
-        });
-    }
-
     /// Atomically release a task without granting to another.
-    /// Used when there are no pending requests to grant to.
+    /// Used by callers post-commit after deleting a holder from the DB batch.
     pub fn atomic_release(&self, tenant: &str, queue: &str, task_id: &str) {
         let key = concurrency_counts_key(tenant, queue);
         {
@@ -351,31 +324,6 @@ impl ConcurrencyCounts {
         });
     }
 
-    /// Rollback a release_and_reserve operation if DB write fails.
-    /// Re-adds the released task and removes the reserved task.
-    pub fn rollback_release_and_reserve(
-        &self,
-        tenant: &str,
-        queue: &str,
-        released_task_id: &str,
-        reserved_task_id: &str,
-    ) {
-        let key = concurrency_counts_key(tenant, queue);
-        let mut h = self.holders.lock().unwrap();
-        let set = h.entry(key).or_default();
-        set.remove(reserved_task_id);
-        set.insert(released_task_id.to_string());
-    }
-
-    /// Rollback a release operation if DB write fails.
-    /// Re-adds the released task.
-    pub fn rollback_release(&self, tenant: &str, queue: &str, task_id: &str) {
-        let key = concurrency_counts_key(tenant, queue);
-        let mut h = self.holders.lock().unwrap();
-        let set = h.entry(key).or_default();
-        set.insert(task_id.to_string());
-    }
-
     /// Get the current holder count for a queue.
     /// Useful for testing and debugging.
     pub fn holder_count(&self, tenant: &str, queue: &str) -> usize {
@@ -385,9 +333,18 @@ impl ConcurrencyCounts {
     }
 }
 
-/// High-level concurrency manager
+/// High-level concurrency manager with a background grant scanner.
+///
+/// The grant scanner is a single background task that processes all pending grants.
+/// This eliminates the race condition where concurrent `release_and_grant_next` calls
+/// would both scan and grant the same pending request.
 pub struct ConcurrencyManager {
     counts: ConcurrencyCounts,
+    /// Pending grant counts per queue. Key: concurrency_counts_key(tenant, queue).
+    /// Value: (tenant, queue, count). Lock held only briefly for increment/drain.
+    pending_grants: Mutex<HashMap<Vec<u8>, (String, String, u32)>>,
+    grant_notify: tokio::sync::Notify,
+    grant_running: AtomicBool,
 }
 
 impl Default for ConcurrencyManager {
@@ -400,11 +357,37 @@ impl ConcurrencyManager {
     pub fn new() -> Self {
         Self {
             counts: ConcurrencyCounts::new(),
+            pending_grants: Mutex::new(HashMap::new()),
+            grant_notify: tokio::sync::Notify::new(),
+            grant_running: AtomicBool::new(false),
         }
     }
 
     pub fn counts(&self) -> &ConcurrencyCounts {
         &self.counts
+    }
+
+    async fn resolve_queue_capacity(db: &Db, tenant: &str, queue: &str, view: &JobView) -> usize {
+        for limit in view.limits() {
+            match limit {
+                Limit::Concurrency(cl) if cl.key == queue => {
+                    return cl.max_concurrency as usize;
+                }
+                Limit::FloatingConcurrency(fl) if fl.key == queue => {
+                    let state_key = floating_limit_state_key(tenant, queue);
+                    let state_capacity = match db.get(&state_key).await {
+                        Ok(Some(raw)) => match decode_floating_limit_state(raw) {
+                            Ok(state) => Some(state.current_max_concurrency() as usize),
+                            Err(_) => None,
+                        },
+                        _ => None,
+                    };
+                    return state_capacity.unwrap_or(fl.default_max_concurrency as usize);
+                }
+                _ => {}
+            }
+        }
+        1
     }
 
     /// Handle concurrency for a new job enqueue.
@@ -537,14 +520,7 @@ impl ConcurrencyManager {
             return Ok(RequestTicketTaskOutcome::JobMissing);
         };
 
-        // Determine max concurrency for this queue
-        let mut max_allowed: usize = 1;
-        for lim in view.concurrency_limits() {
-            if lim.key == queue {
-                max_allowed = lim.max_concurrency as usize;
-                break;
-            }
-        }
+        let max_allowed = Self::resolve_queue_capacity(db, tenant, queue, view).await;
 
         // Atomically check and reserve the slot to prevent TOCTOU races
         if !self
@@ -569,174 +545,331 @@ impl ConcurrencyManager {
         })
     }
 
-    /// Release holders and grant next requests.
-    ///
-    /// IMPORTANT: This method updates in-memory counts BEFORE returning (atomically). If the DB write fails, you MUST call `rollback_release_grants` with the returned rollback info to revert the in-memory changes.
-    ///
-    /// Returns a tuple of (rollback_info, queues_to_wakeup).
-    /// Call broker.wakeup() for each queue after successful DB write.
-    pub async fn release_and_grant_next(
-        &self,
-        db: &Db,
-        batch: &mut WriteBatch,
-        tenant: &str,
-        queues: &[String],
-        finished_task_id: &str,
-        now_ms: i64,
-    ) -> Result<Vec<ReleaseGrantRollback>, ConcurrencyError> {
-        let mut rollbacks: Vec<ReleaseGrantRollback> = Vec::new();
+    /// Signal that a concurrency slot was freed for the given queue.
+    /// Called by callers after releasing a holder (post-commit).
+    /// Wakes the grant scanner to process pending requests.
+    pub fn request_grant(&self, tenant: &str, queue: &str) {
+        self.request_grant_count(tenant, queue, 1);
+    }
 
-        for queue in queues {
-            // [SILO-REL-1] Remove holder for this task/queue from DB
-            batch.delete(concurrency_holder_key(tenant, queue, finished_task_id));
+    fn request_grant_count(&self, tenant: &str, queue: &str, count: u32) {
+        let key = concurrency_counts_key(tenant, queue);
+        {
+            let mut pending = self.pending_grants.lock().unwrap();
+            let entry = pending
+                .entry(key)
+                .or_insert_with(|| (tenant.to_string(), queue.to_string(), 0));
+            entry.2 += count;
+        }
+        self.grant_notify.notify_one();
+    }
 
-            // [SILO-GRANT-1] Queue now has capacity (we just released)
-            // [SILO-GRANT-2] Find pending requests for this queue using binary storekey prefix
-            let start = concurrency_request_prefix(tenant, queue);
-            let end = end_bound(&start);
-            let mut iter: DbIterator = db.scan::<Vec<u8>, _>(start..end).await?;
+    /// Start the background grant scanner task.
+    /// On startup, scans for existing pending requests and processes them.
+    /// Then enters an event-driven loop, woken by `request_grant` calls.
+    pub fn start_grant_scanner(
+        self: &Arc<Self>,
+        db: Arc<Db>,
+        broker: Arc<TaskBroker>,
+        range: ShardRange,
+    ) {
+        self.grant_running.store(true, Ordering::SeqCst);
+        let mgr = Arc::clone(self);
+        tokio::spawn(async move {
+            // Startup: scan for existing pending requests
+            mgr.reconcile_pending_requests(&db, &range).await;
 
-            let mut granted_task_id: Option<String> = None;
-            let mut granted_job_id: Option<String> = None;
-
-            while let Some(kv) = iter.next().await? {
-                let decoded = decode_concurrency_action(kv.value.clone())?;
-                let a = decoded.fb();
-                let et = a.variant_as_enqueue_task();
-                let Some(et) = et else {
-                    tracing::warn!(
-                        queue = %queue,
-                        "grant_next: unknown concurrency action variant, deleting"
-                    );
-                    batch.delete(&kv.key);
-                    continue;
-                };
-
-                let start_time_ms = et.start_time_ms();
-                let priority = et.priority();
-                let job_id_str = et.job_id().unwrap_or_default();
-                let attempt_number = et.attempt_number();
-                let relative_attempt_number = et.relative_attempt_number();
-                let task_group_str = et.task_group().unwrap_or_default();
-
-                // Note: No cancelled check here. Cancelled jobs' requests are eagerly removed
-                // by cancel_job. The terminal status check below catches any stale requests
-                // since Cancelled is a terminal status.
-
-                // Check if job has already reached a terminal state (Succeeded/Failed/Cancelled) -
-                // if so, delete the stale request without granting. This can happen when
-                // a job succeeds via one attempt while a pending concurrency request from
-                // a restart or retry is still in the DB.
-                let status_key = job_status_key(tenant, job_id_str);
-                if let Some(status_raw) = db.get(&status_key).await? {
-                    let status = decode_job_status_owned(&status_raw).map_err(|e| e.to_string())?;
-                    if status.is_terminal() {
-                        batch.delete(&kv.key);
-                        tracing::debug!(
-                            job_id = %job_id_str,
-                            queue = %queue,
-                            status = ?status.kind,
-                            "grant_next: skipping request for terminal job"
-                        );
-                        continue;
-                    }
-                }
-
-                // Parse request key to extract request_id
-                let Some(parsed_req) = parse_concurrency_request_key(&kv.key) else {
-                    continue;
-                };
-                let request_id = parsed_req.request_id();
-
-                if start_time_ms > now_ms {
-                    // Not ready yet; leave request for later and stop searching
-                    // (requests are ordered by time, so subsequent ones are also not ready)
+            loop {
+                mgr.grant_notify.notified().await;
+                if !mgr.grant_running.load(Ordering::SeqCst) {
                     break;
                 }
 
-                // [SILO-GRANT-3] Create holder for this task/queue in DB
-                let holder = HolderRecord {
-                    granted_at_ms: now_ms,
-                };
-                let holder_val = encode_holder(&holder);
-                batch.put(
-                    concurrency_holder_key(tenant, queue, &request_id),
-                    &holder_val,
-                );
+                // Inner loop: drain and process until no more pending work
+                loop {
+                    let work = {
+                        let mut pending = mgr.pending_grants.lock().unwrap();
+                        std::mem::take(&mut *pending)
+                    };
+                    if work.is_empty() {
+                        break;
+                    }
 
-                // [SILO-GRANT-4] Create RunAttempt task in DB queue
-                let task = Task::RunAttempt {
-                    id: request_id.clone(),
-                    tenant: tenant.to_string(),
-                    job_id: job_id_str.to_string(),
-                    attempt_number,
-                    relative_attempt_number,
-                    held_queues: vec![queue.clone()],
-                    task_group: task_group_str.to_string(),
-                };
-                let tval = encode_task(&task);
-                batch.put(
-                    task_key(
-                        task_group_str,
-                        start_time_ms,
-                        priority,
-                        job_id_str,
-                        attempt_number,
-                    ),
-                    &tval,
+                    let mut any_granted = false;
+                    for (_key, (tenant, queue, count)) in work {
+                        let granted = mgr
+                            .process_grants(&db, &range, &tenant, &queue, count)
+                            .await;
+                        if granted {
+                            any_granted = true;
+                        }
+                    }
+
+                    // Wake broker if any grants were made (new tasks in DB)
+                    if any_granted {
+                        broker.wakeup();
+                    }
+                }
+            }
+        });
+    }
+
+    /// Stop the background grant scanner.
+    pub fn stop_grant_scanner(&self) {
+        self.grant_running.store(false, Ordering::SeqCst);
+        self.grant_notify.notify_one();
+    }
+
+    /// Scan all pending concurrency requests and trigger grants for each queue.
+    ///
+    /// This is used at grant-scanner startup and by the shard's periodic
+    /// reconciliation task to self-heal from missed notifications.
+    pub async fn reconcile_pending_requests(&self, db: &Db, range: &ShardRange) {
+        let start = concurrency_requests_prefix();
+        let end = end_bound(&start);
+        let mut iter = match db.scan::<Vec<u8>, _>(start..end).await {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "grant scanner: failed to scan requests during reconciliation"
                 );
+                return;
+            }
+        };
+
+        // Count pending requests per (tenant, queue)
+        let mut queue_counts: HashMap<Vec<u8>, (String, String, u32)> = HashMap::new();
+        loop {
+            let kv = match iter.next().await {
+                Ok(Some(kv)) => kv,
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "grant scanner: reconciliation scan iteration error"
+                    );
+                    break;
+                }
+            };
+
+            let Some(parsed) = parse_concurrency_request_key(&kv.key) else {
+                continue;
+            };
+
+            // Only process requests for tenants in our range
+            if !range.contains(&parsed.tenant) {
+                continue;
+            }
+
+            let key = concurrency_counts_key(&parsed.tenant, &parsed.queue);
+            let entry = queue_counts
+                .entry(key)
+                .or_insert_with(|| (parsed.tenant.clone(), parsed.queue.clone(), 0));
+            entry.2 += 1;
+        }
+
+        // Trigger grants for each queue with pending requests
+        for (_key, (tenant, queue, count)) in queue_counts {
+            self.request_grant_count(&tenant, &queue, count);
+        }
+    }
+
+    /// Process pending grant requests for a single (tenant, queue).
+    /// Scans up to `count` pending requests and grants those for which capacity exists.
+    /// Returns true if any grants were made.
+    async fn process_grants(
+        &self,
+        db: &Db,
+        range: &ShardRange,
+        tenant: &str,
+        queue: &str,
+        count: u32,
+    ) -> bool {
+        if let Err(e) = self.counts.ensure_hydrated(db, range, tenant, queue).await {
+            tracing::warn!(
+                error = %e,
+                tenant = %tenant,
+                queue = %queue,
+                "grant scanner: failed to hydrate queue"
+            );
+            return false;
+        }
+
+        let now_ms = crate::job_store_shard::now_epoch_ms();
+        // [SILO-GRANT-2] Pre: Scan for pending requests for this queue
+        let start = concurrency_request_prefix(tenant, queue);
+        let end_key = end_bound(&start);
+        let mut iter = match db.scan::<Vec<u8>, _>(start..end_key).await {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::warn!(error = %e, "grant scanner: failed to scan requests");
+                return false;
+            }
+        };
+
+        let mut granted_count = 0u32;
+        let mut max_concurrency: Option<usize> = None;
+
+        while granted_count < count {
+            let kv = match iter.next().await {
+                Ok(Some(kv)) => kv,
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::warn!(error = %e, "grant scanner: iteration error");
+                    break;
+                }
+            };
+
+            // Decode request
+            let decoded = match decode_concurrency_action(kv.value.clone()) {
+                Ok(d) => d,
+                Err(_) => {
+                    tracing::warn!(queue = %queue, "grant scanner: failed to decode request, deleting");
+                    let mut batch = WriteBatch::new();
+                    batch.delete(&kv.key);
+                    let _ = db.write(batch).await;
+                    continue;
+                }
+            };
+            let a = decoded.fb();
+            let Some(et) = a.variant_as_enqueue_task() else {
+                tracing::warn!(queue = %queue, "grant scanner: unknown concurrency action variant, deleting");
+                let mut batch = WriteBatch::new();
                 batch.delete(&kv.key);
+                let _ = db.write(batch).await;
+                continue;
+            };
 
-                granted_task_id = Some(request_id);
-                granted_job_id = Some(job_id_str.to_string());
+            let start_time_ms = et.start_time_ms();
+            let priority = et.priority();
+            let job_id_str = et.job_id().unwrap_or_default();
+            let attempt_number = et.attempt_number();
+            let relative_attempt_number = et.relative_attempt_number();
+            let task_group_str = et.task_group().unwrap_or_default();
 
-                // Only grant one request per release
+            // Check if job has reached a terminal state (Succeeded/Failed/Cancelled)
+            let status_key = job_status_key(tenant, job_id_str);
+            if let Ok(Some(status_raw)) = db.get(&status_key).await
+                && let Ok(status) = decode_job_status_owned(&status_raw)
+                && status.is_terminal()
+            {
+                let mut batch = WriteBatch::new();
+                batch.delete(&kv.key);
+                let _ = db.write(batch).await;
+                tracing::debug!(
+                    job_id = %job_id_str,
+                    queue = %queue,
+                    status = ?status.kind,
+                    "grant scanner: skipping request for terminal job"
+                );
+                continue;
+            }
+
+            // Check start_time (requests are ordered by time)
+            if start_time_ms > now_ms {
                 break;
             }
 
-            // Update in-memory counts ATOMICALLY before returning
-            // This prevents a race window where capacity appears available
-            if let Some(ref new_task_id) = granted_task_id {
-                // Release old + grant new in one atomic operation
-                let job_id = granted_job_id.as_deref().unwrap_or("");
-                self.counts.atomic_release_and_reserve(
-                    tenant,
-                    queue,
-                    finished_task_id,
-                    new_task_id,
-                    job_id,
-                );
-            } else {
-                // Just release, no grant
-                self.counts.atomic_release(tenant, queue, finished_task_id);
+            // Parse request key to get request_id
+            let Some(parsed_req) = parse_concurrency_request_key(&kv.key) else {
+                continue;
+            };
+            let request_id = parsed_req.request_id();
+
+            // Get max_concurrency (cached per queue from first successful lookup)
+            let limit = match max_concurrency {
+                Some(l) => l,
+                None => {
+                    let job_key = crate::keys::job_info_key(tenant, job_id_str);
+                    let l = match db.get(&job_key).await {
+                        Ok(Some(bytes)) => match JobView::new(bytes) {
+                            Ok(view) => {
+                                Self::resolve_queue_capacity(db, tenant, queue, &view).await
+                            }
+                            Err(_) => 1,
+                        },
+                        _ => 1,
+                    };
+                    max_concurrency = Some(l);
+                    l
+                }
+            };
+
+            // [SILO-GRANT-1] Pre: Queue has capacity — try to atomically reserve a slot
+            if !self
+                .counts
+                .try_reserve_internal(tenant, queue, &request_id, limit, job_id_str)
+            {
+                // No capacity - stop scanning
+                break;
             }
 
-            rollbacks.push(ReleaseGrantRollback {
+            // Build WriteBatch for this grant
+            let mut batch = WriteBatch::new();
+
+            // [SILO-GRANT-3] Create holder
+            let holder = HolderRecord {
+                granted_at_ms: now_ms,
+            };
+            let holder_val = encode_holder(&holder);
+            batch.put(
+                concurrency_holder_key(tenant, queue, &request_id),
+                &holder_val,
+            );
+
+            // [SILO-GRANT-4] Create RunAttempt task
+            let task = Task::RunAttempt {
+                id: request_id.clone(),
                 tenant: tenant.to_string(),
-                queue: queue.clone(),
-                released_task_id: finished_task_id.to_string(),
-                granted_task_id,
-            });
-        }
+                job_id: job_id_str.to_string(),
+                attempt_number,
+                relative_attempt_number,
+                held_queues: vec![queue.to_string()],
+                task_group: task_group_str.to_string(),
+            };
+            let tval = encode_task(&task);
+            batch.put(
+                task_key(
+                    task_group_str,
+                    start_time_ms,
+                    priority,
+                    job_id_str,
+                    attempt_number,
+                ),
+                &tval,
+            );
+            batch.delete(&kv.key);
 
-        Ok(rollbacks)
-    }
-
-    /// Rollback release_and_grant operations if DB write fails.
-    pub fn rollback_release_grants(&self, rollbacks: &[ReleaseGrantRollback]) {
-        for rb in rollbacks {
-            if let Some(ref granted) = rb.granted_task_id {
-                self.counts.rollback_release_and_reserve(
-                    &rb.tenant,
-                    &rb.queue,
-                    &rb.released_task_id,
-                    granted,
+            // Commit with durability
+            if let Err(e) = db
+                .write_with_options(
+                    batch,
+                    &WriteOptions {
+                        await_durable: true,
+                    },
+                )
+                .await
+            {
+                self.counts.release_reservation(tenant, queue, &request_id);
+                tracing::warn!(
+                    error = %e,
+                    "grant scanner: write failed, rolled back reservation"
                 );
-            } else {
-                self.counts
-                    .rollback_release(&rb.tenant, &rb.queue, &rb.released_task_id);
+                break;
             }
+
+            tracing::debug!(
+                queue = %queue,
+                request_id = %request_id,
+                job_id = %job_id_str,
+                "grant scanner: granted concurrency ticket"
+            );
+
+            granted_count += 1;
         }
+
+        granted_count > 0
     }
 }
 

@@ -295,6 +295,7 @@ pub fn dst_turmoilfs_database_template(
         path,
         wal: None,
         apply_wal_on_close: true,
+        concurrency_reconcile_interval_ms: 5000,
         slatedb: Some(dst_slatedb_settings()),
     }
 }
@@ -318,6 +319,7 @@ pub async fn setup_server(port: u16) -> turmoil::Result<()> {
             path: "mem://shard-{shard}".to_string(),
             wal: None,
             apply_wal_on_close: true,
+            concurrency_reconcile_interval_ms: 5000,
             slatedb: Some(dst_slatedb_settings()),
         },
     };

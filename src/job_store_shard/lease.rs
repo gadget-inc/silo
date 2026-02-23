@@ -13,7 +13,9 @@ use crate::job::{FloatingLimitState, JobStatus, JobView};
 use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt};
 use crate::job_store_shard::helpers::{DbWriteBatcher, now_epoch_ms};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError, LimitTaskParams};
-use crate::keys::{attempt_key, floating_limit_state_key, job_info_key, leased_task_key};
+use crate::keys::{
+    attempt_key, concurrency_holder_key, floating_limit_state_key, job_info_key, leased_task_key,
+};
 use crate::task::{DEFAULT_LEASE_MS, HeartbeatResult};
 use tracing::{debug, info_span};
 
@@ -274,21 +276,11 @@ impl JobStoreShard {
             }
         }
 
-        // [SILO-REL-1][SILO-RETRY-REL] Release any held concurrency tickets
-        // This also handles [SILO-GRANT-*] granting to next waiting request
-        // IMPORTANT: release_and_grant_next updates in-memory counts BEFORE returning
-        // to prevent TOCTOU races. If DB write fails, we must rollback.
-        let release_rollbacks = self
-            .concurrency
-            .release_and_grant_next(
-                &self.db,
-                &mut batch,
-                &tenant,
-                &held_queues_local,
-                task_id,
-                now_ms,
-            )
-            .await?;
+        // [SILO-REL-1][SILO-RETRY-REL] Delete concurrency holders in the batch.
+        // In-memory release and grant-next happen post-commit via the grant scanner.
+        for queue in &held_queues_local {
+            batch.delete(concurrency_holder_key(&tenant, queue, task_id));
+        }
 
         // Two-phase DST events: emit before write for correct causal ordering,
         // confirm after write succeeds, cancel if write fails.
@@ -330,27 +322,21 @@ impl JobStoreShard {
                 self.concurrency
                     .rollback_grant(&tenant, queue, grant_task_id);
             }
-            // Rollback release-and-grant operations
-            self.concurrency.rollback_release_grants(&release_rollbacks);
             return Err(e.into());
         }
         dst_events::confirm_write(write_op);
 
-        // Log and wake broker for any releases/grants
-        // In-memory counts are already updated by release_and_grant_next
-        for rb in &release_rollbacks {
-            let span = info_span!("concurrency.release", queue = %rb.queue, finished_task_id = %rb.released_task_id);
+        // Post-commit: update in-memory concurrency counts and signal grant scanner
+        for queue in &held_queues_local {
+            let span =
+                info_span!("concurrency.release", queue = %queue, finished_task_id = %task_id);
             let _g = span.enter();
             debug!("released ticket for finished task");
 
-            if let Some(ref granted_id) = rb.granted_task_id {
-                let span = info_span!("task.enqueue_from_grant", queue = %rb.queue, task_id = %granted_id, cause = "release");
-                let _g = span.enter();
-                debug!("enqueued task for next requester after release");
-            }
-
-            // Wake broker to scan for new tasks
-            self.broker.wakeup();
+            self.concurrency
+                .counts()
+                .atomic_release(&tenant, queue, task_id);
+            self.concurrency.request_grant(&tenant, queue);
         }
         // If we scheduled a follow-up that is ready now, wake the scanner
         if let Some(nt) = followup_next_time

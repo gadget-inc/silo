@@ -15,6 +15,7 @@ fn make_fs_factory(tmp: &tempfile::TempDir) -> Arc<ShardFactory> {
         path: tmp.path().join("%shard%").to_string_lossy().to_string(),
         wal: None,
         apply_wal_on_close: true,
+        concurrency_reconcile_interval_ms: 5000,
         slatedb: None,
     };
     Arc::new(ShardFactory::new(
@@ -41,6 +42,7 @@ fn make_fs_factory_with_wal(
             path: wal_tmp.path().join("%shard%").to_string_lossy().to_string(),
         }),
         apply_wal_on_close: true,
+        concurrency_reconcile_interval_ms: 5000,
         slatedb: None,
     };
     Arc::new(ShardFactory::new(
@@ -279,6 +281,7 @@ async fn open_invalid_template_no_placeholder() {
             path: "/tmp/no-placeholder-here".to_string(),
             wal: None,
             apply_wal_on_close: true,
+            concurrency_reconcile_interval_ms: 5000,
             slatedb: None,
         },
         MockGubernatorClient::new_arc(),
@@ -305,6 +308,7 @@ async fn open_invalid_template_bad_boundary() {
             path: "/tmp/prefix%shard%".to_string(),
             wal: None,
             apply_wal_on_close: true,
+            concurrency_reconcile_interval_ms: 5000,
             slatedb: None,
         },
         MockGubernatorClient::new_arc(),

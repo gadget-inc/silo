@@ -1,12 +1,12 @@
 mod test_helpers;
 
-use silo::codec::{decode_lease, decode_task, encode_lease};
+use silo::codec::{decode_lease, decode_task, encode_concurrency_action, encode_lease};
 use silo::job::{ConcurrencyLimit, Limit};
 use silo::job_attempt::{AttemptOutcome, AttemptStatus};
-use silo::keys::concurrency_holder_key;
+use silo::keys::{concurrency_holder_key, concurrency_request_key};
 use silo::retry::RetryPolicy;
-use silo::task::{LeaseRecord, Task};
-use slatedb::DbIterator;
+use silo::task::{ConcurrencyAction, LeaseRecord, Task};
+use slatedb::{DbIterator, WriteBatch};
 
 use test_helpers::*;
 
@@ -123,9 +123,91 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
         .await
         .expect("report1");
 
-    // Now there should be a new task for the queued request
-    let some = first_task_kv(shard.db()).await;
+    // Now there should be a new task for the queued request.
+    // Grants happen asynchronously via the background scanner, so poll.
+    let some = poll_until(|| first_task_kv(shard.db()), |r| r.is_some(), 5000).await;
     assert!(some.is_some(), "task should be enqueued for next requester");
+}
+
+#[silo::test]
+async fn periodic_reconcile_grants_pending_request_without_signal() {
+    let (_tmp, shard) = open_temp_shard_with_reconcile_interval_ms(50).await;
+    let now = now_ms();
+    let tenant = "-";
+    let queue = "reconcile-q".to_string();
+
+    // Create a real job record that the grant scanner can resolve when granting.
+    // Use a future start time so no ready task exists for this job yet.
+    let job_id = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now + 60_000,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"reconcile": true})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue");
+
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        0,
+        "no holders before injecting request"
+    );
+
+    // Manually inject a pending request directly in DB without calling request_grant.
+    // This simulates a crash/bug window where durable request exists but in-memory
+    // scanner notification was missed.
+    let action = ConcurrencyAction::EnqueueTask {
+        start_time_ms: now,
+        priority: 10,
+        job_id: job_id.clone(),
+        attempt_number: 1,
+        relative_attempt_number: 1,
+        task_group: "default".to_string(),
+    };
+    let request_key = concurrency_request_key(tenant, &queue, now, 10, &job_id, 1, "manual");
+    let request_value = encode_concurrency_action(&action);
+    let mut batch = WriteBatch::new();
+    batch.put(&request_key, &request_value);
+    shard
+        .db()
+        .write(batch)
+        .await
+        .expect("write pending concurrency request");
+
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        1,
+        "request should be present before reconciliation"
+    );
+
+    // Periodic reconciliation should discover the orphaned request and grant it.
+    let holders = poll_until(
+        || count_concurrency_holders(shard.db()),
+        |count| *count == 1,
+        2_000,
+    )
+    .await;
+    assert_eq!(
+        holders, 1,
+        "periodic reconciliation should grant request and create holder"
+    );
+
+    let requests_left = poll_until(
+        || count_concurrency_requests(shard.db()),
+        |count| *count == 0,
+        2_000,
+    )
+    .await;
+    assert_eq!(
+        requests_left, 0,
+        "request should be consumed after reconciliation grant"
+    );
 }
 
 #[silo::test]
@@ -525,12 +607,12 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
         }
     }
 
-    // Release first; only one new task should appear immediately
+    // Release first; one new task should appear after the background grant scanner runs
     shard
         .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report1");
-    let after = first_task_kv(shard.db()).await;
+    let after = poll_until(|| first_task_kv(shard.db()), |r| r.is_some(), 5000).await;
     assert!(after.is_some(), "one task should be enqueued after release");
 }
 
@@ -721,8 +803,13 @@ async fn concurrency_multiple_holders_max_greater_than_one() {
         .await
         .expect("report1");
 
-    // Still 3 holders (released 1, granted 1)
-    let holders_after = count_concurrency_holders(shard.db()).await;
+    // Still 3 holders (released 1, granted 1). Grant happens asynchronously, so poll.
+    let holders_after = poll_until(
+        || count_concurrency_holders(shard.db()),
+        |&count| count == 3,
+        5000,
+    )
+    .await;
     assert_eq!(holders_after, 3, "should maintain 3 concurrent holders");
 
     // Complete all
@@ -1164,28 +1251,29 @@ async fn concurrency_reap_expired_lease_releases_holder() {
     let reaped = shard.reap_expired_leases("-").await.expect("reap");
     assert_eq!(reaped, 1);
 
-    // Job 2 should now be granted (holder released from job 1)
-    let t2_vec = shard.dequeue("w", "default", 1).await.expect("deq2").tasks;
-    assert_eq!(t2_vec.len(), 1, "job 2 should be granted after reap");
-
-    // Job 1 retry should also be scheduled
-    let j1_attempt2 = shard
-        .get_job_attempt("-", &j1, 2)
-        .await
-        .expect("get attempt 2");
-    assert!(
-        j1_attempt2.is_none(),
-        "attempt 2 not created yet (only task scheduled)"
+    // After reap releases the holder, either job 2's pending request or job 1's retry
+    // RequestTicket can be granted. With the async grant scanner, the ordering is
+    // non-deterministic. The key invariant is that a new task becomes available.
+    let next_task = poll_until(
+        || async { shard.dequeue("w", "default", 1).await.expect("deq2").tasks },
+        |tasks| !tasks.is_empty(),
+        5000,
+    )
+    .await;
+    assert_eq!(
+        next_task.len(),
+        1,
+        "a task should be granted after reap releases the holder"
     );
 
     // Cleanup
     shard
         .report_attempt_outcome(
-            t2_vec[0].attempt().task_id(),
+            next_task[0].attempt().task_id(),
             AttemptOutcome::Success { result: vec![] },
         )
         .await
-        .expect("report2");
+        .expect("report cleanup");
 }
 
 #[silo::test]

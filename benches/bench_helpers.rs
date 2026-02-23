@@ -607,6 +607,9 @@ pub async fn clone_golden_shard(
             }),
             rate_limiter: NullGubernatorClient::new(),
             metrics: None,
+            concurrency_reconcile_interval: Duration::from_millis(
+                silo::settings::DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS,
+            ),
         },
         ShardRange::full(),
     )

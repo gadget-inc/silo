@@ -92,6 +92,7 @@ impl ShardFactory {
                 path: "/noop".to_string(),
                 wal: None,
                 apply_wal_on_close: false,
+                concurrency_reconcile_interval_ms: 5000,
                 slatedb: None,
             },
             rate_limiter: NullGubernatorClient::new(),
@@ -190,6 +191,9 @@ impl ShardFactory {
                         slatedb_settings: template.slatedb.clone(),
                         rate_limiter,
                         metrics,
+                        concurrency_reconcile_interval: Duration::from_millis(
+                            template.concurrency_reconcile_interval_ms.max(1),
+                        ),
                     },
                     range.clone(),
                 )

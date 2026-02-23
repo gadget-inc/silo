@@ -1133,6 +1133,7 @@ async fn setup_multi_shard_server(
         path: tmp.path().join("%shard%").to_string_lossy().to_string(),
         wal: None,
         apply_wal_on_close: true,
+        concurrency_reconcile_interval_ms: 5000,
         slatedb: None,
     };
     let rate_limiter = MockGubernatorClient::new_arc();

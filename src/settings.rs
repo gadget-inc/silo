@@ -159,6 +159,12 @@ fn default_apply_wal_on_close() -> bool {
     true
 }
 
+pub const DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS: u64 = 5000;
+
+fn default_concurrency_reconcile_interval_ms() -> u64 {
+    DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DatabaseTemplate {
     pub backend: Backend,
@@ -178,6 +184,11 @@ pub struct DatabaseTemplate {
     /// Defaults to true.
     #[serde(default = "default_apply_wal_on_close")]
     pub apply_wal_on_close: bool,
+    /// Interval in milliseconds for periodic concurrency request reconciliation.
+    /// This background task scans pending requests and re-triggers grant processing
+    /// to self-heal from missed in-memory notifications.
+    #[serde(default = "default_concurrency_reconcile_interval_ms")]
+    pub concurrency_reconcile_interval_ms: u64,
     /// Optional SlateDB-specific settings for tuning database performance.
     /// If not specified, SlateDB defaults are used. When partially specified,
     /// unspecified fields use SlateDB defaults.
@@ -492,6 +503,7 @@ impl AppConfig {
                 path: "/tmp/silo-%shard%".to_string(),
                 wal: None,
                 apply_wal_on_close: true,
+                concurrency_reconcile_interval_ms: default_concurrency_reconcile_interval_ms(),
                 slatedb: None,
             },
         };

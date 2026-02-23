@@ -60,6 +60,8 @@ The `[database]` section configures how Silo stores job data. Silo uses [SlateDB
 backend = "gcs"
 path = "gs://my-bucket/silo/%shard%"
 apply_wal_on_close = true
+# Optional: periodic self-healing scan for pending concurrency requests
+# concurrency_reconcile_interval_ms = 5000
 
 # Optional: separate WAL storage
 [database.wal]
@@ -74,6 +76,7 @@ path = "/var/lib/silo/wal/%shard%"
 | `backend` | string | `"fs"` | Storage backend type (see below) |
 | `path` | string | `"/tmp/silo/%shard%"` | Path or URL for data storage. Use `%shard%` as a placeholder for the shard number. |
 | `apply_wal_on_close` | bool | `true` | Flush WAL to object storage before closing shards (recommended for durability) |
+| `concurrency_reconcile_interval_ms` | number | `5000` | Optional interval for periodic pending-request reconciliation in the concurrency manager |
 
 <Aside type="caution">
 The `%shard%` placeholder must be an independent directory segment—it cannot have a prefix or suffix within the same path component.
@@ -129,6 +132,12 @@ When using a local WAL with cloud object storage:
 When running on pure object storage, your Silo instances don't necessarily need to apply the WAL to the rest of the storage before shutting down. But, when running with a split WAL, where the WAL is not on object storage, you should apply the WAL to the rest of the storage before shutting down to ensure durability. `apply_wal_on_close` is set to `true` by default, which triggers this behavior.
 
 Note that `apply_wal_on_close` only applies during **graceful** shutdowns. If a node crashes, the WAL is not flushed. Silo's permanent shard leases ensure the crashed node retains ownership of its shards, so when the node restarts, it can recover the unflushed WAL from local disk.
+
+#### `concurrency_reconcile_interval_ms`
+
+Silo runs a background reconciliation loop while each shard is open. This loop periodically scans pending concurrency request records and re-signals grant processing. It is a self-healing mechanism for cases where durable requests exist but in-memory notifications were missed (for example, due to a crash between separate write/notify phases).
+
+This option is **optional**. If omitted, Silo uses the default value of `5000` milliseconds.
 
 ### SlateDB Configuration
 

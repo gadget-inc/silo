@@ -30,6 +30,7 @@ async fn create_multi_shard_factory(
         path: format!("{}/%shard%", base_path),
         wal: None,
         apply_wal_on_close: true,
+        concurrency_reconcile_interval_ms: 5000,
         slatedb: None,
     };
 

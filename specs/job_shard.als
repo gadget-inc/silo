@@ -672,7 +672,10 @@ pred completeSuccessReleaseTicket[tid: TaskId, w: Worker, q: Queue, t: Time, tne
 -- Note: No cancelled check here. Cancelled jobs' requests are eagerly removed
 -- by cancelJob. The terminal status check in the Rust implementation catches any
 -- stale requests for cancelled jobs (since Cancelled is terminal).
--- See: concurrency.rs::release_and_grant_next
+-- Implementation: driven by a background grant scanner (ConcurrencyManager::process_grants)
+-- rather than being called synchronously during release. Callers signal the scanner
+-- via request_grant() after releasing a holder; the scanner serializes all grants
+-- to prevent double-grant races from concurrent releases.
 pred grantNextRequest[q: Queue, reqTid: TaskId, t: Time, tnext: Time] {
     -- [SILO-GRANT-1] Pre: Queue has capacity (limit=1, no holders)
     queueHasCapacity[q, t]
