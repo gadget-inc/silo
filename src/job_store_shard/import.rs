@@ -3,9 +3,9 @@
 //! Allows importing jobs from other systems with historical attempt records.
 //! Unlike enqueue, import accepts completed attempts and lets Silo take ownership going forward.
 
+use slatedb::IsolationLevel;
 use slatedb::config::WriteOptions;
-use slatedb::{IsolationLevel, WriteBatch};
-use tracing::{debug, warn};
+use tracing::debug;
 use uuid::Uuid;
 
 use crate::codec::{decode_attempt, decode_task, encode_attempt, encode_job_info};
@@ -576,8 +576,16 @@ impl JobStoreShard {
             } else {
                 // No task found - TicketRequested case (request record exists but no task
                 // in DB queue). Delete concurrency requests for this job.
-                self.delete_concurrency_requests_for_job(&txn, tenant, job_id, &stored_limits)
-                    .await?;
+                self.delete_concurrency_requests_for_job(
+                    &txn,
+                    tenant,
+                    job_id,
+                    &stored_limits,
+                    attempt_number,
+                    start_time_ms,
+                    priority,
+                )
+                .await?;
             }
         }
 
@@ -672,38 +680,14 @@ impl JobStoreShard {
         // Must happen after commit so the scanner cannot re-buffer old tasks from DB.
         self.broker.evict_keys(&matched_task_keys);
 
-        // Release in-memory holders and grant next requests post-commit.
-        // This mirrors cancel/lease behavior: DB task cleanup commits first, then
-        // release-and-grant runs as a follow-up durable write.
+        // Release in-memory holders and immediately request grant scanning.
+        // This avoids waiting for periodic reconciliation when slots free up.
         for (finished_task_id, held_queues) in &released_holders {
-            let mut grant_batch = WriteBatch::new();
-            let release_rollbacks = self
-                .concurrency
-                .release_and_grant_next(
-                    &self.db,
-                    &mut grant_batch,
-                    tenant,
-                    held_queues,
-                    finished_task_id,
-                    now_ms,
-                )
-                .await
-                .map_err(|e| JobStoreShardError::Codec(e.to_string()))?;
-
-            if let Err(e) = self
-                .db
-                .write_with_options(
-                    grant_batch,
-                    &WriteOptions {
-                        await_durable: true,
-                    },
-                )
-                .await
-            {
-                self.concurrency.rollback_release_grants(&release_rollbacks);
-                warn!(error = %e, job_id = %job_id, "reimport: grant-next write failed, rolled back in-memory state");
-            } else {
-                self.broker.wakeup();
+            for queue in held_queues {
+                self.concurrency
+                    .counts()
+                    .atomic_release(tenant, queue, finished_task_id);
+                self.concurrency.request_grant(tenant, queue);
             }
         }
 
