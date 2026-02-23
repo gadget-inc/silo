@@ -1,5 +1,6 @@
 mod test_helpers;
 
+use silo::codec::{decode_task, encode_task};
 use silo::job::{
     ConcurrencyLimit, GubernatorAlgorithm, GubernatorRateLimit, JobStatusKind, Limit,
     RateLimitRetryPolicy,
@@ -8,6 +9,8 @@ use silo::job_attempt::{AttemptOutcome, AttemptStatus};
 use silo::job_store_shard::JobStoreShard;
 use silo::job_store_shard::import::{ImportJobParams, ImportedAttempt, ImportedAttemptStatus};
 use silo::retry::RetryPolicy;
+use silo::task::{GubernatorRateLimitData, Task};
+use slatedb::WriteBatch;
 use std::sync::Arc;
 
 fn default_retry_policy() -> RetryPolicy {
@@ -2685,5 +2688,237 @@ async fn reimport_no_new_attempts_rejected() {
             .as_ref()
             .unwrap()
             .contains("at least one new attempt")
+    );
+}
+
+// =========================================================================
+// Reimport regressions
+// =========================================================================
+
+#[silo::test]
+async fn reimport_terminal_releases_holders_for_check_rate_limit_task() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let job_id = "reimp-check-rate-limit-holder";
+    let queue = "reimp-check-rate-limit-q";
+
+    let mut initial = base_import_params(job_id);
+    initial.retry_policy = Some(default_retry_policy());
+    initial.limits = vec![Limit::Concurrency(ConcurrencyLimit {
+        key: queue.to_string(),
+        max_concurrency: 10,
+    })];
+    let r = shard.import_jobs("-", vec![initial]).await.unwrap();
+    assert!(r[0].success);
+    assert_eq!(r[0].status, JobStatusKind::Scheduled);
+
+    let (task_key, task_raw) = test_helpers::first_task_kv(shard.db())
+        .await
+        .expect("expected scheduled task");
+    let task = decode_task(&task_raw).expect("decode task");
+    let held_queues = match task {
+        Task::RunAttempt {
+            id,
+            tenant,
+            job_id: task_job_id,
+            attempt_number,
+            relative_attempt_number,
+            held_queues,
+            task_group,
+        } => {
+            let synthetic = Task::CheckRateLimit {
+                task_id: id,
+                tenant,
+                job_id: task_job_id,
+                attempt_number,
+                relative_attempt_number,
+                limit_index: 1,
+                rate_limit: GubernatorRateLimitData {
+                    name: "api-limit".to_string(),
+                    unique_key: format!("reimport-{}", uuid::Uuid::new_v4()),
+                    limit: 100,
+                    duration_ms: 60_000,
+                    hits: 1,
+                    algorithm: GubernatorAlgorithm::TokenBucket.as_u8(),
+                    behavior: 0,
+                    retry_initial_backoff_ms: 10,
+                    retry_max_backoff_ms: 1000,
+                    retry_backoff_multiplier: 2.0,
+                    retry_max_retries: 10,
+                },
+                retry_count: 0,
+                started_at_ms: test_helpers::now_ms(),
+                priority: 50,
+                held_queues: held_queues.clone(),
+                task_group,
+            };
+            let mut batch = WriteBatch::new();
+            batch.put(&task_key, &encode_task(&synthetic));
+            shard
+                .db()
+                .write(batch)
+                .await
+                .expect("replace RunAttempt with CheckRateLimit");
+            held_queues
+        }
+        other => panic!("expected RunAttempt task before replacement, got {other:?}"),
+    };
+    assert!(
+        !held_queues.is_empty(),
+        "synthetic CheckRateLimit should carry held queues"
+    );
+    assert_eq!(
+        test_helpers::count_concurrency_holders(shard.db()).await,
+        1,
+        "import should hold one queue before reimport cleanup"
+    );
+
+    let mut reimport = base_import_params(job_id);
+    reimport.retry_policy = Some(default_retry_policy());
+    reimport.limits = vec![Limit::Concurrency(ConcurrencyLimit {
+        key: queue.to_string(),
+        max_concurrency: 10,
+    })];
+    reimport.attempts = vec![succeeded_attempt(1_700_000_001_000)];
+    let r = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+    assert_eq!(r[0].status, JobStatusKind::Succeeded);
+
+    assert_eq!(
+        test_helpers::count_concurrency_holders(shard.db()).await,
+        0,
+        "terminal reimport should release holders from CheckRateLimit task"
+    );
+}
+
+#[silo::test]
+async fn reimport_updates_retry_policy_used_for_future_failures() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let job_id = "reimp-retry-policy-persisted";
+
+    let mut initial = base_import_params(job_id);
+    initial.retry_policy = None;
+    initial.attempts = vec![failed_attempt(1_700_000_001_000)];
+    let r = shard.import_jobs("-", vec![initial]).await.unwrap();
+    assert!(r[0].success);
+    assert_eq!(r[0].status, JobStatusKind::Failed);
+
+    let updated_policy = RetryPolicy {
+        retry_count: 5,
+        initial_interval_ms: 10,
+        max_interval_ms: 100,
+        randomize_interval: false,
+        backoff_factor: 2.0,
+    };
+    let mut reimport = base_import_params(job_id);
+    reimport.retry_policy = Some(updated_policy.clone());
+    reimport.attempts = vec![
+        failed_attempt(1_700_000_001_000),
+        failed_attempt(1_700_000_002_000),
+    ];
+    let r = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+    assert_eq!(r[0].status, JobStatusKind::Scheduled);
+
+    let view = shard.get_job("-", job_id).await.unwrap().unwrap();
+    let persisted = view
+        .retry_policy()
+        .expect("reimport should persist new retry policy");
+    assert_eq!(persisted.retry_count, updated_policy.retry_count);
+    assert_eq!(
+        persisted.initial_interval_ms,
+        updated_policy.initial_interval_ms
+    );
+    assert_eq!(persisted.max_interval_ms, updated_policy.max_interval_ms);
+    assert_eq!(persisted.backoff_factor, updated_policy.backoff_factor);
+
+    let dequeued = shard.dequeue("worker-1", "default", 1).await.unwrap();
+    assert_eq!(dequeued.tasks.len(), 1);
+    let task_id = dequeued.tasks[0].attempt().task_id().to_string();
+
+    shard
+        .report_attempt_outcome(
+            &task_id,
+            AttemptOutcome::Error {
+                error_code: "RETRY_ME".to_string(),
+                error: vec![7, 7, 7],
+            },
+        )
+        .await
+        .unwrap();
+
+    let status = shard.get_job_status("-", job_id).await.unwrap().unwrap();
+    assert_eq!(
+        status.kind,
+        JobStatusKind::Scheduled,
+        "next failure after reimport should still schedule retries from new policy"
+    );
+}
+
+#[silo::test]
+async fn reimport_releasing_holder_triggers_immediate_grant_scan() {
+    let (_tmp, shard) = test_helpers::open_temp_shard_with_reconcile_interval_ms(60_000).await;
+    let queue = "reimp-release-triggers-grant-q";
+
+    let mut holder_job = base_import_params("reimp-grant-holder");
+    holder_job.retry_policy = Some(default_retry_policy());
+    holder_job.limits = vec![Limit::Concurrency(ConcurrencyLimit {
+        key: queue.to_string(),
+        max_concurrency: 1,
+    })];
+    let r = shard.import_jobs("-", vec![holder_job]).await.unwrap();
+    assert!(r[0].success);
+    assert_eq!(r[0].status, JobStatusKind::Scheduled);
+    assert_eq!(
+        test_helpers::count_concurrency_holders(shard.db()).await,
+        1,
+        "first job should hold the only queue slot"
+    );
+
+    let mut waiting_job = base_import_params("reimp-grant-waiting");
+    waiting_job.retry_policy = Some(default_retry_policy());
+    waiting_job.limits = vec![Limit::Concurrency(ConcurrencyLimit {
+        key: queue.to_string(),
+        max_concurrency: 1,
+    })];
+    let r = shard.import_jobs("-", vec![waiting_job]).await.unwrap();
+    assert!(r[0].success);
+    assert_eq!(r[0].status, JobStatusKind::Scheduled);
+    assert_eq!(
+        test_helpers::count_concurrency_requests(shard.db()).await,
+        1,
+        "second job should queue a pending request"
+    );
+
+    let mut holder_reimport = base_import_params("reimp-grant-holder");
+    holder_reimport.retry_policy = Some(default_retry_policy());
+    holder_reimport.limits = vec![Limit::Concurrency(ConcurrencyLimit {
+        key: queue.to_string(),
+        max_concurrency: 1,
+    })];
+    holder_reimport.attempts = vec![succeeded_attempt(1_700_000_003_000)];
+    let r = shard.import_jobs("-", vec![holder_reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+    assert_eq!(r[0].status, JobStatusKind::Succeeded);
+
+    let holders = test_helpers::poll_until(
+        || test_helpers::count_concurrency_holders(shard.db()),
+        |count| *count == 1,
+        1_000,
+    )
+    .await;
+    assert_eq!(
+        holders, 1,
+        "released holder should trigger immediate grant to pending request"
+    );
+
+    let requests_left = test_helpers::poll_until(
+        || test_helpers::count_concurrency_requests(shard.db()),
+        |count| *count == 0,
+        1_000,
+    )
+    .await;
+    assert_eq!(
+        requests_left, 0,
+        "pending request should be consumed after immediate grant"
     );
 }

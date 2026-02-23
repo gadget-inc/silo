@@ -324,6 +324,30 @@ impl ConcurrencyCounts {
         });
     }
 
+    /// Rollback a release_and_reserve operation if DB write fails.
+    /// Re-adds the released task and removes the reserved task.
+    pub fn rollback_release_and_reserve(
+        &self,
+        tenant: &str,
+        queue: &str,
+        released_task_id: &str,
+        reserved_task_id: &str,
+    ) {
+        let key = concurrency_counts_key(tenant, queue);
+        let mut h = self.holders.lock().unwrap();
+        let set = h.entry(key).or_default();
+        set.remove(reserved_task_id);
+        set.insert(released_task_id.to_string());
+    }
+
+    /// Rollback a release operation if DB write fails.
+    /// Re-adds the released task.
+    pub fn rollback_release(&self, tenant: &str, queue: &str, task_id: &str) {
+        let key = concurrency_counts_key(tenant, queue);
+        let mut h = self.holders.lock().unwrap();
+        let set = h.entry(key).or_default();
+        set.insert(task_id.to_string());
+    }
     /// Get the current holder count for a queue.
     /// Useful for testing and debugging.
     pub fn holder_count(&self, tenant: &str, queue: &str) -> usize {

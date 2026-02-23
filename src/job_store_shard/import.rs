@@ -500,6 +500,21 @@ impl JobStoreShard {
         let (new_job_status, status_kind, is_terminal) =
             determine_import_status(params, total_attempts, now_ms, effective_start_at_ms);
 
+        // Persist the updated retry policy so future retry decisions (e.g. in
+        // report_attempt_outcome) stay consistent with this reimport.
+        let updated_job = JobInfo {
+            id: existing_job.id().to_string(),
+            priority: existing_job.priority(),
+            enqueue_time_ms: existing_job.enqueue_time_ms(),
+            payload: existing_job.payload_bytes().to_vec(),
+            retry_policy: params.retry_policy.clone(),
+            metadata: existing_job.metadata(),
+            limits: existing_job.limits(),
+            task_group: existing_job.task_group().to_string(),
+        };
+        let updated_job_value = encode_job_info(&updated_job);
+        txn.put(job_info_key(tenant, job_id), &updated_job_value)?;
+
         // === Clean up old scheduling state ===
 
         // [SILO-REIMP-5] Remove DB queue tasks for this job.
@@ -536,6 +551,11 @@ impl JobStoreShard {
                 match decoded {
                     Task::RunAttempt {
                         id: tid,
+                        held_queues,
+                        ..
+                    }
+                    | Task::CheckRateLimit {
+                        task_id: tid,
                         held_queues,
                         ..
                     } => {
@@ -656,6 +676,11 @@ impl JobStoreShard {
         // [SILO-REIMP-6] Remove buffered tasks for this job.
         // Must happen after commit so the scanner cannot re-buffer old tasks from DB.
         self.broker.evict_keys(&matched_task_keys);
+
+        // Signal grant scanning for queues where this reimport released holders.
+        for (t, q, _) in &released_holders {
+            self.concurrency.request_grant(t, q);
+        }
 
         // For non-terminal, finish enqueue (flush + broker wakeup)
         if !is_terminal {
