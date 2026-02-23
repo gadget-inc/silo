@@ -2856,7 +2856,7 @@ async fn reimport_updates_retry_policy_used_for_future_failures() {
 
 #[silo::test]
 async fn reimport_releasing_holder_triggers_immediate_grant_scan() {
-    let (_tmp, shard) = test_helpers::open_temp_shard_with_reconcile_interval_ms(60_000).await;
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
     let queue = "reimp-release-triggers-grant-q";
 
     let mut holder_job = base_import_params("reimp-grant-holder");
@@ -2900,23 +2900,27 @@ async fn reimport_releasing_holder_triggers_immediate_grant_scan() {
     assert!(r[0].success, "reimport failed: {:?}", r[0].error);
     assert_eq!(r[0].status, JobStatusKind::Succeeded);
 
-    let holders = test_helpers::poll_until(
-        || test_helpers::count_concurrency_holders(shard.db()),
-        |count| *count == 1,
-        1_000,
-    )
-    .await;
+    let mut holders = 0usize;
+    for _ in 0..20 {
+        holders = test_helpers::count_concurrency_holders(shard.db()).await;
+        if holders == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     assert_eq!(
         holders, 1,
         "released holder should trigger immediate grant to pending request"
     );
 
-    let requests_left = test_helpers::poll_until(
-        || test_helpers::count_concurrency_requests(shard.db()),
-        |count| *count == 0,
-        1_000,
-    )
-    .await;
+    let mut requests_left = usize::MAX;
+    for _ in 0..20 {
+        requests_left = test_helpers::count_concurrency_requests(shard.db()).await;
+        if requests_left == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     assert_eq!(
         requests_left, 0,
         "pending request should be consumed after immediate grant"

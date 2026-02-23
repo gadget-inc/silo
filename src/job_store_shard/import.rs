@@ -3,9 +3,9 @@
 //! Allows importing jobs from other systems with historical attempt records.
 //! Unlike enqueue, import accepts completed attempts and lets Silo take ownership going forward.
 
-use slatedb::IsolationLevel;
 use slatedb::config::WriteOptions;
-use tracing::debug;
+use slatedb::{IsolationLevel, WriteBatch};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::codec::{decode_attempt, decode_task, encode_attempt, encode_job_info};
@@ -524,7 +524,7 @@ impl JobStoreShard {
         let priority = existing_job.priority();
         let stored_limits = existing_job.limits();
         let mut matched_task_keys: Vec<Vec<u8>> = Vec::new();
-        let mut released_holders: Vec<(String, String, String)> = Vec::new();
+        let mut released_holders: Vec<(String, Vec<String>)> = Vec::new();
 
         if old_status.kind == JobStatusKind::Scheduled {
             // O(1) task key reconstruction from status fields (same pattern as cancel/expedite/lease)
@@ -563,10 +563,9 @@ impl JobStoreShard {
                         for queue in &held_queues {
                             let holder_key = concurrency_holder_key(tenant, queue, &tid);
                             txn.delete(&holder_key)?;
-                            self.concurrency
-                                .counts()
-                                .atomic_release(tenant, queue, &tid);
-                            released_holders.push((tenant.to_string(), queue.clone(), tid.clone()));
+                        }
+                        if !held_queues.is_empty() {
+                            released_holders.push((tid, held_queues));
                         }
                     }
                     Task::RequestTicket { .. } => {
@@ -663,10 +662,6 @@ impl JobStoreShard {
             }
             // Rollback new grants
             self.rollback_grants(tenant, &grants);
-            // Rollback released holders
-            for (t, q, tid) in &released_holders {
-                self.concurrency.counts().rollback_release(t, q, tid);
-            }
             return Err(e.into());
         }
         if let Some(op) = write_op {
@@ -677,9 +672,39 @@ impl JobStoreShard {
         // Must happen after commit so the scanner cannot re-buffer old tasks from DB.
         self.broker.evict_keys(&matched_task_keys);
 
-        // Signal grant scanning for queues where this reimport released holders.
-        for (t, q, _) in &released_holders {
-            self.concurrency.request_grant(t, q);
+        // Release in-memory holders and grant next requests post-commit.
+        // This mirrors cancel/lease behavior: DB task cleanup commits first, then
+        // release-and-grant runs as a follow-up durable write.
+        for (finished_task_id, held_queues) in &released_holders {
+            let mut grant_batch = WriteBatch::new();
+            let release_rollbacks = self
+                .concurrency
+                .release_and_grant_next(
+                    &self.db,
+                    &mut grant_batch,
+                    tenant,
+                    held_queues,
+                    finished_task_id,
+                    now_ms,
+                )
+                .await
+                .map_err(|e| JobStoreShardError::Codec(e.to_string()))?;
+
+            if let Err(e) = self
+                .db
+                .write_with_options(
+                    grant_batch,
+                    &WriteOptions {
+                        await_durable: true,
+                    },
+                )
+                .await
+            {
+                self.concurrency.rollback_release_grants(&release_rollbacks);
+                warn!(error = %e, job_id = %job_id, "reimport: grant-next write failed, rolled back in-memory state");
+            } else {
+                self.broker.wakeup();
+            }
         }
 
         // For non-terminal, finish enqueue (flush + broker wakeup)
