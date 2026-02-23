@@ -741,6 +741,125 @@ async fn floating_limit_allows_multiple_concurrent_grants() {
 }
 
 #[silo::test]
+async fn floating_limit_scanner_grants_waiter_while_one_holder_remains() {
+    tokio::time::pause();
+    let now = now_ms();
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "fl-scanner-respects-max-q".to_string();
+    let refresh_interval_ms = 60_000i64;
+
+    let j1 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            vec![silo::job::Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: queue.clone(),
+                    default_max_concurrency: 2,
+                    refresh_interval_ms,
+                    metadata: vec![],
+                },
+            )],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue j1");
+
+    let j2 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+            vec![silo::job::Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: queue.clone(),
+                    default_max_concurrency: 2,
+                    refresh_interval_ms,
+                    metadata: vec![],
+                },
+            )],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue j2");
+
+    let j3 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 3})),
+            vec![silo::job::Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: queue.clone(),
+                    default_max_concurrency: 2,
+                    refresh_interval_ms,
+                    metadata: vec![],
+                },
+            )],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue j3");
+
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        2,
+        "first two jobs should hold the two available slots"
+    );
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        1,
+        "third job should be queued as a waiter"
+    );
+
+    let deq = shard.dequeue("w1", "default", 1).await.expect("dequeue");
+    assert_eq!(deq.tasks.len(), 1, "should lease one runnable job");
+    let t1_id = deq.tasks[0].attempt().task_id().to_string();
+    let running_job = deq.tasks[0].job().id().to_string();
+    assert!(
+        running_job == j1 || running_job == j2,
+        "leased task should be one of the initially granted jobs"
+    );
+
+    shard
+        .report_attempt_outcome(&t1_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report success");
+
+    let has_j3_run = poll_until(
+        || async {
+            let tasks = shard.peek_tasks("default", 10).await.expect("peek tasks");
+            tasks.iter().any(|t| {
+                matches!(
+                    t,
+                    Task::RunAttempt { job_id, .. } if job_id == &j3
+                )
+            })
+        },
+        |&found| found,
+        5_000,
+    )
+    .await;
+    assert!(
+        has_j3_run,
+        "queued waiter should be granted even while one holder remains"
+    );
+}
+
+#[silo::test]
 async fn floating_concurrency_limit_dequeue_returns_refresh_tasks() {
     tokio::time::pause();
     let now = now_ms();

@@ -46,15 +46,17 @@ use slatedb::{Db, DbIterator, WriteBatch};
 use crate::job_store_shard::helpers::WriteBatcher;
 
 use crate::codec::{
-    decode_concurrency_action, encode_concurrency_action, encode_holder, encode_task,
+    decode_concurrency_action, decode_floating_limit_state, encode_concurrency_action,
+    encode_holder, encode_task,
 };
 use crate::dst_events::{self, DstEvent};
-use crate::job::{ConcurrencyLimit, JobView};
+use crate::job::{ConcurrencyLimit, JobView, Limit};
 use crate::job_store_shard::helpers::decode_job_status_owned;
 use crate::keys::{
     concurrency_counts_key, concurrency_holder_key, concurrency_holders_queue_prefix,
     concurrency_request_key, concurrency_request_prefix, concurrency_requests_prefix, end_bound,
-    job_status_key, parse_concurrency_holder_key, parse_concurrency_request_key, task_key,
+    floating_limit_state_key, job_status_key, parse_concurrency_holder_key,
+    parse_concurrency_request_key, task_key,
 };
 use crate::shard_range::ShardRange;
 use crate::task::{ConcurrencyAction, HolderRecord, Task};
@@ -365,6 +367,29 @@ impl ConcurrencyManager {
         &self.counts
     }
 
+    async fn resolve_queue_capacity(db: &Db, tenant: &str, queue: &str, view: &JobView) -> usize {
+        for limit in view.limits() {
+            match limit {
+                Limit::Concurrency(cl) if cl.key == queue => {
+                    return cl.max_concurrency as usize;
+                }
+                Limit::FloatingConcurrency(fl) if fl.key == queue => {
+                    let state_key = floating_limit_state_key(tenant, queue);
+                    let state_capacity = match db.get(&state_key).await {
+                        Ok(Some(raw)) => match decode_floating_limit_state(raw) {
+                            Ok(state) => Some(state.current_max_concurrency() as usize),
+                            Err(_) => None,
+                        },
+                        _ => None,
+                    };
+                    return state_capacity.unwrap_or(fl.default_max_concurrency as usize);
+                }
+                _ => {}
+            }
+        }
+        1
+    }
+
     /// Handle concurrency for a new job enqueue.
     ///
     /// IMPORTANT: This method atomically reserves in-memory concurrency slots BEFORE returning.
@@ -495,14 +520,7 @@ impl ConcurrencyManager {
             return Ok(RequestTicketTaskOutcome::JobMissing);
         };
 
-        // Determine max concurrency for this queue
-        let mut max_allowed: usize = 1;
-        for lim in view.concurrency_limits() {
-            if lim.key == queue {
-                max_allowed = lim.max_concurrency as usize;
-                break;
-            }
-        }
+        let max_allowed = Self::resolve_queue_capacity(db, tenant, queue, view).await;
 
         // Atomically check and reserve the slot to prevent TOCTOU races
         if !self
@@ -767,14 +785,7 @@ impl ConcurrencyManager {
                     let l = match db.get(&job_key).await {
                         Ok(Some(bytes)) => match JobView::new(bytes) {
                             Ok(view) => {
-                                let mut found = 1usize;
-                                for lim in view.concurrency_limits() {
-                                    if lim.key == queue {
-                                        found = lim.max_concurrency as usize;
-                                        break;
-                                    }
-                                }
-                                found
+                                Self::resolve_queue_capacity(db, tenant, queue, &view).await
                             }
                             Err(_) => 1,
                         },
