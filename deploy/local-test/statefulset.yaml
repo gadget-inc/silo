@@ -79,8 +79,9 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: silo
-          image: silo:latest
+          image: silo-dev:latest
           imagePullPolicy: Never
+          command: ["silo"]
           args: ["-c", "/etc/silo/config.toml"]
           ports:
             - containerPort: 50051
