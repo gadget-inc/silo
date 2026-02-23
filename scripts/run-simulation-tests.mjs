@@ -152,12 +152,39 @@ function createRng(seed) {
 }
 
 /**
- * Deterministically select a scenario based on a seed.
- * Uses the seed to pick one of the available scenarios.
+ * Scenario weights for biased selection.
+ * Higher weights mean the scenario runs more often. Based on historical CI
+ * failure frequency — scenarios that fail more are more valuable to fuzz.
+ * Scenarios not listed here get DEFAULT_WEIGHT.
+ */
+const SCENARIO_WEIGHTS = {
+  // High value: frequently failing in CI
+  high_message_loss: 4,
+  high_latency: 4,
+  chaos: 4,
+  k8s_shard_splits: 4,
+  // Medium value: occasional failures or related to high-value scenarios
+  k8s_coordination: 2,
+  k8s_permanent_leases: 2,
+};
+const DEFAULT_WEIGHT = 1;
+
+/**
+ * Deterministically select a scenario based on a seed, with weighted bias.
+ * Scenarios with higher weights are selected more frequently.
  */
 function selectScenarioFromSeed(seed, scenarios) {
-  const index = seed % scenarios.length;
-  return scenarios[index];
+  const totalWeight = scenarios.reduce(
+    (sum, s) => sum + (SCENARIO_WEIGHTS[s] || DEFAULT_WEIGHT),
+    0
+  );
+  let pick = seed % totalWeight;
+  for (const scenario of scenarios) {
+    const weight = SCENARIO_WEIGHTS[scenario] || DEFAULT_WEIGHT;
+    if (pick < weight) return scenario;
+    pick -= weight;
+  }
+  return scenarios[scenarios.length - 1];
 }
 
 /**
