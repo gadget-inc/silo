@@ -62,5 +62,8 @@ await buildAndLoad();
 console.log("\nApplying Kubernetes manifests to OrbStack...");
 run("kubectl", ["--context", "orbstack", "apply", "-f", "deploy/local-test"]);
 
+console.log("\nRestarting StatefulSet...");
+run("kubectl", ["--context", "orbstack", "-n", "silo-test", "rollout", "restart", "statefulset/silo"]);
+
 console.log("\nDone. Pods:");
 run("kubectl", ["--context", "orbstack", "-n", "silo-test", "get", "pods"]);
