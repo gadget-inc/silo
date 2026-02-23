@@ -419,10 +419,11 @@ impl JobStoreShard {
                 }
                 (
                     fb::AttemptStatusKind::Failed,
-                    ImportedAttemptStatus::Failed { error_code, .. },
+                    ImportedAttemptStatus::Failed { error_code, error },
                 ) => {
                     a.finished_at_ms().unwrap_or(0) != imported.finished_at_ms
                         || a.error_code().unwrap_or_default() != error_code.as_str()
+                        || a.error().map(|v| v.bytes()).unwrap_or_default() != error.as_slice()
                         || a.started_at_ms() != imported.started_at_ms
                 }
                 (fb::AttemptStatusKind::Cancelled, ImportedAttemptStatus::Cancelled) => {
@@ -518,8 +519,7 @@ impl JobStoreShard {
         // === Clean up old scheduling state ===
 
         // [SILO-REIMP-5] Remove DB queue tasks for this job.
-        // Only Scheduled jobs have tasks/concurrency state to clean up.
-        // Failed and Cancelled jobs are already terminal with no pending tasks.
+        // Only Scheduled jobs can have a DB queue task to remove.
         let task_group = existing_job.task_group().to_string();
         let priority = existing_job.priority();
         let stored_limits = existing_job.limits();
@@ -575,7 +575,10 @@ impl JobStoreShard {
                 }
             } else {
                 // No task found - TicketRequested case (request record exists but no task
-                // in DB queue). Delete concurrency requests for this job.
+                // in DB queue). For Scheduled jobs we can target deletes precisely using
+                // status-derived attempt/start fields (same approach as cancel).
+                // [SILO-REIMP-CONC-5] Scheduled old-state reimport performs targeted
+                // request-key cleanup for the old scheduled attempt.
                 self.delete_concurrency_requests_for_job(
                     &txn,
                     tenant,
@@ -588,6 +591,12 @@ impl JobStoreShard {
                 .await?;
             }
         }
+
+        // Note: We intentionally do not scan/delete all pending request records here.
+        // [SILO-REIMP-CONC-6] For non-scheduled old states, any stale request keys are
+        // cleaned lazily by the grant scanner guard.
+        // Stale request keys are guarded in the grant scanner by validating
+        // (status.kind == Scheduled && status.current_attempt == request.attempt_number).
 
         // === Update status, scheduling state, and counters ===
         let mut writer = TxnWriter(&txn);

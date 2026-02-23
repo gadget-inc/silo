@@ -1,6 +1,6 @@
 mod test_helpers;
 
-use silo::codec::{decode_task, encode_task};
+use silo::codec::{decode_task, encode_concurrency_action, encode_task};
 use silo::job::{
     ConcurrencyLimit, GubernatorAlgorithm, GubernatorRateLimit, JobStatusKind, Limit,
     RateLimitRetryPolicy,
@@ -9,7 +9,7 @@ use silo::job_attempt::{AttemptOutcome, AttemptStatus};
 use silo::job_store_shard::JobStoreShard;
 use silo::job_store_shard::import::{ImportJobParams, ImportedAttempt, ImportedAttemptStatus};
 use silo::retry::RetryPolicy;
-use silo::task::{GubernatorRateLimitData, Task};
+use silo::task::{ConcurrencyAction, GubernatorRateLimitData, Task};
 use slatedb::WriteBatch;
 use std::sync::Arc;
 
@@ -1394,6 +1394,41 @@ async fn reimport_mismatched_attempt_data_fails() {
             status: ImportedAttemptStatus::Failed {
                 error_code: "DIFFERENT_ERR".to_string(),
                 error: vec![1, 2, 3],
+            },
+            started_at_ms: 1_700_000_000_000,
+            finished_at_ms: 1_700_000_001_000,
+        },
+        failed_attempt(1_700_000_002_000),
+    ];
+
+    let results = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(!results[0].success);
+    assert!(
+        results[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("does not match")
+    );
+}
+
+#[silo::test]
+async fn reimport_mismatched_failed_error_payload_fails() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+
+    let mut initial = base_import_params("reimp-rej-mismatch-error-bytes");
+    initial.retry_policy = Some(default_retry_policy());
+    initial.attempts = vec![failed_attempt(1_700_000_001_000)];
+    shard.import_jobs("-", vec![initial]).await.unwrap();
+
+    // Reimport with same error_code/timestamps but different error payload bytes
+    let mut reimport = base_import_params("reimp-rej-mismatch-error-bytes");
+    reimport.retry_policy = Some(default_retry_policy());
+    reimport.attempts = vec![
+        ImportedAttempt {
+            status: ImportedAttemptStatus::Failed {
+                error_code: "ERR".to_string(),
+                error: vec![9, 9, 9],
             },
             started_at_ms: 1_700_000_000_000,
             finished_at_ms: 1_700_000_001_000,
@@ -2924,5 +2959,131 @@ async fn reimport_releasing_holder_triggers_immediate_grant_scan() {
     assert_eq!(
         requests_left, 0,
         "pending request should be consumed after immediate grant"
+    );
+}
+
+#[silo::test]
+async fn reimport_failed_to_scheduled_ignores_stale_concurrency_requests() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let queue = "reimp-stale-req-cleanup-q";
+
+    // Keep queue at capacity so reimport needs to create a new request record.
+    let mut blocker = base_import_params("reimp-stale-req-blocker");
+    blocker.retry_policy = Some(default_retry_policy());
+    blocker.limits = vec![Limit::Concurrency(ConcurrencyLimit {
+        key: queue.to_string(),
+        max_concurrency: 1,
+    })];
+    let r = shard.import_jobs("-", vec![blocker]).await.unwrap();
+    assert!(r[0].success);
+    assert_eq!(r[0].status, JobStatusKind::Scheduled);
+    assert_eq!(
+        test_helpers::count_concurrency_holders(shard.db()).await,
+        1,
+        "blocker job should hold the only queue slot"
+    );
+
+    // Import terminal Failed job with the same queue.
+    let mut initial = base_import_params("reimp-stale-req-target");
+    initial.retry_policy = None;
+    initial.limits = vec![Limit::Concurrency(ConcurrencyLimit {
+        key: queue.to_string(),
+        max_concurrency: 1,
+    })];
+    initial.attempts = vec![failed_attempt(1_700_000_001_000)];
+    let r = shard.import_jobs("-", vec![initial]).await.unwrap();
+    assert!(r[0].success);
+    assert_eq!(r[0].status, JobStatusKind::Failed);
+
+    // Inject a stale request for attempt 1 (simulates previously orphaned request state).
+    let stale_action = ConcurrencyAction::EnqueueTask {
+        start_time_ms: 0,
+        priority: 50,
+        job_id: "reimp-stale-req-target".to_string(),
+        attempt_number: 1,
+        relative_attempt_number: 1,
+        task_group: "default".to_string(),
+    };
+    let stale_request_key = silo::keys::concurrency_request_key(
+        "-",
+        queue,
+        0,
+        50,
+        "reimp-stale-req-target",
+        1,
+        "stale0001",
+    );
+    let stale_request_value = encode_concurrency_action(&stale_action);
+    let mut batch = WriteBatch::new();
+    batch.put(&stale_request_key, &stale_request_value);
+    shard.db().write(batch).await.unwrap();
+    assert_eq!(
+        test_helpers::count_concurrency_requests(shard.db()).await,
+        1,
+        "expected one injected stale request before reimport"
+    );
+
+    // Reimport to Scheduled; stale request may remain in storage but must not be grantable.
+    let mut reimport = base_import_params("reimp-stale-req-target");
+    reimport.retry_policy = Some(default_retry_policy());
+    reimport.limits = vec![Limit::Concurrency(ConcurrencyLimit {
+        key: queue.to_string(),
+        max_concurrency: 1,
+    })];
+    reimport.attempts = vec![
+        failed_attempt(1_700_000_001_000),
+        failed_attempt(1_700_000_002_000),
+    ];
+    let r = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+    assert_eq!(r[0].status, JobStatusKind::Scheduled);
+
+    // We now have one stale request (attempt 1) plus one current request (attempt 3).
+    assert_eq!(
+        test_helpers::count_concurrency_requests(shard.db()).await,
+        2
+    );
+
+    // Trigger reconciliation: stale request for non-current attempt should be dropped.
+    shard.reconcile_pending_concurrency_requests_once().await;
+    let requests_after_reconcile = test_helpers::poll_until(
+        || async { test_helpers::count_concurrency_requests(shard.db()).await },
+        |count| *count == 1,
+        2_000,
+    )
+    .await;
+    assert_eq!(
+        requests_after_reconcile, 1,
+        "stale request should be ignored and removed by grant scanner"
+    );
+
+    // Free queue capacity, then reconcile again to grant the valid request.
+    let mut blocker_reimport = base_import_params("reimp-stale-req-blocker");
+    blocker_reimport.retry_policy = Some(default_retry_policy());
+    blocker_reimport.limits = vec![Limit::Concurrency(ConcurrencyLimit {
+        key: queue.to_string(),
+        max_concurrency: 1,
+    })];
+    blocker_reimport.attempts = vec![succeeded_attempt(1_700_000_003_000)];
+    let r = shard
+        .import_jobs("-", vec![blocker_reimport])
+        .await
+        .unwrap();
+    assert!(r[0].success, "blocker reimport failed: {:?}", r[0].error);
+    assert_eq!(r[0].status, JobStatusKind::Succeeded);
+
+    shard.reconcile_pending_concurrency_requests_once().await;
+    let dequeued = test_helpers::poll_until(
+        || async { shard.dequeue("worker-1", "default", 1).await.unwrap() },
+        |d| d.tasks.len() == 1,
+        2_000,
+    )
+    .await;
+    assert_eq!(dequeued.tasks.len(), 1, "expected one granted task");
+    assert_eq!(dequeued.tasks[0].job().id(), "reimp-stale-req-target");
+    assert_eq!(
+        dequeued.tasks[0].attempt().attempt_number(),
+        3,
+        "grant scanner must not grant stale request attempts after reimport"
     );
 }

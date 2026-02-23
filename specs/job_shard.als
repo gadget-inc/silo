@@ -192,8 +192,10 @@ fact wellFormed {
     -- A job has at most one requirement per queue
     all j: Job, q: Queue | lone r: JobQueueRequirement | r.jqr_job = j and r.jqr_queue = q
     
-    -- At most one request per (job, queue) at each time
-    all j: Job, q: Queue, t: Time | lone r: TicketRequest | r.tr_job = j and r.tr_queue = q and r.tr_time = t
+    -- At most one request per (task, queue) at each time.
+    -- Multiple attempts of the same job may have outstanding requests concurrently.
+    all tid: TaskId, q: Queue, t: Time | lone r: TicketRequest |
+        r.tr_task = tid and r.tr_queue = q and r.tr_time = t
     
     -- At most one holder per (task, queue) at each time
     all tid: TaskId, q: Queue, t: Time | lone h: TicketHolder | h.th_task = tid and h.th_queue = q and h.th_time = t
@@ -671,14 +673,13 @@ pred completeSuccessReleaseTicket[tid: TaskId, w: Worker, q: Queue, t: Time, tne
 }
 
 -- Transition: GRANT_NEXT_REQUEST - Grant ticket to next waiting request
--- When a queue has capacity (no holders) and there's a pending request, grant it.
--- Note: No cancelled check here. Cancelled jobs' requests are eagerly removed
--- by cancelJob. The terminal status check in the Rust implementation catches any
--- stale requests for cancelled jobs (since Cancelled is terminal).
--- Implementation: driven by a background grant scanner (ConcurrencyManager::process_grants)
--- rather than being called synchronously during release. Callers signal the scanner
--- via request_grant() after releasing a holder; the scanner serializes all grants
--- to prevent double-grant races from concurrent releases.
+-- When a queue has capacity (no holders) and there's a pending request for a
+-- currently scheduled job, grant it.
+-- Implementation: driven by a background grant scanner
+-- (ConcurrencyManager::process_grants) rather than being called synchronously
+-- during release. Callers signal the scanner via request_grant() after
+-- releasing a holder; the scanner serializes all grants to prevent
+-- double-grant races from concurrent releases.
 pred grantNextRequest[q: Queue, reqTid: TaskId, t: Time, tnext: Time] {
     -- [SILO-GRANT-1] Pre: Queue has capacity (limit=1, no holders)
     queueHasCapacity[q, t]
@@ -688,6 +689,10 @@ pred grantNextRequest[q: Queue, reqTid: TaskId, t: Time, tnext: Time] {
     let r = { req: TicketRequest | req.tr_queue = q and req.tr_time = t and req.tr_task = reqTid } | {
         one r
         let j = r.tr_job | {
+            -- [SILO-GRANT-5] Pre: Request still targets a currently scheduled job.
+            -- (Rust also validates attempt number; attempt identity is abstracted in this model.)
+            statusAt[j, t] = Scheduled
+
             -- [SILO-GRANT-3] Post: Create holder for this task/queue
             holdersAt[q, tnext] = reqTid
             
@@ -720,6 +725,36 @@ pred grantNextRequest[q: Queue, reqTid: TaskId, t: Time, tnext: Time] {
         leaseJobAt[tid, tnext] = leaseJobAt[tid, t]
         leaseAttemptAt[tid, tnext] = leaseAttemptAt[tid, t]
     }
+}
+
+-- Transition: DROP_STALE_REQUEST - Remove a stale request without granting work.
+-- This models lazy cleanup in the grant scanner when request status drift is detected.
+pred dropStaleRequest[q: Queue, reqTid: TaskId, t: Time, tnext: Time] {
+    some r: TicketRequest | r.tr_queue = q and r.tr_time = t and r.tr_task = reqTid
+    let r = { req: TicketRequest | req.tr_queue = q and req.tr_time = t and req.tr_task = reqTid } | {
+        one r
+        -- [SILO-GRANT-6] Post: stale request record is deleted (no holder/task grant).
+        statusAt[r.tr_job, t] != Scheduled
+    }
+
+    -- Delete only the selected request key.
+    requestTasksAt[q, tnext] = requestTasksAt[q, t] - reqTid
+    all q2: Queue | q2 != q implies requestTasksAt[q2, tnext] = requestTasksAt[q2, t]
+
+    -- Frame: grant side effects do not happen on stale cleanup.
+    holdersUnchanged[t, tnext]
+    all tid: TaskId | dbQueuedAt[tid, tnext] = dbQueuedAt[tid, t]
+    all tid: TaskId | bufferedAt[tid, tnext] = bufferedAt[tid, t]
+    all tid: TaskId | {
+        leaseAt[tid, tnext] = leaseAt[tid, t]
+        leaseJobAt[tid, tnext] = leaseJobAt[tid, t]
+        leaseAttemptAt[tid, tnext] = leaseAttemptAt[tid, t]
+    }
+    all j: Job | j in jobExistsAt[t] implies statusAt[j, tnext] = statusAt[j, t]
+    all j: Job | isCancelledAt[j, tnext] iff isCancelledAt[j, t]
+    jobExistsAt[tnext] = jobExistsAt[t]
+    attemptExistsAt[tnext] = attemptExistsAt[t]
+    all a: attemptExistsAt[t] | attemptStatusAt[a, tnext] = attemptStatusAt[a, t]
 }
 
 -- Transition: COMPLETE_FAILURE_PERMANENT - Worker reports permanent failure
@@ -1443,14 +1478,20 @@ pred reimportTerminal[j: Job, t: Time, tnext: Time] {
         (dbQueuedAt[tid, t] != j) implies dbQueuedAt[tid, tnext] = dbQueuedAt[tid, t]
     }
 
-    -- Cleanup: remove all concurrency state for this job
-    -- Remove requests for this job, preserve others
-    all q: Queue, tid: TaskId |
-        tid in requestTasksAt[q, tnext] iff (tid in requestTasksAt[q, t] and
-            no r: TicketRequest | r.tr_job = j and r.tr_queue = q and r.tr_task = tid and r.tr_time = t)
-    -- Remove holders for this job's tasks, preserve others
-    all q: Queue, tid: TaskId |
-        tid in holdersAt[q, tnext] iff (tid in holdersAt[q, t] and dbQueuedAt[tid, t] != j)
+    -- [SILO-REIMP-CONC-5] Old Scheduled state performs targeted request cleanup.
+    (statusAt[j, t] = Scheduled) implies {
+        all q: Queue, tid: TaskId |
+            tid in requestTasksAt[q, tnext] iff (tid in requestTasksAt[q, t] and
+                no r: TicketRequest | r.tr_job = j and r.tr_queue = q and r.tr_task = tid and r.tr_time = t)
+        -- Remove holders for this job's old scheduled tasks, preserve others.
+        all q: Queue, tid: TaskId |
+            tid in holdersAt[q, tnext] iff (tid in holdersAt[q, t] and dbQueuedAt[tid, t] != j)
+    }
+    -- [SILO-REIMP-CONC-6] Non-scheduled old state leaves requests untouched; grant scanner drops stale keys lazily.
+    (statusAt[j, t] != Scheduled) implies {
+        all q: Queue | requestTasksAt[q, tnext] = requestTasksAt[q, t]
+        all q: Queue | holdersAt[q, tnext] = holdersAt[q, t]
+    }
 }
 
 -- Transition: REIMPORT_NON_TERMINAL - Reimport job as Scheduled (no concurrency)
@@ -1513,15 +1554,22 @@ pred reimportNonTerminalConcurrencyGranted[newTid: TaskId, j: Job, q: Queue, t: 
 
     -- Post: new holder for newTid in queue q
     holdersAt[q, tnext] = newTid
-    -- Other queues: remove holders for j's old tasks, preserve others
-    all q2: Queue | q2 != q implies {
-        all tid: TaskId |
-            tid in holdersAt[q2, tnext] iff (tid in holdersAt[q2, t] and dbQueuedAt[tid, t] != j)
+
+    -- [SILO-REIMP-CONC-5] Scheduled old state removes old request/holder records for this job.
+    (statusAt[j, t] = Scheduled) implies {
+        all q2: Queue | q2 != q implies {
+            all tid: TaskId |
+                tid in holdersAt[q2, tnext] iff (tid in holdersAt[q2, t] and dbQueuedAt[tid, t] != j)
+        }
+        all q2: Queue, tid: TaskId |
+            tid in requestTasksAt[q2, tnext] iff (tid in requestTasksAt[q2, t] and
+                no r: TicketRequest | r.tr_job = j and r.tr_queue = q2 and r.tr_task = tid and r.tr_time = t)
     }
-    -- Remove requests for this job, preserve others
-    all q2: Queue, tid: TaskId |
-        tid in requestTasksAt[q2, tnext] iff (tid in requestTasksAt[q2, t] and
-            no r: TicketRequest | r.tr_job = j and r.tr_queue = q2 and r.tr_task = tid and r.tr_time = t)
+    -- [SILO-REIMP-CONC-6] Non-scheduled old state preserves pending requests.
+    (statusAt[j, t] != Scheduled) implies {
+        all q2: Queue | q2 != q implies holdersAt[q2, tnext] = holdersAt[q2, t]
+        all q2: Queue | requestTasksAt[q2, tnext] = requestTasksAt[q2, t]
+    }
 }
 
 -- Transition: REIMPORT_NON_TERMINAL_CONCURRENCY_QUEUED - Reimport with concurrency queued
@@ -1552,16 +1600,31 @@ pred reimportNonTerminalConcurrencyQueued[newTid: TaskId, j: Job, q: Queue, t: T
         (dbQueuedAt[tid, t] != j) implies dbQueuedAt[tid, tnext] = dbQueuedAt[tid, t]
     }
 
-    -- Post: create new request for newTid, remove old requests for j, preserve others
+    -- Post: create new request for newTid.
     one r: TicketRequest | r.tr_job = j and r.tr_queue = q and r.tr_task = newTid and r.tr_time = tnext
-    all q2: Queue, tid: TaskId | tid != newTid implies {
-        tid in requestTasksAt[q2, tnext] iff (tid in requestTasksAt[q2, t] and
-            no r: TicketRequest | r.tr_job = j and r.tr_queue = q2 and r.tr_task = tid and r.tr_time = t)
+    -- [SILO-REIMP-CONC-5] Scheduled old state removes old requests for this job.
+    (statusAt[j, t] = Scheduled) implies {
+        all q2: Queue, tid: TaskId | tid != newTid implies {
+            tid in requestTasksAt[q2, tnext] iff (tid in requestTasksAt[q2, t] and
+                no r: TicketRequest | r.tr_job = j and r.tr_queue = q2 and r.tr_task = tid and r.tr_time = t)
+        }
+    }
+    -- [SILO-REIMP-CONC-6] Non-scheduled old state preserves old requests; stale ones are dropped lazily.
+    (statusAt[j, t] != Scheduled) implies {
+        all q2: Queue, tid: TaskId | tid != newTid implies {
+            tid in requestTasksAt[q2, tnext] iff tid in requestTasksAt[q2, t]
+        }
     }
     all q2: Queue | q2 != q implies newTid not in requestTasksAt[q2, tnext]
-    -- Remove holders for j's old tasks, preserve others
-    all q2: Queue, tid: TaskId |
-        tid in holdersAt[q2, tnext] iff (tid in holdersAt[q2, t] and dbQueuedAt[tid, t] != j)
+    -- [SILO-REIMP-CONC-5] Scheduled old state removes holders for old scheduled tasks.
+    (statusAt[j, t] = Scheduled) implies {
+        all q2: Queue, tid: TaskId |
+            tid in holdersAt[q2, tnext] iff (tid in holdersAt[q2, t] and dbQueuedAt[tid, t] != j)
+    }
+    -- [SILO-REIMP-CONC-6] Non-scheduled old state preserves holder state.
+    (statusAt[j, t] != Scheduled) implies {
+        all q2: Queue | holdersAt[q2, tnext] = holdersAt[q2, t]
+    }
 }
 
 -- System Trace
@@ -1583,6 +1646,7 @@ pred step[t: Time, tnext: Time] {
     or (some tid: TaskId, j: Job, q: Queue | enqueueWithConcurrencyGranted[tid, j, q, t, tnext])
     or (some tid: TaskId, j: Job, q: Queue | enqueueWithConcurrencyQueued[tid, j, q, t, tnext])
     or (some q: Queue, tid: TaskId | grantNextRequest[q, tid, t, tnext])
+    or (some q: Queue, tid: TaskId | dropStaleRequest[q, tid, t, tnext])
     or (some tid: TaskId, w: Worker, q: Queue | completeSuccessReleaseTicket[tid, w, q, t, tnext])
     or (some tid: TaskId, w: Worker, q: Queue | completeFailurePermanentReleaseTicket[tid, w, q, t, tnext])
     or (some tid: TaskId, w: Worker, q: Queue, newTid: TaskId | completeFailureRetryReleaseTicket[tid, w, q, newTid, t, tnext])
@@ -2881,4 +2945,3 @@ check reimportPreservesCancellation for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attem
 
 check importRejectsExistingJobs for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
     16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled
-

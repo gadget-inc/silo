@@ -50,7 +50,7 @@ use crate::codec::{
     encode_holder, encode_task,
 };
 use crate::dst_events::{self, DstEvent};
-use crate::job::{ConcurrencyLimit, JobView, Limit};
+use crate::job::{ConcurrencyLimit, JobStatusKind, JobView, Limit};
 use crate::job_store_shard::helpers::decode_job_status_owned;
 use crate::keys::{
     concurrency_counts_key, concurrency_holder_key, concurrency_holders_queue_prefix,
@@ -750,23 +750,21 @@ impl ConcurrencyManager {
                 }
             };
 
+            let parsed_req = parse_concurrency_request_key(&kv.key);
+
             // Decode request
             let decoded = match decode_concurrency_action(kv.value.clone()) {
                 Ok(d) => d,
                 Err(_) => {
                     tracing::warn!(queue = %queue, "grant scanner: failed to decode request, deleting");
-                    let mut batch = WriteBatch::new();
-                    batch.delete(&kv.key);
-                    let _ = db.write(batch).await;
+                    let _ = db.delete(&kv.key).await;
                     continue;
                 }
             };
             let a = decoded.fb();
             let Some(et) = a.variant_as_enqueue_task() else {
                 tracing::warn!(queue = %queue, "grant scanner: unknown concurrency action variant, deleting");
-                let mut batch = WriteBatch::new();
-                batch.delete(&kv.key);
-                let _ = db.write(batch).await;
+                let _ = db.delete(&kv.key).await;
                 continue;
             };
 
@@ -777,22 +775,57 @@ impl ConcurrencyManager {
             let relative_attempt_number = et.relative_attempt_number();
             let task_group_str = et.task_group().unwrap_or_default();
 
-            // Check if job has reached a terminal state (Succeeded/Failed/Cancelled)
             let status_key = job_status_key(tenant, job_id_str);
-            if let Ok(Some(status_raw)) = db.get(&status_key).await
-                && let Ok(status) = decode_job_status_owned(&status_raw)
-                && status.is_terminal()
-            {
-                let mut batch = WriteBatch::new();
-                batch.delete(&kv.key);
-                let _ = db.write(batch).await;
-                tracing::debug!(
-                    job_id = %job_id_str,
-                    queue = %queue,
-                    status = ?status.kind,
-                    "grant scanner: skipping request for terminal job"
-                );
-                continue;
+            match db.get(&status_key).await {
+                Ok(Some(status_raw)) => match decode_job_status_owned(&status_raw) {
+                    // [SILO-GRANT-5] Request records are only valid for the currently
+                    // scheduled attempt.
+                    // If status drifted (e.g. reimport/cancel/restart), drop stale requests.
+                    Ok(status)
+                        if status.kind != JobStatusKind::Scheduled
+                            || status.current_attempt != Some(attempt_number) =>
+                    {
+                        // [SILO-GRANT-6] Drop stale request key without granting work.
+                        let _ = db.delete(&kv.key).await;
+                        tracing::debug!(
+                            job_id = %job_id_str,
+                            queue = %queue,
+                            request_attempt = attempt_number,
+                            status_kind = ?status.kind,
+                            status_attempt = ?status.current_attempt,
+                            "grant scanner: skipping stale request for non-current attempt"
+                        );
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        let _ = db.delete(&kv.key).await;
+                        tracing::warn!(
+                            job_id = %job_id_str,
+                            queue = %queue,
+                            "grant scanner: dropping request with unreadable job status"
+                        );
+                        continue;
+                    }
+                },
+                Ok(None) => {
+                    let _ = db.delete(&kv.key).await;
+                    tracing::debug!(
+                        job_id = %job_id_str,
+                        queue = %queue,
+                        "grant scanner: dropping request for missing job status"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        job_id = %job_id_str,
+                        queue = %queue,
+                        "grant scanner: failed to load job status; skipping request this pass"
+                    );
+                    continue;
+                }
             }
 
             // Check start_time (requests are ordered by time)
@@ -801,7 +834,7 @@ impl ConcurrencyManager {
             }
 
             // Parse request key to get request_id
-            let Some(parsed_req) = parse_concurrency_request_key(&kv.key) else {
+            let Some(parsed_req) = parsed_req else {
                 continue;
             };
             let request_id = parsed_req.request_id();
