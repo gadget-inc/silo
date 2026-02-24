@@ -333,10 +333,33 @@ impl SiloService {
 
         let schema = dataframe.schema().inner().clone();
 
-        let batches = dataframe
-            .collect()
+        let stream = dataframe
+            .execute_stream()
             .await
             .map_err(|e| Status::internal(format!("Query execution failed: {}", e)))?;
+
+        // DataFusion documents that dropping the stream aborts query execution.
+        // Wrapping stream collection in a timeout ensures timed-out queries stop
+        // running instead of continuing in the background.
+        let collect_future = datafusion::physical_plan::common::collect(stream);
+        let batches = if let Some(statement_timeout) = self.cfg.server.statement_timeout() {
+            match tokio::time::timeout(statement_timeout, collect_future).await {
+                Ok(Ok(batches)) => batches,
+                Ok(Err(e)) => {
+                    return Err(Status::internal(format!("Query execution failed: {}", e)));
+                }
+                Err(_) => {
+                    return Err(Status::deadline_exceeded(format!(
+                        "Query exceeded statement timeout of {} ms",
+                        statement_timeout.as_millis()
+                    )));
+                }
+            }
+        } else {
+            collect_future
+                .await
+                .map_err(|e| Status::internal(format!("Query execution failed: {}", e)))?
+        };
 
         Ok((schema, batches))
     }

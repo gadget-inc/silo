@@ -1,8 +1,40 @@
 mod grpc_integration_helpers;
 
 use grpc_integration_helpers::{create_test_factory, setup_test_server, shutdown_server};
+use silo::pb::silo_client::SiloClient;
 use silo::pb::*;
 use silo::settings::AppConfig;
+
+fn config_with_statement_timeout_ms(timeout_ms: u64) -> AppConfig {
+    let mut config = AppConfig::load(None).expect("load default config");
+    config.server.statement_timeout_ms = Some(timeout_ms);
+    config
+}
+
+async fn enqueue_jobs_for_heavy_query(
+    client: &mut SiloClient<tonic::transport::Channel>,
+    count: usize,
+) -> anyhow::Result<()> {
+    let payload_bytes = rmp_serde::to_vec(&serde_json::json!({ "timeout_test": true }))?;
+    for i in 0..count {
+        let enq = EnqueueRequest {
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+            id: format!("timeout-job-{}", i),
+            priority: 10,
+            start_at_ms: 0,
+            retry_policy: None,
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(payload_bytes.clone())),
+            }),
+            limits: vec![],
+            tenant: None,
+            metadata: std::collections::HashMap::new(),
+            task_group: "default".to_string(),
+        };
+        let _ = client.enqueue(enq).await?;
+    }
+    Ok(())
+}
 
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_server_query_basic() -> anyhow::Result<()> {
@@ -94,6 +126,110 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
                 None => panic!("expected msgpack encoding"),
             })?;
         assert_eq!(count_row["count"], 3, "count should be 3");
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_query_statement_timeout_aborts_execution() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(15000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let config = config_with_statement_timeout_ms(100);
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), config).await?;
+
+        enqueue_jobs_for_heavy_query(&mut client, 120).await?;
+
+        // 120^4 cross product count should exceed a 100ms statement timeout.
+        let heavy_query = r#"
+            SELECT COUNT(*) as count
+            FROM jobs j1
+            CROSS JOIN jobs j2
+            CROSS JOIN jobs j3
+            CROSS JOIN jobs j4
+        "#;
+
+        let result = client
+            .query(QueryRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                sql: heavy_query.to_string(),
+                tenant: None,
+            })
+            .await;
+
+        match result {
+            Ok(_) => panic!("expected statement timeout"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+                assert!(
+                    status.message().contains("statement timeout"),
+                    "expected timeout message, got: {}",
+                    status.message()
+                );
+            }
+        }
+
+        // Follow-up query should still execute successfully.
+        let count_resp = client
+            .query(QueryRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
+                tenant: None,
+            })
+            .await?
+            .into_inner();
+        assert_eq!(count_resp.row_count, 1);
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_query_arrow_statement_timeout() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(15000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let config = config_with_statement_timeout_ms(100);
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), config).await?;
+
+        enqueue_jobs_for_heavy_query(&mut client, 120).await?;
+
+        let heavy_query = r#"
+            SELECT COUNT(*) as count
+            FROM jobs j1
+            CROSS JOIN jobs j2
+            CROSS JOIN jobs j3
+            CROSS JOIN jobs j4
+        "#;
+
+        let result = client
+            .query_arrow(QueryArrowRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                sql: heavy_query.to_string(),
+                tenant: None,
+            })
+            .await;
+
+        match result {
+            Ok(_) => panic!("expected statement timeout for query_arrow"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+                assert!(
+                    status.message().contains("statement timeout"),
+                    "expected timeout message, got: {}",
+                    status.message()
+                );
+            }
+        }
 
         shutdown_server(shutdown_tx, server).await?;
         Ok::<(), anyhow::Error>(())

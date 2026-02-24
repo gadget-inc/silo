@@ -38,12 +38,14 @@ The `[server]` section configures the main gRPC server.
 [server]
 grpc_addr = "127.0.0.1:7450"
 dev_mode = false
+statement_timeout_ms = 5000
 ```
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `grpc_addr` | string | `"127.0.0.1:7450"` | Address and port for the gRPC server to listen on |
 | `dev_mode` | bool | `false` | Enable development mode features like `ResetShards` RPC. **Never enable in production.** |
+| `statement_timeout_ms` | number | `5000` | Maximum SQL statement execution time in milliseconds. Query execution is aborted when this timeout is hit. Set to `0` to disable statement timeout. |
 
 <Aside type="danger">
 `dev_mode` allows destructive operations like resetting shard data. Only enable this for local development and testing.

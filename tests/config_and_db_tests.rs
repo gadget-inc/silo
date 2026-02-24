@@ -573,6 +573,57 @@ concurrency_reconcile_interval_ms = 25
 }
 
 #[silo::test]
+fn parse_toml_server_statement_timeout_uses_default() {
+    let toml_str = r#"
+[database]
+backend = "fs"
+path = "/tmp/silo-%shard%"
+"#;
+
+    let cfg: AppConfig = toml::from_str(toml_str).expect("parse TOML");
+    assert_eq!(cfg.server.statement_timeout_ms, Some(5_000));
+    assert_eq!(
+        cfg.server.statement_timeout(),
+        Some(Duration::from_millis(5_000))
+    );
+}
+
+#[silo::test]
+fn parse_toml_server_statement_timeout_override() {
+    let toml_str = r#"
+[server]
+statement_timeout_ms = 250
+
+[database]
+backend = "fs"
+path = "/tmp/silo-%shard%"
+"#;
+
+    let cfg: AppConfig = toml::from_str(toml_str).expect("parse TOML");
+    assert_eq!(cfg.server.statement_timeout_ms, Some(250));
+    assert_eq!(
+        cfg.server.statement_timeout(),
+        Some(Duration::from_millis(250))
+    );
+}
+
+#[silo::test]
+fn parse_toml_server_statement_timeout_can_be_disabled_with_zero() {
+    let toml_str = r#"
+[server]
+statement_timeout_ms = 0
+
+[database]
+backend = "fs"
+path = "/tmp/silo-%shard%"
+"#;
+
+    let cfg: AppConfig = toml::from_str(toml_str).expect("parse TOML");
+    assert_eq!(cfg.server.statement_timeout_ms, Some(0));
+    assert_eq!(cfg.server.statement_timeout(), None);
+}
+
+#[silo::test]
 fn parse_toml_with_partial_slatedb_settings_merges_with_defaults() {
     // Regression test: when only some slatedb settings are specified,
     // unspecified fields should use slatedb defaults instead of failing.
