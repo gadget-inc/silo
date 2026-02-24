@@ -214,6 +214,10 @@ enum SplitExecutionError {
     /// Error occurred before the shard map was updated. The split can be
     /// safely abandoned and the parent shard restored to service.
     PreCommit(CoordinationError),
+    /// Error occurred before the shard map was updated, but after the parent
+    /// shard's database was closed. The split must be abandoned AND the parent
+    /// shard must be reopened to restore it to service.
+    PreCommitParentClosed(CoordinationError),
     /// Error occurred after the shard map was updated. The split is committed
     /// and cannot be rolled back.
     PostCommit(CoordinationError),
@@ -390,6 +394,36 @@ impl ShardSplitter {
                 }
                 Err(e)
             }
+            Err(SplitExecutionError::PreCommitParentClosed(e)) => {
+                // The split failed before the commit point, but the parent shard's
+                // database was already closed during the SplitCloning phase. We must
+                // abandon the split AND reopen the parent shard so it can resume
+                // serving requests. Without this recovery, the parent shard would
+                // remain in the factory with a closed DB, permanently unusable.
+                warn!(
+                    parent_shard_id = %parent_shard_id,
+                    error = %e,
+                    "split failed before commit after parent was closed, recovering parent shard"
+                );
+                if let Err(abandon_err) = self.abandon_split(&parent_shard_id).await {
+                    warn!(
+                        parent_shard_id = %parent_shard_id,
+                        error = %abandon_err,
+                        "failed to abandon split record during error recovery"
+                    );
+                }
+
+                // Recover the parent shard: close the stale entry (with closed DB)
+                // from the factory, then reopen it with a fresh database.
+                if let Err(recover_err) = self.recover_parent_shard(&parent_shard_id).await {
+                    warn!(
+                        parent_shard_id = %parent_shard_id,
+                        error = %recover_err,
+                        "failed to recover parent shard after split failure"
+                    );
+                }
+                Err(e)
+            }
             Err(SplitExecutionError::PostCommit(e)) => {
                 // The split failed after the commit point. The shard map has
                 // already been updated, so the split is committed. Return the
@@ -503,9 +537,12 @@ impl ShardSplitter {
                         )
                         .await
                         .map_err(|e| {
-                            SplitExecutionError::PreCommit(CoordinationError::BackendError(
-                                format!("failed to clone children: {}", e),
-                            ))
+                            SplitExecutionError::PreCommitParentClosed(
+                                CoordinationError::BackendError(format!(
+                                    "failed to clone children: {}",
+                                    e
+                                )),
+                            )
                         })?;
 
                     info!(
@@ -538,7 +575,7 @@ impl ShardSplitter {
                                 owned.remove(child_id);
                             }
                         }
-                        return Err(SplitExecutionError::PreCommit(e));
+                        return Err(SplitExecutionError::PreCommitParentClosed(e));
                     }
 
                     // --- PAST THE COMMIT POINT ---
@@ -680,6 +717,59 @@ impl ShardSplitter {
             "abandoning split, deleting split record to restore parent shard"
         );
         self.coordinator.delete_split(parent_shard_id).await
+    }
+
+    /// Recover the parent shard after a failed split left its database closed.
+    ///
+    /// During the SplitCloning phase, the parent shard's database is closed before
+    /// cloning. If the split fails after this point but before the commit (shard map
+    /// update), the parent shard is left in the factory with a closed database,
+    /// permanently unusable. This method removes the stale entry and reopens the
+    /// shard with a fresh database so it can resume serving requests.
+    async fn recover_parent_shard(
+        &self,
+        parent_shard_id: &ShardId,
+    ) -> Result<(), CoordinationError> {
+        // Look up the parent's range from the shard map (still present since the
+        // shard map update failed).
+        let range = {
+            let map = self.ctx.shard_map.lock().await;
+            let info = map.get_shard(parent_shard_id).ok_or_else(|| {
+                CoordinationError::BackendError(format!(
+                    "parent shard {} not found in shard map during recovery",
+                    parent_shard_id
+                ))
+            })?;
+            info.range.clone()
+        };
+
+        // Close the stale factory entry (handles already-closed DB gracefully).
+        if let Err(e) = self.ctx.factory.close(parent_shard_id).await {
+            warn!(
+                parent_shard_id = %parent_shard_id,
+                error = %e,
+                "failed to close stale parent shard entry during recovery, continuing"
+            );
+        }
+
+        // Reopen the parent shard with a fresh database.
+        self.ctx
+            .factory
+            .open(parent_shard_id, &range)
+            .await
+            .map_err(|e| {
+                CoordinationError::BackendError(format!(
+                    "failed to reopen parent shard {} during recovery: {}",
+                    parent_shard_id, e
+                ))
+            })?;
+
+        info!(
+            parent_shard_id = %parent_shard_id,
+            range = %range,
+            "recovered parent shard after failed split"
+        );
+        Ok(())
     }
 
     /// Recover from stale split operations after a node restart.
