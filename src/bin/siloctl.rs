@@ -32,6 +32,11 @@ struct Args {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Bearer token for gRPC authentication.
+    /// Can also be set via SILO_AUTH_TOKEN environment variable.
+    #[arg(long, global = true, env = "SILO_AUTH_TOKEN")]
+    auth_token: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -42,6 +47,7 @@ impl Args {
             address: self.address.clone(),
             tenant: self.tenant.clone(),
             json: self.json,
+            auth_token: self.auth_token.clone(),
         }
     }
 }

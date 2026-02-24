@@ -32,6 +32,7 @@ use tonic::transport::Channel;
 use tracing::{debug, warn};
 
 use crate::arrow_ipc::ipc_to_batches_only;
+use crate::cluster_client::AuthInterceptor;
 use crate::coordination::Coordinator;
 use crate::factory::ShardFactory;
 use crate::job_store_shard::JobStoreShard;
@@ -72,6 +73,15 @@ impl ClusterQueryEngine {
         factory: Arc<ShardFactory>,
         coordinator: Option<Arc<dyn Coordinator>>,
     ) -> DfResult<Self> {
+        Self::with_auth(factory, coordinator, None).await
+    }
+
+    /// Create a new cluster-wide query engine with optional auth token for remote gRPC calls.
+    pub async fn with_auth(
+        factory: Arc<ShardFactory>,
+        coordinator: Option<Arc<dyn Coordinator>>,
+        auth_token: Option<String>,
+    ) -> DfResult<Self> {
         let ctx = SessionContext::new();
 
         // Register cluster-wide jobs table (shard_id is included in the scanner's schema)
@@ -81,6 +91,7 @@ impl ClusterQueryEngine {
             factory.clone(),
             coordinator.clone(),
             TableKind::Jobs,
+            auth_token.clone(),
         ));
         ctx.register_table("jobs", jobs_provider)?;
 
@@ -91,6 +102,7 @@ impl ClusterQueryEngine {
             factory,
             coordinator,
             TableKind::Queues,
+            auth_token,
         ));
         ctx.register_table("queues", queues_provider)?;
 
@@ -190,6 +202,8 @@ struct ClusterTableProvider {
     /// Optional coordinator for discovering remote shards
     coordinator: Option<Arc<dyn Coordinator>>,
     table_kind: TableKind,
+    /// Auth token for remote gRPC calls
+    auth_token: Option<String>,
 }
 
 impl std::fmt::Debug for ClusterTableProvider {
@@ -219,12 +233,14 @@ impl ClusterTableProvider {
         factory: Arc<ShardFactory>,
         coordinator: Option<Arc<dyn Coordinator>>,
         table_kind: TableKind,
+        auth_token: Option<String>,
     ) -> Self {
         Self {
             schema,
             factory,
             coordinator,
             table_kind,
+            auth_token,
         }
     }
 }
@@ -267,6 +283,7 @@ impl TableProvider for ClusterTableProvider {
             filters.to_vec(),
             limit,
             projection_indices,
+            self.auth_token.clone(),
         )))
     }
 
@@ -293,6 +310,8 @@ struct ClusterExecutionPlan {
     /// Projection indices to apply to remote results (None = no projection)
     projection: Option<Vec<usize>>,
     plan_properties: PlanProperties,
+    /// Auth token for remote gRPC calls
+    auth_token: Option<String>,
 }
 
 impl ClusterExecutionPlan {
@@ -303,6 +322,7 @@ impl ClusterExecutionPlan {
         filters: Vec<Expr>,
         limit: Option<usize>,
         projection: Option<Vec<usize>>,
+        auth_token: Option<String>,
     ) -> Self {
         // Use actual shard count for partitions. If no shards, DataFusion
         // will create an empty result set, which is the correct behavior.
@@ -335,6 +355,7 @@ impl ClusterExecutionPlan {
             limit,
             projection,
             plan_properties: props,
+            auth_token,
         }
     }
 }
@@ -412,6 +433,7 @@ impl ExecutionPlan for ClusterExecutionPlan {
         let limit = self.limit;
         let projection = self.projection.clone();
         let batch_size = context.session_config().batch_size();
+        let auth_token = self.auth_token.clone();
 
         let (tx, rx) = mpsc::channel::<DfResult<RecordBatch>>(4);
 
@@ -443,8 +465,15 @@ impl ExecutionPlan for ClusterExecutionPlan {
                 }
                 ShardConfig::Remote { shard_id, addr } => {
                     // Query remote shard via gRPC with Arrow IPC (returns full schema)
-                    match query_remote_shard_batches(&shard_id, &addr, table_kind, &filters, limit)
-                        .await
+                    match query_remote_shard_batches(
+                        &shard_id,
+                        &addr,
+                        table_kind,
+                        &filters,
+                        limit,
+                        auth_token.as_deref(),
+                    )
+                    .await
                     {
                         Ok(batches) => {
                             for batch in batches {
@@ -517,6 +546,7 @@ async fn query_remote_shard_batches(
     table_kind: TableKind,
     filters: &[Expr],
     limit: Option<usize>,
+    auth_token: Option<&str>,
 ) -> DfResult<Vec<RecordBatch>> {
     // Build SQL query from filters
     let table_name = match table_kind {
@@ -580,7 +610,8 @@ async fn query_remote_shard_batches(
             }
         };
 
-        let mut client = SiloClient::new(channel);
+        let interceptor = AuthInterceptor::new(auth_token.map(|s| s.to_string()));
+        let mut client = SiloClient::with_interceptor(channel, interceptor);
 
         // Make streaming query
         let request = QueryArrowRequest {

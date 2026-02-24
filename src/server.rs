@@ -1750,6 +1750,32 @@ impl Silo for SiloService {
     }
 }
 
+/// Create an auth interceptor that validates Bearer tokens on incoming gRPC requests.
+/// When `token` is `None`, all requests are allowed (auth disabled).
+/// When `token` is `Some`, requests must include a matching `authorization: Bearer <token>` header.
+fn make_auth_interceptor(
+    token: Option<String>,
+) -> impl Fn(Request<()>) -> Result<Request<()>, Status> + Clone {
+    move |req: Request<()>| {
+        let Some(ref expected) = token else {
+            return Ok(req); // No token configured → auth disabled
+        };
+        match req.metadata().get("authorization") {
+            Some(val) => {
+                let val = val
+                    .to_str()
+                    .map_err(|_| Status::unauthenticated("invalid authorization header"))?;
+                if val.strip_prefix("Bearer ").unwrap_or("") == expected.as_str() {
+                    Ok(req)
+                } else {
+                    Err(Status::unauthenticated("invalid auth token"))
+                }
+            }
+            None => Err(Status::unauthenticated("missing authorization header")),
+        }
+    }
+}
+
 /// Run the gRPC server and a periodic reaper task together until shutdown.
 pub async fn run_server(
     listener: TcpListener,
@@ -1782,10 +1808,12 @@ where
         + 'static
         + tonic::transport::server::Connected,
 {
-    let svc = SiloService::new(factory.clone(), coordinator, cfg, metrics.clone());
-    let server = SiloServer::new(svc)
+    let svc = SiloService::new(factory.clone(), coordinator, cfg.clone(), metrics.clone());
+    let interceptor = make_auth_interceptor(cfg.server.auth_token.clone());
+    let silo_server = SiloServer::new(svc)
         .max_decoding_message_size(128 * 1024 * 1024)
         .max_encoding_message_size(128 * 1024 * 1024);
+    let server = tonic::service::interceptor::InterceptedService::new(silo_server, interceptor);
 
     // Create health service for gRPC health probes
     let (mut health_reporter, health_service) = health_reporter();

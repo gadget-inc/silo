@@ -1,7 +1,7 @@
 import type { ClientOptions } from "@grpc/grpc-js";
 import { ChannelCredentials, credentials, Metadata } from "@grpc/grpc-js";
 import { GrpcTransport } from "@protobuf-ts/grpc-transport";
-import type { RpcOptions } from "@protobuf-ts/runtime-rpc";
+import type { RpcInterceptor, RpcOptions } from "@protobuf-ts/runtime-rpc";
 import { RpcError } from "@protobuf-ts/runtime-rpc";
 import { pack, unpack } from "msgpackr";
 import { SiloClient } from "./pb/silo.client";
@@ -1008,6 +1008,9 @@ export class SiloGRPCClient {
   /** @internal */
   private readonly _grpcClientOptions: ClientOptions;
 
+  /** @internal Auth interceptor that injects Bearer token into all calls */
+  private readonly _authInterceptor: RpcInterceptor | null;
+
   /** @internal */
   private readonly _maxWrongShardRetries: number;
 
@@ -1048,22 +1051,63 @@ export class SiloGRPCClient {
 
     const useTls = options.useTls ?? true;
 
-    this._channelCredentials = useTls
-      ? tokenFn
-        ? credentials.combineChannelCredentials(
-            ChannelCredentials.createSsl(),
-            credentials.createFromMetadataGenerator((_, callback) => {
-              tokenFn()
-                .then((token) => {
-                  const meta = new Metadata();
-                  meta.add("authorization", `Bearer ${token}`);
-                  callback(null, meta);
-                })
-                .catch(callback);
-            }),
-          )
-        : ChannelCredentials.createSsl()
-      : ChannelCredentials.createInsecure();
+    // Set up channel credentials and auth. For TLS + token, we use gRPC's
+    // built-in metadata generator on the channel credentials. For insecure
+    // + token, we inject auth via an RPC interceptor instead (gRPC doesn't
+    // support combining insecure credentials with call credentials).
+    if (useTls && tokenFn) {
+      this._channelCredentials = credentials.combineChannelCredentials(
+        ChannelCredentials.createSsl(),
+        credentials.createFromMetadataGenerator((_, callback) => {
+          tokenFn()
+            .then((token) => {
+              const meta = new Metadata();
+              meta.add("authorization", `Bearer ${token}`);
+              callback(null, meta);
+            })
+            .catch(callback);
+        }),
+      );
+      this._authInterceptor = null;
+    } else if (!useTls && tokenFn) {
+      this._channelCredentials = ChannelCredentials.createInsecure();
+      // Cache the resolved token for the interceptor. For static string
+      // tokens this resolves immediately. For async token functions, the
+      // token is refreshed on each call.
+      let cachedToken: string | null = null;
+      if (typeof options.token === "string") {
+        cachedToken = options.token;
+      }
+      const addAuthMeta = (rpcOptions: RpcOptions) => {
+        if (!rpcOptions.meta) {
+          rpcOptions.meta = {};
+        }
+        if (cachedToken) {
+          rpcOptions.meta["authorization"] = `Bearer ${cachedToken}`;
+        }
+      };
+      // For async token functions, eagerly resolve and keep refreshing
+      if (!cachedToken) {
+        tokenFn().then((t) => {
+          cachedToken = t;
+        });
+      }
+      this._authInterceptor = {
+        interceptUnary(next, method, input, rpcOptions) {
+          addAuthMeta(rpcOptions);
+          return next(method, input, rpcOptions);
+        },
+        interceptServerStreaming(next, method, input, rpcOptions) {
+          addAuthMeta(rpcOptions);
+          return next(method, input, rpcOptions);
+        },
+      };
+    } else {
+      this._channelCredentials = useTls
+        ? ChannelCredentials.createSsl()
+        : ChannelCredentials.createInsecure();
+      this._authInterceptor = null;
+    }
 
     // Default gRPC service config with retry policy for transient failures
     const defaultServiceConfig = {
@@ -1164,6 +1208,7 @@ export class SiloGRPCClient {
         host: address,
         channelCredentials: this._channelCredentials,
         clientOptions: this._grpcClientOptions,
+        ...(this._authInterceptor ? { interceptors: [this._authInterceptor] } : {}),
       });
       const client = new SiloClient(transport);
       conn = { address, transport, client };

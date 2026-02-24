@@ -2090,15 +2090,23 @@ pub async fn run_webui(
     cfg: AppConfig,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let cluster_client = Arc::new(ClusterClient::new(
+    let cluster_client = Arc::new(ClusterClient::with_config(
         factory.clone(),
         Some(coordinator.clone()),
+        crate::cluster_client::ClientConfig {
+            auth_token: cfg.server.auth_token.clone(),
+            ..Default::default()
+        },
     ));
 
     let query_engine = Arc::new(
-        ClusterQueryEngine::new(factory.clone(), Some(coordinator.clone()))
-            .await
-            .expect("Failed to create cluster query engine"),
+        ClusterQueryEngine::with_auth(
+            factory.clone(),
+            Some(coordinator.clone()),
+            cfg.server.auth_token.clone(),
+        )
+        .await
+        .expect("Failed to create cluster query engine"),
     );
 
     let state = AppState {

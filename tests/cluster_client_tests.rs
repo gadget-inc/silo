@@ -1107,6 +1107,7 @@ async fn create_silo_client_connection_failure() {
         keepalive_timeout: Duration::from_secs(1),
         max_retries: 1,
         retry_backoff_base: Duration::from_millis(10),
+        auth_token: None,
     };
 
     // Try to connect to a port that nothing is listening on

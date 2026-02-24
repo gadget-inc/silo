@@ -46,9 +46,36 @@ statement_timeout_ms = 5000
 | `grpc_addr` | string | `"127.0.0.1:7450"` | Address and port for the gRPC server to listen on |
 | `dev_mode` | bool | `false` | Enable development mode features like `ResetShards` RPC. **Never enable in production.** |
 | `statement_timeout_ms` | number | `5000` | Maximum SQL statement execution time in milliseconds. Query execution is aborted when this timeout is hit. Set to `0` to disable statement timeout. |
+| `auth_token` | string | (none) | Shared secret for gRPC authentication. When set, all incoming gRPC requests must include this token as a `Bearer` token in the `authorization` metadata header. When unset (default), authentication is disabled. |
 
 <Aside type="danger">
 `dev_mode` allows destructive operations like resetting shard data. Only enable this for local development and testing.
+</Aside>
+
+### gRPC Authentication
+
+Silo supports optional shared-secret authentication for gRPC requests. When `auth_token` is set in the `[server]` section, all incoming RPCs must include an `authorization: Bearer <token>` metadata header matching the configured value. Requests without a valid token are rejected with `UNAUTHENTICATED`.
+
+When `auth_token` is not set (the default), authentication is disabled and all clients can connect freely.
+
+```toml
+[server]
+grpc_addr = "0.0.0.0:7450"
+auth_token = "${SILO_AUTH_TOKEN}"
+```
+
+When authentication is enabled, node-to-node cluster communication and WebUI remote queries automatically use the configured token. External clients (workers, `siloctl`) must provide the token themselves.
+
+**`siloctl`** supports the token via the `--auth-token` flag or the `SILO_AUTH_TOKEN` environment variable:
+
+```bash
+siloctl --auth-token <token> cluster info
+# or
+SILO_AUTH_TOKEN=<token> siloctl cluster info
+```
+
+<Aside>
+The gRPC health check and server reflection services are **not** wrapped in authentication. This ensures Kubernetes liveness/readiness probes and debugging tools like `grpcurl list` continue to work without credentials.
 </Aside>
 
 ---

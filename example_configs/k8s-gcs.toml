@@ -9,6 +9,10 @@
 [server]
 # Bind to all interfaces on port 7450
 grpc_addr = "0.0.0.0:7450"
+# Shared secret for gRPC authentication (optional).
+# When set, all incoming gRPC requests must include this as a Bearer token.
+# Workers must be configured with the same token.
+# auth_token = "${SILO_AUTH_TOKEN}"
 
 [coordination]
 backend = "k8s"
