@@ -2317,6 +2317,43 @@ async fn setup_cancelled_while_running(shard: &Arc<JobStoreShard>, job_id: &str)
     assert!(shard.is_job_cancelled("-", job_id).await.unwrap());
 }
 
+// ── Lifecycle path: Running cancelled, then worker reports Error ─────────
+// Import → dequeue → Running → cancel_job → report(Error) => Failed + cancelled key
+
+async fn setup_failed_after_cancel_while_running(shard: &Arc<JobStoreShard>, job_id: &str) {
+    let mut params = base_import_params(job_id);
+    params.retry_policy = None; // no retries so Error finalizes to Failed
+    let r = shard.import_jobs("-", vec![params]).await.unwrap();
+    assert!(r[0].success);
+
+    let dequeued = shard.dequeue("worker-1", "default", 1).await.unwrap();
+    assert_eq!(dequeued.tasks.len(), 1);
+    let task_id = dequeued.tasks[0].attempt().task_id().to_string();
+
+    // Cancel while running; marker should remain until explicitly cleared.
+    shard.cancel_job("-", job_id).await.unwrap();
+    assert!(shard.is_job_cancelled("-", job_id).await.unwrap());
+
+    // Worker reports a normal error instead of Cancelled.
+    shard
+        .report_attempt_outcome(
+            &task_id,
+            AttemptOutcome::Error {
+                error_code: "ERR".to_string(),
+                error: vec![1, 2, 3],
+            },
+        )
+        .await
+        .unwrap();
+
+    let s = shard.get_job_status("-", job_id).await.unwrap().unwrap();
+    assert_eq!(s.kind, JobStatusKind::Failed);
+    assert!(
+        shard.is_job_cancelled("-", job_id).await.unwrap(),
+        "cancelled marker should still exist before reimport"
+    );
+}
+
 #[silo::test]
 async fn reimport_transitions_cancel_while_running_to_scheduled() {
     let (_tmp, shard) = test_helpers::open_temp_shard().await;
@@ -2335,6 +2372,28 @@ async fn reimport_transitions_cancel_while_running_to_scheduled() {
         JobStatusKind::Scheduled,
         2,
         "cxl-run→sched",
+    )
+    .await;
+}
+
+#[silo::test]
+async fn reimport_transitions_cancel_while_running_error_to_scheduled() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let job_id = "sys-cxl-run-err-to-sched";
+    setup_failed_after_cancel_while_running(&shard, job_id).await;
+
+    let existing = existing_attempts_as_imported(&shard, "-", job_id).await;
+    let reimport = build_reimport_params(job_id, existing, false);
+    let r = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+
+    verify_reimport_invariants(
+        &shard,
+        "-",
+        job_id,
+        JobStatusKind::Scheduled,
+        2,
+        "cxl-run-err→sched",
     )
     .await;
 }

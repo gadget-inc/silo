@@ -605,11 +605,9 @@ impl JobStoreShard {
             .await?;
 
         // Clean up cancelled key: cancel_job writes a separate cancelled key that blocks
-        // lease creation. Always remove it on reimport so it doesn't block future dequeue
-        // or leave stale state on terminal jobs.
-        if old_status.kind == JobStatusKind::Cancelled {
-            txn.delete(job_cancelled_key(tenant, job_id))?;
-        }
+        // lease creation. The marker can outlive Cancelled status (for example when a
+        // running cancelled job later reports Error), so always delete it on reimport.
+        txn.delete(job_cancelled_key(tenant, job_id))?;
 
         // Create new scheduling state if non-terminal
         let mut grants = Vec::new();
