@@ -1543,4 +1543,304 @@ mod splitter_unit_tests {
             "right child should not be in owned set"
         );
     }
+
+    /// Mock coordinator that uses a real factory and can inject failures at the
+    /// shard map update step. This allows testing the recovery path where the
+    /// parent shard is closed during SplitCloning but the split fails before
+    /// the commit point.
+    struct FailingUpdateMockBackend {
+        base: CoordinatorBase,
+        splits: Mutex<HashMap<ShardId, SplitInProgress>>,
+        /// When true, update_shard_map_for_split will return an error
+        fail_shard_map_update: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailingUpdateMockBackend {
+        fn new(
+            shard_map: Arc<Mutex<ShardMap>>,
+            owned: Arc<Mutex<HashSet<ShardId>>>,
+            factory: Arc<ShardFactory>,
+        ) -> Self {
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let base = CoordinatorBase {
+                node_id: "mock-node".to_string(),
+                grpc_addr: "http://mock:7450".to_string(),
+                shard_map,
+                owned,
+                shutdown_tx,
+                shutdown_rx,
+                factory,
+                startup_time_ms: None,
+                placement_rings: Vec::new(),
+            };
+            Self {
+                base,
+                splits: Mutex::new(HashMap::new()),
+                fail_shard_map_update: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Coordinator for FailingUpdateMockBackend {
+        fn base(&self) -> &CoordinatorBase {
+            &self.base
+        }
+
+        async fn shutdown(&self) -> Result<(), CoordinationError> {
+            Ok(())
+        }
+
+        async fn wait_converged(&self, _timeout: Duration) -> bool {
+            true
+        }
+
+        async fn get_members(&self) -> Result<Vec<MemberInfo>, CoordinationError> {
+            Ok(vec![])
+        }
+
+        async fn get_shard_owner_map(&self) -> Result<ShardOwnerMap, CoordinationError> {
+            let shard_map = self.base.shard_map.lock().await.clone();
+            Ok(ShardOwnerMap {
+                shard_map,
+                shard_to_node: HashMap::new(),
+                shard_to_addr: HashMap::new(),
+            })
+        }
+
+        async fn update_shard_placement_ring(
+            &self,
+            _shard_id: &ShardId,
+            _ring: Option<&str>,
+        ) -> Result<(Option<String>, Option<String>), CoordinationError> {
+            Ok((None, None))
+        }
+
+        async fn force_release_shard_lease(
+            &self,
+            _shard_id: &ShardId,
+        ) -> Result<(), CoordinationError> {
+            Ok(())
+        }
+
+        async fn reclaim_existing_leases(&self) -> Result<Vec<ShardId>, CoordinationError> {
+            Ok(vec![])
+        }
+    }
+
+    #[async_trait]
+    impl SplitStorageBackend for FailingUpdateMockBackend {
+        async fn load_split(
+            &self,
+            parent_shard_id: &ShardId,
+        ) -> Result<Option<SplitInProgress>, CoordinationError> {
+            Ok(self.splits.lock().await.get(parent_shard_id).cloned())
+        }
+
+        async fn store_split(&self, split: &SplitInProgress) -> Result<(), CoordinationError> {
+            self.splits
+                .lock()
+                .await
+                .insert(split.parent_shard_id, split.clone());
+            Ok(())
+        }
+
+        async fn delete_split(&self, parent_shard_id: &ShardId) -> Result<(), CoordinationError> {
+            self.splits.lock().await.remove(parent_shard_id);
+            Ok(())
+        }
+
+        async fn update_shard_map_for_split(
+            &self,
+            split: &SplitInProgress,
+        ) -> Result<(), CoordinationError> {
+            if self
+                .fail_shard_map_update
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(CoordinationError::BackendError(
+                    "injected shard map update failure".to_string(),
+                ));
+            }
+            let mut shard_map = self.base.shard_map.lock().await;
+            shard_map.split_shard(
+                &split.parent_shard_id,
+                &split.split_point,
+                split.left_child_id,
+                split.right_child_id,
+            )?;
+            Ok(())
+        }
+
+        async fn reload_shard_map(&self) -> Result<(), CoordinationError> {
+            Ok(())
+        }
+
+        async fn list_all_splits(&self) -> Result<Vec<SplitInProgress>, CoordinationError> {
+            Ok(self.splits.lock().await.values().cloned().collect())
+        }
+    }
+
+    fn make_test_factory_for_unit_test(test_name: &str) -> Arc<ShardFactory> {
+        use silo::gubernator::MockGubernatorClient;
+        use silo::settings::{Backend, DatabaseTemplate};
+
+        let tmpdir = std::env::temp_dir().join(format!("silo-splitter-unit-{}", test_name));
+        // Clean up from previous test runs
+        let _ = std::fs::remove_dir_all(&tmpdir);
+        Arc::new(ShardFactory::new(
+            DatabaseTemplate {
+                backend: Backend::Fs,
+                path: tmpdir.join("%shard%").to_string_lossy().to_string(),
+                wal: None,
+                apply_wal_on_close: true,
+                concurrency_reconcile_interval_ms: 5000,
+                slatedb: None,
+            },
+            MockGubernatorClient::new_arc(),
+            None,
+        ))
+    }
+
+    /// Test that when a split fails at the shard map update (after the parent
+    /// shard's database was closed), the parent shard is recovered and can
+    /// serve requests again.
+    #[silo::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_parent_shard_recovered_after_shard_map_update_failure() {
+        let shard_map = Arc::new(Mutex::new(ShardMap::create_initial(4).unwrap()));
+        let owned = Arc::new(Mutex::new(HashSet::new()));
+        let factory = make_test_factory_for_unit_test("recover-shard-map-fail");
+
+        // Pick a shard and open it in the factory
+        let shard_id = shard_map.lock().await.shard_ids()[0];
+        let range = shard_map
+            .lock()
+            .await
+            .get_shard(&shard_id)
+            .unwrap()
+            .range
+            .clone();
+        factory.open(&shard_id, &range).await.unwrap();
+        owned.lock().await.insert(shard_id);
+
+        // Verify the shard is usable before the split
+        let shard_before = factory.get(&shard_id).unwrap();
+        assert!(
+            shard_before.get_job("test", "nonexistent").await.is_ok(),
+            "shard should be usable before split"
+        );
+
+        let mock = Arc::new(FailingUpdateMockBackend::new(
+            shard_map.clone(),
+            owned.clone(),
+            factory.clone(),
+        ));
+        // Set to fail at shard map update
+        mock.fail_shard_map_update
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let splitter = ShardSplitter::new(Arc::clone(&mock) as Arc<dyn Coordinator>);
+
+        // Request and execute a split — it will fail at the shard map update
+        // after the parent shard's database has been closed
+        splitter
+            .request_split(shard_id, "2".to_string())
+            .await
+            .unwrap();
+        let result = splitter
+            .execute_split(shard_id, || async {
+                Ok(ShardOwnerMap {
+                    shard_map: shard_map.lock().await.clone(),
+                    shard_to_node: HashMap::new(),
+                    shard_to_addr: HashMap::new(),
+                })
+            })
+            .await;
+        assert!(result.is_err(), "split should fail at shard map update");
+
+        // The split record should be cleaned up
+        let status = splitter.get_split_status(shard_id).await.unwrap();
+        assert!(
+            status.is_none(),
+            "split record should be deleted after failure"
+        );
+
+        // The parent shard should still be in the shard map
+        assert!(
+            shard_map.lock().await.get_shard(&shard_id).is_some(),
+            "parent shard should still exist in shard map"
+        );
+
+        // The parent shard should be recovered and usable
+        let shard_after = factory
+            .get(&shard_id)
+            .expect("parent shard should be in factory after recovery");
+        assert!(
+            shard_after.get_job("test", "nonexistent").await.is_ok(),
+            "parent shard should be usable after recovery"
+        );
+
+        // The owned set should still contain the parent
+        assert!(
+            owned.lock().await.contains(&shard_id),
+            "parent shard should still be in owned set"
+        );
+    }
+
+    /// Test that without recovery, a failed split after parent close leaves
+    /// the shard permanently unusable. This is the "before fix" scenario that
+    /// validates the test setup would catch the bug.
+    #[silo::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_parent_shard_unusable_without_recovery_after_close() {
+        let shard_map = Arc::new(Mutex::new(ShardMap::create_initial(4).unwrap()));
+        let _owned: Arc<Mutex<HashSet<ShardId>>> = Arc::new(Mutex::new(HashSet::new()));
+        let factory = make_test_factory_for_unit_test("unusable-without-recovery");
+
+        // Pick a shard and open it in the factory
+        let shard_id = shard_map.lock().await.shard_ids()[0];
+        let range = shard_map
+            .lock()
+            .await
+            .get_shard(&shard_id)
+            .unwrap()
+            .range
+            .clone();
+        factory.open(&shard_id, &range).await.unwrap();
+
+        // Verify the shard is usable
+        let shard = factory.get(&shard_id).unwrap();
+        assert!(shard.get_job("test", "nonexistent").await.is_ok());
+
+        // Close the shard directly (simulating what happens during SplitCloning)
+        shard.close().await.unwrap();
+
+        // The shard is still in the factory but its DB is closed.
+        // Operations on it should fail.
+        let shard_closed = factory.get(&shard_id).unwrap();
+        assert!(
+            shard_closed.get_job("test", "nonexistent").await.is_err(),
+            "shard should be unusable after close without factory removal"
+        );
+
+        // Re-opening via factory.open won't help because OnceCell already has
+        // the closed entry — it returns the same closed instance.
+        let reopen_result = factory.open(&shard_id, &range).await;
+        assert!(reopen_result.is_ok(), "factory.open returns existing entry");
+        let shard_still_closed = factory.get(&shard_id).unwrap();
+        assert!(
+            shard_still_closed
+                .get_job("test", "nonexistent")
+                .await
+                .is_err(),
+            "shard should still be unusable — factory.open returned the stale entry"
+        );
+
+        // Only factory.close() + factory.open() creates a fresh instance
+        factory.close(&shard_id).await.unwrap();
+        let shard_recovered = factory.open(&shard_id, &range).await.unwrap();
+        assert!(
+            shard_recovered.get_job("test", "nonexistent").await.is_ok(),
+            "shard should be usable after factory.close + factory.open"
+        );
+    }
 }
