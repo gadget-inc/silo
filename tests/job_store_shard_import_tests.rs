@@ -2318,7 +2318,8 @@ async fn setup_cancelled_while_running(shard: &Arc<JobStoreShard>, job_id: &str)
 }
 
 // ── Lifecycle path: Running cancelled, then worker reports Error ─────────
-// Import → dequeue → Running → cancel_job → report(Error) => Failed + cancelled key
+// Import → dequeue → Running → cancel_job → report(Error) => Failed + stale
+// cancelled key marker, which reimport must always clear.
 
 async fn setup_failed_after_cancel_while_running(shard: &Arc<JobStoreShard>, job_id: &str) {
     let mut params = base_import_params(job_id);
