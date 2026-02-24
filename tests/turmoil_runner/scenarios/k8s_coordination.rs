@@ -186,6 +186,7 @@ async fn setup_node_server(
         server: silo::settings::ServerConfig {
             grpc_addr: format!("0.0.0.0:{}", port),
             dev_mode: false,
+            statement_timeout_ms: Some(5_000),
         },
         coordination: silo::settings::CoordinationConfig::default(),
         tenancy: silo::settings::TenancyConfig { enabled: true },

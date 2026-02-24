@@ -2,6 +2,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::borrow::Cow;
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 /// Custom deserializer for slatedb::config::Settings that merges user-provided
 /// values with defaults. This is necessary because slatedb's Settings struct
@@ -213,7 +214,7 @@ impl WalConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ServerConfig {
     #[serde(default = "default_grpc_addr")]
     pub grpc_addr: String, // e.g. 127.0.0.1:7450
@@ -221,6 +222,32 @@ pub struct ServerConfig {
     /// WARNING: This allows destructive operations and should never be enabled in production.
     #[serde(default)]
     pub dev_mode: bool,
+    /// Maximum allowed execution time for a single SQL statement, in milliseconds.
+    /// Defaults to 5000ms (5s). Set to 0 to disable statement timeout.
+    #[serde(default = "default_statement_timeout_ms")]
+    pub statement_timeout_ms: Option<u64>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            grpc_addr: default_grpc_addr(),
+            dev_mode: false,
+            statement_timeout_ms: default_statement_timeout_ms(),
+        }
+    }
+}
+
+impl ServerConfig {
+    pub fn statement_timeout(&self) -> Option<Duration> {
+        self.statement_timeout_ms.and_then(|timeout_ms| {
+            if timeout_ms == 0 {
+                None
+            } else {
+                Some(Duration::from_millis(timeout_ms))
+            }
+        })
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -367,6 +394,10 @@ fn default_grpc_addr() -> String {
     "127.0.0.1:7450".to_string()
 }
 
+fn default_statement_timeout_ms() -> Option<u64> {
+    Some(5_000)
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DatabaseConfig {
     pub name: String,
@@ -491,6 +522,7 @@ impl AppConfig {
             server: ServerConfig {
                 grpc_addr: default_grpc_addr(),
                 dev_mode: false,
+                statement_timeout_ms: default_statement_timeout_ms(),
             },
             coordination: CoordinationConfig::default(),
             tenancy: TenancyConfig { enabled: false },
