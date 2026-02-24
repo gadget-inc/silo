@@ -70,6 +70,34 @@ pub struct RequesterRow {
 }
 
 #[derive(Clone)]
+pub struct TenantSummaryRow {
+    pub name: String,
+    pub name_url: String,
+    pub job_count: usize,
+    pub scheduled_count: usize,
+    pub running_count: usize,
+    pub terminal_count: usize,
+    pub top_queues: String,
+}
+
+#[derive(Clone)]
+pub struct TenantQueueRow {
+    pub name: String,
+    pub holders: usize,
+    pub requesters: usize,
+    pub total: usize,
+}
+
+#[derive(Clone)]
+pub struct TenantUpcomingJobRow {
+    pub id: String,
+    pub shard: String,
+    pub status: String,
+    pub priority: u8,
+    pub enqueue_time: String,
+}
+
+#[derive(Clone)]
 pub struct LimitRow {
     pub limit_type: String,
     pub key: String,
@@ -118,6 +146,7 @@ pub struct MemberRow {
 #[template(path = "index.html")]
 struct IndexTemplate {
     nav_active: &'static str,
+    tenancy_enabled: bool,
     jobs: Vec<JobRow>,
     shard_count: usize,
     error: Option<String>,
@@ -127,6 +156,7 @@ struct IndexTemplate {
 #[template(path = "job.html")]
 struct JobTemplate {
     nav_active: &'static str,
+    tenancy_enabled: bool,
     job_id: String,
     shard: String,
     status: String,
@@ -143,6 +173,7 @@ struct JobTemplate {
 #[template(path = "queues.html")]
 struct QueuesTemplate {
     nav_active: &'static str,
+    tenancy_enabled: bool,
     queues: Vec<QueueRow>,
     error: Option<String>,
 }
@@ -151,6 +182,7 @@ struct QueuesTemplate {
 #[template(path = "queue.html")]
 struct QueueTemplate {
     nav_active: &'static str,
+    tenancy_enabled: bool,
     name: String,
     holders: Vec<HolderRow>,
     requesters: Vec<RequesterRow>,
@@ -160,6 +192,7 @@ struct QueueTemplate {
 #[template(path = "cluster.html")]
 struct ClusterTemplate {
     nav_active: &'static str,
+    tenancy_enabled: bool,
     shards: Vec<ShardRow>,
     members: Vec<MemberRow>,
     total_shards: usize,
@@ -174,6 +207,7 @@ struct ClusterTemplate {
 #[template(path = "error.html")]
 struct ErrorTemplate {
     nav_active: &'static str,
+    tenancy_enabled: bool,
     title: String,
     code: u16,
     message: String,
@@ -183,6 +217,7 @@ struct ErrorTemplate {
 #[template(path = "sql.html")]
 struct SqlTemplate {
     nav_active: &'static str,
+    tenancy_enabled: bool,
     query: String,
     has_result: bool,
     // These are for the included sql_result.html when has_result is true
@@ -217,6 +252,7 @@ struct StatusBadgeTemplate {
 #[template(path = "config.html")]
 struct ConfigTemplate {
     nav_active: &'static str,
+    tenancy_enabled: bool,
     config_toml: String,
 }
 
@@ -224,6 +260,7 @@ struct ConfigTemplate {
 #[template(path = "shard.html")]
 struct ShardTemplate {
     nav_active: &'static str,
+    tenancy_enabled: bool,
     shard_id: String,
     range_start: String,
     range_end: String,
@@ -234,6 +271,33 @@ struct ShardTemplate {
     split_phase: Option<String>,
     split_message: Option<String>,
     split_error: Option<String>,
+}
+
+#[derive(Template)]
+#[template(path = "tenants.html")]
+struct TenantsTemplate {
+    nav_active: &'static str,
+    tenancy_enabled: bool,
+    tenants: Vec<TenantSummaryRow>,
+    total_tenants: usize,
+    total_jobs: usize,
+    error: Option<String>,
+}
+
+#[derive(Template)]
+#[template(path = "tenant.html")]
+struct TenantTemplate {
+    nav_active: &'static str,
+    tenancy_enabled: bool,
+    tenant_name: String,
+    tenant_name_url: String,
+    job_count: usize,
+    scheduled_count: usize,
+    running_count: usize,
+    terminal_count: usize,
+    top_queues: Vec<TenantQueueRow>,
+    upcoming_jobs: Vec<TenantUpcomingJobRow>,
+    error: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -249,6 +313,12 @@ pub struct JobParams {
 #[derive(serde::Deserialize)]
 pub struct QueueParams {
     /// Queue name to look up
+    name: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct TenantParams {
+    /// Tenant name
     name: String,
 }
 
@@ -361,6 +431,18 @@ fn format_timestamp(ms: i64) -> String {
     )
 }
 
+fn sql_string_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+#[derive(Default, Clone)]
+struct TenantStatusCounts {
+    total: usize,
+    scheduled: usize,
+    running: usize,
+    terminal: usize,
+}
+
 async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
     let mut all_jobs: Vec<JobRow> = Vec::new();
     let mut error: Option<String> = None;
@@ -444,6 +526,7 @@ async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
 
     let template = IndexTemplate {
         nav_active: "index",
+        tenancy_enabled: state.config.tenancy.enabled,
         jobs: all_jobs,
         shard_count,
         error,
@@ -633,6 +716,7 @@ async fn job_handler(
         return Html(
             ErrorTemplate {
                 nav_active: "job",
+                tenancy_enabled: state.config.tenancy.enabled,
                 title: "Job Not Found".to_string(),
                 code: 404,
                 message: format!("Job '{}' not found in cluster", params.id),
@@ -657,6 +741,7 @@ async fn job_handler(
 
     let template = JobTemplate {
         nav_active: "job",
+        tenancy_enabled: state.config.tenancy.enabled,
         job_id: params.id,
         shard: job.shard_id.to_string(),
         status: job.status_kind,
@@ -836,6 +921,7 @@ async fn queues_handler(State(state): State<AppState>) -> impl IntoResponse {
 
     let template = QueuesTemplate {
         nav_active: "queues",
+        tenancy_enabled: state.config.tenancy.enabled,
         queues,
         error,
     };
@@ -953,9 +1039,435 @@ async fn queue_handler(
 
     let template = QueueTemplate {
         nav_active: "queues",
+        tenancy_enabled: state.config.tenancy.enabled,
         name: params.name,
         holders,
         requesters,
+    };
+
+    Html(
+        template
+            .render()
+            .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
+}
+
+async fn tenants_handler(State(state): State<AppState>) -> impl IntoResponse {
+    if !state.config.tenancy.enabled {
+        return Html(
+            ErrorTemplate {
+                nav_active: "",
+                tenancy_enabled: false,
+                title: "Tenancy Disabled".to_string(),
+                code: 404,
+                message: "Tenant pages are only available when [tenancy].enabled = true"
+                    .to_string(),
+            }
+            .render()
+            .unwrap_or_default(),
+        );
+    }
+
+    let mut status_by_tenant: HashMap<String, TenantStatusCounts> = HashMap::new();
+    let mut queue_counts: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    let jobs_sql =
+        "SELECT tenant, status_kind, COUNT(*) as cnt FROM jobs GROUP BY tenant, status_kind";
+    match state.query_engine.sql(jobs_sql).await {
+        Ok(df) => match df.collect().await {
+            Ok(batches) => {
+                for batch in batches {
+                    let tenant_col = batch.column_by_name("tenant").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::StringArray>()
+                    });
+                    let status_col = batch.column_by_name("status_kind").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::StringArray>()
+                    });
+                    let count_col = batch.column_by_name("cnt").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                    });
+
+                    if let (Some(tenants), Some(statuses), Some(counts)) =
+                        (tenant_col, status_col, count_col)
+                    {
+                        for i in 0..batch.num_rows() {
+                            if tenants.is_null(i) {
+                                continue;
+                            }
+                            let tenant = tenants.value(i).to_string();
+                            let status = if statuses.is_null(i) {
+                                ""
+                            } else {
+                                statuses.value(i)
+                            };
+                            let count = counts.value(i).max(0) as usize;
+
+                            let entry = status_by_tenant.entry(tenant).or_default();
+                            entry.total += count;
+                            match status {
+                                "Scheduled" => entry.scheduled += count,
+                                "Running" => entry.running += count,
+                                "Succeeded" | "Failed" | "Cancelled" => entry.terminal += count,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to collect tenant status query results");
+                errors.push(format!("Jobs aggregation failed: {}", e));
+            }
+        },
+        Err(e) => {
+            warn!(error = %e, "failed to query tenant status aggregates");
+            errors.push(format!("Jobs query failed: {}", e));
+        }
+    }
+
+    let queues_sql =
+        "SELECT tenant, queue_name, COUNT(*) as cnt FROM queues GROUP BY tenant, queue_name";
+    match state.query_engine.sql(queues_sql).await {
+        Ok(df) => match df.collect().await {
+            Ok(batches) => {
+                for batch in batches {
+                    let tenant_col = batch.column_by_name("tenant").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::StringArray>()
+                    });
+                    let queue_col = batch.column_by_name("queue_name").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::StringArray>()
+                    });
+                    let count_col = batch.column_by_name("cnt").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                    });
+
+                    if let (Some(tenants), Some(queues), Some(counts)) =
+                        (tenant_col, queue_col, count_col)
+                    {
+                        for i in 0..batch.num_rows() {
+                            if tenants.is_null(i) || queues.is_null(i) {
+                                continue;
+                            }
+                            let tenant = tenants.value(i).to_string();
+                            let queue = queues.value(i).to_string();
+                            let count = counts.value(i).max(0) as usize;
+                            if queue.is_empty() {
+                                continue;
+                            }
+                            queue_counts.entry(tenant).or_default().push((queue, count));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to collect tenant queue query results");
+                errors.push(format!("Queue aggregation failed: {}", e));
+            }
+        },
+        Err(e) => {
+            warn!(error = %e, "failed to query tenant queue aggregates");
+            errors.push(format!("Queue query failed: {}", e));
+        }
+    }
+
+    let mut tenant_names = std::collections::BTreeSet::new();
+    for tenant in status_by_tenant.keys() {
+        tenant_names.insert(tenant.clone());
+    }
+    for tenant in queue_counts.keys() {
+        tenant_names.insert(tenant.clone());
+    }
+
+    let total_tenants = tenant_names.len();
+    let mut tenants: Vec<TenantSummaryRow> = Vec::with_capacity(tenant_names.len());
+    for tenant in tenant_names {
+        let counts = status_by_tenant.get(&tenant).cloned().unwrap_or_default();
+        let mut queues = queue_counts.remove(&tenant).unwrap_or_default();
+        queues.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        let top_queues = if queues.is_empty() {
+            "-".to_string()
+        } else {
+            queues
+                .iter()
+                .take(3)
+                .map(|(name, count)| format!("{} ({})", name, count))
+                .collect::<Vec<String>>()
+                .join(", ")
+        };
+
+        tenants.push(TenantSummaryRow {
+            name: tenant.clone(),
+            name_url: urlencoding::encode(&tenant).into_owned(),
+            job_count: counts.total,
+            scheduled_count: counts.scheduled,
+            running_count: counts.running,
+            terminal_count: counts.terminal,
+            top_queues,
+        });
+    }
+
+    tenants.sort_by(|a, b| {
+        b.job_count
+            .cmp(&a.job_count)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    let total_jobs: usize = tenants.iter().map(|t| t.job_count).sum();
+    let error = if errors.is_empty() {
+        None
+    } else {
+        Some(errors.join("\n"))
+    };
+
+    let template = TenantsTemplate {
+        nav_active: "tenants",
+        tenancy_enabled: true,
+        tenants,
+        total_tenants,
+        total_jobs,
+        error,
+    };
+
+    Html(
+        template
+            .render()
+            .unwrap_or_else(|e| format!("Template error: {}", e)),
+    )
+}
+
+async fn tenant_handler(
+    State(state): State<AppState>,
+    Query(params): Query<TenantParams>,
+) -> impl IntoResponse {
+    if !state.config.tenancy.enabled {
+        return Html(
+            ErrorTemplate {
+                nav_active: "",
+                tenancy_enabled: false,
+                title: "Tenancy Disabled".to_string(),
+                code: 404,
+                message: "Tenant pages are only available when [tenancy].enabled = true"
+                    .to_string(),
+            }
+            .render()
+            .unwrap_or_default(),
+        );
+    }
+
+    let tenant_escaped = sql_string_literal(&params.name);
+    let mut counts = TenantStatusCounts::default();
+    let mut top_queues: Vec<TenantQueueRow> = Vec::new();
+    let mut upcoming_jobs: Vec<TenantUpcomingJobRow> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    let count_sql = format!(
+        "SELECT status_kind, COUNT(*) as cnt FROM jobs WHERE tenant = '{}' GROUP BY status_kind",
+        tenant_escaped
+    );
+    match state.query_engine.sql(&count_sql).await {
+        Ok(df) => match df.collect().await {
+            Ok(batches) => {
+                for batch in batches {
+                    let status_col = batch.column_by_name("status_kind").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::StringArray>()
+                    });
+                    let count_col = batch.column_by_name("cnt").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                    });
+
+                    if let (Some(statuses), Some(counts_col)) = (status_col, count_col) {
+                        for i in 0..batch.num_rows() {
+                            let status = if statuses.is_null(i) {
+                                ""
+                            } else {
+                                statuses.value(i)
+                            };
+                            let count = counts_col.value(i).max(0) as usize;
+                            counts.total += count;
+                            match status {
+                                "Scheduled" => counts.scheduled += count,
+                                "Running" => counts.running += count,
+                                "Succeeded" | "Failed" | "Cancelled" => counts.terminal += count,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, tenant = %params.name, "failed to collect tenant count results");
+                errors.push(format!("Tenant counts query failed: {}", e));
+            }
+        },
+        Err(e) => {
+            warn!(error = %e, tenant = %params.name, "failed to query tenant counts");
+            errors.push(format!("Tenant counts query failed: {}", e));
+        }
+    }
+
+    let queue_sql = format!(
+        "SELECT queue_name, entry_type, COUNT(*) as cnt FROM queues WHERE tenant = '{}' GROUP BY queue_name, entry_type",
+        tenant_escaped
+    );
+    match state.query_engine.sql(&queue_sql).await {
+        Ok(df) => match df.collect().await {
+            Ok(batches) => {
+                let mut queue_map: HashMap<String, (usize, usize)> = HashMap::new();
+                for batch in batches {
+                    let name_col = batch.column_by_name("queue_name").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::StringArray>()
+                    });
+                    let type_col = batch.column_by_name("entry_type").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::StringArray>()
+                    });
+                    let count_col = batch.column_by_name("cnt").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                    });
+
+                    if let (Some(names), Some(types), Some(counts_col)) =
+                        (name_col, type_col, count_col)
+                    {
+                        for i in 0..batch.num_rows() {
+                            if names.is_null(i) || types.is_null(i) {
+                                continue;
+                            }
+                            let queue_name = names.value(i).to_string();
+                            if queue_name.is_empty() {
+                                continue;
+                            }
+                            let entry_type = types.value(i);
+                            let count = counts_col.value(i).max(0) as usize;
+                            let entry = queue_map.entry(queue_name).or_insert((0, 0));
+                            match entry_type {
+                                "holder" => entry.0 += count,
+                                "requester" => entry.1 += count,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+
+                top_queues = queue_map
+                    .into_iter()
+                    .map(|(name, (holders, requesters))| TenantQueueRow {
+                        name,
+                        holders,
+                        requesters,
+                        total: holders + requesters,
+                    })
+                    .collect();
+                top_queues.sort_by(|a, b| b.total.cmp(&a.total).then_with(|| a.name.cmp(&b.name)));
+            }
+            Err(e) => {
+                warn!(error = %e, tenant = %params.name, "failed to collect tenant queue results");
+                errors.push(format!("Tenant queue query failed: {}", e));
+            }
+        },
+        Err(e) => {
+            warn!(error = %e, tenant = %params.name, "failed to query tenant queues");
+            errors.push(format!("Tenant queue query failed: {}", e));
+        }
+    }
+
+    let upcoming_sql = format!(
+        "SELECT shard_id, id, status_kind, priority, enqueue_time_ms FROM jobs WHERE tenant = '{}' AND status_kind = 'Scheduled' ORDER BY enqueue_time_ms ASC LIMIT 100",
+        tenant_escaped
+    );
+    match state.query_engine.sql(&upcoming_sql).await {
+        Ok(df) => match df.collect().await {
+            Ok(batches) => {
+                for batch in batches {
+                    let shard_col = batch.column_by_name("shard_id").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::StringArray>()
+                    });
+                    let id_col = batch.column_by_name("id").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::StringArray>()
+                    });
+                    let status_col = batch.column_by_name("status_kind").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::StringArray>()
+                    });
+                    let priority_col = batch.column_by_name("priority").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::UInt8Array>()
+                    });
+                    let time_col = batch.column_by_name("enqueue_time_ms").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                    });
+
+                    if let (
+                        Some(shards),
+                        Some(ids),
+                        Some(statuses),
+                        Some(priorities),
+                        Some(times),
+                    ) = (shard_col, id_col, status_col, priority_col, time_col)
+                    {
+                        for i in 0..batch.num_rows() {
+                            if ids.is_null(i) || shards.is_null(i) || priorities.is_null(i) {
+                                continue;
+                            }
+                            upcoming_jobs.push(TenantUpcomingJobRow {
+                                id: ids.value(i).to_string(),
+                                shard: shards.value(i).to_string(),
+                                status: if statuses.is_null(i) {
+                                    "Scheduled".to_string()
+                                } else {
+                                    statuses.value(i).to_string()
+                                },
+                                priority: priorities.value(i),
+                                enqueue_time: format_timestamp(times.value(i)),
+                            });
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, tenant = %params.name, "failed to collect upcoming jobs");
+                errors.push(format!("Upcoming jobs query failed: {}", e));
+            }
+        },
+        Err(e) => {
+            warn!(error = %e, tenant = %params.name, "failed to query upcoming jobs");
+            errors.push(format!("Upcoming jobs query failed: {}", e));
+        }
+    }
+
+    let error = if errors.is_empty() {
+        None
+    } else {
+        Some(errors.join("\n"))
+    };
+
+    let tenant_name_url = urlencoding::encode(&params.name).into_owned();
+    let template = TenantTemplate {
+        nav_active: "tenants",
+        tenancy_enabled: true,
+        tenant_name: params.name,
+        tenant_name_url,
+        job_count: counts.total,
+        scheduled_count: counts.scheduled,
+        running_count: counts.running,
+        terminal_count: counts.terminal,
+        top_queues,
+        upcoming_jobs,
+        error,
     };
 
     Html(
@@ -1143,6 +1655,7 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
 
     let template = ClusterTemplate {
         nav_active: "cluster",
+        tenancy_enabled: state.config.tenancy.enabled,
         shards,
         members,
         total_shards,
@@ -1163,9 +1676,13 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
 /// Maximum number of rows to return from SQL queries to avoid crashing the browser
 const SQL_RESULT_LIMIT: usize = 1000;
 
-async fn sql_handler(Query(params): Query<SqlQueryParams>) -> impl IntoResponse {
+async fn sql_handler(
+    State(state): State<AppState>,
+    Query(params): Query<SqlQueryParams>,
+) -> impl IntoResponse {
     let template = SqlTemplate {
         nav_active: "sql",
+        tenancy_enabled: state.config.tenancy.enabled,
         query: params.q,
         has_result: false,
         columns: Vec::new(),
@@ -1344,6 +1861,7 @@ async fn config_handler(State(state): State<AppState>) -> impl IntoResponse {
 
     let template = ConfigTemplate {
         nav_active: "config",
+        tenancy_enabled: state.config.tenancy.enabled,
         config_toml,
     };
 
@@ -1364,6 +1882,7 @@ async fn shard_handler(
             return Html(
                 ErrorTemplate {
                     nav_active: "cluster",
+                    tenancy_enabled: state.config.tenancy.enabled,
                     title: "Invalid Shard ID".to_string(),
                     code: 400,
                     message: format!("'{}' is not a valid shard UUID", params.id),
@@ -1419,6 +1938,7 @@ async fn shard_handler(
         return Html(
             ErrorTemplate {
                 nav_active: "cluster",
+                tenancy_enabled: state.config.tenancy.enabled,
                 title: "Shard Not Found".to_string(),
                 code: 404,
                 message: format!("Shard '{}' not found in cluster", params.id),
@@ -1438,6 +1958,7 @@ async fn shard_handler(
 
     let template = ShardTemplate {
         nav_active: "cluster",
+        tenancy_enabled: state.config.tenancy.enabled,
         shard_id: params.id,
         range_start: if info.range.start.is_empty() {
             "-∞".to_string()
@@ -1528,10 +2049,11 @@ async fn shard_split_handler(
     }
 }
 
-async fn not_found_handler() -> impl IntoResponse {
+async fn not_found_handler(State(state): State<AppState>) -> impl IntoResponse {
     Html(
         ErrorTemplate {
             nav_active: "",
+            tenancy_enabled: state.config.tenancy.enabled,
             title: "Not Found".to_string(),
             code: 404,
             message: "Page not found".to_string(),
@@ -1548,6 +2070,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/job/cancel", post(cancel_job_handler))
         .route("/queues", get(queues_handler))
         .route("/queue", get(queue_handler))
+        .route("/tenants", get(tenants_handler))
+        .route("/tenant", get(tenant_handler))
         .route("/cluster", get(cluster_handler))
         .route("/shard", get(shard_handler))
         .route("/shard/{id}/split", post(shard_split_handler))

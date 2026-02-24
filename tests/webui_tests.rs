@@ -18,6 +18,13 @@ use tower::ServiceExt;
 
 /// Helper to create a test AppState - returns (TempDir, AppState, ShardMap)
 async fn setup_test_state() -> (tempfile::TempDir, AppState, ShardMap) {
+    setup_test_state_with_tenancy(false).await
+}
+
+/// Helper to create a test AppState with configurable tenancy setting.
+async fn setup_test_state_with_tenancy(
+    tenancy_enabled: bool,
+) -> (tempfile::TempDir, AppState, ShardMap) {
     let tmp = tempfile::tempdir().unwrap();
 
     let rate_limiter = MockGubernatorClient::new_arc();
@@ -60,7 +67,8 @@ async fn setup_test_state() -> (tempfile::TempDir, AppState, ShardMap) {
             .expect("create query engine"),
     );
 
-    let config = AppConfig::load(None).expect("load default config");
+    let mut config = AppConfig::load(None).expect("load default config");
+    config.tenancy.enabled = tenancy_enabled;
 
     let state = AppState {
         factory,
@@ -390,6 +398,14 @@ async fn test_404_handler() {
 
 /// Helper to create a multi-shard test AppState - returns (TempDir, AppState, ShardMap)
 async fn setup_multi_shard_state(num_shards: usize) -> (tempfile::TempDir, AppState, ShardMap) {
+    setup_multi_shard_state_with_tenancy(num_shards, false).await
+}
+
+/// Helper to create a multi-shard test AppState with configurable tenancy setting.
+async fn setup_multi_shard_state_with_tenancy(
+    num_shards: usize,
+    tenancy_enabled: bool,
+) -> (tempfile::TempDir, AppState, ShardMap) {
     let tmp = tempfile::tempdir().unwrap();
 
     let rate_limiter = MockGubernatorClient::new_arc();
@@ -434,7 +450,8 @@ async fn setup_multi_shard_state(num_shards: usize) -> (tempfile::TempDir, AppSt
             .expect("create query engine"),
     );
 
-    let config = AppConfig::load(None).expect("load default config");
+    let mut config = AppConfig::load(None).expect("load default config");
+    config.tenancy.enabled = tenancy_enabled;
 
     let state = AppState {
         factory,
@@ -1027,5 +1044,202 @@ async fn test_shard_detail_shows_range() {
     assert!(
         body.contains("-∞") || body.contains("+∞"),
         "body should show unbounded range indicators"
+    );
+}
+
+#[silo::test]
+async fn test_tenants_nav_hidden_when_tenancy_disabled() {
+    let (_tmp, state, _shard_map) = setup_test_state().await;
+
+    let (status, body) = make_request(state, "GET", "/").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !body.contains("href=\"/tenants\""),
+        "tenants nav link should not render when tenancy is disabled"
+    );
+}
+
+#[silo::test]
+async fn test_tenants_nav_visible_when_tenancy_enabled() {
+    let (_tmp, state, _shard_map) = setup_test_state_with_tenancy(true).await;
+
+    let (status, body) = make_request(state, "GET", "/").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("href=\"/tenants\""),
+        "tenants nav link should render when tenancy is enabled"
+    );
+}
+
+#[silo::test]
+async fn test_tenants_page_requires_tenancy_enabled() {
+    let (_tmp, state, _shard_map) = setup_test_state().await;
+
+    let (status, body) = make_request(state, "GET", "/tenants").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("Tenancy Disabled"),
+        "tenants page should explain tenancy requirement when disabled"
+    );
+}
+
+#[silo::test]
+async fn test_tenant_detail_page_requires_tenancy_enabled() {
+    let (_tmp, state, _shard_map) = setup_test_state().await;
+
+    let (status, body) = make_request(state, "GET", "/tenant?name=acme").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("Tenancy Disabled"),
+        "tenant detail page should explain tenancy requirement when disabled"
+    );
+}
+
+#[silo::test]
+async fn test_tenants_index_shows_tenant_data() {
+    use silo::job::{ConcurrencyLimit, Limit};
+
+    let (_tmp, state, shard_map) = setup_multi_shard_state_with_tenancy(2, true).await;
+
+    let shard0_id = shard_map.shards()[0].id;
+    let shard0 = state.factory.get(&shard0_id).expect("shard 0");
+    let _ = shard0
+        .enqueue(
+            "tenant-alpha",
+            Some("tenant-alpha-job-1".to_string()),
+            50,
+            test_helpers::now_ms() + 60_000,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"tenant":"alpha"})),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: "alpha-queue".to_string(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue tenant alpha job 1");
+    let _ = shard0
+        .enqueue(
+            "tenant-alpha",
+            Some("tenant-alpha-job-2".to_string()),
+            20,
+            test_helpers::now_ms() + 120_000,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"tenant":"alpha"})),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: "alpha-queue".to_string(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue tenant alpha job 2");
+
+    let shard1_id = shard_map.shards()[1].id;
+    let shard1 = state.factory.get(&shard1_id).expect("shard 1");
+    let _ = shard1
+        .enqueue(
+            "tenant-beta",
+            Some("tenant-beta-job-1".to_string()),
+            30,
+            test_helpers::now_ms() + 90_000,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"tenant":"beta"})),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: "beta-queue".to_string(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue tenant beta job");
+
+    let (status, body) = make_request(state, "GET", "/tenants").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("Tenants"),
+        "page should render tenant overview"
+    );
+    assert!(
+        body.contains("tenant-alpha"),
+        "tenant alpha should be listed"
+    );
+    assert!(body.contains("tenant-beta"), "tenant beta should be listed");
+    assert!(
+        body.contains("/tenant?name=tenant-alpha"),
+        "tenant links should point to tenant detail pages"
+    );
+    assert!(
+        body.contains("alpha-queue") || body.contains("beta-queue"),
+        "tenant overview should include top queue names"
+    );
+}
+
+#[silo::test]
+async fn test_tenant_detail_shows_upcoming_jobs_and_queues() {
+    use silo::job::{ConcurrencyLimit, Limit};
+
+    let (_tmp, state, shard_map) = setup_multi_shard_state_with_tenancy(2, true).await;
+
+    let shard0_id = shard_map.shards()[0].id;
+    let shard0 = state.factory.get(&shard0_id).expect("shard 0");
+    let _ = shard0
+        .enqueue(
+            "tenant-detail",
+            Some("tenant-detail-job-1".to_string()),
+            40,
+            test_helpers::now_ms() + 30_000,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"k":"v"})),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: "detail-queue".to_string(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue detail job 1");
+    let _ = shard0
+        .enqueue(
+            "tenant-detail",
+            Some("tenant-detail-job-2".to_string()),
+            10,
+            test_helpers::now_ms() + 45_000,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"k":"v2"})),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: "detail-queue".to_string(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue detail job 2");
+
+    let (status, body) = make_request(state, "GET", "/tenant?name=tenant-detail").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("Tenant:") && body.contains("tenant-detail"),
+        "tenant detail heading should render"
+    );
+    assert!(
+        body.contains("tenant-detail-job-1") || body.contains("tenant-detail-job-2"),
+        "tenant detail should show upcoming jobs"
+    );
+    assert!(
+        body.contains("detail-queue"),
+        "tenant detail should show queue activity"
     );
 }

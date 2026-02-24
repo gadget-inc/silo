@@ -26,6 +26,9 @@
                     <nav class="flex items-center gap-2">
                         <a href="/" class="px-3 py-1 text-sm font-mono {% if nav_active == "index" %}bg-zinc-700 text-emerald-400{% else %}text-zinc-400 hover:text-emerald-400 hover:bg-zinc-800{% endif %}">Jobs</a>
                         <a href="/queues" class="px-3 py-1 text-sm font-mono {% if nav_active == "queues" %}bg-zinc-700 text-emerald-400{% else %}text-zinc-400 hover:text-emerald-400 hover:bg-zinc-800{% endif %}">Queues</a>
+                        {% if tenancy_enabled %}
+                        <a href="/tenants" class="px-3 py-1 text-sm font-mono {% if nav_active == "tenants" %}bg-zinc-700 text-emerald-400{% else %}text-zinc-400 hover:text-emerald-400 hover:bg-zinc-800{% endif %}">Tenants</a>
+                        {% endif %}
                         <a href="/cluster" class="px-3 py-1 text-sm font-mono {% if nav_active == "cluster" %}bg-zinc-700 text-emerald-400{% else %}text-zinc-400 hover:text-emerald-400 hover:bg-zinc-800{% endif %}">Cluster</a>
                         <a href="/sql" class="px-3 py-1 text-sm font-mono {% if nav_active == "sql" %}bg-zinc-700 text-emerald-400{% else %}text-zinc-400 hover:text-emerald-400 hover:bg-zinc-800{% endif %}">SQL</a>
                         <a href="/config" class="px-3 py-1 text-sm font-mono {% if nav_active == "config" %}bg-zinc-700 text-emerald-400{% else %}text-zinc-400 hover:text-emerald-400 hover:bg-zinc-800{% endif %}">Config</a>
@@ -58,4 +61,3 @@
     </script>
 </body>
 </html>
-

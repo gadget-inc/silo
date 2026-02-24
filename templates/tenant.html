@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+
+{% block title %}Tenant {{ tenant_name }} - Silo{% endblock %}
+
+{% block content %}
+<div class="space-y-4">
+    <div class="flex items-center justify-between">
+        <h1 class="text-xl font-bold text-zinc-100">Tenant: <span class="text-emerald-400">{{ tenant_name }}</span></h1>
+        <a href="/tenants" class="text-sm text-zinc-400 hover:text-emerald-400">← All tenants</a>
+    </div>
+
+    {% if error.is_some() %}
+    <div class="bg-red-900/30 border border-red-700 p-4">
+        <div class="text-red-400 text-sm font-medium">Error loading tenant data</div>
+        <pre class="text-red-300 text-xs mt-2 whitespace-pre-wrap">{{ error.as_ref().unwrap() }}</pre>
+    </div>
+    {% endif %}
+
+    <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <div class="bg-zinc-800 border border-zinc-700 p-4">
+            <div class="text-zinc-500 text-xs uppercase tracking-wide">Total Jobs</div>
+            <div class="text-2xl font-bold text-zinc-100 mt-1">{{ job_count }}</div>
+        </div>
+        <div class="bg-zinc-800 border border-zinc-700 p-4">
+            <div class="text-zinc-500 text-xs uppercase tracking-wide">Scheduled</div>
+            <div class="text-2xl font-bold text-blue-400 mt-1">{{ scheduled_count }}</div>
+        </div>
+        <div class="bg-zinc-800 border border-zinc-700 p-4">
+            <div class="text-zinc-500 text-xs uppercase tracking-wide">Running</div>
+            <div class="text-2xl font-bold text-yellow-400 mt-1">{{ running_count }}</div>
+        </div>
+        <div class="bg-zinc-800 border border-zinc-700 p-4">
+            <div class="text-zinc-500 text-xs uppercase tracking-wide">Terminal</div>
+            <div class="text-2xl font-bold text-emerald-400 mt-1">{{ terminal_count }}</div>
+        </div>
+    </div>
+
+    <div class="bg-zinc-800 border border-zinc-700 overflow-hidden">
+        <div class="bg-zinc-850 border-b border-zinc-700 px-4 py-2">
+            <h2 class="text-sm font-semibold text-zinc-300">Top Active Queues</h2>
+        </div>
+        <div class="p-4">
+            {% if top_queues.is_empty() %}
+            <div class="text-zinc-500 text-center py-6">No active queue entries for this tenant</div>
+            {% else %}
+            <div class="overflow-x-auto">
+                <table class="min-w-full divide-y divide-zinc-700">
+                    <thead class="bg-zinc-850">
+                        <tr>
+                            <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Queue</th>
+                            <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Holders</th>
+                            <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Requesters</th>
+                            <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Total</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-zinc-700">
+                        {% for queue in top_queues %}
+                        <tr class="border-b border-zinc-700 hover:bg-zinc-750">
+                            <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">
+                                <a href="/queue?name={{ queue.name }}" class="text-emerald-400 hover:underline">{{ queue.name }}</a>
+                            </td>
+                            <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">{{ queue.holders }}</td>
+                            <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">{{ queue.requesters }}</td>
+                            <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">{{ queue.total }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="bg-zinc-800 border border-zinc-700 overflow-hidden">
+        <div class="bg-zinc-850 border-b border-zinc-700 px-4 py-2">
+            <h2 class="text-sm font-semibold text-zinc-300">Upcoming Scheduled Jobs</h2>
+        </div>
+        <div class="p-4">
+            {% if upcoming_jobs.is_empty() %}
+            <div class="text-zinc-500 text-center py-6">No scheduled jobs for this tenant</div>
+            {% else %}
+            <div class="overflow-x-auto">
+                <table class="min-w-full divide-y divide-zinc-700">
+                    <thead class="bg-zinc-850">
+                        <tr>
+                            <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Job ID</th>
+                            <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Shard</th>
+                            <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Status</th>
+                            <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Priority</th>
+                            <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Enqueue Time</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-zinc-700">
+                        {% for job in upcoming_jobs %}
+                        <tr class="border-b border-zinc-700 hover:bg-zinc-750">
+                            <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">
+                                <a href="/job?shard={{ job.shard }}&tenant={{ tenant_name_url }}&id={{ job.id }}" class="text-emerald-400 hover:underline">{{ job.id }}</a>
+                            </td>
+                            <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">{{ job.shard }}</td>
+                            <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">{{ job.status }}</td>
+                            <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">P{{ job.priority }}</td>
+                            <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">{{ job.enqueue_time }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endblock %}
