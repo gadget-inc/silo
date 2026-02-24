@@ -216,6 +216,7 @@ impl JobStoreShard {
                         now_ms,
                         held_queues: Vec::new(),
                         task_group: &params.task_group,
+                        skip_try_reserve: false,
                     },
                 )
                 .await?;
