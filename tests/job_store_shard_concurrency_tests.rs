@@ -1271,3 +1271,299 @@ async fn retry_must_wait_for_slot_when_another_job_was_granted() {
         "At most 1 holder should exist"
     );
 }
+
+/// Test retry with max_concurrency > 1 (spare capacity).
+///
+/// Retries always skip try_reserve, matching the Alloy model's
+/// completeFailureRetryReleaseTicket which creates a TicketRequest, not an immediate
+/// holder. The retry task is written as a RequestTicket in the DB queue. On the next
+/// dequeue, it is processed and the slot is granted — well after the old holder was
+/// released post-commit. This ensures no window where the same job holds two slots.
+#[silo::test]
+async fn retry_with_spare_concurrency_goes_through_request_queue() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let queue = "spare-cap-retry".to_string();
+
+    // Single job with retry and max_concurrency=3 (plenty of spare capacity)
+    let job_a = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            Some(RetryPolicy {
+                retry_count: 2,
+                initial_interval_ms: 1,
+                max_interval_ms: i64::MAX,
+                randomize_interval: false,
+                backoff_factor: 1.0,
+            }),
+            test_helpers::msgpack_payload(&serde_json::json!({"job": "A"})),
+            vec![Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 3,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue A");
+
+    // Dequeue attempt 1
+    let tasks_a1 = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("deq A1")
+        .tasks;
+    assert_eq!(tasks_a1.len(), 1);
+    assert_eq!(tasks_a1[0].job().id(), job_a);
+    let task_a1_id = tasks_a1[0].attempt().task_id().to_string();
+
+    assert_eq!(count_concurrency_holders(shard.db()).await, 1);
+
+    // Fail attempt 1 → retry written as RequestTicket task, old holder released post-commit.
+    shard
+        .report_attempt_outcome(
+            &task_a1_id,
+            AttemptOutcome::Error {
+                error_code: "E".to_string(),
+                error: vec![],
+            },
+        )
+        .await
+        .expect("report A1 failure");
+
+    // Old holder should be deleted from DB
+    let old_holder = shard
+        .db()
+        .get(&concurrency_holder_key("-", &queue, &task_a1_id))
+        .await
+        .expect("get old holder");
+    assert!(
+        old_holder.is_none(),
+        "Old task's holder should be deleted after retry"
+    );
+
+    // No holders should exist yet — old was released, new hasn't been granted
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        0,
+        "No holders should exist between old release and retry grant"
+    );
+
+    // Dequeue processes the RequestTicket → grants the slot → returns RunAttempt
+    let tasks_a2 = poll_until(
+        || async {
+            shard
+                .dequeue("w", "default", 1)
+                .await
+                .expect("deq A2")
+                .tasks
+        },
+        |t| !t.is_empty(),
+        5000,
+    )
+    .await;
+    assert_eq!(tasks_a2.len(), 1);
+    assert_eq!(tasks_a2[0].job().id(), job_a);
+    let task_a2_id = tasks_a2[0].attempt().task_id().to_string();
+    assert_ne!(task_a2_id, task_a1_id, "Retry should have a new task ID");
+
+    // Now the retry task holds the slot
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        1,
+        "Retry task should hold exactly 1 slot"
+    );
+
+    // Fail attempt 2 → another retry
+    shard
+        .report_attempt_outcome(
+            &task_a2_id,
+            AttemptOutcome::Error {
+                error_code: "E".to_string(),
+                error: vec![],
+            },
+        )
+        .await
+        .expect("report A2 failure");
+
+    // Dequeue attempt 3
+    let tasks_a3 = poll_until(
+        || async {
+            shard
+                .dequeue("w", "default", 1)
+                .await
+                .expect("deq A3")
+                .tasks
+        },
+        |t| !t.is_empty(),
+        5000,
+    )
+    .await;
+    assert_eq!(tasks_a3.len(), 1);
+    let task_a3_id = tasks_a3[0].attempt().task_id().to_string();
+
+    shard
+        .report_attempt_outcome(&task_a3_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report A3 success");
+
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        0,
+        "No holders should remain after job completes"
+    );
+}
+
+/// Test that retry doesn't over-count holders when other jobs share the concurrency queue.
+///
+/// With max_concurrency=2: Job A (with retry) and Job B both hold slots.
+/// Job A fails → retry goes to request queue (skip_try_reserve), old holder released
+/// post-commit. B still holds its slot. On the next dequeue, the retry's RequestTicket
+/// is processed and the slot is granted.
+#[silo::test]
+async fn retry_with_concurrent_jobs_respects_limit() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let queue = "multi-job-retry".to_string();
+
+    // Job A with retry
+    let job_a = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            Some(RetryPolicy {
+                retry_count: 1,
+                initial_interval_ms: 1,
+                max_interval_ms: i64::MAX,
+                randomize_interval: false,
+                backoff_factor: 1.0,
+            }),
+            test_helpers::msgpack_payload(&serde_json::json!({"job": "A"})),
+            vec![Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 2,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue A");
+
+    // Job B (no retry)
+    let _job_b = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"job": "B"})),
+            vec![Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 2,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue B");
+
+    // Dequeue both A and B (max_concurrency=2 allows both)
+    let tasks = shard
+        .dequeue("w", "default", 10)
+        .await
+        .expect("deq both")
+        .tasks;
+    assert_eq!(tasks.len(), 2, "Both jobs should be dequeued");
+
+    let (task_a_id, task_b_id) = if tasks[0].job().id() == job_a {
+        (
+            tasks[0].attempt().task_id().to_string(),
+            tasks[1].attempt().task_id().to_string(),
+        )
+    } else {
+        (
+            tasks[1].attempt().task_id().to_string(),
+            tasks[0].attempt().task_id().to_string(),
+        )
+    };
+
+    assert_eq!(count_concurrency_holders(shard.db()).await, 2);
+
+    // Fail A → retry goes to request queue, old holder released post-commit.
+    shard
+        .report_attempt_outcome(
+            &task_a_id,
+            AttemptOutcome::Error {
+                error_code: "E".to_string(),
+                error: vec![],
+            },
+        )
+        .await
+        .expect("report A failure");
+
+    // Old A holder deleted, B's holder still exists → 1 holder
+    let old_a_holder = shard
+        .db()
+        .get(&concurrency_holder_key("-", &queue, &task_a_id))
+        .await
+        .expect("get old A holder");
+    assert!(old_a_holder.is_none(), "Old A holder should be deleted");
+
+    let b_holder = shard
+        .db()
+        .get(&concurrency_holder_key("-", &queue, &task_b_id))
+        .await
+        .expect("get B holder");
+    assert!(b_holder.is_some(), "B's holder should still exist");
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        1,
+        "Only B's holder should exist before retry is granted"
+    );
+
+    // Dequeue processes A's RequestTicket → grants slot → returns RunAttempt
+    let retry_tasks = poll_until(
+        || async {
+            shard
+                .dequeue("w", "default", 1)
+                .await
+                .expect("deq A retry")
+                .tasks
+        },
+        |t| !t.is_empty(),
+        5000,
+    )
+    .await;
+    assert_eq!(retry_tasks.len(), 1);
+    assert_eq!(retry_tasks[0].job().id(), job_a);
+    let task_a_retry_id = retry_tasks[0].attempt().task_id().to_string();
+
+    // Now 2 holders: B + A retry
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        2,
+        "Should have 2 holders: B + A retry"
+    );
+
+    // Complete both
+    shard
+        .report_attempt_outcome(&task_a_retry_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report A retry success");
+    shard
+        .report_attempt_outcome(&task_b_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report B success");
+
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        0,
+        "No holders should remain after all jobs complete"
+    );
+}

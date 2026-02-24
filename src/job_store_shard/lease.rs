@@ -219,7 +219,9 @@ impl JobStoreShard {
                         let next_relative_attempt_number = relative_attempt_number + 1;
                         let next_task_id = Uuid::new_v4().to_string();
 
-                        // Track any immediate grants for rollback if DB write fails
+                        // [SILO-RETRY-5-CONC] Enqueue retry with skip_try_reserve=true.
+                        // The old holder is still in-memory (released post-commit), so the
+                        // retry must go through the request queue, not get an immediate grant.
                         retry_grants = self
                             .enqueue_limit_task_at_index(
                                 &mut DbWriteBatcher::new(&self.db, &mut batch),
@@ -236,6 +238,7 @@ impl JobStoreShard {
                                     now_ms,
                                     held_queues: Vec::new(),
                                     task_group,
+                                    skip_try_reserve: true,
                                 },
                             )
                             .await?;
@@ -277,7 +280,7 @@ impl JobStoreShard {
         }
 
         // [SILO-REL-1][SILO-RETRY-REL] Delete concurrency holders in the batch.
-        // In-memory release and grant-next happen post-commit via the grant scanner.
+        // In-memory release happens post-commit via atomic_release.
         for queue in &held_queues_local {
             batch.delete(concurrency_holder_key(&tenant, queue, task_id));
         }
@@ -326,10 +329,13 @@ impl JobStoreShard {
         }
         dst_events::confirm_write(write_op);
 
-        // Post-commit: update in-memory concurrency counts and signal grant scanner
+        // Post-commit: release in-memory concurrency counts and signal grant scanner.
         for queue in &held_queues_local {
-            let span =
-                info_span!("concurrency.release", queue = %queue, finished_task_id = %task_id);
+            let span = info_span!(
+                "concurrency.release",
+                queue = %queue,
+                finished_task_id = %task_id
+            );
             let _g = span.enter();
             debug!("released ticket for finished task");
 

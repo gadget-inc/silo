@@ -410,6 +410,7 @@ impl ConcurrencyManager {
         task_group: &str,
         attempt_number: u32,
         relative_attempt_number: u32,
+        skip_try_reserve: bool,
     ) -> Result<Option<RequestTicketOutcome>, ConcurrencyError> {
         // Only gate on the first limit (if any)
         let Some(limit) = limits.first() else {
@@ -421,10 +422,14 @@ impl ConcurrencyManager {
 
         // [SILO-ENQ-CONC-1] Atomically check and reserve if queue has capacity
         // This prevents TOCTOU races by reserving the slot before writing to DB
-        if self
-            .counts
-            .try_reserve(db, range, tenant, queue, task_id, max_allowed, job_id)
-            .await?
+        // [SILO-RETRY-5-CONC] Skip try_reserve for retries: the old holder is still in-memory
+        // (released post-commit), so the retry must go through the request queue. This matches
+        // the Alloy model's completeFailureRetryReleaseTicket which creates a TicketRequest.
+        if !skip_try_reserve
+            && self
+                .counts
+                .try_reserve(db, range, tenant, queue, task_id, max_allowed, job_id)
+                .await?
         {
             // Grant immediately: [SILO-ENQ-CONC-2] create holder, [SILO-ENQ-CONC-3] create task
             // Note: in-memory slot is already reserved by try_reserve

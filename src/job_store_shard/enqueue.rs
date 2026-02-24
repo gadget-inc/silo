@@ -36,6 +36,11 @@ pub(crate) struct LimitTaskParams<'a> {
     pub now_ms: i64,
     pub held_queues: Vec<String>,
     pub task_group: &'a str,
+    /// When true, skip try_reserve and always go through the request queue.
+    /// Used for retry scheduling where the old holder is still in-memory (released post-commit).
+    /// This matches the Alloy model's completeFailureRetryReleaseTicket which creates a
+    /// TicketRequest, not an immediate holder.
+    pub skip_try_reserve: bool,
 }
 
 /// Whether a concurrency grant was obtained or the job was queued for later.
@@ -355,6 +360,7 @@ impl JobStoreShard {
                 now_ms,
                 held_queues: Vec::new(),
                 task_group,
+                skip_try_reserve: false,
             },
         )
         .await
@@ -417,6 +423,7 @@ impl JobStoreShard {
             now_ms,
             held_queues,
             task_group,
+            skip_try_reserve,
         } = params;
         let mut grants = Vec::new();
         let mut current_index = limit_index;
@@ -466,6 +473,7 @@ impl JobStoreShard {
                             task_group,
                             attempt_number,
                             relative_attempt_number,
+                            skip_try_reserve,
                         )
                         .await?;
 
@@ -513,6 +521,7 @@ impl JobStoreShard {
                             task_group,
                             attempt_number,
                             relative_attempt_number,
+                            skip_try_reserve,
                         )
                         .await?;
 

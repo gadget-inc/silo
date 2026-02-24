@@ -512,6 +512,7 @@ impl JobStoreShard {
                             now_ms,
                             held_queues: held_queues.clone(),
                             task_group: check_task_group,
+                            skip_try_reserve: false,
                         },
                     )
                     .await?;
