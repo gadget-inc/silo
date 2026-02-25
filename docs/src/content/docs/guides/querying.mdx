@@ -41,6 +41,21 @@ for (const row of typed.rows) {
 
 The second argument is the tenant used for routing the query to the correct shard. If you're not using multi-tenancy, you can omit it.
 
+You can also pass positional bind parameters as a third argument. Placeholders use `$1`, `$2`, ... and are matched by position.
+
+```typescript
+const tenant = "customer-123";
+const minPriority = 10;
+
+const result = await client.query(
+  "SELECT id, priority FROM jobs WHERE tenant = $1 AND priority >= $2 ORDER BY priority ASC LIMIT 25",
+  tenant,
+  [tenant, minPriority]
+);
+```
+
+Supported bind parameter types in the TypeScript client are `boolean`, `number`, `string`, `Uint8Array`, and `null`.
+
 The result includes:
 - `columns` — schema information (`name` and `dataType` for each column)
 - `rows` — deserialized JavaScript objects, one per row
