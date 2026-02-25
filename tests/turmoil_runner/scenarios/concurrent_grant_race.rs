@@ -19,9 +19,9 @@
 
 use crate::helpers::{
     AttemptStatus, ConcurrencyLimit, EnqueueRequest, GetJobRequest, HashMap, InvariantTracker,
-    JobStatus, LeaseTasksRequest, Limit, ReportOutcomeRequest, SerializedBytes,
-    SiloClient, TEST_SHARD_ID, connect_to_server, get_seed, limit, report_outcome_request,
-    run_scenario_impl, serialized_bytes, setup_server, turmoil_connector,
+    JobStatus, LeaseTasksRequest, Limit, ReportOutcomeRequest, SerializedBytes, SiloClient,
+    TEST_SHARD_ID, connect_to_server, get_seed, limit, report_outcome_request, run_scenario_impl,
+    serialized_bytes, setup_server, turmoil_connector,
 };
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -151,20 +151,18 @@ pub fn run() {
                                     .report_outcome(tonic::Request::new(ReportOutcomeRequest {
                                         shard: TEST_SHARD_ID.to_string(),
                                         task_id: task.id.clone(),
-                                        outcome: Some(
-                                            report_outcome_request::Outcome::Success(
-                                                SerializedBytes {
-                                                    encoding: Some(
-                                                        serialized_bytes::Encoding::Msgpack(
-                                                            rmp_serde::to_vec(
-                                                                &serde_json::json!("done"),
-                                                            )
-                                                            .unwrap(),
-                                                        ),
+                                        outcome: Some(report_outcome_request::Outcome::Success(
+                                            SerializedBytes {
+                                                encoding: Some(
+                                                    serialized_bytes::Encoding::Msgpack(
+                                                        rmp_serde::to_vec(&serde_json::json!(
+                                                            "done"
+                                                        ))
+                                                        .unwrap(),
                                                     ),
-                                                },
-                                            ),
-                                        ),
+                                                ),
+                                            },
+                                        )),
                                     }))
                                     .await
                                 {

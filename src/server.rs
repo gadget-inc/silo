@@ -14,6 +14,7 @@ use tonic_reflection::server::Builder as ReflectionBuilder;
 use tracing::info;
 
 use crate::arrow_ipc::batch_to_ipc;
+use datafusion::common::{ParamValues, ScalarValue};
 
 /// File descriptor set for gRPC reflection
 pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("silo_descriptor");
@@ -310,11 +311,44 @@ impl SiloService {
             .map_err(|_| Status::invalid_argument(format!("invalid shard ID: {}", shard_str)))
     }
 
+    #[allow(clippy::result_large_err)] // Status is required by tonic's API
+    fn query_parameter_to_scalar(parameter: QueryParameter) -> Result<ScalarValue, Status> {
+        match parameter.value {
+            Some(query_parameter::Value::BoolValue(v)) => Ok(ScalarValue::Boolean(Some(v))),
+            Some(query_parameter::Value::Int64Value(v)) => Ok(ScalarValue::Int64(Some(v))),
+            Some(query_parameter::Value::Uint64Value(v)) => Ok(ScalarValue::UInt64(Some(v))),
+            Some(query_parameter::Value::Float64Value(v)) => Ok(ScalarValue::Float64(Some(v))),
+            Some(query_parameter::Value::StringValue(v)) => Ok(ScalarValue::Utf8(Some(v))),
+            Some(query_parameter::Value::BytesValue(v)) => Ok(ScalarValue::Binary(Some(v))),
+            Some(query_parameter::Value::NullValue(_)) => Ok(ScalarValue::Null),
+            None => Err(Status::invalid_argument(
+                "query parameter is missing a value",
+            )),
+        }
+    }
+
+    #[allow(clippy::result_large_err)] // Status is required by tonic's API
+    fn query_parameters_to_param_values(
+        parameters: Vec<QueryParameter>,
+    ) -> Result<Option<ParamValues>, Status> {
+        if parameters.is_empty() {
+            return Ok(None);
+        }
+
+        let positional = parameters
+            .into_iter()
+            .map(Self::query_parameter_to_scalar)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Some(ParamValues::List(positional)))
+    }
+
     /// Execute a SQL query against a shard and return the resulting record batches.
     async fn execute_shard_query(
         &self,
         shard_str: &str,
         sql: &str,
+        parameters: Vec<QueryParameter>,
     ) -> Result<
         (
             datafusion::arrow::datatypes::SchemaRef,
@@ -326,10 +360,16 @@ impl SiloService {
         let shard = self.shard_with_redirect(&shard_id).await?;
         let query_engine = shard.query_engine();
 
-        let dataframe = query_engine
+        let mut dataframe = query_engine
             .sql(sql)
             .await
             .map_err(|e| Status::invalid_argument(format!("SQL error: {}", e)))?;
+
+        if let Some(param_values) = Self::query_parameters_to_param_values(parameters)? {
+            dataframe = dataframe
+                .with_param_values(param_values)
+                .map_err(|e| Status::invalid_argument(format!("SQL parameter error: {}", e)))?;
+        }
 
         let schema = dataframe.schema().inner().clone();
 
@@ -1248,7 +1288,9 @@ impl Silo for SiloService {
 
     async fn query(&self, req: Request<QueryRequest>) -> Result<Response<QueryResponse>, Status> {
         let r = req.into_inner();
-        let (schema, batches) = self.execute_shard_query(&r.shard, &r.sql).await?;
+        let (schema, batches) = self
+            .execute_shard_query(&r.shard, &r.sql, r.parameters)
+            .await?;
         let columns: Vec<ColumnInfo> = schema
             .fields()
             .iter()
@@ -1285,7 +1327,9 @@ impl Silo for SiloService {
         req: Request<QueryArrowRequest>,
     ) -> Result<Response<Self::QueryArrowStream>, Status> {
         let r = req.into_inner();
-        let (_schema, batches) = self.execute_shard_query(&r.shard, &r.sql).await?;
+        let (_schema, batches) = self
+            .execute_shard_query(&r.shard, &r.sql, r.parameters)
+            .await?;
 
         // Create a stream that yields Arrow IPC messages
         let (tx, rx) = tokio::sync::mpsc::channel(16);

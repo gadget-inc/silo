@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, Int64Array, StringArray};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::ScalarValue;
 use silo::job_store_shard::JobStoreShard;
 use silo::query::ShardQueryEngine;
 use test_helpers::*;
@@ -32,6 +33,24 @@ async fn query_ids(sql: &ShardQueryEngine, query: &str) -> Vec<String> {
         .sql(query)
         .await
         .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+    extract_string_column(&batches, 0)
+}
+
+// Helper to run SQL query with positional bind parameters and collect results
+async fn query_ids_with_positional_params(
+    sql: &ShardQueryEngine,
+    query: &str,
+    params: Vec<ScalarValue>,
+) -> Vec<String> {
+    let batches = sql
+        .sql(query)
+        .await
+        .expect("sql")
+        .with_param_values(params)
+        .expect("bind params")
         .collect()
         .await
         .expect("collect");
@@ -133,6 +152,48 @@ async fn sql_exact_id_match() {
     let got = query_ids(&sql, "SELECT id FROM jobs WHERE tenant = '-' AND id = 'b1'").await;
 
     assert_eq!(got, vec!["b1"]);
+}
+
+#[silo::test]
+async fn sql_bind_positional_parameter_exact_id() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    for id in ["a1", "b1", "c1"] {
+        enqueue_job(&shard, id, 5, now).await;
+    }
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let got = query_ids_with_positional_params(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant = '-' AND id = $1 ORDER BY id",
+        vec![ScalarValue::Utf8(Some("b1".to_string()))],
+    )
+    .await;
+
+    assert_eq!(got, vec!["b1"]);
+}
+
+#[silo::test]
+async fn sql_bind_parameter_missing_value_errors() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    enqueue_job(&shard, "a1", 5, now).await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let err = sql
+        .sql("SELECT id FROM jobs WHERE tenant = '-' AND id = $1")
+        .await
+        .expect("sql")
+        .with_param_values(Vec::<ScalarValue>::new())
+        .expect_err("missing parameter should fail");
+
+    assert!(
+        err.to_string()
+            .contains("No value found for placeholder with id $1"),
+        "unexpected error: {}",
+        err
+    );
 }
 
 #[silo::test]

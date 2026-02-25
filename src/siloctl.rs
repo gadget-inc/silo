@@ -433,6 +433,7 @@ pub async fn query<W: Write>(
             shard: shard.to_string(),
             sql: sql.to_string(),
             tenant: opts.tenant.clone(),
+            parameters: vec![],
         })
         .await?
         .into_inner();

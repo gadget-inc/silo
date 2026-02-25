@@ -350,12 +350,28 @@ message HeartbeatResponse {
   optional int64 cancelled_at_ms = 2; // Unix timestamp (ms) when cancellation was requested, if cancelled.
 }
 
+message QueryNull {}
+
+// A single bind parameter value for SQL query placeholders.
+message QueryParameter {
+  oneof value {
+    bool bool_value = 1;
+    int64 int64_value = 2;
+    uint64 uint64_value = 3;
+    double float64_value = 4;
+    string string_value = 5;
+    bytes bytes_value = 6;
+    QueryNull null_value = 7;
+  }
+}
+
 // Request to execute an arbitrary SQL query against shard data.
 // Useful for ad-hoc inspection and debugging.
 message QueryRequest {
   string shard = 1;          // Shard ID (UUID) to query.
   string sql = 2;            // SQL query string.
   optional string tenant = 3; // Tenant ID to scope results, if multi-tenancy is enabled.
+  repeated QueryParameter parameters = 4; // Optional SQL bind parameters (`$1`, `$2`, ...).
 }
 
 // Metadata about a column in query results.
@@ -377,6 +393,7 @@ message QueryArrowRequest {
   string shard = 1;          // Shard ID (UUID) to query.
   string sql = 2;            // SQL query string.
   optional string tenant = 3; // Tenant ID to scope results, if multi-tenancy is enabled.
+  repeated QueryParameter parameters = 4; // Optional SQL bind parameters (`$1`, `$2`, ...).
 }
 
 // Arrow IPC encoded message. Part of a streaming response.

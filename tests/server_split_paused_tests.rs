@@ -374,6 +374,7 @@ async fn query_returns_unavailable_when_shard_paused() {
     let req = Request::new(QueryRequest {
         shard: shard_id.to_string(),
         tenant: None,
+        parameters: vec![],
         sql: "SELECT * FROM jobs LIMIT 10".to_string(),
     });
 
@@ -393,6 +394,7 @@ async fn query_returns_unavailable_when_shard_paused() {
     let req = Request::new(QueryRequest {
         shard: shard_id.to_string(),
         tenant: None,
+        parameters: vec![],
         sql: "SELECT * FROM jobs LIMIT 10".to_string(),
     });
 

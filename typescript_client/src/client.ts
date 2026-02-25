@@ -5,7 +5,14 @@ import type { RpcInterceptor, RpcOptions } from "@protobuf-ts/runtime-rpc";
 import { RpcError } from "@protobuf-ts/runtime-rpc";
 import { pack, unpack } from "msgpackr";
 import { SiloClient } from "./pb/silo.client";
-import type { Limit, SerializedBytes, RetryPolicy, Task, ShardOwner } from "./pb/silo";
+import type {
+  Limit,
+  QueryParameter,
+  SerializedBytes,
+  RetryPolicy,
+  Task,
+  ShardOwner,
+} from "./pb/silo";
 import {
   GubernatorAlgorithm,
   GubernatorBehavior,
@@ -309,6 +316,9 @@ export interface QueryResult<Row = Record<string, unknown>> {
   /** Total number of rows returned */
   rowCount: number;
 }
+
+/** Supported bind parameter value types for SQL query placeholders (`$1`, `$2`, ...). */
+export type QueryBindParameter = string | number | bigint | boolean | Uint8Array | null;
 
 /** gRPC metadata key for shard owner address on redirect */
 const SHARD_OWNER_ADDR_METADATA_KEY = "x-silo-shard-owner-addr";
@@ -618,6 +628,47 @@ function toProtoLimit(limit: JobLimit): Limit {
       },
     };
   }
+}
+
+function toProtoQueryParameter(value: QueryBindParameter): QueryParameter {
+  if (value === null) {
+    return { value: { oneofKind: "nullValue", nullValue: {} } };
+  }
+  if (typeof value === "boolean") {
+    return { value: { oneofKind: "boolValue", boolValue: value } };
+  }
+  if (typeof value === "bigint") {
+    return { value: { oneofKind: "int64Value", int64Value: value } };
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new Error("query bind parameter numbers must be finite");
+    }
+    if (Number.isInteger(value)) {
+      if (!Number.isSafeInteger(value)) {
+        throw new Error(
+          "query bind integer parameters must be safe integers; use bigint for larger values",
+        );
+      }
+      return { value: { oneofKind: "int64Value", int64Value: BigInt(value) } };
+    }
+    return { value: { oneofKind: "float64Value", float64Value: value } };
+  }
+  if (typeof value === "string") {
+    return { value: { oneofKind: "stringValue", stringValue: value } };
+  }
+  if (value instanceof Uint8Array) {
+    return { value: { oneofKind: "bytesValue", bytesValue: value } };
+  }
+
+  throw new Error(`unsupported query bind parameter type: ${typeof value}`);
+}
+
+function toProtoQueryParameters(parameters?: QueryBindParameter[]): QueryParameter[] {
+  if (!parameters || parameters.length === 0) {
+    return [];
+  }
+  return parameters.map((p) => toProtoQueryParameter(p));
 }
 
 /**
@@ -1947,11 +1998,13 @@ export class SiloGRPCClient {
    * Execute a SQL query against the shard data.
    * @param sql    The SQL query to execute.
    * @param tenant Tenant ID for routing to the correct shard. Uses default tenant if not provided.
+   * @param parameters Optional positional bind parameters for `$1`, `$2`, ... placeholders.
    * @returns The query results with deserialized rows.
    */
   public async query<Row = Record<string, unknown>>(
     sql: string,
     tenant?: string,
+    parameters?: QueryBindParameter[],
   ): Promise<QueryResult<Row>> {
     try {
       return await this._withWrongShardRetry(tenant, async (client, shard) => {
@@ -1960,6 +2013,7 @@ export class SiloGRPCClient {
             shard,
             sql,
             tenant,
+            parameters: toProtoQueryParameters(parameters),
           },
           this._rpcOptions(),
         );

@@ -727,6 +727,33 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       expect(typeof row.id).toBe("string");
     });
 
+    it("queries with positional bind parameters", async () => {
+      const tenant = "query-bind-tenant";
+      const targetId = `query-bind-${Date.now()}`;
+
+      await client.enqueue({
+        tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
+        id: targetId,
+        payload: { test: "bind-target" },
+      });
+      await client.enqueue({
+        tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
+        id: `${targetId}-other`,
+        payload: { test: "bind-other" },
+      });
+
+      const result = await client.query<{ id: string }>(
+        "SELECT id FROM jobs WHERE tenant = $1 AND id = $2",
+        tenant,
+        [tenant, targetId],
+      );
+
+      expect(result.rowCount).toBe(1);
+      expect(result.rows[0]?.id).toBe(targetId);
+    });
+
     it("queries with WHERE clause", async () => {
       const tenant = "query-where-tenant";
 

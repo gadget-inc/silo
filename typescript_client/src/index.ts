@@ -49,6 +49,7 @@ export {
   type ShardInfoWithRange,
   type QueryResult,
   type QueryColumnInfo,
+  type QueryBindParameter,
 } from "./client";
 export {
   SiloWorker,
