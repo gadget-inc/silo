@@ -1615,6 +1615,7 @@ pub async fn verify_server_invariants(
             shard: shard.to_string(),
             sql: job_status_query.to_string(),
             tenant: None,
+            parameters: vec![],
         }))
         .await
     {
@@ -1650,6 +1651,7 @@ pub async fn verify_server_invariants(
             shard: shard.to_string(),
             sql: holder_query.to_string(),
             tenant: None,
+            parameters: vec![],
         }))
         .await
     {
@@ -1682,6 +1684,7 @@ pub async fn verify_server_invariants(
             shard: shard.to_string(),
             sql: requester_query.to_string(),
             tenant: None,
+            parameters: vec![],
         }))
         .await
     {
@@ -1721,6 +1724,7 @@ pub async fn verify_server_invariants(
             shard: shard.to_string(),
             sql: terminal_with_holders_query.to_string(),
             tenant: None,
+            parameters: vec![],
         }))
         .await
     {

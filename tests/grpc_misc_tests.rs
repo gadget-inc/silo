@@ -415,6 +415,7 @@ async fn grpc_server_reset_shards_works_in_dev_mode() -> anyhow::Result<()> {
                 shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
                 tenant: None,
+                parameters: vec![],
             })
             .await?
             .into_inner();
@@ -435,6 +436,7 @@ async fn grpc_server_reset_shards_works_in_dev_mode() -> anyhow::Result<()> {
                 shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
                 tenant: None,
+                parameters: vec![],
             })
             .await?
             .into_inner();
@@ -782,6 +784,7 @@ async fn grpc_server_reset_shards_clears_fs_backend_data() -> anyhow::Result<()>
                 shard: test_shard_id.to_string(),
                 sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
                 tenant: None,
+                parameters: vec![],
             })
             .await?
             .into_inner();
@@ -848,6 +851,7 @@ async fn grpc_server_reset_shards_clears_fs_backend_data() -> anyhow::Result<()>
                 shard: test_shard_id.to_string(),
                 sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
                 tenant: None,
+                parameters: vec![],
             })
             .await?
             .into_inner();
@@ -868,6 +872,7 @@ async fn grpc_server_reset_shards_clears_fs_backend_data() -> anyhow::Result<()>
                 shard: test_shard_id.to_string(),
                 sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
                 tenant: None,
+                parameters: vec![],
             })
             .await?
             .into_inner();
@@ -963,6 +968,7 @@ async fn grpc_server_reset_shards_with_relative_path() -> anyhow::Result<()> {
                 shard: test_shard_id.to_string(),
                 sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
                 tenant: None,
+                parameters: vec![],
             })
             .await?
             .into_inner();
@@ -995,6 +1001,7 @@ async fn grpc_server_reset_shards_with_relative_path() -> anyhow::Result<()> {
                 shard: test_shard_id.to_string(),
                 sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
                 tenant: None,
+                parameters: vec![],
             })
             .await?
             .into_inner();
@@ -1090,6 +1097,7 @@ async fn grpc_server_reset_shards_clears_memory_backend_data() -> anyhow::Result
                 shard: test_shard_id.to_string(),
                 sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
                 tenant: None,
+                parameters: vec![],
             })
             .await?
             .into_inner();
@@ -1110,6 +1118,7 @@ async fn grpc_server_reset_shards_clears_memory_backend_data() -> anyhow::Result
                 shard: test_shard_id.to_string(),
                 sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
                 tenant: None,
+                parameters: vec![],
             })
             .await?
             .into_inner();
@@ -1282,6 +1291,7 @@ async fn grpc_server_reset_shards_immediately_available_production_path() -> any
                 shard: shard_id.clone(),
                 sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
                 tenant: None,
+                parameters: vec![],
             })
             .await?
             .into_inner();
@@ -1378,6 +1388,7 @@ async fn grpc_server_reset_shards_multiple_resets_immediately_available() -> any
                     shard: shard_id.clone(),
                     sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
                     tenant: None,
+                    parameters: vec![],
                 })
                 .await?
                 .into_inner();

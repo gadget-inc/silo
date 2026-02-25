@@ -11,6 +11,18 @@ fn config_with_statement_timeout_ms(timeout_ms: u64) -> AppConfig {
     config
 }
 
+fn query_param_string(value: &str) -> QueryParameter {
+    QueryParameter {
+        value: Some(query_parameter::Value::StringValue(value.to_string())),
+    }
+}
+
+fn query_param_int64(value: i64) -> QueryParameter {
+    QueryParameter {
+        value: Some(query_parameter::Value::Int64Value(value)),
+    }
+}
+
 async fn enqueue_jobs_for_heavy_query(
     client: &mut SiloClient<tonic::transport::Channel>,
     count: usize,
@@ -72,6 +84,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
                 shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: "SELECT * FROM jobs".to_string(),
                 tenant: None,
+                parameters: vec![],
             })
             .await?
             .into_inner();
@@ -100,6 +113,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
                 shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: "SELECT id FROM jobs WHERE priority >= 10".to_string(),
                 tenant: None,
+                parameters: vec![],
             })
             .await?
             .into_inner();
@@ -115,6 +129,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
                 shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
                 tenant: None,
+                parameters: vec![],
             })
             .await?
             .into_inner();
@@ -159,6 +174,7 @@ async fn grpc_server_query_statement_timeout_aborts_execution() -> anyhow::Resul
                 shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: heavy_query.to_string(),
                 tenant: None,
+                parameters: vec![],
             })
             .await;
 
@@ -180,6 +196,7 @@ async fn grpc_server_query_statement_timeout_aborts_execution() -> anyhow::Resul
                 shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: "SELECT COUNT(*) as count FROM jobs".to_string(),
                 tenant: None,
+                parameters: vec![],
             })
             .await?
             .into_inner();
@@ -216,6 +233,7 @@ async fn grpc_server_query_arrow_statement_timeout() -> anyhow::Result<()> {
                 shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: heavy_query.to_string(),
                 tenant: None,
+                parameters: vec![],
             })
             .await;
 
@@ -252,6 +270,7 @@ async fn grpc_server_query_errors() -> anyhow::Result<()> {
                 shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: "SELECT FROM WHERE".to_string(),
                 tenant: None,
+                parameters: vec![],
             })
             .await;
 
@@ -273,6 +292,7 @@ async fn grpc_server_query_errors() -> anyhow::Result<()> {
                 shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: "SELECT nonexistent_column FROM jobs".to_string(),
                 tenant: None,
+                parameters: vec![],
             })
             .await;
 
@@ -289,6 +309,7 @@ async fn grpc_server_query_errors() -> anyhow::Result<()> {
                 shard: "99999999-9999-9999-9999-999999999999".to_string(),
                 sql: "SELECT * FROM jobs".to_string(),
                 tenant: None,
+                parameters: vec![],
             })
             .await;
 
@@ -298,6 +319,116 @@ async fn grpc_server_query_errors() -> anyhow::Result<()> {
                 assert_eq!(status.code(), tonic::Code::NotFound);
             }
         }
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_query_bind_parameters_positional() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        for i in 0..3 {
+            let payload_bytes = rmp_serde::to_vec(&serde_json::json!({ "index": i })).unwrap();
+            let enq = EnqueueRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                id: format!("job{}", i),
+                priority: (10 + i) as u32,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(payload_bytes)),
+                }),
+                limits: vec![],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
+            };
+            let _ = client.enqueue(enq).await?;
+        }
+
+        let response = client
+            .query(QueryRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                sql: "SELECT id FROM jobs WHERE tenant = $1 AND priority >= $2 ORDER BY id"
+                    .to_string(),
+                tenant: None,
+                parameters: vec![query_param_string("-"), query_param_int64(11)],
+            })
+            .await?
+            .into_inner();
+        assert_eq!(response.row_count, 2);
+        let ids: Vec<String> = response
+            .rows
+            .iter()
+            .map(|row| {
+                let json: serde_json::Value = rmp_serde::from_slice(match &row.encoding {
+                    Some(serialized_bytes::Encoding::Msgpack(data)) => data,
+                    None => panic!("expected msgpack encoding"),
+                })
+                .expect("decode row");
+                json["id"].as_str().expect("row id string").to_string()
+            })
+            .collect();
+        assert_eq!(ids, vec!["job1", "job2"]);
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_query_bind_parameter_errors() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        let missing_value_err = client
+            .query(QueryRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                sql: "SELECT id FROM jobs WHERE id = $1".to_string(),
+                tenant: None,
+                parameters: vec![QueryParameter { value: None }],
+            })
+            .await
+            .expect_err("expected missing value error");
+        assert_eq!(missing_value_err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            missing_value_err
+                .message()
+                .contains("query parameter is missing a value"),
+            "unexpected error: {}",
+            missing_value_err.message()
+        );
+
+        let too_few_values_err = client
+            .query(QueryRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                sql: "SELECT id FROM jobs WHERE id = $2".to_string(),
+                tenant: None,
+                parameters: vec![query_param_string("job1")],
+            })
+            .await
+            .expect_err("expected missing positional parameter");
+        assert_eq!(too_few_values_err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            too_few_values_err
+                .message()
+                .contains("No value found for placeholder with id $2"),
+            "unexpected error: {}",
+            too_few_values_err.message()
+        );
 
         shutdown_server(shutdown_tx, server).await?;
         Ok::<(), anyhow::Error>(())
@@ -320,6 +451,7 @@ async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
                 shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: "SELECT * FROM jobs".to_string(),
                 tenant: None,
+                parameters: vec![],
             })
             .await?
             .into_inner();
@@ -352,6 +484,7 @@ async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
                 shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: "SELECT * FROM jobs WHERE id = 'nonexistent'".to_string(),
                 tenant: None,
+                parameters: vec![],
             })
             .await?
             .into_inner();
@@ -409,6 +542,7 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
                 shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: "SELECT id, priority, enqueue_time_ms, payload FROM jobs".to_string(),
                 tenant: None,
+                parameters: vec![],
             })
             .await?
             .into_inner();
@@ -490,7 +624,8 @@ async fn grpc_server_query_without_tenant() -> anyhow::Result<()> {
             .query(QueryRequest {
                 shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: "SELECT id FROM jobs ORDER BY id".to_string(),
-                tenant: None, // No tenant required for query
+                tenant: None,
+                parameters: vec![], // No tenant required for query
             })
             .await?
             .into_inner();
@@ -507,6 +642,7 @@ async fn grpc_server_query_without_tenant() -> anyhow::Result<()> {
                 shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: "SELECT id FROM jobs WHERE tenant = '-' ORDER BY id".to_string(),
                 tenant: None,
+                parameters: vec![],
             })
             .await?
             .into_inner();
@@ -576,6 +712,7 @@ async fn grpc_server_query_msgpack_data_types() -> anyhow::Result<()> {
                 "#
                 .to_string(),
                 tenant: None,
+                parameters: vec![],
             })
             .await?
             .into_inner();
@@ -636,6 +773,7 @@ async fn grpc_server_query_msgpack_data_types() -> anyhow::Result<()> {
                 "#
                 .to_string(),
                 tenant: None,
+                parameters: vec![],
             })
             .await?
             .into_inner();
@@ -651,6 +789,64 @@ async fn grpc_server_query_msgpack_data_types() -> anyhow::Result<()> {
         assert!((agg_row["avg_val"].as_f64().unwrap() - 49.666).abs() < 0.01); // AVG returns Float64
         assert_eq!(agg_row["min_val"], 0);
         assert_eq!(agg_row["max_val"], 99);
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// Test that QueryArrow endpoint supports SQL bind parameters.
+/// This validates bind parameter handling for the Arrow IPC streaming path.
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_query_arrow_with_bind_parameters() -> anyhow::Result<()> {
+    use tokio_stream::StreamExt;
+
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        let empty_payload = rmp_serde::to_vec(&serde_json::json!({})).unwrap();
+        for i in 0..2 {
+            let enq = EnqueueRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                id: format!("arrow_bind_job{}", i),
+                priority: 10,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(empty_payload.clone())),
+                }),
+                limits: vec![],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
+            };
+            let _ = client.enqueue(enq).await?;
+        }
+
+        let response = client
+            .query_arrow(QueryArrowRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                sql: "SELECT id FROM jobs WHERE id = $1".to_string(),
+                tenant: None,
+                parameters: vec![query_param_string("arrow_bind_job1")],
+            })
+            .await?;
+
+        let mut stream = response.into_inner();
+        let mut total_messages = 0;
+        while let Some(msg) = stream.next().await {
+            let _arrow_msg = msg?;
+            total_messages += 1;
+        }
+        assert!(
+            total_messages >= 1,
+            "expected at least one Arrow IPC message"
+        );
 
         shutdown_server(shutdown_tx, server).await?;
         Ok::<(), anyhow::Error>(())
@@ -696,7 +892,8 @@ async fn grpc_server_query_arrow_without_tenant() -> anyhow::Result<()> {
             .query_arrow(QueryArrowRequest {
                 shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: "SELECT id FROM jobs ORDER BY id".to_string(),
-                tenant: None, // No tenant required
+                tenant: None,
+                parameters: vec![], // No tenant required
             })
             .await?;
 

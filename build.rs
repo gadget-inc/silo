@@ -44,6 +44,8 @@ fn main() {
         .arg(out_dir.as_os_str())
         .arg("schema/internal_storage.fbs")
         .status()
-        .expect("failed to run flatc - ensure flatbuffers is installed (available via nix devshell)");
+        .expect(
+            "failed to run flatc - ensure flatbuffers is installed (available via nix devshell)",
+        );
     assert!(flatc_status.success(), "flatc failed to compile schema");
 }

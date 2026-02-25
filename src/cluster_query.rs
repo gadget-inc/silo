@@ -618,6 +618,7 @@ async fn query_remote_shard_batches(
             shard: shard_id.to_string(),
             sql: sql.clone(),
             tenant: None,
+            parameters: vec![],
         };
 
         let response = match client.query_arrow(request).await {

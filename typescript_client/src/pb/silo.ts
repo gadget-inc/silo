@@ -933,6 +933,66 @@ export interface HeartbeatResponse {
     cancelledAtMs?: bigint; // Unix timestamp (ms) when cancellation was requested, if cancelled.
 }
 /**
+ * @generated from protobuf message silo.v1.QueryNull
+ */
+export interface QueryNull {
+}
+/**
+ * A single bind parameter value for SQL query placeholders.
+ *
+ * @generated from protobuf message silo.v1.QueryParameter
+ */
+export interface QueryParameter {
+    /**
+     * @generated from protobuf oneof: value
+     */
+    value: {
+        oneofKind: "boolValue";
+        /**
+         * @generated from protobuf field: bool bool_value = 1
+         */
+        boolValue: boolean;
+    } | {
+        oneofKind: "int64Value";
+        /**
+         * @generated from protobuf field: int64 int64_value = 2
+         */
+        int64Value: bigint;
+    } | {
+        oneofKind: "uint64Value";
+        /**
+         * @generated from protobuf field: uint64 uint64_value = 3
+         */
+        uint64Value: bigint;
+    } | {
+        oneofKind: "float64Value";
+        /**
+         * @generated from protobuf field: double float64_value = 4
+         */
+        float64Value: number;
+    } | {
+        oneofKind: "stringValue";
+        /**
+         * @generated from protobuf field: string string_value = 5
+         */
+        stringValue: string;
+    } | {
+        oneofKind: "bytesValue";
+        /**
+         * @generated from protobuf field: bytes bytes_value = 6
+         */
+        bytesValue: Uint8Array;
+    } | {
+        oneofKind: "nullValue";
+        /**
+         * @generated from protobuf field: silo.v1.QueryNull null_value = 7
+         */
+        nullValue: QueryNull;
+    } | {
+        oneofKind: undefined;
+    };
+}
+/**
  * Request to execute an arbitrary SQL query against shard data.
  * Useful for ad-hoc inspection and debugging.
  *
@@ -951,6 +1011,10 @@ export interface QueryRequest {
      * @generated from protobuf field: optional string tenant = 3
      */
     tenant?: string; // Tenant ID to scope results, if multi-tenancy is enabled.
+    /**
+     * @generated from protobuf field: repeated silo.v1.QueryParameter parameters = 4
+     */
+    parameters: QueryParameter[]; // Optional SQL bind parameters (`$1`, `$2`, ...).
 }
 /**
  * Metadata about a column in query results.
@@ -1005,6 +1069,10 @@ export interface QueryArrowRequest {
      * @generated from protobuf field: optional string tenant = 3
      */
     tenant?: string; // Tenant ID to scope results, if multi-tenancy is enabled.
+    /**
+     * @generated from protobuf field: repeated silo.v1.QueryParameter parameters = 4
+     */
+    parameters: QueryParameter[]; // Optional SQL bind parameters (`$1`, `$2`, ...).
 }
 /**
  * Arrow IPC encoded message. Part of a streaming response.
@@ -4365,18 +4433,168 @@ class HeartbeatResponse$Type extends MessageType<HeartbeatResponse> {
  */
 export const HeartbeatResponse = new HeartbeatResponse$Type();
 // @generated message type with reflection information, may provide speed optimized methods
+class QueryNull$Type extends MessageType<QueryNull> {
+    constructor() {
+        super("silo.v1.QueryNull", []);
+    }
+    create(value?: PartialMessage<QueryNull>): QueryNull {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        if (value !== undefined)
+            reflectionMergePartial<QueryNull>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: QueryNull): QueryNull {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: QueryNull, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.QueryNull
+ */
+export const QueryNull = new QueryNull$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class QueryParameter$Type extends MessageType<QueryParameter> {
+    constructor() {
+        super("silo.v1.QueryParameter", [
+            { no: 1, name: "bool_value", kind: "scalar", oneof: "value", T: 8 /*ScalarType.BOOL*/ },
+            { no: 2, name: "int64_value", kind: "scalar", oneof: "value", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 3, name: "uint64_value", kind: "scalar", oneof: "value", T: 4 /*ScalarType.UINT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 4, name: "float64_value", kind: "scalar", oneof: "value", T: 1 /*ScalarType.DOUBLE*/ },
+            { no: 5, name: "string_value", kind: "scalar", oneof: "value", T: 9 /*ScalarType.STRING*/ },
+            { no: 6, name: "bytes_value", kind: "scalar", oneof: "value", T: 12 /*ScalarType.BYTES*/ },
+            { no: 7, name: "null_value", kind: "message", oneof: "value", T: () => QueryNull }
+        ]);
+    }
+    create(value?: PartialMessage<QueryParameter>): QueryParameter {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.value = { oneofKind: undefined };
+        if (value !== undefined)
+            reflectionMergePartial<QueryParameter>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: QueryParameter): QueryParameter {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* bool bool_value */ 1:
+                    message.value = {
+                        oneofKind: "boolValue",
+                        boolValue: reader.bool()
+                    };
+                    break;
+                case /* int64 int64_value */ 2:
+                    message.value = {
+                        oneofKind: "int64Value",
+                        int64Value: reader.int64().toBigInt()
+                    };
+                    break;
+                case /* uint64 uint64_value */ 3:
+                    message.value = {
+                        oneofKind: "uint64Value",
+                        uint64Value: reader.uint64().toBigInt()
+                    };
+                    break;
+                case /* double float64_value */ 4:
+                    message.value = {
+                        oneofKind: "float64Value",
+                        float64Value: reader.double()
+                    };
+                    break;
+                case /* string string_value */ 5:
+                    message.value = {
+                        oneofKind: "stringValue",
+                        stringValue: reader.string()
+                    };
+                    break;
+                case /* bytes bytes_value */ 6:
+                    message.value = {
+                        oneofKind: "bytesValue",
+                        bytesValue: reader.bytes()
+                    };
+                    break;
+                case /* silo.v1.QueryNull null_value */ 7:
+                    message.value = {
+                        oneofKind: "nullValue",
+                        nullValue: QueryNull.internalBinaryRead(reader, reader.uint32(), options, (message.value as any).nullValue)
+                    };
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: QueryParameter, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* bool bool_value = 1; */
+        if (message.value.oneofKind === "boolValue")
+            writer.tag(1, WireType.Varint).bool(message.value.boolValue);
+        /* int64 int64_value = 2; */
+        if (message.value.oneofKind === "int64Value")
+            writer.tag(2, WireType.Varint).int64(message.value.int64Value);
+        /* uint64 uint64_value = 3; */
+        if (message.value.oneofKind === "uint64Value")
+            writer.tag(3, WireType.Varint).uint64(message.value.uint64Value);
+        /* double float64_value = 4; */
+        if (message.value.oneofKind === "float64Value")
+            writer.tag(4, WireType.Bit64).double(message.value.float64Value);
+        /* string string_value = 5; */
+        if (message.value.oneofKind === "stringValue")
+            writer.tag(5, WireType.LengthDelimited).string(message.value.stringValue);
+        /* bytes bytes_value = 6; */
+        if (message.value.oneofKind === "bytesValue")
+            writer.tag(6, WireType.LengthDelimited).bytes(message.value.bytesValue);
+        /* silo.v1.QueryNull null_value = 7; */
+        if (message.value.oneofKind === "nullValue")
+            QueryNull.internalBinaryWrite(message.value.nullValue, writer.tag(7, WireType.LengthDelimited).fork(), options).join();
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.QueryParameter
+ */
+export const QueryParameter = new QueryParameter$Type();
+// @generated message type with reflection information, may provide speed optimized methods
 class QueryRequest$Type extends MessageType<QueryRequest> {
     constructor() {
         super("silo.v1.QueryRequest", [
             { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
             { no: 2, name: "sql", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
-            { no: 3, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ }
+            { no: 3, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
+            { no: 4, name: "parameters", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => QueryParameter }
         ]);
     }
     create(value?: PartialMessage<QueryRequest>): QueryRequest {
         const message = globalThis.Object.create((this.messagePrototype!));
         message.shard = "";
         message.sql = "";
+        message.parameters = [];
         if (value !== undefined)
             reflectionMergePartial<QueryRequest>(this, message, value);
         return message;
@@ -4394,6 +4612,9 @@ class QueryRequest$Type extends MessageType<QueryRequest> {
                     break;
                 case /* optional string tenant */ 3:
                     message.tenant = reader.string();
+                    break;
+                case /* repeated silo.v1.QueryParameter parameters */ 4:
+                    message.parameters.push(QueryParameter.internalBinaryRead(reader, reader.uint32(), options));
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -4416,6 +4637,9 @@ class QueryRequest$Type extends MessageType<QueryRequest> {
         /* optional string tenant = 3; */
         if (message.tenant !== undefined)
             writer.tag(3, WireType.LengthDelimited).string(message.tenant);
+        /* repeated silo.v1.QueryParameter parameters = 4; */
+        for (let i = 0; i < message.parameters.length; i++)
+            QueryParameter.internalBinaryWrite(message.parameters[i], writer.tag(4, WireType.LengthDelimited).fork(), options).join();
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -4550,13 +4774,15 @@ class QueryArrowRequest$Type extends MessageType<QueryArrowRequest> {
         super("silo.v1.QueryArrowRequest", [
             { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
             { no: 2, name: "sql", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
-            { no: 3, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ }
+            { no: 3, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
+            { no: 4, name: "parameters", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => QueryParameter }
         ]);
     }
     create(value?: PartialMessage<QueryArrowRequest>): QueryArrowRequest {
         const message = globalThis.Object.create((this.messagePrototype!));
         message.shard = "";
         message.sql = "";
+        message.parameters = [];
         if (value !== undefined)
             reflectionMergePartial<QueryArrowRequest>(this, message, value);
         return message;
@@ -4574,6 +4800,9 @@ class QueryArrowRequest$Type extends MessageType<QueryArrowRequest> {
                     break;
                 case /* optional string tenant */ 3:
                     message.tenant = reader.string();
+                    break;
+                case /* repeated silo.v1.QueryParameter parameters */ 4:
+                    message.parameters.push(QueryParameter.internalBinaryRead(reader, reader.uint32(), options));
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -4596,6 +4825,9 @@ class QueryArrowRequest$Type extends MessageType<QueryArrowRequest> {
         /* optional string tenant = 3; */
         if (message.tenant !== undefined)
             writer.tag(3, WireType.LengthDelimited).string(message.tenant);
+        /* repeated silo.v1.QueryParameter parameters = 4; */
+        for (let i = 0; i < message.parameters.length; i++)
+            QueryParameter.internalBinaryWrite(message.parameters[i], writer.tag(4, WireType.LengthDelimited).fork(), options).join();
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);

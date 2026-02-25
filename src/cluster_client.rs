@@ -461,6 +461,7 @@ impl ClusterClient {
             shard: shard_id.to_string(),
             sql: sql.to_string(),
             tenant: None,
+            parameters: vec![],
         };
 
         let response = match client.query(request).await {
