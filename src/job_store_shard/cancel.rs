@@ -214,7 +214,7 @@ impl JobStoreShard {
     /// all requests for the queue. Falls back to start_time_ms=0 if no requests found
     /// (same pattern as task key reconstruction fallback).
     #[expect(clippy::too_many_arguments)]
-    async fn delete_concurrency_requests_for_job(
+    pub(crate) async fn delete_concurrency_requests_for_job(
         &self,
         txn: &slatedb::DbTransaction,
         tenant: &str,
