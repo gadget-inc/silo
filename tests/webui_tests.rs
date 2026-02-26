@@ -922,6 +922,34 @@ async fn test_shard_detail_page_renders() {
 }
 
 #[silo::test]
+async fn test_shard_split_route_accepts_post() {
+    let (_tmp, state, shard_map) = setup_test_state().await;
+    let shard_id = shard_map.shards()[0].id;
+    let app = create_router(state);
+
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/shard/{}/split", shard_id))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from("split_point=test-tenant"))
+        .expect("build request");
+
+    let response = app.oneshot(request).await.expect("execute request");
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let location = response
+        .headers()
+        .get("location")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        location.starts_with(&format!("/shard?id={}", shard_id)),
+        "expected redirect back to shard detail page, got: {location}"
+    );
+}
+
+#[silo::test]
 async fn test_shard_detail_page_invalid_id() {
     let (_tmp, state, _shard_map) = setup_test_state().await;
 
