@@ -2074,7 +2074,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/tenant", get(tenant_handler))
         .route("/cluster", get(cluster_handler))
         .route("/shard", get(shard_handler))
-        .route("/shard/{id}/split", post(shard_split_handler))
+        .route("/shard/:id/split", post(shard_split_handler))
         .route("/sql", get(sql_handler))
         .route("/sql/execute", get(sql_execute_handler))
         .route("/config", get(config_handler))
