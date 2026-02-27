@@ -1875,7 +1875,6 @@ where
         loop {
             tokio::select! {
                 biased;
-                _ = tick_rx.recv() => { break; }
                 _ = interval.tick() => {
                     let instances = reaper_factory.instances();
 
@@ -1895,6 +1894,7 @@ where
                         }
                     }
                 }
+                _ = tick_rx.recv() => { break; }
             }
         }
     });
