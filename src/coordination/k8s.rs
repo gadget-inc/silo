@@ -342,12 +342,6 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         loop {
             tokio::select! {
                 biased;
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        debug!(node_id = %self.base.node_id, "membership watcher shutting down");
-                        break;
-                    }
-                }
                 event = watch_stream.next() => {
                     match event {
                         Some(Ok(ev)) => {
@@ -391,6 +385,12 @@ impl<B: K8sBackend> K8sCoordinator<B> {
                         }
                     }
                 }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        debug!(node_id = %self.base.node_id, "membership watcher shutting down");
+                        break;
+                    }
+                }
             }
         }
     }
@@ -406,12 +406,6 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         loop {
             tokio::select! {
                 biased;
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        debug!(node_id = %self.base.node_id, "shard map watcher shutting down");
-                        break;
-                    }
-                }
                 event = watch_stream.next() => {
                     match event {
                         Some(Ok(ev)) => {
@@ -450,6 +444,12 @@ impl<B: K8sBackend> K8sCoordinator<B> {
                         }
                     }
                 }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        debug!(node_id = %self.base.node_id, "shard map watcher shutting down");
+                        break;
+                    }
+                }
             }
         }
     }
@@ -478,12 +478,6 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         loop {
             tokio::select! {
                 biased;
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        debug!(node_id = %self.base.node_id, "shard lease watcher shutting down");
-                        break;
-                    }
-                }
                 event = watch_stream.next() => {
                     match event {
                         Some(Ok(ev)) => {
@@ -553,6 +547,12 @@ impl<B: K8sBackend> K8sCoordinator<B> {
                         }
                     }
                 }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        debug!(node_id = %self.base.node_id, "shard lease watcher shutting down");
+                        break;
+                    }
+                }
             }
         }
     }
@@ -586,12 +586,6 @@ impl<B: K8sBackend> K8sCoordinator<B> {
             tokio::select! {
                 biased;
 
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        debug!(node_id = %self.base.node_id, "coordination loop shutting down");
-                        break;
-                    }
-                }
                 // React to membership changes from the watcher (primary path)
                 _ = self.membership_changed.notified() => {
                     info!(node_id = %self.base.node_id, "membership changed, reconciling shards");
@@ -621,6 +615,12 @@ impl<B: K8sBackend> K8sCoordinator<B> {
                     }
                     if let Err(e) = self.reconcile_shards().await {
                         warn!(node_id = %self.base.node_id, error = %e, "periodic safety reconcile failed");
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        debug!(node_id = %self.base.node_id, "coordination loop shutting down");
+                        break;
                     }
                 }
             }

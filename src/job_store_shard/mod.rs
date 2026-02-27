@@ -405,18 +405,18 @@ impl JobStoreShard {
             loop {
                 tokio::select! {
                     biased;
+                    _ = interval.tick() => {
+                        shard
+                            .concurrency
+                            .reconcile_pending_requests(shard.db.as_ref(), &range)
+                            .await;
+                    }
                     _ = cancellation.cancelled() => {
                         tracing::debug!(
                             shard = %shard_name,
                             "stopping periodic concurrency reconciliation (shard closing)"
                         );
                         break;
-                    }
-                    _ = interval.tick() => {
-                        shard
-                            .concurrency
-                            .reconcile_pending_requests(shard.db.as_ref(), &range)
-                            .await;
                     }
                 }
             }

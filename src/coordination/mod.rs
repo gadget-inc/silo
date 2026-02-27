@@ -289,8 +289,8 @@ impl<T> ShardGuardContext<T> {
         let mut shutdown_rx = self.shutdown.clone();
         tokio::select! {
             biased;
-            _ = shutdown_rx.changed() => {}
             _ = self.notify.notified() => {}
+            _ = shutdown_rx.changed() => {}
         }
     }
 
