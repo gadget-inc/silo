@@ -288,8 +288,9 @@ impl<T> ShardGuardContext<T> {
     pub async fn wait_for_change(&self) {
         let mut shutdown_rx = self.shutdown.clone();
         tokio::select! {
-            _ = self.notify.notified() => {}
+            biased;
             _ = shutdown_rx.changed() => {}
+            _ = self.notify.notified() => {}
         }
     }
 

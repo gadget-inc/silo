@@ -36,7 +36,7 @@
 //!   request from a restart or retry is still in the DB. Since Cancelled is terminal,
 //!   this also catches any stale cancelled requests.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -342,7 +342,8 @@ pub struct ConcurrencyManager {
     counts: ConcurrencyCounts,
     /// Pending grant counts per queue. Key: concurrency_counts_key(tenant, queue).
     /// Value: (tenant, queue, count). Lock held only briefly for increment/drain.
-    pending_grants: Mutex<HashMap<Vec<u8>, (String, String, u32)>>,
+    /// BTreeMap ensures deterministic iteration order for DST reproducibility.
+    pending_grants: Mutex<BTreeMap<Vec<u8>, (String, String, u32)>>,
     grant_notify: tokio::sync::Notify,
     grant_running: AtomicBool,
 }
@@ -357,7 +358,7 @@ impl ConcurrencyManager {
     pub fn new() -> Self {
         Self {
             counts: ConcurrencyCounts::new(),
-            pending_grants: Mutex::new(HashMap::new()),
+            pending_grants: Mutex::new(BTreeMap::new()),
             grant_notify: tokio::sync::Notify::new(),
             grant_running: AtomicBool::new(false),
         }
@@ -644,7 +645,7 @@ impl ConcurrencyManager {
         };
 
         // Count pending requests per (tenant, queue)
-        let mut queue_counts: HashMap<Vec<u8>, (String, String, u32)> = HashMap::new();
+        let mut queue_counts: BTreeMap<Vec<u8>, (String, String, u32)> = BTreeMap::new();
         loop {
             let kv = match iter.next().await {
                 Ok(Some(kv)) => kv,

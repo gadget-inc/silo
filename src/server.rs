@@ -1874,6 +1874,8 @@ where
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
         loop {
             tokio::select! {
+                biased;
+                _ = tick_rx.recv() => { break; }
                 _ = interval.tick() => {
                     let instances = reaper_factory.instances();
 
@@ -1893,7 +1895,6 @@ where
                         }
                     }
                 }
-                _ = tick_rx.recv() => { break; }
             }
         }
     });

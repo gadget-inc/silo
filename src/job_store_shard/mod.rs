@@ -404,6 +404,7 @@ impl JobStoreShard {
 
             loop {
                 tokio::select! {
+                    biased;
                     _ = cancellation.cancelled() => {
                         tracing::debug!(
                             shard = %shard_name,
