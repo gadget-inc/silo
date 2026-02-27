@@ -510,6 +510,8 @@ export interface Job<Payload = unknown, Result = unknown> {
   nextAttemptStartsAfterMs?: bigint;
   /** Task group the job belongs to */
   taskGroup: string;
+  /** Result data from the last attempt, if the job succeeded */
+  result?: Result;
 }
 
 /** Possible job statuses */
@@ -1544,6 +1546,14 @@ export class SiloGRPCClient {
             response.attempts.length > 0 ? response.attempts.map(protoAttemptToPublic) : undefined,
           nextAttemptStartsAfterMs: response.nextAttemptStartsAfterMs,
           taskGroup: response.taskGroup,
+          result: response.result
+            ? decodeBytes(
+                response.result.encoding.oneofKind === "msgpack"
+                  ? response.result.encoding.msgpack
+                  : undefined,
+                "result",
+              )
+            : undefined,
         };
       });
     } catch (error) {

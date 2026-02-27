@@ -382,6 +382,10 @@ export interface GetJobResponse {
      * @generated from protobuf field: string task_group = 12
      */
     taskGroup: string; // Task group this job's tasks are enqueued into.
+    /**
+     * @generated from protobuf field: optional silo.v1.SerializedBytes result = 13
+     */
+    result?: SerializedBytes; // Result data from the last attempt, if the job succeeded.
 }
 /**
  * Request to get the result of a completed job.
@@ -2569,7 +2573,8 @@ class GetJobResponse$Type extends MessageType<GetJobResponse> {
             { no: 9, name: "status_changed_at_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
             { no: 10, name: "attempts", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => JobAttempt },
             { no: 11, name: "next_attempt_starts_after_ms", kind: "scalar", opt: true, T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
-            { no: 12, name: "task_group", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+            { no: 12, name: "task_group", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 13, name: "result", kind: "message", T: () => SerializedBytes }
         ]);
     }
     create(value?: PartialMessage<GetJobResponse>): GetJobResponse {
@@ -2627,6 +2632,9 @@ class GetJobResponse$Type extends MessageType<GetJobResponse> {
                     break;
                 case /* string task_group */ 12:
                     message.taskGroup = reader.string();
+                    break;
+                case /* optional silo.v1.SerializedBytes result */ 13:
+                    message.result = SerializedBytes.internalBinaryRead(reader, reader.uint32(), options, message.result);
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -2692,6 +2700,9 @@ class GetJobResponse$Type extends MessageType<GetJobResponse> {
         /* string task_group = 12; */
         if (message.taskGroup !== "")
             writer.tag(12, WireType.LengthDelimited).string(message.taskGroup);
+        /* optional silo.v1.SerializedBytes result = 13; */
+        if (message.result)
+            SerializedBytes.internalBinaryWrite(message.result, writer.tag(13, WireType.LengthDelimited).fork(), options).join();
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);

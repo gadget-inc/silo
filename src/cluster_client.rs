@@ -623,6 +623,24 @@ impl ClusterClient {
                 Vec::new()
             };
 
+            // For succeeded jobs, populate the result field
+            let result = if job_status.kind == crate::job::JobStatusKind::Succeeded {
+                if !attempts.is_empty() {
+                    crate::server::result_from_proto_attempts(&attempts)
+                } else {
+                    let latest = shard
+                        .get_latest_job_attempt(tenant, job_id)
+                        .await
+                        .map_err(|e| ClusterClientError::QueryFailed(e.to_string()))?;
+                    latest.and_then(|a| {
+                        let proto = crate::server::job_attempt_view_to_proto(&a);
+                        proto.result
+                    })
+                }
+            } else {
+                None
+            };
+
             return Ok(GetJobResponse {
                 id: job_view.id().to_string(),
                 priority: job_view.priority() as u32,
@@ -644,6 +662,7 @@ impl ClusterClient {
                 attempts,
                 next_attempt_starts_after_ms: job_status.next_attempt_starts_after_ms,
                 task_group: job_view.task_group().to_string(),
+                result,
             });
         }
 

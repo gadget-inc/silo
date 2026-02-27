@@ -1186,3 +1186,261 @@ async fn grpc_lease_tasks_empty_limits() -> anyhow::Result<()> {
     .expect("test timed out")?;
     Ok(())
 }
+
+/// Test that GetJob returns the result field for succeeded jobs without include_attempts
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_get_job_result_field_without_attempts() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        // Enqueue a job
+        let enq = EnqueueRequest {
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+            id: "result_field_no_attempts".to_string(),
+            priority: 10,
+            start_at_ms: 0,
+            retry_policy: None,
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                    rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                )),
+            }),
+            limits: vec![],
+            tenant: None,
+            metadata: std::collections::HashMap::new(),
+            task_group: "default".to_string(),
+        };
+        let _ = client.enqueue(enq).await?;
+
+        // GetJob for a scheduled job should have no result
+        let job = client
+            .get_job(GetJobRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                id: "result_field_no_attempts".to_string(),
+                tenant: None,
+                include_attempts: false,
+            })
+            .await?
+            .into_inner();
+        assert!(job.result.is_none(), "scheduled job should have no result");
+
+        // Lease and complete the task with a result
+        let lease_resp = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: Some(crate::grpc_integration_helpers::TEST_SHARD_ID.to_string()),
+                worker_id: "w1".to_string(),
+                max_tasks: 1,
+                task_group: "default".to_string(),
+            })
+            .await?
+            .into_inner();
+        let task = &lease_resp.tasks[0];
+        let result_data = rmp_serde::to_vec(&serde_json::json!({"answer": 42})).unwrap();
+
+        let _ = client
+            .report_outcome(ReportOutcomeRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                task_id: task.id.clone(),
+                outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(result_data.clone())),
+                })),
+            })
+            .await?;
+
+        // GetJob without include_attempts should still have the result field populated
+        let job = client
+            .get_job(GetJobRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                id: "result_field_no_attempts".to_string(),
+                tenant: None,
+                include_attempts: false,
+            })
+            .await?
+            .into_inner();
+
+        assert_eq!(job.status, JobStatus::Succeeded as i32);
+        assert!(job.attempts.is_empty(), "attempts should not be populated");
+        let result = job.result.expect("succeeded job should have result");
+        let actual_data = match result.encoding {
+            Some(serialized_bytes::Encoding::Msgpack(d)) => d,
+            None => vec![],
+        };
+        assert_eq!(actual_data, result_data);
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// Test that GetJob returns the result field for succeeded jobs with include_attempts
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_get_job_result_field_with_attempts() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        // Enqueue a job
+        let enq = EnqueueRequest {
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+            id: "result_field_with_attempts".to_string(),
+            priority: 10,
+            start_at_ms: 0,
+            retry_policy: None,
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                    rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                )),
+            }),
+            limits: vec![],
+            tenant: None,
+            metadata: std::collections::HashMap::new(),
+            task_group: "default".to_string(),
+        };
+        let _ = client.enqueue(enq).await?;
+
+        // Lease and complete the task
+        let lease_resp = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: Some(crate::grpc_integration_helpers::TEST_SHARD_ID.to_string()),
+                worker_id: "w1".to_string(),
+                max_tasks: 1,
+                task_group: "default".to_string(),
+            })
+            .await?
+            .into_inner();
+        let task = &lease_resp.tasks[0];
+        let result_data = rmp_serde::to_vec(&serde_json::json!({"value": "hello"})).unwrap();
+
+        let _ = client
+            .report_outcome(ReportOutcomeRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                task_id: task.id.clone(),
+                outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(result_data.clone())),
+                })),
+            })
+            .await?;
+
+        // GetJob with include_attempts should have both attempts and result
+        let job = client
+            .get_job(GetJobRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                id: "result_field_with_attempts".to_string(),
+                tenant: None,
+                include_attempts: true,
+            })
+            .await?
+            .into_inner();
+
+        assert_eq!(job.status, JobStatus::Succeeded as i32);
+        assert!(!job.attempts.is_empty(), "attempts should be populated");
+
+        // Verify the top-level result matches the attempt's result
+        let result = job.result.expect("succeeded job should have result");
+        let actual_data = match result.encoding {
+            Some(serialized_bytes::Encoding::Msgpack(d)) => d,
+            None => vec![],
+        };
+        assert_eq!(actual_data, result_data);
+
+        // Also verify the attempt has the same result
+        let last_attempt = job.attempts.last().unwrap();
+        let attempt_result = last_attempt
+            .result
+            .as_ref()
+            .expect("succeeded attempt should have result");
+        let attempt_data = match &attempt_result.encoding {
+            Some(serialized_bytes::Encoding::Msgpack(d)) => d.clone(),
+            None => vec![],
+        };
+        assert_eq!(attempt_data, result_data);
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// Test that GetJob result field is None for failed jobs
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_get_job_result_field_none_for_failed() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        // Enqueue a job
+        let enq = EnqueueRequest {
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+            id: "result_field_failed".to_string(),
+            priority: 10,
+            start_at_ms: 0,
+            retry_policy: None,
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                    rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                )),
+            }),
+            limits: vec![],
+            tenant: None,
+            metadata: std::collections::HashMap::new(),
+            task_group: "default".to_string(),
+        };
+        let _ = client.enqueue(enq).await?;
+
+        // Lease and fail the task
+        let lease_resp = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: Some(crate::grpc_integration_helpers::TEST_SHARD_ID.to_string()),
+                worker_id: "w1".to_string(),
+                max_tasks: 1,
+                task_group: "default".to_string(),
+            })
+            .await?
+            .into_inner();
+        let task = &lease_resp.tasks[0];
+
+        let _ = client
+            .report_outcome(ReportOutcomeRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                task_id: task.id.clone(),
+                outcome: Some(report_outcome_request::Outcome::Failure(Failure {
+                    code: "TEST_ERROR".to_string(),
+                    data: Some(SerializedBytes {
+                        encoding: Some(serialized_bytes::Encoding::Msgpack(
+                            rmp_serde::to_vec(&serde_json::json!({"msg": "failed"})).unwrap(),
+                        )),
+                    }),
+                })),
+            })
+            .await?;
+
+        // GetJob for a failed job should have no result
+        let job = client
+            .get_job(GetJobRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                id: "result_field_failed".to_string(),
+                tenant: None,
+                include_attempts: false,
+            })
+            .await?
+            .into_inner();
+
+        assert_eq!(job.status, JobStatus::Failed as i32);
+        assert!(job.result.is_none(), "failed job should have no result");
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}

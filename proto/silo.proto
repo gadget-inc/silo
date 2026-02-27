@@ -158,6 +158,7 @@ message GetJobResponse {
   repeated JobAttempt attempts = 10;     // All attempts for this job. Only populated if include_attempts was true in the request.
   optional int64 next_attempt_starts_after_ms = 11; // Unix timestamp (ms) when the next attempt will start. Present for scheduled jobs, absent for running or terminal jobs.
   string task_group = 12;                // Task group this job's tasks are enqueued into.
+  optional SerializedBytes result = 13;  // Result data from the last attempt, if the job succeeded.
 }
 
 // Request to get the result of a completed job.
