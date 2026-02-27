@@ -286,10 +286,11 @@ impl TaskBroker {
                 let delay = tokio::time::sleep(Duration::from_millis(sleep_ms));
                 tokio::pin!(delay);
                 tokio::select! {
-                    _ = &mut delay => {},
+                    biased;
                     _ = broker.notify.notified() => {
                         debug!("broker woken by notification");
                     }
+                    _ = &mut delay => {},
                 }
             }
         });

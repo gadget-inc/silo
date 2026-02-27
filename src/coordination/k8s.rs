@@ -341,6 +341,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
 
         loop {
             tokio::select! {
+                biased;
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         debug!(node_id = %self.base.node_id, "membership watcher shutting down");
@@ -404,6 +405,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
 
         loop {
             tokio::select! {
+                biased;
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         debug!(node_id = %self.base.node_id, "shard map watcher shutting down");
@@ -475,6 +477,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
 
         loop {
             tokio::select! {
+                biased;
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         debug!(node_id = %self.base.node_id, "shard lease watcher shutting down");

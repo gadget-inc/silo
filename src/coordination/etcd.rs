@@ -208,6 +208,7 @@ impl EtcdCoordinator {
 
             loop {
                 tokio::select! {
+                    biased;
                     _ = keepalive_timer.tick() => {
                         if *shutdown_rx.borrow() { break; }
                         // Send keepalive for membership lease
