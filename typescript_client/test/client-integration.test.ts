@@ -293,6 +293,93 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       expect(job!.limits[0].type).toBe("concurrency");
       expect(job!.limits[1].type).toBe("rateLimit");
     });
+
+    it("getJob returns result field for succeeded jobs", async () => {
+      const tenant = "result-field-tenant";
+      const resultData = { answer: 42, nested: { ok: true } };
+
+      const handle = await client.enqueue({
+        tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
+        payload: { test: "result-field-test" },
+      });
+
+      // Before completion, result should be undefined
+      const scheduledJob = await client.getJob(handle.id, tenant);
+      expect(scheduledJob.result).toBeUndefined();
+
+      // Lease and complete the task
+      const shard = client.getShardForTenant(tenant);
+      let task;
+      for (let i = 0; i < 5 && !task; i++) {
+        const leased = await client.leaseTasks({
+          workerId: `result-field-worker-${Date.now()}`,
+          maxTasks: 50,
+          shard,
+          taskGroup: DEFAULT_TASK_GROUP,
+        });
+        task = leased.tasks.find((t) => t.jobId === handle.id);
+        if (!task) {
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      }
+      expect(task).toBeDefined();
+
+      await client.reportOutcome({
+        shard: task!.shard,
+        taskId: task!.id,
+        outcome: { type: "success", result: resultData },
+      });
+
+      // getJob without includeAttempts should have result
+      const succeededJob = await client.getJob(handle.id, tenant);
+      expect(succeededJob.status).toBe(JobStatus.Succeeded);
+      expect(succeededJob.result).toEqual(resultData);
+
+      // getJob with includeAttempts should also have result
+      const jobWithAttempts = await client.getJob(handle.id, tenant, { includeAttempts: true });
+      expect(jobWithAttempts.status).toBe(JobStatus.Succeeded);
+      expect(jobWithAttempts.result).toEqual(resultData);
+      expect(jobWithAttempts.attempts).toBeDefined();
+      expect(jobWithAttempts.attempts!.length).toBeGreaterThan(0);
+    });
+
+    it("getJob result field is undefined for failed jobs", async () => {
+      const tenant = "result-field-failed-tenant";
+
+      const handle = await client.enqueue({
+        tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
+        payload: { test: "result-field-failed-test" },
+      });
+
+      // Lease and fail the task
+      const shard = client.getShardForTenant(tenant);
+      let task;
+      for (let i = 0; i < 5 && !task; i++) {
+        const leased = await client.leaseTasks({
+          workerId: `result-field-fail-worker-${Date.now()}`,
+          maxTasks: 50,
+          shard,
+          taskGroup: DEFAULT_TASK_GROUP,
+        });
+        task = leased.tasks.find((t) => t.jobId === handle.id);
+        if (!task) {
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      }
+      expect(task).toBeDefined();
+
+      await client.reportOutcome({
+        shard: task!.shard,
+        taskId: task!.id,
+        outcome: { type: "failure", code: "TEST_ERR", data: { msg: "failed" } },
+      });
+
+      const failedJob = await client.getJob(handle.id, tenant);
+      expect(failedJob.status).toBe(JobStatus.Failed);
+      expect(failedJob.result).toBeUndefined();
+    });
   });
 
   describe("leaseTasks and reportOutcome", () => {

@@ -186,6 +186,16 @@ pub fn job_attempt_view_to_proto(
     }
 }
 
+/// Extract the result from a list of proto JobAttempts.
+/// Returns the result from the last succeeded attempt, if any.
+pub fn result_from_proto_attempts(attempts: &[crate::pb::JobAttempt]) -> Option<SerializedBytes> {
+    attempts
+        .iter()
+        .rev()
+        .find(|a| a.status == i32::from(AttemptStatus::Succeeded))
+        .and_then(|a| a.result.clone())
+}
+
 /// Convert a `LeasedTask` into a proto `Task` message.
 fn leased_task_to_proto(lt: &crate::task::LeasedTask, shard_id: &str) -> Task {
     let job = lt.job();
@@ -887,6 +897,26 @@ impl Silo for SiloService {
             Vec::new()
         };
 
+        // For succeeded jobs, populate the result field
+        let result = if job_status.kind == crate::job::JobStatusKind::Succeeded {
+            if !attempts.is_empty() {
+                // We already have attempts loaded, extract result from them
+                result_from_proto_attempts(&attempts)
+            } else {
+                // Attempts not loaded, query the latest attempt
+                let latest = shard
+                    .get_latest_job_attempt(&tenant, &r.id)
+                    .await
+                    .map_err(map_err)?;
+                latest.and_then(|a| {
+                    let proto = job_attempt_view_to_proto(&a);
+                    proto.result
+                })
+            }
+        } else {
+            None
+        };
+
         let resp = GetJobResponse {
             id: view.id().to_string(),
             priority: view.priority() as u32,
@@ -908,6 +938,7 @@ impl Silo for SiloService {
             attempts,
             next_attempt_starts_after_ms: job_status.next_attempt_starts_after_ms,
             task_group: view.task_group().to_string(),
+            result,
         };
         Ok(Response::new(resp))
     }
