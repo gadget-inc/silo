@@ -1076,6 +1076,12 @@ export class SiloGRPCClient {
   /** @internal Array of shards sorted by rangeStart for efficient lookup */
   private _shards: ShardInfoWithRange[] = [];
 
+  /** @internal Whether topology has been successfully loaded at least once */
+  private _topologyReady: boolean = false;
+
+  /** @internal In-flight topology refresh promise for deduplication */
+  private _pendingTopologyRefresh: Promise<void> | null = null;
+
   /** @internal */
   private _topologyRefreshInterval: ReturnType<typeof setInterval> | null = null;
   /** Counter for round-robin server selection */
@@ -1347,6 +1353,24 @@ export class SiloGRPCClient {
   }
 
   /**
+   * Ensure topology has been loaded, triggering a lazy refresh if needed.
+   * Multiple concurrent callers will share the same in-flight refresh.
+   * @internal
+   */
+  private async _ensureTopology(): Promise<void> {
+    if (this._topologyReady) {
+      return;
+    }
+    if (this._pendingTopologyRefresh) {
+      return this._pendingTopologyRefresh;
+    }
+    this._pendingTopologyRefresh = this.refreshTopology().finally(() => {
+      this._pendingTopologyRefresh = null;
+    });
+    return this._pendingTopologyRefresh;
+  }
+
+  /**
    * Execute an operation with retry logic for wrong shard errors.
    * @internal
    */
@@ -1354,6 +1378,7 @@ export class SiloGRPCClient {
     tenant: string | undefined,
     operation: (client: SiloClient, shard: string) => Promise<T>,
   ): Promise<T> {
+    await this._ensureTopology();
     let lastError: unknown;
     let delay = this._wrongShardRetryDelayMs;
     let { client, shard } = this._getClientForTenant(tenant);
@@ -1435,6 +1460,7 @@ export class SiloGRPCClient {
         // Sort shards by rangeStart for efficient binary search lookup
         shards.sort((a, b) => a.rangeStart.localeCompare(b.rangeStart));
         this._shards = shards;
+        this._topologyReady = true;
 
         return; // Success
       } catch {
@@ -2104,6 +2130,11 @@ export class SiloGRPCClient {
         const call = conn.client.resetShards({}, this._rpcOptions());
         await call.response;
       }
+
+      // Clear topology state so the next operation triggers a lazy refresh
+      this._shardToServer.clear();
+      this._shards = [];
+      this._topologyReady = false;
     } catch (error) {
       throwMappedRpcError(error, { operation: "resetShards" });
     }

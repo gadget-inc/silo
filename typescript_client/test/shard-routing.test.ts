@@ -308,6 +308,7 @@ describe("Shard Routing", () => {
         },
       ];
       (c as any)._shardToServer.set("00000000-0000-0000-0000-000000000001", "localhost:7450");
+      (c as any)._topologyReady = true;
     };
 
     beforeEach(() => {
@@ -529,6 +530,159 @@ describe("Shard Routing", () => {
         expect(handle.id).toBe("job-abc");
         expect(refreshSpy).not.toHaveBeenCalled();
       });
+    });
+  });
+
+  describe("Lazy topology auto-refresh", () => {
+    let client: SiloGRPCClient;
+
+    afterEach(() => {
+      client.close();
+    });
+
+    // Helper: create a client and mock getClusterInfo to return a single shard
+    const setupClientWithMockTopology = () => {
+      client = new SiloGRPCClient({
+        servers: "localhost:7450",
+        useTls: false,
+        shardRouting: {
+          topologyRefreshIntervalMs: 0,
+        },
+      });
+
+      const mockGetClusterInfo = vi.fn().mockReturnValue({
+        response: Promise.resolve({
+          numShards: 1,
+          shardOwners: [
+            {
+              shardId: "00000000-0000-0000-0000-000000000001",
+              grpcAddr: "localhost:7450",
+              nodeId: "node-1",
+              rangeStart: "",
+              rangeEnd: "",
+            },
+          ],
+          thisNodeId: "node-1",
+          thisGrpcAddr: "localhost:7450",
+        }),
+      });
+
+      const mockEnqueue = vi.fn().mockReturnValue({
+        response: Promise.resolve({ id: "job-123" }),
+      });
+
+      const connections = (client as any)._connections as Map<string, any>;
+      const conn = connections.values().next().value;
+      conn.client.getClusterInfo = mockGetClusterInfo;
+      conn.client.enqueue = mockEnqueue;
+
+      return { mockGetClusterInfo, mockEnqueue };
+    };
+
+    it("auto-refreshes topology on first enqueue if refreshTopology() was never called", async () => {
+      const { mockGetClusterInfo, mockEnqueue } = setupClientWithMockTopology();
+
+      // Don't call refreshTopology() - just call enqueue directly
+      const handle = await client.enqueue({
+        tenant: "test-tenant",
+        payload: { test: true },
+        taskGroup: "default",
+      });
+
+      expect(handle.id).toBe("job-123");
+      // Should have called getClusterInfo to auto-discover topology
+      expect(mockGetClusterInfo).toHaveBeenCalled();
+      expect(mockEnqueue).toHaveBeenCalled();
+    });
+
+    it("does not re-fetch topology if it was already loaded", async () => {
+      const { mockGetClusterInfo, mockEnqueue } = setupClientWithMockTopology();
+
+      // Explicitly refresh topology first
+      await client.refreshTopology();
+      expect(mockGetClusterInfo).toHaveBeenCalledTimes(1);
+
+      // Now enqueue should not trigger another refresh
+      await client.enqueue({
+        tenant: "test-tenant",
+        payload: { test: true },
+        taskGroup: "default",
+      });
+
+      expect(mockGetClusterInfo).toHaveBeenCalledTimes(1);
+      expect(mockEnqueue).toHaveBeenCalled();
+    });
+
+    it("deduplicates concurrent topology refreshes", async () => {
+      const { mockGetClusterInfo } = setupClientWithMockTopology();
+
+      const mockEnqueue = vi.fn().mockReturnValue({
+        response: Promise.resolve({ id: "job-concurrent" }),
+      });
+      const connections = (client as any)._connections as Map<string, any>;
+      const conn = connections.values().next().value;
+      conn.client.enqueue = mockEnqueue;
+
+      // Launch 5 concurrent enqueues without having called refreshTopology
+      const promises = Array.from({ length: 5 }, (_, i) =>
+        client.enqueue({
+          tenant: "test-tenant",
+          payload: { index: i },
+          taskGroup: "default",
+        }),
+      );
+
+      const results = await Promise.all(promises);
+
+      // All should succeed
+      expect(results).toHaveLength(5);
+      for (const handle of results) {
+        expect(handle.id).toBe("job-concurrent");
+      }
+
+      // getClusterInfo should have been called exactly once (deduped)
+      expect(mockGetClusterInfo).toHaveBeenCalledTimes(1);
+    });
+
+    it("resetShards puts client back into lazy-refresh mode", async () => {
+      const { mockGetClusterInfo } = setupClientWithMockTopology();
+
+      const mockEnqueue = vi.fn().mockReturnValue({
+        response: Promise.resolve({ id: "job-after-reset" }),
+      });
+      const mockResetShards = vi.fn().mockReturnValue({
+        response: Promise.resolve({}),
+      });
+
+      const connections = (client as any)._connections as Map<string, any>;
+      const conn = connections.values().next().value;
+      conn.client.enqueue = mockEnqueue;
+      conn.client.resetShards = mockResetShards;
+
+      // First, refresh topology and do an enqueue
+      await client.refreshTopology();
+      expect(mockGetClusterInfo).toHaveBeenCalledTimes(1);
+
+      await client.enqueue({
+        tenant: "test-tenant",
+        payload: { test: true },
+        taskGroup: "default",
+      });
+      // No additional refresh needed
+      expect(mockGetClusterInfo).toHaveBeenCalledTimes(1);
+
+      // Now reset shards - this should clear topology state
+      await client.resetShards();
+
+      // Next enqueue should trigger a new topology refresh
+      await client.enqueue({
+        tenant: "test-tenant",
+        payload: { test: true },
+        taskGroup: "default",
+      });
+
+      // Should have refreshed topology again
+      expect(mockGetClusterInfo).toHaveBeenCalledTimes(2);
     });
   });
 });
