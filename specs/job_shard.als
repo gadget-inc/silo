@@ -157,13 +157,14 @@ fact wellFormed {
     -- A task can be leased to at most one worker at each time
     all taskid: TaskId, t: Time | lone l: Lease | l.ltask = taskid and l.ltime = t
     
-    -- Task-job binding is permanent: if a task is ever associated with a job 
-    -- (in DB, buffer, or lease), it can only be associated with that same job
+    -- Task-job binding is permanent: if a task is ever associated with a job
+    -- (in DB, buffer, lease, or request), it can only be associated with that same job
     -- (In Rust, the task's key contains job_id which is immutable)
-    all taskid: TaskId | lone j: Job | 
+    all taskid: TaskId | lone j: Job |
         (some t: Time | some dbQueuedAt[taskid, t] and dbQueuedAt[taskid, t] = j) or
         (some t: Time | some bufferedAt[taskid, t] and bufferedAt[taskid, t] = j) or
-        (some t: Time | some leaseJobAt[taskid, t] and leaseJobAt[taskid, t] = j)
+        (some t: Time | some leaseJobAt[taskid, t] and leaseJobAt[taskid, t] = j) or
+        (some r: TicketRequest | r.tr_task = taskid and r.tr_job = j)
     
     -- Existential tracking: one tracker per time
     all t: Time | one e: AttemptExists | e.time = t
@@ -191,8 +192,10 @@ fact wellFormed {
     -- A job has at most one requirement per queue
     all j: Job, q: Queue | lone r: JobQueueRequirement | r.jqr_job = j and r.jqr_queue = q
     
-    -- At most one request per (job, queue) at each time
-    all j: Job, q: Queue, t: Time | lone r: TicketRequest | r.tr_job = j and r.tr_queue = q and r.tr_time = t
+    -- At most one request per (task, queue) at each time.
+    -- Multiple attempts of the same job may have outstanding requests concurrently.
+    all tid: TaskId, q: Queue, t: Time | lone r: TicketRequest |
+        r.tr_task = tid and r.tr_queue = q and r.tr_time = t
     
     -- At most one holder per (task, queue) at each time
     all tid: TaskId, q: Queue, t: Time | lone h: TicketHolder | h.th_task = tid and h.th_queue = q and h.th_time = t
@@ -277,6 +280,7 @@ pred leaseUnchanged[taskid: TaskId, t: Time, tnext: Time] {
 
 /** Terminal status - Cancelled is now separate and orthogonal */
 pred isTerminal[s: JobStatus] {
+    some s
     s in (Succeeded + Failed)
 }
 
@@ -469,8 +473,9 @@ pred enqueueWithConcurrencyQueued[tid: TaskId, j: Job, q: Queue, t: Time, tnext:
     -- [SILO-ENQ-CONC-6] Post: Create request record in concurrency requests namespace
     one r: TicketRequest | r.tr_job = j and r.tr_queue = q and r.tr_task = tid and r.tr_time = tnext
     all tid2: TaskId | dbQueuedAt[tid2, tnext] = dbQueuedAt[tid2, t]
-    
-    -- Frame: other requests unchanged, holders unchanged
+
+    -- Frame: requests in queue q = old + new request, other queues unchanged
+    requestTasksAt[q, tnext] = requestTasksAt[q, t] + tid
     all q2: Queue | q2 != q implies requestTasksAt[q2, tnext] = requestTasksAt[q2, t]
     holdersUnchanged[t, tnext]
 }
@@ -668,14 +673,13 @@ pred completeSuccessReleaseTicket[tid: TaskId, w: Worker, q: Queue, t: Time, tne
 }
 
 -- Transition: GRANT_NEXT_REQUEST - Grant ticket to next waiting request
--- When a queue has capacity (no holders) and there's a pending request, grant it.
--- Note: No cancelled check here. Cancelled jobs' requests are eagerly removed
--- by cancelJob. The terminal status check in the Rust implementation catches any
--- stale requests for cancelled jobs (since Cancelled is terminal).
--- Implementation: driven by a background grant scanner (ConcurrencyManager::process_grants)
--- rather than being called synchronously during release. Callers signal the scanner
--- via request_grant() after releasing a holder; the scanner serializes all grants
--- to prevent double-grant races from concurrent releases.
+-- When a queue has capacity (no holders) and there's a pending request for a
+-- currently scheduled job, grant it.
+-- Implementation: driven by a background grant scanner
+-- (ConcurrencyManager::process_grants) rather than being called synchronously
+-- during release. Callers signal the scanner via request_grant() after
+-- releasing a holder; the scanner serializes all grants to prevent
+-- double-grant races from concurrent releases.
 pred grantNextRequest[q: Queue, reqTid: TaskId, t: Time, tnext: Time] {
     -- [SILO-GRANT-1] Pre: Queue has capacity (limit=1, no holders)
     queueHasCapacity[q, t]
@@ -685,6 +689,10 @@ pred grantNextRequest[q: Queue, reqTid: TaskId, t: Time, tnext: Time] {
     let r = { req: TicketRequest | req.tr_queue = q and req.tr_time = t and req.tr_task = reqTid } | {
         one r
         let j = r.tr_job | {
+            -- [SILO-GRANT-5] Pre: Request still targets a currently scheduled job.
+            -- (Rust also validates attempt number; attempt identity is abstracted in this model.)
+            statusAt[j, t] = Scheduled
+
             -- [SILO-GRANT-3] Post: Create holder for this task/queue
             holdersAt[q, tnext] = reqTid
             
@@ -717,6 +725,36 @@ pred grantNextRequest[q: Queue, reqTid: TaskId, t: Time, tnext: Time] {
         leaseJobAt[tid, tnext] = leaseJobAt[tid, t]
         leaseAttemptAt[tid, tnext] = leaseAttemptAt[tid, t]
     }
+}
+
+-- Transition: DROP_STALE_REQUEST - Remove a stale request without granting work.
+-- This models lazy cleanup in the grant scanner when request status drift is detected.
+pred dropStaleRequest[q: Queue, reqTid: TaskId, t: Time, tnext: Time] {
+    some r: TicketRequest | r.tr_queue = q and r.tr_time = t and r.tr_task = reqTid
+    let r = { req: TicketRequest | req.tr_queue = q and req.tr_time = t and req.tr_task = reqTid } | {
+        one r
+        -- [SILO-GRANT-6] Post: stale request record is deleted (no holder/task grant).
+        statusAt[r.tr_job, t] != Scheduled
+    }
+
+    -- Delete only the selected request key.
+    requestTasksAt[q, tnext] = requestTasksAt[q, t] - reqTid
+    all q2: Queue | q2 != q implies requestTasksAt[q2, tnext] = requestTasksAt[q2, t]
+
+    -- Frame: grant side effects do not happen on stale cleanup.
+    holdersUnchanged[t, tnext]
+    all tid: TaskId | dbQueuedAt[tid, tnext] = dbQueuedAt[tid, t]
+    all tid: TaskId | bufferedAt[tid, tnext] = bufferedAt[tid, t]
+    all tid: TaskId | {
+        leaseAt[tid, tnext] = leaseAt[tid, t]
+        leaseJobAt[tid, tnext] = leaseJobAt[tid, t]
+        leaseAttemptAt[tid, tnext] = leaseAttemptAt[tid, t]
+    }
+    all j: Job | j in jobExistsAt[t] implies statusAt[j, tnext] = statusAt[j, t]
+    all j: Job | isCancelledAt[j, tnext] iff isCancelledAt[j, t]
+    jobExistsAt[tnext] = jobExistsAt[t]
+    attemptExistsAt[tnext] = attemptExistsAt[t]
+    all a: attemptExistsAt[t] | attemptStatusAt[a, tnext] = attemptStatusAt[a, t]
 }
 
 -- Transition: COMPLETE_FAILURE_PERMANENT - Worker reports permanent failure
@@ -878,7 +916,12 @@ pred completeFailureRetryReleaseTicket[tid: TaskId, w: Worker, q: Queue, newTid:
     all tid2: TaskId | bufferedAt[tid2, tnext] = bufferedAt[tid2, t]
     
     -- [SILO-RETRY-REL] Release the holder so other jobs can acquire the ticket
-    releaseHolder[tid, q, t, tnext]
+    -- (inline releaseHolder without requestsUnchanged, since we also create a new request)
+    holdersAt[q, tnext] = holdersAt[q, t] - tid
+    all q2: Queue | q2 != q implies holdersAt[q2, tnext] = holdersAt[q2, t]
+    -- Frame: requests in queue q = old + newTid, other queues unchanged
+    requestTasksAt[q, tnext] = requestTasksAt[q, t] + newTid
+    all q2: Queue | q2 != q implies requestTasksAt[q2, tnext] = requestTasksAt[q2, t]
 }
 
 -- Transition: CANCEL - mark job as cancelled
@@ -1237,6 +1280,353 @@ pred stutter[t: Time, tnext: Time] {
     concurrencyUnchanged[t, tnext]
 }
 
+/** Import precondition: job must not exist */
+pred importPreConditions[j: Job, t: Time] {
+    -- [SILO-IMP-1] Pre: job does NOT exist yet
+    j not in jobExistsAt[t]
+}
+
+/**
+ * Shared postcondition for adding terminal attempts during import/reimport.
+ * Does NOT require `some` new attempts - callers add that constraint when needed.
+ */
+pred importNewAttempts[j: Job, t: Time, tnext: Time] {
+    -- Post: existing attempts preserved (no removals)
+    attemptExistsAt[t] in attemptExistsAt[tnext]
+    -- [SILO-IMP-2] Post: existing attempt statuses unchanged
+    all a: attemptExistsAt[t] | attemptStatusAt[a, tnext] = attemptStatusAt[a, t]
+    -- [SILO-IMP-3] Post: all new attempts belong to j and are terminal
+    all a: attemptExistsAt[tnext] - attemptExistsAt[t] | attemptJob[a] = j and isTerminalAttempt[attemptStatusAt[a, tnext]]
+}
+
+/** Frame conditions for import (buffer, existing jobs, leases unchanged) */
+pred importFrameConditions[t: Time, tnext: Time] {
+    -- Buffer unchanged
+    all tid: TaskId | bufferedAt[tid, tnext] = bufferedAt[tid, t]
+    -- Frame: other existing jobs unchanged (status and cancellation)
+    all j2: Job | j2 in jobExistsAt[t] implies statusAt[j2, tnext] = statusAt[j2, t]
+    all j2: Job | j2 in jobExistsAt[t] implies (isCancelledAt[j2, tnext] iff isCancelledAt[j2, t])
+    -- Frame: leases unchanged
+    all tid: TaskId | {
+        leaseAt[tid, tnext] = leaseAt[tid, t]
+        leaseJobAt[tid, tnext] = leaseJobAt[tid, t]
+        leaseAttemptAt[tid, tnext] = leaseAttemptAt[tid, t]
+    }
+}
+
+-- Transition: IMPORT_TERMINAL - Import a job with terminal status (Succeeded/Failed)
+-- Job is created with pre-existing terminal attempts and no scheduling state.
+pred importTerminal[j: Job, t: Time, tnext: Time] {
+    importPreConditions[j, t]
+    importNewAttempts[j, t, tnext]
+    importFrameConditions[t, tnext]
+
+    -- [SILO-IMP-5] Post: status is terminal (Succeeded or Failed)
+    isTerminal[statusAt[j, tnext]]
+    -- Post: at least one new attempt (terminal status requires attempt history)
+    some attemptExistsAt[tnext] - attemptExistsAt[t]
+    -- Post: job exists, not cancelled
+    jobExistsAt[tnext] = jobExistsAt[t] + j
+    not isCancelledAt[j, tnext]
+    -- No task created
+    all tid: TaskId | dbQueuedAt[tid, tnext] = dbQueuedAt[tid, t]
+    -- Concurrency unchanged
+    concurrencyUnchanged[t, tnext]
+}
+
+-- Transition: IMPORT_NON_TERMINAL - Import a job as Scheduled (no concurrency)
+-- Job is created with optional terminal attempts and a task in DB queue.
+pred importNonTerminal[tid: TaskId, j: Job, t: Time, tnext: Time] {
+    importPreConditions[j, t]
+    importNewAttempts[j, t, tnext]
+    importFrameConditions[t, tnext]
+
+    -- Pre: task is not already in use
+    no dbQueuedAt[tid, t]
+    no bufferedAt[tid, t]
+    no leaseAt[tid, t]
+
+    -- Pre: Job does NOT require any concurrency queues
+    no jobQueues[j]
+
+    -- [SILO-IMP-6] Post: status = Scheduled
+    statusAt[j, tnext] = Scheduled
+    -- Post: job exists, not cancelled
+    jobExistsAt[tnext] = jobExistsAt[t] + j
+    not isCancelledAt[j, tnext]
+    -- [SILO-IMP-7] Post: task created in DB queue
+    one qt: DbQueuedTask | qt.db_qtask = tid and qt.db_qjob = j and qt.db_qtime = tnext
+    all tid2: TaskId | tid2 != tid implies dbQueuedAt[tid2, tnext] = dbQueuedAt[tid2, t]
+    -- Concurrency unchanged
+    concurrencyUnchanged[t, tnext]
+}
+
+-- Transition: IMPORT_NON_TERMINAL_CONCURRENCY_GRANTED - Import job, granted concurrency immediately
+pred importNonTerminalConcurrencyGranted[tid: TaskId, j: Job, q: Queue, t: Time, tnext: Time] {
+    importPreConditions[j, t]
+    importNewAttempts[j, t, tnext]
+    importFrameConditions[t, tnext]
+
+    -- Pre: task is not already in use
+    no dbQueuedAt[tid, t]
+    no bufferedAt[tid, t]
+    no leaseAt[tid, t]
+
+    -- Pre: Job requires this queue
+    q in jobQueues[j]
+
+    -- [SILO-IMP-CONC-1] Pre: Queue has capacity
+    queueHasCapacity[q, t]
+
+    -- Post: status = Scheduled, job exists, not cancelled
+    statusAt[j, tnext] = Scheduled
+    jobExistsAt[tnext] = jobExistsAt[t] + j
+    not isCancelledAt[j, tnext]
+    -- [SILO-IMP-CONC-2] Post: holder + task in DB queue
+    holdersAt[q, tnext] = tid
+    one qt: DbQueuedTask | qt.db_qtask = tid and qt.db_qjob = j and qt.db_qtime = tnext
+    all tid2: TaskId | tid2 != tid implies dbQueuedAt[tid2, tnext] = dbQueuedAt[tid2, t]
+    -- Frame: other holders unchanged, requests unchanged
+    all q2: Queue | q2 != q implies holdersAt[q2, tnext] = holdersAt[q2, t]
+    requestsUnchanged[t, tnext]
+}
+
+-- Transition: IMPORT_NON_TERMINAL_CONCURRENCY_QUEUED - Import job, must wait for concurrency
+pred importNonTerminalConcurrencyQueued[tid: TaskId, j: Job, q: Queue, t: Time, tnext: Time] {
+    importPreConditions[j, t]
+    importNewAttempts[j, t, tnext]
+    importFrameConditions[t, tnext]
+
+    -- Pre: task is not already in use
+    no dbQueuedAt[tid, t]
+    no bufferedAt[tid, t]
+    no leaseAt[tid, t]
+
+    -- Pre: Job requires this queue
+    q in jobQueues[j]
+
+    -- [SILO-IMP-CONC-3] Pre: Queue at capacity
+    not queueHasCapacity[q, t]
+
+    -- Post: status = Scheduled, job exists, not cancelled
+    statusAt[j, tnext] = Scheduled
+    jobExistsAt[tnext] = jobExistsAt[t] + j
+    not isCancelledAt[j, tnext]
+    -- [SILO-IMP-CONC-4] Post: request created (no task in DB)
+    one r: TicketRequest | r.tr_job = j and r.tr_queue = q and r.tr_task = tid and r.tr_time = tnext
+    no qt: DbQueuedTask | qt.db_qtask = tid and qt.db_qtime = tnext
+    all tid2: TaskId | dbQueuedAt[tid2, tnext] = dbQueuedAt[tid2, t]
+    -- Frame: requests in queue q = old + new request, other queues unchanged
+    requestTasksAt[q, tnext] = requestTasksAt[q, t] + tid
+    all q2: Queue | q2 != q implies requestTasksAt[q2, tnext] = requestTasksAt[q2, t]
+    holdersUnchanged[t, tnext]
+}
+
+/** Reimport preconditions: job exists, not running, not succeeded, all attempts terminal */
+pred reimportPreConditions[j: Job, t: Time] {
+    -- [SILO-REIMP-1] Pre: job exists
+    j in jobExistsAt[t]
+    -- [SILO-REIMP-2] Pre: no active lease for this job (not running)
+    no tid: TaskId | leaseJobAt[tid, t] = j
+    -- [SILO-REIMP-3] Pre: all existing attempts for this job are terminal
+    all a: attemptExistsAt[t] | attemptJob[a] = j implies isTerminalAttempt[attemptStatusAt[a, t]]
+    -- [SILO-REIMP-4] Pre: job is NOT Succeeded
+    statusAt[j, t] != Succeeded
+}
+
+/** Reimport cleanup: remove buffer entries for the job */
+pred reimportCleanup[j: Job, t: Time, tnext: Time] {
+    -- [SILO-REIMP-6] Post: remove any BufferedTask for this job
+    no tid: TaskId | bufferedAt[tid, tnext] = j
+    -- Frame: buffer entries for other jobs unchanged
+    all tid: TaskId | bufferedAt[tid, t] != j implies bufferedAt[tid, tnext] = bufferedAt[tid, t]
+}
+
+/** Reimport frame conditions: job existence, other jobs, leases, cancellation preserved */
+pred reimportFrameConditions[j: Job, t: Time, tnext: Time] {
+    -- Job existence unchanged
+    jobExistsAt[tnext] = jobExistsAt[t]
+    -- Other jobs' status and cancellation unchanged
+    all j2: Job | j2 in jobExistsAt[t] and j2 != j implies statusAt[j2, tnext] = statusAt[j2, t]
+    all j2: Job | j2 != j implies (isCancelledAt[j2, tnext] iff isCancelledAt[j2, t])
+    -- All leases unchanged (reimport doesn't touch leases)
+    all tid: TaskId | {
+        leaseAt[tid, tnext] = leaseAt[tid, t]
+        leaseJobAt[tid, tnext] = leaseJobAt[tid, t]
+        leaseAttemptAt[tid, tnext] = leaseAttemptAt[tid, t]
+    }
+    -- Cancellation for this job preserved
+    isCancelledAt[j, tnext] iff isCancelledAt[j, t]
+}
+
+-- Transition: REIMPORT_TERMINAL - Reimport job to terminal status
+-- Removes all scheduling state and concurrency state for the job.
+pred reimportTerminal[j: Job, t: Time, tnext: Time] {
+    reimportPreConditions[j, t]
+    importNewAttempts[j, t, tnext]
+    reimportCleanup[j, t, tnext]
+    reimportFrameConditions[j, t, tnext]
+
+    -- [SILO-REIMP-7] Post: status is terminal
+    isTerminal[statusAt[j, tnext]]
+    -- Post: at least one new attempt
+    some attemptExistsAt[tnext] - attemptExistsAt[t]
+
+    -- [SILO-REIMP-5] Post: remove any DbQueuedTask for this job, preserve others
+    all tid: TaskId | {
+        (dbQueuedAt[tid, t] = j) implies no dbQueuedAt[tid, tnext]
+        (dbQueuedAt[tid, t] != j) implies dbQueuedAt[tid, tnext] = dbQueuedAt[tid, t]
+    }
+
+    -- [SILO-REIMP-CONC-5] Old Scheduled state performs targeted request cleanup.
+    (statusAt[j, t] = Scheduled) implies {
+        all q: Queue, tid: TaskId |
+            tid in requestTasksAt[q, tnext] iff (tid in requestTasksAt[q, t] and
+                no r: TicketRequest | r.tr_job = j and r.tr_queue = q and r.tr_task = tid and r.tr_time = t)
+        -- Remove holders for this job's old scheduled tasks, preserve others.
+        all q: Queue, tid: TaskId |
+            tid in holdersAt[q, tnext] iff (tid in holdersAt[q, t] and dbQueuedAt[tid, t] != j)
+    }
+    -- [SILO-REIMP-CONC-6] Non-scheduled old state leaves requests untouched; grant scanner drops stale keys lazily.
+    (statusAt[j, t] != Scheduled) implies {
+        all q: Queue | requestTasksAt[q, tnext] = requestTasksAt[q, t]
+        all q: Queue | holdersAt[q, tnext] = holdersAt[q, t]
+    }
+}
+
+-- Transition: REIMPORT_NON_TERMINAL - Reimport job as Scheduled (no concurrency)
+pred reimportNonTerminal[newTid: TaskId, j: Job, t: Time, tnext: Time] {
+    reimportPreConditions[j, t]
+    importNewAttempts[j, t, tnext]
+    reimportCleanup[j, t, tnext]
+    reimportFrameConditions[j, t, tnext]
+
+    -- Pre: new task is not already in use
+    no dbQueuedAt[newTid, t]
+    no bufferedAt[newTid, t]
+    no leaseAt[newTid, t]
+
+    -- Pre: Job does NOT require any concurrency queues
+    no jobQueues[j]
+
+    -- [SILO-REIMP-8] Post: status = Scheduled
+    statusAt[j, tnext] = Scheduled
+
+    -- [SILO-REIMP-9] Post: new task in DB queue, old tasks for j removed
+    one qt: DbQueuedTask | qt.db_qtask = newTid and qt.db_qjob = j and qt.db_qtime = tnext
+    all tid: TaskId | tid != newTid implies {
+        (dbQueuedAt[tid, t] = j) implies no dbQueuedAt[tid, tnext]
+        (dbQueuedAt[tid, t] != j) implies dbQueuedAt[tid, tnext] = dbQueuedAt[tid, t]
+    }
+
+    -- Concurrency unchanged (no concurrency requirements)
+    concurrencyUnchanged[t, tnext]
+}
+
+-- Transition: REIMPORT_NON_TERMINAL_CONCURRENCY_GRANTED - Reimport with concurrency granted
+pred reimportNonTerminalConcurrencyGranted[newTid: TaskId, j: Job, q: Queue, t: Time, tnext: Time] {
+    reimportPreConditions[j, t]
+    importNewAttempts[j, t, tnext]
+    reimportCleanup[j, t, tnext]
+    reimportFrameConditions[j, t, tnext]
+
+    -- Pre: new task is not already in use
+    no dbQueuedAt[newTid, t]
+    no bufferedAt[newTid, t]
+    no leaseAt[newTid, t]
+
+    -- Pre: Job requires this queue
+    q in jobQueues[j]
+
+    -- [SILO-REIMP-CONC-1] Pre: queue has capacity after cleanup
+    -- Either empty or holder is for this job's task (will be cleaned up)
+    all tid: TaskId | tid in holdersAt[q, t] implies dbQueuedAt[tid, t] = j
+
+    -- Post: status = Scheduled
+    statusAt[j, tnext] = Scheduled
+
+    -- [SILO-REIMP-CONC-2] Post: new task + holder, old tasks for j removed
+    one qt: DbQueuedTask | qt.db_qtask = newTid and qt.db_qjob = j and qt.db_qtime = tnext
+    all tid: TaskId | tid != newTid implies {
+        (dbQueuedAt[tid, t] = j) implies no dbQueuedAt[tid, tnext]
+        (dbQueuedAt[tid, t] != j) implies dbQueuedAt[tid, tnext] = dbQueuedAt[tid, t]
+    }
+
+    -- Post: new holder for newTid in queue q
+    holdersAt[q, tnext] = newTid
+
+    -- [SILO-REIMP-CONC-5] Scheduled old state removes old request/holder records for this job.
+    (statusAt[j, t] = Scheduled) implies {
+        all q2: Queue | q2 != q implies {
+            all tid: TaskId |
+                tid in holdersAt[q2, tnext] iff (tid in holdersAt[q2, t] and dbQueuedAt[tid, t] != j)
+        }
+        all q2: Queue, tid: TaskId |
+            tid in requestTasksAt[q2, tnext] iff (tid in requestTasksAt[q2, t] and
+                no r: TicketRequest | r.tr_job = j and r.tr_queue = q2 and r.tr_task = tid and r.tr_time = t)
+    }
+    -- [SILO-REIMP-CONC-6] Non-scheduled old state preserves pending requests.
+    (statusAt[j, t] != Scheduled) implies {
+        all q2: Queue | q2 != q implies holdersAt[q2, tnext] = holdersAt[q2, t]
+        all q2: Queue | requestTasksAt[q2, tnext] = requestTasksAt[q2, t]
+    }
+}
+
+-- Transition: REIMPORT_NON_TERMINAL_CONCURRENCY_QUEUED - Reimport with concurrency queued
+pred reimportNonTerminalConcurrencyQueued[newTid: TaskId, j: Job, q: Queue, t: Time, tnext: Time] {
+    reimportPreConditions[j, t]
+    importNewAttempts[j, t, tnext]
+    reimportCleanup[j, t, tnext]
+    reimportFrameConditions[j, t, tnext]
+
+    -- Pre: new task is not already in use
+    no dbQueuedAt[newTid, t]
+    no bufferedAt[newTid, t]
+    no leaseAt[newTid, t]
+
+    -- Pre: Job requires this queue
+    q in jobQueues[j]
+
+    -- [SILO-REIMP-CONC-3] Pre: queue at capacity (holder is for a non-j task)
+    some tid: TaskId | tid in holdersAt[q, t] and dbQueuedAt[tid, t] != j
+
+    -- Post: status = Scheduled
+    statusAt[j, tnext] = Scheduled
+
+    -- [SILO-REIMP-5] Post: remove old DB queue tasks for this job, no new DB task
+    -- [SILO-REIMP-CONC-4] Post: NO task in DB queue for new task (must wait for grant)
+    all tid: TaskId | {
+        (dbQueuedAt[tid, t] = j) implies no dbQueuedAt[tid, tnext]
+        (dbQueuedAt[tid, t] != j) implies dbQueuedAt[tid, tnext] = dbQueuedAt[tid, t]
+    }
+
+    -- Post: create new request for newTid.
+    one r: TicketRequest | r.tr_job = j and r.tr_queue = q and r.tr_task = newTid and r.tr_time = tnext
+    -- [SILO-REIMP-CONC-5] Scheduled old state removes old requests for this job.
+    (statusAt[j, t] = Scheduled) implies {
+        all q2: Queue, tid: TaskId | tid != newTid implies {
+            tid in requestTasksAt[q2, tnext] iff (tid in requestTasksAt[q2, t] and
+                no r: TicketRequest | r.tr_job = j and r.tr_queue = q2 and r.tr_task = tid and r.tr_time = t)
+        }
+    }
+    -- [SILO-REIMP-CONC-6] Non-scheduled old state preserves old requests; stale ones are dropped lazily.
+    (statusAt[j, t] != Scheduled) implies {
+        all q2: Queue, tid: TaskId | tid != newTid implies {
+            tid in requestTasksAt[q2, tnext] iff tid in requestTasksAt[q2, t]
+        }
+    }
+    all q2: Queue | q2 != q implies newTid not in requestTasksAt[q2, tnext]
+    -- [SILO-REIMP-CONC-5] Scheduled old state removes holders for old scheduled tasks.
+    (statusAt[j, t] = Scheduled) implies {
+        all q2: Queue, tid: TaskId |
+            tid in holdersAt[q2, tnext] iff (tid in holdersAt[q2, t] and dbQueuedAt[tid, t] != j)
+    }
+    -- [SILO-REIMP-CONC-6] Non-scheduled old state preserves holder state.
+    (statusAt[j, t] != Scheduled) implies {
+        all q2: Queue | holdersAt[q2, tnext] = holdersAt[q2, t]
+    }
+}
+
 -- System Trace
 pred step[t: Time, tnext: Time] {
     -- Job lifecycle (no concurrency)
@@ -1256,10 +1646,21 @@ pred step[t: Time, tnext: Time] {
     or (some tid: TaskId, j: Job, q: Queue | enqueueWithConcurrencyGranted[tid, j, q, t, tnext])
     or (some tid: TaskId, j: Job, q: Queue | enqueueWithConcurrencyQueued[tid, j, q, t, tnext])
     or (some q: Queue, tid: TaskId | grantNextRequest[q, tid, t, tnext])
+    or (some q: Queue, tid: TaskId | dropStaleRequest[q, tid, t, tnext])
     or (some tid: TaskId, w: Worker, q: Queue | completeSuccessReleaseTicket[tid, w, q, t, tnext])
     or (some tid: TaskId, w: Worker, q: Queue | completeFailurePermanentReleaseTicket[tid, w, q, t, tnext])
     or (some tid: TaskId, w: Worker, q: Queue, newTid: TaskId | completeFailureRetryReleaseTicket[tid, w, q, newTid, t, tnext])
     or (some tid: TaskId, q: Queue | reapExpiredLeaseReleaseTicket[tid, q, t, tnext])
+    -- Import transitions
+    or (some j: Job | importTerminal[j, t, tnext])
+    or (some tid: TaskId, j: Job | importNonTerminal[tid, j, t, tnext])
+    or (some tid: TaskId, j: Job, q: Queue | importNonTerminalConcurrencyGranted[tid, j, q, t, tnext])
+    or (some tid: TaskId, j: Job, q: Queue | importNonTerminalConcurrencyQueued[tid, j, q, t, tnext])
+    -- Reimport transitions
+    or (some j: Job | reimportTerminal[j, t, tnext])
+    or (some newTid: TaskId, j: Job | reimportNonTerminal[newTid, j, t, tnext])
+    or (some newTid: TaskId, j: Job, q: Queue | reimportNonTerminalConcurrencyGranted[newTid, j, q, t, tnext])
+    or (some newTid: TaskId, j: Job, q: Queue | reimportNonTerminalConcurrencyQueued[newTid, j, q, t, tnext])
     -- Stutter
     or stutter[t, tnext]
 }
@@ -1316,12 +1717,14 @@ assert attemptTerminalIsForever {
  */
 assert validTransitions {
     all t: Time - last, j: Job | j in jobExistsAt[t] implies {
-        statusAt[j, t] = Scheduled implies statusAt[j, t.next] in (Scheduled + Running)
+        -- Scheduled can go to Running (dequeue), stay Scheduled (stutter/reimport),
+        -- or go to Succeeded/Failed (reimport with terminal attempts)
+        statusAt[j, t] = Scheduled implies statusAt[j, t.next] in (Scheduled + Running + Succeeded + Failed)
         statusAt[j, t] = Running implies statusAt[j, t.next] in (Running + Succeeded + Failed + Scheduled)
-        -- Succeeded is truly terminal (cannot be restarted)
+        -- Succeeded is truly terminal (cannot be restarted or reimported)
         statusAt[j, t] = Succeeded implies statusAt[j, t.next] = Succeeded
-        -- Failed can transition to Scheduled via restart
-        statusAt[j, t] = Failed implies statusAt[j, t.next] in (Failed + Scheduled)
+        -- Failed can transition to Scheduled (restart) or Succeeded/Failed (reimport)
+        statusAt[j, t] = Failed implies statusAt[j, t.next] in (Failed + Scheduled + Succeeded)
     }
 }
 
@@ -2125,6 +2528,160 @@ pred exampleRetryReleasesTicketForOtherJob {
     }
 }
 
+-- ========== IMPORT/REIMPORT EXAMPLES ==========
+
+/**
+ * Scenario: Import a terminal (succeeded) job
+ * Job is imported directly as Succeeded with a succeeded attempt.
+ * Job was never Running.
+ */
+pred exampleImportSucceeded {
+    some j: Job | {
+        j in jobExistsAt[last]
+        statusAt[j, last] = Succeeded
+        -- Job was never Running
+        all t: Time | j in jobExistsAt[t] implies statusAt[j, t] != Running
+        -- Has a succeeded attempt
+        some a: attemptExistsAt[last] | attemptJob[a] = j and attemptStatusAt[a, last] = AttemptSucceeded
+    }
+}
+
+/**
+ * Scenario: Import job with failed attempt (retries remain), then run and succeed
+ * Job is imported as Scheduled with a pre-existing failed attempt,
+ * then goes through normal dequeue/complete cycle and succeeds.
+ */
+pred exampleImportNonTerminalThenSucceeds {
+    some j: Job, a1, a2: Attempt, t1: Time | {
+        a1 != a2
+        attemptJob[a1] = j
+        attemptJob[a2] = j
+        -- Job is Scheduled with a failed attempt (from import)
+        statusAt[j, t1] = Scheduled
+        a1 in attemptExistsAt[t1]
+        attemptStatusAt[a1, t1] = AttemptFailed
+        -- Job eventually succeeds
+        statusAt[j, last] = Succeeded
+        attemptStatusAt[a2, last] = AttemptSucceeded
+    }
+}
+
+/**
+ * Scenario: Import job with concurrency into full queue
+ * Job is imported with concurrency requirement into a queue at capacity.
+ * A request is created. When capacity frees, job is granted and runs to success.
+ */
+pred exampleImportWithConcurrencyQueued {
+    some tid1, tid2: TaskId, j1, j2: Job, q: Queue, t1, t2, t3: Time | {
+        lt[t1, t2] and lt[t2, t3]
+        j1 != j2
+        tid1 != tid2
+        -- t1: j1 holds the queue, j2 is imported with concurrency queued (has request)
+        some h: TicketHolder | h.th_queue = q and h.th_time = t1
+        j2 in jobExistsAt[t1]
+        some r: TicketRequest | r.tr_job = j2 and r.tr_queue = q and r.tr_time = t1
+        -- t2: j2 granted and running
+        some h: TicketHolder | h.th_task = tid2 and h.th_queue = q and h.th_time = t2
+        statusAt[j2, t2] = Running
+        -- t3: j2 succeeds
+        statusAt[j2, t3] = Succeeded
+    }
+}
+
+/**
+ * Scenario: Import job with 1 failed attempt (Scheduled), then reimport with additional failed attempt
+ * After reimport, job is still Scheduled with 2 failed attempts and a new task.
+ */
+pred exampleReimportAddAttempts {
+    some j: Job, a1, a2: Attempt, t1, t2: Time | {
+        lt[t1, t2]
+        a1 != a2
+        attemptJob[a1] = j
+        attemptJob[a2] = j
+        -- t1: job has 1 failed attempt, Scheduled
+        statusAt[j, t1] = Scheduled
+        a1 in attemptExistsAt[t1]
+        attemptStatusAt[a1, t1] = AttemptFailed
+        a2 not in attemptExistsAt[t1]
+        -- t2: reimported with additional failed attempt, still Scheduled
+        statusAt[j, t2] = Scheduled
+        a1 in attemptExistsAt[t2]
+        a2 in attemptExistsAt[t2]
+        attemptStatusAt[a1, t2] = AttemptFailed
+        attemptStatusAt[a2, t2] = AttemptFailed
+    }
+}
+
+/**
+ * Scenario: Import job as Scheduled with task, then reimport with succeeded attempt
+ * Old task is cleaned up, job becomes terminal Succeeded.
+ */
+pred exampleReimportScheduledToSucceeded {
+    some j: Job, a1: Attempt, tid: TaskId, t1, t2: Time | {
+        lt[t1, t2]
+        attemptJob[a1] = j
+        -- t1: job Scheduled with task in DB queue
+        statusAt[j, t1] = Scheduled
+        dbQueuedAt[tid, t1] = j
+        a1 not in attemptExistsAt[t1]
+        -- t2: reimported with succeeded attempt, now terminal
+        statusAt[j, t2] = Succeeded
+        a1 in attemptExistsAt[t2]
+        attemptStatusAt[a1, t2] = AttemptSucceeded
+        -- Old task cleaned up
+        no dbQueuedAt[tid, t2]
+    }
+}
+
+/**
+ * Scenario: Import job, cancel it, reimport - cancellation preserved
+ * Job is imported, cancelled, then reimported with a terminal attempt.
+ * Cancellation flag is preserved through reimport.
+ */
+pred exampleReimportCancelledJob {
+    some j: Job, a1: Attempt, t1, t2, t3: Time | {
+        lt[t1, t2] and lt[t2, t3]
+        attemptJob[a1] = j
+        -- t1: job imported as Scheduled
+        j in jobExistsAt[t1]
+        statusAt[j, t1] = Scheduled
+        not isCancelledAt[j, t1]
+        -- t2: job cancelled
+        isCancelledAt[j, t2]
+        -- t3: reimported with failed attempt, cancellation preserved
+        a1 in attemptExistsAt[t3]
+        isTerminalAttempt[attemptStatusAt[a1, t3]]
+        isCancelledAt[j, t3]
+    }
+}
+
+/**
+ * Scenario: Full migration cycle - import, reimport, reimport
+ * Import with 0 attempts (Scheduled), reimport adding 1 failed attempt (still Scheduled),
+ * reimport adding succeeded attempt (now terminal Succeeded).
+ */
+pred exampleImportReimportReimportThenRun {
+    some j: Job, a1, a2: Attempt, t1, t2, t3: Time | {
+        lt[t1, t2] and lt[t2, t3]
+        a1 != a2
+        attemptJob[a1] = j
+        attemptJob[a2] = j
+        -- t1: import with 0 attempts, Scheduled
+        j in jobExistsAt[t1]
+        statusAt[j, t1] = Scheduled
+        no a: attemptExistsAt[t1] | attemptJob[a] = j
+        -- t2: reimport with 1 failed attempt, still Scheduled
+        statusAt[j, t2] = Scheduled
+        a1 in attemptExistsAt[t2]
+        attemptStatusAt[a1, t2] = AttemptFailed
+        -- t3: reimport with additional succeeded attempt, terminal
+        statusAt[j, t3] = Succeeded
+        a1 in attemptExistsAt[t3]
+        a2 in attemptExistsAt[t3]
+        attemptStatusAt[a2, t3] = AttemptSucceeded
+    }
+}
+
 /**
  * Asserts that when a job with concurrency releases its ticket on retry,
  * other jobs can acquire the ticket before the retry runs.
@@ -2138,6 +2695,74 @@ assert retryReleasesTicket {
     all tid: TaskId, w: Worker, q: Queue, newTid: TaskId, t: Time - last |
         completeFailureRetryReleaseTicket[tid, w, q, newTid, t, t.next] implies
             no h: TicketHolder | h.th_task = tid and h.th_queue = q and h.th_time = t.next
+}
+
+-- ========== IMPORT/REIMPORT ASSERTIONS ==========
+
+/** All attempts newly created by import are terminal */
+assert importCreatesTerminalAttempts {
+    all j: Job, t: Time - last |
+        (importTerminal[j, t, t.next]
+         or (some tid: TaskId | importNonTerminal[tid, j, t, t.next])
+         or (some tid: TaskId, q: Queue | importNonTerminalConcurrencyGranted[tid, j, q, t, t.next])
+         or (some tid: TaskId, q: Queue | importNonTerminalConcurrencyQueued[tid, j, q, t, t.next]))
+        implies
+            all a: attemptExistsAt[t.next] - attemptExistsAt[t] | isTerminalAttempt[attemptStatusAt[a, t.next]]
+}
+
+/** Existing attempt statuses are unchanged after reimport */
+assert reimportPreservesExistingAttempts {
+    all j: Job, t: Time - last |
+        (reimportTerminal[j, t, t.next]
+         or (some newTid: TaskId | reimportNonTerminal[newTid, j, t, t.next])
+         or (some newTid: TaskId, q: Queue | reimportNonTerminalConcurrencyGranted[newTid, j, q, t, t.next])
+         or (some newTid: TaskId, q: Queue | reimportNonTerminalConcurrencyQueued[newTid, j, q, t, t.next]))
+        implies
+            all a: attemptExistsAt[t] | attemptStatusAt[a, t.next] = attemptStatusAt[a, t]
+}
+
+/** Can't reimport a job with status Running (has lease) */
+assert reimportRejectsRunning {
+    all j: Job, t: Time |
+        (j in jobExistsAt[t] and statusAt[j, t] = Running) implies (
+            not reimportTerminal[j, t, t.next] and
+            not (some newTid: TaskId | reimportNonTerminal[newTid, j, t, t.next]) and
+            not (some newTid: TaskId, q: Queue | reimportNonTerminalConcurrencyGranted[newTid, j, q, t, t.next]) and
+            not (some newTid: TaskId, q: Queue | reimportNonTerminalConcurrencyQueued[newTid, j, q, t, t.next])
+        )
+}
+
+/** Can't reimport a Succeeded job */
+assert reimportRejectsSucceeded {
+    all j: Job, t: Time |
+        (j in jobExistsAt[t] and statusAt[j, t] = Succeeded) implies (
+            not reimportTerminal[j, t, t.next] and
+            not (some newTid: TaskId | reimportNonTerminal[newTid, j, t, t.next]) and
+            not (some newTid: TaskId, q: Queue | reimportNonTerminalConcurrencyGranted[newTid, j, q, t, t.next]) and
+            not (some newTid: TaskId, q: Queue | reimportNonTerminalConcurrencyQueued[newTid, j, q, t, t.next])
+        )
+}
+
+/** Cancellation flag unchanged after reimport */
+assert reimportPreservesCancellation {
+    all j: Job, t: Time - last |
+        (reimportTerminal[j, t, t.next]
+         or (some newTid: TaskId | reimportNonTerminal[newTid, j, t, t.next])
+         or (some newTid: TaskId, q: Queue | reimportNonTerminalConcurrencyGranted[newTid, j, q, t, t.next])
+         or (some newTid: TaskId, q: Queue | reimportNonTerminalConcurrencyQueued[newTid, j, q, t, t.next]))
+        implies
+            (isCancelledAt[j, t.next] iff isCancelledAt[j, t])
+}
+
+/** Import only works on non-existing jobs */
+assert importRejectsExistingJobs {
+    all j: Job, t: Time |
+        j in jobExistsAt[t] implies (
+            not importTerminal[j, t, t.next] and
+            not (some tid: TaskId | importNonTerminal[tid, j, t, t.next]) and
+            not (some tid: TaskId, q: Queue | importNonTerminalConcurrencyGranted[tid, j, q, t, t.next]) and
+            not (some tid: TaskId, q: Queue | importNonTerminalConcurrencyQueued[tid, j, q, t, t.next])
+        )
 }
 
 -- Note: JobState count = Jobs × Times where job exists (not all times)
@@ -2226,52 +2851,97 @@ run exampleRetryReleasesTicketForOtherJob for 5 but exactly 2 Job, 2 Worker, 3 T
 -- TicketRequest: Jobs × Queues × Times but requests are short-lived (~8)
 -- TicketHolder: Queues × Times with limit=1 per queue (~8)
 
-check noDoubleLease for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
-    16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 12 JobCancelled
-check oneLeasePerJob for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
-    16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 12 JobCancelled
-check leaseJobMustBeRunning for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
-    16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 12 JobCancelled
-check runningJobHasRunningAttempt for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
-    16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 12 JobCancelled
-check attemptTerminalIsForever for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
-    16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 12 JobCancelled
-check validTransitions for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
-    16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 12 JobCancelled
-check noZombieAttempts for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
-    16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 12 JobCancelled
-check noQueuedTasksForTerminal for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
-    16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 12 JobCancelled
-check noLeasesForTerminal for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
-    16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 12 JobCancelled
-check cancellationClearedRequiresRestartable for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
-    16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 16 JobCancelled
-check restartedJobIsScheduledWithTask for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
-    16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 16 JobCancelled
+check noDoubleLease for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled
+check oneLeasePerJob for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled
+check leaseJobMustBeRunning for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled
+check runningJobHasRunningAttempt for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled
+check attemptTerminalIsForever for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled
+check validTransitions for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled
+check noZombieAttempts for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled
+check noQueuedTasksForTerminal for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled
+check noLeasesForTerminal for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled
+check cancellationClearedRequiresRestartable for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 16 JobCancelled
+check restartedJobIsScheduledWithTask for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 16 JobCancelled
 
 -- Concurrency ticket assertions (with Queue, TicketRequest, TicketHolder, JobQueueRequirement bounds)
-check queueLimitEnforced for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time, 2 Queue,
-    16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 12 JobCancelled,
+check queueLimitEnforced for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time, 2 Queue,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled,
     4 JobQueueRequirement, 8 TicketRequest, 8 TicketHolder
 
-check holdersRequireActiveTask for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time, 2 Queue,
-    16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 12 JobCancelled,
+check holdersRequireActiveTask for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time, 2 Queue,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled,
     4 JobQueueRequirement, 8 TicketRequest, 8 TicketHolder
 
-check grantedMeansNoRequest for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time, 2 Queue,
-    16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 12 JobCancelled,
+check grantedMeansNoRequest for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time, 2 Queue,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled,
+    4 JobQueueRequirement, 8 TicketRequest, 8 TicketHolder
+
+check noHoldersForTerminal for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time, 2 Queue,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled,
     4 JobQueueRequirement, 8 TicketRequest, 8 TicketHolder
 
 -- Expedite assertions
-check expeditePreservesStatus for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
-    16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 12 JobCancelled
-check expediteRejectsTerminal for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
-    16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 12 JobCancelled
-check expediteRejectsCancelled for 4 but 2 Job, 2 Worker, 3 TaskId, 3 Attempt, 8 Time,
-    16 JobState, 18 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 12 JobCancelled
+check expeditePreservesStatus for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled
+check expediteRejectsTerminal for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled
+check expediteRejectsCancelled for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled
 
 -- Retry with concurrency release assertion
 check retryReleasesTicket for 4 but 2 Job, 2 Worker, 4 TaskId, 4 Attempt, 8 Time, 2 Queue,
-    16 JobState, 18 AttemptState, 8 DbQueuedTask, 8 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled,
+    16 JobState, 24 AttemptState, 8 DbQueuedTask, 8 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled,
     4 JobQueueRequirement, 12 TicketRequest, 12 TicketHolder
 
+-- Import/Reimport examples
+run exampleImportSucceeded for 3 but exactly 1 Job, 1 Worker, 1 TaskId, 1 Attempt, 4 Time,
+    4 JobState, 4 AttemptState, 2 DbQueuedTask, 2 BufferedTask, 1 Lease, 4 AttemptExists, 4 JobExists, 1 JobAttemptRelation, 4 JobCancelled
+
+run exampleImportNonTerminalThenSucceeds for 3 but exactly 1 Job, 1 Worker, 2 TaskId, 2 Attempt, 8 Time,
+    8 JobState, 8 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 2 Lease, 8 AttemptExists, 8 JobExists, 2 JobAttemptRelation, 8 JobCancelled
+
+run exampleImportWithConcurrencyQueued for 4 but exactly 2 Job, 1 Worker, 3 TaskId, 3 Attempt, 12 Time, 1 Queue,
+    24 JobState, 12 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 12 AttemptExists, 12 JobExists, 3 JobAttemptRelation, 24 JobCancelled,
+    2 JobQueueRequirement, 12 TicketRequest, 12 TicketHolder
+
+run exampleReimportAddAttempts for 3 but exactly 1 Job, 1 Worker, 2 TaskId, 2 Attempt, 6 Time,
+    6 JobState, 6 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 2 Lease, 6 AttemptExists, 6 JobExists, 2 JobAttemptRelation, 6 JobCancelled
+
+run exampleReimportScheduledToSucceeded for 3 but exactly 1 Job, 1 Worker, 2 TaskId, 2 Attempt, 6 Time,
+    6 JobState, 6 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 2 Lease, 6 AttemptExists, 6 JobExists, 2 JobAttemptRelation, 6 JobCancelled
+
+run exampleReimportCancelledJob for 3 but exactly 1 Job, 1 Worker, 2 TaskId, 2 Attempt, 8 Time,
+    8 JobState, 8 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 2 Lease, 8 AttemptExists, 8 JobExists, 2 JobAttemptRelation, 8 JobCancelled
+
+run exampleImportReimportReimportThenRun for 3 but exactly 1 Job, 1 Worker, 2 TaskId, 3 Attempt, 8 Time,
+    8 JobState, 8 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 2 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 8 JobCancelled
+
+-- Import/Reimport assertions
+check importCreatesTerminalAttempts for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled
+
+check reimportPreservesExistingAttempts for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled
+
+check reimportRejectsRunning for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled
+
+check reimportRejectsSucceeded for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled
+
+check reimportPreservesCancellation for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 16 JobCancelled
+
+check importRejectsExistingJobs for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled
