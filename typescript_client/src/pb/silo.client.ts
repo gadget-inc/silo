@@ -29,6 +29,8 @@ import type { ReportRefreshOutcomeResponse } from "./silo";
 import type { ReportRefreshOutcomeRequest } from "./silo";
 import type { ReportOutcomeResponse } from "./silo";
 import type { ReportOutcomeRequest } from "./silo";
+import type { LeaseTasksLongPollResponse } from "./silo";
+import type { LeaseTasksLongPollRequest } from "./silo";
 import type { LeaseTasksResponse } from "./silo";
 import type { LeaseTasksRequest } from "./silo";
 import type { LeaseTaskResponse } from "./silo";
@@ -143,6 +145,15 @@ export interface ISiloClient {
      * @generated from protobuf rpc: LeaseTasks
      */
     leaseTasks(input: LeaseTasksRequest, options?: RpcOptions): UnaryCall<LeaseTasksRequest, LeaseTasksResponse>;
+    /**
+     * Long-poll variant of LeaseTasks.
+     * Blocks until tasks are available or timeout is reached.
+     * Returns immediately if tasks are already available.
+     * Avoids the latency overhead of short-polling intervals.
+     *
+     * @generated from protobuf rpc: LeaseTasksLongPoll
+     */
+    leaseTasksLongPoll(input: LeaseTasksLongPollRequest, options?: RpcOptions): UnaryCall<LeaseTasksLongPollRequest, LeaseTasksLongPollResponse>;
     /**
      * Report the outcome of a completed job task.
      * Must be called before the task lease expires.
@@ -369,13 +380,25 @@ export class SiloClient implements ISiloClient, ServiceInfo {
         return stackIntercept<LeaseTasksRequest, LeaseTasksResponse>("unary", this._transport, method, opt, input);
     }
     /**
+     * Long-poll variant of LeaseTasks.
+     * Blocks until tasks are available or timeout is reached.
+     * Returns immediately if tasks are already available.
+     * Avoids the latency overhead of short-polling intervals.
+     *
+     * @generated from protobuf rpc: LeaseTasksLongPoll
+     */
+    leaseTasksLongPoll(input: LeaseTasksLongPollRequest, options?: RpcOptions): UnaryCall<LeaseTasksLongPollRequest, LeaseTasksLongPollResponse> {
+        const method = this.methods[11], opt = this._transport.mergeOptions(options);
+        return stackIntercept<LeaseTasksLongPollRequest, LeaseTasksLongPollResponse>("unary", this._transport, method, opt, input);
+    }
+    /**
      * Report the outcome of a completed job task.
      * Must be called before the task lease expires.
      *
      * @generated from protobuf rpc: ReportOutcome
      */
     reportOutcome(input: ReportOutcomeRequest, options?: RpcOptions): UnaryCall<ReportOutcomeRequest, ReportOutcomeResponse> {
-        const method = this.methods[11], opt = this._transport.mergeOptions(options);
+        const method = this.methods[12], opt = this._transport.mergeOptions(options);
         return stackIntercept<ReportOutcomeRequest, ReportOutcomeResponse>("unary", this._transport, method, opt, input);
     }
     /**
@@ -385,7 +408,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: ReportRefreshOutcome
      */
     reportRefreshOutcome(input: ReportRefreshOutcomeRequest, options?: RpcOptions): UnaryCall<ReportRefreshOutcomeRequest, ReportRefreshOutcomeResponse> {
-        const method = this.methods[12], opt = this._transport.mergeOptions(options);
+        const method = this.methods[13], opt = this._transport.mergeOptions(options);
         return stackIntercept<ReportRefreshOutcomeRequest, ReportRefreshOutcomeResponse>("unary", this._transport, method, opt, input);
     }
     /**
@@ -396,7 +419,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: Heartbeat
      */
     heartbeat(input: HeartbeatRequest, options?: RpcOptions): UnaryCall<HeartbeatRequest, HeartbeatResponse> {
-        const method = this.methods[13], opt = this._transport.mergeOptions(options);
+        const method = this.methods[14], opt = this._transport.mergeOptions(options);
         return stackIntercept<HeartbeatRequest, HeartbeatResponse>("unary", this._transport, method, opt, input);
     }
     /**
@@ -406,7 +429,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: Query
      */
     query(input: QueryRequest, options?: RpcOptions): UnaryCall<QueryRequest, QueryResponse> {
-        const method = this.methods[14], opt = this._transport.mergeOptions(options);
+        const method = this.methods[15], opt = this._transport.mergeOptions(options);
         return stackIntercept<QueryRequest, QueryResponse>("unary", this._transport, method, opt, input);
     }
     /**
@@ -417,7 +440,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: QueryArrow
      */
     queryArrow(input: QueryArrowRequest, options?: RpcOptions): ServerStreamingCall<QueryArrowRequest, ArrowIpcMessage> {
-        const method = this.methods[15], opt = this._transport.mergeOptions(options);
+        const method = this.methods[16], opt = this._transport.mergeOptions(options);
         return stackIntercept<QueryArrowRequest, ArrowIpcMessage>("serverStreaming", this._transport, method, opt, input);
     }
     /**
@@ -428,7 +451,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: CpuProfile
      */
     cpuProfile(input: CpuProfileRequest, options?: RpcOptions): UnaryCall<CpuProfileRequest, CpuProfileResponse> {
-        const method = this.methods[16], opt = this._transport.mergeOptions(options);
+        const method = this.methods[17], opt = this._transport.mergeOptions(options);
         return stackIntercept<CpuProfileRequest, CpuProfileResponse>("unary", this._transport, method, opt, input);
     }
     /**
@@ -441,7 +464,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: RequestSplit
      */
     requestSplit(input: RequestSplitRequest, options?: RpcOptions): UnaryCall<RequestSplitRequest, RequestSplitResponse> {
-        const method = this.methods[17], opt = this._transport.mergeOptions(options);
+        const method = this.methods[18], opt = this._transport.mergeOptions(options);
         return stackIntercept<RequestSplitRequest, RequestSplitResponse>("unary", this._transport, method, opt, input);
     }
     /**
@@ -452,7 +475,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: GetSplitStatus
      */
     getSplitStatus(input: GetSplitStatusRequest, options?: RpcOptions): UnaryCall<GetSplitStatusRequest, GetSplitStatusResponse> {
-        const method = this.methods[18], opt = this._transport.mergeOptions(options);
+        const method = this.methods[19], opt = this._transport.mergeOptions(options);
         return stackIntercept<GetSplitStatusRequest, GetSplitStatusResponse>("unary", this._transport, method, opt, input);
     }
     /**
@@ -464,7 +487,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: ConfigureShard
      */
     configureShard(input: ConfigureShardRequest, options?: RpcOptions): UnaryCall<ConfigureShardRequest, ConfigureShardResponse> {
-        const method = this.methods[19], opt = this._transport.mergeOptions(options);
+        const method = this.methods[20], opt = this._transport.mergeOptions(options);
         return stackIntercept<ConfigureShardRequest, ConfigureShardResponse>("unary", this._transport, method, opt, input);
     }
     /**
@@ -476,7 +499,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: ImportJobs
      */
     importJobs(input: ImportJobsRequest, options?: RpcOptions): UnaryCall<ImportJobsRequest, ImportJobsResponse> {
-        const method = this.methods[20], opt = this._transport.mergeOptions(options);
+        const method = this.methods[21], opt = this._transport.mergeOptions(options);
         return stackIntercept<ImportJobsRequest, ImportJobsResponse>("unary", this._transport, method, opt, input);
     }
     /**
@@ -487,7 +510,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: ResetShards
      */
     resetShards(input: ResetShardsRequest, options?: RpcOptions): UnaryCall<ResetShardsRequest, ResetShardsResponse> {
-        const method = this.methods[21], opt = this._transport.mergeOptions(options);
+        const method = this.methods[22], opt = this._transport.mergeOptions(options);
         return stackIntercept<ResetShardsRequest, ResetShardsResponse>("unary", this._transport, method, opt, input);
     }
     /**
@@ -498,7 +521,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: ForceReleaseShard
      */
     forceReleaseShard(input: ForceReleaseShardRequest, options?: RpcOptions): UnaryCall<ForceReleaseShardRequest, ForceReleaseShardResponse> {
-        const method = this.methods[22], opt = this._transport.mergeOptions(options);
+        const method = this.methods[23], opt = this._transport.mergeOptions(options);
         return stackIntercept<ForceReleaseShardRequest, ForceReleaseShardResponse>("unary", this._transport, method, opt, input);
     }
 }

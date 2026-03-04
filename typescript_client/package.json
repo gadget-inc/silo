@@ -22,6 +22,7 @@
     "lint:fix": "oxfmt && oxlint --type-aware --fix",
     "format": "oxfmt",
     "test:watch": "vitest",
+    "bench": "vitest bench",
     "prepublishOnly": "pnpm run build",
     "typecheck": "tsc --noEmit",
     "prerelease": "gitpkg publish"

@@ -295,7 +295,8 @@ export class SiloWorker<
   }
 
   /**
-   * Start the worker. This will begin polling for tasks and executing them.
+   * Start the worker with short polling. This will begin polling for tasks
+   * at regular intervals and executing them.
    * Returns immediately after starting the polling loops.
    */
   public start(): void {
@@ -312,6 +313,32 @@ export class SiloWorker<
     // Start the configured number of pollers
     for (let i = 0; i < this._concurrentPollers; i++) {
       this._pollerPromises.push(this._pollLoop());
+    }
+  }
+
+  /**
+   * Start the worker with long polling. The server will hold requests open
+   * until tasks are available, providing much lower latency than short polling.
+   *
+   * @param longPollTimeoutMs Maximum time each long-poll request will block on the
+   *   server waiting for tasks. Server caps at 60000ms. Default: 30000ms.
+   */
+  public startLongPoll(longPollTimeoutMs = 30000): void {
+    if (this._running) {
+      return;
+    }
+
+    this._running = true;
+    this._abortController = new AbortController();
+
+    // Reset the queue in case we're restarting
+    this._taskQueue = new PQueue({ concurrency: this._maxConcurrentTasks });
+
+    // Start long-poll loops, each pinned to a specific server index.
+    // Unlike short polling (which cycles rapidly), long-poll requests block
+    // for the full timeout, so each poller must be dedicated to one server.
+    for (let i = 0; i < this._concurrentPollers; i++) {
+      this._pollerPromises.push(this._longPollLoop(longPollTimeoutMs, i));
     }
   }
 
@@ -353,7 +380,7 @@ export class SiloWorker<
   }
 
   /**
-   * The main polling loop for a single poller.
+   * The main polling loop for a single poller (short polling).
    */
   private async _pollLoop(): Promise<void> {
     while (this._running) {
@@ -368,6 +395,24 @@ export class SiloWorker<
       // Wait before polling again if we're still running
       if (this._running) {
         await this._sleep(this._pollIntervalMs);
+      }
+    }
+  }
+
+  /**
+   * The main polling loop for long-poll mode.
+   * No sleep between polls since the server handles the waiting.
+   */
+  private async _longPollLoop(timeoutMs: number, serverIndex: number): Promise<void> {
+    while (this._running) {
+      try {
+        await this._longPoll(timeoutMs, serverIndex);
+      } catch (error) {
+        if (this._running) {
+          this._onError(error instanceof Error ? error : new Error(String(error)));
+          // Brief backoff on error to avoid tight error loop
+          await this._sleep(1000);
+        }
       }
     }
   }
@@ -412,6 +457,53 @@ export class SiloWorker<
     }
 
     // Handle refresh tasks
+    if (result.refreshTasks.length > 0) {
+      if (!this._refreshHandler) {
+        throw new Error(
+          `Worker received ${result.refreshTasks.length} floating limit refresh task(s) but no refreshHandler is configured. ` +
+            `Configure a refreshHandler in SiloWorkerOptions to handle floating concurrency limits.`,
+        );
+      }
+      for (const refreshTask of result.refreshTasks) {
+        this._enqueueRefreshTask(refreshTask);
+      }
+    }
+  }
+
+  /**
+   * Long-poll variant: blocks on the server until tasks are available.
+   */
+  private async _longPoll(timeoutMs: number, serverIndex: number): Promise<void> {
+    // Wait if the queue is too full
+    while (this._running && this._taskQueue.size >= this._maxConcurrentTasks) {
+      await this._sleep(this._pollIntervalMs / 2);
+    }
+
+    if (!this._running) {
+      return;
+    }
+
+    const availableQueueSlots = this._maxConcurrentTasks - this._taskQueue.size;
+    if (availableQueueSlots <= 0) {
+      return;
+    }
+
+    const tasksToRequest = Math.min(availableQueueSlots, this._tasksPerPoll);
+    const result = await this._client.leaseTasksLongPoll(
+      {
+        workerId: this._workerId,
+        maxTasks: tasksToRequest,
+        taskGroup: this._taskGroup,
+        timeoutMs,
+      },
+      serverIndex,
+      this._abortController?.signal,
+    );
+
+    for (const task of result.tasks) {
+      this._enqueueTask(task);
+    }
+
     if (result.refreshTasks.length > 0) {
       if (!this._refreshHandler) {
         throw new Error(
