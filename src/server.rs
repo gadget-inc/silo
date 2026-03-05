@@ -712,7 +712,7 @@ impl SiloService {
         };
 
         // Validate tenant_id is within the shard's range
-        if !shard_info.range.contains(tenant_id) {
+        if !shard_info.contains(tenant_id) {
             tracing::warn!(
                 shard_id = %shard_id,
                 tenant_id = %tenant_id,

@@ -1,14 +1,35 @@
-//! Range-based shard coordination types.
+//! Hash-based shard coordination types.
 //!
-//! This module defines the core data structures for range-based sharding,
-//! where the tenant_id keyspace is split into lexicographical ranges,
-//! each owned by a shard with a unique UUID identity.
+//! This module defines the core data structures for hash-based sharding,
+//! where tenant IDs are hashed (FNV-1a) into a uniform keyspace and then
+//! assigned to shards via lexicographical ranges over the hex-encoded hash.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
 
 use crate::coordination::SplitPhase;
+
+/// Hash a tenant ID to a 16-character hex string using FNV-1a with
+/// splitmix64 finalization for strong avalanche properties.
+///
+/// This ensures uniform distribution across the shard keyspace regardless
+/// of the structure of tenant ID strings (e.g. shared prefixes like "env-").
+pub fn hash_tenant(tenant_id: &str) -> String {
+    // FNV-1a accumulation
+    let mut hash: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
+    for byte in tenant_id.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3); // FNV-1a prime
+    }
+    // splitmix64 finalization — ensures full avalanche even for similar inputs
+    hash ^= hash >> 30;
+    hash = hash.wrapping_mul(0xbf58476d1ce4e5b9);
+    hash ^= hash >> 27;
+    hash = hash.wrapping_mul(0x94d049bb133111eb);
+    hash ^= hash >> 31;
+    format!("{:016x}", hash)
+}
 
 /// A unique identifier for a shard.
 ///
@@ -69,13 +90,14 @@ impl From<ShardId> for Uuid {
     }
 }
 
-/// A lexicographical range of tenant IDs owned by a shard.
+/// A range in the hash keyspace owned by a shard.
 ///
 /// Ranges are defined as `[start, end)` where:
 /// - `start` is inclusive (empty string means unbounded start, i.e., from the beginning)
 /// - `end` is exclusive (empty string means unbounded end, i.e., to infinity)
 ///
-/// Tenant IDs are compared lexicographically (byte-by-byte string comparison).
+/// Boundaries are 16-character hex-encoded u64 hash values.
+/// Use `contains_tenant` (which hashes the tenant ID first) for tenant lookups.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardRange {
     /// Inclusive start of the range. Empty string means unbounded (from beginning).
@@ -112,6 +134,14 @@ impl ShardRange {
         let before_end = self.end.is_empty() || tenant_id < self.end.as_str();
 
         after_start && before_end
+    }
+
+    /// Check if this range contains the hash of the given tenant ID.
+    ///
+    /// Hashes the tenant ID with FNV-1a and checks if the result falls
+    /// within this range's bounds.
+    pub fn contains_tenant(&self, tenant_id: &str) -> bool {
+        self.contains(&hash_tenant(tenant_id))
     }
 
     /// Check if this range is unbounded at the start.
@@ -177,81 +207,30 @@ impl ShardRange {
         Ok((left, right))
     }
 
-    /// Compute the lexicographic midpoint of this range for auto-split.
+    /// Compute the numeric midpoint of this hash-space range for auto-split.
     ///
-    /// Returns None if the range cannot be split (e.g., single character range).
+    /// Interprets the range boundaries as 16-character hex-encoded u64 values
+    /// and returns the midpoint as a 16-character hex string.
+    /// Returns None if the range is too small to split.
     pub fn midpoint(&self) -> Option<String> {
-        // For unbounded ranges, we need to pick reasonable bounds
-        let effective_start = if self.start.is_empty() {
-            "0".to_string()
+        let start_val: u64 = if self.start.is_empty() {
+            0
         } else {
-            self.start.clone()
+            u64::from_str_radix(&self.start, 16).ok()?
         };
 
-        let effective_end = if self.end.is_empty() {
-            // Use a reasonably high value (all 'z's)
-            "zzzzzzzz".to_string()
+        let end_val: u64 = if self.end.is_empty() {
+            u64::MAX
         } else {
-            self.end.clone()
+            u64::from_str_radix(&self.end, 16).ok()?
         };
 
-        // Simple midpoint: take first char of start, compute midpoint with first char of end
-        // This is a simplified approach; a production system might use more sophisticated logic
-        if effective_start >= effective_end {
+        if end_val <= start_val + 1 {
             return None;
         }
 
-        // Binary search through the string space
-        let start_bytes = effective_start.as_bytes();
-        let end_bytes = effective_end.as_bytes();
-
-        // Find the first differing position
-        let min_len = start_bytes.len().min(end_bytes.len());
-        let mut diff_pos = 0;
-        while diff_pos < min_len && start_bytes[diff_pos] == end_bytes[diff_pos] {
-            diff_pos += 1;
-        }
-
-        if diff_pos == min_len {
-            // One is a prefix of the other
-            if start_bytes.len() < end_bytes.len() {
-                // Start is shorter; extend start with a character that keeps us below end.
-                // Since start is a prefix of end, start + C < end when C < end_bytes[diff_pos].
-                let end_char_at_diff = end_bytes[diff_pos];
-                if end_char_at_diff >= 2 {
-                    let mid_char = end_char_at_diff / 2;
-                    let mut mid = effective_start.clone();
-                    mid.push(mid_char as char);
-                    return Some(mid);
-                }
-            }
-            return None;
-        }
-
-        // Compute midpoint at the differing position
-        let start_char = start_bytes[diff_pos];
-        let end_char = end_bytes[diff_pos];
-
-        if end_char <= start_char + 1 {
-            // Too close to split at this level, extend
-            let mut mid = String::from_utf8_lossy(&start_bytes[..=diff_pos]).to_string();
-            mid.push('~'); // High ASCII value
-            if mid.as_str() > effective_start.as_str() && mid.as_str() < effective_end.as_str() {
-                return Some(mid);
-            }
-            return None;
-        }
-
-        let mid_char = start_char + (end_char - start_char) / 2;
-        let mut result = String::from_utf8_lossy(&start_bytes[..diff_pos]).to_string();
-        result.push(mid_char as char);
-
-        // Validate the result
-        if result.as_str() > effective_start.as_str() && result.as_str() < effective_end.as_str() {
-            Some(result)
-        } else {
-            None
-        }
+        let mid = start_val + (end_val - start_val) / 2;
+        Some(format!("{:016x}", mid))
     }
 }
 
@@ -341,8 +320,10 @@ impl ShardInfo {
     }
 
     /// Check if this shard's range contains the given tenant ID.
+    ///
+    /// Hashes the tenant ID before checking the range.
     pub fn contains(&self, tenant_id: &str) -> bool {
-        self.range.contains(tenant_id)
+        self.range.contains_tenant(tenant_id)
     }
 }
 
@@ -434,9 +415,9 @@ impl ShardMap {
 
     /// Create an initial shard map with the given number of shards.
     ///
-    /// Divides the keyspace evenly among shards using hex prefixes.
-    /// For example, with 16 shards, each shard owns 1/16th of the keyspace
-    /// based on the first hex digit of the tenant ID hash.
+    /// Divides the u64 hash keyspace evenly among shards.
+    /// Tenant IDs are hashed with FNV-1a before lookup, so the
+    /// boundaries are 16-character hex strings in hash space.
     pub fn create_initial(shard_count: u32) -> Result<Self, ShardMapError> {
         if shard_count == 0 {
             return Err(ShardMapError::InvalidShardCount(
@@ -498,7 +479,7 @@ impl ShardMap {
 
     /// Find the shard that owns the given tenant ID.
     ///
-    /// Uses binary search for efficient lookup.
+    /// Hashes the tenant ID with FNV-1a and uses binary search for efficient lookup.
     /// Returns None if the map is empty or the tenant ID doesn't fall in any range
     /// (which should not happen in a valid map).
     pub fn shard_for_tenant(&self, tenant_id: &str) -> Option<&ShardInfo> {
@@ -506,25 +487,23 @@ impl ShardMap {
             return None;
         }
 
-        // Binary search to find the shard whose range contains this tenant
-        // We search for the rightmost shard where start <= tenant_id
+        let hashed = hash_tenant(tenant_id);
+        let hashed_str = hashed.as_str();
+
+        // Binary search to find the shard whose range contains this tenant's hash
         let idx = self.shards.partition_point(|shard| {
-            // For unbounded start (empty string), it's always <= tenant_id
-            shard.range.start.is_empty() || shard.range.start.as_str() <= tenant_id
+            shard.range.start.is_empty() || shard.range.start.as_str() <= hashed_str
         });
 
-        // partition_point returns the index where we'd insert, so we need idx - 1
         if idx == 0 {
-            // tenant_id is before all shards - check first shard
-            // This can happen if first shard has unbounded start
-            if self.shards[0].range.contains(tenant_id) {
+            if self.shards[0].range.contains(hashed_str) {
                 return Some(&self.shards[0]);
             }
             return None;
         }
 
         let candidate = &self.shards[idx - 1];
-        if candidate.range.contains(tenant_id) {
+        if candidate.range.contains(hashed_str) {
             Some(candidate)
         } else {
             None
@@ -711,40 +690,19 @@ pub enum ShardMapError {
 
 /// Compute evenly-spaced range boundaries for the given shard count.
 ///
-/// Returns `shard_count - 1` boundary strings that divide the keyspace.
-/// Uses a simple hex-based scheme for predictable distribution.
+/// Returns `shard_count - 1` boundary strings that divide the u64 hash
+/// keyspace into equal-sized partitions, formatted as 16-character hex strings.
 fn compute_range_boundaries(shard_count: u32) -> Vec<String> {
     if shard_count <= 1 {
         return Vec::new();
     }
 
     let mut boundaries = Vec::with_capacity((shard_count - 1) as usize);
+    let space: u128 = 1u128 << 64; // 2^64
 
-    // We'll use a simple scheme based on hex characters
-    // For up to 16 shards, we use single hex digits
-    // For more, we use multi-character boundaries
-    if shard_count <= 16 {
-        // Use hex digits 0-f to create boundaries
-        let hex_chars: Vec<char> = "0123456789abcdef".chars().collect();
-        let step = 16 / shard_count;
-        for i in 1..shard_count {
-            let idx = (i * step) as usize;
-            if idx < hex_chars.len() {
-                boundaries.push(hex_chars[idx].to_string());
-            }
-        }
-    } else if shard_count <= 256 {
-        // Use two hex digits
-        for i in 1..shard_count {
-            let boundary = (i * 256 / shard_count) as u8;
-            boundaries.push(format!("{:02x}", boundary));
-        }
-    } else {
-        // Use four hex digits for larger shard counts
-        for i in 1..shard_count {
-            let boundary = (i as u64 * 65536 / shard_count as u64) as u16;
-            boundaries.push(format!("{:04x}", boundary));
-        }
+    for i in 1..shard_count {
+        let boundary = (i as u128 * space / shard_count as u128) as u64;
+        boundaries.push(format!("{:016x}", boundary));
     }
 
     boundaries
