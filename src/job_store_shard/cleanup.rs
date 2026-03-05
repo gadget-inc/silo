@@ -247,7 +247,7 @@ impl JobStoreShard {
             progress.keys_scanned += 1;
 
             if let Some(tenant) = extract_tenant(&kv.key, &kv.value)
-                && !range.contains(&tenant)
+                && !range.contains_tenant(&tenant)
             {
                 batch.delete(&kv.key);
                 batch_count += 1;

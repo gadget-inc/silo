@@ -2,14 +2,11 @@ use std::collections::HashSet;
 
 use silo::shard_range::ShardMap;
 
-/// Demonstrates that all tenants with the format "env-XXXXXXXXXX" (env- followed by a
-/// 10-digit number, matching Gadget's environment ID tenant keys) land on the same shard
-/// because silo uses lexicographic range-based sharding on the raw tenant string.
-///
-/// Since all these tenants share the "env-" prefix, they cluster in the same region of the
-/// keyspace and will always be assigned to whichever shard's range covers that prefix.
+/// Demonstrates that hash-based sharding distributes env-XXXXXXXXXX tenants
+/// across multiple shards, avoiding the hotspot that occurred with
+/// lexicographic range-based sharding.
 #[silo::test]
-fn all_env_tenants_with_10_digit_ids_land_on_same_shard() {
+fn env_tenants_with_10_digit_ids_spread_across_shards() {
     // Test across multiple shard counts that are realistic for production
     for shard_count in [2, 4, 8, 16] {
         let map = ShardMap::create_initial(shard_count).unwrap();
@@ -34,27 +31,22 @@ fn all_env_tenants_with_10_digit_ids_land_on_same_shard() {
             shard_ids.insert(shard.id);
         }
 
-        assert_eq!(
-            shard_ids.len(),
-            1,
-            "With {} shards, all env-XXXXXXXXXX tenants should land on the same shard, \
-             but they were distributed across {} shards. \
-             Shard ranges: {:?}",
+        assert!(
+            shard_ids.len() > 1,
+            "With {} shards, env-XXXXXXXXXX tenants should spread across multiple shards, \
+             but they all landed on {} shard(s)",
             shard_count,
             shard_ids.len(),
-            map.shards()
-                .iter()
-                .map(|s| format!("{}: {}", s.id, s.range))
-                .collect::<Vec<_>>()
         );
     }
 }
 
-/// Shows that even with many more tenants, they all still land on the same shard
-/// because the discriminating part (the numeric ID) comes after the shared "env-" prefix.
+/// Shows that with many tenants, hash-based sharding distributes them well
+/// across all available shards.
 #[silo::test]
-fn env_tenants_do_not_spread_across_shards_even_with_many_tenants() {
-    let map = ShardMap::create_initial(16).unwrap();
+fn env_tenants_spread_across_shards_with_many_tenants() {
+    let shard_count = 16;
+    let map = ShardMap::create_initial(shard_count).unwrap();
 
     let mut shard_ids = HashSet::new();
     // Generate 1000 different env- tenant keys
@@ -64,45 +56,19 @@ fn env_tenants_do_not_spread_across_shards_even_with_many_tenants() {
         shard_ids.insert(shard.id);
     }
 
-    assert_eq!(
-        shard_ids.len(),
-        1,
-        "All 1000 env- tenants should land on the same shard with 16 shards, \
-         but they were distributed across {} shards",
+    assert!(
+        shard_ids.len() >= shard_count as usize - 1,
+        "1000 env- tenants should spread across nearly all {} shards, \
+         but only hit {} shards",
+        shard_count,
         shard_ids.len()
     );
 }
 
-/// Confirms the root cause: the "env-" prefix falls entirely within one shard range
-/// because range boundaries are hex characters (0-9, a-f) and "e" < "env-" < "f".
+/// Confirms that both env- prefixed tenants and diverse tenants distribute
+/// across shards, since hashing eliminates prefix-based clustering.
 #[silo::test]
-fn env_prefix_falls_in_single_range_because_boundaries_are_hex() {
-    let map = ShardMap::create_initial(16).unwrap();
-
-    // Find which shard owns "env-" prefixed tenants
-    let shard = map.shard_for_tenant("env-1234567890").unwrap();
-
-    // The shard range should contain the entire "env-" prefix space
-    // since all env-XXXXXXXXXX strings are lexicographically between "e" and "f"
-    let range = &shard.range;
-
-    // Verify: the range start is <= "e" and the range end is >= "f" (or unbounded)
-    // meaning all "env-*" strings fall within this single range
-    let start_covers = range.start.is_empty() || range.start.as_str() <= "e";
-    let end_covers = range.end.is_empty() || range.end.as_str() > "env-9999999999";
-
-    assert!(
-        start_covers && end_covers,
-        "Expected a single shard range to cover all env- tenants. \
-         Range: {}, start_covers: {}, end_covers: {}",
-        range, start_covers, end_covers
-    );
-}
-
-/// Contrasts env- tenants with tenants that have diverse prefixes to show that
-/// diverse prefixes DO spread across shards, while env- does not.
-#[silo::test]
-fn diverse_tenant_prefixes_spread_across_shards_but_env_does_not() {
+fn both_env_and_diverse_tenants_spread_across_shards() {
     let map = ShardMap::create_initial(16).unwrap();
 
     // Diverse tenants spread across shards
@@ -118,8 +84,8 @@ fn diverse_tenant_prefixes_spread_across_shards_but_env_does_not() {
         diverse_shard_ids.insert(shard.id);
     }
 
-    // env- tenants all on one shard
-    let env_tenants: Vec<String> = (0..16).map(|i| format!("env-{:010}", i)).collect();
+    // env- tenants also spread across shards (use more tenants for statistical reliability)
+    let env_tenants: Vec<String> = (0..100).map(|i| format!("env-{:010}", i)).collect();
     let mut env_shard_ids = HashSet::new();
     for tenant in &env_tenants {
         let shard = map.shard_for_tenant(tenant).unwrap();
@@ -131,10 +97,25 @@ fn diverse_tenant_prefixes_spread_across_shards_but_env_does_not() {
         "Diverse tenants should spread across multiple shards, got {}",
         diverse_shard_ids.len()
     );
-    assert_eq!(
-        env_shard_ids.len(),
-        1,
-        "All env- tenants should land on exactly 1 shard, got {}",
+    assert!(
+        env_shard_ids.len() > 1,
+        "env- tenants should spread across multiple shards, got {}",
         env_shard_ids.len()
     );
+}
+
+/// Verifies that the same tenant always maps to the same shard (determinism).
+#[silo::test]
+fn hash_based_sharding_is_deterministic() {
+    let map = ShardMap::create_initial(16).unwrap();
+
+    for tenant in ["env-1234567890", "env-0000000001", "tenant-abc", "foo"] {
+        let shard1 = map.shard_for_tenant(tenant).unwrap();
+        let shard2 = map.shard_for_tenant(tenant).unwrap();
+        assert_eq!(
+            shard1.id, shard2.id,
+            "tenant '{}' should always map to the same shard",
+            tenant
+        );
+    }
 }

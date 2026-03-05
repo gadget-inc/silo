@@ -156,7 +156,7 @@ impl ConcurrencyCounts {
             };
 
             // Filter by shard range - only hydrate holders for tenants in this shard
-            if !range.contains(&parsed.tenant) {
+            if !range.contains_tenant(&parsed.tenant) {
                 tracing::debug!(
                     tenant = %parsed.tenant,
                     queue = %parsed.queue,
@@ -664,7 +664,7 @@ impl ConcurrencyManager {
             };
 
             // Only process requests for tenants in our range
-            if !range.contains(&parsed.tenant) {
+            if !range.contains_tenant(&parsed.tenant) {
                 continue;
             }
 
