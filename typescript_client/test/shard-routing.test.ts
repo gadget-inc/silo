@@ -23,18 +23,16 @@ describe("Shard Routing", () => {
     });
   });
 
-  describe("shardForTenant hash-based lookup", () => {
-    it("routes tenant to correct shard based on hash", () => {
-      // Use hash-space boundaries (16-char hex)
+  describe("shardForTenant lexicographic lookup (expects hash-space keys)", () => {
+    it("finds correct shard for key in range", () => {
       const shards: ShardInfoWithRange[] = [
         { shardId: "shard-1", serverAddr: "server-a:7450", rangeStart: "", rangeEnd: "8000000000000000" },
         { shardId: "shard-2", serverAddr: "server-b:7450", rangeStart: "8000000000000000", rangeEnd: "" },
       ];
 
-      // Every tenant should land on one of the two shards
-      const result = shardForTenant("test-tenant", shards);
-      expect(result).toBeDefined();
-      expect(["shard-1", "shard-2"]).toContain(result?.shardId);
+      // Keys in hash space — direct lexicographic comparison
+      expect(shardForTenant("3000000000000000", shards)?.shardId).toBe("shard-1");
+      expect(shardForTenant("a000000000000000", shards)?.shardId).toBe("shard-2");
     });
 
     it("handles single full-range shard", () => {
@@ -42,14 +40,14 @@ describe("Shard Routing", () => {
         { shardId: "shard-1", serverAddr: "server-a:7450", rangeStart: "", rangeEnd: "" },
       ];
 
-      expect(shardForTenant("any-tenant", shards)?.shardId).toBe("shard-1");
+      expect(shardForTenant("anything", shards)?.shardId).toBe("shard-1");
     });
 
     it("returns undefined for empty shards array", () => {
-      expect(shardForTenant("tenant", [])).toBeUndefined();
+      expect(shardForTenant("key", [])).toBeUndefined();
     });
 
-    it("handles multiple shard ranges in hash space", () => {
+    it("handles multiple shard ranges", () => {
       const shards: ShardInfoWithRange[] = [
         { shardId: "shard-1", serverAddr: "server-a:7450", rangeStart: "", rangeEnd: "4000000000000000" },
         { shardId: "shard-2", serverAddr: "server-b:7450", rangeStart: "4000000000000000", rangeEnd: "8000000000000000" },
@@ -57,23 +55,29 @@ describe("Shard Routing", () => {
         { shardId: "shard-4", serverAddr: "server-b:7450", rangeStart: "c000000000000000", rangeEnd: "" },
       ];
 
-      // All tenants should route to exactly one shard
-      for (const tenant of ["tenant-1", "tenant-2", "env-123", "zebra", "apple"]) {
-        const result = shardForTenant(tenant, shards);
-        expect(result).toBeDefined();
-        expect(["shard-1", "shard-2", "shard-3", "shard-4"]).toContain(result?.shardId);
-      }
+      expect(shardForTenant("1000000000000000", shards)?.shardId).toBe("shard-1");
+      expect(shardForTenant("5000000000000000", shards)?.shardId).toBe("shard-2");
+      expect(shardForTenant("9000000000000000", shards)?.shardId).toBe("shard-3");
+      expect(shardForTenant("d000000000000000", shards)?.shardId).toBe("shard-4");
     });
 
-    it("same tenant always routes to same shard", () => {
+    it("end-to-end: hashTenant + shardForTenant routes tenants correctly", () => {
       const shards: ShardInfoWithRange[] = [
         { shardId: "shard-1", serverAddr: "server-a:7450", rangeStart: "", rangeEnd: "8000000000000000" },
         { shardId: "shard-2", serverAddr: "server-b:7450", rangeStart: "8000000000000000", rangeEnd: "" },
       ];
 
-      const result1 = shardForTenant("my-tenant", shards);
-      const result2 = shardForTenant("my-tenant", shards);
-      expect(result1?.shardId).toBe(result2?.shardId);
+      // Hash first, then look up — this is what _resolveShard does
+      for (const tenant of ["test-tenant", "env-123", "bench-0"]) {
+        const result = shardForTenant(hashTenant(tenant), shards);
+        expect(result).toBeDefined();
+        expect(["shard-1", "shard-2"]).toContain(result?.shardId);
+      }
+
+      // Same tenant always routes to same shard
+      const r1 = shardForTenant(hashTenant("my-tenant"), shards);
+      const r2 = shardForTenant(hashTenant("my-tenant"), shards);
+      expect(r1?.shardId).toBe(r2?.shardId);
     });
   });
 
