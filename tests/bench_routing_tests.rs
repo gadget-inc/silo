@@ -11,6 +11,7 @@ use silo::pb::silo_client::SiloClient;
 use silo::pb::*;
 use silo::server::run_server;
 use silo::settings::{AppConfig, Backend, DatabaseTemplate};
+use silo::shard_range::hash_tenant;
 use tokio::net::TcpListener;
 
 /// Helper to set up a multi-shard test server using the production code path.
@@ -113,21 +114,23 @@ async fn bench_tenant_routing_with_shard_ranges() -> anyhow::Result<()> {
         // The bench tenants: "bench-0", "bench-1", "bench-2", "bench-3"
         let tenants = vec!["bench-0", "bench-1", "bench-2", "bench-3"];
 
-        // For each tenant, find the shard that owns it by checking ranges
+        // For each tenant, find the shard that owns it by hashing the tenant
+        // and checking against the hash-space range boundaries.
         // This is what silo-bench SHOULD do (but didn't before the fix)
         for tenant in &tenants {
+            let hashed = hash_tenant(tenant);
             let owning_shard = cluster_info
                 .shard_owners
                 .iter()
                 .find(|owner| {
                     let after_start =
-                        owner.range_start.is_empty() || *tenant >= owner.range_start.as_str();
+                        owner.range_start.is_empty() || hashed.as_str() >= owner.range_start.as_str();
                     let before_end =
-                        owner.range_end.is_empty() || *tenant < owner.range_end.as_str();
+                        owner.range_end.is_empty() || hashed.as_str() < owner.range_end.as_str();
                     after_start && before_end
                 })
                 .unwrap_or_else(|| {
-                    panic!("tenant '{}' should be owned by some shard", tenant)
+                    panic!("tenant '{}' (hash '{}') should be owned by some shard", tenant, hashed)
                 });
 
             // Enqueue to the correct shard -- this should succeed
@@ -164,12 +167,13 @@ async fn bench_tenant_routing_with_shard_ranges() -> anyhow::Result<()> {
         // Now demonstrate the bug: if we pick the WRONG shard for a tenant,
         // the server rejects it with FailedPrecondition
         let first_shard = &cluster_info.shard_owners[0];
-        // Find a tenant NOT in the first shard's range
+        // Find a tenant NOT in the first shard's range (using hashed comparison)
         let wrong_tenant = tenants.iter().find(|tenant| {
+            let hashed = hash_tenant(tenant);
             let after_start =
-                first_shard.range_start.is_empty() || **tenant >= first_shard.range_start.as_str();
+                first_shard.range_start.is_empty() || hashed.as_str() >= first_shard.range_start.as_str();
             let before_end =
-                first_shard.range_end.is_empty() || **tenant < first_shard.range_end.as_str();
+                first_shard.range_end.is_empty() || hashed.as_str() < first_shard.range_end.as_str();
             !(after_start && before_end)
         });
 

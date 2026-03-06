@@ -250,22 +250,50 @@ export interface ShardInfoWithRange {
 }
 
 /**
- * Find the shard that owns a given tenant ID using range-based lookup.
+ * Hash a tenant ID to a 16-character hex string using FNV-1a with
+ * splitmix64 finalization. Must match the Rust `hash_tenant` implementation
+ * in `src/shard_range.rs` exactly.
+ */
+export function hashTenant(tenantId: string): string {
+  const MASK = 0xffffffffffffffffn;
+  const FNV_OFFSET = 0xcbf29ce484222325n;
+  const FNV_PRIME = 0x100000001b3n;
+
+  // FNV-1a accumulation
+  let hash = FNV_OFFSET;
+  for (let i = 0; i < tenantId.length; i++) {
+    hash ^= BigInt(tenantId.charCodeAt(i));
+    hash = (hash * FNV_PRIME) & MASK;
+  }
+
+  // splitmix64 finalization
+  hash ^= hash >> 30n;
+  hash = (hash * 0xbf58476d1ce4e5b9n) & MASK;
+  hash ^= hash >> 27n;
+  hash = (hash * 0x94d049bb133111ebn) & MASK;
+  hash ^= hash >> 31n;
+
+  return hash.toString(16).padStart(16, "0");
+}
+
+/**
+ * Find the shard whose range contains the given key using lexicographic comparison.
+ * The key should already be in hash space (use hashTenant() first for tenant IDs).
  * Shards should be sorted by rangeStart for efficient binary search.
- * @param tenantId The tenant identifier
+ * @param key The hash-space key to look up
  * @param shards Array of shards sorted by rangeStart
  * @returns The shard info, or undefined if no shard found
  */
 export function shardForTenant(
-  tenantId: string,
+  key: string,
   shards: ShardInfoWithRange[],
 ): ShardInfoWithRange | undefined {
   if (shards.length === 0) {
     return undefined;
   }
 
-  // Binary search to find the shard whose range contains the tenant
-  // We're looking for the last shard where rangeStart <= tenantId
+  // Binary search to find the shard whose range contains the key
+  // We're looking for the last shard where rangeStart <= key
   let left = 0;
   let right = shards.length - 1;
   let result: ShardInfoWithRange | undefined = undefined;
@@ -274,23 +302,23 @@ export function shardForTenant(
     const mid = Math.floor((left + right) / 2);
     const shard = shards[mid];
 
-    // Check if tenantId >= rangeStart (empty rangeStart means -infinity)
-    const afterStart = shard.rangeStart === "" || tenantId >= shard.rangeStart;
+    // Check if key >= rangeStart (empty rangeStart means -infinity)
+    const afterStart = shard.rangeStart === "" || key >= shard.rangeStart;
 
     if (afterStart) {
-      // This shard's rangeStart is <= tenantId, could be a candidate
+      // This shard's rangeStart is <= key, could be a candidate
       result = shard;
       left = mid + 1; // Look for a shard with a later rangeStart
     } else {
-      right = mid - 1; // rangeStart > tenantId, look earlier
+      right = mid - 1; // rangeStart > key, look earlier
     }
   }
 
-  // Verify the tenant is within the range (before rangeEnd)
+  // Verify the key is within the range (before rangeEnd)
   if (result) {
-    const beforeEnd = result.rangeEnd === "" || tenantId < result.rangeEnd;
+    const beforeEnd = result.rangeEnd === "" || key < result.rangeEnd;
     if (!beforeEnd) {
-      // The tenant is >= rangeEnd, so it's not in this shard's range
+      // The key is >= rangeEnd, so it's not in this shard's range
       // This shouldn't happen if shards cover the full keyspace
       return undefined;
     }
@@ -1285,7 +1313,8 @@ export class SiloGRPCClient {
     if (this._shards.length === 0) {
       throw new Error("Cluster topology not discovered yet. Call refreshTopology() first.");
     }
-    const shardInfo = shardForTenant(tenantId, this._shards);
+    const hashed = hashTenant(tenantId);
+    const shardInfo = shardForTenant(hashed, this._shards);
     if (!shardInfo) {
       throw new Error(`No shard found for tenant "${tenantId}". This indicates a topology error.`);
     }

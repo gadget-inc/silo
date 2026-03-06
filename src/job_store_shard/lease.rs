@@ -385,7 +385,7 @@ impl JobStoreShard {
             // Check if lease's tenant is within shard range
             let lease_tenant = decoded.tenant();
 
-            if !shard_range.contains(lease_tenant) {
+            if !shard_range.contains_tenant(lease_tenant) {
                 // Lease is for a tenant outside our range - mark for deletion
                 debug!(
                     key = ?kv.key,
