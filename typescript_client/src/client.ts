@@ -1,3 +1,4 @@
+import xxhashInit from "xxhash-wasm";
 import type { ClientOptions } from "@grpc/grpc-js";
 import { ChannelCredentials, credentials, Metadata } from "@grpc/grpc-js";
 import { GrpcTransport } from "@protobuf-ts/grpc-transport";
@@ -250,30 +251,32 @@ export interface ShardInfoWithRange {
 }
 
 /**
- * Hash a tenant ID to a 16-character hex string using FNV-1a with
- * splitmix64 finalization. Must match the Rust `hash_tenant` implementation
- * in `src/shard_range.rs` exactly.
+ * Initialize the XXH64 hasher (loads WASM). Must be awaited before calling
+ * hashTenant(). The SiloGRPCClient handles this automatically; only needed
+ * when using hashTenant() directly.
+ */
+let _h64: ((input: string, seed?: bigint) => bigint) | undefined;
+let _initPromise: Promise<void> | undefined;
+
+export function initHasher(): Promise<void> {
+  if (!_initPromise) {
+    _initPromise = xxhashInit().then((api) => {
+      _h64 = api.h64;
+    });
+  }
+  return _initPromise;
+}
+
+/**
+ * Hash a tenant ID to a 16-character hex string using XXH64 (seed 0).
+ * Must match the Rust `hash_tenant` implementation in `src/shard_range.rs`.
+ * Call and await initHasher() before first use.
  */
 export function hashTenant(tenantId: string): string {
-  const MASK = 0xffffffffffffffffn;
-  const FNV_OFFSET = 0xcbf29ce484222325n;
-  const FNV_PRIME = 0x100000001b3n;
-
-  // FNV-1a accumulation
-  let hash = FNV_OFFSET;
-  for (let i = 0; i < tenantId.length; i++) {
-    hash ^= BigInt(tenantId.charCodeAt(i));
-    hash = (hash * FNV_PRIME) & MASK;
+  if (!_h64) {
+    throw new Error("XXH64 hasher not initialized. Call and await initHasher() first.");
   }
-
-  // splitmix64 finalization
-  hash ^= hash >> 30n;
-  hash = (hash * 0xbf58476d1ce4e5b9n) & MASK;
-  hash ^= hash >> 27n;
-  hash = (hash * 0x94d049bb133111ebn) & MASK;
-  hash ^= hash >> 31n;
-
-  return hash.toString(16).padStart(16, "0");
+  return _h64(tenantId).toString(16).padStart(16, "0");
 }
 
 /**
@@ -1387,6 +1390,7 @@ export class SiloGRPCClient {
    * @internal
    */
   private async _ensureTopology(): Promise<void> {
+    await initHasher();
     if (this._topologyReady) {
       return;
     }

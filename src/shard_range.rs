@@ -1,7 +1,7 @@
 //! Hash-based shard coordination types.
 //!
 //! This module defines the core data structures for hash-based sharding,
-//! where tenant IDs are hashed (FNV-1a) into a uniform keyspace and then
+//! where tenant IDs are hashed (XXH64) into a uniform keyspace and then
 //! assigned to shards via lexicographical ranges over the hex-encoded hash.
 
 use serde::{Deserialize, Serialize};
@@ -10,24 +10,12 @@ use uuid::Uuid;
 
 use crate::coordination::SplitPhase;
 
-/// Hash a tenant ID to a 16-character hex string using FNV-1a with
-/// splitmix64 finalization for strong avalanche properties.
+/// Hash a tenant ID to a 16-character hex string using XXH64 (seed 0).
 ///
 /// This ensures uniform distribution across the shard keyspace regardless
 /// of the structure of tenant ID strings (e.g. shared prefixes like "env-").
 pub fn hash_tenant(tenant_id: &str) -> String {
-    // FNV-1a accumulation
-    let mut hash: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
-    for byte in tenant_id.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3); // FNV-1a prime
-    }
-    // splitmix64 finalization — ensures full avalanche even for similar inputs
-    hash ^= hash >> 30;
-    hash = hash.wrapping_mul(0xbf58476d1ce4e5b9);
-    hash ^= hash >> 27;
-    hash = hash.wrapping_mul(0x94d049bb133111eb);
-    hash ^= hash >> 31;
+    let hash = xxhash_rust::xxh64::xxh64(tenant_id.as_bytes(), 0);
     format!("{:016x}", hash)
 }
 
@@ -138,7 +126,7 @@ impl ShardRange {
 
     /// Check if this range contains the hash of the given tenant ID.
     ///
-    /// Hashes the tenant ID with FNV-1a and checks if the result falls
+    /// Hashes the tenant ID with XXH64 and checks if the result falls
     /// within this range's bounds.
     pub fn contains_tenant(&self, tenant_id: &str) -> bool {
         self.contains(&hash_tenant(tenant_id))
@@ -416,7 +404,7 @@ impl ShardMap {
     /// Create an initial shard map with the given number of shards.
     ///
     /// Divides the u64 hash keyspace evenly among shards.
-    /// Tenant IDs are hashed with FNV-1a before lookup, so the
+    /// Tenant IDs are hashed with XXH64 before lookup, so the
     /// boundaries are 16-character hex strings in hash space.
     pub fn create_initial(shard_count: u32) -> Result<Self, ShardMapError> {
         if shard_count == 0 {
@@ -479,7 +467,7 @@ impl ShardMap {
 
     /// Find the shard that owns the given tenant ID.
     ///
-    /// Hashes the tenant ID with FNV-1a and uses binary search for efficient lookup.
+    /// Hashes the tenant ID with XXH64 and uses binary search for efficient lookup.
     /// Returns None if the map is empty or the tenant ID doesn't fall in any range
     /// (which should not happen in a valid map).
     pub fn shard_for_tenant(&self, tenant_id: &str) -> Option<&ShardInfo> {

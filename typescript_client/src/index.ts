@@ -16,6 +16,8 @@ export {
   SiloResourceExhaustedError,
   SiloUnavailableError,
   SiloDeadlineExceededError,
+  initHasher,
+  hashTenant,
   shardForTenant,
   GubernatorAlgorithm,
   GubernatorBehavior,

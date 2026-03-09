@@ -1,8 +1,10 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
-import { SiloGRPCClient, shardForTenant, hashTenant, type ShardInfoWithRange } from "../src/client";
+import { SiloGRPCClient, shardForTenant, hashTenant, initHasher, type ShardInfoWithRange } from "../src/client";
 import { RpcError } from "@protobuf-ts/runtime-rpc";
 
 describe("Shard Routing", () => {
+  beforeAll(() => initHasher());
+
   describe("hashTenant", () => {
     it("returns a 16-character hex string", () => {
       const hash = hashTenant("test-tenant");

@@ -75,6 +75,7 @@ flate2 = "1"
 urlencoding = "2"
 storekey = { version = "0.11", features = ["storekey-derive"] }
 hex = "0.4"
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
 
 [features]
 default = ["k8s"]

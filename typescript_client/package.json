@@ -33,7 +33,8 @@
     "@protobuf-ts/runtime-rpc": "^2.9.4",
     "msgpackr": "^1.11.2",
     "p-queue": "6.6.2",
-    "serialize-error": "7.0.1"
+    "serialize-error": "7.0.1",
+    "xxhash-wasm": "^1.1.0"
   },
   "devDependencies": {
     "@arethetypeswrong/cli": "^0.18.2",
