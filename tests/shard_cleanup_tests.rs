@@ -81,8 +81,14 @@ async fn cleanup_removes_keys_outside_range() {
     let yyy_jobs = count_job_info_keys_for_tenant(shard.db(), "yyy").await;
 
     assert_eq!(bbb_jobs, 2, "bbb jobs should remain (hash in range)");
-    assert_eq!(aaa_jobs, 0, "aaa jobs should be deleted (hash out of range)");
-    assert_eq!(yyy_jobs, 0, "yyy jobs should be deleted (hash out of range)");
+    assert_eq!(
+        aaa_jobs, 0,
+        "aaa jobs should be deleted (hash out of range)"
+    );
+    assert_eq!(
+        yyy_jobs, 0,
+        "yyy jobs should be deleted (hash out of range)"
+    );
 }
 
 #[silo::test]
@@ -152,8 +158,14 @@ async fn cleanup_handles_right_child_range() {
     let aaa_jobs = count_job_info_keys_for_tenant(shard.db(), "aaa").await;
     let ccc_jobs = count_job_info_keys_for_tenant(shard.db(), "ccc").await;
 
-    assert_eq!(bbb_jobs, 0, "bbb jobs should be deleted (hash out of range)");
-    assert_eq!(zzz_jobs, 0, "zzz jobs should be deleted (hash out of range)");
+    assert_eq!(
+        bbb_jobs, 0,
+        "bbb jobs should be deleted (hash out of range)"
+    );
+    assert_eq!(
+        zzz_jobs, 0,
+        "zzz jobs should be deleted (hash out of range)"
+    );
     assert_eq!(aaa_jobs, 2, "aaa jobs should remain (hash in range)");
     assert_eq!(ccc_jobs, 2, "ccc jobs should remain (hash in range)");
 }
