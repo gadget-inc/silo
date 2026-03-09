@@ -5,6 +5,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Array, Int64Array, StringArray};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
+use datafusion::physical_plan::ExecutionPlan;
 use silo::job_store_shard::JobStoreShard;
 use silo::query::ShardQueryEngine;
 use test_helpers::*;
@@ -1337,6 +1338,29 @@ async fn query_queue_names(sql: &ShardQueryEngine, query: &str) -> Vec<String> {
     extract_string_column(&batches, 0)
 }
 
+fn find_plan_schema_fields(
+    plan: &Arc<dyn ExecutionPlan>,
+    target_name: &str,
+) -> Option<Vec<String>> {
+    if plan.name() == target_name {
+        return Some(
+            plan.schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().to_string())
+                .collect(),
+        );
+    }
+
+    for child in plan.children() {
+        if let Some(fields) = find_plan_schema_fields(child, target_name) {
+            return Some(fields);
+        }
+    }
+
+    None
+}
+
 #[silo::test]
 async fn queues_table_exists() {
     let (_tmp, shard) = open_temp_shard().await;
@@ -1678,6 +1702,46 @@ async fn queues_table_count_aggregate() {
         .downcast_ref::<datafusion::arrow::array::Int64Array>()
         .expect("count column");
     assert_eq!(count_arr.value(0), 3);
+}
+
+#[silo::test]
+async fn queues_count_plan_uses_empty_scan_projection_without_filters() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+
+    let plan = sql
+        .get_physical_plan("SELECT COUNT(*) FROM queues")
+        .await
+        .expect("plan");
+
+    let fields =
+        find_plan_schema_fields(&plan, "SiloExecutionPlan").expect("SiloExecutionPlan fields");
+    assert!(
+        fields.is_empty(),
+        "COUNT(*) without filters should let the scan use an empty projection, got {:?}",
+        fields
+    );
+}
+
+#[silo::test]
+async fn queues_requester_count_plan_projects_filter_columns() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+
+    let plan = sql
+        .get_physical_plan(
+            "SELECT COUNT(*) FROM queues WHERE tenant = '-' AND queue_name = 'q' AND entry_type = 'requester'",
+        )
+        .await
+        .expect("plan");
+
+    let fields =
+        find_plan_schema_fields(&plan, "SiloExecutionPlan").expect("SiloExecutionPlan fields");
+    assert_eq!(
+        fields,
+        vec!["tenant", "queue_name", "entry_type"],
+        "Filtered requester COUNT(*) should keep the filter columns in the scan projection"
+    );
 }
 
 #[silo::test]

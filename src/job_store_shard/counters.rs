@@ -21,7 +21,10 @@ use slatedb::{MergeOperator, MergeOperatorError};
 
 use crate::job_store_shard::helpers::WriteBatcher;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
-use crate::keys::{shard_completed_jobs_counter_key, shard_total_jobs_counter_key};
+use crate::keys::{
+    concurrency_requester_counter_key, shard_completed_jobs_counter_key,
+    shard_total_jobs_counter_key,
+};
 
 /// Shard job counters returned by get_counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -157,5 +160,18 @@ impl JobStoreShard {
         let key = shard_completed_jobs_counter_key();
         writer.merge(&key, encode_counter(-1))?;
         Ok(())
+    }
+
+    /// Get the current concurrency requester count for a specific tenant/queue.
+    pub async fn get_concurrency_requester_count(
+        &self,
+        tenant: &str,
+        queue: &str,
+    ) -> Result<i64, JobStoreShardError> {
+        let key = concurrency_requester_counter_key(tenant, queue);
+        match self.db.get(&key).await? {
+            Some(bytes) => Ok(decode_counter(&bytes)),
+            None => Ok(0),
+        }
     }
 }
