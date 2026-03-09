@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeAll, beforeEach } from "vitest";
 import { SiloGRPCClient, shardForTenant, hashTenant, initHasher, type ShardInfoWithRange } from "../src/client";
 import { RpcError } from "@protobuf-ts/runtime-rpc";
 
