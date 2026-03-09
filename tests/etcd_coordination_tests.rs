@@ -1619,14 +1619,10 @@ async fn etcd_sequential_splits_work_correctly() {
     // Create splitter
     let splitter = ShardSplitter::new(coord.clone());
 
-    // First split at midpoint
+    // First split: midpoint minus an offset (not exactly at the midpoint)
     let shard_map = coord.get_shard_map().await.unwrap();
-    let split_point1 = shard_map
-        .get_shard(&shard_id)
-        .unwrap()
-        .range
-        .midpoint()
-        .unwrap();
+    let mid1: u64 = u64::MAX / 2;
+    let split_point1 = format!("{:016x}", mid1 - 0x0100000000000000);
 
     let split1 = splitter
         .request_split(shard_id, split_point1)
@@ -1640,14 +1636,11 @@ async fn etcd_sequential_splits_work_correctly() {
     let shard_map = coord.get_shard_map().await.unwrap();
     assert_eq!(shard_map.len(), 2);
 
-    // Second split: split left child at its midpoint
+    // Second split: split left child at midpoint plus an offset
     let left_child_id = split1.left_child_id;
-    let split_point2 = shard_map
-        .get_shard(&left_child_id)
-        .unwrap()
-        .range
-        .midpoint()
-        .unwrap();
+    let left_range = &shard_map.get_shard(&left_child_id).unwrap().range;
+    let left_end = u64::from_str_radix(&left_range.end, 16).unwrap();
+    let split_point2 = format!("{:016x}", left_end / 2 + 0x0080000000000000);
     let split2 = splitter
         .request_split(left_child_id, split_point2)
         .await
