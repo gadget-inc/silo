@@ -88,11 +88,9 @@ Concurrency limits control how many jobs with the same concurrency key can run s
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `silo_concurrency_holders` | Gauge | `tenant`, `queue` | Active concurrency ticket holders per queue |
 | `silo_concurrency_tickets_granted_total` | Counter | - | Total concurrency tickets granted |
 
 **Key insights:**
-- `silo_concurrency_holders` at limit indicates jobs are waiting for capacity
 - Track `silo_concurrency_tickets_granted_total` rate to understand throughput through limited queues
 
 ### gRPC Metrics
