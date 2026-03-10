@@ -642,25 +642,19 @@ pub async fn shard_split<W: Write>(
     let split_point = if let Some(point) = split_point {
         point
     } else if auto {
-        // Compute midpoint of the shard's range
-        let start = if shard_owner.range_start.is_empty() {
-            "0".to_string()
-        } else {
-            shard_owner.range_start.clone()
-        };
-        let end = if shard_owner.range_end.is_empty() {
-            "zzzzzzzz".to_string()
-        } else {
-            shard_owner.range_end.clone()
-        };
-
-        compute_midpoint(&start, &end).ok_or_else(|| {
+        // Compute numeric midpoint of the shard's hash-space range
+        let range = crate::shard_range::ShardRange::new(
+            shard_owner.range_start.clone(),
+            shard_owner.range_end.clone(),
+        );
+        let mid = range.midpoint().ok_or_else(|| {
             anyhow::anyhow!(
                 "Cannot compute midpoint for range [{}, {})",
                 shard_owner.range_start,
                 shard_owner.range_end
             )
-        })?
+        })?;
+        crate::shard_range::format_hash_boundary(mid)
     } else {
         return Err(anyhow::anyhow!(
             "Either --at <split-point> or --auto must be specified"
@@ -903,56 +897,13 @@ pub async fn validate_config<W: Write>(
     }
 }
 
-/// Compute the lexicographic midpoint of two strings
+/// Compute the midpoint of a hash-space range defined by hex-encoded u64 boundaries.
+///
+/// Delegates to [`ShardRange::midpoint`](crate::shard_range::ShardRange::midpoint)
+/// and formats the result as a 16-character hex string.
 pub fn compute_midpoint(start: &str, end: &str) -> Option<String> {
-    if start >= end {
-        return None;
-    }
-
-    let start_bytes = start.as_bytes();
-    let end_bytes = end.as_bytes();
-
-    // Find the first differing position
-    let min_len = start_bytes.len().min(end_bytes.len());
-    let mut diff_pos = 0;
-    while diff_pos < min_len && start_bytes[diff_pos] == end_bytes[diff_pos] {
-        diff_pos += 1;
-    }
-
-    if diff_pos == min_len {
-        // One is a prefix of the other
-        if start_bytes.len() < end_bytes.len() {
-            // Start is shorter, add a middle character
-            let mut mid = start.to_string();
-            mid.push('M');
-            if mid.as_str() > start && mid.as_str() < end {
-                return Some(mid);
-            }
-        }
-        return None;
-    }
-
-    // Compute midpoint at the differing position
-    let start_char = start_bytes[diff_pos];
-    let end_char = end_bytes[diff_pos];
-
-    if end_char <= start_char + 1 {
-        // Too close, extend with a high character
-        let mut mid = String::from_utf8_lossy(&start_bytes[..=diff_pos]).to_string();
-        mid.push('~');
-        if mid.as_str() > start && mid.as_str() < end {
-            return Some(mid);
-        }
-        return None;
-    }
-
-    let mid_char = start_char + (end_char - start_char) / 2;
-    let mut result = String::from_utf8_lossy(&start_bytes[..diff_pos]).to_string();
-    result.push(mid_char as char);
-
-    if result.as_str() > start && result.as_str() < end {
-        Some(result)
-    } else {
-        None
-    }
+    let range = crate::shard_range::ShardRange::new(start, end);
+    range
+        .midpoint()
+        .map(crate::shard_range::format_hash_boundary)
 }
