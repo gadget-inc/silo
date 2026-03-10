@@ -110,6 +110,107 @@ async fn main() {
     run_tenant_queries(&engine, small_tenant).await;
     println!();
 
+    // --- Queue Count Queries ---
+    println!(
+        "--- Queue Count Queries (deep-queue: {} holders + {} waiters) ---",
+        DEEP_QUEUE_HOLDERS, DEEP_QUEUE_WAITERS
+    );
+
+    let r = bench_query(
+        &engine,
+        "count_all_holders",
+        "SELECT COUNT(*) FROM queues WHERE entry_type = 'holder'",
+    )
+    .await;
+    r.print();
+
+    let r = bench_query(
+        &engine,
+        "count_all_requesters",
+        "SELECT COUNT(*) FROM queues WHERE entry_type = 'requester'",
+    )
+    .await;
+    r.print();
+
+    let r = bench_query(
+        &engine,
+        "count_holders_by_tenant",
+        &format!(
+            "SELECT COUNT(*) FROM queues WHERE tenant = '{}' AND entry_type = 'holder'",
+            BENCH_DEEP_QUEUE_TENANT
+        ),
+    )
+    .await;
+    r.print();
+
+    let r = bench_query(
+        &engine,
+        "count_requesters_by_tenant",
+        &format!(
+            "SELECT COUNT(*) FROM queues WHERE tenant = '{}' AND entry_type = 'requester'",
+            BENCH_DEEP_QUEUE_TENANT
+        ),
+    )
+    .await;
+    r.print();
+
+    let r = bench_query(
+        &engine,
+        "count_holders_by_queue",
+        &format!(
+            "SELECT COUNT(*) FROM queues WHERE tenant = '{}' AND queue_name = '{}' AND entry_type = 'holder'",
+            BENCH_DEEP_QUEUE_TENANT, DEEP_QUEUE_KEY
+        ),
+    )
+    .await;
+    r.print();
+
+    let r = bench_query(
+        &engine,
+        "count_requesters_by_queue",
+        &format!(
+            "SELECT COUNT(*) FROM queues WHERE tenant = '{}' AND queue_name = '{}' AND entry_type = 'requester'",
+            BENCH_DEEP_QUEUE_TENANT, DEEP_QUEUE_KEY
+        ),
+    )
+    .await;
+    r.print();
+
+    let r = bench_query(
+        &engine,
+        "queue_breakdown",
+        &format!(
+            "SELECT queue_name, entry_type, COUNT(*) FROM queues WHERE tenant = '{}' GROUP BY queue_name, entry_type",
+            BENCH_DEEP_QUEUE_TENANT
+        ),
+    )
+    .await;
+    r.print();
+
+    let r = bench_query(
+        &engine,
+        "list_holders_for_queue",
+        &format!(
+            "SELECT * FROM queues WHERE tenant = '{}' AND queue_name = '{}' AND entry_type = 'holder'",
+            BENCH_DEEP_QUEUE_TENANT, DEEP_QUEUE_KEY
+        ),
+    )
+    .await;
+    r.print();
+
+    let r = bench_query(
+        &engine,
+        "first_page_requesters",
+        &format!(
+            "SELECT * FROM queues WHERE tenant = '{}' AND queue_name = '{}' AND entry_type = 'requester' LIMIT 20",
+            BENCH_DEEP_QUEUE_TENANT, DEEP_QUEUE_KEY
+        ),
+    )
+    .await;
+    r.print();
+
+    println!();
+
     shard.close().await.expect("close shard");
     println!("Done.");
 }

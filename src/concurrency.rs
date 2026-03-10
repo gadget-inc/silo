@@ -43,6 +43,7 @@ use std::sync::{Arc, Mutex};
 use slatedb::config::WriteOptions;
 use slatedb::{Db, DbIterator, WriteBatch};
 
+use crate::job_store_shard::counters::encode_counter;
 use crate::job_store_shard::helpers::WriteBatcher;
 
 use crate::codec::{
@@ -54,9 +55,9 @@ use crate::job::{ConcurrencyLimit, JobStatusKind, JobView, Limit};
 use crate::job_store_shard::helpers::decode_job_status_owned;
 use crate::keys::{
     concurrency_counts_key, concurrency_holder_key, concurrency_holders_queue_prefix,
-    concurrency_request_key, concurrency_request_prefix, concurrency_requests_prefix, end_bound,
-    floating_limit_state_key, job_status_key, parse_concurrency_holder_key,
-    parse_concurrency_request_key, task_key,
+    concurrency_request_key, concurrency_request_prefix, concurrency_requester_counter_key,
+    concurrency_requests_prefix, end_bound, floating_limit_state_key, job_status_key,
+    parse_concurrency_holder_key, parse_concurrency_request_key, task_key,
 };
 use crate::shard_range::ShardRange;
 use crate::task::{ConcurrencyAction, HolderRecord, Task};
@@ -763,7 +764,12 @@ impl ConcurrencyManager {
                             || status.current_attempt != Some(attempt_number) =>
                     {
                         // [SILO-GRANT-6] Drop stale request key without granting work.
-                        let _ = db.delete(&kv.key).await;
+                        if delete_stale_request(db, &kv.key, tenant, queue)
+                            .await
+                            .is_err()
+                        {
+                            continue;
+                        }
                         tracing::debug!(
                             job_id = %job_id_str,
                             queue = %queue,
@@ -776,7 +782,12 @@ impl ConcurrencyManager {
                     }
                     Ok(_) => {}
                     Err(_) => {
-                        let _ = db.delete(&kv.key).await;
+                        if delete_stale_request(db, &kv.key, tenant, queue)
+                            .await
+                            .is_err()
+                        {
+                            continue;
+                        }
                         tracing::warn!(
                             job_id = %job_id_str,
                             queue = %queue,
@@ -786,7 +797,12 @@ impl ConcurrencyManager {
                     }
                 },
                 Ok(None) => {
-                    let _ = db.delete(&kv.key).await;
+                    if delete_stale_request(db, &kv.key, tenant, queue)
+                        .await
+                        .is_err()
+                    {
+                        continue;
+                    }
                     tracing::debug!(
                         job_id = %job_id_str,
                         queue = %queue,
@@ -879,6 +895,12 @@ impl ConcurrencyManager {
                 &tval,
             );
             batch.delete(&kv.key);
+
+            // Decrement the per-queue requester counter (request converted to holder)
+            batch.merge(
+                concurrency_requester_counter_key(tenant, queue),
+                encode_counter(-1),
+            );
 
             // Commit with durability
             if let Err(e) = db
@@ -984,5 +1006,32 @@ fn append_request_edits<W: WriteBatcher>(
         &suffix,
     );
     writer.put(&req_key, &action_val)?;
+
+    // Increment the per-queue requester counter
+    let counter_key = concurrency_requester_counter_key(tenant, queue);
+    writer.merge(&counter_key, encode_counter(1))?;
+
+    Ok(())
+}
+
+/// Atomically delete a stale concurrency request key and decrement the per-queue
+/// requester counter. Used by the grant scanner when it discovers requests for
+/// jobs that are no longer in the expected state.
+async fn delete_stale_request(
+    db: &Db,
+    request_key: &[u8],
+    tenant: &str,
+    queue: &str,
+) -> Result<(), slatedb::Error> {
+    let mut batch = WriteBatch::new();
+    batch.delete(request_key);
+    batch.merge(
+        concurrency_requester_counter_key(tenant, queue),
+        encode_counter(-1),
+    );
+    if let Err(e) = db.write(batch).await {
+        tracing::warn!(error = %e, "grant scanner: failed to delete stale request");
+        return Err(e);
+    }
     Ok(())
 }

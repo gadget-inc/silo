@@ -1171,6 +1171,62 @@ fn make_empty_projection_batch(projection: &SchemaRef, row_count: usize) -> DfRe
     .map_err(|e| DataFusionError::Execution(e.to_string()))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueRequesterFastPathProjection {
+    Empty,
+    ConstantColumns,
+}
+
+fn queue_requester_fast_path_projection(
+    projection: &SchemaRef,
+) -> Option<QueueRequesterFastPathProjection> {
+    if projection.fields().is_empty() {
+        return Some(QueueRequesterFastPathProjection::Empty);
+    }
+
+    projection
+        .fields()
+        .iter()
+        .all(|field| {
+            matches!(
+                field.name().as_str(),
+                "shard_id" | "tenant" | "queue_name" | "entry_type"
+            )
+        })
+        .then_some(QueueRequesterFastPathProjection::ConstantColumns)
+}
+
+fn make_queue_constant_projection_batch(
+    projection: &SchemaRef,
+    shard_id: &str,
+    tenant: &str,
+    queue: &str,
+    entry_type: &str,
+    row_count: usize,
+) -> DfResult<RecordBatch> {
+    if projection.fields().is_empty() {
+        return make_empty_projection_batch(projection, row_count);
+    }
+
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(projection.fields().len());
+    for field in projection.fields() {
+        match field.name().as_str() {
+            "shard_id" => cols.push(Arc::new(StringArray::from(vec![shard_id; row_count]))),
+            "tenant" => cols.push(Arc::new(StringArray::from(vec![tenant; row_count]))),
+            "queue_name" => cols.push(Arc::new(StringArray::from(vec![queue; row_count]))),
+            "entry_type" => cols.push(Arc::new(StringArray::from(vec![entry_type; row_count]))),
+            other => {
+                return Err(DataFusionError::Execution(format!(
+                    "requester fast path does not support projection column {other}"
+                )));
+            }
+        }
+    }
+
+    RecordBatch::try_new(Arc::clone(projection), cols)
+        .map_err(|e| DataFusionError::Execution(e.to_string()))
+}
+
 /// Scanner for the queues table - reads concurrency queue data from a single shard.
 pub struct QueuesScanner {
     pub(crate) shard: Arc<JobStoreShard>,
@@ -1221,18 +1277,20 @@ impl Scan for QueuesScanner {
     fn describe(&self, filters: &[Expr], limit: Option<usize>) -> String {
         let mut tenant = None;
         let mut queue = None;
+        let mut entry_type = None;
         for f in filters {
             if let Some((col, val)) = parse_eq_filter(f) {
                 match col.as_str() {
                     "tenant" => tenant = Some(val),
                     "queue_name" => queue = Some(val),
+                    "entry_type" => entry_type = Some(val),
                     _ => {}
                 }
             }
         }
         format!(
-            "queues[tenant={:?}, queue={:?}], limit={:?}",
-            tenant, queue, limit
+            "queues[tenant={:?}, queue={:?}, entry_type={:?}], limit={:?}",
+            tenant, queue, entry_type, limit
         )
     }
 
@@ -1243,18 +1301,135 @@ impl Scan for QueuesScanner {
         batch_size: usize,
         limit: Option<usize>,
     ) -> SendableRecordBatchStream {
-        // Parse filters for tenant and queue_name
+        // Parse filters for tenant, queue_name, and entry_type
         let mut tenant_filter: Option<String> = None;
         let mut queue_filter: Option<String> = None;
+        let mut entry_type_filter: Option<String> = None;
         for f in filters {
             if let Some((col, val)) = parse_eq_filter(f) {
                 match col.as_str() {
                     "tenant" => tenant_filter = Some(val),
                     "queue_name" => queue_filter = Some(val),
+                    "entry_type" => entry_type_filter = Some(val),
                     _ => {}
                 }
             }
         }
+
+        // Fast path: requester-only scans for a specific tenant + queue.
+        // Filtered COUNT(*) keeps the filter columns projected because FilterExec stays above
+        // our scan, so support both the empty projection and constant-column variants.
+        if let Some(fast_path_projection) = queue_requester_fast_path_projection(&projection)
+            && let Some(ref tenant) = tenant_filter
+            && let Some(ref queue) = queue_filter
+            && entry_type_filter.as_deref() == Some("requester")
+        {
+            let tenant = tenant.clone();
+            let queue = queue.clone();
+            let shard = Arc::clone(&self.shard);
+            let proj_for_stream = Arc::clone(&projection);
+            let (tx, rx) = mpsc::channel::<DfResult<RecordBatch>>(2);
+            tokio::spawn(async move {
+                let db = shard.db();
+                let counter_key = crate::keys::concurrency_requester_counter_key(&tenant, &queue);
+                let count = match db.get(&counter_key).await {
+                    Ok(Some(bytes)) => {
+                        crate::job_store_shard::counters::decode_counter(&bytes).max(0) as usize
+                    }
+                    Ok(None) => {
+                        let prefix = crate::keys::concurrency_request_prefix(&tenant, &queue);
+                        let end = crate::keys::end_bound(&prefix);
+                        let mut iter = match db.scan::<Vec<u8>, _>(prefix..=end).await {
+                            Ok(iter) => iter,
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Err(DataFusionError::Execution(e.to_string())))
+                                    .await;
+                                return;
+                            }
+                        };
+
+                        let mut scanned_count: usize = 0;
+                        loop {
+                            match iter.next().await {
+                                Ok(Some(kv)) => {
+                                    if crate::keys::parse_concurrency_request_key(&kv.key).is_some()
+                                    {
+                                        scanned_count += 1;
+                                    }
+                                }
+                                Ok(None) => break,
+                                Err(e) => {
+                                    let _ = tx
+                                        .send(Err(DataFusionError::Execution(e.to_string())))
+                                        .await;
+                                    return;
+                                }
+                            }
+                        }
+                        scanned_count
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(DataFusionError::Execution(format!(
+                                "failed to read requester counter: {e}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+
+                match fast_path_projection {
+                    QueueRequesterFastPathProjection::Empty => {
+                        let batch = make_empty_projection_batch(&proj_for_stream, count);
+                        let _ = tx.send(batch).await;
+                    }
+                    QueueRequesterFastPathProjection::ConstantColumns => {
+                        let batch_rows = batch_size.max(1);
+                        let shard_id = shard.name().to_string();
+                        let mut remaining = count;
+
+                        loop {
+                            let rows = remaining.min(batch_rows);
+                            if remaining == 0 && rows == 0 {
+                                let batch = make_queue_constant_projection_batch(
+                                    &proj_for_stream,
+                                    &shard_id,
+                                    &tenant,
+                                    &queue,
+                                    "requester",
+                                    0,
+                                );
+                                let _ = tx.send(batch).await;
+                                break;
+                            }
+
+                            let batch = make_queue_constant_projection_batch(
+                                &proj_for_stream,
+                                &shard_id,
+                                &tenant,
+                                &queue,
+                                "requester",
+                                rows,
+                            );
+                            if tx.send(batch).await.is_err() {
+                                break;
+                            }
+
+                            remaining -= rows;
+                            if remaining == 0 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            return Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&projection),
+                ReceiverStream::new(rx).map(|r| r),
+            ));
+        }
+
         let (tx, rx) = mpsc::channel::<DfResult<RecordBatch>>(2);
         let shard = Arc::clone(&self.shard);
         let proj_for_stream = Arc::clone(&projection);

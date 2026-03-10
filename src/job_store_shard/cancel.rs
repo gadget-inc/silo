@@ -4,13 +4,14 @@ use slatedb::{DbIterator, IsolationLevel};
 
 use crate::codec::{decode_cancellation_at_ms, decode_task, encode_job_cancellation};
 use crate::job::{JobCancellation, JobStatus, JobStatusKind, JobView, Limit};
+use crate::job_store_shard::counters::encode_counter;
 use crate::job_store_shard::helpers::{
     TxnWriter, decode_job_status_owned, now_epoch_ms, retry_on_txn_conflict,
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{
-    concurrency_holder_key, concurrency_request_job_prefix, end_bound, job_cancelled_key,
-    job_info_key, job_status_key, task_key,
+    concurrency_holder_key, concurrency_request_job_prefix, concurrency_requester_counter_key,
+    end_bound, job_cancelled_key, job_info_key, job_status_key, task_key,
 };
 use crate::task::Task;
 
@@ -284,17 +285,25 @@ impl JobStoreShard {
         let end = end_bound(&prefix);
         let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(prefix..end).await?;
 
-        let mut deleted_any = false;
+        let mut deleted_count: i64 = 0;
         while let Some(kv) = iter.next().await? {
             txn.delete(&kv.key)?;
-            deleted_any = true;
+            deleted_count += 1;
             tracing::debug!(
                 job_id = %job_id,
                 queue = %queue_key,
                 "cancel: deleted concurrency request for cancelled job"
             );
         }
-        Ok(deleted_any)
+
+        if deleted_count > 0 {
+            // Decrement the per-queue requester counter
+            let counter_key = concurrency_requester_counter_key(tenant, queue_key);
+            txn.merge(&counter_key, encode_counter(-deleted_count))?;
+            txn.unmark_write([counter_key.as_slice()])?;
+        }
+
+        Ok(deleted_count > 0)
     }
 
     /// Check if a job has been cancelled.

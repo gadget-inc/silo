@@ -1,7 +1,7 @@
 //! Job store shard - a single shard of the distributed job storage system.
 mod cancel;
 mod cleanup;
-mod counters;
+pub(crate) mod counters;
 mod dequeue;
 mod enqueue;
 mod expedite;

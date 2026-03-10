@@ -31,6 +31,7 @@ pub(crate) mod prefix {
     pub const CLEANUP_STATUS: u8 = 0xF4;
     pub const SHARD_CREATED_AT: u8 = 0xF5;
     pub const CLEANUP_COMPLETED_AT: u8 = 0xF6;
+    pub const COUNTER_CONCURRENCY_REQUESTERS: u8 = 0xF7;
 }
 
 /// Encode a key with its namespace prefix.
@@ -565,6 +566,30 @@ pub fn shard_created_at_key() -> Vec<u8> {
 /// Only set after a split cleanup finishes.
 pub fn cleanup_completed_at_key() -> Vec<u8> {
     vec![prefix::CLEANUP_COMPLETED_AT]
+}
+
+/// Key for the per-queue concurrency requester counter.
+/// Tracks the number of pending concurrency requests for a specific tenant/queue.
+pub fn concurrency_requester_counter_key(tenant: &str, queue: &str) -> Vec<u8> {
+    encode_with_prefix(prefix::COUNTER_CONCURRENCY_REQUESTERS, &(tenant, queue))
+}
+
+/// Parsed concurrency requester counter key components.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedConcurrencyRequesterCounterKey {
+    pub tenant: String,
+    pub queue: String,
+}
+
+/// Parse a concurrency requester counter key back to its components.
+pub fn parse_concurrency_requester_counter_key(
+    key: &[u8],
+) -> Option<ParsedConcurrencyRequesterCounterKey> {
+    if key.first() != Some(&prefix::COUNTER_CONCURRENCY_REQUESTERS) {
+        return None;
+    }
+    let (tenant, queue): (String, String) = decode(&key[1..]).ok()?;
+    Some(ParsedConcurrencyRequesterCounterKey { tenant, queue })
 }
 
 /// Construct a composite key for in-memory concurrency queue tracking.
