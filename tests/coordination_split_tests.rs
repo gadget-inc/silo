@@ -473,12 +473,14 @@ async fn execute_split_completes_full_cycle() {
 
     // Compute midpoint of the shard's range for a balanced split
     let shard_map = c1.get_shard_map().await.expect("get shard map");
-    let split_point = shard_map
-        .get_shard(&shard_id)
-        .unwrap()
-        .range
-        .midpoint()
-        .unwrap();
+    let split_point = silo::shard_range::format_hash_boundary(
+        shard_map
+            .get_shard(&shard_id)
+            .unwrap()
+            .range
+            .midpoint()
+            .unwrap(),
+    );
 
     // Request and execute the split
     let split = splitter
@@ -761,12 +763,14 @@ async fn sequential_splits_work_correctly() {
 
     // First split at midpoint
     let shard_map = c1.get_shard_map().await.expect("get shard map");
-    let split_point1 = shard_map
-        .get_shard(&shard_id)
-        .unwrap()
-        .range
-        .midpoint()
-        .unwrap();
+    let split_point1 = silo::shard_range::format_hash_boundary(
+        shard_map
+            .get_shard(&shard_id)
+            .unwrap()
+            .range
+            .midpoint()
+            .unwrap(),
+    );
 
     let split1 = splitter
         .request_split(shard_id, split_point1)
@@ -783,12 +787,14 @@ async fn sequential_splits_work_correctly() {
 
     // Second split: split the left child at its midpoint
     let left_child_id = split1.left_child_id;
-    let split_point2 = shard_map
-        .get_shard(&left_child_id)
-        .unwrap()
-        .range
-        .midpoint()
-        .unwrap();
+    let split_point2 = silo::shard_range::format_hash_boundary(
+        shard_map
+            .get_shard(&left_child_id)
+            .unwrap()
+            .range
+            .midpoint()
+            .unwrap(),
+    );
     let split2 = splitter
         .request_split(left_child_id, split_point2)
         .await
@@ -880,10 +886,12 @@ async fn split_in_multi_node_cluster() {
     let shard_info = shard_map
         .get_shard(&shard_to_split)
         .expect("find shard in map");
-    let split_point = shard_info
-        .range
-        .midpoint()
-        .expect("shard range should have a midpoint");
+    let split_point = silo::shard_range::format_hash_boundary(
+        shard_info
+            .range
+            .midpoint()
+            .expect("shard range should have a midpoint"),
+    );
 
     // Create splitter and split the shard
 

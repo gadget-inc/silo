@@ -1736,10 +1736,12 @@ async fn etcd_split_in_multi_node_cluster() {
     let shard_info = shard_map
         .get_shard(&shard_to_split)
         .expect("find shard in map");
-    let split_point = shard_info
-        .range
-        .midpoint()
-        .expect("shard range should have a midpoint");
+    let split_point = silo::shard_range::format_hash_boundary(
+        shard_info
+            .range
+            .midpoint()
+            .expect("shard range should have a midpoint"),
+    );
 
     // Create splitter and split the shard
     let splitter = ShardSplitter::new(splitter_coord.clone());

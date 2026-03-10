@@ -198,9 +198,9 @@ impl ShardRange {
     /// Compute the numeric midpoint of this hash-space range for auto-split.
     ///
     /// Interprets the range boundaries as 16-character hex-encoded u64 values
-    /// and returns the midpoint as a 16-character hex string.
+    /// and returns the midpoint as a u64.
     /// Returns None if the range is too small to split.
-    pub fn midpoint(&self) -> Option<String> {
+    pub fn midpoint(&self) -> Option<u64> {
         let start_val: u64 = if self.start.is_empty() {
             0
         } else {
@@ -217,8 +217,7 @@ impl ShardRange {
             return None;
         }
 
-        let mid = start_val + (end_val - start_val) / 2;
-        Some(format!("{:016x}", mid))
+        Some(start_val + (end_val - start_val) / 2)
     }
 }
 
@@ -419,22 +418,20 @@ impl ShardMap {
             // Single shard covers entire keyspace
             shards.push(ShardInfo::new(ShardId::new(), ShardRange::full()));
         } else {
-            // Divide keyspace into equal ranges
-            // We use a simple approach: divide into ranges based on first character
-            // For better distribution, we create ranges using hex boundaries
+            // Divide the u64 hash keyspace into equal ranges
             let boundaries = compute_range_boundaries(shard_count);
 
             for i in 0..shard_count as usize {
                 let start = if i == 0 {
                     String::new() // Unbounded start
                 } else {
-                    boundaries[i - 1].clone()
+                    format_hash_boundary(boundaries[i - 1])
                 };
 
                 let end = if i == shard_count as usize - 1 {
                     String::new() // Unbounded end
                 } else {
-                    boundaries[i].clone()
+                    format_hash_boundary(boundaries[i])
                 };
 
                 shards.push(ShardInfo::new(ShardId::new(), ShardRange::new(start, end)));
@@ -676,11 +673,16 @@ pub enum ShardMapError {
     SplitAlreadyInProgress(ShardId),
 }
 
+/// Format a u64 hash-space value as a 16-character hex string for use in shard ranges.
+pub fn format_hash_boundary(val: u64) -> String {
+    format!("{:016x}", val)
+}
+
 /// Compute evenly-spaced range boundaries for the given shard count.
 ///
-/// Returns `shard_count - 1` boundary strings that divide the u64 hash
-/// keyspace into equal-sized partitions, formatted as 16-character hex strings.
-fn compute_range_boundaries(shard_count: u32) -> Vec<String> {
+/// Returns `shard_count - 1` boundary values that divide the u64 hash
+/// keyspace into equal-sized partitions.
+fn compute_range_boundaries(shard_count: u32) -> Vec<u64> {
     if shard_count <= 1 {
         return Vec::new();
     }
@@ -690,7 +692,7 @@ fn compute_range_boundaries(shard_count: u32) -> Vec<String> {
 
     for i in 1..shard_count {
         let boundary = (i as u128 * space / shard_count as u128) as u64;
-        boundaries.push(format!("{:016x}", boundary));
+        boundaries.push(boundary);
     }
 
     boundaries

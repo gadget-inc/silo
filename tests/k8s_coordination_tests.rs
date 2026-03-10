@@ -3376,10 +3376,12 @@ async fn k8s_split_in_multi_node_cluster() {
     let shard_info = shard_map
         .get_shard(&shard_to_split)
         .expect("find shard in map");
-    let split_point = shard_info
-        .range
-        .midpoint()
-        .expect("shard range should have a midpoint");
+    let split_point = silo::shard_range::format_hash_boundary(
+        shard_info
+            .range
+            .midpoint()
+            .expect("shard range should have a midpoint"),
+    );
 
     // Create splitter for the coordinator that owns the shard and split it
     let splitter = ShardSplitter::new(splitter_coord.clone());

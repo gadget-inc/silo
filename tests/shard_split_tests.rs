@@ -1,5 +1,7 @@
 use silo::coordination::{SplitCleanupStatus, SplitPhase};
-use silo::shard_range::{ShardId, ShardInfo, ShardMap, ShardMapError, ShardRange, SplitInProgress};
+use silo::shard_range::{
+    ShardId, ShardInfo, ShardMap, ShardMapError, ShardRange, SplitInProgress, format_hash_boundary,
+};
 
 #[test]
 fn cleanup_status_default_is_compaction_done() {
@@ -170,14 +172,15 @@ fn shard_range_midpoint_basic() {
     // Midpoint should exist
     assert!(midpoint.is_some());
     let mid = midpoint.unwrap();
+    let mid_hex = format_hash_boundary(mid);
 
     // Midpoint should be within range
-    assert!(range.contains(&mid));
+    assert!(range.contains(&mid_hex));
 
     // Midpoint should be strictly between start and end
-    assert!(mid.as_str() > "2000000000000000");
-    assert!(mid.as_str() < "a000000000000000");
-    assert_eq!(mid, "6000000000000000");
+    assert!(mid > 0x2000000000000000);
+    assert!(mid < 0xa000000000000000);
+    assert_eq!(mid, 0x6000000000000000);
 }
 
 #[test]
@@ -186,15 +189,16 @@ fn shard_range_midpoint_full_range() {
     let midpoint = range.midpoint();
 
     assert!(midpoint.is_some());
-    let mid = midpoint.unwrap();
-    assert!(range.contains(&mid));
+    let mid_hex = format_hash_boundary(midpoint.unwrap());
+    assert!(range.contains(&mid_hex));
 }
 
 #[test]
 fn shard_range_midpoint_can_be_used_for_split() {
     let range = ShardRange::new("1000000000000000", "f000000000000000");
     if let Some(mid) = range.midpoint() {
-        let result = range.split(&mid);
+        let mid_hex = format_hash_boundary(mid);
+        let result = range.split(&mid_hex);
         assert!(result.is_ok(), "midpoint should be valid for splitting");
 
         let (left, right) = result.unwrap();
@@ -211,10 +215,11 @@ fn shard_range_midpoint_all_32_shard_ranges() {
             .range
             .midpoint()
             .unwrap_or_else(|| panic!("range {} should have a midpoint", shard_info.range));
+        let mid_hex = format_hash_boundary(mid);
         assert!(
-            shard_info.range.contains(&mid),
-            "midpoint {:?} should be within range {}",
-            mid,
+            shard_info.range.contains(&mid_hex),
+            "midpoint {} should be within range {}",
+            mid_hex,
             shard_info.range
         );
     }
@@ -224,9 +229,9 @@ fn shard_range_midpoint_all_32_shard_ranges() {
 fn shard_range_midpoint_small_range() {
     let range = ShardRange::new("0000000000000000", "0800000000000000");
     let mid = range.midpoint().expect("should have a midpoint");
-    assert!(mid.as_str() > "0000000000000000");
-    assert!(mid.as_str() < "0800000000000000");
-    assert_eq!(mid, "0400000000000000");
+    assert!(mid > 0x0000000000000000);
+    assert!(mid < 0x0800000000000000);
+    assert_eq!(mid, 0x0400000000000000);
 }
 
 #[test]
@@ -251,7 +256,7 @@ fn shard_map_split_shard_basic() {
     let original_version = map.version;
 
     // Use the midpoint of the full hash-space range as split point
-    let split_point = map.shards()[0].range.midpoint().unwrap();
+    let split_point = format_hash_boundary(map.shards()[0].range.midpoint().unwrap());
 
     let left_child_id = ShardId::new();
     let right_child_id = ShardId::new();
@@ -297,7 +302,7 @@ fn shard_map_split_preserves_keyspace_coverage() {
     let mut map = ShardMap::create_initial(1).expect("create initial map");
     let shard_id = map.shards()[0].id;
 
-    let split_point = map.shards()[0].range.midpoint().unwrap();
+    let split_point = format_hash_boundary(map.shards()[0].range.midpoint().unwrap());
     map.split_shard(&shard_id, &split_point, ShardId::new(), ShardId::new())
         .expect("split should succeed");
 
@@ -321,7 +326,7 @@ fn shard_map_split_tenant_routing() {
     let left_id = ShardId::new();
     let right_id = ShardId::new();
 
-    let split_point = map.shards()[0].range.midpoint().unwrap();
+    let split_point = format_hash_boundary(map.shards()[0].range.midpoint().unwrap());
     map.split_shard(&shard_id, &split_point, left_id, right_id)
         .expect("split should succeed");
 
@@ -360,7 +365,7 @@ fn shard_map_split_invalid_split_point() {
 
     // Use a hash-space value that falls in the first shard's range as split point
     // for the second shard — this should fail
-    let first_shard_mid = map.shards()[0].range.midpoint().unwrap();
+    let first_shard_mid = format_hash_boundary(map.shards()[0].range.midpoint().unwrap());
     let second_shard_id = map.shards()[1].id;
 
     let result = map.split_shard(
@@ -378,7 +383,7 @@ fn shard_map_sequential_splits() {
 
     // First split at midpoint of full range
     let shard_id = map.shards()[0].id;
-    let split1 = map.shards()[0].range.midpoint().unwrap();
+    let split1 = format_hash_boundary(map.shards()[0].range.midpoint().unwrap());
     let left1 = ShardId::new();
     let right1 = ShardId::new();
     map.split_shard(&shard_id, &split1, left1, right1)
@@ -386,7 +391,7 @@ fn shard_map_sequential_splits() {
     assert_eq!(map.len(), 2);
 
     // Second split on left child at its midpoint
-    let split2 = map.get_shard(&left1).unwrap().range.midpoint().unwrap();
+    let split2 = format_hash_boundary(map.get_shard(&left1).unwrap().range.midpoint().unwrap());
     let left2 = ShardId::new();
     let right2 = ShardId::new();
     map.split_shard(&left1, &split2, left2, right2)
@@ -394,7 +399,7 @@ fn shard_map_sequential_splits() {
     assert_eq!(map.len(), 3);
 
     // Third split on right child of first split at its midpoint
-    let split3 = map.get_shard(&right1).unwrap().range.midpoint().unwrap();
+    let split3 = format_hash_boundary(map.get_shard(&right1).unwrap().range.midpoint().unwrap());
     let left3 = ShardId::new();
     let right3 = ShardId::new();
     map.split_shard(&right1, &split3, left3, right3)
