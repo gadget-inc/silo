@@ -38,11 +38,11 @@ A **task group** determines which workers process a job. Workers poll for tasks 
 
 ### Tenants
 
-A **tenant** is an isolation boundary for job data. All data for a tenant lives on a single shard, enabling fast local transactions. Tenants can be very high cardinality (millions), but each individual tenant is bounded by a single shard's throughput (roughly 4,000 jobs/second).
+A **tenant** is an isolation boundary for job data. All data for a tenant lives on a single shard, enabling fast local transactions. Tenants are routed to shards using hash-based routing (XXH64), which distributes tenants uniformly across the hash space regardless of naming patterns. Tenants can be very high cardinality (millions), but each individual tenant is bounded by a single shard's throughput (roughly 4,000 jobs/second).
 
 ### Shards
 
-Silo partitions data across **shards**. Each shard is backed by its own SlateDB instance in object storage. Shards are assigned to compute nodes, and can be split dynamically as load grows. Shard ownership is coordinated via etcd or Kubernetes.
+Silo partitions data across **shards**. Each shard owns a range of the 64-bit hash space. When a job is enqueued for a tenant, Silo hashes the tenant ID (XXH64) and routes it to the shard whose range contains that hash. Shards are backed by their own SlateDB instance in object storage, assigned to compute nodes, and can be split dynamically as load grows. Shard ownership is coordinated via etcd or Kubernetes.
 
 ### Workers
 
@@ -51,7 +51,7 @@ Silo partitions data across **shards**. Each shard is backed by its own SlateDB 
 ## How It Works
 
 1. Your application **enqueues** a job by calling Silo's gRPC API with a payload and task group.
-2. Silo stores the job in the appropriate shard (based on tenant) and makes it available for dequeue.
+2. Silo hashes the tenant ID and stores the job in the appropriate shard, making it available for dequeue.
 3. A **worker** polling that task group leases the task and processes it.
 4. The worker **reports the outcome** (success with optional result, or failure) back to Silo.
 5. On failure, Silo automatically retries according to the job's retry policy.

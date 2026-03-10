@@ -2619,8 +2619,8 @@ async fn k8s_request_split_creates_split_record() {
     assert!(!owned.is_empty(), "should own at least one shard");
     let shard_id = owned[0];
 
-    // Use a simple split point - with 1 shard the range is unbounded so "m" is valid
-    let split_point = "m".to_string();
+    // Use hash-space midpoint as split point
+    let split_point = "8000000000000000".to_string();
 
     // Create splitter
 
@@ -2726,7 +2726,7 @@ async fn k8s_request_split_fails_if_not_owner() {
     };
 
     let result = non_owner_splitter
-        .request_split(target_shard, "mmmmm".to_string())
+        .request_split(target_shard, "8000000000000000".to_string())
         .await;
     assert!(
         matches!(result, Err(CoordinationError::NotShardOwner(_))),
@@ -2768,12 +2768,14 @@ async fn k8s_request_split_fails_if_already_in_progress() {
 
     // First split request should succeed
     let _split = splitter
-        .request_split(shard_id, "m".to_string())
+        .request_split(shard_id, "8000000000000000".to_string())
         .await
         .expect("first request_split should succeed");
 
     // Second split request should fail
-    let result = splitter.request_split(shard_id, "n".to_string()).await;
+    let result = splitter
+        .request_split(shard_id, "4000000000000000".to_string())
+        .await;
     assert!(
         matches!(result, Err(CoordinationError::SplitAlreadyInProgress(_))),
         "should fail with SplitAlreadyInProgress, got: {:?}",
@@ -2869,7 +2871,7 @@ async fn k8s_is_shard_paused_returns_correct_values() {
 
     // Request a split - still not paused in SplitRequested phase
     let _split = splitter
-        .request_split(shard_id, "m".to_string())
+        .request_split(shard_id, "8000000000000000".to_string())
         .await
         .expect("request_split should succeed");
 
@@ -2912,7 +2914,7 @@ async fn k8s_split_state_persists_across_restart() {
     let splitter1 = ShardSplitter::new(c1.clone());
 
     let split = splitter1
-        .request_split(shard_id, "m".to_string())
+        .request_split(shard_id, "8000000000000000".to_string())
         .await
         .expect("request_split should succeed");
 
@@ -2955,7 +2957,7 @@ async fn k8s_split_state_persists_across_restart() {
     );
     let status = status.unwrap();
     assert_eq!(status.parent_shard_id, shard_id);
-    assert_eq!(status.split_point, "m");
+    assert_eq!(status.split_point, "8000000000000000");
     assert_eq!(status.left_child_id, split.left_child_id);
     assert_eq!(status.right_child_id, split.right_child_id);
 
@@ -3028,7 +3030,7 @@ async fn k8s_execute_split_completes_full_cycle() {
 
     // Request and execute the split
     let split = splitter
-        .request_split(shard_id, "m".to_string())
+        .request_split(shard_id, "8000000000000000".to_string())
         .await
         .expect("request_split should succeed");
 
@@ -3101,7 +3103,7 @@ async fn k8s_shard_paused_during_split_execution() {
 
     // Request split but don't execute
     let _split = splitter
-        .request_split(shard_id, "m".to_string())
+        .request_split(shard_id, "8000000000000000".to_string())
         .await
         .expect("request_split");
 
@@ -3198,7 +3200,7 @@ async fn k8s_execute_split_resumes_from_partial_state() {
 
     // Request and advance to SplitPausing
     let split = splitter
-        .request_split(shard_id, "m".to_string())
+        .request_split(shard_id, "8000000000000000".to_string())
         .await
         .expect("request_split");
     splitter
@@ -3257,9 +3259,13 @@ async fn k8s_sequential_splits_work_correctly() {
 
     let splitter = ShardSplitter::new(coord.clone());
 
-    // First split at "m"
+    // First split: midpoint minus an offset (not exactly at the midpoint)
+    let shard_map = coord.get_shard_map().await.unwrap();
+    let mid1: u64 = u64::MAX / 2;
+    let split_point1 = format!("{:016x}", mid1 - 0x0100000000000000);
+
     let split1 = splitter
-        .request_split(shard_id, "m".to_string())
+        .request_split(shard_id, split_point1)
         .await
         .expect("first request_split");
     splitter
@@ -3270,10 +3276,13 @@ async fn k8s_sequential_splits_work_correctly() {
     let shard_map = coord.get_shard_map().await.unwrap();
     assert_eq!(shard_map.len(), 2);
 
-    // Second split: split left child at "g"
+    // Second split: split left child at midpoint plus an offset
     let left_child_id = split1.left_child_id;
+    let left_range = &shard_map.get_shard(&left_child_id).unwrap().range;
+    let left_end = u64::from_str_radix(&left_range.end, 16).unwrap();
+    let split_point2 = format!("{:016x}", left_end / 2 + 0x0080000000000000);
     let split2 = splitter
-        .request_split(left_child_id, "g".to_string())
+        .request_split(left_child_id, split_point2)
         .await
         .expect("second request_split");
     splitter
@@ -3284,14 +3293,20 @@ async fn k8s_sequential_splits_work_correctly() {
     let shard_map = coord.get_shard_map().await.unwrap();
     assert_eq!(shard_map.len(), 3);
 
-    // Verify tenant routing
-    let tenant_a = shard_map.shard_for_tenant("a").unwrap();
-    let tenant_h = shard_map.shard_for_tenant("h").unwrap();
-    let tenant_z = shard_map.shard_for_tenant("z").unwrap();
-
-    assert_eq!(tenant_a.id, split2.left_child_id);
-    assert_eq!(tenant_h.id, split2.right_child_id);
-    assert_eq!(tenant_z.id, split1.right_child_id);
+    // Verify tenant routing — all tenants route to one of the three shards
+    let valid_ids = [
+        split2.left_child_id,
+        split2.right_child_id,
+        split1.right_child_id,
+    ];
+    for tenant in ["a", "h", "z", "env-123"] {
+        let routed = shard_map.shard_for_tenant(tenant).unwrap();
+        assert!(
+            valid_ids.contains(&routed.id),
+            "tenant '{}' should route to one of the three shards",
+            tenant
+        );
+    }
 
     coord.shutdown().await.unwrap();
     handle.abort();
@@ -3361,10 +3376,12 @@ async fn k8s_split_in_multi_node_cluster() {
     let shard_info = shard_map
         .get_shard(&shard_to_split)
         .expect("find shard in map");
-    let split_point = shard_info
-        .range
-        .midpoint()
-        .expect("shard range should have a midpoint");
+    let split_point = silo::shard_range::format_hash_boundary(
+        shard_info
+            .range
+            .midpoint()
+            .expect("shard range should have a midpoint"),
+    );
 
     // Create splitter for the coordinator that owns the shard and split it
     let splitter = ShardSplitter::new(splitter_coord.clone());
@@ -3422,7 +3439,7 @@ async fn k8s_crash_recovery_early_phase_abandons_split() {
     let splitter1 = ShardSplitter::new(c1.clone());
 
     let _split = splitter1
-        .request_split(shard_id, "m".to_string())
+        .request_split(shard_id, "8000000000000000".to_string())
         .await
         .expect("request_split");
     splitter1
@@ -3539,7 +3556,7 @@ async fn k8s_child_shards_acquired_via_watch_after_split() {
     // Perform the split
     let splitter = ShardSplitter::new(splitter_coord.clone());
     let split = splitter
-        .request_split(shard_id, "m".to_string())
+        .request_split(shard_id, "8000000000000000".to_string())
         .await
         .expect("request_split");
     splitter
@@ -3650,10 +3667,10 @@ async fn k8s_child_shards_usable_after_split() {
         "job should exist in parent before split"
     );
 
-    // Perform the split at "m"
+    // Perform the split at hash-space midpoint
     let splitter = ShardSplitter::new(coord.clone());
     let split = splitter
-        .request_split(shard_id, "m".to_string())
+        .request_split(shard_id, "8000000000000000".to_string())
         .await
         .expect("request_split");
 
@@ -3670,36 +3687,40 @@ async fn k8s_child_shards_usable_after_split() {
     assert!(right_shard.is_some(), "right child shard should be open");
 
     let _left_shard = left_shard.unwrap();
-    let right_shard = right_shard.unwrap();
+    let _right_shard = right_shard.unwrap();
 
     // Verify the ranges are correct
     let shard_map = coord.get_shard_map().await.unwrap();
     let left_info = shard_map.get_shard(&split.left_child_id).unwrap();
     let right_info = shard_map.get_shard(&split.right_child_id).unwrap();
 
-    // Left child should have range up to "m"
+    // Left child should have range up to the split point
     assert!(
-        left_info.range.end == "m",
+        left_info.range.end == "8000000000000000",
         "left child should have end bound at split point"
     );
 
-    // Right child should have range starting at "m"
+    // Right child should have range starting at the split point
     assert!(
-        right_info.range.start == "m",
+        right_info.range.start == "8000000000000000",
         "right child should have start bound at split point"
     );
 
-    // Verify jobs are accessible in one of the child shards
-    // (depends on which range the tenant falls into)
-    // Since tenant "test-tenant" > "m", it should be in the right child
-    let right_job_status = right_shard.get_job_status(tenant, "job-0").await;
+    // Verify jobs are accessible in the correct child shard based on tenant hash
+    let routed = shard_map.shard_for_tenant(tenant).unwrap();
+    let target_shard = if routed.id == split.left_child_id {
+        factory.get(&split.left_child_id).unwrap()
+    } else {
+        factory.get(&split.right_child_id).unwrap()
+    };
+    let job_status = target_shard.get_job_status(tenant, "job-0").await;
     assert!(
-        right_job_status.is_ok() && right_job_status.unwrap().is_some(),
+        job_status.is_ok() && job_status.unwrap().is_some(),
         "jobs should be accessible in the correct child shard after split"
     );
 
     // Verify dequeue works on child shards (tests TaskBroker is functional)
-    let dequeue_result = right_shard.dequeue("test-worker", "default", 10).await;
+    let dequeue_result = target_shard.dequeue("test-worker", "default", 10).await;
     assert!(dequeue_result.is_ok(), "dequeue should work on child shard");
 
     coord.shutdown().await.unwrap();
@@ -3737,7 +3758,7 @@ async fn k8s_crash_recovery_cloning_phase_abandons_split() {
     let splitter1 = ShardSplitter::new(c1.clone());
 
     let _split = splitter1
-        .request_split(shard_id, "m".to_string())
+        .request_split(shard_id, "8000000000000000".to_string())
         .await
         .expect("request_split");
 
@@ -4796,7 +4817,9 @@ async fn k8s_crash_restart_reclaims_and_opens_shards() {
 async fn k8s_hash_ring_divergence_on_restart() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
-    let num_shards: u32 = 8;
+    // Use 32 shards to ensure both nodes get some via rendezvous hashing.
+    // With 8 shards the probability of all going to one node is (0.5)^8 ≈ 0.4%.
+    let num_shards: u32 = 32;
 
     // Start A and B, let them partition shards
     let (ca, ha) = start_coordinator!(

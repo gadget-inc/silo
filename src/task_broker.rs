@@ -178,7 +178,7 @@ impl TaskBroker {
             // Check if task's tenant is within shard range
             let task_tenant = decoded.tenant();
 
-            if !self.range.contains(task_tenant) {
+            if !self.range.contains_tenant(task_tenant) {
                 // Task is for a tenant outside our range - mark for deletion
                 defunct_keys.push(kv.key.to_vec());
                 debug!(

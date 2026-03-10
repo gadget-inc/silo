@@ -1,5 +1,7 @@
 use silo::coordination::{SplitCleanupStatus, SplitPhase};
-use silo::shard_range::{ShardId, ShardInfo, ShardMap, ShardMapError, ShardRange, SplitInProgress};
+use silo::shard_range::{
+    ShardId, ShardInfo, ShardMap, ShardMapError, ShardRange, SplitInProgress, format_hash_boundary,
+};
 
 #[test]
 fn cleanup_status_default_is_compaction_done() {
@@ -163,19 +165,22 @@ fn shard_range_split_children_contain_correct_tenants() {
 
 #[test]
 fn shard_range_midpoint_basic() {
-    let range = ShardRange::new("a", "z");
+    // Use hex-encoded hash-space boundaries
+    let range = ShardRange::new("2000000000000000", "a000000000000000");
     let midpoint = range.midpoint();
 
     // Midpoint should exist
     assert!(midpoint.is_some());
     let mid = midpoint.unwrap();
+    let mid_hex = format_hash_boundary(mid);
 
     // Midpoint should be within range
-    assert!(range.contains(&mid));
+    assert!(range.contains(&mid_hex));
 
     // Midpoint should be strictly between start and end
-    assert!(mid.as_str() > "a");
-    assert!(mid.as_str() < "z");
+    assert!(mid > 0x2000000000000000);
+    assert!(mid < 0xa000000000000000);
+    assert_eq!(mid, 0x6000000000000000);
 }
 
 #[test]
@@ -184,15 +189,16 @@ fn shard_range_midpoint_full_range() {
     let midpoint = range.midpoint();
 
     assert!(midpoint.is_some());
-    let mid = midpoint.unwrap();
-    assert!(range.contains(&mid));
+    let mid_hex = format_hash_boundary(midpoint.unwrap());
+    assert!(range.contains(&mid_hex));
 }
 
 #[test]
 fn shard_range_midpoint_can_be_used_for_split() {
-    let range = ShardRange::new("abc", "xyz");
+    let range = ShardRange::new("1000000000000000", "f000000000000000");
     if let Some(mid) = range.midpoint() {
-        let result = range.split(&mid);
+        let mid_hex = format_hash_boundary(mid);
+        let result = range.split(&mid_hex);
         assert!(result.is_ok(), "midpoint should be valid for splitting");
 
         let (left, right) = result.unwrap();
@@ -209,22 +215,23 @@ fn shard_range_midpoint_all_32_shard_ranges() {
             .range
             .midpoint()
             .unwrap_or_else(|| panic!("range {} should have a midpoint", shard_info.range));
+        let mid_hex = format_hash_boundary(mid);
         assert!(
-            shard_info.range.contains(&mid),
-            "midpoint {:?} should be within range {}",
-            mid,
+            shard_info.range.contains(&mid_hex),
+            "midpoint {} should be within range {}",
+            mid_hex,
             shard_info.range
         );
     }
 }
 
 #[test]
-fn shard_range_midpoint_prefix_with_low_boundary() {
-    // Regression: ["0", "08") failed when midpoint appended 'M' > '8'
-    let range = ShardRange::new("0", "08");
+fn shard_range_midpoint_small_range() {
+    let range = ShardRange::new("0000000000000000", "0800000000000000");
     let mid = range.midpoint().expect("should have a midpoint");
-    assert!(mid.as_str() > "0");
-    assert!(mid.as_str() < "08");
+    assert!(mid > 0x0000000000000000);
+    assert!(mid < 0x0800000000000000);
+    assert_eq!(mid, 0x0400000000000000);
 }
 
 #[test]
@@ -248,11 +255,19 @@ fn shard_map_split_shard_basic() {
     let original_shard_id = map.shards()[0].id;
     let original_version = map.version;
 
+    // Use the midpoint of the full hash-space range as split point
+    let split_point = format_hash_boundary(map.shards()[0].range.midpoint().unwrap());
+
     let left_child_id = ShardId::new();
     let right_child_id = ShardId::new();
 
     let (left, right) = map
-        .split_shard(&original_shard_id, "m", left_child_id, right_child_id)
+        .split_shard(
+            &original_shard_id,
+            &split_point,
+            left_child_id,
+            right_child_id,
+        )
         .expect("split should succeed");
 
     // Map should now have 2 shards
@@ -270,8 +285,8 @@ fn shard_map_split_shard_basic() {
 
     // Children should have correct ranges
     assert!(left.range.is_start_unbounded());
-    assert_eq!(left.range.end, "m");
-    assert_eq!(right.range.start, "m");
+    assert_eq!(left.range.end, split_point);
+    assert_eq!(right.range.start, split_point);
     assert!(right.range.is_end_unbounded());
 
     // [SILO-COORD-INV-3] Children should be contiguous
@@ -287,13 +302,14 @@ fn shard_map_split_preserves_keyspace_coverage() {
     let mut map = ShardMap::create_initial(1).expect("create initial map");
     let shard_id = map.shards()[0].id;
 
-    map.split_shard(&shard_id, "tenant-500", ShardId::new(), ShardId::new())
+    let split_point = format_hash_boundary(map.shards()[0].range.midpoint().unwrap());
+    map.split_shard(&shard_id, &split_point, ShardId::new(), ShardId::new())
         .expect("split should succeed");
 
     // [SILO-COORD-INV-2] Map should still be valid (full coverage)
     map.validate().expect("map should be valid after split");
 
-    // Should be able to find shards for all tenants
+    // Should be able to find shards for all tenants (hashes distribute across both halves)
     assert!(map.shard_for_tenant("a").is_some());
     assert!(map.shard_for_tenant("tenant-100").is_some());
     assert!(map.shard_for_tenant("tenant-500").is_some());
@@ -303,27 +319,35 @@ fn shard_map_split_preserves_keyspace_coverage() {
 
 #[test]
 fn shard_map_split_tenant_routing() {
+    use silo::shard_range::hash_tenant;
+
     let mut map = ShardMap::create_initial(1).expect("create initial map");
     let shard_id = map.shards()[0].id;
     let left_id = ShardId::new();
     let right_id = ShardId::new();
 
-    map.split_shard(&shard_id, "m", left_id, right_id)
+    let split_point = format_hash_boundary(map.shards()[0].range.midpoint().unwrap());
+    map.split_shard(&shard_id, &split_point, left_id, right_id)
         .expect("split should succeed");
 
-    // Tenants before split point should route to left child
-    let shard_for_a = map.shard_for_tenant("a").unwrap();
-    assert_eq!(shard_for_a.id, left_id);
-
-    let shard_for_l = map.shard_for_tenant("l").unwrap();
-    assert_eq!(shard_for_l.id, left_id);
-
-    // Tenants at or after split point should route to right child
-    let shard_for_m = map.shard_for_tenant("m").unwrap();
-    assert_eq!(shard_for_m.id, right_id);
-
-    let shard_for_z = map.shard_for_tenant("z").unwrap();
-    assert_eq!(shard_for_z.id, right_id);
+    // Every tenant should route to one of the two children based on its hash
+    for tenant in ["a", "m", "z", "env-123", "tenant-456"] {
+        let shard = map.shard_for_tenant(tenant).unwrap();
+        let hashed = hash_tenant(tenant);
+        if hashed.as_str() < split_point.as_str() {
+            assert_eq!(
+                shard.id, left_id,
+                "tenant '{}' (hash {}) should route to left",
+                tenant, hashed
+            );
+        } else {
+            assert_eq!(
+                shard.id, right_id,
+                "tenant '{}' (hash {}) should route to right",
+                tenant, hashed
+            );
+        }
+    }
 }
 
 #[test]
@@ -339,41 +363,46 @@ fn shard_map_split_shard_not_found() {
 fn shard_map_split_invalid_split_point() {
     let mut map = ShardMap::create_initial(2).expect("create initial map with 2 shards");
 
-    // Find a shard that doesn't cover "m"
-    let shard_id = map
-        .shards()
-        .iter()
-        .find(|s| !s.range.contains("m"))
-        .map(|s| s.id);
-    if let Some(id) = shard_id {
-        let result = map.split_shard(&id, "m", ShardId::new(), ShardId::new());
-        assert!(matches!(result, Err(ShardMapError::InvalidSplitPoint(_))));
-    }
+    // Use a hash-space value that falls in the first shard's range as split point
+    // for the second shard — this should fail
+    let first_shard_mid = format_hash_boundary(map.shards()[0].range.midpoint().unwrap());
+    let second_shard_id = map.shards()[1].id;
+
+    let result = map.split_shard(
+        &second_shard_id,
+        &first_shard_mid,
+        ShardId::new(),
+        ShardId::new(),
+    );
+    assert!(matches!(result, Err(ShardMapError::InvalidSplitPoint(_))));
 }
 
 #[test]
 fn shard_map_sequential_splits() {
     let mut map = ShardMap::create_initial(1).expect("create initial map");
 
-    // First split
+    // First split at midpoint of full range
     let shard_id = map.shards()[0].id;
+    let split1 = format_hash_boundary(map.shards()[0].range.midpoint().unwrap());
     let left1 = ShardId::new();
     let right1 = ShardId::new();
-    map.split_shard(&shard_id, "m", left1, right1)
+    map.split_shard(&shard_id, &split1, left1, right1)
         .expect("first split should succeed");
     assert_eq!(map.len(), 2);
 
-    // Second split on left child
+    // Second split on left child at its midpoint
+    let split2 = format_hash_boundary(map.get_shard(&left1).unwrap().range.midpoint().unwrap());
     let left2 = ShardId::new();
     let right2 = ShardId::new();
-    map.split_shard(&left1, "g", left2, right2)
+    map.split_shard(&left1, &split2, left2, right2)
         .expect("second split should succeed");
     assert_eq!(map.len(), 3);
 
-    // Third split on right child of first split
+    // Third split on right child of first split at its midpoint
+    let split3 = format_hash_boundary(map.get_shard(&right1).unwrap().range.midpoint().unwrap());
     let left3 = ShardId::new();
     let right3 = ShardId::new();
-    map.split_shard(&right1, "t", left3, right3)
+    map.split_shard(&right1, &split3, left3, right3)
         .expect("third split should succeed");
     assert_eq!(map.len(), 4);
 
@@ -381,11 +410,14 @@ fn shard_map_sequential_splits() {
     map.validate()
         .expect("map should be valid after multiple splits");
 
-    // All tenants should route correctly
-    assert_eq!(map.shard_for_tenant("a").unwrap().id, left2);
-    assert_eq!(map.shard_for_tenant("h").unwrap().id, right2);
-    assert_eq!(map.shard_for_tenant("n").unwrap().id, left3);
-    assert_eq!(map.shard_for_tenant("z").unwrap().id, right3);
+    // All tenants should still route to some shard
+    for tenant in ["a", "h", "n", "z", "env-123", "tenant-999"] {
+        assert!(
+            map.shard_for_tenant(tenant).is_some(),
+            "tenant '{}' should map to a shard",
+            tenant
+        );
+    }
 }
 
 #[test]

@@ -252,10 +252,8 @@ async fn worker_loop(
                             if client.handle_routing_error(&e, &task_shard).await.is_some() {
                                 // Retry once with updated routing
                                 if let Ok(mut retry_client) = client.client_for_shard(&task_shard) {
-                                    let retry_req = make_success_outcome_request(
-                                        task_shard,
-                                        task.id.clone(),
-                                    );
+                                    let retry_req =
+                                        make_success_outcome_request(task_shard, task.id.clone());
                                     match retry_client.report_outcome(retry_req).await {
                                         Ok(_) => {
                                             completed_count.fetch_add(1, Ordering::Relaxed);
@@ -352,8 +350,7 @@ async fn enqueuer_loop(
                 }
                 Err(e) => {
                     if retries < MAX_ROUTING_RETRIES
-                        && let Some(needs_backoff) =
-                            client.handle_routing_error(&e, &shard).await
+                        && let Some(needs_backoff) = client.handle_routing_error(&e, &shard).await
                     {
                         retries += 1;
                         if needs_backoff {

@@ -117,7 +117,7 @@ impl JobStoreShard {
                 // Tasks for tenants outside the range are defunct (from before a split)
                 let task_tenant = decoded.tenant();
 
-                if !shard_range.contains(task_tenant) {
+                if !shard_range.contains_tenant(task_tenant) {
                     // Task is for a tenant outside our range - delete and skip
                     state.batch.delete(&entry.key);
                     state.ack_deleted(&entry.key);

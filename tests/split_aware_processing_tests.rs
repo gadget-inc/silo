@@ -16,6 +16,9 @@ use test_helpers::{
 
 use silo::shard_range::ShardRange;
 
+/// Boundary at the midpoint of the u64 hash space, encoded as a 16-char hex string.
+const RANGE_BOUNDARY: &str = "8000000000000000";
+
 /// Helper to enqueue jobs for multiple tenants
 async fn enqueue_jobs_for_tenants(
     shard: &silo::job_store_shard::JobStoreShard,
@@ -49,16 +52,18 @@ async fn enqueue_jobs_for_tenants(
 async fn cleanup_removes_tasks_outside_range() {
     let (_tmp, shard) = open_temp_shard().await;
 
-    // Enqueue jobs for tenants across a potential split point
-    enqueue_jobs_for_tenants(&shard, &["aaa", "mmm", "zzz"], 2, "default").await;
+    // Enqueue jobs for tenants across the hash boundary
+    // IN  range [, 8000): bbb(3a4f)
+    // OUT range: aaa(ae01), yyy(ed58)
+    enqueue_jobs_for_tenants(&shard, &["aaa", "bbb", "yyy"], 2, "default").await;
     shard.db().flush().await.unwrap();
 
     // Verify tasks exist for all tenants
     let task_count_before = count_task_keys(shard.db()).await;
     assert_eq!(task_count_before, 6); // 3 tenants * 2 jobs
 
-    // Run cleanup with range that only includes tenants < "mmm"
-    let cleanup_range = ShardRange::new("", "mmm");
+    // Run cleanup with range that only includes tenants whose hash < 8000
+    let cleanup_range = ShardRange::new("", RANGE_BOUNDARY);
     let result = shard
         .after_split_cleanup_defunct_data(&cleanup_range, 100)
         .await
@@ -66,11 +71,11 @@ async fn cleanup_removes_tasks_outside_range() {
 
     shard.db().flush().await.unwrap();
 
-    // Tasks for mmm and zzz should be deleted
+    // Tasks for aaa and yyy should be deleted (hashes out of range)
     let task_count_after = count_task_keys(shard.db()).await;
     assert_eq!(
         task_count_after, 2,
-        "only aaa tasks should remain (2 tasks)"
+        "only bbb tasks should remain (2 tasks)"
     );
     assert!(result.keys_deleted > 0, "should have deleted some keys");
 }
@@ -80,12 +85,13 @@ async fn cleanup_removes_tasks_outside_range() {
 async fn cleanup_preserves_tasks_within_range() {
     let (_tmp, shard) = open_temp_shard().await;
 
-    // Enqueue jobs only for tenants within a specific range
-    enqueue_jobs_for_tenants(&shard, &["abc", "def", "ghi"], 2, "default").await;
+    // Enqueue jobs only for tenants whose hashes are all within [, 8000)
+    // bbb(3a4f), mmm(0489), zzz(6d85) — all IN range
+    enqueue_jobs_for_tenants(&shard, &["bbb", "mmm", "zzz"], 2, "default").await;
     shard.db().flush().await.unwrap();
 
-    // Run cleanup with a range that includes all these tenants
-    let cleanup_range = ShardRange::new("a", "n");
+    // Run cleanup with range that includes all these tenants
+    let cleanup_range = ShardRange::new("", RANGE_BOUNDARY);
     let result = shard
         .after_split_cleanup_defunct_data(&cleanup_range, 100)
         .await
@@ -116,11 +122,11 @@ async fn dequeue_works_with_full_range() {
 /// Shard opened with restricted range only processes tasks within that range
 #[silo::test]
 async fn shard_with_restricted_range_only_processes_within_range() {
-    // Open shard with range that only includes tenants < "ccc"
-    let (_tmp, shard) = open_temp_shard_with_range(ShardRange::new("", "ccc")).await;
+    // Open shard with range [, 8000) — only tenants whose hashes fall in this range
+    let (_tmp, shard) = open_temp_shard_with_range(ShardRange::new("", RANGE_BOUNDARY)).await;
 
-    // Enqueue jobs only for tenants within the range
-    enqueue_jobs_for_tenants(&shard, &["aaa", "bbb"], 2, "default").await;
+    // Enqueue jobs for tenants within the range: bbb(3a4f), mmm(0489) — both IN
+    enqueue_jobs_for_tenants(&shard, &["bbb", "mmm"], 2, "default").await;
     shard.db().flush().await.unwrap();
 
     // All tasks should be present and processable
@@ -128,15 +134,15 @@ async fn shard_with_restricted_range_only_processes_within_range() {
     assert_eq!(
         result.tasks.len(),
         4,
-        "should get all 4 tasks for aaa and bbb"
+        "should get all 4 tasks for bbb and mmm"
     );
 
     // Verify the returned tasks are for the correct tenants
     for task in &result.tasks {
         let tid = task.tenant_id();
         assert!(
-            tid == "aaa" || tid == "bbb",
-            "task tenant should be aaa or bbb, got {}",
+            tid == "bbb" || tid == "mmm",
+            "task tenant should be bbb or mmm, got {}",
             tid
         );
     }
@@ -148,7 +154,8 @@ async fn cleanup_removes_leases_outside_range() {
     let (_tmp, shard) = open_temp_shard().await;
 
     // Enqueue and dequeue jobs to create leases
-    enqueue_jobs_for_tenants(&shard, &["aaa", "zzz"], 1, "default").await;
+    // bbb(3a4f) IN range [, 8000), aaa(ae01) OUT
+    enqueue_jobs_for_tenants(&shard, &["aaa", "bbb"], 1, "default").await;
     shard.db().flush().await.unwrap();
 
     let result = shard.dequeue("worker-1", "default", 10).await.unwrap();
@@ -159,19 +166,19 @@ async fn cleanup_removes_leases_outside_range() {
     let lease_count_before = count_lease_keys(shard.db()).await;
     assert_eq!(lease_count_before, 2, "should have 2 leases");
 
-    // Run cleanup with range that only includes aaa
-    let cleanup_range = ShardRange::new("", "b");
+    // Run cleanup with range [, 8000) — keeps bbb, removes aaa
+    let cleanup_range = ShardRange::new("", RANGE_BOUNDARY);
     shard
         .after_split_cleanup_defunct_data(&cleanup_range, 100)
         .await
         .expect("cleanup should succeed");
     shard.db().flush().await.unwrap();
 
-    // The zzz lease should be deleted
+    // The aaa lease should be deleted (hash out of range)
     let lease_count_after = count_lease_keys(shard.db()).await;
     assert_eq!(
         lease_count_after, 1,
-        "should have 1 lease remaining (aaa only)"
+        "should have 1 lease remaining (bbb only)"
     );
 }
 
@@ -181,6 +188,8 @@ async fn post_split_cleanup_left_child() {
     let (_tmp, shard) = open_temp_shard().await;
 
     // Simulate parent shard with jobs for multiple tenants
+    // IN  range [, 8000): delta(21c5), gamma(7707)
+    // OUT range: alpha(c758), beta(f5ee), epsilon(a64f)
     enqueue_jobs_for_tenants(
         &shard,
         &["alpha", "beta", "gamma", "delta", "epsilon"],
@@ -194,29 +203,26 @@ async fn post_split_cleanup_left_child() {
     let job_count = count_job_info_keys(shard.db()).await;
     assert_eq!(job_count, 10); // 5 tenants * 2 jobs
 
-    // Run cleanup as if this is the LEFT child after split at "delta"
-    // Left child gets tenants < "delta": alpha, beta (not gamma which comes after delta alphabetically)
-    // Wait, alphabetically: alpha < beta < delta < epsilon < gamma
-    // So tenants < "delta" are: alpha, beta
-    let cleanup_range = ShardRange::new("", "delta");
+    // Run cleanup as the LEFT child with range [, 8000)
+    let cleanup_range = ShardRange::new("", RANGE_BOUNDARY);
     shard
         .after_split_cleanup_defunct_data(&cleanup_range, 100)
         .await
         .expect("cleanup should succeed");
     shard.db().flush().await.unwrap();
 
-    // Jobs for delta, epsilon, gamma should be deleted
+    // Jobs for alpha, beta, epsilon should be deleted (hashes out of range)
     let job_count_after = count_job_info_keys(shard.db()).await;
     assert_eq!(
         job_count_after, 4,
-        "should have 4 jobs remaining (alpha=2, beta=2)"
+        "should have 4 jobs remaining (delta=2, gamma=2)"
     );
 
-    // Tasks for delta, epsilon, gamma should also be deleted
+    // Tasks for alpha, beta, epsilon should also be deleted
     let task_count_after = count_task_keys(shard.db()).await;
     assert_eq!(
         task_count_after, 4,
-        "should have 4 tasks remaining (alpha=2, beta=2)"
+        "should have 4 tasks remaining (delta=2, gamma=2)"
     );
 }
 
@@ -226,31 +232,31 @@ async fn post_split_cleanup_right_child() {
     let (_tmp, shard) = open_temp_shard().await;
 
     // Simulate parent shard with jobs for multiple tenants
-    // Note: alphabetically aaa < bbb < mmm < nnn < zzz
-    enqueue_jobs_for_tenants(&shard, &["aaa", "bbb", "mmm", "nnn", "zzz"], 2, "default").await;
+    // IN  right range [8000, ""): aaa(ae01), ccc(8ed4), yyy(ed58)
+    // OUT right range (hash < 8000): bbb(3a4f), zzz(6d85)
+    enqueue_jobs_for_tenants(&shard, &["aaa", "bbb", "ccc", "yyy", "zzz"], 2, "default").await;
     shard.db().flush().await.unwrap();
 
-    // Run cleanup as if this is the RIGHT child after split at "mmm"
-    // Right child gets tenants >= "mmm": mmm, nnn, zzz
-    let cleanup_range = ShardRange::new("mmm", "");
+    // Run cleanup as the RIGHT child with range [8000, "")
+    let cleanup_range = ShardRange::new(RANGE_BOUNDARY, "");
     shard
         .after_split_cleanup_defunct_data(&cleanup_range, 100)
         .await
         .expect("cleanup should succeed");
     shard.db().flush().await.unwrap();
 
-    // Jobs for aaa, bbb should be deleted
+    // Jobs for bbb, zzz should be deleted (hashes out of range)
     let job_count_after = count_job_info_keys(shard.db()).await;
     assert_eq!(
         job_count_after, 6,
-        "should have 6 jobs remaining (mmm=2, nnn=2, zzz=2)"
+        "should have 6 jobs remaining (aaa=2, ccc=2, yyy=2)"
     );
 
-    // Tasks for aaa, bbb should also be deleted
+    // Tasks for bbb, zzz should also be deleted
     let task_count_after = count_task_keys(shard.db()).await;
     assert_eq!(
         task_count_after, 6,
-        "should have 6 tasks remaining (mmm=2, nnn=2, zzz=2)"
+        "should have 6 tasks remaining (aaa=2, ccc=2, yyy=2)"
     );
 }
 
@@ -259,12 +265,12 @@ async fn post_split_cleanup_right_child() {
 async fn can_process_jobs_during_cleanup() {
     use silo::coordination::SplitCleanupStatus;
 
-    // Open shard with full range initially
-    let (_tmp, shard) = open_temp_shard_with_range(ShardRange::new("", "mmm")).await;
+    // Open shard with restricted range [, 8000)
+    let (_tmp, shard) = open_temp_shard_with_range(ShardRange::new("", RANGE_BOUNDARY)).await;
 
-    // Enqueue jobs for tenants inside and outside the range
-    // "aaa" and "bbb" are inside range, "zzz" would be outside
-    enqueue_jobs_for_tenants(&shard, &["aaa", "bbb"], 3, "default").await;
+    // Enqueue jobs for tenants inside the range
+    // bbb(3a4f) and mmm(0489) are inside range [, 8000)
+    enqueue_jobs_for_tenants(&shard, &["bbb", "mmm"], 3, "default").await;
     shard.db().flush().await.unwrap();
 
     // Set status to CleanupRunning (simulating cleanup in progress)
@@ -278,14 +284,14 @@ async fn can_process_jobs_during_cleanup() {
     assert_eq!(
         result.tasks.len(),
         6,
-        "should dequeue all 6 jobs (aaa=3 + bbb=3)"
+        "should dequeue all 6 jobs (bbb=3 + mmm=3)"
     );
 
     // All dequeued tasks should be for tenants within range
     for task in &result.tasks {
         let tid = task.tenant_id();
         assert!(
-            tid == "aaa" || tid == "bbb",
+            tid == "bbb" || tid == "mmm",
             "task tenant should be within range, got {}",
             tid
         );
@@ -297,10 +303,10 @@ async fn can_process_jobs_during_cleanup() {
 async fn can_enqueue_and_process_during_cleanup() {
     use silo::coordination::SplitCleanupStatus;
 
-    let (_tmp, shard) = open_temp_shard_with_range(ShardRange::new("", "mmm")).await;
+    let (_tmp, shard) = open_temp_shard_with_range(ShardRange::new("", RANGE_BOUNDARY)).await;
 
-    // Enqueue initial jobs
-    enqueue_jobs_for_tenants(&shard, &["aaa"], 2, "default").await;
+    // Enqueue initial jobs for an in-range tenant: nnn(02ff) IN
+    enqueue_jobs_for_tenants(&shard, &["nnn"], 2, "default").await;
     shard.db().flush().await.unwrap();
 
     // Set status to CleanupRunning
@@ -309,7 +315,7 @@ async fn can_enqueue_and_process_during_cleanup() {
         .await
         .expect("set cleanup running");
 
-    // Enqueue more jobs during "cleanup"
+    // Enqueue more jobs during "cleanup" for another in-range tenant: bbb(3a4f) IN
     enqueue_jobs_for_tenants(&shard, &["bbb"], 2, "default").await;
     shard.db().flush().await.unwrap();
 
@@ -318,17 +324,17 @@ async fn can_enqueue_and_process_during_cleanup() {
     assert_eq!(result.tasks.len(), 4, "should dequeue all 4 jobs");
 
     // Verify both tenants are represented
-    let aaa_count = result
+    let nnn_count = result
         .tasks
         .iter()
-        .filter(|t| t.tenant_id() == "aaa")
+        .filter(|t| t.tenant_id() == "nnn")
         .count();
     let bbb_count = result
         .tasks
         .iter()
         .filter(|t| t.tenant_id() == "bbb")
         .count();
-    assert_eq!(aaa_count, 2, "should have 2 aaa tasks");
+    assert_eq!(nnn_count, 2, "should have 2 nnn tasks");
     assert_eq!(bbb_count, 2, "should have 2 bbb tasks");
 }
 
@@ -339,12 +345,14 @@ async fn cleanup_concurrent_with_job_processing() {
     let shard = std::sync::Arc::new(shard);
 
     // Enqueue jobs for multiple tenants (some inside, some outside the cleanup range)
+    // IN  range [, 8000): bbb(3a4f), zzz(6d85)
+    // OUT range: aaa(ae01)
     enqueue_jobs_for_tenants(&shard, &["aaa", "bbb", "zzz"], 3, "default").await;
     shard.db().flush().await.unwrap();
 
-    let cleanup_range = ShardRange::new("", "mmm");
+    let cleanup_range = ShardRange::new("", RANGE_BOUNDARY);
 
-    // Dequeue jobs for tenant "aaa" before cleanup
+    // Dequeue some jobs before cleanup
     let result1 = shard.dequeue("worker-1", "default", 3).await.unwrap();
     assert!(!result1.tasks.is_empty(), "should get some tasks");
 
@@ -355,27 +363,27 @@ async fn cleanup_concurrent_with_job_processing() {
         .expect("cleanup should succeed");
 
     assert!(cleanup_result.complete);
-    // zzz keys should be deleted
+    // aaa keys should be deleted (hash out of range)
     assert!(cleanup_result.keys_deleted > 0);
 
     shard.db().flush().await.unwrap();
 
-    // Dequeue remaining jobs - should only get jobs for aaa and bbb
+    // Dequeue remaining jobs - should only get jobs for bbb and zzz
     let result2 = shard.dequeue("worker-2", "default", 20).await.unwrap();
 
     // Verify all dequeued tasks are for tenants within the cleanup range
     for task in &result2.tasks {
         let tid = task.tenant_id();
         assert!(
-            tid == "aaa" || tid == "bbb",
+            tid == "bbb" || tid == "zzz",
             "after cleanup, tasks should only be for tenants in range, got {}",
             tid
         );
     }
 
-    // Verify zzz jobs are gone
-    let zzz_jobs = count_job_info_keys_for_tenant(shard.db(), "zzz").await;
-    assert_eq!(zzz_jobs, 0, "zzz jobs should be cleaned up");
+    // Verify aaa jobs are gone
+    let aaa_jobs = count_job_info_keys_for_tenant(shard.db(), "aaa").await;
+    assert_eq!(aaa_jobs, 0, "aaa jobs should be cleaned up");
 }
 
 // After a shard split, cleanup runs asynchronously in the background.
@@ -453,11 +461,11 @@ async fn create_shard_with_uncleaned_data(
 /// Dequeue should NOT return tasks for out-of-range tenants, even before cleanup
 #[silo::test]
 async fn dequeue_ignores_uncleaned_out_of_range_tasks() {
-    let range = ShardRange::new("", "mmm"); // Only tenants < "mmm"
+    let range = ShardRange::new("", RANGE_BOUNDARY);
     let (_tmp, shard) = create_shard_with_uncleaned_data(
         range,
-        &["aaa", "bbb"], // in-range
-        &["zzz", "yyy"], // out-of-range (uncleaned)
+        &["bbb", "zzz"], // in-range: bbb(3a4f), zzz(6d85)
+        &["aaa", "yyy"], // out-of-range: aaa(ae01), yyy(ed58)
         3,
     )
     .await;
@@ -472,13 +480,13 @@ async fn dequeue_ignores_uncleaned_out_of_range_tasks() {
     // Dequeue should ONLY return in-range tasks
     let result = shard.dequeue("worker-1", "default", 100).await.unwrap();
 
-    // Should only get tasks for aaa and bbb (6 total), NOT zzz or yyy
+    // Should only get tasks for bbb and zzz (6 total), NOT aaa or yyy
     assert_eq!(result.tasks.len(), 6, "should only dequeue in-range tasks");
 
     for task in &result.tasks {
         let tid = task.tenant_id();
         assert!(
-            tid == "aaa" || tid == "bbb",
+            tid == "bbb" || tid == "zzz",
             "dequeue returned out-of-range tenant task: {}",
             tid
         );
@@ -488,8 +496,8 @@ async fn dequeue_ignores_uncleaned_out_of_range_tasks() {
 /// Scan/query operations should respect shard range with uncleaned data present
 #[silo::test]
 async fn scan_jobs_ignores_uncleaned_out_of_range_jobs() {
-    let range = ShardRange::new("", "mmm");
-    let (_tmp, shard) = create_shard_with_uncleaned_data(range, &["aaa", "bbb"], &["zzz"], 2).await;
+    let range = ShardRange::new("", RANGE_BOUNDARY);
+    let (_tmp, shard) = create_shard_with_uncleaned_data(range, &["bbb", "zzz"], &["aaa"], 2).await;
 
     // Verify uncleaned data exists
     let all_jobs = count_job_info_keys(shard.db()).await;
@@ -499,25 +507,25 @@ async fn scan_jobs_ignores_uncleaned_out_of_range_jobs() {
     );
 
     // scan_jobs for in-range tenant should work
-    let aaa_jobs = shard.scan_jobs("aaa", Some(100)).await.unwrap();
-    assert_eq!(aaa_jobs.len(), 2, "should find 2 aaa jobs");
+    let bbb_jobs = shard.scan_jobs("bbb", Some(100)).await.unwrap();
+    assert_eq!(bbb_jobs.len(), 2, "should find 2 bbb jobs");
 
     // scan_jobs for out-of-range tenant - the data exists but shouldn't be accessible
     // Note: scan_jobs doesn't filter by range, it just scans by tenant
     // This is OK because the tenant explicitly requested their own data
-    let zzz_jobs = shard.scan_jobs("zzz", Some(100)).await.unwrap();
+    let aaa_jobs = shard.scan_jobs("aaa", Some(100)).await.unwrap();
     // This will return results since scan_jobs is tenant-specific
     // The important thing is dequeue and other operations filter correctly
-    assert_eq!(zzz_jobs.len(), 2, "scan_jobs returns tenant's own data");
+    assert_eq!(aaa_jobs.len(), 2, "scan_jobs returns tenant's own data");
 }
 
 /// Enqueue should work for in-range tenants even with uncleaned data present
 #[silo::test]
 async fn enqueue_works_with_uncleaned_data_present() {
-    let range = ShardRange::new("", "mmm");
-    let (_tmp, shard) = create_shard_with_uncleaned_data(range, &["aaa"], &["zzz"], 2).await;
+    let range = ShardRange::new("", RANGE_BOUNDARY);
+    let (_tmp, shard) = create_shard_with_uncleaned_data(range, &["zzz"], &["aaa"], 2).await;
 
-    // Enqueue a new job for an in-range tenant
+    // Enqueue a new job for an in-range tenant: bbb(3a4f) IN
     let payload = msgpack_payload(&serde_json::json!({"new": true}));
     let job_id = shard
         .enqueue(
@@ -540,7 +548,7 @@ async fn enqueue_works_with_uncleaned_data_present() {
     // The new job should be dequeue-able along with the original in-range jobs
     let dequeue_result = shard.dequeue("worker-1", "default", 100).await.unwrap();
 
-    // Should have 3 in-range tasks: 2 from aaa + 1 new from bbb
+    // Should have 3 in-range tasks: 2 from zzz + 1 new from bbb
     assert_eq!(
         dequeue_result.tasks.len(),
         3,
@@ -556,7 +564,7 @@ async fn enqueue_works_with_uncleaned_data_present() {
     // Verify all dequeued tasks are in-range
     for task in &dequeue_result.tasks {
         assert!(
-            task.tenant_id() == "aaa" || task.tenant_id() == "bbb",
+            task.tenant_id() == "zzz" || task.tenant_id() == "bbb",
             "should only dequeue in-range tasks, got {}",
             task.tenant_id()
         );
@@ -568,14 +576,14 @@ async fn enqueue_works_with_uncleaned_data_present() {
 async fn job_completion_works_with_uncleaned_data() {
     use silo::job_attempt::AttemptOutcome;
 
-    let range = ShardRange::new("", "mmm");
-    let (_tmp, shard) = create_shard_with_uncleaned_data(range, &["aaa"], &["zzz"], 2).await;
+    let range = ShardRange::new("", RANGE_BOUNDARY);
+    let (_tmp, shard) = create_shard_with_uncleaned_data(range, &["zzz"], &["aaa"], 2).await;
 
-    // Dequeue an in-range job
+    // Dequeue an in-range job: zzz(6d85) is IN range [, 8000)
     let result = shard.dequeue("worker-1", "default", 1).await.unwrap();
     assert_eq!(result.tasks.len(), 1);
     let task = &result.tasks[0];
-    assert_eq!(task.tenant_id(), "aaa", "should dequeue in-range tenant");
+    assert_eq!(task.tenant_id(), "zzz", "should dequeue in-range tenant");
 
     // Complete the job
     let complete_result = shard
@@ -602,7 +610,7 @@ async fn concurrency_hydration_ignores_uncleaned_holders() {
 
     let tmp = tempfile::tempdir().unwrap();
     let rate_limiter = MockGubernatorClient::new_arc();
-    let range = ShardRange::new("", "mmm");
+    let range = ShardRange::new("", RANGE_BOUNDARY);
 
     let cfg = DatabaseConfig {
         name: "test".to_string(),
@@ -614,13 +622,14 @@ async fn concurrency_hydration_ignores_uncleaned_holders() {
     };
 
     // Phase 1: Create jobs with concurrency limits for both in-range and out-of-range tenants
+    // zzz(6d85) IN range [, 8000), aaa(ae01) OUT
     {
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, ShardRange::full())
             .await
             .expect("open shard");
 
         // Create jobs with concurrency limits
-        for tenant in ["aaa", "zzz"] {
+        for tenant in ["zzz", "aaa"] {
             let payload = msgpack_payload(&serde_json::json!({}));
             let limits = vec![Limit::Concurrency(ConcurrencyLimit {
                 key: "shared-queue".to_string(),
@@ -649,10 +658,10 @@ async fn concurrency_hydration_ignores_uncleaned_holders() {
         shard.db().flush().await.unwrap();
 
         // Verify holders exist for both tenants
-        let aaa_holders = count_concurrency_holders_for_tenant(shard.db(), "aaa").await;
         let zzz_holders = count_concurrency_holders_for_tenant(shard.db(), "zzz").await;
-        assert!(aaa_holders > 0, "aaa should have holders");
+        let aaa_holders = count_concurrency_holders_for_tenant(shard.db(), "aaa").await;
         assert!(zzz_holders > 0, "zzz should have holders");
+        assert!(aaa_holders > 0, "aaa should have holders");
 
         shard.close().await.unwrap();
     }
@@ -663,18 +672,18 @@ async fn concurrency_hydration_ignores_uncleaned_holders() {
             .await
             .expect("reopen with restricted range");
 
-        // The zzz holder records still exist in the DB (uncleaned)
-        let zzz_holders = count_concurrency_holders_for_tenant(shard.db(), "zzz").await;
+        // The aaa holder records still exist in the DB (uncleaned)
+        let aaa_holders = count_concurrency_holders_for_tenant(shard.db(), "aaa").await;
         assert!(
-            zzz_holders > 0,
-            "uncleaned zzz holders should still be in DB"
+            aaa_holders > 0,
+            "uncleaned aaa holders should still be in DB"
         );
 
         // But when we try to get a new concurrency ticket, the in-memory count
         // should only reflect in-range tenants (verified by hydration filtering)
         // We can't directly inspect in-memory counts, but we can verify behavior:
-        // If a job needs a ticket on "shared-queue" with limit 1, and zzz is holding one,
-        // an in-range job should still be able to get a ticket (because zzz is filtered)
+        // If a job needs a ticket on "shared-queue" with limit 1, and aaa is holding one,
+        // an in-range job should still be able to get a ticket (because aaa is filtered)
 
         // This is implicitly tested by the dequeue working correctly above
         shard.close().await.unwrap();
@@ -687,9 +696,9 @@ async fn processing_continues_during_active_cleanup() {
     use silo::coordination::SplitCleanupStatus;
     use std::sync::Arc;
 
-    let range = ShardRange::new("", "mmm");
+    let range = ShardRange::new("", RANGE_BOUNDARY);
     let (_tmp, shard) =
-        create_shard_with_uncleaned_data(range.clone(), &["aaa", "bbb"], &["zzz", "yyy"], 5).await;
+        create_shard_with_uncleaned_data(range.clone(), &["bbb", "zzz"], &["aaa", "yyy"], 5).await;
     let shard = Arc::new(shard);
 
     // Set status to indicate cleanup is running
@@ -714,11 +723,11 @@ async fn processing_continues_during_active_cleanup() {
     assert_eq!(
         result.tasks.len(),
         10,
-        "should dequeue all in-range tasks (aaa=5, bbb=5)"
+        "should dequeue all in-range tasks (bbb=5, zzz=5)"
     );
     for task in &result.tasks {
         assert!(
-            task.tenant_id() == "aaa" || task.tenant_id() == "bbb",
+            task.tenant_id() == "bbb" || task.tenant_id() == "zzz",
             "should only get in-range tasks during cleanup"
         );
     }
@@ -731,12 +740,12 @@ async fn processing_continues_during_active_cleanup() {
 /// Verify all dequeue operations filter by range, not just the first batch
 #[silo::test]
 async fn repeated_dequeue_consistently_filters_out_of_range() {
-    let range = ShardRange::new("", "mmm");
+    let range = ShardRange::new("", RANGE_BOUNDARY);
     let (_tmp, shard) = create_shard_with_uncleaned_data(
         range,
-        &["aaa"],
-        &["zzz"],
-        10, // More jobs to ensure multiple dequeue calls
+        &["zzz"], // zzz(6d85) IN range [, 8000)
+        &["aaa"], // aaa(ae01) OUT
+        10,       // More jobs to ensure multiple dequeue calls
     )
     .await;
 
@@ -746,7 +755,7 @@ async fn repeated_dequeue_consistently_filters_out_of_range() {
         for task in &result.tasks {
             assert_eq!(
                 task.tenant_id(),
-                "aaa",
+                "zzz",
                 "every dequeue batch should only return in-range tasks"
             );
         }
@@ -762,10 +771,10 @@ async fn lease_operations_handle_cleanup_gracefully() {
 
     let (_tmp, shard) = open_temp_shard().await;
 
-    // Enqueue jobs for a tenant that will be outside cleanup range
-    enqueue_jobs_for_tenants(&shard, &["zzz"], 1, "default").await;
-    // Also enqueue jobs within range
+    // Enqueue jobs for a tenant that will be outside cleanup range: aaa(ae01) OUT
     enqueue_jobs_for_tenants(&shard, &["aaa"], 1, "default").await;
+    // Also enqueue jobs within range: zzz(6d85) IN [, 8000)
+    enqueue_jobs_for_tenants(&shard, &["zzz"], 1, "default").await;
     shard.db().flush().await.unwrap();
 
     // Dequeue all tasks (this creates leases)
@@ -773,8 +782,8 @@ async fn lease_operations_handle_cleanup_gracefully() {
     assert_eq!(dequeue_result.tasks.len(), 2);
     shard.db().flush().await.unwrap();
 
-    // Run cleanup for range that excludes "zzz"
-    let cleanup_range = ShardRange::new("", "mmm");
+    // Run cleanup for range that excludes "aaa"
+    let cleanup_range = ShardRange::new("", RANGE_BOUNDARY);
     let cleanup_result = shard
         .after_split_cleanup_defunct_data(&cleanup_range, 100)
         .await
@@ -783,17 +792,17 @@ async fn lease_operations_handle_cleanup_gracefully() {
     assert!(cleanup_result.complete);
     shard.db().flush().await.unwrap();
 
-    // Find the "aaa" task and complete its lease - this should work
-    let aaa_task = dequeue_result
+    // Find the "zzz" task and complete its lease - this should work (in range)
+    let zzz_task = dequeue_result
         .tasks
         .iter()
-        .find(|t| t.tenant_id() == "aaa")
-        .expect("should have aaa task");
+        .find(|t| t.tenant_id() == "zzz")
+        .expect("should have zzz task");
 
-    // Completing the lease for aaa should work fine
+    // Completing the lease for zzz should work fine
     let complete_result = shard
         .report_attempt_outcome(
-            aaa_task.attempt().task_id(),
+            zzz_task.attempt().task_id(),
             AttemptOutcome::Success { result: vec![] },
         )
         .await;
@@ -803,24 +812,24 @@ async fn lease_operations_handle_cleanup_gracefully() {
         "completing lease for in-range task should succeed"
     );
 
-    // The zzz task's lease was deleted by cleanup, so operations on it
+    // The aaa task's lease was deleted by cleanup, so operations on it
     // will fail with lease not found - this is expected behavior
-    let zzz_task = dequeue_result
+    let aaa_task = dequeue_result
         .tasks
         .iter()
-        .find(|t| t.tenant_id() == "zzz")
-        .expect("should have zzz task");
+        .find(|t| t.tenant_id() == "aaa")
+        .expect("should have aaa task");
 
-    let zzz_result = shard
+    let aaa_result = shard
         .report_attempt_outcome(
-            zzz_task.attempt().task_id(),
+            aaa_task.attempt().task_id(),
             AttemptOutcome::Success { result: vec![] },
         )
         .await;
 
-    // The zzz lease was deleted by cleanup, so this should fail
+    // The aaa lease was deleted by cleanup, so this should fail
     assert!(
-        zzz_result.is_err(),
+        aaa_result.is_err(),
         "completing lease for out-of-range task should fail after cleanup"
     );
 }

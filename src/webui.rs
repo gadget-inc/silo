@@ -2007,7 +2007,9 @@ async fn shard_split_handler(
         // Auto-compute midpoint from shard range
         if let Ok(shard_map) = state.coordinator.get_shard_map().await {
             if let Some(info) = shard_map.get_shard(&parsed_shard_id) {
-                info.range.midpoint()
+                info.range
+                    .midpoint()
+                    .map(crate::shard_range::format_hash_boundary)
             } else {
                 None
             }

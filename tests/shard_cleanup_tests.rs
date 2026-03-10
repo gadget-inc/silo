@@ -6,6 +6,9 @@ use test_helpers::{
 
 use silo::shard_range::ShardRange;
 
+/// Boundary at the midpoint of the u64 hash space, encoded as a 16-char hex string.
+const RANGE_BOUNDARY: &str = "8000000000000000";
+
 /// Helper to enqueue jobs for multiple tenants
 async fn enqueue_jobs_for_tenants(
     shard: &silo::job_store_shard::JobStoreShard,
@@ -37,18 +40,18 @@ async fn enqueue_jobs_for_tenants(
 async fn cleanup_removes_keys_outside_range() {
     let (_tmp, shard) = open_temp_shard().await;
 
-    // Enqueue jobs for tenants a, m, and z
-    // After split at "m", left shard gets [, m) and right shard gets [m, )
-    enqueue_jobs_for_tenants(&shard, &["aaa", "bbb", "lll", "mmm", "nnn", "zzz"], 2).await;
+    // Enqueue jobs for 6 tenants: 3 whose hashes fall in [, 8000) and 3 outside.
+    // IN  range: bbb(3a4f), mmm(0489), nnn(02ff)
+    // OUT range: aaa(ae01), lll(d389), yyy(ed58)
+    enqueue_jobs_for_tenants(&shard, &["aaa", "bbb", "lll", "mmm", "nnn", "yyy"], 2).await;
     shard.db().flush().await.unwrap();
 
     // Verify jobs exist for all tenants before cleanup
     let count_before = count_job_info_keys(shard.db()).await;
     assert_eq!(count_before, 12); // 6 tenants * 2 jobs
 
-    // Simulate this shard becoming the LEFT child after a split at "m"
-    // Left child should have range [, m) - keeps tenants < "m"
-    let left_range = ShardRange::new("", "mmm"); // Exclusive end
+    // Simulate this shard becoming the LEFT child after a split at the hash midpoint
+    let left_range = ShardRange::new("", RANGE_BOUNDARY);
 
     // Run cleanup to remove keys outside range
     let result = shard
@@ -64,8 +67,8 @@ async fn cleanup_removes_keys_outside_range() {
     shard.db().flush().await.unwrap();
 
     // Verify only left-range tenants remain
-    // aaa, bbb, lll should remain (3 tenants * 2 jobs = 6)
-    // mmm, nnn, zzz should be deleted
+    // bbb, mmm, nnn should remain (3 tenants * 2 jobs = 6)
+    // aaa, lll, yyy should be deleted
     let count_after = count_job_info_keys(shard.db()).await;
     assert_eq!(
         count_after, 6,
@@ -73,20 +76,27 @@ async fn cleanup_removes_keys_outside_range() {
     );
 
     // Verify specific tenants
+    let bbb_jobs = count_job_info_keys_for_tenant(shard.db(), "bbb").await;
     let aaa_jobs = count_job_info_keys_for_tenant(shard.db(), "aaa").await;
-    let mmm_jobs = count_job_info_keys_for_tenant(shard.db(), "mmm").await;
-    let zzz_jobs = count_job_info_keys_for_tenant(shard.db(), "zzz").await;
+    let yyy_jobs = count_job_info_keys_for_tenant(shard.db(), "yyy").await;
 
-    assert_eq!(aaa_jobs, 2, "aaa jobs should remain");
-    assert_eq!(mmm_jobs, 0, "mmm jobs should be deleted");
-    assert_eq!(zzz_jobs, 0, "zzz jobs should be deleted");
+    assert_eq!(bbb_jobs, 2, "bbb jobs should remain (hash in range)");
+    assert_eq!(
+        aaa_jobs, 0,
+        "aaa jobs should be deleted (hash out of range)"
+    );
+    assert_eq!(
+        yyy_jobs, 0,
+        "yyy jobs should be deleted (hash out of range)"
+    );
 }
 
 #[silo::test]
 async fn cleanup_removes_status_and_index_keys() {
     let (_tmp, shard) = open_temp_shard().await;
 
-    // Enqueue jobs for tenants on both sides of a split point
+    // Enqueue jobs for tenants on both sides of the hash boundary
+    // zzz(6d85) is IN range [, 8000), aaa(ae01) is OUT
     enqueue_jobs_for_tenants(&shard, &["aaa", "zzz"], 3).await;
     shard.db().flush().await.unwrap();
 
@@ -98,8 +108,8 @@ async fn cleanup_removes_status_and_index_keys() {
     let idx_before = count_status_time_index_keys(shard.db()).await;
     assert_eq!(idx_before, 6);
 
-    // Run cleanup for LEFT child range (tenants < "mmm")
-    let left_range = ShardRange::new("", "mmm");
+    // Run cleanup for LEFT child range
+    let left_range = ShardRange::new("", RANGE_BOUNDARY);
     let result = shard
         .after_split_cleanup_defunct_data(&left_range, 10)
         .await
@@ -108,26 +118,28 @@ async fn cleanup_removes_status_and_index_keys() {
     assert!(result.complete);
     shard.db().flush().await.unwrap();
 
-    // Verify only aaa tenant keys remain
+    // Verify only zzz tenant keys remain (hash 6d85 is in range)
     let status_after = count_job_status_keys(shard.db()).await;
-    assert_eq!(status_after, 3, "only aaa status records should remain");
+    assert_eq!(status_after, 3, "only zzz status records should remain");
 
     // Note: we can't easily filter status index by tenant with binary keys without
     // adding more helper functions, so just verify total count decreased
     let idx_after = count_status_time_index_keys(shard.db()).await;
-    assert_eq!(idx_after, 3, "only aaa index records should remain");
+    assert_eq!(idx_after, 3, "only zzz index records should remain");
 }
 
 #[silo::test]
 async fn cleanup_handles_right_child_range() {
     let (_tmp, shard) = open_temp_shard().await;
 
-    // Enqueue jobs for tenants on both sides of a split point
-    enqueue_jobs_for_tenants(&shard, &["aaa", "bbb", "mmm", "nnn", "zzz"], 2).await;
+    // Enqueue jobs for tenants on both sides of the hash boundary
+    // IN  right range [8000, ""): aaa(ae01), ccc(8ed4), yyy(ed58)
+    // OUT right range (hash < 8000): bbb(3a4f), zzz(6d85)
+    enqueue_jobs_for_tenants(&shard, &["aaa", "bbb", "ccc", "yyy", "zzz"], 2).await;
     shard.db().flush().await.unwrap();
 
-    // Run cleanup for RIGHT child range (tenants >= "mmm")
-    let right_range = ShardRange::new("mmm", ""); // Unbounded end
+    // Run cleanup for RIGHT child range
+    let right_range = ShardRange::new(RANGE_BOUNDARY, "");
     let result = shard
         .after_split_cleanup_defunct_data(&right_range, 10)
         .await
@@ -136,20 +148,26 @@ async fn cleanup_handles_right_child_range() {
     assert!(result.complete);
     shard.db().flush().await.unwrap();
 
-    // Verify only right-range tenants remain (mmm, nnn, zzz)
+    // Verify only right-range tenants remain (aaa, ccc, yyy)
     let count_after = count_job_info_keys(shard.db()).await;
     assert_eq!(count_after, 6, "should have 6 job records (3 tenants * 2)");
 
     // Verify specific tenants
-    let aaa_jobs = count_job_info_keys_for_tenant(shard.db(), "aaa").await;
     let bbb_jobs = count_job_info_keys_for_tenant(shard.db(), "bbb").await;
-    let mmm_jobs = count_job_info_keys_for_tenant(shard.db(), "mmm").await;
     let zzz_jobs = count_job_info_keys_for_tenant(shard.db(), "zzz").await;
+    let aaa_jobs = count_job_info_keys_for_tenant(shard.db(), "aaa").await;
+    let ccc_jobs = count_job_info_keys_for_tenant(shard.db(), "ccc").await;
 
-    assert_eq!(aaa_jobs, 0, "aaa jobs should be deleted");
-    assert_eq!(bbb_jobs, 0, "bbb jobs should be deleted");
-    assert_eq!(mmm_jobs, 2, "mmm jobs should remain");
-    assert_eq!(zzz_jobs, 2, "zzz jobs should remain");
+    assert_eq!(
+        bbb_jobs, 0,
+        "bbb jobs should be deleted (hash out of range)"
+    );
+    assert_eq!(
+        zzz_jobs, 0,
+        "zzz jobs should be deleted (hash out of range)"
+    );
+    assert_eq!(aaa_jobs, 2, "aaa jobs should remain (hash in range)");
+    assert_eq!(ccc_jobs, 2, "ccc jobs should remain (hash in range)");
 }
 
 #[silo::test]
@@ -159,7 +177,7 @@ async fn cleanup_is_idempotent() {
     enqueue_jobs_for_tenants(&shard, &["aaa", "zzz"], 3).await;
     shard.db().flush().await.unwrap();
 
-    let range = ShardRange::new("", "mmm");
+    let range = ShardRange::new("", RANGE_BOUNDARY);
 
     // First cleanup
     let result1 = shard
@@ -197,7 +215,7 @@ async fn cleanup_progress_tracks_work() {
     enqueue_jobs_for_tenants(&shard, &["aaa", "bbb", "mmm", "nnn"], 5).await;
     shard.db().flush().await.unwrap();
 
-    let range = ShardRange::new("", "mmm");
+    let range = ShardRange::new("", RANGE_BOUNDARY);
 
     // Before cleanup, no pending work
     let pending_before = shard
@@ -230,7 +248,7 @@ async fn full_compaction_clears_cleanup_progress() {
     enqueue_jobs_for_tenants(&shard, &["aaa", "zzz"], 2).await;
     shard.db().flush().await.unwrap();
 
-    let range = ShardRange::new("", "mmm");
+    let range = ShardRange::new("", RANGE_BOUNDARY);
 
     // Run cleanup
     let result = shard
@@ -268,7 +286,7 @@ async fn full_compaction_clears_cleanup_progress() {
 async fn cleanup_empty_shard_succeeds() {
     let (_tmp, shard) = open_temp_shard().await;
 
-    let range = ShardRange::new("", "mmm");
+    let range = ShardRange::new("", RANGE_BOUNDARY);
 
     let result = shard
         .after_split_cleanup_defunct_data(&range, 10)
@@ -339,9 +357,9 @@ async fn cleanup_handles_escaped_tenant_ids() {
     }
     shard.db().flush().await.unwrap();
 
-    // Use a range that should include "normal-tenant" but exclude the others
-    // The escaped versions sort differently than unescaped
-    let range = ShardRange::new("normal", "normz");
+    // Use a hash-space range that includes normal-tenant(7ab0) but excludes
+    // tenant/with/slashes(0fdd) and tenant%with%percent(dfa4)
+    let range = ShardRange::new("7000000000000000", "8000000000000000");
 
     let result = shard
         .after_split_cleanup_defunct_data(&range, 10)
@@ -433,7 +451,7 @@ async fn cleanup_sets_status_to_running_then_done() {
         .await
         .expect("set cleanup pending");
 
-    let range = ShardRange::new("", "mmm");
+    let range = ShardRange::new("", RANGE_BOUNDARY);
 
     // Run cleanup (this should set status to CleanupRunning, then CleanupDone)
     let result = shard
@@ -513,7 +531,7 @@ async fn reopening_shard_after_cleanup_preserves_status() {
             .expect("set cleanup pending");
 
         // Run cleanup
-        let range = ShardRange::new("", "mmm");
+        let range = ShardRange::new("", RANGE_BOUNDARY);
         let result = shard
             .after_split_cleanup_defunct_data(&range, 10)
             .await
@@ -706,7 +724,7 @@ async fn cleanup_completed_at_only_set_on_actual_completion() {
     );
 
     // Run cleanup
-    let range = ShardRange::new("", "mmm");
+    let range = ShardRange::new("", RANGE_BOUNDARY);
     shard
         .after_split_cleanup_defunct_data(&range, 10)
         .await

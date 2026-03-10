@@ -46,11 +46,16 @@ pub struct ClusterTopology {
 
 impl ClusterTopology {
     /// Find the shard that owns the given tenant ID based on shard ranges.
+    ///
+    /// Hashes the tenant ID with the same algorithm used by the server
+    /// and matches against hash-space range boundaries.
     pub fn shard_for_tenant(&self, tenant_id: &str) -> Option<&ShardOwnerInfo> {
+        let hashed = crate::shard_range::hash_tenant(tenant_id);
         self.shard_owners.iter().find(|owner| {
             let after_start =
-                owner.range_start.is_empty() || tenant_id >= owner.range_start.as_str();
-            let before_end = owner.range_end.is_empty() || tenant_id < owner.range_end.as_str();
+                owner.range_start.is_empty() || hashed.as_str() >= owner.range_start.as_str();
+            let before_end =
+                owner.range_end.is_empty() || hashed.as_str() < owner.range_end.as_str();
             after_start && before_end
         })
     }

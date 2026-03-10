@@ -18,6 +18,13 @@ use silo::settings::{Backend, DatabaseConfig};
 use silo::shard_range::ShardRange;
 use std::sync::Arc;
 
+/// Hash-space boundary for cleanup tests.
+/// Tenants whose XXH64 hash < this value are "in range"; others are "out of range".
+///
+/// In range  (hash < 8000): bbb(3a4f), xxx(3c37), zzz(6d85), zulu(774a), yankee(2197)
+/// Out of range (hash >= 8000): aaa(ae01), ccc(8ed4), yyy(ed58), alpha(c758), beta(f5ee)
+const RANGE_BOUNDARY: &str = "8000000000000000";
+
 /// Helper to enqueue jobs for multiple tenants
 async fn enqueue_jobs_for_tenants(shard: &JobStoreShard, tenants: &[&str], jobs_per_tenant: usize) {
     for tenant in tenants {
@@ -47,7 +54,7 @@ async fn background_cleanup_spawns_when_cleanup_pending() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().to_string_lossy().to_string();
     let rate_limiter = MockGubernatorClient::new_arc();
-    let range = ShardRange::new("", "mmm");
+    let range = ShardRange::new("", RANGE_BOUNDARY);
 
     // First, create a shard and set it up with pending cleanup
     {
@@ -64,8 +71,9 @@ async fn background_cleanup_spawns_when_cleanup_pending() {
             .await
             .expect("open shard");
 
-        // Enqueue jobs for tenants inside and outside the range
-        enqueue_jobs_for_tenants(&shard, &["aaa", "bbb", "zzz"], 3).await;
+        // Enqueue jobs for tenants inside and outside the hash-space range
+        // bbb(3a) and zzz(6d) are in range; aaa(ae) is out of range
+        enqueue_jobs_for_tenants(&shard, &["bbb", "zzz", "aaa"], 3).await;
         shard.db().flush().await.unwrap();
 
         // Set status to CleanupPending (simulating a split child)
@@ -107,7 +115,7 @@ async fn background_cleanup_spawns_when_cleanup_pending() {
         let remaining_jobs = count_job_info_keys(shard.db()).await;
         assert_eq!(
             remaining_jobs, 6,
-            "should have 6 jobs (aaa=3 + bbb=3), zzz should be cleaned up"
+            "should have 6 jobs (bbb=3 + zzz=3), aaa should be cleaned up"
         );
 
         // Verify cleanup status is now CompactionDone
@@ -128,7 +136,7 @@ async fn background_cleanup_resumes_when_cleanup_was_running() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().to_string_lossy().to_string();
     let rate_limiter = MockGubernatorClient::new_arc();
-    let range = ShardRange::new("", "mmm");
+    let range = ShardRange::new("", RANGE_BOUNDARY);
 
     // First, create a shard and simulate interrupted cleanup
     {
@@ -145,8 +153,8 @@ async fn background_cleanup_resumes_when_cleanup_was_running() {
             .await
             .expect("open shard");
 
-        // Enqueue jobs
-        enqueue_jobs_for_tenants(&shard, &["aaa", "zzz"], 5).await;
+        // Enqueue jobs: zzz(6d) is in range, aaa(ae) is out
+        enqueue_jobs_for_tenants(&shard, &["zzz", "aaa"], 5).await;
         shard.db().flush().await.unwrap();
 
         // Set status to CleanupRunning (simulating an interrupted cleanup)
@@ -182,7 +190,7 @@ async fn background_cleanup_resumes_when_cleanup_was_running() {
 
         // Verify cleanup completed
         let remaining_jobs = count_job_info_keys(shard.db()).await;
-        assert_eq!(remaining_jobs, 5, "should have 5 jobs (aaa only)");
+        assert_eq!(remaining_jobs, 5, "should have 5 jobs (zzz only)");
 
         let status = shard.get_cleanup_status().await.expect("get status");
         assert_eq!(status, SplitCleanupStatus::CompactionDone);
@@ -197,7 +205,7 @@ async fn background_cleanup_runs_compaction_when_cleanup_done() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().to_string_lossy().to_string();
     let rate_limiter = MockGubernatorClient::new_arc();
-    let range = ShardRange::new("", "mmm");
+    let range = ShardRange::new("", RANGE_BOUNDARY);
 
     // First, create a shard with CleanupDone status
     {
@@ -262,7 +270,7 @@ async fn no_cleanup_when_already_complete() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().to_string_lossy().to_string();
     let rate_limiter = MockGubernatorClient::new_arc();
-    let range = ShardRange::new("", "mmm");
+    let range = ShardRange::new("", RANGE_BOUNDARY);
 
     // Create a shard with CompactionDone status (default)
     {
@@ -330,7 +338,7 @@ async fn cleanup_cancelled_on_shard_close() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().to_string_lossy().to_string();
     let rate_limiter = MockGubernatorClient::new_arc();
-    let range = ShardRange::new("", "mmm");
+    let range = ShardRange::new("", RANGE_BOUNDARY);
 
     // Create shard with lots of data to make cleanup take longer
     let cfg = DatabaseConfig {
@@ -390,7 +398,7 @@ async fn cleanup_progress_saved_on_cancellation() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().to_string_lossy().to_string();
     let rate_limiter = MockGubernatorClient::new_arc();
-    let range = ShardRange::new("", "mmm");
+    let range = ShardRange::new("", RANGE_BOUNDARY);
 
     let cfg = DatabaseConfig {
         name: "test".to_string(),
@@ -407,8 +415,8 @@ async fn cleanup_progress_saved_on_cancellation() {
             .await
             .expect("open shard");
 
-        // Enqueue jobs
-        for tenant in ["aaa", "zzz", "yyy", "xxx"] {
+        // Enqueue jobs: zzz(6d) is in range; aaa(ae), yyy(ed), ccc(8e) are out
+        for tenant in ["zzz", "aaa", "yyy", "ccc"] {
             enqueue_jobs_for_tenants(&shard, &[tenant], 10).await;
         }
         shard.db().flush().await.unwrap();
@@ -469,9 +477,9 @@ async fn cleanup_progress_saved_on_cancellation() {
 
         shard.db().flush().await.unwrap();
 
-        // Only aaa jobs should remain
+        // Only zzz jobs should remain (in range)
         let remaining_jobs = count_job_info_keys(shard.db()).await;
-        assert_eq!(remaining_jobs, 10, "only aaa jobs should remain");
+        assert_eq!(remaining_jobs, 10, "only zzz jobs should remain");
 
         shard.close().await.expect("close shard");
     }
@@ -483,7 +491,7 @@ async fn cleanup_result_indicates_cancellation() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().to_string_lossy().to_string();
     let rate_limiter = MockGubernatorClient::new_arc();
-    let range = ShardRange::new("", "mmm");
+    let range = ShardRange::new("", RANGE_BOUNDARY);
 
     let cfg = DatabaseConfig {
         name: "test".to_string(),
@@ -498,8 +506,8 @@ async fn cleanup_result_indicates_cancellation() {
         .await
         .expect("open shard");
 
-    // Enqueue jobs
-    enqueue_jobs_for_tenants(&shard, &["aaa", "zzz"], 30).await;
+    // Enqueue jobs: zzz(6d) in range, aaa(ae) out
+    enqueue_jobs_for_tenants(&shard, &["zzz", "aaa"], 30).await;
     shard.db().flush().await.unwrap();
 
     // Set status to CleanupPending
@@ -548,7 +556,7 @@ async fn cleanup_handles_multiple_close_calls() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().to_string_lossy().to_string();
     let rate_limiter = MockGubernatorClient::new_arc();
-    let range = ShardRange::new("", "mmm");
+    let range = ShardRange::new("", RANGE_BOUNDARY);
 
     let cfg = DatabaseConfig {
         name: "test".to_string(),
@@ -589,7 +597,7 @@ async fn full_reacquisition_cycle_triggers_cleanup() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().to_string_lossy().to_string();
     let rate_limiter = MockGubernatorClient::new_arc();
-    let range = ShardRange::new("", "mmm"); // Only tenants < "mmm"
+    let range = ShardRange::new("", RANGE_BOUNDARY); // Only tenants < "mmm"
 
     let cfg = DatabaseConfig {
         name: "test".to_string(),
@@ -606,8 +614,9 @@ async fn full_reacquisition_cycle_triggers_cleanup() {
             .await
             .expect("open shard");
 
-        // Enqueue jobs for various tenants
-        enqueue_jobs_for_tenants(&shard, &["alpha", "beta", "zulu", "yankee"], 5).await;
+        // Enqueue jobs: yankee(21) and zulu(77) are in range;
+        // alpha(c7) and beta(f5) are out of range
+        enqueue_jobs_for_tenants(&shard, &["yankee", "zulu", "alpha", "beta"], 5).await;
         shard.db().flush().await.unwrap();
 
         // Verify all jobs exist
@@ -638,15 +647,15 @@ async fn full_reacquisition_cycle_triggers_cleanup() {
         shard.db().flush().await.unwrap();
 
         // Verify cleanup happened
+        let yankee_jobs = count_job_info_keys_for_tenant(shard.db(), "yankee").await;
+        let zulu_jobs = count_job_info_keys_for_tenant(shard.db(), "zulu").await;
         let alpha_jobs = count_job_info_keys_for_tenant(shard.db(), "alpha").await;
         let beta_jobs = count_job_info_keys_for_tenant(shard.db(), "beta").await;
-        let zulu_jobs = count_job_info_keys_for_tenant(shard.db(), "zulu").await;
-        let yankee_jobs = count_job_info_keys_for_tenant(shard.db(), "yankee").await;
 
-        assert_eq!(alpha_jobs, 5, "alpha (in range) should be kept");
-        assert_eq!(beta_jobs, 5, "beta (in range) should be kept");
-        assert_eq!(zulu_jobs, 0, "zulu (out of range) should be cleaned");
-        assert_eq!(yankee_jobs, 0, "yankee (out of range) should be cleaned");
+        assert_eq!(yankee_jobs, 5, "yankee (in range) should be kept");
+        assert_eq!(zulu_jobs, 5, "zulu (in range) should be kept");
+        assert_eq!(alpha_jobs, 0, "alpha (out of range) should be cleaned");
+        assert_eq!(beta_jobs, 0, "beta (out of range) should be cleaned");
 
         // Verify final status
         let status = shard.get_cleanup_status().await.expect("get status");
@@ -684,7 +693,7 @@ async fn interrupted_cleanup_resumes_on_reacquisition() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().to_string_lossy().to_string();
     let rate_limiter = MockGubernatorClient::new_arc();
-    let range = ShardRange::new("", "mmm");
+    let range = ShardRange::new("", RANGE_BOUNDARY);
 
     let cfg = DatabaseConfig {
         name: "test".to_string(),
@@ -701,8 +710,8 @@ async fn interrupted_cleanup_resumes_on_reacquisition() {
             .await
             .expect("open shard");
 
-        // Enqueue jobs
-        enqueue_jobs_for_tenants(&shard, &["aaa", "zzz"], 15).await;
+        // Enqueue jobs: zzz(6d) in range, aaa(ae) out
+        enqueue_jobs_for_tenants(&shard, &["zzz", "aaa"], 15).await;
         shard.db().flush().await.unwrap();
 
         shard
@@ -742,7 +751,7 @@ async fn interrupted_cleanup_resumes_on_reacquisition() {
         assert_eq!(status, SplitCleanupStatus::CompactionDone);
 
         let remaining = count_job_info_keys(shard.db()).await;
-        assert_eq!(remaining, 15, "only aaa jobs should remain");
+        assert_eq!(remaining, 15, "only zzz jobs should remain");
 
         shard.close().await.expect("close shard");
     }

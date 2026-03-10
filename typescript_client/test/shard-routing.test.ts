@@ -1,53 +1,85 @@
-import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
-import { SiloGRPCClient, shardForTenant, type ShardInfoWithRange } from "../src/client";
+import { describe, it, expect, vi, afterEach, beforeAll, beforeEach } from "vitest";
+import { SiloGRPCClient, shardForTenant, hashTenant, initHasher, type ShardInfoWithRange } from "../src/client";
 import { RpcError } from "@protobuf-ts/runtime-rpc";
 
 describe("Shard Routing", () => {
-  describe("shardForTenant range-based lookup", () => {
-    it("finds correct shard for tenant in range", () => {
-      const shards: ShardInfoWithRange[] = [
-        { shardId: "shard-1", serverAddr: "server-a:7450", rangeStart: "", rangeEnd: "m" },
-        { shardId: "shard-2", serverAddr: "server-b:7450", rangeStart: "m", rangeEnd: "" },
-      ];
+  beforeAll(() => initHasher());
 
-      // "apple" comes before "m"
-      expect(shardForTenant("apple", shards)?.shardId).toBe("shard-1");
-      // "zebra" comes after "m"
-      expect(shardForTenant("zebra", shards)?.shardId).toBe("shard-2");
+  describe("hashTenant", () => {
+    it("returns a 16-character hex string", () => {
+      const hash = hashTenant("test-tenant");
+      expect(hash).toMatch(/^[0-9a-f]{16}$/);
     });
 
-    it("handles empty rangeStart (no lower bound)", () => {
+    it("is deterministic", () => {
+      expect(hashTenant("tenant-1")).toBe(hashTenant("tenant-1"));
+    });
+
+    it("distributes env- tenants across different first hex digits", () => {
+      const firstDigits = new Set<string>();
+      for (let i = 0; i < 100; i++) {
+        firstDigits.add(hashTenant(`env-${i}`)[0]);
+      }
+      // With good hashing, 100 env- tenants should hit many different first digits
+      expect(firstDigits.size).toBeGreaterThan(8);
+    });
+  });
+
+  describe("shardForTenant lexicographic lookup (expects hash-space keys)", () => {
+    it("finds correct shard for key in range", () => {
+      const shards: ShardInfoWithRange[] = [
+        { shardId: "shard-1", serverAddr: "server-a:7450", rangeStart: "", rangeEnd: "8000000000000000" },
+        { shardId: "shard-2", serverAddr: "server-b:7450", rangeStart: "8000000000000000", rangeEnd: "" },
+      ];
+
+      // Keys in hash space — direct lexicographic comparison
+      expect(shardForTenant("3000000000000000", shards)?.shardId).toBe("shard-1");
+      expect(shardForTenant("a000000000000000", shards)?.shardId).toBe("shard-2");
+    });
+
+    it("handles single full-range shard", () => {
       const shards: ShardInfoWithRange[] = [
         { shardId: "shard-1", serverAddr: "server-a:7450", rangeStart: "", rangeEnd: "" },
       ];
 
-      expect(shardForTenant("any-tenant", shards)?.shardId).toBe("shard-1");
-    });
-
-    it("handles empty rangeEnd (no upper bound)", () => {
-      const shards: ShardInfoWithRange[] = [
-        { shardId: "shard-1", serverAddr: "server-a:7450", rangeStart: "a", rangeEnd: "" },
-      ];
-
-      expect(shardForTenant("zebra", shards)?.shardId).toBe("shard-1");
+      expect(shardForTenant("anything", shards)?.shardId).toBe("shard-1");
     });
 
     it("returns undefined for empty shards array", () => {
-      expect(shardForTenant("tenant", [])).toBeUndefined();
+      expect(shardForTenant("key", [])).toBeUndefined();
     });
 
     it("handles multiple shard ranges", () => {
       const shards: ShardInfoWithRange[] = [
-        { shardId: "shard-1", serverAddr: "server-a:7450", rangeStart: "", rangeEnd: "4" },
-        { shardId: "shard-2", serverAddr: "server-b:7450", rangeStart: "4", rangeEnd: "8" },
-        { shardId: "shard-3", serverAddr: "server-a:7450", rangeStart: "8", rangeEnd: "c" },
-        { shardId: "shard-4", serverAddr: "server-b:7450", rangeStart: "c", rangeEnd: "" },
+        { shardId: "shard-1", serverAddr: "server-a:7450", rangeStart: "", rangeEnd: "4000000000000000" },
+        { shardId: "shard-2", serverAddr: "server-b:7450", rangeStart: "4000000000000000", rangeEnd: "8000000000000000" },
+        { shardId: "shard-3", serverAddr: "server-a:7450", rangeStart: "8000000000000000", rangeEnd: "c000000000000000" },
+        { shardId: "shard-4", serverAddr: "server-b:7450", rangeStart: "c000000000000000", rangeEnd: "" },
       ];
 
-      expect(shardForTenant("1", shards)?.shardId).toBe("shard-1");
-      expect(shardForTenant("5", shards)?.shardId).toBe("shard-2");
-      expect(shardForTenant("9", shards)?.shardId).toBe("shard-3");
-      expect(shardForTenant("d", shards)?.shardId).toBe("shard-4");
+      expect(shardForTenant("1000000000000000", shards)?.shardId).toBe("shard-1");
+      expect(shardForTenant("5000000000000000", shards)?.shardId).toBe("shard-2");
+      expect(shardForTenant("9000000000000000", shards)?.shardId).toBe("shard-3");
+      expect(shardForTenant("d000000000000000", shards)?.shardId).toBe("shard-4");
+    });
+
+    it("end-to-end: hashTenant + shardForTenant routes tenants correctly", () => {
+      const shards: ShardInfoWithRange[] = [
+        { shardId: "shard-1", serverAddr: "server-a:7450", rangeStart: "", rangeEnd: "8000000000000000" },
+        { shardId: "shard-2", serverAddr: "server-b:7450", rangeStart: "8000000000000000", rangeEnd: "" },
+      ];
+
+      // Hash first, then look up — this is what _resolveShard does
+      for (const tenant of ["test-tenant", "env-123", "bench-0"]) {
+        const result = shardForTenant(hashTenant(tenant), shards);
+        expect(result).toBeDefined();
+        expect(["shard-1", "shard-2"]).toContain(result?.shardId);
+      }
+
+      // Same tenant always routes to same shard
+      const r1 = shardForTenant(hashTenant("my-tenant"), shards);
+      const r2 = shardForTenant(hashTenant("my-tenant"), shards);
+      expect(r1?.shardId).toBe(r2?.shardId);
     });
   });
 
@@ -78,27 +110,27 @@ describe("Shard Routing", () => {
               grpcAddr: "server-a:7450",
               nodeId: "node-a",
               rangeStart: "",
-              rangeEnd: "4",
+              rangeEnd: "4000000000000000",
             },
             {
               shardId: "00000000-0000-0000-0000-000000000002",
               grpcAddr: "server-b:7450",
               nodeId: "node-b",
-              rangeStart: "4",
-              rangeEnd: "8",
+              rangeStart: "4000000000000000",
+              rangeEnd: "8000000000000000",
             },
             {
               shardId: "00000000-0000-0000-0000-000000000003",
               grpcAddr: "server-a:7450",
               nodeId: "node-a",
-              rangeStart: "8",
-              rangeEnd: "c",
+              rangeStart: "8000000000000000",
+              rangeEnd: "c000000000000000",
             },
             {
               shardId: "00000000-0000-0000-0000-000000000004",
               grpcAddr: "server-b:7450",
               nodeId: "node-b",
-              rangeStart: "c",
+              rangeStart: "c000000000000000",
               rangeEnd: "",
             },
           ],
@@ -139,13 +171,13 @@ describe("Shard Routing", () => {
               grpcAddr: "server-x:7450",
               nodeId: "node-x",
               rangeStart: "",
-              rangeEnd: "m",
+              rangeEnd: "8000000000000000",
             },
             {
               shardId: "00000000-0000-0000-0000-000000000002",
               grpcAddr: "server-y:7450",
               nodeId: "node-y",
-              rangeStart: "m",
+              rangeStart: "8000000000000000",
               rangeEnd: "",
             },
           ],
