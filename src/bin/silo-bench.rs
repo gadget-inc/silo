@@ -11,14 +11,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::Parser;
 use rand::Rng;
 use silo::pb::report_outcome_request::Outcome;
-use silo::pb::silo_client::SiloClient;
 use silo::pb::{
-    ConcurrencyLimit, EnqueueRequest, GetClusterInfoRequest, LeaseTasksRequest, Limit,
-    ReportOutcomeRequest, SerializedBytes, serialized_bytes,
+    ConcurrencyLimit, EnqueueRequest, LeaseTasksRequest, Limit, ReportOutcomeRequest,
+    SerializedBytes, serialized_bytes,
 };
+use silo::routing_client::RoutingClient;
 use silo::settings::LogFormat;
 use silo::trace;
-use tonic::transport::Channel;
 use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
@@ -84,106 +83,6 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64
-}
-
-/// Ensure an address has the http:// scheme prefix
-fn ensure_http_scheme(addr: &str) -> String {
-    if addr.starts_with("http://") || addr.starts_with("https://") {
-        addr.to_string()
-    } else {
-        format!("http://{}", addr)
-    }
-}
-
-async fn connect(address: &str) -> anyhow::Result<SiloClient<Channel>> {
-    let url = ensure_http_scheme(address);
-    let channel = Channel::from_shared(url)?.connect().await?;
-    Ok(SiloClient::new(channel))
-}
-
-/// Discover cluster topology by calling GetClusterInfo
-async fn discover_cluster(address: &str) -> anyhow::Result<ClusterInfo> {
-    let mut client = connect(address).await?;
-    let response = client
-        .get_cluster_info(GetClusterInfoRequest {})
-        .await?
-        .into_inner();
-
-    let num_shards = response.num_shards;
-    let shard_owners: Vec<ShardOwnerInfo> = response
-        .shard_owners
-        .into_iter()
-        .map(|owner| ShardOwnerInfo {
-            shard_id: owner.shard_id,
-            grpc_addr: owner.grpc_addr,
-            node_id: owner.node_id,
-            range_start: owner.range_start,
-            range_end: owner.range_end,
-        })
-        .collect();
-
-    Ok(ClusterInfo {
-        num_shards,
-        shard_owners,
-        this_node_id: response.this_node_id,
-        this_grpc_addr: response.this_grpc_addr,
-    })
-}
-
-#[derive(Debug, Clone)]
-struct ShardOwnerInfo {
-    shard_id: String,
-    grpc_addr: String,
-    #[allow(dead_code)]
-    node_id: String,
-    range_start: String,
-    range_end: String,
-}
-
-#[derive(Debug, Clone)]
-struct ClusterInfo {
-    num_shards: u32,
-    shard_owners: Vec<ShardOwnerInfo>,
-    this_node_id: String,
-    this_grpc_addr: String,
-}
-
-impl ClusterInfo {
-    /// Get a random shard ID
-    fn random_shard(&self) -> &str {
-        let idx = rand::rng().random_range(0..self.shard_owners.len());
-        &self.shard_owners[idx].shard_id
-    }
-
-    /// Get the address of the server owning a specific shard
-    fn address_for_shard(&self, shard_id: &str) -> Option<&str> {
-        self.shard_owners
-            .iter()
-            .find(|owner| owner.shard_id == shard_id)
-            .map(|owner| owner.grpc_addr.as_str())
-    }
-
-    /// Find the shard that owns the given tenant ID based on shard ranges.
-    fn shard_for_tenant(&self, tenant_id: &str) -> Option<&ShardOwnerInfo> {
-        self.shard_owners.iter().find(|owner| {
-            let after_start =
-                owner.range_start.is_empty() || tenant_id >= owner.range_start.as_str();
-            let before_end = owner.range_end.is_empty() || tenant_id < owner.range_end.as_str();
-            after_start && before_end
-        })
-    }
-
-    /// Get all unique server addresses in the cluster
-    fn all_addresses(&self) -> Vec<String> {
-        let mut addrs: Vec<String> = self
-            .shard_owners
-            .iter()
-            .map(|owner| owner.grpc_addr.clone())
-            .collect();
-        addrs.sort();
-        addrs.dedup();
-        addrs
-    }
 }
 
 /// Handles weighted tenant selection for distributing jobs across tenants.
@@ -275,11 +174,27 @@ impl TenantSelector {
     }
 }
 
+/// Maximum number of retries for wrong-shard routing errors per request.
+const MAX_ROUTING_RETRIES: u32 = 3;
+
+/// Pre-serialized empty success payload, shared across all outcome reports.
+fn make_success_outcome_request(shard: String, task_id: String) -> ReportOutcomeRequest {
+    ReportOutcomeRequest {
+        shard,
+        task_id,
+        outcome: Some(Outcome::Success(SerializedBytes {
+            encoding: Some(serialized_bytes::Encoding::Msgpack(
+                rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+            )),
+        })),
+    }
+}
+
 /// Worker task that polls for tasks from random shards and reports success outcomes.
 /// Workers lease tasks from all tenants and report outcomes without specifying a tenant
 /// (the server determines the tenant from the task_id).
 async fn worker_loop(
-    cluster_info: Arc<ClusterInfo>,
+    client: Arc<RoutingClient>,
     worker_id: String,
     max_tasks: u32,
     running: Arc<AtomicBool>,
@@ -287,58 +202,18 @@ async fn worker_loop(
     poll_count: Arc<AtomicU64>,
     empty_poll_count: Arc<AtomicU64>,
 ) {
-    // Create connections to all servers in the cluster
-    let mut connections: std::collections::HashMap<String, SiloClient<Channel>> =
-        std::collections::HashMap::new();
-
-    for addr in cluster_info.all_addresses() {
-        match connect(&addr).await {
-            Ok(client) => {
-                connections.insert(addr, client);
-            }
-            Err(e) => {
-                error!(worker_id = %worker_id, address = %addr, error = %e, "Worker failed to connect");
-            }
-        }
-    }
-
-    if connections.is_empty() {
-        error!(worker_id = %worker_id, "Worker has no active connections, exiting");
-        return;
-    }
-
     while running.load(Ordering::Relaxed) {
-        // Pick a random shard
-        let shard = cluster_info.random_shard();
-
-        // Find the server owning this shard
-        let addr = match cluster_info.address_for_shard(shard) {
-            Some(addr) => addr.to_string(),
-            None => {
-                // Fallback: use any available connection
-                connections.keys().next().unwrap().clone()
-            }
-        };
-
-        let client = match connections.get_mut(&addr) {
-            Some(c) => c,
-            None => {
-                // Try to reconnect
-                match connect(&addr).await {
-                    Ok(c) => {
-                        connections.insert(addr.clone(), c);
-                        connections.get_mut(&addr).unwrap()
-                    }
-                    Err(_) => {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                        continue;
-                    }
-                }
+        let (mut silo_client, shard) = match client.client_for_random_shard() {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!(worker_id = %worker_id, error = %e, "Worker failed to get client");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
             }
         };
 
         let request = LeaseTasksRequest {
-            shard: Some(shard.to_string()),
+            shard: Some(shard.clone()),
             worker_id: worker_id.clone(),
             max_tasks,
             task_group: "default".to_string(),
@@ -346,7 +221,8 @@ async fn worker_loop(
 
         poll_count.fetch_add(1, Ordering::Relaxed);
 
-        match client.lease_tasks(request).await {
+        let result = silo_client.lease_tasks(request).await;
+        match result {
             Ok(response) => {
                 let tasks = response.into_inner().tasks;
                 if tasks.is_empty() {
@@ -357,36 +233,39 @@ async fn worker_loop(
                 }
 
                 for task in tasks {
-                    // Report success immediately (simulating instant task execution)
                     let task_shard = task.shard.clone();
-                    let task_addr = cluster_info
-                        .address_for_shard(&task_shard)
-                        .map(|a| a.to_string())
-                        .unwrap_or_else(|| addr.clone());
 
-                    // Determine which address to use for reporting - prefer task_addr if we have a connection
-                    let report_addr = if connections.contains_key(&task_addr) {
-                        task_addr
-                    } else {
-                        addr.clone()
+                    let mut report_client = match client.client_for_shard(&task_shard) {
+                        Ok(c) => c,
+                        Err(_) => silo_client.clone(),
                     };
 
-                    let outcome_request = ReportOutcomeRequest {
-                        shard: task_shard,
-                        task_id: task.id.clone(),
-                        outcome: Some(Outcome::Success(SerializedBytes {
-                            encoding: Some(serialized_bytes::Encoding::Msgpack(
-                                rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
-                            )),
-                        })),
-                    };
+                    let outcome_request =
+                        make_success_outcome_request(task_shard.clone(), task.id.clone());
 
-                    if let Some(report_client) = connections.get_mut(&report_addr) {
-                        match report_client.report_outcome(outcome_request).await {
-                            Ok(_) => {
-                                completed_count.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(e) => {
+                    match report_client.report_outcome(outcome_request).await {
+                        Ok(_) => {
+                            completed_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            // Try handling routing error for outcome reporting
+                            if client.handle_routing_error(&e, &task_shard).await.is_some() {
+                                // Retry once with updated routing
+                                if let Ok(mut retry_client) = client.client_for_shard(&task_shard) {
+                                    let retry_req = make_success_outcome_request(
+                                        task_shard,
+                                        task.id.clone(),
+                                    );
+                                    match retry_client.report_outcome(retry_req).await {
+                                        Ok(_) => {
+                                            completed_count.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        Err(e) => {
+                                            warn!(worker_id = %worker_id, error = %e, "Worker failed to report outcome after retry");
+                                        }
+                                    }
+                                }
+                            } else {
                                 warn!(worker_id = %worker_id, error = %e, "Worker failed to report outcome");
                             }
                         }
@@ -394,6 +273,13 @@ async fn worker_loop(
                 }
             }
             Err(e) => {
+                // Handle routing errors for lease_tasks
+                if let Some(needs_backoff) = client.handle_routing_error(&e, &shard).await {
+                    if needs_backoff {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    continue;
+                }
                 warn!(worker_id = %worker_id, error = %e, "Worker poll failed");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -401,9 +287,9 @@ async fn worker_loop(
     }
 }
 
-/// Enqueuer task that continuously enqueues tasks to random shards
+/// Enqueuer task that continuously enqueues tasks to the correct shards.
 async fn enqueuer_loop(
-    cluster_info: Arc<ClusterInfo>,
+    client: Arc<RoutingClient>,
     enqueuer_id: String,
     concurrency_key: String,
     max_concurrency: u32,
@@ -411,105 +297,74 @@ async fn enqueuer_loop(
     enqueued_count: Arc<AtomicU64>,
     tenant_selector: Arc<TenantSelector>,
 ) {
-    // Create connections to all servers in the cluster
-    let mut connections: std::collections::HashMap<String, SiloClient<Channel>> =
-        std::collections::HashMap::new();
-
-    for addr in cluster_info.all_addresses() {
-        match connect(&addr).await {
-            Ok(client) => {
-                connections.insert(addr, client);
-            }
-            Err(e) => {
-                error!(enqueuer_id = %enqueuer_id, address = %addr, error = %e, "Enqueuer failed to connect");
-            }
-        }
-    }
-
-    if connections.is_empty() {
-        error!(enqueuer_id = %enqueuer_id, "Enqueuer has no active connections, exiting");
-        return;
-    }
-
     let mut job_counter = 0u64;
 
     while running.load(Ordering::Relaxed) {
-        // Select a tenant first, then route to the correct shard
         let tenant = tenant_selector.select().to_string();
 
-        // Find the shard that owns this tenant based on range information
-        let shard = match cluster_info.shard_for_tenant(&tenant) {
-            Some(owner) => owner.shard_id.clone(),
-            None => {
-                warn!(enqueuer_id = %enqueuer_id, tenant = %tenant, "No shard found for tenant");
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                continue;
-            }
-        };
-
-        // Find the server owning this shard
-        let addr = match cluster_info.address_for_shard(&shard) {
-            Some(addr) => addr.to_string(),
-            None => {
-                // Fallback: use any available connection
-                connections.keys().next().unwrap().clone()
-            }
-        };
-
-        let client = match connections.get_mut(&addr) {
-            Some(c) => c,
-            None => {
-                // Try to reconnect
-                match connect(&addr).await {
-                    Ok(c) => {
-                        connections.insert(addr.clone(), c);
-                        connections.get_mut(&addr).unwrap()
-                    }
-                    Err(_) => {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                        continue;
-                    }
-                }
-            }
-        };
-
+        // Serialize payload once outside the retry loop
         let payload = serde_json::json!({
             "enqueuer": enqueuer_id,
             "job": job_counter,
             "tenant": tenant,
             "timestamp": now_ms(),
         });
+        let payload_bytes = rmp_serde::to_vec(&payload).unwrap();
+        let priority = (job_counter % 100) as u32;
+        let start_at_ms = now_ms();
 
-        let request = EnqueueRequest {
-            shard: shard.to_string(),
-            id: String::new(), // Let server generate ID
-            priority: (job_counter % 100) as u32,
-            start_at_ms: now_ms(),
-            retry_policy: None,
-            payload: Some(SerializedBytes {
-                encoding: Some(serialized_bytes::Encoding::Msgpack(
-                    rmp_serde::to_vec(&payload).unwrap(),
-                )),
-            }),
-            limits: vec![Limit {
-                limit: Some(silo::pb::limit::Limit::Concurrency(ConcurrencyLimit {
-                    key: concurrency_key.clone(),
-                    max_concurrency,
-                })),
-            }],
-            tenant: Some(tenant),
-            metadata: Default::default(),
-            task_group: "default".to_string(),
-        };
+        let mut retries = 0u32;
+        loop {
+            let (mut silo_client, shard) = match client.client_for_tenant(&tenant) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    warn!(enqueuer_id = %enqueuer_id, tenant = %tenant, error = %e, "No shard for tenant");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    break;
+                }
+            };
 
-        match client.enqueue(request).await {
-            Ok(_) => {
-                enqueued_count.fetch_add(1, Ordering::Relaxed);
-                job_counter = job_counter.wrapping_add(1);
-            }
-            Err(e) => {
-                warn!(enqueuer_id = %enqueuer_id, error = %e, "Enqueuer failed to enqueue");
-                tokio::time::sleep(Duration::from_millis(10)).await;
+            let request = EnqueueRequest {
+                shard: shard.clone(),
+                id: String::new(),
+                priority,
+                start_at_ms,
+                retry_policy: None,
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(payload_bytes.clone())),
+                }),
+                limits: vec![Limit {
+                    limit: Some(silo::pb::limit::Limit::Concurrency(ConcurrencyLimit {
+                        key: concurrency_key.clone(),
+                        max_concurrency,
+                    })),
+                }],
+                tenant: Some(tenant.clone()),
+                metadata: Default::default(),
+                task_group: "default".to_string(),
+            };
+
+            match silo_client.enqueue(request).await {
+                Ok(_) => {
+                    enqueued_count.fetch_add(1, Ordering::Relaxed);
+                    job_counter = job_counter.wrapping_add(1);
+                    break;
+                }
+                Err(e) => {
+                    if retries < MAX_ROUTING_RETRIES
+                        && let Some(needs_backoff) =
+                            client.handle_routing_error(&e, &shard).await
+                    {
+                        retries += 1;
+                        if needs_backoff {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        continue; // retry with updated routing
+                    }
+                    warn!(enqueuer_id = %enqueuer_id, error = %e, "Enqueuer failed to enqueue");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    break;
+                }
             }
         }
 
@@ -564,16 +419,18 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Discover cluster topology
+    // Discover cluster topology and create shared client
     info!("Discovering cluster topology...");
-    let cluster_info = discover_cluster(&args.address).await?;
+    let client = RoutingClient::discover(&args.address).await?;
+
+    let topo = client.topology();
     info!(
-        node_id = %cluster_info.this_node_id,
-        grpc_addr = %cluster_info.this_grpc_addr,
+        node_id = %topo.this_node_id,
+        grpc_addr = %topo.this_grpc_addr,
         "Connected to node"
     );
-    info!(num_shards = cluster_info.num_shards, "Cluster shard count");
-    for owner in &cluster_info.shard_owners {
+    info!(num_shards = topo.num_shards, "Cluster shard count");
+    for owner in &topo.shard_owners {
         let range_display = format!(
             "[{}, {})",
             if owner.range_start.is_empty() {
@@ -595,11 +452,11 @@ async fn main() -> anyhow::Result<()> {
             "Shard owner"
         );
     }
-    info!(servers = ?cluster_info.all_addresses(), "Unique servers");
+    info!(servers = ?client.all_addresses(), "Unique servers");
 
     // Log tenant-to-shard mapping
     for tenant in tenant_selector.all_tenants() {
-        match cluster_info.shard_for_tenant(tenant) {
+        match topo.shard_for_tenant(tenant) {
             Some(owner) => {
                 info!(
                     tenant = %tenant,
@@ -614,8 +471,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let cluster_info = Arc::new(cluster_info);
-
     // Shared counters
     let running = Arc::new(AtomicBool::new(true));
     let completed_count = Arc::new(AtomicU64::new(0));
@@ -626,7 +481,7 @@ async fn main() -> anyhow::Result<()> {
     // Spawn worker tasks
     let mut handles = Vec::new();
     for i in 0..args.workers {
-        let cluster = cluster_info.clone();
+        let client = client.clone();
         let worker_id = format!("bench-worker-{}", i);
         let running = running.clone();
         let completed = completed_count.clone();
@@ -634,7 +489,7 @@ async fn main() -> anyhow::Result<()> {
         let empty_polls = empty_poll_count.clone();
 
         handles.push(tokio::spawn(worker_loop(
-            cluster,
+            client,
             worker_id,
             args.max_tasks_per_poll,
             running,
@@ -646,7 +501,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn enqueuer tasks
     for i in 0..args.enqueuers {
-        let cluster = cluster_info.clone();
+        let client = client.clone();
         let enqueuer_id = format!("bench-enqueuer-{}", i);
         let running = running.clone();
         let enqueued = enqueued_count.clone();
@@ -655,7 +510,7 @@ async fn main() -> anyhow::Result<()> {
         let selector = tenant_selector.clone();
 
         handles.push(tokio::spawn(enqueuer_loop(
-            cluster,
+            client,
             enqueuer_id,
             concurrency_key,
             max_concurrency,

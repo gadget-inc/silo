@@ -264,17 +264,18 @@ impl Metrics {
             ),
         ];
 
-        let mut prev_values = self.slatedb_prev_values.lock().expect("lock poisoned");
-
-        for (stat_name, counter) in counter_mappings {
-            if let Some(stat) = stats.lookup(stat_name) {
-                let current = stat.get() as f64;
-                let key = (stat_name.to_string(), shard.to_string());
-                let prev = prev_values.get(&key).copied().unwrap_or(0.0);
-                if current > prev {
-                    counter.with_label_values(&[shard]).inc_by(current - prev);
+        {
+            let mut prev_values = self.slatedb_prev_values.lock().expect("lock poisoned");
+            for (stat_name, counter) in counter_mappings {
+                if let Some(stat) = stats.lookup(stat_name) {
+                    let current = stat.get() as f64;
+                    let key = (stat_name.to_string(), shard.to_string());
+                    let prev = prev_values.get(&key).copied().unwrap_or(0.0);
+                    if current > prev {
+                        counter.with_label_values(&[shard]).inc_by(current - prev);
+                    }
+                    prev_values.insert(key, current);
                 }
-                prev_values.insert(key, current);
             }
         }
 

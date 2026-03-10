@@ -14,6 +14,7 @@ pub mod keys;
 pub mod metrics;
 pub mod query;
 pub mod retry;
+pub mod routing_client;
 pub mod settings;
 pub mod shard_range;
 pub mod storage;
