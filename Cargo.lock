@@ -2915,7 +2915,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.0",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -4461,7 +4461,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
  "heck 0.5.0",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "once_cell",
@@ -4494,7 +4494,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.106",
@@ -4620,7 +4620,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.32",
- "socket2 0.6.0",
+ "socket2 0.5.10",
  "thiserror 2.0.16",
  "tokio",
  "tracing",
@@ -4657,7 +4657,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.0",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.59.0",
 ]
@@ -5476,8 +5476,8 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 
 [[package]]
 name = "slatedb"
-version = "0.10.0"
-source = "git+https://github.com/slatedb/slatedb.git?branch=main#5f1703652e05d792a9f9bb17b163a7e60100f397"
+version = "0.11.1"
+source = "git+https://github.com/slatedb/slatedb.git?branch=main#61f519e082e524a9b4a6764df2626c3bff8dd690"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5522,8 +5522,8 @@ dependencies = [
 
 [[package]]
 name = "slatedb-common"
-version = "0.10.0"
-source = "git+https://github.com/slatedb/slatedb.git?branch=main#5f1703652e05d792a9f9bb17b163a7e60100f397"
+version = "0.11.1"
+source = "git+https://github.com/slatedb/slatedb.git?branch=main#61f519e082e524a9b4a6764df2626c3bff8dd690"
 dependencies = [
  "chrono",
  "tokio",
@@ -5531,8 +5531,8 @@ dependencies = [
 
 [[package]]
 name = "slatedb-txn-obj"
-version = "0.10.0"
-source = "git+https://github.com/slatedb/slatedb.git?branch=main#5f1703652e05d792a9f9bb17b163a7e60100f397"
+version = "0.11.1"
+source = "git+https://github.com/slatedb/slatedb.git?branch=main#61f519e082e524a9b4a6764df2626c3bff8dd690"
 dependencies = [
  "async-trait",
  "bytes",
