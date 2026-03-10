@@ -72,6 +72,68 @@ pub async fn create_test_factory() -> anyhow::Result<(Arc<ShardFactory>, tempfil
     Ok((Arc::new(factory), tmp))
 }
 
+/// Helper to set up a multi-shard test server using NoneCoordinator.
+///
+/// Creates a temporary storage directory, a ShardFactory, and spawns a gRPC
+/// server with the given number of initial shards. Returns the components
+/// needed to interact with and shut down the server.
+///
+/// Callers that need a `SiloClient` can create one from the returned `SocketAddr`:
+/// ```ignore
+/// let endpoint = format!("http://{}", addr);
+/// let channel = tonic::transport::Endpoint::new(endpoint)?.connect().await?;
+/// let client = SiloClient::new(channel);
+/// ```
+pub async fn setup_multi_shard_server(
+    initial_shard_count: u32,
+    config: AppConfig,
+) -> anyhow::Result<(
+    tokio::sync::broadcast::Sender<()>,
+    tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    SocketAddr,
+    Arc<ShardFactory>,
+    tempfile::TempDir,
+)> {
+    let tmp = tempfile::tempdir()?;
+    let template = DatabaseTemplate {
+        backend: Backend::Fs,
+        path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+        wal: None,
+        apply_wal_on_close: true,
+        concurrency_reconcile_interval_ms: 5000,
+        slatedb: None,
+    };
+    let rate_limiter = MockGubernatorClient::new_arc();
+    let factory = Arc::new(ShardFactory::new(template, rate_limiter, None));
+
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+    let addr = listener.local_addr()?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
+    let coordinator = Arc::new(
+        NoneCoordinator::new(
+            "test-node",
+            format!("http://{}", addr),
+            initial_shard_count,
+            factory.clone(),
+            Vec::new(),
+        )
+        .await
+        .unwrap(),
+    );
+
+    let server = tokio::spawn(run_server(
+        listener,
+        factory.clone(),
+        coordinator,
+        config,
+        None,
+        shutdown_rx,
+    ));
+
+    Ok((shutdown_tx, server, addr, factory, tmp))
+}
+
 /// Helper to gracefully shutdown the server
 pub async fn shutdown_server(
     shutdown_tx: tokio::sync::broadcast::Sender<()>,

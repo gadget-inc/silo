@@ -8,16 +8,13 @@ mod grpc_integration_helpers;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use grpc_integration_helpers::{create_test_factory, setup_test_server, shutdown_server};
-use silo::coordination::NoneCoordinator;
-use silo::factory::ShardFactory;
-use silo::gubernator::MockGubernatorClient;
+use grpc_integration_helpers::{
+    create_test_factory, setup_multi_shard_server, setup_test_server, shutdown_server,
+};
 use silo::pb::silo_client::SiloClient;
 use silo::pb::*;
-use silo::server::run_server;
-use silo::settings::{AppConfig, Backend, DatabaseTemplate};
+use silo::settings::AppConfig;
 use silo::siloctl::{self, GlobalOptions};
-use tokio::net::TcpListener;
 
 // Global mutex to serialize profile tests - only one CPU profiler can run at a time system-wide
 static PROFILE_TEST_MUTEX: Mutex<()> = Mutex::new(());
@@ -1119,61 +1116,6 @@ fn test_compute_midpoint_same_prefix() {
 // Multi-shard routing tests
 // ============================================================================
 
-async fn setup_multi_shard_server(
-    initial_shard_count: u32,
-    config: AppConfig,
-) -> anyhow::Result<(
-    SiloClient<tonic::transport::Channel>,
-    tokio::sync::broadcast::Sender<()>,
-    tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
-    SocketAddr,
-    Arc<ShardFactory>,
-    tempfile::TempDir,
-)> {
-    let tmp = tempfile::tempdir()?;
-    let template = DatabaseTemplate {
-        backend: Backend::Fs,
-        path: tmp.path().join("%shard%").to_string_lossy().to_string(),
-        wal: None,
-        apply_wal_on_close: true,
-        concurrency_reconcile_interval_ms: 5000,
-        slatedb: None,
-    };
-    let rate_limiter = MockGubernatorClient::new_arc();
-    let factory = Arc::new(ShardFactory::new(template, rate_limiter, None));
-
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
-    let addr = listener.local_addr()?;
-    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-
-    let coordinator = Arc::new(
-        NoneCoordinator::new(
-            "test-node",
-            format!("http://{}", addr),
-            initial_shard_count,
-            factory.clone(),
-            Vec::new(),
-        )
-        .await
-        .unwrap(),
-    );
-
-    let server = tokio::spawn(run_server(
-        listener,
-        factory.clone(),
-        coordinator,
-        config,
-        None,
-        shutdown_rx,
-    ));
-
-    let endpoint = format!("http://{}", addr);
-    let channel = tonic::transport::Endpoint::new(endpoint)?.connect().await?;
-    let client = SiloClient::new(channel);
-
-    Ok((client, shutdown_tx, server, addr, factory, tmp))
-}
-
 /// Test that siloctl commands auto-route to the correct shard owner
 /// even when there are multiple shards in the cluster.
 #[silo::test(flavor = "multi_thread")]
@@ -1181,8 +1123,10 @@ async fn siloctl_auto_routes_job_commands_multi_shard() -> anyhow::Result<()> {
     tokio::time::timeout(std::time::Duration::from_millis(15000), async {
         let cfg = AppConfig::load(None).unwrap();
 
-        let (mut client, shutdown_tx, server, addr, _factory, _tmp) =
-            setup_multi_shard_server(8, cfg).await?;
+        let (shutdown_tx, server, addr, _factory, _tmp) = setup_multi_shard_server(8, cfg).await?;
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint)?.connect().await?;
+        let mut client = SiloClient::new(channel);
 
         // Discover topology
         let cluster_info = client
@@ -1268,8 +1212,7 @@ async fn siloctl_cluster_info_shows_ranges() -> anyhow::Result<()> {
     tokio::time::timeout(std::time::Duration::from_millis(15000), async {
         let cfg = AppConfig::load(None).unwrap();
 
-        let (_client, shutdown_tx, server, addr, _factory, _tmp) =
-            setup_multi_shard_server(4, cfg).await?;
+        let (shutdown_tx, server, addr, _factory, _tmp) = setup_multi_shard_server(4, cfg).await?;
 
         // Test human-readable output includes ranges
         let opts = opts_for_addr(&addr);
@@ -1318,8 +1261,10 @@ async fn siloctl_shard_split_status_auto_routes() -> anyhow::Result<()> {
     tokio::time::timeout(std::time::Duration::from_millis(15000), async {
         let cfg = AppConfig::load(None).unwrap();
 
-        let (mut client, shutdown_tx, server, addr, _factory, _tmp) =
-            setup_multi_shard_server(4, cfg).await?;
+        let (shutdown_tx, server, addr, _factory, _tmp) = setup_multi_shard_server(4, cfg).await?;
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint)?.connect().await?;
+        let mut client = SiloClient::new(channel);
 
         // Discover topology
         let cluster_info = client
@@ -1356,8 +1301,7 @@ async fn siloctl_unknown_shard_returns_clear_error() -> anyhow::Result<()> {
     tokio::time::timeout(std::time::Duration::from_millis(15000), async {
         let cfg = AppConfig::load(None).unwrap();
 
-        let (_client, shutdown_tx, server, addr, _factory, _tmp) =
-            setup_multi_shard_server(4, cfg).await?;
+        let (shutdown_tx, server, addr, _factory, _tmp) = setup_multi_shard_server(4, cfg).await?;
 
         let opts = opts_for_addr(&addr);
 

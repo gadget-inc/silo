@@ -1,12 +1,27 @@
-//! Cluster client for routing queries to appropriate nodes in a distributed Silo cluster.
+//! Internal cluster client for server-to-server communication within a Silo cluster.
 //!
-//! This module provides a client that can query any shard in the cluster by:
-//! - Querying local shards directly via the ShardFactory
-//! - Making gRPC Query calls to remote nodes for shards they own
+//! [`ClusterClient`] is used by silo server nodes to route operations (queries,
+//! job lookups, cancellations, splits) to the correct peer. It has direct access
+//! to the [`Coordinator`](crate::coordination::Coordinator) and
+//! [`ShardFactory`](crate::factory::ShardFactory), so it always knows the live
+//! topology and can serve local shards without a network hop. It does **not**
+//! need redirect or topology-refresh logic because the coordinator is the source
+//! of truth.
+//!
+//! For external consumers (benchmarks, workers, other services) that connect to
+//! the cluster from outside and need to handle stale topology, see
+//! [`RoutingClient`](crate::routing_client::RoutingClient).
+//!
+//! This module also exports shared connection infrastructure used by both clients:
+//! [`ClientConfig`], [`create_silo_client`], [`create_silo_client_lazy`],
+//! [`ensure_http_scheme`], [`AuthInterceptor`], and [`InterceptedSiloClient`].
 //!
 //! ## Connection Resilience
 //!
-//! The client includes built-in timeout and reconnection logic to handle network failures gracefully. When a connection fails or times out, the client will  automatically invalidate the cached connection and attempt to reconnect on the next request.
+//! The client includes built-in timeout and reconnection logic to handle network
+//! failures gracefully. When a connection fails or times out, the client
+//! automatically invalidates the cached connection and reconnects on the next
+//! request.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -127,24 +142,28 @@ pub fn ensure_http_scheme(addr: &str) -> String {
 }
 
 /// Client-side gRPC interceptor that injects a Bearer auth token into outgoing requests.
-/// When `token` is `None`, this is a no-op pass-through.
+/// When `header_value` is `None`, this is a no-op pass-through.
 #[derive(Clone)]
 pub struct AuthInterceptor {
-    token: Option<String>,
+    header_value: Option<MetadataValue<tonic::metadata::Ascii>>,
 }
 
 impl AuthInterceptor {
     pub fn new(token: Option<String>) -> Self {
-        Self { token }
+        Self {
+            header_value: token.map(|t| {
+                format!("Bearer {}", t)
+                    .parse()
+                    .expect("auth token should be valid ASCII metadata")
+            }),
+        }
     }
 }
 
 impl tonic::service::Interceptor for AuthInterceptor {
     fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
-        if let Some(ref token) = self.token {
-            let val: MetadataValue<tonic::metadata::Ascii> =
-                format!("Bearer {}", token).parse().unwrap();
-            req.metadata_mut().insert("authorization", val);
+        if let Some(ref val) = self.header_value {
+            req.metadata_mut().insert("authorization", val.clone());
         }
         Ok(req)
     }
@@ -153,7 +172,34 @@ impl tonic::service::Interceptor for AuthInterceptor {
 /// Type alias for a SiloClient with auth interceptor applied.
 pub type InterceptedSiloClient = SiloClient<InterceptedService<Channel, AuthInterceptor>>;
 
-/// Helper to create a SiloClient with proper timeout and retry configuration.
+/// Create a SiloClient with a lazy (non-blocking) connection.
+///
+/// Returns a client immediately without establishing a TCP connection. The actual
+/// connection is made on the first RPC call, and tonic handles reconnection
+/// automatically. The endpoint is configured with the same timeouts and keepalive
+/// settings from [`ClientConfig`].
+///
+/// This is preferred for connection pools where you want fast client creation
+/// and don't need to verify reachability upfront. For eager connection with
+/// retry logic, use [`create_silo_client`] instead.
+pub fn create_silo_client_lazy(
+    uri: &str,
+    config: &ClientConfig,
+) -> Result<InterceptedSiloClient, ClusterClientError> {
+    let full_uri = ensure_http_scheme(uri);
+
+    let endpoint = config
+        .configure_endpoint(&full_uri)
+        .map_err(|e| ClusterClientError::ConnectionFailed(full_uri.clone(), e.to_string()))?;
+
+    let channel = endpoint.connect_lazy();
+    let interceptor = AuthInterceptor::new(config.auth_token.clone());
+    Ok(SiloClient::with_interceptor(channel, interceptor)
+        .max_decoding_message_size(128 * 1024 * 1024)
+        .max_encoding_message_size(128 * 1024 * 1024))
+}
+
+/// Helper to create a SiloClient with an eager connection and retry logic.
 ///
 /// This function creates a gRPC client with configurable timeouts and automatic retry logic with exponential backoff. Retries are attempted when the initial connection fails.
 ///
@@ -316,7 +362,21 @@ impl ClusterNodeInfo {
     }
 }
 
-/// Client for querying shards across a distributed Silo cluster
+/// Internal server-to-server client for routing operations across a Silo cluster.
+///
+/// This client runs inside silo server nodes and has direct access to the
+/// [`Coordinator`](crate::coordination::Coordinator) for live topology and the
+/// [`ShardFactory`](crate::factory::ShardFactory) for local shard access. It
+/// routes queries, job operations, and split requests to the correct peer node
+/// via gRPC, or handles them locally when the shard is owned by this node.
+///
+/// Because it has the coordinator, it always knows the current shard→node mapping
+/// and does not need redirect handling or topology refresh. Connection failures
+/// are handled by invalidating the cached connection and reconnecting on the next
+/// request.
+///
+/// For external clients that don't have coordinator access, see
+/// [`RoutingClient`](crate::routing_client::RoutingClient).
 pub struct ClusterClient {
     /// Local shard factory for querying local shards
     factory: Arc<ShardFactory>,
