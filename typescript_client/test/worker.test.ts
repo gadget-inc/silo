@@ -72,6 +72,13 @@ describe("SiloWorker", () => {
 
       expect(worker.isRunning).toBe(false);
       expect(worker.activeTasks).toBe(0);
+      expect(worker.workerId).toBe("test-worker");
+      expect(worker.taskGroup).toBe("default");
+      expect(worker.concurrentPollers).toBe(1);
+      expect(worker.maxConcurrentTasks).toBe(10);
+      expect(worker.tasksPerPoll).toBe(5);
+      expect(worker.pollIntervalMs).toBe(1000);
+      expect(worker.heartbeatIntervalMs).toBe(5000);
     });
 
     it("creates a worker with custom options", () => {
@@ -94,6 +101,13 @@ describe("SiloWorker", () => {
       });
 
       expect(worker.isRunning).toBe(false);
+      expect(worker.workerId).toBe("test-worker");
+      expect(worker.taskGroup).toBe("default");
+      expect(worker.concurrentPollers).toBe(3);
+      expect(worker.maxConcurrentTasks).toBe(20);
+      expect(worker.tasksPerPoll).toBe(5);
+      expect(worker.pollIntervalMs).toBe(500);
+      expect(worker.heartbeatIntervalMs).toBe(2000);
     });
   });
 
