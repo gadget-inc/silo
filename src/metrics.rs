@@ -22,8 +22,9 @@
 //! metrics.jobs_enqueued.with_label_values(&["0", "default"]).inc();
 //! ```
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use prometheus::{
@@ -71,24 +72,30 @@ pub struct Metrics {
     task_leases_active: GaugeVec,
 
     // Concurrency metrics
-    concurrency_holders: GaugeVec,
     concurrency_tickets_granted: Counter,
 
-    // SlateDB storage metrics (per-shard)
-    slatedb_get_requests: GaugeVec,
-    slatedb_scan_requests: GaugeVec,
-    slatedb_write_ops: GaugeVec,
-    slatedb_write_batch_count: GaugeVec,
-    slatedb_backpressure_count: GaugeVec,
+    // SlateDB storage counters (per-shard, monotonically increasing in SlateDB)
+    slatedb_get_requests: CounterVec,
+    slatedb_scan_requests: CounterVec,
+    slatedb_write_ops: CounterVec,
+    slatedb_write_batch_count: CounterVec,
+    slatedb_backpressure_count: CounterVec,
+    slatedb_wal_buffer_flushes: CounterVec,
+    slatedb_immutable_memtable_flushes: CounterVec,
+    slatedb_sst_filter_positives: CounterVec,
+    slatedb_sst_filter_negatives: CounterVec,
+    slatedb_sst_filter_false_positives: CounterVec,
+    slatedb_bytes_compacted: CounterVec,
+
+    // SlateDB storage gauges (per-shard, point-in-time values)
     slatedb_wal_buffer_estimated_bytes: GaugeVec,
-    slatedb_wal_buffer_flushes: GaugeVec,
-    slatedb_immutable_memtable_flushes: GaugeVec,
-    slatedb_sst_filter_positives: GaugeVec,
-    slatedb_sst_filter_negatives: GaugeVec,
-    slatedb_sst_filter_false_positives: GaugeVec,
-    slatedb_bytes_compacted: GaugeVec,
     slatedb_running_compactions: GaugeVec,
     slatedb_last_compaction_ts_sec: GaugeVec,
+
+    /// Tracks previous SlateDB counter values per (stat_name, shard) for delta computation.
+    /// SlateDB exposes counters as absolute values via `stat.get()`, but Prometheus counters
+    /// only support `inc_by(delta)`, so we compute deltas between polls.
+    slatedb_prev_values: Arc<Mutex<HashMap<(String, String), f64>>>,
 }
 
 impl Metrics {
@@ -191,13 +198,6 @@ impl Metrics {
             .dec();
     }
 
-    /// Update concurrency holders count for a queue.
-    pub fn set_concurrency_holders(&self, tenant: &str, queue: &str, count: u64) {
-        self.concurrency_holders
-            .with_label_values(&[tenant, queue])
-            .set(count as f64);
-    }
-
     /// Record a concurrency ticket being granted.
     pub fn record_concurrency_ticket_granted(&self) {
         self.concurrency_tickets_granted.inc();
@@ -206,10 +206,11 @@ impl Metrics {
     /// Update SlateDB storage metrics from a shard's StatRegistry.
     ///
     /// Call this periodically (e.g., every second) to sync SlateDB's internal
-    /// statistics to Prometheus gauges.
+    /// statistics to Prometheus metrics. Counter-type stats are tracked via deltas
+    /// since Prometheus counters only support `inc_by()`, not `set()`.
     pub fn update_slatedb_stats(&self, shard: &str, stats: &Arc<StatRegistry>) {
-        let mappings: &[(&str, &GaugeVec)] = &[
-            // DB stats
+        // Counter-type stats: monotonically increasing in SlateDB
+        let counter_mappings: &[(&str, &CounterVec)] = &[
             (slatedb::db_stats::GET_REQUESTS, &self.slatedb_get_requests),
             (
                 slatedb::db_stats::SCAN_REQUESTS,
@@ -223,10 +224,6 @@ impl Metrics {
             (
                 slatedb::db_stats::BACKPRESSURE_COUNT,
                 &self.slatedb_backpressure_count,
-            ),
-            (
-                slatedb::db_stats::WAL_BUFFER_ESTIMATED_BYTES,
-                &self.slatedb_wal_buffer_estimated_bytes,
             ),
             (
                 slatedb::db_stats::WAL_BUFFER_FLUSHES,
@@ -248,8 +245,15 @@ impl Metrics {
                 slatedb::db_stats::SST_FILTER_FALSE_POSITIVES,
                 &self.slatedb_sst_filter_false_positives,
             ),
-            // Compactor stats (string literals - constants not exported in slatedb 0.10)
             ("compactor/bytes_compacted", &self.slatedb_bytes_compacted),
+        ];
+
+        // Gauge-type stats: point-in-time values
+        let gauge_mappings: &[(&str, &GaugeVec)] = &[
+            (
+                slatedb::db_stats::WAL_BUFFER_ESTIMATED_BYTES,
+                &self.slatedb_wal_buffer_estimated_bytes,
+            ),
             (
                 "compactor/running_compactions",
                 &self.slatedb_running_compactions,
@@ -260,7 +264,21 @@ impl Metrics {
             ),
         ];
 
-        for (stat_name, gauge) in mappings {
+        let mut prev_values = self.slatedb_prev_values.lock().expect("lock poisoned");
+
+        for (stat_name, counter) in counter_mappings {
+            if let Some(stat) = stats.lookup(stat_name) {
+                let current = stat.get() as f64;
+                let key = (stat_name.to_string(), shard.to_string());
+                let prev = prev_values.get(&key).copied().unwrap_or(0.0);
+                if current > prev {
+                    counter.with_label_values(&[shard]).inc_by(current - prev);
+                }
+                prev_values.insert(key, current);
+            }
+        }
+
+        for (stat_name, gauge) in gauge_mappings {
             if let Some(stat) = stats.lookup(stat_name) {
                 gauge.with_label_values(&[shard]).set(stat.get() as f64);
             }
@@ -419,17 +437,6 @@ pub fn init() -> anyhow::Result<Metrics> {
     );
 
     // Concurrency metrics
-    let concurrency_holders = register(
-        &registry,
-        GaugeVec::new(
-            Opts::new(
-                "silo_concurrency_holders",
-                "Number of active concurrency ticket holders per queue",
-            ),
-            &["tenant", "queue"],
-        )?,
-    );
-
     let concurrency_tickets_granted = register(
         &registry,
         Counter::new(
@@ -438,10 +445,10 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
-    // SlateDB storage metrics
+    // SlateDB storage counters (monotonically increasing in SlateDB)
     let slatedb_get_requests = register(
         &registry,
-        GaugeVec::new(
+        CounterVec::new(
             Opts::new(
                 "silo_slatedb_get_requests_total",
                 "Total number of GET (read) requests to SlateDB",
@@ -452,7 +459,7 @@ pub fn init() -> anyhow::Result<Metrics> {
 
     let slatedb_scan_requests = register(
         &registry,
-        GaugeVec::new(
+        CounterVec::new(
             Opts::new(
                 "silo_slatedb_scan_requests_total",
                 "Total number of scan (range query) requests to SlateDB",
@@ -463,7 +470,7 @@ pub fn init() -> anyhow::Result<Metrics> {
 
     let slatedb_write_ops = register(
         &registry,
-        GaugeVec::new(
+        CounterVec::new(
             Opts::new(
                 "silo_slatedb_write_ops_total",
                 "Total number of individual write operations to SlateDB",
@@ -474,7 +481,7 @@ pub fn init() -> anyhow::Result<Metrics> {
 
     let slatedb_write_batch_count = register(
         &registry,
-        GaugeVec::new(
+        CounterVec::new(
             Opts::new(
                 "silo_slatedb_write_batch_count_total",
                 "Total number of write batches to SlateDB",
@@ -485,7 +492,7 @@ pub fn init() -> anyhow::Result<Metrics> {
 
     let slatedb_backpressure_count = register(
         &registry,
-        GaugeVec::new(
+        CounterVec::new(
             Opts::new(
                 "silo_slatedb_backpressure_count_total",
                 "Number of times writes were blocked by back-pressure in SlateDB",
@@ -494,20 +501,9 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
-    let slatedb_wal_buffer_estimated_bytes = register(
-        &registry,
-        GaugeVec::new(
-            Opts::new(
-                "silo_slatedb_wal_buffer_estimated_bytes",
-                "Estimated bytes buffered in the SlateDB WAL buffer",
-            ),
-            &["shard"],
-        )?,
-    );
-
     let slatedb_wal_buffer_flushes = register(
         &registry,
-        GaugeVec::new(
+        CounterVec::new(
             Opts::new(
                 "silo_slatedb_wal_buffer_flushes_total",
                 "Total number of WAL buffer flushes in SlateDB",
@@ -518,7 +514,7 @@ pub fn init() -> anyhow::Result<Metrics> {
 
     let slatedb_immutable_memtable_flushes = register(
         &registry,
-        GaugeVec::new(
+        CounterVec::new(
             Opts::new(
                 "silo_slatedb_immutable_memtable_flushes_total",
                 "Total number of immutable memtable flushes to SSTs in SlateDB",
@@ -529,7 +525,7 @@ pub fn init() -> anyhow::Result<Metrics> {
 
     let slatedb_sst_filter_positives = register(
         &registry,
-        GaugeVec::new(
+        CounterVec::new(
             Opts::new(
                 "silo_slatedb_sst_filter_positives_total",
                 "Total SST filter true positives (key exists, filter says yes)",
@@ -540,7 +536,7 @@ pub fn init() -> anyhow::Result<Metrics> {
 
     let slatedb_sst_filter_negatives = register(
         &registry,
-        GaugeVec::new(
+        CounterVec::new(
             Opts::new(
                 "silo_slatedb_sst_filter_negatives_total",
                 "Total SST filter true negatives (key absent, filter says no)",
@@ -551,7 +547,7 @@ pub fn init() -> anyhow::Result<Metrics> {
 
     let slatedb_sst_filter_false_positives = register(
         &registry,
-        GaugeVec::new(
+        CounterVec::new(
             Opts::new(
                 "silo_slatedb_sst_filter_false_positives_total",
                 "Total SST filter false positives (key absent, but filter said yes)",
@@ -562,10 +558,22 @@ pub fn init() -> anyhow::Result<Metrics> {
 
     let slatedb_bytes_compacted = register(
         &registry,
-        GaugeVec::new(
+        CounterVec::new(
             Opts::new(
                 "silo_slatedb_bytes_compacted_total",
                 "Total number of bytes compacted by SlateDB compactor",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    // SlateDB storage gauges (point-in-time values)
+    let slatedb_wal_buffer_estimated_bytes = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_slatedb_wal_buffer_estimated_bytes",
+                "Estimated bytes buffered in the SlateDB WAL buffer",
             ),
             &["shard"],
         )?,
@@ -608,22 +616,22 @@ pub fn init() -> anyhow::Result<Metrics> {
         broker_inflight_size,
         broker_scan_duration,
         task_leases_active,
-        concurrency_holders,
         concurrency_tickets_granted,
         slatedb_get_requests,
         slatedb_scan_requests,
         slatedb_write_ops,
         slatedb_write_batch_count,
         slatedb_backpressure_count,
-        slatedb_wal_buffer_estimated_bytes,
         slatedb_wal_buffer_flushes,
         slatedb_immutable_memtable_flushes,
         slatedb_sst_filter_positives,
         slatedb_sst_filter_negatives,
         slatedb_sst_filter_false_positives,
         slatedb_bytes_compacted,
+        slatedb_wal_buffer_estimated_bytes,
         slatedb_running_compactions,
         slatedb_last_compaction_ts_sec,
+        slatedb_prev_values: Arc::new(Mutex::new(HashMap::new())),
     })
 }
 

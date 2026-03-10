@@ -217,9 +217,6 @@ async fn test_metrics_all_recording_methods() {
     metrics.inc_task_leases_active("0", "default");
     metrics.dec_task_leases_active("0", "default");
 
-    // set_concurrency_holders
-    metrics.set_concurrency_holders("tenant-1", "queue-a", 7);
-
     // record_concurrency_ticket_granted
     metrics.record_concurrency_ticket_granted();
 
@@ -320,18 +317,6 @@ async fn test_metrics_all_recording_methods() {
         leases_line
     );
 
-    // Verify concurrency holders
-    let holders_line = find_line(&[
-        "silo_concurrency_holders",
-        "tenant=\"tenant-1\"",
-        "queue=\"queue-a\"",
-    ]);
-    assert!(
-        holders_line.as_ref().map_or(false, |l| l.ends_with(" 7")),
-        "concurrency holders should be 7, found: {:?}",
-        holders_line
-    );
-
     // Verify concurrency tickets granted
     assert!(
         body_str.contains("silo_concurrency_tickets_granted_total 1"),
@@ -347,7 +332,7 @@ async fn test_metrics_all_recording_methods() {
 
 #[silo::test]
 async fn test_metrics_slatedb_stats() {
-    let (metrics, app) = create_metrics_router();
+    let (metrics, _app) = create_metrics_router();
 
     // Create a real SlateDB to get a StatRegistry with actual stats
     let tmpdir = tempfile::tempdir().unwrap();
@@ -366,27 +351,182 @@ async fn test_metrics_slatedb_stats() {
     let stat_registry = db.metrics();
     metrics.update_slatedb_stats("0", &stat_registry);
 
-    let request = Request::builder()
-        .method("GET")
-        .uri("/metrics")
-        .body(Body::empty())
-        .unwrap();
+    let body_str = gather_metrics_text(&metrics);
 
-    let response = app.oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    let body_str = String::from_utf8_lossy(&body);
-
-    // Verify SlateDB metrics are present
+    // Counter-type metrics should be emitted as TYPE counter
     assert!(
-        body_str.contains("silo_slatedb_write_ops_total"),
-        "should contain slatedb write ops metric"
+        body_str.contains("# TYPE silo_slatedb_write_ops_total counter"),
+        "write_ops should be a counter type"
     );
     assert!(
-        body_str.contains("silo_slatedb_get_requests_total"),
-        "should contain slatedb get requests metric"
+        body_str.contains("# TYPE silo_slatedb_get_requests_total counter"),
+        "get_requests should be a counter type"
+    );
+    assert!(
+        body_str.contains("# TYPE silo_slatedb_write_batch_count_total counter"),
+        "write_batch_count should be a counter type"
+    );
+
+    // Gauge-type metrics should be emitted as TYPE gauge
+    assert!(
+        body_str.contains("# TYPE silo_slatedb_wal_buffer_estimated_bytes gauge"),
+        "wal_buffer_estimated_bytes should be a gauge type"
+    );
+    assert!(
+        body_str.contains("# TYPE silo_slatedb_running_compactions gauge"),
+        "running_compactions should be a gauge type"
+    );
+
+    // Verify counter values are non-zero after writes and reads
+    let find_line = |substrings: &[&str]| -> Option<String> {
+        body_str
+            .lines()
+            .find(|l| substrings.iter().all(|s| l.contains(s)))
+            .map(|s| s.to_string())
+    };
+
+    let write_ops_line = find_line(&["silo_slatedb_write_ops_total", "shard=\"0\""]);
+    assert!(
+        write_ops_line
+            .as_ref()
+            .map_or(false, |l| !l.ends_with(" 0")),
+        "write_ops counter should be > 0 after puts, found: {:?}",
+        write_ops_line
+    );
+
+    let get_requests_line = find_line(&["silo_slatedb_get_requests_total", "shard=\"0\""]);
+    assert!(
+        get_requests_line
+            .as_ref()
+            .map_or(false, |l| !l.ends_with(" 0")),
+        "get_requests counter should be > 0 after get, found: {:?}",
+        get_requests_line
     );
 
     db.close().await.unwrap();
+}
+
+#[silo::test]
+async fn test_metrics_slatedb_counter_delta_tracking() {
+    let (metrics, _app) = create_metrics_router();
+
+    let tmpdir = tempfile::tempdir().unwrap();
+    let object_store = std::sync::Arc::new(
+        object_store::local::LocalFileSystem::new_with_prefix(tmpdir.path()).unwrap(),
+    );
+    let db = slatedb::Db::open(object_store::path::Path::from("test-db"), object_store)
+        .await
+        .unwrap();
+
+    // First batch of writes
+    db.put(b"key1", b"value1").await.unwrap();
+    let stat_registry = db.metrics();
+    metrics.update_slatedb_stats("0", &stat_registry);
+
+    let body1 = gather_metrics_text(&metrics);
+    let write_ops_1 =
+        extract_metric_value(&body1, &["silo_slatedb_write_ops_total", "shard=\"0\""]);
+    assert!(write_ops_1 > 0.0, "write_ops should be > 0 after first put");
+
+    // Second batch of writes — delta tracking should accumulate, not reset
+    db.put(b"key2", b"value2").await.unwrap();
+    db.put(b"key3", b"value3").await.unwrap();
+    metrics.update_slatedb_stats("0", &stat_registry);
+
+    let body2 = gather_metrics_text(&metrics);
+    let write_ops_2 =
+        extract_metric_value(&body2, &["silo_slatedb_write_ops_total", "shard=\"0\""]);
+    assert!(
+        write_ops_2 > write_ops_1,
+        "write_ops should increase after more puts: {} -> {}",
+        write_ops_1,
+        write_ops_2
+    );
+
+    // Calling update again without new writes should not change the counter
+    metrics.update_slatedb_stats("0", &stat_registry);
+    let body3 = gather_metrics_text(&metrics);
+    let write_ops_3 =
+        extract_metric_value(&body3, &["silo_slatedb_write_ops_total", "shard=\"0\""]);
+    assert_eq!(
+        write_ops_2, write_ops_3,
+        "write_ops should not change when no new writes occurred"
+    );
+
+    db.close().await.unwrap();
+}
+
+#[silo::test]
+async fn test_metrics_slatedb_multiple_shards() {
+    let (metrics, _app) = create_metrics_router();
+
+    let tmpdir1 = tempfile::tempdir().unwrap();
+    let object_store1 = std::sync::Arc::new(
+        object_store::local::LocalFileSystem::new_with_prefix(tmpdir1.path()).unwrap(),
+    );
+    let db1 = slatedb::Db::open(object_store::path::Path::from("test-db"), object_store1)
+        .await
+        .unwrap();
+
+    let tmpdir2 = tempfile::tempdir().unwrap();
+    let object_store2 = std::sync::Arc::new(
+        object_store::local::LocalFileSystem::new_with_prefix(tmpdir2.path()).unwrap(),
+    );
+    let db2 = slatedb::Db::open(object_store::path::Path::from("test-db"), object_store2)
+        .await
+        .unwrap();
+
+    // Write different amounts to each shard
+    db1.put(b"a", b"1").await.unwrap();
+    db2.put(b"b", b"2").await.unwrap();
+    db2.put(b"c", b"3").await.unwrap();
+
+    metrics.update_slatedb_stats("shard-a", &db1.metrics());
+    metrics.update_slatedb_stats("shard-b", &db2.metrics());
+
+    let body = gather_metrics_text(&metrics);
+    let shard_a_writes = extract_metric_value(
+        &body,
+        &["silo_slatedb_write_ops_total", "shard=\"shard-a\""],
+    );
+    let shard_b_writes = extract_metric_value(
+        &body,
+        &["silo_slatedb_write_ops_total", "shard=\"shard-b\""],
+    );
+
+    assert!(shard_a_writes > 0.0, "shard-a should have writes");
+    assert!(shard_b_writes > 0.0, "shard-b should have writes");
+    assert!(
+        shard_b_writes > shard_a_writes,
+        "shard-b should have more writes than shard-a: {} vs {}",
+        shard_b_writes,
+        shard_a_writes
+    );
+
+    db1.close().await.unwrap();
+    db2.close().await.unwrap();
+}
+
+/// Gather metrics text from the Prometheus registry.
+fn gather_metrics_text(metrics: &metrics::Metrics) -> String {
+    use prometheus::{Encoder, TextEncoder};
+    let encoder = TextEncoder::new();
+    let metric_families = metrics.registry().gather();
+    let mut buffer = Vec::new();
+    encoder.encode(&metric_families, &mut buffer).unwrap();
+    String::from_utf8(buffer).unwrap()
+}
+
+/// Extract a numeric metric value from Prometheus text output, finding the line
+/// that contains all given substrings.
+fn extract_metric_value(body: &str, substrings: &[&str]) -> f64 {
+    let line = body
+        .lines()
+        .find(|l| !l.starts_with('#') && substrings.iter().all(|s| l.contains(s)))
+        .unwrap_or_else(|| panic!("metric line not found for substrings {:?}", substrings));
+    line.rsplit_once(' ')
+        .unwrap_or_else(|| panic!("no space-separated value in line: {}", line))
+        .1
+        .parse::<f64>()
+        .unwrap_or_else(|_| panic!("failed to parse metric value from line: {}", line))
 }
