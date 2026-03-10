@@ -1281,7 +1281,9 @@ async fn etcd_request_split_fails_if_not_owner() {
     // Create splitter for c2 and try to split a shard owned by c1
     let splitter2 = ShardSplitter::new(c2.clone());
 
-    let result = splitter2.request_split(c1_shard, "8000000000000000".to_string()).await;
+    let result = splitter2
+        .request_split(c1_shard, "8000000000000000".to_string())
+        .await;
     assert!(
         matches!(result, Err(CoordinationError::NotShardOwner(_))),
         "should fail with NotShardOwner, got: {:?}",
@@ -1320,7 +1322,9 @@ async fn etcd_request_split_fails_if_already_in_progress() {
         .expect("first request_split should succeed");
 
     // Second split request should fail
-    let result = splitter.request_split(shard_id, "4000000000000000".to_string()).await;
+    let result = splitter
+        .request_split(shard_id, "4000000000000000".to_string())
+        .await;
     assert!(
         matches!(result, Err(CoordinationError::SplitAlreadyInProgress(_))),
         "should fail with SplitAlreadyInProgress, got: {:?}",

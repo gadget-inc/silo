@@ -2773,7 +2773,9 @@ async fn k8s_request_split_fails_if_already_in_progress() {
         .expect("first request_split should succeed");
 
     // Second split request should fail
-    let result = splitter.request_split(shard_id, "4000000000000000".to_string()).await;
+    let result = splitter
+        .request_split(shard_id, "4000000000000000".to_string())
+        .await;
     assert!(
         matches!(result, Err(CoordinationError::SplitAlreadyInProgress(_))),
         "should fail with SplitAlreadyInProgress, got: {:?}",
