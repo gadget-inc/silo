@@ -274,6 +274,55 @@ export class SiloWorker<
   }
 
   /**
+   * The unique identifier for this worker.
+   */
+  public get workerId(): string {
+    return this._workerId;
+  }
+
+  /**
+   * The task group this worker polls for tasks from.
+   */
+  public get taskGroup(): string {
+    return this._taskGroup;
+  }
+
+  /**
+   * The number of concurrent poll calls configured.
+   */
+  public get concurrentPollers(): number {
+    return this._concurrentPollers;
+  }
+
+  /**
+   * The maximum number of tasks that can execute simultaneously.
+   */
+  public get maxConcurrentTasks(): number {
+    return this._maxConcurrentTasks;
+  }
+
+  /**
+   * The number of tasks requested per poll call.
+   */
+  public get tasksPerPoll(): number {
+    return this._tasksPerPoll;
+  }
+
+  /**
+   * The interval in ms between poll attempts.
+   */
+  public get pollIntervalMs(): number {
+    return this._pollIntervalMs;
+  }
+
+  /**
+   * The interval in ms between heartbeats for running tasks.
+   */
+  public get heartbeatIntervalMs(): number {
+    return this._heartbeatIntervalMs;
+  }
+
+  /**
    * Whether the worker is currently running.
    */
   public get isRunning(): boolean {
