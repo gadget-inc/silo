@@ -4815,7 +4815,9 @@ async fn k8s_crash_restart_reclaims_and_opens_shards() {
 async fn k8s_hash_ring_divergence_on_restart() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
-    let num_shards: u32 = 8;
+    // Use 32 shards to ensure both nodes get some via rendezvous hashing.
+    // With 8 shards the probability of all going to one node is (0.5)^8 ≈ 0.4%.
+    let num_shards: u32 = 32;
 
     // Start A and B, let them partition shards
     let (ca, ha) = start_coordinator!(
