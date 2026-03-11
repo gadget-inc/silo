@@ -164,10 +164,10 @@ pub async fn cluster_info<W: Write>(opts: &GlobalOptions, out: &mut W) -> anyhow
         writeln!(out, "Shard Ownership:")?;
         writeln!(
             out,
-            "{:<38}  {:<14}  {:<20}  gRPC Address",
+            "{:<38}  {:<40}  {:<20}  gRPC Address",
             "Shard", "Range", "Node ID"
         )?;
-        writeln!(out, "{}", "-".repeat(100))?;
+        writeln!(out, "{}", "-".repeat(120))?;
         for owner in &response.shard_owners {
             let range = format!(
                 "[{}, {})",
@@ -184,7 +184,7 @@ pub async fn cluster_info<W: Write>(opts: &GlobalOptions, out: &mut W) -> anyhow
             );
             writeln!(
                 out,
-                "{:<38}  {:<14}  {:<20}  {}",
+                "{:<38}  {:<40}  {:<20}  {}",
                 owner.shard_id, range, owner.node_id, owner.grpc_addr
             )?;
         }
@@ -642,25 +642,19 @@ pub async fn shard_split<W: Write>(
     let split_point = if let Some(point) = split_point {
         point
     } else if auto {
-        // Compute midpoint of the shard's range
-        let start = if shard_owner.range_start.is_empty() {
-            "0".to_string()
-        } else {
-            shard_owner.range_start.clone()
-        };
-        let end = if shard_owner.range_end.is_empty() {
-            "zzzzzzzz".to_string()
-        } else {
-            shard_owner.range_end.clone()
-        };
-
-        compute_midpoint(&start, &end).ok_or_else(|| {
+        // Compute numeric midpoint of the shard's hash-space range
+        let range = crate::shard_range::ShardRange::new(
+            shard_owner.range_start.clone(),
+            shard_owner.range_end.clone(),
+        );
+        let mid = range.midpoint().ok_or_else(|| {
             anyhow::anyhow!(
                 "Cannot compute midpoint for range [{}, {})",
                 shard_owner.range_start,
                 shard_owner.range_end
             )
-        })?
+        })?;
+        crate::shard_range::format_hash_boundary(mid)
     } else {
         return Err(anyhow::anyhow!(
             "Either --at <split-point> or --auto must be specified"
@@ -903,56 +897,104 @@ pub async fn validate_config<W: Write>(
     }
 }
 
-/// Compute the lexicographic midpoint of two strings
-pub fn compute_midpoint(start: &str, end: &str) -> Option<String> {
-    if start >= end {
-        return None;
+/// Compute and display the xxhash for a tenant ID.
+pub fn tenant_hash<W: Write>(
+    opts: &GlobalOptions,
+    out: &mut W,
+    tenant_id: &str,
+) -> anyhow::Result<()> {
+    let hashed = crate::shard_range::hash_tenant(tenant_id);
+
+    if opts.json {
+        let json_output = serde_json::json!({
+            "tenant_id": tenant_id,
+            "hash": hashed,
+        });
+        writeln!(out, "{}", serde_json::to_string_pretty(&json_output)?)?;
+    } else {
+        writeln!(out, "{}", hashed)?;
     }
 
-    let start_bytes = start.as_bytes();
-    let end_bytes = end.as_bytes();
+    Ok(())
+}
 
-    // Find the first differing position
-    let min_len = start_bytes.len().min(end_bytes.len());
-    let mut diff_pos = 0;
-    while diff_pos < min_len && start_bytes[diff_pos] == end_bytes[diff_pos] {
-        diff_pos += 1;
-    }
+/// Locate which shard a tenant belongs to by hashing the tenant ID
+/// and finding the shard whose range contains the hash.
+pub async fn tenant_locate<W: Write>(
+    opts: &GlobalOptions,
+    out: &mut W,
+    tenant_id: &str,
+) -> anyhow::Result<()> {
+    let mut client = connect(&opts.address, opts.auth_token.as_deref()).await?;
+    let response = client
+        .get_cluster_info(GetClusterInfoRequest {})
+        .await?
+        .into_inner();
 
-    if diff_pos == min_len {
-        // One is a prefix of the other
-        if start_bytes.len() < end_bytes.len() {
-            // Start is shorter, add a middle character
-            let mut mid = start.to_string();
-            mid.push('M');
-            if mid.as_str() > start && mid.as_str() < end {
-                return Some(mid);
+    let hashed = crate::shard_range::hash_tenant(tenant_id);
+
+    // Find the shard whose range contains the hashed tenant
+    let owner = response.shard_owners.iter().find(|s| {
+        let range = crate::shard_range::ShardRange::new(s.range_start.clone(), s.range_end.clone());
+        range.contains(&hashed)
+    });
+
+    match owner {
+        Some(owner) => {
+            if opts.json {
+                let json_output = serde_json::json!({
+                    "tenant_id": tenant_id,
+                    "tenant_hash": hashed,
+                    "shard_id": owner.shard_id,
+                    "node_id": owner.node_id,
+                    "grpc_addr": owner.grpc_addr,
+                    "range_start": owner.range_start,
+                    "range_end": owner.range_end,
+                });
+                writeln!(out, "{}", serde_json::to_string_pretty(&json_output)?)?;
+            } else {
+                writeln!(out, "Tenant Location")?;
+                writeln!(out, "===============")?;
+                writeln!(out, "Tenant ID:   {}", tenant_id)?;
+                writeln!(out, "Tenant Hash: {}", hashed)?;
+                writeln!(out, "Shard ID:    {}", owner.shard_id)?;
+                writeln!(out, "Node ID:     {}", owner.node_id)?;
+                writeln!(out, "gRPC Addr:   {}", owner.grpc_addr)?;
+                let range = format!(
+                    "[{}, {})",
+                    if owner.range_start.is_empty() {
+                        "-\u{221e}"
+                    } else {
+                        &owner.range_start
+                    },
+                    if owner.range_end.is_empty() {
+                        "+\u{221e}"
+                    } else {
+                        &owner.range_end
+                    }
+                );
+                writeln!(out, "Shard Range: {}", range)?;
             }
         }
-        return None;
-    }
-
-    // Compute midpoint at the differing position
-    let start_char = start_bytes[diff_pos];
-    let end_char = end_bytes[diff_pos];
-
-    if end_char <= start_char + 1 {
-        // Too close, extend with a high character
-        let mut mid = String::from_utf8_lossy(&start_bytes[..=diff_pos]).to_string();
-        mid.push('~');
-        if mid.as_str() > start && mid.as_str() < end {
-            return Some(mid);
+        None => {
+            return Err(anyhow::anyhow!(
+                "no shard found for tenant '{}' (hash: {})",
+                tenant_id,
+                hashed
+            ));
         }
-        return None;
     }
 
-    let mid_char = start_char + (end_char - start_char) / 2;
-    let mut result = String::from_utf8_lossy(&start_bytes[..diff_pos]).to_string();
-    result.push(mid_char as char);
+    Ok(())
+}
 
-    if result.as_str() > start && result.as_str() < end {
-        Some(result)
-    } else {
-        None
-    }
+/// Compute the midpoint of a hash-space range defined by hex-encoded u64 boundaries.
+///
+/// Delegates to [`ShardRange::midpoint`](crate::shard_range::ShardRange::midpoint)
+/// and formats the result as a 16-character hex string.
+pub fn compute_midpoint(start: &str, end: &str) -> Option<String> {
+    let range = crate::shard_range::ShardRange::new(start, end);
+    range
+        .midpoint()
+        .map(crate::shard_range::format_hash_boundary)
 }

@@ -1071,45 +1071,39 @@ async fn siloctl_validate_config() -> anyhow::Result<()> {
     Ok(())
 }
 
-// Unit tests for compute_midpoint
+// Unit tests for compute_midpoint (hash-space hex boundaries)
 
 #[silo::test]
-fn test_compute_midpoint_normal() {
-    let mid = siloctl::compute_midpoint("a", "z").unwrap();
-    assert!(mid.as_str() > "a", "midpoint should be > start");
-    assert!(mid.as_str() < "z", "midpoint should be < end");
+fn test_compute_midpoint_full_range() {
+    // Unbounded range: ["", "") → midpoint of [0, u64::MAX]
+    let mid = siloctl::compute_midpoint("", "").unwrap();
+    assert_eq!(mid, "7fffffffffffffff");
 }
 
 #[silo::test]
-fn test_compute_midpoint_equal_strings() {
-    assert!(siloctl::compute_midpoint("abc", "abc").is_none());
+fn test_compute_midpoint_normal_hex_range() {
+    let mid = siloctl::compute_midpoint("2000000000000000", "6000000000000000").unwrap();
+    assert_eq!(mid, "4000000000000000");
 }
 
 #[silo::test]
-fn test_compute_midpoint_start_greater_than_end() {
-    assert!(siloctl::compute_midpoint("z", "a").is_none());
+fn test_compute_midpoint_unbounded_start() {
+    // ["", "8000000000000000") → midpoint of [0, 0x8000000000000000]
+    let mid = siloctl::compute_midpoint("", "8000000000000000").unwrap();
+    assert_eq!(mid, "4000000000000000");
 }
 
 #[silo::test]
-fn test_compute_midpoint_prefix_case() {
-    let mid = siloctl::compute_midpoint("abc", "abcdef").unwrap();
-    assert!(mid.as_str() > "abc", "midpoint should be > start");
-    assert!(mid.as_str() < "abcdef", "midpoint should be < end");
+fn test_compute_midpoint_unbounded_end() {
+    // ["8000000000000000", "") → midpoint of [0x8000000000000000, u64::MAX]
+    let mid = siloctl::compute_midpoint("8000000000000000", "").unwrap();
+    assert_eq!(mid, "bfffffffffffffff");
 }
 
 #[silo::test]
-fn test_compute_midpoint_adjacent_chars() {
-    // 'a' and 'b' are adjacent, so midpoint extends with '~'
-    let mid = siloctl::compute_midpoint("a", "b").unwrap();
-    assert!(mid.as_str() > "a", "midpoint should be > start");
-    assert!(mid.as_str() < "b", "midpoint should be < end");
-}
-
-#[silo::test]
-fn test_compute_midpoint_same_prefix() {
-    let mid = siloctl::compute_midpoint("hello", "world").unwrap();
-    assert!(mid.as_str() > "hello", "midpoint should be > start");
-    assert!(mid.as_str() < "world", "midpoint should be < end");
+fn test_compute_midpoint_adjacent_values() {
+    // Range too small to split (end <= start + 1)
+    assert!(siloctl::compute_midpoint("0000000000000005", "0000000000000006").is_none());
 }
 
 // ============================================================================

@@ -69,6 +69,11 @@ enum Command {
         #[command(subcommand)]
         action: ShardAction,
     },
+    /// Tenant operations
+    Tenant {
+        #[command(subcommand)]
+        action: TenantAction,
+    },
     /// Execute SQL query against a shard
     Query {
         /// Shard ID (UUID) to query
@@ -135,6 +140,20 @@ enum ShardAction {
     ForceRelease {
         /// Shard ID (UUID) to force-release
         shard: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TenantAction {
+    /// Show which shard a tenant belongs to
+    Locate {
+        /// Tenant ID to look up
+        tenant_id: String,
+    },
+    /// Compute the xxhash for a tenant ID
+    Hash {
+        /// Tenant ID to hash
+        tenant_id: String,
     },
 }
 
@@ -223,6 +242,12 @@ async fn run(args: Args) -> anyhow::Result<()> {
             ShardAction::ForceRelease { shard } => {
                 siloctl::shard_force_release(&opts, &mut stdout, shard).await
             }
+        },
+        Command::Tenant { action } => match action {
+            TenantAction::Locate { tenant_id } => {
+                siloctl::tenant_locate(&opts, &mut stdout, tenant_id).await
+            }
+            TenantAction::Hash { tenant_id } => siloctl::tenant_hash(&opts, &mut stdout, tenant_id),
         },
         Command::Query { shard, sql } => siloctl::query(&opts, &mut stdout, shard, sql).await,
         Command::Profile {
