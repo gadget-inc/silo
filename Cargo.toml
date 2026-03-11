@@ -3,7 +3,7 @@ authors = ["Harry Brundage <harry@gadget.dev>"]
 edition = "2024"
 name = "silo"
 description = "A background job server on top of object storage"
-version = "0.1.0"
+version = "0.2.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
