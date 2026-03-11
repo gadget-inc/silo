@@ -897,6 +897,27 @@ pub async fn validate_config<W: Write>(
     }
 }
 
+/// Compute and display the xxhash for a tenant ID.
+pub fn tenant_hash<W: Write>(
+    opts: &GlobalOptions,
+    out: &mut W,
+    tenant_id: &str,
+) -> anyhow::Result<()> {
+    let hashed = crate::shard_range::hash_tenant(tenant_id);
+
+    if opts.json {
+        let json_output = serde_json::json!({
+            "tenant_id": tenant_id,
+            "hash": hashed,
+        });
+        writeln!(out, "{}", serde_json::to_string_pretty(&json_output)?)?;
+    } else {
+        writeln!(out, "{}", hashed)?;
+    }
+
+    Ok(())
+}
+
 /// Locate which shard a tenant belongs to by hashing the tenant ID
 /// and finding the shard whose range contains the hash.
 pub async fn tenant_locate<W: Write>(
