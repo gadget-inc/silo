@@ -164,10 +164,10 @@ pub async fn cluster_info<W: Write>(opts: &GlobalOptions, out: &mut W) -> anyhow
         writeln!(out, "Shard Ownership:")?;
         writeln!(
             out,
-            "{:<38}  {:<14}  {:<20}  gRPC Address",
+            "{:<38}  {:<40}  {:<20}  gRPC Address",
             "Shard", "Range", "Node ID"
         )?;
-        writeln!(out, "{}", "-".repeat(100))?;
+        writeln!(out, "{}", "-".repeat(120))?;
         for owner in &response.shard_owners {
             let range = format!(
                 "[{}, {})",
@@ -184,7 +184,7 @@ pub async fn cluster_info<W: Write>(opts: &GlobalOptions, out: &mut W) -> anyhow
             );
             writeln!(
                 out,
-                "{:<38}  {:<14}  {:<20}  {}",
+                "{:<38}  {:<40}  {:<20}  {}",
                 owner.shard_id, range, owner.node_id, owner.grpc_addr
             )?;
         }
@@ -895,6 +895,77 @@ pub async fn validate_config<W: Write>(
             Err(anyhow::anyhow!("Config validation failed: {}", e))
         }
     }
+}
+
+/// Locate which shard a tenant belongs to by hashing the tenant ID
+/// and finding the shard whose range contains the hash.
+pub async fn tenant_locate<W: Write>(
+    opts: &GlobalOptions,
+    out: &mut W,
+    tenant_id: &str,
+) -> anyhow::Result<()> {
+    let mut client = connect(&opts.address, opts.auth_token.as_deref()).await?;
+    let response = client
+        .get_cluster_info(GetClusterInfoRequest {})
+        .await?
+        .into_inner();
+
+    let hashed = crate::shard_range::hash_tenant(tenant_id);
+
+    // Find the shard whose range contains the hashed tenant
+    let owner = response.shard_owners.iter().find(|s| {
+        let range =
+            crate::shard_range::ShardRange::new(s.range_start.clone(), s.range_end.clone());
+        range.contains(&hashed)
+    });
+
+    match owner {
+        Some(owner) => {
+            if opts.json {
+                let json_output = serde_json::json!({
+                    "tenant_id": tenant_id,
+                    "tenant_hash": hashed,
+                    "shard_id": owner.shard_id,
+                    "node_id": owner.node_id,
+                    "grpc_addr": owner.grpc_addr,
+                    "range_start": owner.range_start,
+                    "range_end": owner.range_end,
+                });
+                writeln!(out, "{}", serde_json::to_string_pretty(&json_output)?)?;
+            } else {
+                writeln!(out, "Tenant Location")?;
+                writeln!(out, "===============")?;
+                writeln!(out, "Tenant ID:   {}", tenant_id)?;
+                writeln!(out, "Tenant Hash: {}", hashed)?;
+                writeln!(out, "Shard ID:    {}", owner.shard_id)?;
+                writeln!(out, "Node ID:     {}", owner.node_id)?;
+                writeln!(out, "gRPC Addr:   {}", owner.grpc_addr)?;
+                let range = format!(
+                    "[{}, {})",
+                    if owner.range_start.is_empty() {
+                        "-\u{221e}"
+                    } else {
+                        &owner.range_start
+                    },
+                    if owner.range_end.is_empty() {
+                        "+\u{221e}"
+                    } else {
+                        &owner.range_end
+                    }
+                );
+                writeln!(out, "Shard Range: {}", range)?;
+            }
+        }
+        None => {
+            return Err(anyhow::anyhow!(
+                "no shard found for tenant '{}' (hash: {})",
+                tenant_id,
+                hashed
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Compute the midpoint of a hash-space range defined by hex-encoded u64 boundaries.
