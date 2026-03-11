@@ -247,9 +247,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             TenantAction::Locate { tenant_id } => {
                 siloctl::tenant_locate(&opts, &mut stdout, tenant_id).await
             }
-            TenantAction::Hash { tenant_id } => {
-                siloctl::tenant_hash(&opts, &mut stdout, tenant_id)
-            }
+            TenantAction::Hash { tenant_id } => siloctl::tenant_hash(&opts, &mut stdout, tenant_id),
         },
         Command::Query { shard, sql } => siloctl::query(&opts, &mut stdout, shard, sql).await,
         Command::Profile {

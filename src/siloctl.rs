@@ -935,8 +935,7 @@ pub async fn tenant_locate<W: Write>(
 
     // Find the shard whose range contains the hashed tenant
     let owner = response.shard_owners.iter().find(|s| {
-        let range =
-            crate::shard_range::ShardRange::new(s.range_start.clone(), s.range_end.clone());
+        let range = crate::shard_range::ShardRange::new(s.range_start.clone(), s.range_end.clone());
         range.contains(&hashed)
     });
 
