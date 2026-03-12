@@ -1377,6 +1377,7 @@ async fn enqueue_and_complete_job(
                     rmp_serde::to_vec(result_data).unwrap(),
                 )),
             })),
+            tenant_id: None,
         })
         .await?;
 
@@ -1437,6 +1438,7 @@ async fn enqueue_and_fail_job(
                     )),
                 }),
             })),
+            tenant_id: None,
         })
         .await?;
 
