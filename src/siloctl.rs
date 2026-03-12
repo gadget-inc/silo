@@ -12,7 +12,8 @@ use crate::pb::silo_client::SiloClient;
 use crate::pb::{
     CancelJobRequest, ConfigureShardRequest, CpuProfileRequest, DeleteJobRequest,
     ExpediteJobRequest, ForceReleaseShardRequest, GetClusterInfoRequest, GetJobRequest,
-    GetSplitStatusRequest, QueryRequest, RequestSplitRequest, RestartJobRequest,
+    GetJobResultRequest, GetSplitStatusRequest, QueryRequest, RequestSplitRequest,
+    RestartJobRequest,
 };
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -313,6 +314,124 @@ pub async fn job_get<W: Write>(
     }
 
     Ok(())
+}
+
+/// Output format for raw bytes
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BytesOutputFormat {
+    /// Hex-encoded output
+    Hex,
+    /// Base64-encoded output
+    Base64,
+    /// Decode msgpack and pretty-print as JSON
+    MsgpackJson,
+}
+
+/// Get the result or error data of a completed job
+pub async fn job_result<W: Write>(
+    opts: &GlobalOptions,
+    out: &mut W,
+    shard: &str,
+    id: &str,
+    format: BytesOutputFormat,
+) -> anyhow::Result<()> {
+    let mut client =
+        connect_to_shard_owner(&opts.address, shard, opts.auth_token.as_deref()).await?;
+    let response = client
+        .get_job_result(GetJobResultRequest {
+            shard: shard.to_string(),
+            id: id.to_string(),
+            tenant: opts.tenant.clone(),
+        })
+        .await?
+        .into_inner();
+
+    let status = job_status_to_string(response.status);
+
+    match response.result {
+        Some(crate::pb::get_job_result_response::Result::SuccessData(data)) => {
+            let raw = extract_serialized_bytes(&data);
+            if opts.json {
+                let json_output = serde_json::json!({
+                    "id": response.id,
+                    "status": status,
+                    "finished_at_ms": response.finished_at_ms,
+                    "result": format_bytes(&raw, format)?,
+                });
+                writeln!(out, "{}", serde_json::to_string_pretty(&json_output)?)?;
+            } else {
+                writeln!(out, "Job:     {}", response.id)?;
+                writeln!(out, "Status:  {}", status)?;
+                writeln!(out, "Result:")?;
+                writeln!(out, "{}", format_bytes(&raw, format)?)?;
+            }
+        }
+        Some(crate::pb::get_job_result_response::Result::Failure(failure)) => {
+            let error_data = failure
+                .error_data
+                .map(|d| extract_serialized_bytes(&d))
+                .unwrap_or_default();
+            if opts.json {
+                let json_output = serde_json::json!({
+                    "id": response.id,
+                    "status": status,
+                    "finished_at_ms": response.finished_at_ms,
+                    "error_code": failure.error_code,
+                    "error_data": format_bytes(&error_data, format)?,
+                });
+                writeln!(out, "{}", serde_json::to_string_pretty(&json_output)?)?;
+            } else {
+                writeln!(out, "Job:        {}", response.id)?;
+                writeln!(out, "Status:     {}", status)?;
+                writeln!(out, "Error Code: {}", failure.error_code)?;
+                writeln!(out, "Error Data:")?;
+                writeln!(out, "{}", format_bytes(&error_data, format)?)?;
+            }
+        }
+        Some(crate::pb::get_job_result_response::Result::Cancelled(cancelled)) => {
+            if opts.json {
+                let json_output = serde_json::json!({
+                    "id": response.id,
+                    "status": status,
+                    "cancelled_at_ms": cancelled.cancelled_at_ms,
+                });
+                writeln!(out, "{}", serde_json::to_string_pretty(&json_output)?)?;
+            } else {
+                writeln!(out, "Job:    {}", response.id)?;
+                writeln!(out, "Status: {}", status)?;
+                writeln!(
+                    out,
+                    "Cancelled at: {}",
+                    format_timestamp_ms(cancelled.cancelled_at_ms)
+                )?;
+            }
+        }
+        None => {
+            return Err(anyhow::anyhow!("no result data returned for job {}", id));
+        }
+    }
+
+    Ok(())
+}
+
+fn extract_serialized_bytes(data: &crate::pb::SerializedBytes) -> Vec<u8> {
+    match &data.encoding {
+        Some(crate::pb::serialized_bytes::Encoding::Msgpack(bytes)) => bytes.clone(),
+        None => vec![],
+    }
+}
+
+fn format_bytes(raw: &[u8], format: BytesOutputFormat) -> anyhow::Result<String> {
+    use base64::Engine;
+    match format {
+        BytesOutputFormat::Hex => Ok(hex::encode(raw)),
+        BytesOutputFormat::Base64 => Ok(base64::engine::general_purpose::STANDARD.encode(raw)),
+        BytesOutputFormat::MsgpackJson => {
+            let value: serde_json::Value = rmp_serde::from_slice(raw)
+                .map_err(|e| anyhow::anyhow!("failed to decode msgpack: {}", e))?;
+            Ok(serde_json::to_string_pretty(&value)?)
+        }
+    }
 }
 
 /// Cancel a job
