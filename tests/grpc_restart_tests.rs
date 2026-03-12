@@ -110,6 +110,7 @@ async fn grpc_restart_cancelled_job() -> anyhow::Result<()> {
                         rmp_serde::to_vec(&serde_json::json!("done")).unwrap(),
                     )),
                 })),
+                tenant_id: None,
             })
             .await?;
 
@@ -188,6 +189,7 @@ async fn grpc_restart_failed_job() -> anyhow::Result<()> {
                         )),
                     }),
                 })),
+                tenant_id: None,
             })
             .await?;
 
@@ -246,6 +248,7 @@ async fn grpc_restart_failed_job() -> anyhow::Result<()> {
                         rmp_serde::to_vec(&serde_json::json!("success after restart")).unwrap(),
                     )),
                 })),
+                tenant_id: None,
             })
             .await?;
 
@@ -387,6 +390,7 @@ async fn grpc_restart_running_job_fails() -> anyhow::Result<()> {
                         rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
                     )),
                 })),
+                tenant_id: None,
             })
             .await?;
 
@@ -449,6 +453,7 @@ async fn grpc_restart_succeeded_job_fails() -> anyhow::Result<()> {
                         rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
                     )),
                 })),
+                tenant_id: None,
             })
             .await?;
 

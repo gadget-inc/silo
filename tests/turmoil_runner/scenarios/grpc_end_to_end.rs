@@ -113,6 +113,7 @@ pub fn run() {
                                 rmp_serde::to_vec(&serde_json::json!({"result": "ok"})).unwrap(),
                             )),
                         })),
+                        tenant_id: None,
                     }))
                     .await?;
                 tracing::trace!(job_id = %task.job_id, "complete");

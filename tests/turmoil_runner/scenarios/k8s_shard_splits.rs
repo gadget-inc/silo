@@ -1238,6 +1238,7 @@ pub fn run() {
                                     shard: task_shard_id.to_string(),
                                     task_id: task.id.clone(),
                                     outcome: Some(outcome),
+                                    tenant_id: task.tenant_id.clone(),
                                 }))
                                 .await
                             {

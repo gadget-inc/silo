@@ -565,6 +565,228 @@ describe("Shard Routing", () => {
     });
   });
 
+  describe("Wrong Shard Retry for shard-routed operations", () => {
+    let client: SiloGRPCClient;
+
+    const setupMockTopology = (c: SiloGRPCClient) => {
+      (c as any)._shards = [
+        {
+          shardId: "00000000-0000-0000-0000-000000000001",
+          serverAddr: "localhost:7450",
+          rangeStart: "",
+          rangeEnd: "",
+        },
+      ];
+      (c as any)._shardToServer.set("00000000-0000-0000-0000-000000000001", "localhost:7450");
+      (c as any)._topologyReady = true;
+    };
+
+    const SHARD_ID = "00000000-0000-0000-0000-000000000001";
+
+    beforeEach(() => {
+      client = new SiloGRPCClient({
+        servers: "localhost:7450",
+        useTls: false,
+        shardRouting: {
+          maxWrongShardRetries: 3,
+          wrongShardRetryDelayMs: 1,
+          topologyRefreshIntervalMs: 0,
+        },
+      });
+      setupMockTopology(client);
+    });
+
+    afterEach(() => {
+      client.close();
+    });
+
+    describe("reportOutcome", () => {
+      it("retries on wrong shard error with redirect metadata", async () => {
+        let callCount = 0;
+        const mockReportOutcome = vi.fn().mockImplementation(() => {
+          callCount++;
+          if (callCount === 1) {
+            throw new RpcError("shard not found", "NOT_FOUND", {
+              "x-silo-shard-owner-addr": "localhost:7450",
+            });
+          }
+          return { response: Promise.resolve({}) };
+        });
+
+        const connections = (client as any)._connections as Map<string, any>;
+        const conn = connections.values().next().value;
+        conn.client.reportOutcome = mockReportOutcome;
+        (client as any).refreshTopology = vi.fn().mockResolvedValue(undefined);
+
+        await client.reportOutcome({
+          taskId: "task-1",
+          shard: SHARD_ID,
+          outcome: { type: "success", result: { ok: true } },
+        });
+
+        expect(mockReportOutcome).toHaveBeenCalledTimes(2);
+      });
+
+      it("retries on wrong shard error without redirect metadata (triggers topology refresh)", async () => {
+        let callCount = 0;
+        const mockReportOutcome = vi.fn().mockImplementation(() => {
+          callCount++;
+          if (callCount === 1) {
+            throw new RpcError("shard not found", "NOT_FOUND", {});
+          }
+          return { response: Promise.resolve({}) };
+        });
+
+        const connections = (client as any)._connections as Map<string, any>;
+        const conn = connections.values().next().value;
+        conn.client.reportOutcome = mockReportOutcome;
+
+        const refreshSpy = vi.fn().mockResolvedValue(undefined);
+        (client as any).refreshTopology = refreshSpy;
+
+        await client.reportOutcome({
+          taskId: "task-1",
+          shard: SHARD_ID,
+          outcome: { type: "success", result: { ok: true } },
+        });
+
+        expect(mockReportOutcome).toHaveBeenCalledTimes(2);
+        expect(refreshSpy).toHaveBeenCalled();
+      });
+
+      it("stops retrying after maxWrongShardRetries", async () => {
+        const mockReportOutcome = vi.fn().mockImplementation(() => {
+          throw new RpcError("shard not found", "NOT_FOUND", {});
+        });
+
+        const connections = (client as any)._connections as Map<string, any>;
+        const conn = connections.values().next().value;
+        conn.client.reportOutcome = mockReportOutcome;
+        (client as any).refreshTopology = vi.fn().mockResolvedValue(undefined);
+
+        await expect(
+          client.reportOutcome({
+            taskId: "task-1",
+            shard: SHARD_ID,
+            outcome: { type: "success", result: { ok: true } },
+          }),
+        ).rejects.toThrow();
+
+        // Initial call + 3 retries = 4 total
+        expect(mockReportOutcome).toHaveBeenCalledTimes(4);
+      });
+
+      it("does not retry on non-wrong-shard errors", async () => {
+        const mockReportOutcome = vi.fn().mockImplementation(() => {
+          throw new RpcError("internal error", "INTERNAL", {});
+        });
+
+        const connections = (client as any)._connections as Map<string, any>;
+        const conn = connections.values().next().value;
+        conn.client.reportOutcome = mockReportOutcome;
+
+        await expect(
+          client.reportOutcome({
+            taskId: "task-1",
+            shard: SHARD_ID,
+            outcome: { type: "success", result: { ok: true } },
+          }),
+        ).rejects.toThrow("internal error");
+
+        expect(mockReportOutcome).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    describe("heartbeat", () => {
+      it("retries on wrong shard error with redirect metadata", async () => {
+        let callCount = 0;
+        const mockHeartbeat = vi.fn().mockImplementation(() => {
+          callCount++;
+          if (callCount === 1) {
+            throw new RpcError("shard not found", "NOT_FOUND", {
+              "x-silo-shard-owner-addr": "localhost:7450",
+            });
+          }
+          return { response: Promise.resolve({ cancelled: false }) };
+        });
+
+        const connections = (client as any)._connections as Map<string, any>;
+        const conn = connections.values().next().value;
+        conn.client.heartbeat = mockHeartbeat;
+        (client as any).refreshTopology = vi.fn().mockResolvedValue(undefined);
+
+        const result = await client.heartbeat("worker-1", "task-1", SHARD_ID);
+
+        expect(result.cancelled).toBe(false);
+        expect(mockHeartbeat).toHaveBeenCalledTimes(2);
+      });
+
+      it("stops retrying after maxWrongShardRetries", async () => {
+        const mockHeartbeat = vi.fn().mockImplementation(() => {
+          throw new RpcError("shard not found", "NOT_FOUND", {});
+        });
+
+        const connections = (client as any)._connections as Map<string, any>;
+        const conn = connections.values().next().value;
+        conn.client.heartbeat = mockHeartbeat;
+        (client as any).refreshTopology = vi.fn().mockResolvedValue(undefined);
+
+        await expect(client.heartbeat("worker-1", "task-1", SHARD_ID)).rejects.toThrow();
+
+        expect(mockHeartbeat).toHaveBeenCalledTimes(4);
+      });
+    });
+
+    describe("reportRefreshOutcome", () => {
+      it("retries on wrong shard error with redirect metadata", async () => {
+        let callCount = 0;
+        const mockReportRefreshOutcome = vi.fn().mockImplementation(() => {
+          callCount++;
+          if (callCount === 1) {
+            throw new RpcError("shard not found", "NOT_FOUND", {
+              "x-silo-shard-owner-addr": "localhost:7450",
+            });
+          }
+          return { response: Promise.resolve({}) };
+        });
+
+        const connections = (client as any)._connections as Map<string, any>;
+        const conn = connections.values().next().value;
+        conn.client.reportRefreshOutcome = mockReportRefreshOutcome;
+        (client as any).refreshTopology = vi.fn().mockResolvedValue(undefined);
+
+        await client.reportRefreshOutcome({
+          taskId: "task-1",
+          shard: SHARD_ID,
+          outcome: { type: "success", newMaxConcurrency: 10 },
+        });
+
+        expect(mockReportRefreshOutcome).toHaveBeenCalledTimes(2);
+      });
+
+      it("stops retrying after maxWrongShardRetries", async () => {
+        const mockReportRefreshOutcome = vi.fn().mockImplementation(() => {
+          throw new RpcError("shard not found", "NOT_FOUND", {});
+        });
+
+        const connections = (client as any)._connections as Map<string, any>;
+        const conn = connections.values().next().value;
+        conn.client.reportRefreshOutcome = mockReportRefreshOutcome;
+        (client as any).refreshTopology = vi.fn().mockResolvedValue(undefined);
+
+        await expect(
+          client.reportRefreshOutcome({
+            taskId: "task-1",
+            shard: SHARD_ID,
+            outcome: { type: "success", newMaxConcurrency: 10 },
+          }),
+        ).rejects.toThrow();
+
+        expect(mockReportRefreshOutcome).toHaveBeenCalledTimes(4);
+      });
+    });
+  });
+
   describe("Lazy topology auto-refresh", () => {
     let client: SiloGRPCClient;
 

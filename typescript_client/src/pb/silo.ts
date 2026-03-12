@@ -747,7 +747,7 @@ export interface RefreshFloatingLimitTask {
     /**
      * @generated from protobuf field: optional string tenant_id = 9
      */
-    tenantId?: string; // Tenant ID if multi-tenancy is enabled.
+    tenantId?: string; // Tenant ID for routing. Required if multi-tenancy is enabled.
 }
 /**
  * Response containing tasks leased to a worker.
@@ -766,7 +766,6 @@ export interface LeaseTasksResponse {
 }
 /**
  * Request to report the outcome of a completed task.
- * Note: tenant is determined from the task lease, not from the request.
  *
  * @generated from protobuf message silo.v1.ReportOutcomeRequest
  */
@@ -803,6 +802,10 @@ export interface ReportOutcomeRequest {
     } | {
         oneofKind: undefined;
     };
+    /**
+     * @generated from protobuf field: optional string tenant_id = 7
+     */
+    tenantId?: string; // Tenant ID for shard routing. Required if multi-tenancy is enabled. Should come from Task.tenant_id.
 }
 /**
  * Error details for a failed task.
@@ -835,7 +838,6 @@ export interface ReportOutcomeResponse {
 }
 /**
  * Request to report the outcome of a floating limit refresh task.
- * Note: tenant is determined from the task lease, not from the request.
  *
  * @generated from protobuf message silo.v1.ReportRefreshOutcomeRequest
  */
@@ -866,6 +868,10 @@ export interface ReportRefreshOutcomeRequest {
     } | {
         oneofKind: undefined;
     };
+    /**
+     * @generated from protobuf field: optional string tenant_id = 6
+     */
+    tenantId?: string; // Tenant ID for shard routing. Required if multi-tenancy is enabled. Should come from RefreshTask.tenant_id.
 }
 /**
  * Successful floating limit refresh with the new computed value.
@@ -903,7 +909,6 @@ export interface ReportRefreshOutcomeResponse {
 /**
  * Request to extend a task lease and check for cancellation.
  * Workers must heartbeat before lease_ms expires to keep the task.
- * Note: tenant is determined from the task lease, not from the request.
  *
  * @generated from protobuf message silo.v1.HeartbeatRequest
  */
@@ -920,6 +925,10 @@ export interface HeartbeatRequest {
      * @generated from protobuf field: string task_id = 3
      */
     taskId: string; // The task's unique ID.
+    /**
+     * @generated from protobuf field: optional string tenant_id = 4
+     */
+    tenantId?: string; // Tenant ID for shard routing. Required if multi-tenancy is enabled. Should come from Task.tenant_id.
 }
 /**
  * Response indicating if the lease was extended and if the job was cancelled.
@@ -3902,7 +3911,8 @@ class ReportOutcomeRequest$Type extends MessageType<ReportOutcomeRequest> {
             { no: 2, name: "task_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
             { no: 3, name: "success", kind: "message", oneof: "outcome", T: () => SerializedBytes },
             { no: 4, name: "failure", kind: "message", oneof: "outcome", T: () => Failure },
-            { no: 6, name: "cancelled", kind: "message", oneof: "outcome", T: () => Cancelled }
+            { no: 6, name: "cancelled", kind: "message", oneof: "outcome", T: () => Cancelled },
+            { no: 7, name: "tenant_id", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ }
         ]);
     }
     create(value?: PartialMessage<ReportOutcomeRequest>): ReportOutcomeRequest {
@@ -3943,6 +3953,9 @@ class ReportOutcomeRequest$Type extends MessageType<ReportOutcomeRequest> {
                         cancelled: Cancelled.internalBinaryRead(reader, reader.uint32(), options, (message.outcome as any).cancelled)
                     };
                     break;
+                case /* optional string tenant_id */ 7:
+                    message.tenantId = reader.string();
+                    break;
                 default:
                     let u = options.readUnknownField;
                     if (u === "throw")
@@ -3970,6 +3983,9 @@ class ReportOutcomeRequest$Type extends MessageType<ReportOutcomeRequest> {
         /* silo.v1.Cancelled cancelled = 6; */
         if (message.outcome.oneofKind === "cancelled")
             Cancelled.internalBinaryWrite(message.outcome.cancelled, writer.tag(6, WireType.LengthDelimited).fork(), options).join();
+        /* optional string tenant_id = 7; */
+        if (message.tenantId !== undefined)
+            writer.tag(7, WireType.LengthDelimited).string(message.tenantId);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -4117,7 +4133,8 @@ class ReportRefreshOutcomeRequest$Type extends MessageType<ReportRefreshOutcomeR
             { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
             { no: 2, name: "task_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
             { no: 4, name: "success", kind: "message", oneof: "outcome", T: () => RefreshSuccess },
-            { no: 5, name: "failure", kind: "message", oneof: "outcome", T: () => RefreshFailure }
+            { no: 5, name: "failure", kind: "message", oneof: "outcome", T: () => RefreshFailure },
+            { no: 6, name: "tenant_id", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ }
         ]);
     }
     create(value?: PartialMessage<ReportRefreshOutcomeRequest>): ReportRefreshOutcomeRequest {
@@ -4152,6 +4169,9 @@ class ReportRefreshOutcomeRequest$Type extends MessageType<ReportRefreshOutcomeR
                         failure: RefreshFailure.internalBinaryRead(reader, reader.uint32(), options, (message.outcome as any).failure)
                     };
                     break;
+                case /* optional string tenant_id */ 6:
+                    message.tenantId = reader.string();
+                    break;
                 default:
                     let u = options.readUnknownField;
                     if (u === "throw")
@@ -4176,6 +4196,9 @@ class ReportRefreshOutcomeRequest$Type extends MessageType<ReportRefreshOutcomeR
         /* silo.v1.RefreshFailure failure = 5; */
         if (message.outcome.oneofKind === "failure")
             RefreshFailure.internalBinaryWrite(message.outcome.failure, writer.tag(5, WireType.LengthDelimited).fork(), options).join();
+        /* optional string tenant_id = 6; */
+        if (message.tenantId !== undefined)
+            writer.tag(6, WireType.LengthDelimited).string(message.tenantId);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -4332,7 +4355,8 @@ class HeartbeatRequest$Type extends MessageType<HeartbeatRequest> {
         super("silo.v1.HeartbeatRequest", [
             { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
             { no: 2, name: "worker_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
-            { no: 3, name: "task_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+            { no: 3, name: "task_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 4, name: "tenant_id", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ }
         ]);
     }
     create(value?: PartialMessage<HeartbeatRequest>): HeartbeatRequest {
@@ -4358,6 +4382,9 @@ class HeartbeatRequest$Type extends MessageType<HeartbeatRequest> {
                 case /* string task_id */ 3:
                     message.taskId = reader.string();
                     break;
+                case /* optional string tenant_id */ 4:
+                    message.tenantId = reader.string();
+                    break;
                 default:
                     let u = options.readUnknownField;
                     if (u === "throw")
@@ -4379,6 +4406,9 @@ class HeartbeatRequest$Type extends MessageType<HeartbeatRequest> {
         /* string task_id = 3; */
         if (message.taskId !== "")
             writer.tag(3, WireType.LengthDelimited).string(message.taskId);
+        /* optional string tenant_id = 4; */
+        if (message.tenantId !== undefined)
+            writer.tag(4, WireType.LengthDelimited).string(message.tenantId);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);

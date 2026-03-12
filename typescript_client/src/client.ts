@@ -834,6 +834,8 @@ export interface ReportOutcomeOptions<Result = unknown> {
   shard: string;
   /** The outcome of the task */
   outcome: TaskOutcome<Result>;
+  /** Tenant ID for shard routing validation (from Task.tenantId) */
+  tenant?: string;
 }
 
 /**
@@ -860,6 +862,8 @@ export interface RefreshTask {
   shard: string;
   /** Task group this task belongs to */
   taskGroup: string;
+  /** Tenant ID if multi-tenancy is enabled */
+  tenant?: string;
 }
 
 /** Outcome for reporting refresh task success */
@@ -888,6 +892,8 @@ export interface ReportRefreshOutcomeOptions {
   shard: string;
   /** The outcome of the refresh */
   outcome: RefreshOutcome;
+  /** Tenant ID for shard routing validation (from RefreshTask.tenantId) */
+  tenant?: string;
 }
 
 /** Result from a heartbeat request */
@@ -1452,6 +1458,53 @@ export class SiloGRPCClient {
   }
 
   /**
+   * Execute an operation with retry logic for wrong shard errors, using a known shard ID.
+   * Used by shard-routed operations (reportOutcome, heartbeat, reportRefreshOutcome)
+   * where the shard ID is already known from the task, rather than resolved from a tenant.
+   * @internal
+   */
+  private async _withWrongShardRetryForShard<T>(
+    shardId: string,
+    operation: (client: SiloClient) => Promise<T>,
+  ): Promise<T> {
+    let lastError: unknown;
+    let delay = this._wrongShardRetryDelayMs;
+    let client = this._getClientForShard(shardId);
+
+    for (let attempt = 0; attempt <= this._maxWrongShardRetries; attempt++) {
+      try {
+        return await operation(client);
+      } catch (error) {
+        if (isWrongShardError(error) && attempt < this._maxWrongShardRetries) {
+          lastError = error;
+
+          // Check for redirect address in metadata
+          const redirectAddr = extractRedirectAddress(error);
+          if (redirectAddr) {
+            // Update routing and create connection to new server
+            const mappedAddr = this._mapAddress(redirectAddr);
+            this._shardToServer.set(shardId, mappedAddr);
+            const conn = this._getOrCreateConnection(mappedAddr);
+            client = conn.client;
+          } else {
+            // No redirect info, try refreshing topology
+            await this.refreshTopology();
+            client = this._getClientForShard(shardId);
+          }
+
+          // Wait with exponential backoff before retrying
+          await sleep(delay);
+          delay = Math.min(delay * 2, 5000); // Cap at 5 seconds
+          continue;
+        }
+        throw error;
+      }
+    }
+    // Should not reach here, but throw last error if we do
+    throw lastError;
+  }
+
+  /**
    * Refresh the cluster topology by calling GetClusterInfo.
    * This updates the shard → server mapping and range info.
    */
@@ -1914,6 +1967,7 @@ export class SiloGRPCClient {
         leaseMs: rt.leaseMs,
         shard: rt.shard,
         taskGroup: rt.taskGroup,
+        tenant: rt.tenantId,
       }));
 
       return {
@@ -1966,16 +2020,18 @@ export class SiloGRPCClient {
     }
 
     try {
-      // Route to the correct shard (from Task.shard)
-      const client = this._getClientForShard(options.shard);
-      await client.reportOutcome(
-        {
-          shard: options.shard,
-          taskId: options.taskId,
-          outcome,
-        },
-        this._rpcOptions(),
-      );
+      // Route to the correct shard (from Task.shard), with retry on stale routing
+      await this._withWrongShardRetryForShard(options.shard, async (client) => {
+        await client.reportOutcome(
+          {
+            shard: options.shard,
+            taskId: options.taskId,
+            tenantId: options.tenant,
+            outcome,
+          },
+          this._rpcOptions(),
+        );
+      });
     } catch (error) {
       throwMappedRpcError(error, {
         operation: "reportOutcome",
@@ -2013,15 +2069,17 @@ export class SiloGRPCClient {
           };
 
     try {
-      const client = this._getClientForShard(options.shard);
-      await client.reportRefreshOutcome(
-        {
-          shard: options.shard,
-          taskId: options.taskId,
-          outcome,
-        },
-        this._rpcOptions(),
-      );
+      await this._withWrongShardRetryForShard(options.shard, async (client) => {
+        await client.reportRefreshOutcome(
+          {
+            shard: options.shard,
+            taskId: options.taskId,
+            tenantId: options.tenant,
+            outcome,
+          },
+          this._rpcOptions(),
+        );
+      });
     } catch (error) {
       throwMappedRpcError(error, {
         operation: "reportRefreshOutcome",
@@ -2035,6 +2093,7 @@ export class SiloGRPCClient {
    * @param workerId The worker ID that owns the task.
    * @param taskId   The task ID.
    * @param shard    The shard the task came from (from Task.shard).
+   * @param tenant   Optional tenant ID for shard routing validation (from Task.tenantId).
    * @returns HeartbeatResult indicating if the job was cancelled.
    * @throws TaskNotFoundError if the task (lease) doesn't exist.
    */
@@ -2042,22 +2101,25 @@ export class SiloGRPCClient {
     workerId: string,
     taskId: string,
     shard: string,
+    tenant?: string,
   ): Promise<HeartbeatResult> {
     try {
-      const client = this._getClientForShard(shard);
-      const call = client.heartbeat(
-        {
-          shard,
-          workerId,
-          taskId,
-        },
-        this._rpcOptions(),
-      );
-      const response = await call.response;
-      return {
-        cancelled: response.cancelled,
-        cancelledAtMs: response.cancelledAtMs,
-      };
+      return await this._withWrongShardRetryForShard(shard, async (client) => {
+        const call = client.heartbeat(
+          {
+            shard,
+            workerId,
+            taskId,
+            tenantId: tenant,
+          },
+          this._rpcOptions(),
+        );
+        const response = await call.response;
+        return {
+          cancelled: response.cancelled,
+          cancelledAtMs: response.cancelledAtMs,
+        };
+      });
     } catch (error) {
       throwMappedRpcError(error, { operation: "heartbeat", taskId });
     }

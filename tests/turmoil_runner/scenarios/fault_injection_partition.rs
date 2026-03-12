@@ -133,6 +133,7 @@ pub fn run() {
                                     .unwrap(),
                             )),
                         })),
+                        tenant_id: None,
                     }))
                     .await?;
                 tracing::trace!(job_id = %task.job_id, "complete");

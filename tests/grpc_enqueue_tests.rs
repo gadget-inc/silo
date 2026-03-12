@@ -64,6 +64,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
                         rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
                     )),
                 })),
+                tenant_id: None,
             })
             .await?;
 

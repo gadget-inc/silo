@@ -178,7 +178,11 @@ impl TenantSelector {
 const MAX_ROUTING_RETRIES: u32 = 3;
 
 /// Pre-serialized empty success payload, shared across all outcome reports.
-fn make_success_outcome_request(shard: String, task_id: String) -> ReportOutcomeRequest {
+fn make_success_outcome_request(
+    shard: String,
+    task_id: String,
+    tenant_id: Option<String>,
+) -> ReportOutcomeRequest {
     ReportOutcomeRequest {
         shard,
         task_id,
@@ -187,6 +191,7 @@ fn make_success_outcome_request(shard: String, task_id: String) -> ReportOutcome
                 rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
             )),
         })),
+        tenant_id,
     }
 }
 
@@ -234,14 +239,18 @@ async fn worker_loop(
 
                 for task in tasks {
                     let task_shard = task.shard.clone();
+                    let task_tenant = task.tenant_id.clone();
 
                     let mut report_client = match client.client_for_shard(&task_shard) {
                         Ok(c) => c,
                         Err(_) => silo_client.clone(),
                     };
 
-                    let outcome_request =
-                        make_success_outcome_request(task_shard.clone(), task.id.clone());
+                    let outcome_request = make_success_outcome_request(
+                        task_shard.clone(),
+                        task.id.clone(),
+                        task_tenant.clone(),
+                    );
 
                     match report_client.report_outcome(outcome_request).await {
                         Ok(_) => {
@@ -252,8 +261,11 @@ async fn worker_loop(
                             if client.handle_routing_error(&e, &task_shard).await.is_some() {
                                 // Retry once with updated routing
                                 if let Ok(mut retry_client) = client.client_for_shard(&task_shard) {
-                                    let retry_req =
-                                        make_success_outcome_request(task_shard, task.id.clone());
+                                    let retry_req = make_success_outcome_request(
+                                        task_shard,
+                                        task.id.clone(),
+                                        task_tenant,
+                                    );
                                     match retry_client.report_outcome(retry_req).await {
                                         Ok(_) => {
                                             completed_count.fetch_add(1, Ordering::Relaxed);

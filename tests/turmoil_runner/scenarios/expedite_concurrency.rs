@@ -351,6 +351,7 @@ pub fn run() {
                                     )),
                                 },
                             )),
+                            tenant_id: None,
                         }))
                         .await
                     {

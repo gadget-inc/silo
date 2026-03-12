@@ -468,6 +468,7 @@ async fn grpc_server_report_outcome_missing_outcome() -> anyhow::Result<()> {
                 shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 task_id: "fake-task".to_string(),
                 outcome: None, // Missing!
+                tenant_id: None,
             })
             .await;
 
@@ -504,6 +505,7 @@ async fn grpc_server_report_refresh_outcome_missing_outcome() -> anyhow::Result<
                 shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 task_id: "fake-refresh-task".to_string(),
                 outcome: None, // Missing!
+                tenant_id: None,
             })
             .await;
 
@@ -679,6 +681,7 @@ async fn grpc_server_get_node_info_tracks_lifecycle() -> anyhow::Result<()> {
                         rmp_serde::to_vec(&serde_json::json!({"result": "done"})).unwrap(),
                     )),
                 })),
+                tenant_id: None,
             })
             .await?;
 
@@ -822,6 +825,7 @@ async fn grpc_server_reset_shards_clears_fs_backend_data() -> anyhow::Result<()>
                         rmp_serde::to_vec(&serde_json::json!({"result": "done"})).unwrap(),
                     )),
                 })),
+                tenant_id: None,
             })
             .await?;
 
@@ -1546,6 +1550,272 @@ async fn grpc_force_release_shard_invalid_id_returns_error() -> anyhow::Result<(
             status.code(),
             tonic::Code::InvalidArgument,
             "invalid shard ID should return InvalidArgument"
+        );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// When tenancy is enabled, report_outcome/heartbeat/report_refresh_outcome must include tenant_id.
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_worker_rpcs_require_tenant_when_tenancy_enabled() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let mut cfg = AppConfig::load(None).unwrap();
+        cfg.tenancy.enabled = true;
+
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), cfg).await?;
+
+        // report_outcome without tenant_id should fail
+        let res = client
+            .report_outcome(ReportOutcomeRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                task_id: "fake-task".to_string(),
+                outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                    )),
+                })),
+                tenant_id: None,
+            })
+            .await;
+
+        match res {
+            Ok(_) => panic!("expected error for missing tenant_id on report_outcome"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::InvalidArgument);
+                assert!(
+                    status.message().contains("tenant_id"),
+                    "error should mention tenant_id: {}",
+                    status.message()
+                );
+            }
+        }
+
+        // heartbeat without tenant_id should fail
+        let res = client
+            .heartbeat(HeartbeatRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                worker_id: "test-worker".to_string(),
+                task_id: "fake-task".to_string(),
+                tenant_id: None,
+            })
+            .await;
+
+        match res {
+            Ok(_) => panic!("expected error for missing tenant_id on heartbeat"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::InvalidArgument);
+                assert!(
+                    status.message().contains("tenant_id"),
+                    "error should mention tenant_id: {}",
+                    status.message()
+                );
+            }
+        }
+
+        // report_refresh_outcome without tenant_id should fail
+        let res = client
+            .report_refresh_outcome(ReportRefreshOutcomeRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                task_id: "fake-task".to_string(),
+                outcome: Some(report_refresh_outcome_request::Outcome::Success(
+                    RefreshSuccess {
+                        new_max_concurrency: 10,
+                    },
+                )),
+                tenant_id: None,
+            })
+            .await;
+
+        match res {
+            Ok(_) => panic!("expected error for missing tenant_id on report_refresh_outcome"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::InvalidArgument);
+                assert!(
+                    status.message().contains("tenant_id"),
+                    "error should mention tenant_id: {}",
+                    status.message()
+                );
+            }
+        }
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// When tenancy is disabled, worker RPCs should work without tenant_id.
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_worker_rpcs_skip_tenant_validation_when_tenancy_disabled() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let mut cfg = AppConfig::load(None).unwrap();
+        cfg.tenancy.enabled = false;
+
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), cfg).await?;
+
+        // Enqueue a job and lease it so we have a real task
+        client
+            .enqueue(EnqueueRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                id: "job-no-tenant".to_string(),
+                priority: 5,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                    )),
+                }),
+                limits: vec![],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
+            })
+            .await?;
+
+        let lease_resp = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: Some(crate::grpc_integration_helpers::TEST_SHARD_ID.to_string()),
+                worker_id: "test-worker".to_string(),
+                max_tasks: 1,
+                task_group: "default".to_string(),
+            })
+            .await?
+            .into_inner();
+
+        assert_eq!(lease_resp.tasks.len(), 1);
+        let task = &lease_resp.tasks[0];
+
+        // heartbeat without tenant_id should succeed when tenancy is disabled
+        let hb = client
+            .heartbeat(HeartbeatRequest {
+                shard: task.shard.clone(),
+                worker_id: "test-worker".to_string(),
+                task_id: task.id.clone(),
+                tenant_id: None,
+            })
+            .await;
+        assert!(
+            hb.is_ok(),
+            "heartbeat should succeed without tenant_id when tenancy is disabled"
+        );
+
+        // report_outcome without tenant_id should succeed when tenancy is disabled
+        let res = client
+            .report_outcome(ReportOutcomeRequest {
+                shard: task.shard.clone(),
+                task_id: task.id.clone(),
+                outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                    )),
+                })),
+                tenant_id: None,
+            })
+            .await;
+        assert!(
+            res.is_ok(),
+            "report_outcome should succeed without tenant_id when tenancy is disabled"
+        );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// When tenancy is enabled, worker RPCs should accept valid tenant_id and succeed.
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_worker_rpcs_accept_valid_tenant_when_tenancy_enabled() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let mut cfg = AppConfig::load(None).unwrap();
+        cfg.tenancy.enabled = true;
+
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), cfg).await?;
+
+        let tenant = "test-tenant";
+
+        // Enqueue a job with tenant
+        client
+            .enqueue(EnqueueRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                id: "job-with-tenant".to_string(),
+                priority: 5,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                    )),
+                }),
+                limits: vec![],
+                tenant: Some(tenant.to_string()),
+                metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
+            })
+            .await?;
+
+        let lease_resp = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: Some(crate::grpc_integration_helpers::TEST_SHARD_ID.to_string()),
+                worker_id: "test-worker".to_string(),
+                max_tasks: 1,
+                task_group: "default".to_string(),
+            })
+            .await?
+            .into_inner();
+
+        assert_eq!(lease_resp.tasks.len(), 1);
+        let task = &lease_resp.tasks[0];
+        assert_eq!(task.tenant_id.as_deref(), Some(tenant));
+
+        // heartbeat with valid tenant_id should succeed
+        let hb = client
+            .heartbeat(HeartbeatRequest {
+                shard: task.shard.clone(),
+                worker_id: "test-worker".to_string(),
+                task_id: task.id.clone(),
+                tenant_id: Some(tenant.to_string()),
+            })
+            .await;
+        assert!(
+            hb.is_ok(),
+            "heartbeat should succeed with valid tenant_id: {:?}",
+            hb.err()
+        );
+
+        // report_outcome with valid tenant_id should succeed
+        let res = client
+            .report_outcome(ReportOutcomeRequest {
+                shard: task.shard.clone(),
+                task_id: task.id.clone(),
+                outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                    )),
+                })),
+                tenant_id: Some(tenant.to_string()),
+            })
+            .await;
+        assert!(
+            res.is_ok(),
+            "report_outcome should succeed with valid tenant_id: {:?}",
+            res.err()
         );
 
         shutdown_server(shutdown_tx, server).await?;

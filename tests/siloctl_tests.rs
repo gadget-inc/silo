@@ -670,6 +670,7 @@ async fn siloctl_job_get_with_attempts() -> anyhow::Result<()> {
                         rmp_serde::to_vec(&serde_json::json!({"result": "done"})).unwrap(),
                     )),
                 })),
+                tenant_id: None,
             })
             .await?;
 

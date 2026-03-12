@@ -72,6 +72,7 @@ async fn lease_task_grpc_basic() -> anyhow::Result<()> {
                         rmp_serde::to_vec(&serde_json::json!("leased success")).unwrap(),
                     )),
                 })),
+                tenant_id: None,
             })
             .await?;
 
@@ -202,6 +203,7 @@ async fn lease_task_grpc_already_running() -> anyhow::Result<()> {
                         rmp_serde::to_vec(&serde_json::json!("done")).unwrap(),
                     )),
                 })),
+                tenant_id: None,
             })
             .await?;
 

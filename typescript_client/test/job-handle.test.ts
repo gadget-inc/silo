@@ -138,6 +138,7 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
       await client.reportOutcome({
         shard: task!.shard,
         taskId: task!.id,
+        tenant: task!.tenantId,
         outcome: { type: "success", result: {} },
       });
     });
@@ -205,6 +206,7 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
       await client.reportOutcome({
         shard: task!.shard,
         taskId: task!.id,
+        tenant: task!.tenantId,
         outcome: { type: "success", result: {} },
       });
 
@@ -253,6 +255,7 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
       await client.reportOutcome({
         shard: task!.shard,
         taskId: task!.id,
+        tenant: task!.tenantId,
         outcome: { type: "success", result: resultData },
       });
 
@@ -294,6 +297,7 @@ describe.skipIf(!RUN_INTEGRATION)("JobHandle integration", () => {
       await client.reportOutcome({
         shard: task!.shard,
         taskId: task!.id,
+        tenant: task!.tenantId,
         outcome: {
           type: "failure",
           code: "TEST_ERROR",
