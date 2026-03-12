@@ -47,11 +47,13 @@ Leases represent tasks actively being processed by workers.
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `silo_task_leases_active` | Gauge | `shard`, `task_group` | Number of tasks currently leased to workers |
+| `silo_ready_to_start_latency_ms` | Histogram | `shard`, `task_group` | Time between when a task became ready and when it was first leased (in milliseconds) |
 
 **Key insights:**
 - This metric shows in-flight work at any given moment
 - Sudden drops may indicate worker crashes or network issues
 - Compare against worker count to understand utilization
+- `silo_ready_to_start_latency_ms` measures scheduling delay — high values indicate workers aren't polling fast enough or broker scan intervals are too long. Unlike `silo_job_wait_time_seconds` (which measures total time from enqueue), this metric isolates the time a task sat ready but unleased
 
 ### Broker Metrics
 

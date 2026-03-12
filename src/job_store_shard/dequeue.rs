@@ -11,7 +11,7 @@ use crate::job::{JobStatus, JobView};
 use crate::job_attempt::{AttemptStatus, JobAttempt, JobAttemptView};
 use crate::job_store_shard::helpers::{DbWriteBatcher, now_epoch_ms};
 use crate::job_store_shard::{DequeueResult, JobStoreShard, JobStoreShardError, LimitTaskParams};
-use crate::keys::{attempt_key, job_info_key, leased_task_key};
+use crate::keys::{attempt_key, job_info_key, leased_task_key, parse_task_key};
 use crate::shard_range::ShardRange;
 use crate::task::{DEFAULT_LEASE_MS, LeaseRecord, LeasedRefreshTask, LeasedTask, Task};
 use crate::task_broker::BrokerTask;
@@ -427,9 +427,13 @@ impl JobStoreShard {
                     .leased_tasks_for_dst
                     .push((tenant, job_id.to_string(), request_id));
 
-                // Record concurrency ticket metric
+                // Record concurrency ticket metric and ready-to-start latency
                 if let Some(ref m) = self.metrics {
                     m.record_concurrency_ticket_granted();
+                    if let Some(parsed) = parse_task_key(task_key) {
+                        let latency_ms = (now_ms - parsed.start_time_ms as i64).max(0) as f64;
+                        m.record_ready_to_start_latency_ms(self.name(), req_task_group, latency_ms);
+                    }
                 }
             }
             RequestTicketTaskOutcome::Requested => {
@@ -697,6 +701,12 @@ impl JobStoreShard {
             job_id.to_string(),
             task_id.to_string(),
         ));
+
+        // Record ready-to-start latency metric
+        if let (Some(m), Some(parsed)) = (&self.metrics, parse_task_key(task_key)) {
+            let latency_ms = (now_ms - parsed.start_time_ms as i64).max(0) as f64;
+            m.record_ready_to_start_latency_ms(self.name(), decoded.task_group(), latency_ms);
+        }
 
         Ok(())
     }
