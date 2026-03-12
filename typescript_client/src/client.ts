@@ -1262,6 +1262,7 @@ export class SiloGRPCClient {
           console.error("[SiloGRPCClient] Failed to refresh topology:", err);
         });
       }, refreshInterval);
+      this._topologyRefreshInterval.unref();
     }
   }
 
