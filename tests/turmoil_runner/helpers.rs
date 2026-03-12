@@ -268,11 +268,13 @@ pub async fn connect_to_server(
 
 /// Create SlateDB settings suitable for DST tests.
 ///
-/// Compaction is disabled because slatedb's compactor uses `spawn_blocking` and `block_on`
-/// which are incompatible with turmoil's single-threaded simulated runtime.
+/// Compaction and garbage collection are disabled because slatedb's compactor
+/// and GC use `spawn_blocking` and `block_on` which are incompatible with
+/// turmoil's single-threaded simulated runtime.
 pub fn dst_slatedb_settings() -> slatedb::config::Settings {
     slatedb::config::Settings {
         compactor_options: None,
+        garbage_collector_options: None,
         ..Default::default()
     }
 }

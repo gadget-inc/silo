@@ -4,10 +4,29 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
+/// Returns Silo's default SlateDB settings, which differ from SlateDB's own
+/// defaults by enabling garbage collection.
+fn silo_default_slatedb_settings() -> slatedb::config::Settings {
+    slatedb::config::Settings {
+        garbage_collector_options: Some(slatedb::config::GarbageCollectorOptions {
+            manifest_options: Some(slatedb::config::GarbageCollectorDirectoryOptions::default()),
+            wal_options: Some(slatedb::config::GarbageCollectorDirectoryOptions::default()),
+            compacted_options: Some(slatedb::config::GarbageCollectorDirectoryOptions::default()),
+            compactions_options: Some(slatedb::config::GarbageCollectorDirectoryOptions::default()),
+        }),
+        ..slatedb::config::Settings::default()
+    }
+}
+
+fn default_slatedb_settings() -> Option<slatedb::config::Settings> {
+    Some(silo_default_slatedb_settings())
+}
+
 /// Custom deserializer for slatedb::config::Settings that merges user-provided
-/// values with defaults. This is necessary because slatedb's Settings struct
-/// doesn't use #[serde(default)] on its fields, so serde requires all non-Option
-/// fields to be present when any field is specified.
+/// values with Silo's defaults (which enable garbage collection).
+/// This is necessary because slatedb's Settings struct doesn't use
+/// #[serde(default)] on its fields, so serde requires all non-Option fields
+/// to be present when any field is specified.
 fn deserialize_slatedb_settings<'de, D>(
     deserializer: D,
 ) -> Result<Option<slatedb::config::Settings>, D::Error>
@@ -17,25 +36,21 @@ where
     // Deserialize as an optional TOML table
     let user_config: Option<toml::Table> = Option::deserialize(deserializer)?;
 
-    match user_config {
-        None => Ok(None),
-        Some(user_table) => {
-            // Serialize defaults to TOML
-            let defaults = slatedb::config::Settings::default();
-            let default_str = toml::to_string(&defaults).map_err(serde::de::Error::custom)?;
-            let mut merged: toml::Table =
-                toml::from_str(&default_str).map_err(serde::de::Error::custom)?;
+    // Start from Silo's defaults (which enable GC) rather than SlateDB's defaults
+    let defaults = silo_default_slatedb_settings();
+    let default_str = toml::to_string(&defaults).map_err(serde::de::Error::custom)?;
+    let mut merged: toml::Table = toml::from_str(&default_str).map_err(serde::de::Error::custom)?;
 
-            // Deep merge user config into defaults
-            deep_merge_toml(&mut merged, user_table);
-
-            // Deserialize merged config back to Settings
-            let settings: slatedb::config::Settings =
-                merged.try_into().map_err(serde::de::Error::custom)?;
-
-            Ok(Some(settings))
-        }
+    // If user provided config, deep merge it into our defaults
+    if let Some(user_table) = user_config {
+        deep_merge_toml(&mut merged, user_table);
     }
+
+    // Deserialize merged config back to Settings
+    let settings: slatedb::config::Settings =
+        merged.try_into().map_err(serde::de::Error::custom)?;
+
+    Ok(Some(settings))
 }
 
 /// Recursively merge overlay table into base table. Values in overlay take precedence.
@@ -191,10 +206,14 @@ pub struct DatabaseTemplate {
     #[serde(default = "default_concurrency_reconcile_interval_ms")]
     pub concurrency_reconcile_interval_ms: u64,
     /// Optional SlateDB-specific settings for tuning database performance.
-    /// If not specified, SlateDB defaults are used. When partially specified,
-    /// unspecified fields use SlateDB defaults.
+    /// When partially specified, unspecified fields use Silo's defaults
+    /// (which enable garbage collection). When not specified at all, Silo's
+    /// defaults are used.
     /// See <https://docs.rs/slatedb/latest/slatedb/config/struct.Settings.html> for all options.
-    #[serde(default, deserialize_with = "deserialize_slatedb_settings")]
+    #[serde(
+        default = "default_slatedb_settings",
+        deserialize_with = "deserialize_slatedb_settings"
+    )]
     pub slatedb: Option<slatedb::config::Settings>,
 }
 
@@ -425,10 +444,14 @@ pub struct DatabaseConfig {
     #[serde(default = "default_apply_wal_on_close")]
     pub apply_wal_on_close: bool,
     /// Optional SlateDB-specific settings for tuning database performance.
-    /// If not specified, SlateDB defaults are used. When partially specified,
-    /// unspecified fields use SlateDB defaults.
+    /// When partially specified, unspecified fields use Silo's defaults
+    /// (which enable garbage collection). When not specified at all, Silo's
+    /// defaults are used.
     /// See <https://docs.rs/slatedb/latest/slatedb/config/struct.Settings.html> for all options.
-    #[serde(default, deserialize_with = "deserialize_slatedb_settings")]
+    #[serde(
+        default = "default_slatedb_settings",
+        deserialize_with = "deserialize_slatedb_settings"
+    )]
     pub slatedb: Option<slatedb::config::Settings>,
 }
 
@@ -544,7 +567,7 @@ impl AppConfig {
                 wal: None,
                 apply_wal_on_close: true,
                 concurrency_reconcile_interval_ms: default_concurrency_reconcile_interval_ms(),
-                slatedb: None,
+                slatedb: default_slatedb_settings(),
             },
         };
 

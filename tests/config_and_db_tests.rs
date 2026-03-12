@@ -551,8 +551,16 @@ path = "/tmp/silo-%shard%"
 
     let cfg: AppConfig = toml::from_str(toml_str).expect("parse TOML");
 
-    // slatedb should be None when not specified
-    assert!(cfg.database.slatedb.is_none());
+    // slatedb should use Silo's defaults (with GC enabled) when not specified
+    let slatedb = cfg
+        .database
+        .slatedb
+        .as_ref()
+        .expect("slatedb should have Silo defaults");
+    assert!(
+        slatedb.garbage_collector_options.is_some(),
+        "GC should be enabled by default"
+    );
     assert_eq!(
         cfg.database.concurrency_reconcile_interval_ms, 5000,
         "missing concurrency_reconcile_interval_ms should use default"

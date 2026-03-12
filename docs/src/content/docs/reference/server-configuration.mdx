@@ -208,6 +208,8 @@ Configure compaction behavior via `[database.slatedb.compactor_options]`:
 
 #### Garbage Collector Options
 
+Silo enables garbage collection by default (SlateDB's own default is to disable it). The GC cleans up old manifest files, WAL segments, compacted SSTs, and compaction state files.
+
 Configure garbage collection via `[database.slatedb.garbage_collector_options]`:
 
 ```toml
@@ -218,6 +220,14 @@ min_age = "86400s"
 [database.slatedb.garbage_collector_options.wal_options]
 interval = "60s"
 min_age = "60s"
+
+[database.slatedb.garbage_collector_options.compacted_options]
+interval = "300s"
+min_age = "86400s"
+
+[database.slatedb.garbage_collector_options.compactions_options]
+interval = "300s"
+min_age = "86400s"
 ```
 
 <Aside>
