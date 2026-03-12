@@ -747,7 +747,7 @@ export interface RefreshFloatingLimitTask {
     /**
      * @generated from protobuf field: optional string tenant_id = 9
      */
-    tenantId?: string; // Tenant ID if multi-tenancy is enabled.
+    tenantId?: string; // Tenant ID for routing. Required if multi-tenancy is enabled.
 }
 /**
  * Response containing tasks leased to a worker.
@@ -805,7 +805,7 @@ export interface ReportOutcomeRequest {
     /**
      * @generated from protobuf field: optional string tenant_id = 7
      */
-    tenantId?: string; // Tenant ID for shard routing validation. From Task.tenant_id.
+    tenantId?: string; // Tenant ID for shard routing. Required if multi-tenancy is enabled. Should come from Task.tenant_id.
 }
 /**
  * Error details for a failed task.
@@ -871,7 +871,7 @@ export interface ReportRefreshOutcomeRequest {
     /**
      * @generated from protobuf field: optional string tenant_id = 6
      */
-    tenantId?: string; // Tenant ID for shard routing validation. From RefreshTask.tenant_id.
+    tenantId?: string; // Tenant ID for shard routing. Required if multi-tenancy is enabled. Should come from RefreshTask.tenant_id.
 }
 /**
  * Successful floating limit refresh with the new computed value.
@@ -928,7 +928,7 @@ export interface HeartbeatRequest {
     /**
      * @generated from protobuf field: optional string tenant_id = 4
      */
-    tenantId?: string; // Tenant ID for shard routing validation. From Task.tenant_id.
+    tenantId?: string; // Tenant ID for shard routing. Required if multi-tenancy is enabled. Should come from Task.tenant_id.
 }
 /**
  * Response indicating if the lease was extended and if the job was cancelled.
