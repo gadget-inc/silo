@@ -243,6 +243,10 @@ fn leased_task_to_proto(lt: &crate::task::LeasedTask, shard_id: &str) -> Task {
 fn map_err(e: JobStoreShardError) -> Status {
     match e {
         JobStoreShardError::JobNotFound(_) => Status::not_found("job not found"),
+        JobStoreShardError::LeaseNotFound(_) => Status::not_found("lease not found"),
+        JobStoreShardError::LeaseOwnerMismatch { .. } => {
+            Status::failed_precondition("lease owner mismatch")
+        }
         JobStoreShardError::JobAlreadyCancelled(_) => {
             Status::failed_precondition("job is already cancelled")
         }
