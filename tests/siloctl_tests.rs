@@ -14,7 +14,7 @@ use grpc_integration_helpers::{
 use silo::pb::silo_client::SiloClient;
 use silo::pb::*;
 use silo::settings::AppConfig;
-use silo::siloctl::{self, GlobalOptions};
+use silo::siloctl::{self, BytesOutputFormat, GlobalOptions};
 
 // Global mutex to serialize profile tests - only one CPU profiler can run at a time system-wide
 static PROFILE_TEST_MUTEX: Mutex<()> = Mutex::new(());
@@ -1317,6 +1317,419 @@ async fn siloctl_unknown_shard_returns_clear_error() -> anyhow::Result<()> {
             "error should indicate shard not found in cluster: {}",
             err
         );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// Helper: enqueue a job, lease it, and report a successful outcome with result data.
+async fn enqueue_and_complete_job(
+    client: &mut SiloClient<tonic::transport::Channel>,
+    job_id: &str,
+    result_data: &serde_json::Value,
+) -> anyhow::Result<()> {
+    client
+        .enqueue(EnqueueRequest {
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+            id: job_id.to_string(),
+            priority: 50,
+            start_at_ms: 0,
+            retry_policy: None,
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                    rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                )),
+            }),
+            limits: vec![],
+            tenant: None,
+            metadata: std::collections::HashMap::new(),
+            task_group: "default".to_string(),
+        })
+        .await?;
+
+    let lease_resp = client
+        .lease_tasks(LeaseTasksRequest {
+            shard: Some(crate::grpc_integration_helpers::TEST_SHARD_ID.to_string()),
+            worker_id: "test-worker".to_string(),
+            max_tasks: 1,
+            task_group: "default".to_string(),
+        })
+        .await?
+        .into_inner();
+
+    let task = lease_resp
+        .tasks
+        .iter()
+        .find(|t| t.job_id == job_id)
+        .expect("should find leased task for job");
+
+    client
+        .report_outcome(ReportOutcomeRequest {
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+            task_id: task.id.clone(),
+            outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                    rmp_serde::to_vec(result_data).unwrap(),
+                )),
+            })),
+        })
+        .await?;
+
+    Ok(())
+}
+
+/// Helper: enqueue a job, lease it, and report a failed outcome with error data.
+async fn enqueue_and_fail_job(
+    client: &mut SiloClient<tonic::transport::Channel>,
+    job_id: &str,
+    error_code: &str,
+    error_data: &serde_json::Value,
+) -> anyhow::Result<()> {
+    client
+        .enqueue(EnqueueRequest {
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+            id: job_id.to_string(),
+            priority: 50,
+            start_at_ms: 0,
+            retry_policy: None,
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                    rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                )),
+            }),
+            limits: vec![],
+            tenant: None,
+            metadata: std::collections::HashMap::new(),
+            task_group: "default".to_string(),
+        })
+        .await?;
+
+    let lease_resp = client
+        .lease_tasks(LeaseTasksRequest {
+            shard: Some(crate::grpc_integration_helpers::TEST_SHARD_ID.to_string()),
+            worker_id: "test-worker".to_string(),
+            max_tasks: 1,
+            task_group: "default".to_string(),
+        })
+        .await?
+        .into_inner();
+
+    let task = lease_resp
+        .tasks
+        .iter()
+        .find(|t| t.job_id == job_id)
+        .expect("should find leased task for job");
+
+    client
+        .report_outcome(ReportOutcomeRequest {
+            shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+            task_id: task.id.clone(),
+            outcome: Some(report_outcome_request::Outcome::Failure(Failure {
+                code: error_code.to_string(),
+                data: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(error_data).unwrap(),
+                    )),
+                }),
+            })),
+        })
+        .await?;
+
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn siloctl_job_result_success_hex() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(30000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        let result_data = serde_json::json!({"answer": 42});
+        enqueue_and_complete_job(&mut client, "result-hex-job", &result_data).await?;
+
+        let opts = opts_for_addr(&addr);
+        let mut output = Vec::new();
+        siloctl::job_result(
+            &opts,
+            &mut output,
+            crate::grpc_integration_helpers::TEST_SHARD_ID,
+            "result-hex-job",
+            BytesOutputFormat::Hex,
+        )
+        .await?;
+        let stdout = String::from_utf8(output)?;
+
+        assert!(
+            stdout.contains("result-hex-job"),
+            "should contain job ID: {}",
+            stdout
+        );
+        assert!(
+            stdout.contains("succeeded"),
+            "should show succeeded status: {}",
+            stdout
+        );
+        // Verify it contains hex-encoded bytes
+        let expected_hex = hex::encode(rmp_serde::to_vec(&result_data).unwrap());
+        assert!(
+            stdout.contains(&expected_hex),
+            "should contain hex-encoded result bytes: {}",
+            stdout
+        );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn siloctl_job_result_success_msgpack_decode() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(30000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        let result_data = serde_json::json!({"message": "hello world", "count": 123});
+        enqueue_and_complete_job(&mut client, "result-msgpack-job", &result_data).await?;
+
+        // Test msgpack decode in human-readable mode
+        let opts = opts_for_addr(&addr);
+        let mut output = Vec::new();
+        siloctl::job_result(
+            &opts,
+            &mut output,
+            crate::grpc_integration_helpers::TEST_SHARD_ID,
+            "result-msgpack-job",
+            BytesOutputFormat::MsgpackJson,
+        )
+        .await?;
+        let stdout = String::from_utf8(output)?;
+
+        assert!(
+            stdout.contains("result-msgpack-job"),
+            "should contain job ID: {}",
+            stdout
+        );
+        assert!(
+            stdout.contains("hello world"),
+            "decoded msgpack should contain the original string value: {}",
+            stdout
+        );
+        assert!(
+            stdout.contains("123"),
+            "decoded msgpack should contain the original numeric value: {}",
+            stdout
+        );
+
+        // Test msgpack decode in JSON mode
+        let opts_json = opts_for_addr_json(&addr);
+        let mut json_output = Vec::new();
+        siloctl::job_result(
+            &opts_json,
+            &mut json_output,
+            crate::grpc_integration_helpers::TEST_SHARD_ID,
+            "result-msgpack-job",
+            BytesOutputFormat::MsgpackJson,
+        )
+        .await?;
+        let json_stdout = String::from_utf8(json_output)?;
+
+        let parsed: serde_json::Value = serde_json::from_str(&json_stdout)
+            .unwrap_or_else(|_| panic!("Failed to parse JSON output: {}", json_stdout));
+        assert_eq!(parsed["id"], "result-msgpack-job");
+        assert_eq!(parsed["status"], "succeeded");
+        // The result field should be a pretty-printed JSON string of the decoded msgpack
+        let result_str = parsed["result"]
+            .as_str()
+            .expect("result should be a string");
+        let decoded: serde_json::Value = serde_json::from_str(result_str)
+            .unwrap_or_else(|_| panic!("result should be valid JSON: {}", result_str));
+        assert_eq!(decoded["message"], "hello world");
+        assert_eq!(decoded["count"], 123);
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn siloctl_job_result_failure_msgpack_decode() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(30000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        let error_data = serde_json::json!({"reason": "timeout", "retry_after_ms": 5000});
+        enqueue_and_fail_job(&mut client, "result-fail-job", "TIMEOUT", &error_data).await?;
+
+        // Test msgpack decode of error data
+        let opts = opts_for_addr(&addr);
+        let mut output = Vec::new();
+        siloctl::job_result(
+            &opts,
+            &mut output,
+            crate::grpc_integration_helpers::TEST_SHARD_ID,
+            "result-fail-job",
+            BytesOutputFormat::MsgpackJson,
+        )
+        .await?;
+        let stdout = String::from_utf8(output)?;
+
+        assert!(
+            stdout.contains("result-fail-job"),
+            "should contain job ID: {}",
+            stdout
+        );
+        assert!(
+            stdout.contains("failed"),
+            "should show failed status: {}",
+            stdout
+        );
+        assert!(
+            stdout.contains("TIMEOUT"),
+            "should show error code: {}",
+            stdout
+        );
+        assert!(
+            stdout.contains("timeout"),
+            "decoded error data should contain reason: {}",
+            stdout
+        );
+        assert!(
+            stdout.contains("5000"),
+            "decoded error data should contain retry_after_ms: {}",
+            stdout
+        );
+
+        // Test JSON mode
+        let opts_json = opts_for_addr_json(&addr);
+        let mut json_output = Vec::new();
+        siloctl::job_result(
+            &opts_json,
+            &mut json_output,
+            crate::grpc_integration_helpers::TEST_SHARD_ID,
+            "result-fail-job",
+            BytesOutputFormat::MsgpackJson,
+        )
+        .await?;
+        let json_stdout = String::from_utf8(json_output)?;
+
+        let parsed: serde_json::Value = serde_json::from_str(&json_stdout)
+            .unwrap_or_else(|_| panic!("Failed to parse JSON output: {}", json_stdout));
+        assert_eq!(parsed["id"], "result-fail-job");
+        assert_eq!(parsed["status"], "failed");
+        assert_eq!(parsed["error_code"], "TIMEOUT");
+        let error_str = parsed["error_data"]
+            .as_str()
+            .expect("error_data should be a string");
+        let decoded: serde_json::Value = serde_json::from_str(error_str)
+            .unwrap_or_else(|_| panic!("error_data should be valid JSON: {}", error_str));
+        assert_eq!(decoded["reason"], "timeout");
+        assert_eq!(decoded["retry_after_ms"], 5000);
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn siloctl_job_result_base64() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(30000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        let result_data = serde_json::json!({"key": "value"});
+        enqueue_and_complete_job(&mut client, "result-b64-job", &result_data).await?;
+
+        let opts = opts_for_addr(&addr);
+        let mut output = Vec::new();
+        siloctl::job_result(
+            &opts,
+            &mut output,
+            crate::grpc_integration_helpers::TEST_SHARD_ID,
+            "result-b64-job",
+            BytesOutputFormat::Base64,
+        )
+        .await?;
+        let stdout = String::from_utf8(output)?;
+
+        use base64::Engine;
+        let expected_b64 = base64::engine::general_purpose::STANDARD
+            .encode(rmp_serde::to_vec(&result_data).unwrap());
+        assert!(
+            stdout.contains(&expected_b64),
+            "should contain base64-encoded result: {}",
+            stdout
+        );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn siloctl_job_result_not_terminal() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(30000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        // Enqueue a job but don't complete it — schedule in the future so it stays scheduled
+        let future_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            + 60000;
+
+        client
+            .enqueue(EnqueueRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                id: "result-nonterminal-job".to_string(),
+                priority: 50,
+                start_at_ms: future_ms,
+                retry_policy: None,
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                    )),
+                }),
+                limits: vec![],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
+            })
+            .await?;
+
+        let opts = opts_for_addr(&addr);
+        let mut output = Vec::new();
+        let result = siloctl::job_result(
+            &opts,
+            &mut output,
+            crate::grpc_integration_helpers::TEST_SHARD_ID,
+            "result-nonterminal-job",
+            BytesOutputFormat::Hex,
+        )
+        .await;
+
+        assert!(result.is_err(), "should fail for non-terminal job");
 
         shutdown_server(shutdown_tx, server).await?;
         Ok::<(), anyhow::Error>(())

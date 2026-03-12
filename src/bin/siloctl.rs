@@ -7,8 +7,8 @@ use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
-use silo::siloctl::{self, GlobalOptions};
+use clap::{Parser, Subcommand, ValueEnum};
+use silo::siloctl::{self, BytesOutputFormat, GlobalOptions};
 
 #[derive(Parser, Debug)]
 #[command(name = "siloctl")]
@@ -169,6 +169,16 @@ enum JobAction {
         #[arg(long)]
         attempts: bool,
     },
+    /// Get the result or error data of a completed job
+    Result {
+        /// Shard ID (UUID) where the job is stored
+        shard: String,
+        /// Job ID
+        id: String,
+        /// Output format for the result bytes
+        #[arg(long, short = 'f', default_value = "hex")]
+        format: OutputFormat,
+    },
     /// Cancel a job
     Cancel {
         /// Shard ID (UUID) where the job is stored
@@ -199,6 +209,26 @@ enum JobAction {
     },
 }
 
+#[derive(ValueEnum, Debug, Clone, Copy)]
+enum OutputFormat {
+    /// Hex-encoded bytes
+    Hex,
+    /// Base64-encoded bytes
+    Base64,
+    /// Decode msgpack and pretty-print as JSON
+    Msgpack,
+}
+
+impl OutputFormat {
+    fn to_bytes_output_format(self) -> BytesOutputFormat {
+        match self {
+            OutputFormat::Hex => BytesOutputFormat::Hex,
+            OutputFormat::Base64 => BytesOutputFormat::Base64,
+            OutputFormat::Msgpack => BytesOutputFormat::MsgpackJson,
+        }
+    }
+}
+
 async fn run(args: Args) -> anyhow::Result<()> {
     let opts = args.to_global_options();
     let mut stdout = io::stdout();
@@ -213,6 +243,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 id,
                 attempts,
             } => siloctl::job_get(&opts, &mut stdout, shard, id, *attempts).await,
+            JobAction::Result { shard, id, format } => {
+                siloctl::job_result(&opts, &mut stdout, shard, id, format.to_bytes_output_format())
+                    .await
+            }
             JobAction::Cancel { shard, id } => {
                 siloctl::job_cancel(&opts, &mut stdout, shard, id).await
             }
