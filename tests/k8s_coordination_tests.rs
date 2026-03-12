@@ -2593,6 +2593,106 @@ async fn k8s_graceful_shutdown_releases_shards_promptly() {
     h1.abort();
 }
 
+/// Regression test: verify that membership watcher notifications are not lost
+/// when the coordination loop is busy.
+///
+/// This test deliberately avoids using `wait_converged` on the remaining node
+/// after the peer shuts down. `wait_converged` calls `notify_one()` every 100ms
+/// which masks lost notifications from the watcher. By only polling `owned_shards()`,
+/// we verify the watcher's own notifications drive convergence.
+///
+/// Before the fix (notify_waiters → notify_one), the watcher used `notify_waiters()`
+/// which drops the notification when no task is awaiting `.notified()`. If the
+/// coordination loop was busy (e.g., processing a previous reconcile), the membership
+/// change notification was lost and the node would not converge until the safety
+/// reconcile timer fired (previously 30s).
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k8s_watcher_notification_drives_convergence_without_external_poke() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 32;
+    let short_ttl: i64 = 5;
+
+    // Start two nodes
+    let (c1, h1) = match K8sCoordinator::start(
+        make_coordinator_config(
+            &namespace,
+            &prefix,
+            "notify-1",
+            "http://127.0.0.1:7450",
+            num_shards,
+            short_ttl,
+        ),
+        make_test_factory("notify-1"),
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Skipping test: {}", e);
+            return;
+        }
+    };
+    let (c2, h2) = K8sCoordinator::start(
+        make_coordinator_config(
+            &namespace,
+            &prefix,
+            "notify-2",
+            "http://127.0.0.1:7451",
+            num_shards,
+            short_ttl,
+        ),
+        make_test_factory("notify-2"),
+    )
+    .await
+    .expect("c2");
+
+    // Use wait_converged to reach initial 2-node convergence
+    assert!(c1.wait_converged(Duration::from_secs(20)).await);
+    assert!(c2.wait_converged(Duration::from_secs(20)).await);
+
+    let all_shards: HashSet<ShardId> = c1
+        .get_shard_map()
+        .await
+        .unwrap()
+        .shard_ids()
+        .into_iter()
+        .collect();
+    let c1_initial: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    let c2_initial: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
+    assert!(!c1_initial.is_empty(), "c1 should own some shards");
+    assert!(!c2_initial.is_empty(), "c2 should own some shards");
+
+    // Graceful shutdown of c2
+    c2.shutdown().await.unwrap();
+    h2.abort();
+
+    // DO NOT use wait_converged on c1 — it would poke the coordination loop via
+    // notify_one(), masking any lost watcher notifications.
+    // Instead, just poll owned_shards() and wait for c1 to acquire all shards.
+    let converged = wait_until(Duration::from_secs(15), || {
+        let c1_ref = &c1;
+        let all_ref = &all_shards;
+        async move {
+            let owned: HashSet<ShardId> = c1_ref.owned_shards().await.into_iter().collect();
+            owned == *all_ref
+        }
+    })
+    .await;
+
+    assert!(
+        converged,
+        "c1 should converge to all shards without wait_converged poking it. \
+         owned: {:?}, expected: {:?}",
+        c1.owned_shards().await,
+        all_shards
+    );
+
+    // Cleanup
+    c1.shutdown().await.unwrap();
+    h1.abort();
+}
+
 /// Test that request_split creates a split record in k8s.
 #[silo::test(flavor = "multi_thread", worker_threads = 2)]
 async fn k8s_request_split_creates_split_record() {
