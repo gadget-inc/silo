@@ -100,6 +100,7 @@ async fn grpc_expedite_future_scheduled_job() -> anyhow::Result<()> {
                         rmp_serde::to_vec(&serde_json::json!("expedited success")).unwrap(),
                     )),
                 })),
+                tenant_id: None,
             })
             .await?;
 
@@ -241,6 +242,7 @@ async fn grpc_expedite_running_job_fails() -> anyhow::Result<()> {
                         rmp_serde::to_vec(&serde_json::json!("done")).unwrap(),
                     )),
                 })),
+                tenant_id: None,
             })
             .await?;
 

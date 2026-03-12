@@ -278,7 +278,7 @@ message RefreshFloatingLimitTask {
   int64 lease_ms = 6;                  // How long the lease lasts. Heartbeat before this expires.
   string shard = 7;                    // Shard ID (UUID) this task came from (needed for reporting outcome).
   string task_group = 8;               // Task group this refresh task belongs to.
-  optional string tenant_id = 9;       // Tenant ID if multi-tenancy is enabled.
+  optional string tenant_id = 9;       // Tenant ID for routing. Required if multi-tenancy is enabled.
 }
 
 // Response containing tasks leased to a worker.
@@ -288,7 +288,6 @@ message LeaseTasksResponse {
 }
 
 // Request to report the outcome of a completed task.
-// Note: tenant is determined from the task lease, not from the request.
 message ReportOutcomeRequest {
   string shard = 1;          // Shard ID (UUID) the task came from.
   string task_id = 2;        // The task's unique ID.
@@ -297,6 +296,7 @@ message ReportOutcomeRequest {
     Failure failure = 4;        // Job failed. Contains error details.
     Cancelled cancelled = 6;    // Worker acknowledges job was cancelled.
   }
+  optional string tenant_id = 7;  // Tenant ID for shard routing. Required if multi-tenancy is enabled. Should come from Task.tenant_id.
 }
 
 // Error details for a failed task.
@@ -312,7 +312,6 @@ message Cancelled {}
 message ReportOutcomeResponse {}
 
 // Request to report the outcome of a floating limit refresh task.
-// Note: tenant is determined from the task lease, not from the request.
 message ReportRefreshOutcomeRequest {
   string shard = 1;          // Shard ID (UUID) the task came from.
   string task_id = 2;        // The task's unique ID.
@@ -320,6 +319,7 @@ message ReportRefreshOutcomeRequest {
     RefreshSuccess success = 4; // Refresh succeeded with new max concurrency.
     RefreshFailure failure = 5; // Refresh failed.
   }
+  optional string tenant_id = 6;  // Tenant ID for shard routing. Required if multi-tenancy is enabled. Should come from RefreshTask.tenant_id.
 }
 
 // Successful floating limit refresh with the new computed value.
@@ -338,11 +338,11 @@ message ReportRefreshOutcomeResponse {}
 
 // Request to extend a task lease and check for cancellation.
 // Workers must heartbeat before lease_ms expires to keep the task.
-// Note: tenant is determined from the task lease, not from the request.
 message HeartbeatRequest {
   string shard = 1;          // Shard ID (UUID) the task came from.
   string worker_id = 2;      // Worker ID that holds the lease.
   string task_id = 3;        // The task's unique ID.
+  optional string tenant_id = 4;  // Tenant ID for shard routing. Required if multi-tenancy is enabled. Should come from Task.tenant_id.
 }
 
 // Response indicating if the lease was extended and if the job was cancelled.

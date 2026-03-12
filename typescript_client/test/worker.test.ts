@@ -32,6 +32,7 @@ function createTask(
   id: string,
   jobId: string,
   shard: string = "00000000-0000-0000-0000-000000000001",
+  tenantId?: string,
 ): Task {
   return {
     id,
@@ -51,6 +52,7 @@ function createTask(
     isLastAttempt: false,
     metadata: {},
     limits: [],
+    tenantId,
   };
 }
 
@@ -259,7 +261,59 @@ describe("SiloWorker", () => {
         taskId: "task-1",
         outcome: { type: "success", result: { processed: true } },
         shard: "00000000-0000-0000-0000-000000000001",
+        tenant: undefined,
       });
+    });
+
+    it("passes tenant_id through to reportOutcome and heartbeat for multitenant tasks", async () => {
+      const task = createTask(
+        "task-mt",
+        "job-mt",
+        "00000000-0000-0000-0000-000000000001",
+        "tenant-abc",
+      );
+      const reportOutcome = vi.fn().mockResolvedValue(undefined);
+      const heartbeat = vi.fn().mockResolvedValue({ cancelled: false });
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
+
+      // Handler that takes long enough for at least one heartbeat to fire
+      const handler: TaskHandler = vi.fn().mockImplementation(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        return { type: "success", result: { result: "ok" } };
+      });
+
+      const client = createMockClient({ leaseTasks, reportOutcome, heartbeat });
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler,
+        heartbeatIntervalMs: 50,
+        pollIntervalMs: 10,
+      });
+
+      worker.start();
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      await worker.stop();
+
+      // reportOutcome should include the tenant from the task
+      expect(reportOutcome).toHaveBeenCalledWith({
+        taskId: "task-mt",
+        outcome: { type: "success", result: { result: "ok" } },
+        shard: "00000000-0000-0000-0000-000000000001",
+        tenant: "tenant-abc",
+      });
+
+      // heartbeat should include the tenant from the task
+      expect(heartbeat).toHaveBeenCalledWith(
+        "test-worker",
+        "task-mt",
+        "00000000-0000-0000-0000-000000000001",
+        "tenant-abc",
+      );
     });
 
     it("passes limits to handler in task context", async () => {
@@ -561,11 +615,12 @@ describe("SiloWorker", () => {
       await worker.stop();
 
       // Should have sent multiple heartbeats
-      // heartbeat(workerId, taskId, shard)
+      // heartbeat(workerId, taskId, shard, tenant)
       expect(heartbeat).toHaveBeenCalledWith(
         "test-worker",
         "task-hb",
         "00000000-0000-0000-0000-000000000001",
+        undefined,
       );
       expect(heartbeat.mock.calls.length).toBeGreaterThanOrEqual(2);
     });

@@ -524,7 +524,7 @@ export class SiloWorker<
 
     // Start heartbeat for this refresh task (no TaskExecution needed, refresh tasks can't be cancelled)
     const heartbeatInterval = setInterval(() => {
-      this._sendHeartbeat(task.id, shard).catch((error) => {
+      this._sendHeartbeat(task.id, shard, task.tenant).catch((error) => {
         this._onError(error instanceof Error ? error : new Error(String(error)), {
           taskId: task.id,
         });
@@ -581,6 +581,7 @@ export class SiloWorker<
       await this._client.reportOutcome({
         taskId: execution.task.id,
         shard: execution.task.shard,
+        tenant: execution.task.tenantId,
         outcome: { type: "cancelled" },
       });
       return;
@@ -590,6 +591,7 @@ export class SiloWorker<
     await this._client.reportOutcome({
       taskId: execution.task.id,
       shard: execution.task.shard,
+      tenant: execution.task.tenantId,
       outcome,
     });
   }
@@ -627,6 +629,7 @@ export class SiloWorker<
     await this._client.reportRefreshOutcome({
       taskId: task.id,
       shard,
+      tenant: task.tenant,
       outcome,
     });
   }
@@ -644,6 +647,7 @@ export class SiloWorker<
       this._workerId,
       execution.task.id,
       execution.task.shard,
+      execution.task.tenantId,
     );
 
     // If the server reports cancellation, mark the execution as cancelled
@@ -655,8 +659,8 @@ export class SiloWorker<
   /**
    * Send a heartbeat for a task (for refresh tasks that don't need TaskExecution).
    */
-  private async _sendHeartbeat(taskId: string, shard: string): Promise<void> {
-    await this._client.heartbeat(this._workerId, taskId, shard);
+  private async _sendHeartbeat(taskId: string, shard: string, tenant?: string): Promise<void> {
+    await this._client.heartbeat(this._workerId, taskId, shard, tenant);
   }
 
   /**

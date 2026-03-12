@@ -727,6 +727,29 @@ impl SiloService {
 
         Ok(())
     }
+
+    /// Validate the tenant_id field on worker RPCs (reportOutcome, heartbeat, reportRefreshOutcome).
+    ///
+    /// When tenancy is enabled, the client MUST send tenant_id so the server can verify
+    /// the request is routed to the correct shard. When tenancy is disabled, tenant_id
+    /// is ignored (workers don't have meaningful tenant routing).
+    async fn validate_worker_tenant(
+        &self,
+        shard_id: &crate::shard_range::ShardId,
+        tenant_id: Option<&str>,
+    ) -> Result<(), Status> {
+        if !self.cfg.tenancy.enabled {
+            return Ok(());
+        }
+
+        let tenant = tenant_id.and_then(|t| if t.is_empty() { None } else { Some(t) });
+        match tenant {
+            Some(t) => self.validate_tenant_in_shard_range(shard_id, t).await,
+            None => Err(Status::invalid_argument(
+                "tenant_id is required for worker operations when tenancy is enabled",
+            )),
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -1226,6 +1249,8 @@ impl Silo for SiloService {
         let shard_str = r.shard.to_string();
         let shard_id = Self::parse_shard_id(&r.shard)?;
         let shard = self.shard_with_redirect(&shard_id).await?;
+        self.validate_worker_tenant(&shard_id, r.tenant_id.as_deref())
+            .await?;
         let (outcome, status_str) = match r
             .outcome
             .ok_or_else(|| Status::invalid_argument("missing outcome"))?
@@ -1277,7 +1302,8 @@ impl Silo for SiloService {
         let r = req.into_inner();
         let shard_id = Self::parse_shard_id(&r.shard)?;
         let shard = self.shard_with_redirect(&shard_id).await?;
-        // Tenant is extracted from the lease on the server side, not from the request
+        self.validate_worker_tenant(&shard_id, r.tenant_id.as_deref())
+            .await?;
         let outcome = r
             .outcome
             .ok_or_else(|| Status::invalid_argument("missing outcome"))?;
@@ -1306,7 +1332,8 @@ impl Silo for SiloService {
         let r = req.into_inner();
         let shard_id = Self::parse_shard_id(&r.shard)?;
         let shard = self.shard_with_redirect(&shard_id).await?;
-        // Tenant is extracted from the lease on the server side, not from the request
+        self.validate_worker_tenant(&shard_id, r.tenant_id.as_deref())
+            .await?;
         let result = shard
             .heartbeat_task(&r.worker_id, &r.task_id)
             .await

@@ -213,6 +213,7 @@ pub fn run() {
                                             data: None,
                                         },
                                     )),
+                                    tenant_id: None,
                                 }))
                                 .await?;
 
@@ -256,6 +257,7 @@ pub fn run() {
                                             )),
                                         },
                                     )),
+                                    tenant_id: None,
                                 }))
                                 .await?;
 
@@ -292,6 +294,7 @@ pub fn run() {
                                         )),
                                     },
                                 )),
+                                tenant_id: None,
                             }))
                             .await?;
 

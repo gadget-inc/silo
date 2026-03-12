@@ -390,6 +390,7 @@ pub fn run() {
                                     shard: TEST_SHARD_ID.to_string(),
                                     task_id: task.id.clone(),
                                     outcome: Some(outcome),
+                                    tenant_id: None,
                                 }))
                                 .await
                             {
@@ -460,6 +461,7 @@ pub fn run() {
                             outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
                                 encoding: Some(serialized_bytes::Encoding::Msgpack(rmp_serde::to_vec(&serde_json::json!("done")).unwrap())),
                             })),
+                            tenant_id: None,
                         }))
                         .await
                     {

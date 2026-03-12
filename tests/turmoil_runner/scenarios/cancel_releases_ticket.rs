@@ -247,6 +247,7 @@ pub fn run() {
                             shard: TEST_SHARD_ID.to_string(),
                             worker_id: "worker-1".into(),
                             task_id: task_id.clone(),
+                            tenant_id: None,
                         }))
                         .await;
 
@@ -273,6 +274,7 @@ pub fn run() {
                                         outcome: Some(report_outcome_request::Outcome::Cancelled(
                                             silo::pb::Cancelled {},
                                         )),
+                                        tenant_id: None,
                                     }))
                                     .await
                                 {
@@ -324,6 +326,7 @@ pub fn run() {
                                         )),
                                     },
                                 )),
+                                tenant_id: None,
                             }))
                             .await
                         {

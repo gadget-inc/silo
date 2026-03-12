@@ -86,6 +86,7 @@ async fn grpc_get_job_includes_status() -> anyhow::Result<()> {
                         rmp_serde::to_vec(&serde_json::json!({"result": "done"})).unwrap(),
                     )),
                 })),
+                tenant_id: None,
             })
             .await?;
 
@@ -261,6 +262,7 @@ async fn grpc_get_job_result_success() -> anyhow::Result<()> {
                 outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
                     encoding: Some(serialized_bytes::Encoding::Msgpack(result_data.clone())),
                 })),
+                tenant_id: None,
             })
             .await?;
 
@@ -355,6 +357,7 @@ async fn grpc_get_job_result_failure() -> anyhow::Result<()> {
                         encoding: Some(serialized_bytes::Encoding::Msgpack(error_data.clone())),
                     }),
                 })),
+                tenant_id: None,
             })
             .await?;
 
@@ -515,6 +518,7 @@ async fn grpc_get_job_result_cancelled_while_running() -> anyhow::Result<()> {
                 shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 task_id: task.id.clone(),
                 outcome: Some(report_outcome_request::Outcome::Cancelled(Cancelled {})),
+                tenant_id: None,
             })
             .await?;
 
@@ -734,6 +738,7 @@ async fn grpc_get_job_next_attempt_starts_after() -> anyhow::Result<()> {
                         rmp_serde::to_vec(&serde_json::json!({"result": "done"})).unwrap(),
                     )),
                 })),
+                tenant_id: None,
             })
             .await?;
 
@@ -822,6 +827,7 @@ async fn grpc_get_job_next_attempt_after_retry() -> anyhow::Result<()> {
                         encoding: Some(serialized_bytes::Encoding::Msgpack(b"{}".to_vec())),
                     }),
                 })),
+                tenant_id: None,
             })
             .await?;
 
@@ -1246,6 +1252,7 @@ async fn grpc_get_job_result_field_without_attempts() -> anyhow::Result<()> {
                 outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
                     encoding: Some(serialized_bytes::Encoding::Msgpack(result_data.clone())),
                 })),
+                tenant_id: None,
             })
             .await?;
 
@@ -1324,6 +1331,7 @@ async fn grpc_get_job_result_field_with_attempts() -> anyhow::Result<()> {
                 outcome: Some(report_outcome_request::Outcome::Success(SerializedBytes {
                     encoding: Some(serialized_bytes::Encoding::Msgpack(result_data.clone())),
                 })),
+                tenant_id: None,
             })
             .await?;
 
@@ -1420,6 +1428,7 @@ async fn grpc_get_job_result_field_none_for_failed() -> anyhow::Result<()> {
                         )),
                     }),
                 })),
+                tenant_id: None,
             })
             .await?;
 
