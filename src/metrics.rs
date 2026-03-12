@@ -45,6 +45,12 @@ const WAIT_TIME_BUCKETS: &[f64] = &[
     0.001, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0, 600.0, 1800.0, 3600.0,
 ];
 
+/// Histogram buckets for ready-to-start latency (in milliseconds)
+const READY_TO_START_LATENCY_MS_BUCKETS: &[f64] = &[
+    1.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 30000.0, 60000.0, 300000.0, 600000.0,
+    1800000.0, 3600000.0,
+];
+
 /// Silo metrics handle containing all metric instruments.
 #[derive(Clone)]
 pub struct Metrics {
@@ -70,6 +76,7 @@ pub struct Metrics {
 
     // Lease metrics
     task_leases_active: GaugeVec,
+    ready_to_start_latency_ms: HistogramVec,
 
     // Concurrency metrics
     concurrency_tickets_granted: Counter,
@@ -196,6 +203,13 @@ impl Metrics {
         self.task_leases_active
             .with_label_values(&[shard, task_group])
             .dec();
+    }
+
+    /// Record the latency between when a task became ready and when it was first leased, in milliseconds.
+    pub fn record_ready_to_start_latency_ms(&self, shard: &str, task_group: &str, latency_ms: f64) {
+        self.ready_to_start_latency_ms
+            .with_label_values(&[shard, task_group])
+            .observe(latency_ms);
     }
 
     /// Record a concurrency ticket being granted.
@@ -437,6 +451,18 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let ready_to_start_latency_ms = register(
+        &registry,
+        HistogramVec::new(
+            HistogramOpts::new(
+                "silo_ready_to_start_latency_ms",
+                "Latency between when a task became ready and when it was first leased (in milliseconds)",
+            )
+            .buckets(READY_TO_START_LATENCY_MS_BUCKETS.to_vec()),
+            &["shard", "task_group"],
+        )?,
+    );
+
     // Concurrency metrics
     let concurrency_tickets_granted = register(
         &registry,
@@ -617,6 +643,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         broker_inflight_size,
         broker_scan_duration,
         task_leases_active,
+        ready_to_start_latency_ms,
         concurrency_tickets_granted,
         slatedb_get_requests,
         slatedb_scan_requests,
