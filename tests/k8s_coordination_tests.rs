@@ -2606,6 +2606,9 @@ async fn k8s_graceful_shutdown_releases_shards_promptly() {
 /// coordination loop was busy (e.g., processing a previous reconcile), the membership
 /// change notification was lost and the node would not converge until the safety
 /// reconcile timer fired (previously 30s).
+///
+/// The timeout here (4s) is deliberately shorter than the safety reconcile interval (5s)
+/// so this test can only pass if the watcher notification actually drives convergence.
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
 async fn k8s_watcher_notification_drives_convergence_without_external_poke() {
     let prefix = unique_prefix();
@@ -2670,7 +2673,9 @@ async fn k8s_watcher_notification_drives_convergence_without_external_poke() {
     // DO NOT use wait_converged on c1 — it would poke the coordination loop via
     // notify_one(), masking any lost watcher notifications.
     // Instead, just poll owned_shards() and wait for c1 to acquire all shards.
-    let converged = wait_until(Duration::from_secs(15), || {
+    // Use a timeout shorter than the 5s safety reconcile interval so this test
+    // can only pass via watcher-driven notifications, not the safety timer.
+    let converged = wait_until(Duration::from_secs(4), || {
         let c1_ref = &c1;
         let all_ref = &all_shards;
         async move {
