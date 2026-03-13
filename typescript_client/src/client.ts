@@ -59,7 +59,9 @@ export class JobNotTerminalError extends Error {
   public readonly currentStatus?: JobStatus;
 
   constructor(jobId: string, tenant?: string, currentStatus?: JobStatus) {
-    const statusMsg = currentStatus ? ` (current status: ${currentStatus})` : "";
+    const statusMsg = currentStatus
+      ? ` (current status: ${currentStatus})`
+      : "";
     const tenantMsg = tenant ? ` in tenant "${tenant}"` : "";
     super(`Job "${jobId}"${tenantMsg} is not in a terminal state${statusMsg}`);
     this.name = "JobNotTerminalError";
@@ -274,7 +276,9 @@ export function initHasher(): Promise<void> {
  */
 export function hashTenant(tenantId: string): string {
   if (!_h64) {
-    throw new Error("XXH64 hasher not initialized. Call and await initHasher() first.");
+    throw new Error(
+      "XXH64 hasher not initialized. Call and await initHasher() first.",
+    );
   }
   return _h64(tenantId).toString(16).padStart(16, "0");
 }
@@ -349,7 +353,13 @@ export interface QueryResult<Row = Record<string, unknown>> {
 }
 
 /** Supported bind parameter value types for SQL query placeholders (`$1`, `$2`, ...). */
-export type QueryBindParameter = string | number | bigint | boolean | Uint8Array | null;
+export type QueryBindParameter =
+  | string
+  | number
+  | bigint
+  | boolean
+  | Uint8Array
+  | null;
 
 /** gRPC metadata key for shard owner address on redirect */
 const SHARD_OWNER_ADDR_METADATA_KEY = "x-silo-shard-owner-addr";
@@ -359,18 +369,18 @@ const SHARD_OWNER_ADDR_METADATA_KEY = "x-silo-shard-owner-addr";
  */
 export interface ShardRoutingConfig {
   /**
-   * Maximum number of retries when receiving a "wrong shard" error.
-   * This can happen during cluster rebalancing.
+   * Maximum number of retries when a request fails due to a wrong shard
+   * routing or a connectivity error (UNAVAILABLE / DEADLINE_EXCEEDED).
    * @default 5
    */
-  maxWrongShardRetries?: number;
+  maxRetries?: number;
 
   /**
-   * Initial delay in ms before retrying after a wrong shard error.
-   * Uses exponential backoff.
+   * Initial delay in ms before retrying a failed request.
+   * Uses exponential backoff capped at 5 seconds.
    * @default 100
    */
-  wrongShardRetryDelayMs?: number;
+  retryDelayMs?: number;
 
   /**
    * How often to refresh the cluster topology (in ms).
@@ -378,6 +388,14 @@ export interface ShardRoutingConfig {
    * @default 30000
    */
   topologyRefreshIntervalMs?: number;
+
+  /**
+   * Maximum time in ms to wait for a single topology refresh attempt
+   * (i.e. one GetClusterInfo RPC per server). If the attempt exceeds
+   * this timeout, the client moves on to the next server.
+   * @default 10000
+   */
+  topologyRefreshTimeoutMs?: number;
 }
 
 /**
@@ -510,7 +528,10 @@ export interface FloatingConcurrencyLimitConfig {
 }
 
 /** A limit that can be a concurrency limit, rate limit, or floating concurrency limit */
-export type JobLimit = ConcurrencyLimitConfig | RateLimitConfig | FloatingConcurrencyLimitConfig;
+export type JobLimit =
+  | ConcurrencyLimitConfig
+  | RateLimitConfig
+  | FloatingConcurrencyLimitConfig;
 
 /** Job details returned from getJob */
 export interface Job<Payload = unknown, Result = unknown> {
@@ -697,7 +718,9 @@ function toProtoQueryParameter(value: QueryBindParameter): QueryParameter {
   throw new Error(`unsupported query bind parameter type: ${typeof value}`);
 }
 
-function toProtoQueryParameters(parameters?: QueryBindParameter[]): QueryParameter[] {
+function toProtoQueryParameters(
+  parameters?: QueryBindParameter[],
+): QueryParameter[] {
   if (!parameters || parameters.length === 0) {
     return [];
   }
@@ -722,7 +745,8 @@ function fromProtoLimit(limit: Limit): JobLimit | undefined {
       key: fl.key,
       defaultMaxConcurrency: fl.defaultMaxConcurrency,
       refreshIntervalMs: fl.refreshIntervalMs,
-      metadata: Object.keys(fl.metadata).length > 0 ? { ...fl.metadata } : undefined,
+      metadata:
+        Object.keys(fl.metadata).length > 0 ? { ...fl.metadata } : undefined,
     };
   } else if (limit.limit.oneofKind === "rateLimit") {
     const rl = limit.limit.rateLimit;
@@ -824,7 +848,10 @@ export interface CancelledOutcome {
   type: "cancelled";
 }
 
-export type TaskOutcome<Result> = SuccessOutcome<Result> | FailureOutcome | CancelledOutcome;
+export type TaskOutcome<Result> =
+  | SuccessOutcome<Result>
+  | FailureOutcome
+  | CancelledOutcome;
 
 /** Options for reporting task outcome */
 export interface ReportOutcomeOptions<Result = unknown> {
@@ -919,7 +946,21 @@ export interface LeaseTasksResult {
 function isWrongShardError(error: unknown): boolean {
   if (error instanceof RpcError) {
     // gRPC NOT_FOUND status with "shard not found" message
-    return error.code === "NOT_FOUND" && error.message.includes("shard not found");
+    return (
+      error.code === "NOT_FOUND" && error.message.includes("shard not found")
+    );
+  }
+  return false;
+}
+
+/**
+ * Check if an error indicates a connectivity problem that may be resolved
+ * by refreshing topology and retrying on a different server.
+ * @internal
+ */
+function isConnectivityError(error: unknown): boolean {
+  if (error instanceof RpcError) {
+    return error.code === "UNAVAILABLE" || error.code === "DEADLINE_EXCEEDED";
   }
   return false;
 }
@@ -964,7 +1005,11 @@ function mapRpcError(error: unknown, context: RpcErrorContext): Error {
       return new SiloNotFoundError(error.message);
     case "ALREADY_EXISTS":
       if (context.jobId) {
-        return new JobAlreadyExistsError(context.jobId, context.tenant, error.message);
+        return new JobAlreadyExistsError(
+          context.jobId,
+          context.tenant,
+          error.message,
+        );
       }
       return new SiloAlreadyExistsError(error.message);
     case "INVALID_ARGUMENT":
@@ -1102,10 +1147,13 @@ export class SiloGRPCClient {
   private readonly _authInterceptor: RpcInterceptor | null;
 
   /** @internal */
-  private readonly _maxWrongShardRetries: number;
+  private readonly _maxRetries: number;
 
   /** @internal */
-  private readonly _wrongShardRetryDelayMs: number;
+  private readonly _retryDelayMs: number;
+
+  /** @internal */
+  private readonly _topologyRefreshTimeoutMs: number;
 
   /** @internal Shard ID (string UUID) → server address */
   private _shardToServer: Map<string, string> = new Map();
@@ -1120,7 +1168,8 @@ export class SiloGRPCClient {
   private _pendingTopologyRefresh: Promise<void> | null = null;
 
   /** @internal */
-  private _topologyRefreshInterval: ReturnType<typeof setInterval> | null = null;
+  private _topologyRefreshInterval: ReturnType<typeof setInterval> | null =
+    null;
   /** Counter for round-robin server selection */
   private _anyClientCounter: number = 0;
 
@@ -1205,7 +1254,12 @@ export class SiloGRPCClient {
       this._authInterceptor = null;
     }
 
-    // Default gRPC service config with retry policy for transient failures
+    // Default gRPC service config with retry policy for transient failures.
+    // Only RESOURCE_EXHAUSTED is retried at the gRPC level (server-side
+    // backpressure on a live connection). UNAVAILABLE is NOT retried here
+    // because our application-level retry (_withShardRetry) handles it with
+    // topology refresh, allowing re-routing to a different server instead of
+    // repeatedly hitting the same dead connection.
     const defaultServiceConfig = {
       methodConfig: [
         {
@@ -1215,7 +1269,7 @@ export class SiloGRPCClient {
             initialBackoff: "0.1s",
             maxBackoff: "5s",
             backoffMultiplier: 2,
-            retryableStatusCodes: ["UNAVAILABLE", "RESOURCE_EXHAUSTED"],
+            retryableStatusCodes: ["RESOURCE_EXHAUSTED"],
           },
         },
       ],
@@ -1240,8 +1294,10 @@ export class SiloGRPCClient {
 
     // Shard routing configuration
 
-    this._maxWrongShardRetries = options.shardRouting?.maxWrongShardRetries ?? 5;
-    this._wrongShardRetryDelayMs = options.shardRouting?.wrongShardRetryDelayMs ?? 100;
+    this._maxRetries = options.shardRouting?.maxRetries ?? 5;
+    this._retryDelayMs = options.shardRouting?.retryDelayMs ?? 100;
+    this._topologyRefreshTimeoutMs =
+      options.shardRouting?.topologyRefreshTimeoutMs ?? 10_000;
 
     // Parse initial servers
     this._initialServers = this._parseServers(options.servers);
@@ -1255,7 +1311,8 @@ export class SiloGRPCClient {
     }
 
     // Start topology refresh if configured
-    const refreshInterval = options.shardRouting?.topologyRefreshIntervalMs ?? 30000;
+    const refreshInterval =
+      options.shardRouting?.topologyRefreshIntervalMs ?? 30000;
     if (refreshInterval > 0) {
       this._topologyRefreshInterval = setInterval(() => {
         this.refreshTopology().catch((err) => {
@@ -1281,7 +1338,9 @@ export class SiloGRPCClient {
       return [servers];
     }
     if (Array.isArray(servers)) {
-      return servers.map((s) => (typeof s === "string" ? s : `${s.host}:${s.port}`));
+      return servers.map((s) =>
+        typeof s === "string" ? s : `${s.host}:${s.port}`,
+      );
     }
     return [`${servers.host}:${servers.port}`];
   }
@@ -1305,7 +1364,9 @@ export class SiloGRPCClient {
         host: address,
         channelCredentials: this._channelCredentials,
         clientOptions: this._grpcClientOptions,
-        ...(this._authInterceptor ? { interceptors: [this._authInterceptor] } : {}),
+        ...(this._authInterceptor
+          ? { interceptors: [this._authInterceptor] }
+          : {}),
       });
       const client = new SiloClient(transport);
       conn = { address, transport, client };
@@ -1321,12 +1382,16 @@ export class SiloGRPCClient {
   private _resolveShard(tenant: string | undefined): string {
     const tenantId = tenant ?? DEFAULT_TENANT;
     if (this._shards.length === 0) {
-      throw new Error("Cluster topology not discovered yet. Call refreshTopology() first.");
+      throw new Error(
+        "Cluster topology not discovered yet. Call refreshTopology() first.",
+      );
     }
     const hashed = hashTenant(tenantId);
     const shardInfo = shardForTenant(hashed, this._shards);
     if (!shardInfo) {
-      throw new Error(`No shard found for tenant "${tenantId}". This indicates a topology error.`);
+      throw new Error(
+        `No shard found for tenant "${tenantId}". This indicates a topology error.`,
+      );
     }
     return shardInfo.shardId;
   }
@@ -1411,27 +1476,32 @@ export class SiloGRPCClient {
   }
 
   /**
-   * Execute an operation with retry logic for wrong shard errors.
+   * Execute an operation with retry on wrong-shard and connectivity errors.
    * @internal
    */
-  private async _withWrongShardRetry<T>(
+  private async _withShardRetry<T>(
     tenant: string | undefined,
     operation: (client: SiloClient, shard: string) => Promise<T>,
   ): Promise<T> {
     await this._ensureTopology();
     let lastError: unknown;
-    let delay = this._wrongShardRetryDelayMs;
+    let delay = this._retryDelayMs;
     let { client, shard } = this._getClientForTenant(tenant);
 
-    for (let attempt = 0; attempt <= this._maxWrongShardRetries; attempt++) {
+    for (let attempt = 0; attempt <= this._maxRetries; attempt++) {
       try {
         return await operation(client, shard);
       } catch (error) {
-        if (isWrongShardError(error) && attempt < this._maxWrongShardRetries) {
+        if (
+          (isWrongShardError(error) || isConnectivityError(error)) &&
+          attempt < this._maxRetries
+        ) {
           lastError = error;
 
-          // Check for redirect address in metadata
-          const redirectAddr = extractRedirectAddress(error);
+          // Check for redirect address in metadata (only on wrong shard errors)
+          const redirectAddr = isWrongShardError(error)
+            ? extractRedirectAddress(error)
+            : undefined;
           if (redirectAddr) {
             // Update routing and create connection to new server
             const mappedAddr = this._mapAddress(redirectAddr);
@@ -1439,7 +1509,8 @@ export class SiloGRPCClient {
             const conn = this._getOrCreateConnection(mappedAddr);
             client = conn.client;
           } else {
-            // No redirect info, try refreshing topology
+            // Connectivity error or wrong shard without redirect — refresh
+            // topology so the retry can reach a different server
             await this.refreshTopology();
             const result = this._getClientForTenant(tenant);
             client = result.client;
@@ -1459,28 +1530,33 @@ export class SiloGRPCClient {
   }
 
   /**
-   * Execute an operation with retry logic for wrong shard errors, using a known shard ID.
+   * Execute an operation with retry on wrong-shard and connectivity errors, using a known shard ID.
    * Used by shard-routed operations (reportOutcome, heartbeat, reportRefreshOutcome)
    * where the shard ID is already known from the task, rather than resolved from a tenant.
    * @internal
    */
-  private async _withWrongShardRetryForShard<T>(
+  private async _withShardRetryForShard<T>(
     shardId: string,
     operation: (client: SiloClient) => Promise<T>,
   ): Promise<T> {
     let lastError: unknown;
-    let delay = this._wrongShardRetryDelayMs;
+    let delay = this._retryDelayMs;
     let client = this._getClientForShard(shardId);
 
-    for (let attempt = 0; attempt <= this._maxWrongShardRetries; attempt++) {
+    for (let attempt = 0; attempt <= this._maxRetries; attempt++) {
       try {
         return await operation(client);
       } catch (error) {
-        if (isWrongShardError(error) && attempt < this._maxWrongShardRetries) {
+        if (
+          (isWrongShardError(error) || isConnectivityError(error)) &&
+          attempt < this._maxRetries
+        ) {
           lastError = error;
 
-          // Check for redirect address in metadata
-          const redirectAddr = extractRedirectAddress(error);
+          // Check for redirect address in metadata (only on wrong shard errors)
+          const redirectAddr = isWrongShardError(error)
+            ? extractRedirectAddress(error)
+            : undefined;
           if (redirectAddr) {
             // Update routing and create connection to new server
             const mappedAddr = this._mapAddress(redirectAddr);
@@ -1488,7 +1564,8 @@ export class SiloGRPCClient {
             const conn = this._getOrCreateConnection(mappedAddr);
             client = conn.client;
           } else {
-            // No redirect info, try refreshing topology
+            // Connectivity error or wrong shard without redirect — refresh
+            // topology so the retry can reach a different server
             await this.refreshTopology();
             client = this._getClientForShard(shardId);
           }
@@ -1519,12 +1596,23 @@ export class SiloGRPCClient {
     for (const serverAddr of servers) {
       try {
         const conn = this._getOrCreateConnection(serverAddr);
-        const call = conn.client.getClusterInfo({}, this._rpcOptions());
+
+        // Apply a per-server deadline so a single hung connection doesn't
+        // block the entire refresh. The user-supplied rpcOptions are merged
+        // underneath so that the timeout always takes effect.
+        const baseOpts = this._rpcOptions() ?? {};
+        const refreshOpts: RpcOptions = {
+          ...baseOpts,
+          timeout: this._topologyRefreshTimeoutMs,
+        };
+
+        const call = conn.client.getClusterInfo({}, refreshOpts);
         const response = await call.response;
 
         // Update shard → server mapping and build shards array
         // Skip shards without a valid address (cluster may not have fully converged)
         this._shardToServer.clear();
+        const activeAddresses = new Set<string>();
         const shards: ShardInfoWithRange[] = [];
         for (const owner of response.shardOwners) {
           // Skip shards that don't have an owner yet (empty grpcAddr)
@@ -1533,6 +1621,7 @@ export class SiloGRPCClient {
             continue;
           }
           const addr = this._mapAddress(owner.grpcAddr);
+          activeAddresses.add(addr);
           this._shardToServer.set(owner.shardId, addr);
           shards.push({
             shardId: owner.shardId,
@@ -1542,6 +1631,20 @@ export class SiloGRPCClient {
           });
           // Ensure we have a connection to this server
           this._getOrCreateConnection(addr);
+        }
+
+        // Close and remove connections to servers that are no longer in the
+        // topology. This prevents stale connections (e.g. to old pod IPs
+        // after a StatefulSet restart) from accumulating and causing timeouts
+        // on subsequent refreshes.
+        for (const [addr, existingConn] of this._connections) {
+          if (
+            !activeAddresses.has(addr) &&
+            !this._initialServers.includes(addr)
+          ) {
+            existingConn.transport.close();
+            this._connections.delete(addr);
+          }
         }
 
         // Sort shards by rangeStart for efficient binary search lookup
@@ -1582,31 +1685,34 @@ export class SiloGRPCClient {
    */
   public async enqueue(options: EnqueueJobOptions): Promise<JobHandle> {
     try {
-      const id = await this._withWrongShardRetry(options.tenant, async (client, shard) => {
-        const call = client.enqueue(
-          {
-            shard,
-            id: options.id ?? "",
-            priority: options.priority ?? 50,
-            startAtMs: options.startAtMs ?? BigInt(Date.now()),
-            retryPolicy: options.retryPolicy,
-            payload: {
-              encoding: {
-                oneofKind: "msgpack",
-                msgpack: encodeBytes(options.payload),
+      const id = await this._withShardRetry(
+        options.tenant,
+        async (client, shard) => {
+          const call = client.enqueue(
+            {
+              shard,
+              id: options.id ?? "",
+              priority: options.priority ?? 50,
+              startAtMs: options.startAtMs ?? BigInt(Date.now()),
+              retryPolicy: options.retryPolicy,
+              payload: {
+                encoding: {
+                  oneofKind: "msgpack",
+                  msgpack: encodeBytes(options.payload),
+                },
               },
+              limits: options.limits?.map(toProtoLimit) ?? [],
+              tenant: options.tenant,
+              metadata: options.metadata ?? {},
+              taskGroup: options.taskGroup,
             },
-            limits: options.limits?.map(toProtoLimit) ?? [],
-            tenant: options.tenant,
-            metadata: options.metadata ?? {},
-            taskGroup: options.taskGroup,
-          },
-          this._rpcOptions(),
-        );
+            this._rpcOptions(),
+          );
 
-        const response = await call.response;
-        return response.id;
-      });
+          const response = await call.response;
+          return response.id;
+        },
+      );
       return new JobHandle(this, id, options.tenant);
     } catch (error) {
       throwMappedRpcError(error, {
@@ -1625,9 +1731,13 @@ export class SiloGRPCClient {
    * @returns The job details.
    * @throws JobNotFoundError if the job doesn't exist.
    */
-  public async getJob(id: string, tenant?: string, options?: GetJobOptions): Promise<Job> {
+  public async getJob(
+    id: string,
+    tenant?: string,
+    options?: GetJobOptions,
+  ): Promise<Job> {
     try {
-      return await this._withWrongShardRetry(tenant, async (client, shard) => {
+      return await this._withShardRetry(tenant, async (client, shard) => {
         const call = client.getJob(
           {
             shard,
@@ -1651,12 +1761,16 @@ export class SiloGRPCClient {
             "payload",
           ),
           retryPolicy: response.retryPolicy,
-          limits: response.limits.map(fromProtoLimit).filter((l): l is JobLimit => l !== undefined),
+          limits: response.limits
+            .map(fromProtoLimit)
+            .filter((l): l is JobLimit => l !== undefined),
           metadata: response.metadata,
           status: protoJobStatusToPublic(response.status),
           statusChangedAtMs: response.statusChangedAtMs,
           attempts:
-            response.attempts.length > 0 ? response.attempts.map(protoAttemptToPublic) : undefined,
+            response.attempts.length > 0
+              ? response.attempts.map(protoAttemptToPublic)
+              : undefined,
           nextAttemptStartsAfterMs: response.nextAttemptStartsAfterMs,
           taskGroup: response.taskGroup,
           result: response.result
@@ -1682,7 +1796,7 @@ export class SiloGRPCClient {
    */
   public async deleteJob(id: string, tenant?: string): Promise<void> {
     try {
-      await this._withWrongShardRetry(tenant, async (client, shard) => {
+      await this._withShardRetry(tenant, async (client, shard) => {
         await client.deleteJob(
           {
             shard,
@@ -1707,7 +1821,7 @@ export class SiloGRPCClient {
    */
   public async cancelJob(id: string, tenant?: string): Promise<void> {
     try {
-      await this._withWrongShardRetry(tenant, async (client, shard) => {
+      await this._withShardRetry(tenant, async (client, shard) => {
         await client.cancelJob(
           {
             shard,
@@ -1732,7 +1846,7 @@ export class SiloGRPCClient {
    */
   public async restartJob(id: string, tenant?: string): Promise<void> {
     try {
-      await this._withWrongShardRetry(tenant, async (client, shard) => {
+      await this._withShardRetry(tenant, async (client, shard) => {
         await client.restartJob(
           {
             shard,
@@ -1743,7 +1857,11 @@ export class SiloGRPCClient {
         );
       });
     } catch (error) {
-      throwMappedRpcError(error, { operation: "restartJob", jobId: id, tenant });
+      throwMappedRpcError(error, {
+        operation: "restartJob",
+        jobId: id,
+        tenant,
+      });
     }
   }
 
@@ -1759,7 +1877,7 @@ export class SiloGRPCClient {
    */
   public async expediteJob(id: string, tenant?: string): Promise<void> {
     try {
-      await this._withWrongShardRetry(tenant, async (client, shard) => {
+      await this._withShardRetry(tenant, async (client, shard) => {
         await client.expediteJob(
           {
             shard,
@@ -1770,7 +1888,11 @@ export class SiloGRPCClient {
         );
       });
     } catch (error) {
-      throwMappedRpcError(error, { operation: "expediteJob", jobId: id, tenant });
+      throwMappedRpcError(error, {
+        operation: "expediteJob",
+        jobId: id,
+        tenant,
+      });
     }
   }
 
@@ -1788,23 +1910,26 @@ export class SiloGRPCClient {
    */
   public async leaseTask(options: LeaseTaskOptions): Promise<Task> {
     try {
-      return await this._withWrongShardRetry(options.tenant, async (client, shard) => {
-        const call = client.leaseTask(
-          {
-            shard,
-            id: options.id,
-            tenant: options.tenant,
-            workerId: options.workerId,
-          },
-          this._rpcOptions(),
-        );
+      return await this._withShardRetry(
+        options.tenant,
+        async (client, shard) => {
+          const call = client.leaseTask(
+            {
+              shard,
+              id: options.id,
+              tenant: options.tenant,
+              workerId: options.workerId,
+            },
+            this._rpcOptions(),
+          );
 
-        const response = await call.response;
-        if (!response.task) {
-          throw new Error("leaseTask response missing task");
-        }
-        return response.task;
-      });
+          const response = await call.response;
+          if (!response.task) {
+            throw new Error("leaseTask response missing task");
+          }
+          return response.task;
+        },
+      );
     } catch (error) {
       throwMappedRpcError(error, {
         operation: "leaseTask",
@@ -1835,9 +1960,12 @@ export class SiloGRPCClient {
    * @throws JobNotTerminalError if the job is not yet in a terminal state.
    * @internal
    */
-  public async getJobResult<T = unknown>(id: string, tenant?: string): Promise<JobResult<T>> {
+  public async getJobResult<T = unknown>(
+    id: string,
+    tenant?: string,
+  ): Promise<JobResult<T>> {
     try {
-      return await this._withWrongShardRetry(tenant, async (client, shard) => {
+      return await this._withShardRetry(tenant, async (client, shard) => {
         const call = client.getJobResult(
           {
             shard,
@@ -1861,7 +1989,10 @@ export class SiloGRPCClient {
             response.result.successData.encoding.oneofKind === "msgpack" &&
             response.result.successData.encoding.msgpack.length > 0
           ) {
-            result = decodeBytes<T>(response.result.successData.encoding.msgpack, "successData");
+            result = decodeBytes<T>(
+              response.result.successData.encoding.msgpack,
+              "successData",
+            );
           }
           return { status: JobStatus.Succeeded, result };
         }
@@ -1870,10 +2001,14 @@ export class SiloGRPCClient {
           let errorData: unknown;
           if (
             response.result.oneofKind === "failure" &&
-            response.result.failure.errorData?.encoding.oneofKind === "msgpack" &&
+            response.result.failure.errorData?.encoding.oneofKind ===
+              "msgpack" &&
             response.result.failure.errorData.encoding.msgpack.length > 0
           ) {
-            errorData = decodeBytes(response.result.failure.errorData.encoding.msgpack, "failure");
+            errorData = decodeBytes(
+              response.result.failure.errorData.encoding.msgpack,
+              "failure",
+            );
           }
           return {
             status: JobStatus.Failed,
@@ -1900,7 +2035,11 @@ export class SiloGRPCClient {
           throw new JobNotTerminalError(id, tenant);
         }
       }
-      throwMappedRpcError(error, { operation: "getJobResult", jobId: id, tenant });
+      throwMappedRpcError(error, {
+        operation: "getJobResult",
+        jobId: id,
+        tenant,
+      });
     }
   }
 
@@ -1988,14 +2127,20 @@ export class SiloGRPCClient {
   public async reportOutcome(options: ReportOutcomeOptions): Promise<void> {
     let outcome:
       | { oneofKind: "success"; success: SerializedBytes }
-      | { oneofKind: "failure"; failure: { code: string; data?: SerializedBytes } }
+      | {
+          oneofKind: "failure";
+          failure: { code: string; data?: SerializedBytes };
+        }
       | { oneofKind: "cancelled"; cancelled: Record<string, never> };
 
     if (options.outcome.type === "success") {
       outcome = {
         oneofKind: "success" as const,
         success: {
-          encoding: { oneofKind: "msgpack", msgpack: encodeBytes(options.outcome.result) },
+          encoding: {
+            oneofKind: "msgpack",
+            msgpack: encodeBytes(options.outcome.result),
+          },
         },
       };
     } else if (options.outcome.type === "failure") {
@@ -2022,7 +2167,7 @@ export class SiloGRPCClient {
 
     try {
       // Route to the correct shard (from Task.shard), with retry on stale routing
-      await this._withWrongShardRetryForShard(options.shard, async (client) => {
+      await this._withShardRetryForShard(options.shard, async (client) => {
         await client.reportOutcome(
           {
             shard: options.shard,
@@ -2054,7 +2199,9 @@ export class SiloGRPCClient {
    * @param options The options for reporting the refresh outcome.
    * @throws TaskNotFoundError if the refresh task (lease) doesn't exist.
    */
-  public async reportRefreshOutcome(options: ReportRefreshOutcomeOptions): Promise<void> {
+  public async reportRefreshOutcome(
+    options: ReportRefreshOutcomeOptions,
+  ): Promise<void> {
     const outcome =
       options.outcome.type === "success"
         ? {
@@ -2070,7 +2217,7 @@ export class SiloGRPCClient {
           };
 
     try {
-      await this._withWrongShardRetryForShard(options.shard, async (client) => {
+      await this._withShardRetryForShard(options.shard, async (client) => {
         await client.reportRefreshOutcome(
           {
             shard: options.shard,
@@ -2105,7 +2252,7 @@ export class SiloGRPCClient {
     tenant?: string,
   ): Promise<HeartbeatResult> {
     try {
-      return await this._withWrongShardRetryForShard(shard, async (client) => {
+      return await this._withShardRetryForShard(shard, async (client) => {
         const call = client.heartbeat(
           {
             shard,
@@ -2139,7 +2286,7 @@ export class SiloGRPCClient {
     parameters?: QueryBindParameter[],
   ): Promise<QueryResult<Row>> {
     try {
-      return await this._withWrongShardRetry(tenant, async (client, shard) => {
+      return await this._withShardRetry(tenant, async (client, shard) => {
         const call = client.query(
           {
             shard,
@@ -2161,7 +2308,9 @@ export class SiloGRPCClient {
           if (row.encoding.oneofKind === "msgpack") {
             return decodeBytes<Row>(row.encoding.msgpack, `row[${index}]`);
           }
-          throw new Error(`Unsupported encoding for row[${index}]: ${row.encoding.oneofKind}`);
+          throw new Error(
+            `Unsupported encoding for row[${index}]: ${row.encoding.oneofKind}`,
+          );
         });
 
         return { columns, rows, rowCount: response.rowCount };
@@ -2251,7 +2400,10 @@ export function encodeBytes(value: unknown): Uint8Array {
  * @param bytes The MessagePack bytes to decode.
  * @returns The decoded value.
  */
-export function decodeBytes<T = unknown>(bytes: Uint8Array | undefined, field: string): T {
+export function decodeBytes<T = unknown>(
+  bytes: Uint8Array | undefined,
+  field: string,
+): T {
   if (!bytes || bytes.length === 0) {
     throw new Error(`No bytes to decode for field ${field}`);
   }

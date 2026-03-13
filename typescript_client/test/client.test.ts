@@ -82,7 +82,9 @@ describe("decodeBytes", () => {
   });
 
   it("throws for undefined input", () => {
-    expect(() => decodeBytes(undefined, "test")).toThrow("No bytes to decode for field test");
+    expect(() => decodeBytes(undefined, "test")).toThrow(
+      "No bytes to decode for field test",
+    );
   });
 
   it("throws for empty byte array", () => {
@@ -326,12 +328,12 @@ describe("SiloGRPCClient", () => {
   });
 
   describe("error mapping", () => {
-    const mockWithWrongShardRetryError = (
+    const mockWithShardRetryError = (
       client: SiloGRPCClient,
       code: string,
       message: string,
     ) => {
-      (client as any)._withWrongShardRetry = vi
+      (client as any)._withShardRetry = vi
         .fn()
         .mockRejectedValue(new RpcError(message, code, {}));
     };
@@ -341,7 +343,7 @@ describe("SiloGRPCClient", () => {
         servers: "localhost:7450",
         ...defaultOptions,
       });
-      mockWithWrongShardRetryError(client, "ALREADY_EXISTS", "job already exists");
+      mockWithShardRetryError(client, "ALREADY_EXISTS", "job already exists");
 
       const error = await client
         .enqueue({
@@ -375,7 +377,7 @@ describe("SiloGRPCClient", () => {
           servers: "localhost:7450",
           ...defaultOptions,
         });
-        mockWithWrongShardRetryError(client, grpcCode, `rpc failed: ${grpcCode}`);
+        mockWithShardRetryError(client, grpcCode, `rpc failed: ${grpcCode}`);
 
         await expect(client.query("SELECT 1")).rejects.toThrow(ErrorClass);
       },
@@ -386,9 +388,11 @@ describe("SiloGRPCClient", () => {
         servers: "localhost:7450",
         ...defaultOptions,
       });
-      mockWithWrongShardRetryError(client, "NOT_FOUND", "job not found");
+      mockWithShardRetryError(client, "NOT_FOUND", "job not found");
 
-      await expect(client.getJob("job-404", "tenant-abc")).rejects.toThrow(JobNotFoundError);
+      await expect(client.getJob("job-404", "tenant-abc")).rejects.toThrow(
+        JobNotFoundError,
+      );
     });
 
     it("maps NOT_FOUND on heartbeat to TaskNotFoundError", async () => {
@@ -398,13 +402,15 @@ describe("SiloGRPCClient", () => {
       });
       (client as any)._getClientForShard = vi.fn().mockReturnValue({
         heartbeat: vi.fn().mockReturnValue({
-          response: Promise.reject(new RpcError("task not found", "NOT_FOUND", {})),
+          response: Promise.reject(
+            new RpcError("task not found", "NOT_FOUND", {}),
+          ),
         }),
       });
 
-      await expect(client.heartbeat("worker-a", "task-404", "shard-1")).rejects.toThrow(
-        TaskNotFoundError,
-      );
+      await expect(
+        client.heartbeat("worker-a", "task-404", "shard-1"),
+      ).rejects.toThrow(TaskNotFoundError);
     });
   });
 });
@@ -478,7 +484,9 @@ describe("AwaitJobOptions type", () => {
 describe("JobNotFoundError", () => {
   it("formats error message with job id and tenant", () => {
     const error = new JobNotFoundError("job-123", "tenant-abc");
-    expect(error.message).toBe('Job "job-123" not found in tenant "tenant-abc"');
+    expect(error.message).toBe(
+      'Job "job-123" not found in tenant "tenant-abc"',
+    );
     expect(error.name).toBe("JobNotFoundError");
     expect(error.code).toBe("SILO_JOB_NOT_FOUND");
     expect(error.jobId).toBe("job-123");
@@ -502,7 +510,11 @@ describe("JobNotFoundError", () => {
 
 describe("JobNotTerminalError", () => {
   it("formats error message with job id, tenant, and status", () => {
-    const error = new JobNotTerminalError("job-123", "tenant-abc", JobStatus.Running);
+    const error = new JobNotTerminalError(
+      "job-123",
+      "tenant-abc",
+      JobStatus.Running,
+    );
     expect(error.message).toBe(
       'Job "job-123" in tenant "tenant-abc" is not in a terminal state (current status: Running)',
     );
@@ -548,7 +560,9 @@ describe("TaskNotFoundError", () => {
 describe("JobAlreadyExistsError", () => {
   it("formats error message with job id and tenant", () => {
     const error = new JobAlreadyExistsError("job-123", "tenant-abc");
-    expect(error.message).toBe('Job "job-123" already exists in tenant "tenant-abc"');
+    expect(error.message).toBe(
+      'Job "job-123" already exists in tenant "tenant-abc"',
+    );
     expect(error.name).toBe("JobAlreadyExistsError");
     expect(error.code).toBe("SILO_JOB_ALREADY_EXISTS");
     expect(error.grpcCode).toBe("ALREADY_EXISTS");
@@ -677,10 +691,10 @@ describe("SiloGRPCClient.query deserialization", () => {
       rowCount: 2,
     };
 
-    (client as any)._withWrongShardRetry = vi
+    (client as any)._withShardRetry = vi
       .fn()
       .mockImplementation(async (_tenant: any, _operation: any) => {
-        // Simulate the internal deserialization that happens inside the real _withWrongShardRetry callback
+        // Simulate the internal deserialization that happens inside the real _withShardRetry callback
         const columns = mockResponse.columns.map((c: any) => ({
           name: c.name,
           dataType: c.dataType,
@@ -714,7 +728,7 @@ describe("SiloGRPCClient.query deserialization", () => {
       count: number;
     }
 
-    (client as any)._withWrongShardRetry = vi.fn().mockImplementation(async () => {
+    (client as any)._withShardRetry = vi.fn().mockImplementation(async () => {
       return {
         columns: [{ name: "count", dataType: "Int64" }],
         rows: [{ count: 42 }],
@@ -722,7 +736,9 @@ describe("SiloGRPCClient.query deserialization", () => {
       };
     });
 
-    const result = await client.query<CountRow>("SELECT COUNT(*) as count FROM jobs");
+    const result = await client.query<CountRow>(
+      "SELECT COUNT(*) as count FROM jobs",
+    );
     const row: CountRow = result.rows[0];
     expect(row.count).toBe(42);
   });

@@ -1,5 +1,10 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { SiloGRPCClient, JobStatus, decodeBytes, GubernatorAlgorithm } from "../src/client";
+import {
+  SiloGRPCClient,
+  JobStatus,
+  decodeBytes,
+  GubernatorAlgorithm,
+} from "../src/client";
 
 // Support comma-separated list of servers for multi-node testing
 const SILO_SERVERS = (
@@ -7,7 +12,8 @@ const SILO_SERVERS = (
   process.env.SILO_SERVER ||
   "localhost:7450"
 ).split(",");
-const RUN_INTEGRATION = process.env.RUN_INTEGRATION === "true" || process.env.CI === "true";
+const RUN_INTEGRATION =
+  process.env.RUN_INTEGRATION === "true" || process.env.CI === "true";
 
 // Default task group for all integration tests
 const DEFAULT_TASK_GROUP = "integration-test-group";
@@ -85,6 +91,31 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
       const topology = client.getTopology();
       expect(topology.shards.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("skips non-existent server and discovers topology from a valid one", async () => {
+      // Use localhost on a port that nothing is listening on — the OS will
+      // immediately refuse the connection so the test doesn't block waiting
+      // for a TCP timeout.
+      const badServer = "localhost:1";
+      const testClient = new SiloGRPCClient({
+        servers: [badServer, ...SILO_SERVERS],
+        useTls: false,
+        shardRouting: {
+          topologyRefreshIntervalMs: 0,
+          topologyRefreshTimeoutMs: 500,
+        },
+      });
+
+      try {
+        await testClient.refreshTopology();
+
+        const topology = testClient.getTopology();
+        expect(topology.shards.length).toBeGreaterThanOrEqual(1);
+        expect(topology.shardToServer.size).toBeGreaterThanOrEqual(1);
+      } finally {
+        testClient.close();
+      }
     });
   });
 
@@ -338,7 +369,9 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       expect(succeededJob.result).toEqual(resultData);
 
       // getJob with includeAttempts should also have result
-      const jobWithAttempts = await client.getJob(handle.id, tenant, { includeAttempts: true });
+      const jobWithAttempts = await client.getJob(handle.id, tenant, {
+        includeAttempts: true,
+      });
       expect(jobWithAttempts.status).toBe(JobStatus.Succeeded);
       expect(jobWithAttempts.result).toEqual(resultData);
       expect(jobWithAttempts.attempts).toBeDefined();
@@ -420,7 +453,9 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       expect(task?.priority).toBe(1);
 
       const taskPayload = decodeBytes(
-        task?.payload?.encoding.oneofKind === "msgpack" ? task.payload.encoding.msgpack : undefined,
+        task?.payload?.encoding.oneofKind === "msgpack"
+          ? task.payload.encoding.msgpack
+          : undefined,
         "payload",
       );
       expect(taskPayload).toEqual(payload);
@@ -504,7 +539,12 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       const task = result.tasks.find((t) => t.jobId === handle.id);
       expect(task).toBeDefined();
 
-      await client.heartbeat("test-worker-3", task!.id, task!.shard, task!.tenantId);
+      await client.heartbeat(
+        "test-worker-3",
+        task!.id,
+        task!.shard,
+        task!.tenantId,
+      );
 
       await client.reportOutcome({
         shard: task!.shard,
@@ -591,7 +631,9 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         maxTasks: 1,
         taskGroup: DEFAULT_TASK_GROUP,
       });
-      expect(resultBefore.tasks.find((t) => t.jobId === handle.id)).toBeUndefined();
+      expect(
+        resultBefore.tasks.find((t) => t.jobId === handle.id),
+      ).toBeUndefined();
 
       // Expedite the job
       await client.expediteJob(handle.id, tenant);
@@ -626,7 +668,9 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
     it("expedite throws error for non-existent job", async () => {
       const tenant = "expedite-tenant";
-      await expect(client.expediteJob("non-existent-job-id", tenant)).rejects.toThrow();
+      await expect(
+        client.expediteJob("non-existent-job-id", tenant),
+      ).rejects.toThrow();
     });
 
     it("expedite throws error for running job", async () => {
@@ -812,7 +856,10 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       }
 
       // SQL queries require tenant in WHERE clause for filtering
-      const result = await client.query(`SELECT * FROM jobs WHERE tenant = '${tenant}'`, tenant);
+      const result = await client.query(
+        `SELECT * FROM jobs WHERE tenant = '${tenant}'`,
+        tenant,
+      );
       expect(result.rowCount).toBeGreaterThanOrEqual(3);
       expect(result.columns.length).toBeGreaterThan(0);
       expect(result.columns.some((c) => c.name === "id")).toBe(true);
@@ -1162,44 +1209,48 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       });
 
       // Try to await with a short timeout - should fail
-      await expect(handle.awaitResult({ pollIntervalMs: 50, timeoutMs: 200 })).rejects.toThrow(
-        /Timeout/,
-      );
+      await expect(
+        handle.awaitResult({ pollIntervalMs: 50, timeoutMs: 200 }),
+      ).rejects.toThrow(/Timeout/);
     });
   });
 
   describe("large payloads", () => {
-    it("enqueues and retrieves a 10MB payload", { timeout: 30_000 }, async () => {
-      const tenant = "large-payload-tenant";
+    it(
+      "enqueues and retrieves a 10MB payload",
+      { timeout: 30_000 },
+      async () => {
+        const tenant = "large-payload-tenant";
 
-      // Build a ~10MB payload using a raw Buffer.
-      // msgpack encodes Buffers as binary data without base64 expansion,
-      // so the wire size stays close to 10MB. This validates we're above
-      // the default 4MB gRPC limit without overwhelming CI resources.
-      const sizeBytes = 10 * 1024 * 1024;
-      const largeBuffer = Buffer.alloc(sizeBytes, 0x42);
-      const payload = { data: largeBuffer };
+        // Build a ~10MB payload using a raw Buffer.
+        // msgpack encodes Buffers as binary data without base64 expansion,
+        // so the wire size stays close to 10MB. This validates we're above
+        // the default 4MB gRPC limit without overwhelming CI resources.
+        const sizeBytes = 10 * 1024 * 1024;
+        const largeBuffer = Buffer.alloc(sizeBytes, 0x42);
+        const payload = { data: largeBuffer };
 
-      const taskGroup = "large-payload-test-group";
+        const taskGroup = "large-payload-test-group";
 
-      const handle = await client.enqueue({
-        tenant,
-        taskGroup,
-        payload,
-        priority: 50,
-      });
+        const handle = await client.enqueue({
+          tenant,
+          taskGroup,
+          payload,
+          priority: 50,
+        });
 
-      expect(handle.id).toBeTruthy();
+        expect(handle.id).toBeTruthy();
 
-      // Retrieve the job and verify the payload round-trips correctly
-      const job = await client.getJob(handle.id, tenant);
-      expect(job).toBeDefined();
-      expect(job?.id).toBe(handle.id);
+        // Retrieve the job and verify the payload round-trips correctly
+        const job = await client.getJob(handle.id, tenant);
+        expect(job).toBeDefined();
+        expect(job?.id).toBe(handle.id);
 
-      const retrieved = job?.payload as { data: Uint8Array };
-      expect(retrieved.data.length).toBe(sizeBytes);
-      expect(Buffer.from(retrieved.data).equals(largeBuffer)).toBe(true);
-    });
+        const retrieved = job?.payload as { data: Uint8Array };
+        expect(retrieved.data.length).toBe(sizeBytes);
+        expect(Buffer.from(retrieved.data).equals(largeBuffer)).toBe(true);
+      },
+    );
   });
 
   describe("floating concurrency limits", () => {
@@ -1292,7 +1343,9 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       expect(result.tasks.length).toBeGreaterThanOrEqual(0);
 
       // Find our refresh task - it MUST exist
-      const refreshTask = result.refreshTasks.find((rt) => rt.queueKey === queueKey);
+      const refreshTask = result.refreshTasks.find(
+        (rt) => rt.queueKey === queueKey,
+      );
       expect(refreshTask).toBeDefined();
       expect(refreshTask!.id).toBeTruthy();
       expect(refreshTask!.queueKey).toBe(queueKey);
@@ -1371,7 +1424,9 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       });
 
       // Find our refresh task - it MUST exist
-      const refreshTask = result.refreshTasks.find((rt) => rt.queueKey === queueKey);
+      const refreshTask = result.refreshTasks.find(
+        (rt) => rt.queueKey === queueKey,
+      );
       expect(refreshTask).toBeDefined();
 
       // Report failure
@@ -1432,7 +1487,9 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       });
 
       // Filter to just our jobs
-      const ourTasks = result.tasks.filter((t) => handles.some((h) => h.id === t.jobId));
+      const ourTasks = result.tasks.filter((t) =>
+        handles.some((h) => h.id === t.jobId),
+      );
 
       // Should have at most 1 task due to concurrency limit
       expect(ourTasks.length).toBeLessThanOrEqual(1);
@@ -1478,7 +1535,9 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
       const job = await client.getJob(handle.id, tenant);
       expect(job.limits).toHaveLength(2);
 
-      const floatingLimit = job.limits.find((l) => l.type === "floatingConcurrency");
+      const floatingLimit = job.limits.find(
+        (l) => l.type === "floatingConcurrency",
+      );
       const regularLimit = job.limits.find((l) => l.type === "concurrency");
 
       expect(floatingLimit).toBeDefined();
@@ -1518,8 +1577,8 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
         servers: SILO_SERVERS,
         useTls: false,
         shardRouting: {
-          maxWrongShardRetries: 2,
-          wrongShardRetryDelayMs: 50,
+          maxRetries: 2,
+          retryDelayMs: 50,
           topologyRefreshIntervalMs: 0,
         },
       });
@@ -1545,8 +1604,8 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
         servers: SILO_SERVERS,
         useTls: false,
         shardRouting: {
-          maxWrongShardRetries: 5,
-          wrongShardRetryDelayMs: 10,
+          maxRetries: 5,
+          retryDelayMs: 10,
           topologyRefreshIntervalMs: 0,
         },
       });
@@ -1609,42 +1668,46 @@ describe.skipIf(!RUN_INTEGRATION)("Shard routing integration", () => {
       }
     });
 
-    it("handles high volume of different tenants", { timeout: 30000 }, async () => {
-      const client = new SiloGRPCClient({
-        servers: SILO_SERVERS,
-        useTls: false,
-        shardRouting: {
-          topologyRefreshIntervalMs: 0,
-        },
-      });
+    it(
+      "handles high volume of different tenants",
+      { timeout: 30000 },
+      async () => {
+        const client = new SiloGRPCClient({
+          servers: SILO_SERVERS,
+          useTls: false,
+          shardRouting: {
+            topologyRefreshIntervalMs: 0,
+          },
+        });
 
-      try {
-        await client.refreshTopology();
+        try {
+          await client.refreshTopology();
 
-        const numTenants = 50;
-        const results: Array<{ tenant: string; jobId: string }> = [];
+          const numTenants = 50;
+          const results: Array<{ tenant: string; jobId: string }> = [];
 
-        // Enqueue jobs for many tenants
-        for (let i = 0; i < numTenants; i++) {
-          const tenant = `bulk-tenant-${i}`;
-          const handle = await client.enqueue({
-            tenant,
-            taskGroup: DEFAULT_TASK_GROUP,
-            payload: { index: i },
-          });
-          results.push({ tenant, jobId: handle.id });
+          // Enqueue jobs for many tenants
+          for (let i = 0; i < numTenants; i++) {
+            const tenant = `bulk-tenant-${i}`;
+            const handle = await client.enqueue({
+              tenant,
+              taskGroup: DEFAULT_TASK_GROUP,
+              payload: { index: i },
+            });
+            results.push({ tenant, jobId: handle.id });
+          }
+
+          // Verify random sample can be retrieved
+          const samples = [0, 10, 25, 49].map((i) => results[i]);
+          for (const { tenant, jobId } of samples) {
+            const job = await client.getJob(jobId, tenant);
+            expect(job?.id).toBe(jobId);
+          }
+        } finally {
+          client.close();
         }
-
-        // Verify random sample can be retrieved
-        const samples = [0, 10, 25, 49].map((i) => results[i]);
-        for (const { tenant, jobId } of samples) {
-          const job = await client.getJob(jobId, tenant);
-          expect(job?.id).toBe(jobId);
-        }
-      } finally {
-        client.close();
-      }
-    });
+      },
+    );
   });
 
   describe("topology changes", () => {
