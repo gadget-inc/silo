@@ -271,99 +271,30 @@ async fn setup_node_server(
     })
 }
 
-/// Generate a tenant key that falls within the given shard range.
-/// This ensures jobs are routed to the correct shard based on tenant.
+/// Generate a tenant key whose XXH64 hash falls within the given shard range.
+/// This ensures jobs are routed to the correct shard based on tenant hashing.
 fn generate_tenant_for_range(range: &silo::shard_range::ShardRange, rng: &mut StdRng) -> String {
-    let start = &range.start;
-    let end = &range.end;
-
-    match (start.is_empty(), end.is_empty()) {
-        (true, true) => {
-            // Full range: any character works
-            let c = rng.random_range(b'a'..=b'z') as char;
-            c.to_string()
-        }
-        (true, false) => {
-            // [unbounded, end): pick something less than end
-            let end_char = end.chars().next().unwrap_or('z') as u8;
-            if end_char > b'!' {
-                let c = rng.random_range(b'!'..end_char) as char;
-                c.to_string()
-            } else {
-                "!".to_string()
-            }
-        }
-        (false, true) => {
-            // [start, unbounded): pick something >= start
-            let start_char = start.chars().next().unwrap_or('a') as u8;
-            let max_char = b'z';
-            if start_char < max_char {
-                let c = rng.random_range(start_char..=max_char) as char;
-                c.to_string()
-            } else {
-                start.clone()
-            }
-        }
-        (false, false) => {
-            // [start, end): pick something in between
-            let start_char = start.chars().next().unwrap_or('a') as u8;
-            let end_char = end.chars().next().unwrap_or('z') as u8;
-            if end_char > start_char {
-                let c = rng.random_range(start_char..end_char) as char;
-                c.to_string()
-            } else {
-                start.clone()
-            }
+    // Shard ranges operate on hex-encoded XXH64 hashes of tenant IDs, not raw
+    // tenant strings. Generate random tenant IDs until we find one whose hash
+    // falls within the range.
+    loop {
+        let candidate = format!("tenant-{}", rng.random_range(0u64..u64::MAX));
+        if range.contains_tenant(&candidate) {
+            return candidate;
         }
     }
 }
 
 /// Compute a valid split point for a shard based on its range.
-/// Returns a point that is within the shard's range.
+/// Returns a hex-encoded hash-space midpoint within the shard's range.
 fn compute_split_point(shard_range: &silo::shard_range::ShardRange) -> String {
-    // Generate a split point by taking the midpoint of the range
-    // In ShardRange, empty string means unbounded
-    let start = &shard_range.start;
-    let end = &shard_range.end;
-
-    // If the range is unbounded, use a simple midpoint character
-    match (start.is_empty(), end.is_empty()) {
-        (true, true) => "m".to_string(), // Full range: split at 'm'
-        (true, false) => {
-            // Start is empty (unbounded), end is bounded
-            if let Some(c) = end.chars().next() {
-                let mid = (c as u8 / 2) as char;
-                mid.to_string()
-            } else {
-                "m".to_string()
-            }
-        }
-        (false, true) => {
-            // Start is bounded, end is empty (unbounded)
-            if let Some(c) = start.chars().next() {
-                let mid = ((c as u8).saturating_add(127) / 2) as char;
-                // Make sure it's > start
-                if mid.to_string() > *start {
-                    mid.to_string()
-                } else {
-                    format!("{}m", start)
-                }
-            } else {
-                format!("{}m", start)
-            }
-        }
-        (false, false) => {
-            // Both bounded - compute midpoint
-            let start_char = start.chars().next().unwrap_or('a') as u8;
-            let end_char = end.chars().next().unwrap_or('z') as u8;
-            if end_char > start_char {
-                let mid = ((start_char as u16 + end_char as u16) / 2) as u8 as char;
-                mid.to_string()
-            } else {
-                format!("{}m", start)
-            }
-        }
-    }
+    // Shard ranges are defined over 16-char hex-encoded u64 hash values.
+    // Use the built-in midpoint calculation which correctly handles the u64 keyspace.
+    silo::shard_range::format_hash_boundary(
+        shard_range
+            .midpoint()
+            .expect("shard range too small to split"),
+    )
 }
 
 pub fn run() {
