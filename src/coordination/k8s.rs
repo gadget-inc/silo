@@ -353,7 +353,10 @@ impl<B: K8sBackend> K8sCoordinator<B> {
                                     if let Err(e) = self.refresh_members_cache().await {
                                         warn!(node_id = %self.base.node_id, error = %e, "failed to refresh members cache");
                                     }
-                                    self.membership_changed.notify_waiters();
+                                    // Use notify_one (not notify_waiters) so the permit is stored
+                                    // if the coordination loop is busy. notify_waiters drops the
+                                    // notification when no task is currently awaiting .notified().
+                                    self.membership_changed.notify_one();
                                 }
                                 LeaseWatchEvent::Deleted(lease) => {
                                     let lease_name = lease.metadata.name.as_deref().unwrap_or("unknown");
@@ -361,7 +364,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
                                     if let Err(e) = self.refresh_members_cache().await {
                                         warn!(node_id = %self.base.node_id, error = %e, "failed to refresh members cache");
                                     }
-                                    self.membership_changed.notify_waiters();
+                                    self.membership_changed.notify_one();
                                 }
                                 LeaseWatchEvent::Init => {
                                     debug!(node_id = %self.base.node_id, "membership watcher initialized");
@@ -371,7 +374,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
                                     if let Err(e) = self.refresh_members_cache().await {
                                         warn!(node_id = %self.base.node_id, error = %e, "failed to refresh members cache on init");
                                     }
-                                    self.membership_changed.notify_waiters();
+                                    self.membership_changed.notify_one();
                                 }
                             }
                         }
@@ -417,7 +420,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
                                     if let Err(e) = self.reload_shard_map().await {
                                         warn!(node_id = %self.base.node_id, error = %e, "failed to reload shard map");
                                     }
-                                    self.shard_map_changed.notify_waiters();
+                                    self.shard_map_changed.notify_one();
                                 }
                                 ConfigMapWatchEvent::Deleted(cm) => {
                                     let cm_name = cm.metadata.name.as_deref().unwrap_or("unknown");
@@ -430,7 +433,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
                                 ConfigMapWatchEvent::InitDone => {
                                     debug!(node_id = %self.base.node_id, "shard map watcher init done");
                                     // Notify on init done in case we missed events
-                                    self.shard_map_changed.notify_waiters();
+                                    self.shard_map_changed.notify_one();
                                 }
                             }
                         }
@@ -566,7 +569,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         let mut renew_timer = tokio::time::interval(renew_interval);
 
         // Periodic reconciliation as a safety net to catch any missed watch events due to network issues
-        let safety_reconcile_interval = Duration::from_secs(30);
+        let safety_reconcile_interval = Duration::from_secs(5);
         let mut safety_reconcile_timer = tokio::time::interval(safety_reconcile_interval);
 
         // Reclaim shards from a previous run before initial reconciliation.
