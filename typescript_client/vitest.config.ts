@@ -15,5 +15,8 @@ export default defineConfig({
     pool: "threads",
     // Timeout for tearing down test environment
     teardownTimeout: 1000,
+    benchmark: {
+      include: ["test/**/*.bench.ts"],
+    },
   },
 });

@@ -287,6 +287,23 @@ message LeaseTasksResponse {
   repeated RefreshFloatingLimitTask refresh_tasks = 2; // Floating limit refresh tasks.
 }
 
+// Long-poll variant of LeaseTasksRequest.
+// Blocks until tasks are available or timeout is reached.
+// Avoids the latency overhead of short-polling intervals.
+message LeaseTasksLongPollRequest {
+  optional string shard = 1;  // optional filter - if set, only lease from this shard (UUID)
+  string worker_id = 2;
+  uint32 max_tasks = 3;
+  string task_group = 4;      // Required. Task group to poll tasks from.
+  uint32 timeout_ms = 5;      // Max time to wait for tasks (ms). Server caps at 60000. 0 = immediate (same as LeaseTasks).
+}
+
+// Response for long-poll lease. Same shape as LeaseTasksResponse.
+message LeaseTasksLongPollResponse {
+  repeated Task tasks = 1;                         // Job execution tasks.
+  repeated RefreshFloatingLimitTask refresh_tasks = 2; // Floating limit refresh tasks.
+}
+
 // Request to report the outcome of a completed task.
 message ReportOutcomeRequest {
   string shard = 1;          // Shard ID (UUID) the task came from.
@@ -625,6 +642,12 @@ service Silo {
   // Workers should call this periodically to get work.
   // Returns both job tasks and floating limit refresh tasks.
   rpc LeaseTasks(LeaseTasksRequest) returns (LeaseTasksResponse);
+
+  // Long-poll variant of LeaseTasks.
+  // Blocks until tasks are available or timeout is reached.
+  // Returns immediately if tasks are already available.
+  // Avoids the latency overhead of short-polling intervals.
+  rpc LeaseTasksLongPoll(LeaseTasksLongPollRequest) returns (LeaseTasksLongPollResponse);
   
   // Report the outcome of a completed job task.
   // Must be called before the task lease expires.

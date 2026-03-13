@@ -24,6 +24,7 @@ export {
   type SiloGRPCClientOptions,
   type EnqueueJobOptions,
   type LeaseTasksOptions,
+  type LeaseTasksLongPollOptions,
   type LeaseTasksResult,
   type ReportOutcomeOptions,
   type SuccessOutcome,
