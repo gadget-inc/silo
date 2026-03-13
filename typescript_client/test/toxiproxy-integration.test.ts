@@ -1,20 +1,40 @@
-import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach } from "vitest";
+import {
+  describe,
+  it,
+  expect,
+  beforeAll,
+  beforeEach,
+  afterAll,
+  afterEach,
+} from "vitest";
 import { SiloGRPCClient } from "../src/client";
-import { Toxiproxy, Proxy, type Latency, type Bandwidth, type Timeout, type Slicer, type Slowclose } from "toxiproxy-node-client";
+import {
+  Toxiproxy,
+  Proxy,
+  type Latency,
+  type Bandwidth,
+  type Timeout,
+  type Slicer,
+  type Slowclose,
+} from "toxiproxy-node-client";
 
 // Direct silo servers (for setup/verification)
-const SILO_SERVERS = (process.env.SILO_SERVERS || process.env.SILO_SERVER || "localhost:7450").split(
-  ",",
-);
+const SILO_SERVERS = (
+  process.env.SILO_SERVERS ||
+  process.env.SILO_SERVER ||
+  "localhost:7450"
+).split(",");
 
 // Toxiproxy-proxied silo servers
 const TOXIPROXY_SILO_SERVERS = (
   process.env.TOXIPROXY_SILO_SERVERS || "localhost:17450,localhost:17451"
 ).split(",");
 
-const TOXIPROXY_API_URL = process.env.TOXIPROXY_API_URL || "http://127.0.0.1:8474";
+const TOXIPROXY_API_URL =
+  process.env.TOXIPROXY_API_URL || "http://127.0.0.1:8474";
 
-const RUN_INTEGRATION = process.env.RUN_INTEGRATION === "true" || process.env.CI === "true";
+const RUN_INTEGRATION =
+  process.env.RUN_INTEGRATION === "true" || process.env.CI === "true";
 
 const DEFAULT_TASK_GROUP = "toxiproxy-test-group";
 
@@ -79,7 +99,9 @@ async function waitForClusterConvergence(
     }
 
     if (attempt === maxAttempts) {
-      throw new Error(`Cluster did not converge after ${maxAttempts} attempts.`);
+      throw new Error(
+        `Cluster did not converge after ${maxAttempts} attempts.`,
+      );
     }
 
     await new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -105,7 +127,11 @@ function createProxyClient(): SiloGRPCClient {
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Retry an operation until it succeeds, instead of using a fixed sleep. */
-async function retryUntilSuccess<T>(fn: () => Promise<T>, maxAttempts = 30, delayMs = 100): Promise<T> {
+async function retryUntilSuccess<T>(
+  fn: () => Promise<T>,
+  maxAttempts = 30,
+  delayMs = 100,
+): Promise<T> {
   let lastError: unknown;
   for (let i = 0; i < maxAttempts; i++) {
     try {
@@ -138,7 +164,11 @@ function createFastFailProxyClient(): SiloGRPCClient {
   return new SiloGRPCClient({
     servers: TOXIPROXY_SILO_SERVERS,
     useTls: false,
-    shardRouting: { topologyRefreshIntervalMs: 0 },
+    shardRouting: {
+      topologyRefreshIntervalMs: 0,
+      maxRetries: 2,
+      retryDelayMs: 50,
+    },
     addressMap: ADDRESS_MAP,
     rpcOptions: { timeout: 1000 },
     grpcClientOptions: {
@@ -321,7 +351,9 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
       await toxic2.remove();
 
       // Retry until gRPC reconnects instead of a fixed sleep
-      const job = await retryUntilSuccess(() => proxyClient.getJob(handle.id, tenant));
+      const job = await retryUntilSuccess(() =>
+        proxyClient.getJob(handle.id, tenant),
+      );
       expect(job?.id).toBe(handle.id);
     });
   });
@@ -337,16 +369,34 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
       });
       expect(handle.id).toBeTruthy();
 
-      await silo1.update({ enabled: false, listen: silo1.listen, upstream: silo1.upstream });
-      await silo2.update({ enabled: false, listen: silo2.listen, upstream: silo2.upstream });
+      await silo1.update({
+        enabled: false,
+        listen: silo1.listen,
+        upstream: silo1.upstream,
+      });
+      await silo2.update({
+        enabled: false,
+        listen: silo2.listen,
+        upstream: silo2.upstream,
+      });
 
       await expect(proxyClient.getJob(handle.id, tenant)).rejects.toThrow();
 
-      await silo1.update({ enabled: true, listen: silo1.listen, upstream: silo1.upstream });
-      await silo2.update({ enabled: true, listen: silo2.listen, upstream: silo2.upstream });
+      await silo1.update({
+        enabled: true,
+        listen: silo1.listen,
+        upstream: silo1.upstream,
+      });
+      await silo2.update({
+        enabled: true,
+        listen: silo2.listen,
+        upstream: silo2.upstream,
+      });
 
       // Retry until gRPC reconnects instead of a fixed sleep
-      const job = await retryUntilSuccess(() => proxyClient.getJob(handle.id, tenant));
+      const job = await retryUntilSuccess(() =>
+        proxyClient.getJob(handle.id, tenant),
+      );
       expect(job?.id).toBe(handle.id);
     });
   });
@@ -414,7 +464,11 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
       const fastClient = createFastFailProxyClient();
       await fastClient.refreshTopology();
 
-      await silo1.update({ enabled: false, listen: silo1.listen, upstream: silo1.upstream });
+      await silo1.update({
+        enabled: false,
+        listen: silo1.listen,
+        upstream: silo1.upstream,
+      });
 
       const results: string[] = [];
       const errors: Error[] = [];
@@ -435,7 +489,11 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
 
       expect(results.length + errors.length).toBe(5);
 
-      await silo1.update({ enabled: true, listen: silo1.listen, upstream: silo1.upstream });
+      await silo1.update({
+        enabled: true,
+        listen: silo1.listen,
+        upstream: silo1.upstream,
+      });
       fastClient.close();
     });
   });
@@ -534,7 +592,10 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
       expect(handle.id).toBeTruthy();
 
       const job = await proxyClient.getJob(handle.id, tenant);
-      expect(job?.payload).toEqual({ test: "slicer-latency", items: [1, 2, 3, 4, 5] });
+      expect(job?.payload).toEqual({
+        test: "slicer-latency",
+        items: [1, 2, 3, 4, 5],
+      });
     });
   });
 
@@ -544,13 +605,29 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
       // instead of retrying each server with full backoff (~3s per server)
       const freshClient = createFastFailProxyClient();
 
-      await silo1.update({ enabled: false, listen: silo1.listen, upstream: silo1.upstream });
-      await silo2.update({ enabled: false, listen: silo2.listen, upstream: silo2.upstream });
+      await silo1.update({
+        enabled: false,
+        listen: silo1.listen,
+        upstream: silo1.upstream,
+      });
+      await silo2.update({
+        enabled: false,
+        listen: silo2.listen,
+        upstream: silo2.upstream,
+      });
 
       await expect(freshClient.refreshTopology()).rejects.toThrow();
 
-      await silo1.update({ enabled: true, listen: silo1.listen, upstream: silo1.upstream });
-      await silo2.update({ enabled: true, listen: silo2.listen, upstream: silo2.upstream });
+      await silo1.update({
+        enabled: true,
+        listen: silo1.listen,
+        upstream: silo1.upstream,
+      });
+      await silo2.update({
+        enabled: true,
+        listen: silo2.listen,
+        upstream: silo2.upstream,
+      });
 
       freshClient.close();
     });

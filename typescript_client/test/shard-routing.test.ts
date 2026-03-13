@@ -1,5 +1,19 @@
-import { describe, it, expect, vi, afterEach, beforeAll, beforeEach } from "vitest";
-import { SiloGRPCClient, shardForTenant, hashTenant, initHasher, type ShardInfoWithRange } from "../src/client";
+import {
+  describe,
+  it,
+  expect,
+  vi,
+  afterEach,
+  beforeAll,
+  beforeEach,
+} from "vitest";
+import {
+  SiloGRPCClient,
+  shardForTenant,
+  hashTenant,
+  initHasher,
+  type ShardInfoWithRange,
+} from "../src/client";
 import { RpcError } from "@protobuf-ts/runtime-rpc";
 
 describe("Shard Routing", () => {
@@ -28,18 +42,37 @@ describe("Shard Routing", () => {
   describe("shardForTenant lexicographic lookup (expects hash-space keys)", () => {
     it("finds correct shard for key in range", () => {
       const shards: ShardInfoWithRange[] = [
-        { shardId: "shard-1", serverAddr: "server-a:7450", rangeStart: "", rangeEnd: "8000000000000000" },
-        { shardId: "shard-2", serverAddr: "server-b:7450", rangeStart: "8000000000000000", rangeEnd: "" },
+        {
+          shardId: "shard-1",
+          serverAddr: "server-a:7450",
+          rangeStart: "",
+          rangeEnd: "8000000000000000",
+        },
+        {
+          shardId: "shard-2",
+          serverAddr: "server-b:7450",
+          rangeStart: "8000000000000000",
+          rangeEnd: "",
+        },
       ];
 
       // Keys in hash space — direct lexicographic comparison
-      expect(shardForTenant("3000000000000000", shards)?.shardId).toBe("shard-1");
-      expect(shardForTenant("a000000000000000", shards)?.shardId).toBe("shard-2");
+      expect(shardForTenant("3000000000000000", shards)?.shardId).toBe(
+        "shard-1",
+      );
+      expect(shardForTenant("a000000000000000", shards)?.shardId).toBe(
+        "shard-2",
+      );
     });
 
     it("handles single full-range shard", () => {
       const shards: ShardInfoWithRange[] = [
-        { shardId: "shard-1", serverAddr: "server-a:7450", rangeStart: "", rangeEnd: "" },
+        {
+          shardId: "shard-1",
+          serverAddr: "server-a:7450",
+          rangeStart: "",
+          rangeEnd: "",
+        },
       ];
 
       expect(shardForTenant("anything", shards)?.shardId).toBe("shard-1");
@@ -51,22 +84,60 @@ describe("Shard Routing", () => {
 
     it("handles multiple shard ranges", () => {
       const shards: ShardInfoWithRange[] = [
-        { shardId: "shard-1", serverAddr: "server-a:7450", rangeStart: "", rangeEnd: "4000000000000000" },
-        { shardId: "shard-2", serverAddr: "server-b:7450", rangeStart: "4000000000000000", rangeEnd: "8000000000000000" },
-        { shardId: "shard-3", serverAddr: "server-a:7450", rangeStart: "8000000000000000", rangeEnd: "c000000000000000" },
-        { shardId: "shard-4", serverAddr: "server-b:7450", rangeStart: "c000000000000000", rangeEnd: "" },
+        {
+          shardId: "shard-1",
+          serverAddr: "server-a:7450",
+          rangeStart: "",
+          rangeEnd: "4000000000000000",
+        },
+        {
+          shardId: "shard-2",
+          serverAddr: "server-b:7450",
+          rangeStart: "4000000000000000",
+          rangeEnd: "8000000000000000",
+        },
+        {
+          shardId: "shard-3",
+          serverAddr: "server-a:7450",
+          rangeStart: "8000000000000000",
+          rangeEnd: "c000000000000000",
+        },
+        {
+          shardId: "shard-4",
+          serverAddr: "server-b:7450",
+          rangeStart: "c000000000000000",
+          rangeEnd: "",
+        },
       ];
 
-      expect(shardForTenant("1000000000000000", shards)?.shardId).toBe("shard-1");
-      expect(shardForTenant("5000000000000000", shards)?.shardId).toBe("shard-2");
-      expect(shardForTenant("9000000000000000", shards)?.shardId).toBe("shard-3");
-      expect(shardForTenant("d000000000000000", shards)?.shardId).toBe("shard-4");
+      expect(shardForTenant("1000000000000000", shards)?.shardId).toBe(
+        "shard-1",
+      );
+      expect(shardForTenant("5000000000000000", shards)?.shardId).toBe(
+        "shard-2",
+      );
+      expect(shardForTenant("9000000000000000", shards)?.shardId).toBe(
+        "shard-3",
+      );
+      expect(shardForTenant("d000000000000000", shards)?.shardId).toBe(
+        "shard-4",
+      );
     });
 
     it("end-to-end: hashTenant + shardForTenant routes tenants correctly", () => {
       const shards: ShardInfoWithRange[] = [
-        { shardId: "shard-1", serverAddr: "server-a:7450", rangeStart: "", rangeEnd: "8000000000000000" },
-        { shardId: "shard-2", serverAddr: "server-b:7450", rangeStart: "8000000000000000", rangeEnd: "" },
+        {
+          shardId: "shard-1",
+          serverAddr: "server-a:7450",
+          rangeStart: "",
+          rangeEnd: "8000000000000000",
+        },
+        {
+          shardId: "shard-2",
+          serverAddr: "server-b:7450",
+          rangeStart: "8000000000000000",
+          rangeEnd: "",
+        },
       ];
 
       // Hash first, then look up — this is what _resolveShard does
@@ -147,18 +218,18 @@ describe("Shard Routing", () => {
 
       const topology = client.getTopology();
       expect(topology.shards.length).toBe(4);
-      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000001")).toBe(
-        "server-a:7450",
-      );
-      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000002")).toBe(
-        "server-b:7450",
-      );
-      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000003")).toBe(
-        "server-a:7450",
-      );
-      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000004")).toBe(
-        "server-b:7450",
-      );
+      expect(
+        topology.shardToServer.get("00000000-0000-0000-0000-000000000001"),
+      ).toBe("server-a:7450");
+      expect(
+        topology.shardToServer.get("00000000-0000-0000-0000-000000000002"),
+      ).toBe("server-b:7450");
+      expect(
+        topology.shardToServer.get("00000000-0000-0000-0000-000000000003"),
+      ).toBe("server-a:7450");
+      expect(
+        topology.shardToServer.get("00000000-0000-0000-0000-000000000004"),
+      ).toBe("server-b:7450");
     });
 
     it("creates connections to discovered servers", async () => {
@@ -237,9 +308,9 @@ describe("Shard Routing", () => {
 
       const topology = client.getTopology();
       expect(topology.shards.length).toBe(1);
-      expect(topology.shardToServer.get("00000000-0000-0000-0000-000000000001")).toBe(
-        "working-server:7450",
-      );
+      expect(
+        topology.shardToServer.get("00000000-0000-0000-0000-000000000001"),
+      ).toBe("working-server:7450");
     });
 
     it("throws if all servers fail during topology refresh after exhausting retries", async () => {
@@ -256,6 +327,658 @@ describe("Shard Routing", () => {
       await expect(client.refreshTopology()).rejects.toThrow(
         "Failed to refresh cluster topology from any server",
       );
+    });
+
+    it("applies per-server timeout to getClusterInfo calls during refresh", async () => {
+      client.close();
+      client = new SiloGRPCClient({
+        servers: "localhost:7450",
+        useTls: false,
+        shardRouting: {
+          topologyRefreshIntervalMs: 0,
+          topologyRefreshTimeoutMs: 5000,
+        },
+      });
+
+      const capturedOptions: any[] = [];
+      const mockGetClusterInfo = vi
+        .fn()
+        .mockImplementation((_req: any, opts: any) => {
+          capturedOptions.push(opts);
+          return {
+            response: Promise.resolve({
+              numShards: 1,
+              shardOwners: [
+                {
+                  shardId: "00000000-0000-0000-0000-000000000001",
+                  grpcAddr: "localhost:7450",
+                  nodeId: "node-1",
+                  rangeStart: "",
+                  rangeEnd: "",
+                },
+              ],
+              thisNodeId: "node-1",
+              thisGrpcAddr: "localhost:7450",
+            }),
+          };
+        });
+
+      const connections = (client as any)._connections as Map<string, any>;
+      const conn = connections.values().next().value;
+      conn.client.getClusterInfo = mockGetClusterInfo;
+
+      await client.refreshTopology();
+
+      expect(capturedOptions.length).toBe(1);
+      expect(capturedOptions[0].timeout).toBe(5000);
+    });
+
+    it("uses default 10s timeout when topologyRefreshTimeoutMs is not set", async () => {
+      const capturedOptions: any[] = [];
+      const mockGetClusterInfo = vi
+        .fn()
+        .mockImplementation((_req: any, opts: any) => {
+          capturedOptions.push(opts);
+          return {
+            response: Promise.resolve({
+              numShards: 1,
+              shardOwners: [
+                {
+                  shardId: "00000000-0000-0000-0000-000000000001",
+                  grpcAddr: "localhost:7450",
+                  nodeId: "node-1",
+                  rangeStart: "",
+                  rangeEnd: "",
+                },
+              ],
+              thisNodeId: "node-1",
+              thisGrpcAddr: "localhost:7450",
+            }),
+          };
+        });
+
+      const connections = (client as any)._connections as Map<string, any>;
+      const conn = connections.values().next().value;
+      conn.client.getClusterInfo = mockGetClusterInfo;
+
+      await client.refreshTopology();
+
+      expect(capturedOptions.length).toBe(1);
+      expect(capturedOptions[0].timeout).toBe(10_000);
+    });
+
+    it("moves to next server when getClusterInfo times out on first server", async () => {
+      client.close();
+      client = new SiloGRPCClient({
+        servers: ["slow-server:7450", "fast-server:7450"],
+        useTls: false,
+        shardRouting: {
+          topologyRefreshIntervalMs: 0,
+          topologyRefreshTimeoutMs: 100,
+        },
+      });
+
+      const connections = (client as any)._connections as Map<string, any>;
+
+      // First server hangs (never resolves, simulating a timeout that gRPC would enforce)
+      const slowConn = connections.get("slow-server:7450");
+      slowConn.client.getClusterInfo = vi.fn().mockReturnValue({
+        response: new Promise((_resolve, reject) => {
+          setTimeout(() => reject(new Error("DEADLINE_EXCEEDED")), 50);
+        }),
+      });
+
+      // Second server responds immediately
+      const fastConn = connections.get("fast-server:7450");
+      fastConn.client.getClusterInfo = vi.fn().mockReturnValue({
+        response: Promise.resolve({
+          numShards: 1,
+          shardOwners: [
+            {
+              shardId: "00000000-0000-0000-0000-000000000001",
+              grpcAddr: "fast-server:7450",
+              nodeId: "node-1",
+              rangeStart: "",
+              rangeEnd: "",
+            },
+          ],
+          thisNodeId: "node-1",
+          thisGrpcAddr: "fast-server:7450",
+        }),
+      });
+
+      await client.refreshTopology();
+
+      const topology = client.getTopology();
+      expect(topology.shards.length).toBe(1);
+      expect(
+        topology.shardToServer.get("00000000-0000-0000-0000-000000000001"),
+      ).toBe("fast-server:7450");
+    });
+
+    it("cleans up stale connections after topology refresh", async () => {
+      // Simulate first topology refresh that discovers two servers by pod IP
+      const mockGetClusterInfo = vi.fn().mockReturnValue({
+        response: Promise.resolve({
+          numShards: 2,
+          shardOwners: [
+            {
+              shardId: "00000000-0000-0000-0000-000000000001",
+              grpcAddr: "10.0.0.1:7450",
+              nodeId: "node-a",
+              rangeStart: "",
+              rangeEnd: "8000000000000000",
+            },
+            {
+              shardId: "00000000-0000-0000-0000-000000000002",
+              grpcAddr: "10.0.0.2:7450",
+              nodeId: "node-b",
+              rangeStart: "8000000000000000",
+              rangeEnd: "",
+            },
+          ],
+          thisNodeId: "node-a",
+          thisGrpcAddr: "10.0.0.1:7450",
+        }),
+      });
+
+      const connections = (client as any)._connections as Map<string, any>;
+      const conn = connections.values().next().value;
+      conn.client.getClusterInfo = mockGetClusterInfo;
+
+      await client.refreshTopology();
+
+      // Should have connections to initial server + two discovered pod IPs
+      expect(connections.has("localhost:7450")).toBe(true);
+      expect(connections.has("10.0.0.1:7450")).toBe(true);
+      expect(connections.has("10.0.0.2:7450")).toBe(true);
+
+      // Now simulate pod restart: node-b gets new IP 10.0.0.3
+      // The response comes from the initial server (localhost:7450)
+      const updatedMock = vi.fn().mockReturnValue({
+        response: Promise.resolve({
+          numShards: 2,
+          shardOwners: [
+            {
+              shardId: "00000000-0000-0000-0000-000000000001",
+              grpcAddr: "10.0.0.1:7450",
+              nodeId: "node-a",
+              rangeStart: "",
+              rangeEnd: "8000000000000000",
+            },
+            {
+              shardId: "00000000-0000-0000-0000-000000000002",
+              grpcAddr: "10.0.0.3:7450",
+              nodeId: "node-b",
+              rangeStart: "8000000000000000",
+              rangeEnd: "",
+            },
+          ],
+          thisNodeId: "node-a",
+          thisGrpcAddr: "10.0.0.1:7450",
+        }),
+      });
+
+      // The refresh will try connections in order. Mock all of them to use the updated response.
+      for (const [, c] of connections) {
+        c.client.getClusterInfo = updatedMock;
+      }
+
+      await client.refreshTopology();
+
+      // Old pod IP should be removed
+      expect(connections.has("10.0.0.2:7450")).toBe(false);
+      // New pod IP should be present
+      expect(connections.has("10.0.0.3:7450")).toBe(true);
+      // Initial server should be preserved (never cleaned up)
+      expect(connections.has("localhost:7450")).toBe(true);
+      // Still-active server should be preserved
+      expect(connections.has("10.0.0.1:7450")).toBe(true);
+    });
+
+    it("preserves initial server connections even when not in topology response", async () => {
+      // The initial DNS-based server might not appear in the topology
+      // (the topology response uses pod IPs), but we should keep it
+      const mockGetClusterInfo = vi.fn().mockReturnValue({
+        response: Promise.resolve({
+          numShards: 1,
+          shardOwners: [
+            {
+              shardId: "00000000-0000-0000-0000-000000000001",
+              grpcAddr: "10.0.0.1:7450",
+              nodeId: "node-a",
+              rangeStart: "",
+              rangeEnd: "",
+            },
+          ],
+          thisNodeId: "node-a",
+          thisGrpcAddr: "10.0.0.1:7450",
+        }),
+      });
+
+      const connections = (client as any)._connections as Map<string, any>;
+      const conn = connections.values().next().value;
+      conn.client.getClusterInfo = mockGetClusterInfo;
+
+      await client.refreshTopology();
+
+      // localhost:7450 is the initial server and should be kept even though
+      // the topology only references 10.0.0.1:7450
+      expect(connections.has("localhost:7450")).toBe(true);
+      expect(connections.has("10.0.0.1:7450")).toBe(true);
+    });
+
+    it("closes transport on stale connections during cleanup", async () => {
+      const mockGetClusterInfo = vi.fn().mockReturnValue({
+        response: Promise.resolve({
+          numShards: 1,
+          shardOwners: [
+            {
+              shardId: "00000000-0000-0000-0000-000000000001",
+              grpcAddr: "10.0.0.1:7450",
+              nodeId: "node-a",
+              rangeStart: "",
+              rangeEnd: "",
+            },
+          ],
+          thisNodeId: "node-a",
+          thisGrpcAddr: "10.0.0.1:7450",
+        }),
+      });
+
+      const connections = (client as any)._connections as Map<string, any>;
+      const conn = connections.values().next().value;
+      conn.client.getClusterInfo = mockGetClusterInfo;
+
+      // First refresh: discover 10.0.0.1
+      await client.refreshTopology();
+
+      // Grab a reference to the old connection and spy on its transport.close
+      const oldConn = connections.get("10.0.0.1:7450");
+      const closeSpy = vi.spyOn(oldConn.transport, "close");
+
+      // Second refresh: pod IP changed to 10.0.0.2
+      const updatedMock = vi.fn().mockReturnValue({
+        response: Promise.resolve({
+          numShards: 1,
+          shardOwners: [
+            {
+              shardId: "00000000-0000-0000-0000-000000000001",
+              grpcAddr: "10.0.0.2:7450",
+              nodeId: "node-a",
+              rangeStart: "",
+              rangeEnd: "",
+            },
+          ],
+          thisNodeId: "node-a",
+          thisGrpcAddr: "10.0.0.2:7450",
+        }),
+      });
+
+      // Mock the initial server's getClusterInfo since it will be tried first
+      const initialConn = connections.get("localhost:7450");
+      initialConn.client.getClusterInfo = updatedMock;
+
+      await client.refreshTopology();
+
+      // The old connection's transport should have been closed
+      expect(closeSpy).toHaveBeenCalled();
+      expect(connections.has("10.0.0.1:7450")).toBe(false);
+      expect(connections.has("10.0.0.2:7450")).toBe(true);
+    });
+  });
+
+  describe("Connectivity error retry with topology refresh", () => {
+    let client: SiloGRPCClient;
+
+    afterEach(() => {
+      client.close();
+    });
+
+    it("retries on a different server after UNAVAILABLE triggers topology refresh", async () => {
+      client = new SiloGRPCClient({
+        servers: "localhost:7450",
+        useTls: false,
+        shardRouting: {
+          maxRetries: 3,
+          retryDelayMs: 1,
+          topologyRefreshIntervalMs: 0,
+        },
+      });
+
+      // Set up initial topology: shard → server-a (stale pod IP)
+      (client as any)._shards = [
+        {
+          shardId: "00000000-0000-0000-0000-000000000001",
+          serverAddr: "10.0.0.1:7450",
+          rangeStart: "",
+          rangeEnd: "",
+        },
+      ];
+      (client as any)._shardToServer.set(
+        "00000000-0000-0000-0000-000000000001",
+        "10.0.0.1:7450",
+      );
+      (client as any)._topologyReady = true;
+
+      const connections = (client as any)._connections as Map<string, any>;
+
+      // Create connection to stale server-a that will return UNAVAILABLE
+      const staleConn = (client as any)._getOrCreateConnection("10.0.0.1:7450");
+      staleConn.client.enqueue = vi.fn().mockImplementation(() => {
+        throw new RpcError(
+          "connect ETIMEDOUT 10.0.0.1:7450",
+          "UNAVAILABLE",
+          {},
+        );
+      });
+
+      // Mock refreshTopology to simulate discovering the shard moved to server-b
+      let refreshCalled = false;
+      const originalRefresh = client.refreshTopology.bind(client);
+      (client as any).refreshTopology = vi.fn().mockImplementation(async () => {
+        refreshCalled = true;
+        // Update topology: shard now lives on server-b (new pod IP)
+        (client as any)._shards = [
+          {
+            shardId: "00000000-0000-0000-0000-000000000001",
+            serverAddr: "10.0.0.2:7450",
+            rangeStart: "",
+            rangeEnd: "",
+          },
+        ];
+        (client as any)._shardToServer.set(
+          "00000000-0000-0000-0000-000000000001",
+          "10.0.0.2:7450",
+        );
+
+        // Create connection to new server-b that succeeds
+        const newConn = (client as any)._getOrCreateConnection("10.0.0.2:7450");
+        newConn.client.enqueue = vi.fn().mockReturnValue({
+          response: Promise.resolve({ id: "job-success" }),
+        });
+      });
+
+      const handle = await client.enqueue({
+        tenant: "test-tenant",
+        payload: { test: true },
+        taskGroup: "default",
+      });
+
+      expect(handle.id).toBe("job-success");
+      expect(refreshCalled).toBe(true);
+      // The stale server should have been tried exactly once before refreshing
+      expect(staleConn.client.enqueue).toHaveBeenCalledTimes(1);
+    });
+
+    it("retries reportOutcome on a different server after UNAVAILABLE triggers topology refresh", async () => {
+      client = new SiloGRPCClient({
+        servers: "localhost:7450",
+        useTls: false,
+        shardRouting: {
+          maxRetries: 3,
+          retryDelayMs: 1,
+          topologyRefreshIntervalMs: 0,
+        },
+      });
+
+      const SHARD_ID = "00000000-0000-0000-0000-000000000001";
+
+      // Set up initial topology: shard → server-a
+      (client as any)._shards = [
+        {
+          shardId: SHARD_ID,
+          serverAddr: "10.0.0.1:7450",
+          rangeStart: "",
+          rangeEnd: "",
+        },
+      ];
+      (client as any)._shardToServer.set(SHARD_ID, "10.0.0.1:7450");
+      (client as any)._topologyReady = true;
+
+      // Create stale connection that returns UNAVAILABLE
+      const staleConn = (client as any)._getOrCreateConnection("10.0.0.1:7450");
+      staleConn.client.reportOutcome = vi.fn().mockImplementation(() => {
+        throw new RpcError(
+          "connect ETIMEDOUT 10.0.0.1:7450",
+          "UNAVAILABLE",
+          {},
+        );
+      });
+
+      // Mock refreshTopology to point shard to server-b
+      (client as any).refreshTopology = vi.fn().mockImplementation(async () => {
+        (client as any)._shardToServer.set(SHARD_ID, "10.0.0.2:7450");
+        const newConn = (client as any)._getOrCreateConnection("10.0.0.2:7450");
+        newConn.client.reportOutcome = vi.fn().mockReturnValue({
+          response: Promise.resolve({}),
+        });
+      });
+
+      await client.reportOutcome({
+        taskId: "task-1",
+        shard: SHARD_ID,
+        outcome: { type: "success", result: { ok: true } },
+      });
+
+      expect((client as any).refreshTopology).toHaveBeenCalled();
+      expect(staleConn.client.reportOutcome).toHaveBeenCalledTimes(1);
+    });
+
+    it("retries shard-routed leaseTasks on a different server after UNAVAILABLE", async () => {
+      client = new SiloGRPCClient({
+        servers: "localhost:7450",
+        useTls: false,
+        shardRouting: {
+          maxRetries: 3,
+          retryDelayMs: 1,
+          topologyRefreshIntervalMs: 0,
+        },
+      });
+
+      const SHARD_ID = "00000000-0000-0000-0000-000000000001";
+
+      // Set up initial topology: shard → server-a
+      (client as any)._shards = [
+        {
+          shardId: SHARD_ID,
+          serverAddr: "10.0.0.1:7450",
+          rangeStart: "",
+          rangeEnd: "",
+        },
+      ];
+      (client as any)._shardToServer.set(SHARD_ID, "10.0.0.1:7450");
+      (client as any)._topologyReady = true;
+
+      // Create stale connection that returns UNAVAILABLE
+      const staleConn = (client as any)._getOrCreateConnection("10.0.0.1:7450");
+      staleConn.client.leaseTasks = vi.fn().mockImplementation(() => {
+        throw new RpcError(
+          "connect ETIMEDOUT 10.0.0.1:7450",
+          "UNAVAILABLE",
+          {},
+        );
+      });
+
+      // Mock refreshTopology to point shard to server-b
+      (client as any).refreshTopology = vi.fn().mockImplementation(async () => {
+        (client as any)._shardToServer.set(SHARD_ID, "10.0.0.2:7450");
+        const newConn = (client as any)._getOrCreateConnection("10.0.0.2:7450");
+        newConn.client.leaseTasks = vi.fn().mockReturnValue({
+          response: Promise.resolve({ tasks: [], refreshTasks: [] }),
+        });
+      });
+
+      const result = await client.leaseTasks({
+        shard: SHARD_ID,
+        workerId: "worker-1",
+        maxTasks: 1,
+        taskGroup: "default",
+      });
+
+      expect(result.tasks).toEqual([]);
+      expect((client as any).refreshTopology).toHaveBeenCalled();
+      expect(staleConn.client.leaseTasks).toHaveBeenCalledTimes(1);
+    });
+
+    it("retries round-robin leaseTasks on a different server after UNAVAILABLE", async () => {
+      client = new SiloGRPCClient({
+        servers: "localhost:7450",
+        useTls: false,
+        shardRouting: {
+          maxRetries: 3,
+          retryDelayMs: 1,
+          topologyRefreshIntervalMs: 0,
+        },
+      });
+
+      // Set up topology with two servers
+      (client as any)._shards = [
+        {
+          shardId: "00000000-0000-0000-0000-000000000001",
+          serverAddr: "10.0.0.1:7450",
+          rangeStart: "",
+          rangeEnd: "8",
+        },
+        {
+          shardId: "00000000-0000-0000-0000-000000000002",
+          serverAddr: "10.0.0.2:7450",
+          rangeStart: "8",
+          rangeEnd: "",
+        },
+      ];
+      (client as any)._shardToServer.set(
+        "00000000-0000-0000-0000-000000000001",
+        "10.0.0.1:7450",
+      );
+      (client as any)._shardToServer.set(
+        "00000000-0000-0000-0000-000000000002",
+        "10.0.0.2:7450",
+      );
+      (client as any)._topologyReady = true;
+
+      // Clear the initial localhost connection so round-robin only sees our test servers
+      (client as any)._connections.clear();
+
+      // First server is dead
+      const deadConn = (client as any)._getOrCreateConnection("10.0.0.1:7450");
+      deadConn.client.leaseTasks = vi.fn().mockImplementation(() => {
+        throw new RpcError("connect ETIMEDOUT", "UNAVAILABLE", {});
+      });
+
+      // Second server is healthy
+      const healthyConn = (client as any)._getOrCreateConnection(
+        "10.0.0.2:7450",
+      );
+      healthyConn.client.leaseTasks = vi.fn().mockReturnValue({
+        response: Promise.resolve({ tasks: [], refreshTasks: [] }),
+      });
+
+      // Mock refreshTopology as no-op (topology is already correct, just need round-robin to advance)
+      (client as any).refreshTopology = vi.fn().mockResolvedValue(undefined);
+
+      // Force round-robin to start at the dead server
+      (client as any)._anyClientCounter = 0;
+
+      const result = await client.leaseTasks({
+        workerId: "worker-1",
+        maxTasks: 1,
+        taskGroup: "default",
+      });
+
+      expect(result.tasks).toEqual([]);
+      expect((client as any).refreshTopology).toHaveBeenCalled();
+      expect(deadConn.client.leaseTasks).toHaveBeenCalledTimes(1);
+    });
+
+    it("gives up after maxRetries even with UNAVAILABLE errors", async () => {
+      client = new SiloGRPCClient({
+        servers: "localhost:7450",
+        useTls: false,
+        shardRouting: {
+          maxRetries: 2,
+          retryDelayMs: 1,
+          topologyRefreshIntervalMs: 0,
+        },
+      });
+
+      // Set up topology
+      (client as any)._shards = [
+        {
+          shardId: "00000000-0000-0000-0000-000000000001",
+          serverAddr: "10.0.0.1:7450",
+          rangeStart: "",
+          rangeEnd: "",
+        },
+      ];
+      (client as any)._shardToServer.set(
+        "00000000-0000-0000-0000-000000000001",
+        "10.0.0.1:7450",
+      );
+      (client as any)._topologyReady = true;
+
+      // Every server always returns UNAVAILABLE
+      const staleConn = (client as any)._getOrCreateConnection("10.0.0.1:7450");
+      staleConn.client.enqueue = vi.fn().mockImplementation(() => {
+        throw new RpcError("connect ETIMEDOUT", "UNAVAILABLE", {});
+      });
+
+      // Topology refresh doesn't help — same broken server
+      (client as any).refreshTopology = vi.fn().mockResolvedValue(undefined);
+
+      await expect(
+        client.enqueue({
+          tenant: "test-tenant",
+          payload: { test: true },
+          taskGroup: "default",
+        }),
+      ).rejects.toThrow("connect ETIMEDOUT");
+
+      // Initial call + 2 retries = 3 total attempts
+      expect(staleConn.client.enqueue).toHaveBeenCalledTimes(3);
+    });
+
+    it("does not retry non-retryable errors like INVALID_ARGUMENT", async () => {
+      client = new SiloGRPCClient({
+        servers: "localhost:7450",
+        useTls: false,
+        shardRouting: {
+          maxRetries: 3,
+          retryDelayMs: 1,
+          topologyRefreshIntervalMs: 0,
+        },
+      });
+
+      (client as any)._shards = [
+        {
+          shardId: "00000000-0000-0000-0000-000000000001",
+          serverAddr: "localhost:7450",
+          rangeStart: "",
+          rangeEnd: "",
+        },
+      ];
+      (client as any)._shardToServer.set(
+        "00000000-0000-0000-0000-000000000001",
+        "localhost:7450",
+      );
+      (client as any)._topologyReady = true;
+
+      const connections = (client as any)._connections as Map<string, any>;
+      const conn = connections.values().next().value;
+      conn.client.enqueue = vi.fn().mockImplementation(() => {
+        throw new RpcError("invalid payload", "INVALID_ARGUMENT", {});
+      });
+
+      await expect(
+        client.enqueue({
+          tenant: "test-tenant",
+          payload: { test: true },
+          taskGroup: "default",
+        }),
+      ).rejects.toThrow("invalid payload");
+
+      // Should NOT retry — thrown immediately
+      expect(conn.client.enqueue).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -278,12 +1001,14 @@ describe("Shard Routing", () => {
         const serviceConfig = JSON.parse(grpcOptions["grpc.service_config"]);
         expect(serviceConfig.methodConfig).toBeDefined();
         expect(serviceConfig.methodConfig[0].retryPolicy).toBeDefined();
-        expect(serviceConfig.methodConfig[0].retryPolicy.retryableStatusCodes).toContain(
-          "UNAVAILABLE",
-        );
-        expect(serviceConfig.methodConfig[0].retryPolicy.retryableStatusCodes).toContain(
-          "RESOURCE_EXHAUSTED",
-        );
+        // UNAVAILABLE is NOT retried at the gRPC level — our application-level
+        // retry handles it with topology refresh for smarter re-routing
+        expect(
+          serviceConfig.methodConfig[0].retryPolicy.retryableStatusCodes,
+        ).not.toContain("UNAVAILABLE");
+        expect(
+          serviceConfig.methodConfig[0].retryPolicy.retryableStatusCodes,
+        ).toContain("RESOURCE_EXHAUSTED");
       } finally {
         client.close();
       }
@@ -339,7 +1064,10 @@ describe("Shard Routing", () => {
           rangeEnd: "",
         },
       ];
-      (c as any)._shardToServer.set("00000000-0000-0000-0000-000000000001", "localhost:7450");
+      (c as any)._shardToServer.set(
+        "00000000-0000-0000-0000-000000000001",
+        "localhost:7450",
+      );
       (c as any)._topologyReady = true;
     };
 
@@ -348,8 +1076,8 @@ describe("Shard Routing", () => {
         servers: "localhost:7450",
         useTls: false,
         shardRouting: {
-          maxWrongShardRetries: 3,
-          wrongShardRetryDelayMs: 1, // Fast retries for tests
+          maxRetries: 3,
+          retryDelayMs: 1, // Fast retries for tests
           topologyRefreshIntervalMs: 0,
         },
       });
@@ -384,7 +1112,9 @@ describe("Shard Routing", () => {
           "x-silo-shard-owner-node": "node-2",
         });
 
-        expect(error.meta?.["x-silo-shard-owner-addr"]).toBe("other-server:7450");
+        expect(error.meta?.["x-silo-shard-owner-addr"]).toBe(
+          "other-server:7450",
+        );
         expect(error.meta?.["x-silo-shard-owner-node"]).toBe("node-2");
       });
     });
@@ -420,7 +1150,7 @@ describe("Shard Routing", () => {
         expect(mockEnqueue).toHaveBeenCalledTimes(2);
       });
 
-      it("stops retrying after maxWrongShardRetries", async () => {
+      it("stops retrying after maxRetries", async () => {
         const mockEnqueue = vi.fn().mockImplementation(() => {
           throw new RpcError("shard not found", "NOT_FOUND", {});
         });
@@ -481,7 +1211,9 @@ describe("Shard Routing", () => {
         const conn = connections.values().next().value;
         conn.client.enqueue = mockEnqueue;
 
-        const originalGetOrCreate = (client as any)._getOrCreateConnection.bind(client);
+        const originalGetOrCreate = (client as any)._getOrCreateConnection.bind(
+          client,
+        );
         const getOrCreateSpy = vi.fn().mockImplementation((addr: string) => {
           const newConn = originalGetOrCreate(addr);
           newConn.client.enqueue = mockEnqueue;
@@ -577,7 +1309,10 @@ describe("Shard Routing", () => {
           rangeEnd: "",
         },
       ];
-      (c as any)._shardToServer.set("00000000-0000-0000-0000-000000000001", "localhost:7450");
+      (c as any)._shardToServer.set(
+        "00000000-0000-0000-0000-000000000001",
+        "localhost:7450",
+      );
       (c as any)._topologyReady = true;
     };
 
@@ -588,8 +1323,8 @@ describe("Shard Routing", () => {
         servers: "localhost:7450",
         useTls: false,
         shardRouting: {
-          maxWrongShardRetries: 3,
-          wrongShardRetryDelayMs: 1,
+          maxRetries: 3,
+          retryDelayMs: 1,
           topologyRefreshIntervalMs: 0,
         },
       });
@@ -654,7 +1389,7 @@ describe("Shard Routing", () => {
         expect(refreshSpy).toHaveBeenCalled();
       });
 
-      it("stops retrying after maxWrongShardRetries", async () => {
+      it("stops retrying after maxRetries", async () => {
         const mockReportOutcome = vi.fn().mockImplementation(() => {
           throw new RpcError("shard not found", "NOT_FOUND", {});
         });
@@ -721,7 +1456,7 @@ describe("Shard Routing", () => {
         expect(mockHeartbeat).toHaveBeenCalledTimes(2);
       });
 
-      it("stops retrying after maxWrongShardRetries", async () => {
+      it("stops retrying after maxRetries", async () => {
         const mockHeartbeat = vi.fn().mockImplementation(() => {
           throw new RpcError("shard not found", "NOT_FOUND", {});
         });
@@ -731,7 +1466,9 @@ describe("Shard Routing", () => {
         conn.client.heartbeat = mockHeartbeat;
         (client as any).refreshTopology = vi.fn().mockResolvedValue(undefined);
 
-        await expect(client.heartbeat("worker-1", "task-1", SHARD_ID)).rejects.toThrow();
+        await expect(
+          client.heartbeat("worker-1", "task-1", SHARD_ID),
+        ).rejects.toThrow();
 
         expect(mockHeartbeat).toHaveBeenCalledTimes(4);
       });
@@ -764,7 +1501,7 @@ describe("Shard Routing", () => {
         expect(mockReportRefreshOutcome).toHaveBeenCalledTimes(2);
       });
 
-      it("stops retrying after maxWrongShardRetries", async () => {
+      it("stops retrying after maxRetries", async () => {
         const mockReportRefreshOutcome = vi.fn().mockImplementation(() => {
           throw new RpcError("shard not found", "NOT_FOUND", {});
         });
