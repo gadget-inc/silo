@@ -765,6 +765,132 @@ describe("Shard Routing", () => {
       expect(staleConn.client.reportOutcome).toHaveBeenCalledTimes(1);
     });
 
+    it("retries shard-routed leaseTasks on a different server after UNAVAILABLE", async () => {
+      client = new SiloGRPCClient({
+        servers: "localhost:7450",
+        useTls: false,
+        shardRouting: {
+          maxRetries: 3,
+          retryDelayMs: 1,
+          topologyRefreshIntervalMs: 0,
+        },
+      });
+
+      const SHARD_ID = "00000000-0000-0000-0000-000000000001";
+
+      // Set up initial topology: shard → server-a
+      (client as any)._shards = [
+        {
+          shardId: SHARD_ID,
+          serverAddr: "10.0.0.1:7450",
+          rangeStart: "",
+          rangeEnd: "",
+        },
+      ];
+      (client as any)._shardToServer.set(SHARD_ID, "10.0.0.1:7450");
+      (client as any)._topologyReady = true;
+
+      // Create stale connection that returns UNAVAILABLE
+      const staleConn = (client as any)._getOrCreateConnection("10.0.0.1:7450");
+      staleConn.client.leaseTasks = vi.fn().mockImplementation(() => {
+        throw new RpcError(
+          "connect ETIMEDOUT 10.0.0.1:7450",
+          "UNAVAILABLE",
+          {},
+        );
+      });
+
+      // Mock refreshTopology to point shard to server-b
+      (client as any).refreshTopology = vi.fn().mockImplementation(async () => {
+        (client as any)._shardToServer.set(SHARD_ID, "10.0.0.2:7450");
+        const newConn = (client as any)._getOrCreateConnection("10.0.0.2:7450");
+        newConn.client.leaseTasks = vi.fn().mockReturnValue({
+          response: Promise.resolve({ tasks: [], refreshTasks: [] }),
+        });
+      });
+
+      const result = await client.leaseTasks({
+        shard: SHARD_ID,
+        workerId: "worker-1",
+        maxTasks: 1,
+        taskGroup: "default",
+      });
+
+      expect(result.tasks).toEqual([]);
+      expect((client as any).refreshTopology).toHaveBeenCalled();
+      expect(staleConn.client.leaseTasks).toHaveBeenCalledTimes(1);
+    });
+
+    it("retries round-robin leaseTasks on a different server after UNAVAILABLE", async () => {
+      client = new SiloGRPCClient({
+        servers: "localhost:7450",
+        useTls: false,
+        shardRouting: {
+          maxRetries: 3,
+          retryDelayMs: 1,
+          topologyRefreshIntervalMs: 0,
+        },
+      });
+
+      // Set up topology with two servers
+      (client as any)._shards = [
+        {
+          shardId: "00000000-0000-0000-0000-000000000001",
+          serverAddr: "10.0.0.1:7450",
+          rangeStart: "",
+          rangeEnd: "8",
+        },
+        {
+          shardId: "00000000-0000-0000-0000-000000000002",
+          serverAddr: "10.0.0.2:7450",
+          rangeStart: "8",
+          rangeEnd: "",
+        },
+      ];
+      (client as any)._shardToServer.set(
+        "00000000-0000-0000-0000-000000000001",
+        "10.0.0.1:7450",
+      );
+      (client as any)._shardToServer.set(
+        "00000000-0000-0000-0000-000000000002",
+        "10.0.0.2:7450",
+      );
+      (client as any)._topologyReady = true;
+
+      // Clear the initial localhost connection so round-robin only sees our test servers
+      (client as any)._connections.clear();
+
+      // First server is dead
+      const deadConn = (client as any)._getOrCreateConnection("10.0.0.1:7450");
+      deadConn.client.leaseTasks = vi.fn().mockImplementation(() => {
+        throw new RpcError("connect ETIMEDOUT", "UNAVAILABLE", {});
+      });
+
+      // Second server is healthy
+      const healthyConn = (client as any)._getOrCreateConnection(
+        "10.0.0.2:7450",
+      );
+      healthyConn.client.leaseTasks = vi.fn().mockReturnValue({
+        response: Promise.resolve({ tasks: [], refreshTasks: [] }),
+      });
+
+      // Mock refreshTopology as no-op (topology is already correct, just need round-robin to advance)
+      (client as any).refreshTopology = vi.fn().mockResolvedValue(undefined);
+
+      // Force round-robin to start at the dead server
+      (client as any)._anyClientCounter = 0;
+
+      const result = await client.leaseTasks({
+        workerId: "worker-1",
+        maxTasks: 1,
+        taskGroup: "default",
+      });
+
+      expect(result.tasks).toEqual([]);
+      expect((client as any).refreshTopology).toHaveBeenCalled();
+      expect(deadConn.client.leaseTasks).toHaveBeenCalledTimes(1);
+    });
+
     it("gives up after maxRetries even with UNAVAILABLE errors", async () => {
       client = new SiloGRPCClient({
         servers: "localhost:7450",

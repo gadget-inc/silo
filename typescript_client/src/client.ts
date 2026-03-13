@@ -1476,17 +1476,17 @@ export class SiloGRPCClient {
   }
 
   /**
-   * Execute an operation with retry on wrong-shard and connectivity errors.
+   * Core retry loop for wrong-shard and connectivity errors.
+   * Handles redirect metadata, topology refresh, and exponential backoff.
    * @internal
    */
-  private async _withShardRetry<T>(
-    tenant: string | undefined,
+  private async _retryLoop<T>(
+    resolveClient: () => { client: SiloClient; shard: string },
     operation: (client: SiloClient, shard: string) => Promise<T>,
   ): Promise<T> {
-    await this._ensureTopology();
     let lastError: unknown;
     let delay = this._retryDelayMs;
-    let { client, shard } = this._getClientForTenant(tenant);
+    let { client, shard } = resolveClient();
 
     for (let attempt = 0; attempt <= this._maxRetries; attempt++) {
       try {
@@ -1512,9 +1512,7 @@ export class SiloGRPCClient {
             // Connectivity error or wrong shard without redirect — refresh
             // topology so the retry can reach a different server
             await this.refreshTopology();
-            const result = this._getClientForTenant(tenant);
-            client = result.client;
-            shard = result.shard;
+            ({ client, shard } = resolveClient());
           }
 
           // Wait with exponential backoff before retrying
@@ -1530,6 +1528,18 @@ export class SiloGRPCClient {
   }
 
   /**
+   * Execute an operation with retry on wrong-shard and connectivity errors.
+   * @internal
+   */
+  private async _withShardRetry<T>(
+    tenant: string | undefined,
+    operation: (client: SiloClient, shard: string) => Promise<T>,
+  ): Promise<T> {
+    await this._ensureTopology();
+    return this._retryLoop(() => this._getClientForTenant(tenant), operation);
+  }
+
+  /**
    * Execute an operation with retry on wrong-shard and connectivity errors, using a known shard ID.
    * Used by shard-routed operations (reportOutcome, heartbeat, reportRefreshOutcome)
    * where the shard ID is already known from the task, rather than resolved from a tenant.
@@ -1539,47 +1549,10 @@ export class SiloGRPCClient {
     shardId: string,
     operation: (client: SiloClient) => Promise<T>,
   ): Promise<T> {
-    let lastError: unknown;
-    let delay = this._retryDelayMs;
-    let client = this._getClientForShard(shardId);
-
-    for (let attempt = 0; attempt <= this._maxRetries; attempt++) {
-      try {
-        return await operation(client);
-      } catch (error) {
-        if (
-          (isWrongShardError(error) || isConnectivityError(error)) &&
-          attempt < this._maxRetries
-        ) {
-          lastError = error;
-
-          // Check for redirect address in metadata (only on wrong shard errors)
-          const redirectAddr = isWrongShardError(error)
-            ? extractRedirectAddress(error)
-            : undefined;
-          if (redirectAddr) {
-            // Update routing and create connection to new server
-            const mappedAddr = this._mapAddress(redirectAddr);
-            this._shardToServer.set(shardId, mappedAddr);
-            const conn = this._getOrCreateConnection(mappedAddr);
-            client = conn.client;
-          } else {
-            // Connectivity error or wrong shard without redirect — refresh
-            // topology so the retry can reach a different server
-            await this.refreshTopology();
-            client = this._getClientForShard(shardId);
-          }
-
-          // Wait with exponential backoff before retrying
-          await sleep(delay);
-          delay = Math.min(delay * 2, 5000); // Cap at 5 seconds
-          continue;
-        }
-        throw error;
-      }
-    }
-    // Should not reach here, but throw last error if we do
-    throw lastError;
+    return this._retryLoop(
+      () => ({ client: this._getClientForShard(shardId), shard: shardId }),
+      (client) => operation(client),
+    );
   }
 
   /**
@@ -2074,17 +2047,9 @@ export class SiloGRPCClient {
     options: LeaseTasksOptions,
     serverIndex?: number,
   ): Promise<LeaseTasksResult> {
-    try {
-      // If shard is specified, route to that shard's server
-      // Otherwise, use round-robin server selection. If serverIndex is provided,
-      // use it for per-worker round-robin (avoids lock-step with shared counter).
-      const client =
-        options.shard !== undefined
-          ? this._getClientForShard(options.shard)
-          : serverIndex !== undefined
-            ? this._getClientAtIndex(serverIndex)
-            : this._getAnyClient();
-
+    const executeLeaseRpc = async (
+      client: SiloClient,
+    ): Promise<LeaseTasksResult> => {
       const call = client.leaseTasks(
         {
           shard: options.shard,
@@ -2110,10 +2075,31 @@ export class SiloGRPCClient {
         tenant: rt.tenantId,
       }));
 
-      return {
-        tasks: response.tasks,
-        refreshTasks,
-      };
+      return { tasks: response.tasks, refreshTasks };
+    };
+
+    try {
+      if (options.shard !== undefined) {
+        // Shard-routed: use standard shard retry for redirect + connectivity handling
+        return await this._withShardRetryForShard(
+          options.shard,
+          executeLeaseRpc,
+        );
+      }
+
+      // Round-robin: retry with topology refresh on connectivity errors.
+      // Each call to the resolver picks the next server via the round-robin
+      // counter (_getAnyClient) or the fixed worker index.
+      return await this._retryLoop(
+        () => {
+          const client =
+            serverIndex !== undefined
+              ? this._getClientAtIndex(serverIndex)
+              : this._getAnyClient();
+          return { client, shard: "" };
+        },
+        (client) => executeLeaseRpc(client),
+      );
     } catch (error) {
       throwMappedRpcError(error, { operation: "leaseTasks" });
     }
