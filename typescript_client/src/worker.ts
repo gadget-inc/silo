@@ -1,3 +1,4 @@
+import type { Meter } from "@opentelemetry/api";
 import PQueue from "p-queue";
 import { serializeError } from "serialize-error";
 import type { Task as ProtoTask } from "./pb/silo";
@@ -9,6 +10,7 @@ import type {
   HeartbeatResult,
 } from "./client";
 import { Task, TaskExecution, transformTask } from "./TaskExecution";
+import { WorkerMetrics, getWorkerMeter } from "./metrics";
 
 /**
  * Context passed to task handlers with utilities for the current task.
@@ -179,6 +181,11 @@ export interface SiloWorkerOptions<
    * If not provided, errors are logged to console.error.
    */
   onError?: (error: Error, context?: { taskId?: string }) => void;
+  /**
+   * OpenTelemetry Meter to use for worker metrics.
+   * If not provided, the global MeterProvider is used.
+   */
+  meter?: Meter;
 }
 
 /**
@@ -251,6 +258,8 @@ export class SiloWorker<
   private _heartbeatIntervals: Map<string, ReturnType<typeof setInterval>> = new Map();
   /** Counter for per-worker round-robin server selection */
   private _pollCounter: number = 0;
+  /** OpenTelemetry metrics */
+  private readonly _metrics: WorkerMetrics;
 
   public constructor(options: SiloWorkerOptions<Payload, Metadata, Result>) {
     this._client = options.client;
@@ -271,6 +280,10 @@ export class SiloWorker<
 
     // Initialize the task queue with concurrency limit
     this._taskQueue = new PQueue({ concurrency: this._maxConcurrentTasks });
+
+    // Initialize metrics
+    const meter = getWorkerMeter(options.meter);
+    this._metrics = new WorkerMetrics(meter, () => this.availableTaskSlots);
   }
 
   /**
@@ -341,6 +354,20 @@ export class SiloWorker<
    */
   public get queuedTasks(): number {
     return this._taskQueue.size;
+  }
+
+  /**
+   * The number of task slots currently available (not active or queued).
+   */
+  public get availableTaskSlots(): number {
+    return this._maxConcurrentTasks - this._taskQueue.pending - this._taskQueue.size;
+  }
+
+  /**
+   * The OpenTelemetry metrics for this worker.
+   */
+  public get workerMetrics(): WorkerMetrics {
+    return this._metrics;
   }
 
   /**
@@ -454,6 +481,12 @@ export class SiloWorker<
       },
       serverIndex,
     );
+
+    // Record poll metrics
+    this._metrics.pollCounter.add(1);
+    if (result.tasks.length === 0 && result.refreshTasks.length === 0) {
+      this._metrics.emptyPollCounter.add(1);
+    }
 
     // Add regular job tasks to the queue
     for (const task of result.tasks) {

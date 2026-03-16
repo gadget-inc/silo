@@ -70,4 +70,5 @@ export {
   type GubernatorRateLimit,
 } from "./TaskExecution";
 export { JobHandle } from "./JobHandle";
+export { WorkerMetrics } from "./metrics";
 export type { RetryPolicy, Failure } from "./pb/silo";
