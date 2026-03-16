@@ -21,7 +21,7 @@
             <h2 class="text-sm font-semibold text-zinc-300">Tenant Overview</h2>
         </div>
         <div class="p-4">
-            {% if tenants.is_empty() %}
+            {% if tenants.is_empty() && page == 1 %}
             <div class="text-zinc-500 text-center py-8">No tenant activity found</div>
             {% else %}
             <div class="overflow-x-auto">
@@ -54,6 +54,27 @@
             </div>
             {% endif %}
         </div>
+
+        {% if total_pages > 1 %}
+        <div class="border-t border-zinc-700 px-4 py-3 flex items-center justify-between">
+            <div class="text-sm text-zinc-500">
+                Page {{ page }} of {{ total_pages }}
+            </div>
+            <div class="flex gap-2">
+                {% if page > 1 %}
+                <a href="/tenants?page={{ page - 1 }}&per_page={{ per_page }}" class="px-3 py-1 text-sm bg-zinc-700 text-zinc-300 hover:bg-zinc-600 border border-zinc-600">Previous</a>
+                {% else %}
+                <span class="px-3 py-1 text-sm bg-zinc-800 text-zinc-600 border border-zinc-700 cursor-not-allowed">Previous</span>
+                {% endif %}
+
+                {% if page < total_pages %}
+                <a href="/tenants?page={{ page + 1 }}&per_page={{ per_page }}" class="px-3 py-1 text-sm bg-zinc-700 text-zinc-300 hover:bg-zinc-600 border border-zinc-600">Next</a>
+                {% else %}
+                <span class="px-3 py-1 text-sm bg-zinc-800 text-zinc-600 border border-zinc-700 cursor-not-allowed">Next</span>
+                {% endif %}
+            </div>
+        </div>
+        {% endif %}
     </div>
 </div>
 {% endblock %}

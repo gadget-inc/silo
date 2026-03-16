@@ -273,6 +273,22 @@ struct ShardTemplate {
     split_error: Option<String>,
 }
 
+#[derive(serde::Deserialize)]
+pub struct TenantsParams {
+    #[serde(default = "default_page")]
+    page: usize,
+    #[serde(default = "default_per_page")]
+    per_page: usize,
+}
+
+fn default_page() -> usize {
+    1
+}
+
+fn default_per_page() -> usize {
+    50
+}
+
 #[derive(Template)]
 #[template(path = "tenants.html")]
 struct TenantsTemplate {
@@ -281,6 +297,9 @@ struct TenantsTemplate {
     tenants: Vec<TenantSummaryRow>,
     total_tenants: usize,
     total_jobs: usize,
+    page: usize,
+    per_page: usize,
+    total_pages: usize,
     error: Option<String>,
 }
 
@@ -1052,7 +1071,10 @@ async fn queue_handler(
     )
 }
 
-async fn tenants_handler(State(state): State<AppState>) -> impl IntoResponse {
+async fn tenants_handler(
+    State(state): State<AppState>,
+    Query(params): Query<TenantsParams>,
+) -> impl IntoResponse {
     if !state.config.tenancy.enabled {
         return Html(
             ErrorTemplate {
@@ -1109,7 +1131,7 @@ async fn tenants_handler(State(state): State<AppState>) -> impl IntoResponse {
                             let entry = status_by_tenant.entry(tenant).or_default();
                             entry.total += count;
                             match status {
-                                "Scheduled" => entry.scheduled += count,
+                                "Scheduled" | "Waiting" => entry.scheduled += count,
                                 "Running" => entry.running += count,
                                 "Succeeded" | "Failed" | "Cancelled" => entry.terminal += count,
                                 _ => {}
@@ -1215,8 +1237,9 @@ async fn tenants_handler(State(state): State<AppState>) -> impl IntoResponse {
     }
 
     tenants.sort_by(|a, b| {
-        b.job_count
-            .cmp(&a.job_count)
+        b.scheduled_count
+            .cmp(&a.scheduled_count)
+            .then_with(|| b.job_count.cmp(&a.job_count))
             .then_with(|| a.name.cmp(&b.name))
     });
 
@@ -1227,12 +1250,30 @@ async fn tenants_handler(State(state): State<AppState>) -> impl IntoResponse {
         Some(errors.join("\n"))
     };
 
+    // Pagination
+    let page = params.page.max(1);
+    let per_page = params.per_page.clamp(1, 500);
+    let total_pages = if total_tenants == 0 {
+        1
+    } else {
+        total_tenants.div_ceil(per_page)
+    };
+    let start = (page - 1) * per_page;
+    let paginated_tenants = if start < tenants.len() {
+        tenants[start..(start + per_page).min(tenants.len())].to_vec()
+    } else {
+        Vec::new()
+    };
+
     let template = TenantsTemplate {
         nav_active: "tenants",
         tenancy_enabled: true,
-        tenants,
+        tenants: paginated_tenants,
         total_tenants,
         total_jobs,
+        page,
+        per_page,
+        total_pages,
         error,
     };
 
@@ -1295,7 +1336,7 @@ async fn tenant_handler(
                             let count = counts_col.value(i).max(0) as usize;
                             counts.total += count;
                             match status {
-                                "Scheduled" => counts.scheduled += count,
+                                "Scheduled" | "Waiting" => counts.scheduled += count,
                                 "Running" => counts.running += count,
                                 "Succeeded" | "Failed" | "Cancelled" => counts.terminal += count,
                                 _ => {}
@@ -1383,7 +1424,7 @@ async fn tenant_handler(
     }
 
     let upcoming_sql = format!(
-        "SELECT shard_id, id, status_kind, priority, enqueue_time_ms FROM jobs WHERE tenant = '{}' AND status_kind = 'Scheduled' ORDER BY enqueue_time_ms ASC LIMIT 100",
+        "SELECT shard_id, id, status_kind, priority, enqueue_time_ms FROM jobs WHERE tenant = '{}' AND (status_kind = 'Scheduled' OR status_kind = 'Waiting') ORDER BY enqueue_time_ms ASC LIMIT 100",
         tenant_escaped
     );
     match state.query_engine.sql(&upcoming_sql).await {
