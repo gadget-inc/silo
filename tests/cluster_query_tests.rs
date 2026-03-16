@@ -1540,3 +1540,251 @@ async fn cluster_query_webui_style_no_tenant_filter() {
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 2, "Should see jobs from all tenants");
 }
+
+/// Verifies that the status_kind aggregation query (used by the tenants page)
+/// returns consistent results regardless of which scan path is used.
+///
+/// The bug: the status index fast path returned raw "Scheduled" from the index,
+/// while the standard path (used for SELECT *) applied display_status_kind which
+/// converts "Scheduled" to "Waiting" for jobs whose start time has passed.
+/// This caused the tenants page to show 0 scheduled jobs when the shard was remote.
+#[silo::test]
+async fn cluster_query_status_kind_consistent_between_scan_paths() {
+    let (_temps, factory, shard_map) = create_multi_shard_factory(1).await;
+    let now = now_ms();
+
+    let shard = get_shard(&factory, &shard_map, 0);
+
+    // Enqueue waiting jobs (start time in the past → "Waiting")
+    for i in 0..3 {
+        shard
+            .enqueue(
+                "tenant-a",
+                Some(format!("waiting-{}", i)),
+                10,
+                now - 5000,
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({})),
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue waiting");
+    }
+
+    // Enqueue future-scheduled jobs (start time in the future → "Scheduled")
+    for i in 0..2 {
+        shard
+            .enqueue(
+                "tenant-a",
+                Some(format!("future-{}", i)),
+                10,
+                now + 120_000,
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({})),
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue future");
+    }
+
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
+        .await
+        .expect("create engine");
+
+    // Query 1: Aggregation query (tenants page pattern) - uses status index fast path
+    // because DataFusion only projects tenant + status_kind for the GROUP BY
+    let agg_batches = query_collect(
+        &engine,
+        "SELECT tenant, status_kind, COUNT(*) as cnt FROM jobs GROUP BY tenant, status_kind ORDER BY status_kind",
+    )
+    .await;
+
+    let mut agg_counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for batch in &agg_batches {
+        let statuses = batch
+            .column_by_name("status_kind")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let counts = batch
+            .column_by_name("cnt")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            let status = if statuses.is_null(i) {
+                "null".to_string()
+            } else {
+                statuses.value(i).to_string()
+            };
+            *agg_counts.entry(status).or_default() += counts.value(i);
+        }
+    }
+
+    // Query 2: Full SELECT (remote shard pattern) - uses standard/fullscan path
+    // which goes through display_status_kind
+    let full_batches = query_collect(
+        &engine,
+        "SELECT status_kind FROM jobs WHERE tenant = 'tenant-a'",
+    )
+    .await;
+
+    let mut full_counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for batch in &full_batches {
+        let statuses = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            let status = if statuses.is_null(i) {
+                "null".to_string()
+            } else {
+                statuses.value(i).to_string()
+            };
+            *full_counts.entry(status).or_default() += 1;
+        }
+    }
+
+    // Both queries should produce the same status_kind distribution
+    assert_eq!(
+        agg_counts, full_counts,
+        "Status kind counts should be identical between aggregation (fast path) and full scan paths.\n\
+         Aggregation path: {:?}\n\
+         Full scan path: {:?}",
+        agg_counts, full_counts
+    );
+
+    // Specifically verify: 3 Waiting + 2 Scheduled = 5 total
+    assert_eq!(
+        agg_counts.get("Waiting").copied().unwrap_or(0),
+        3,
+        "Should have 3 Waiting jobs"
+    );
+    assert_eq!(
+        agg_counts.get("Scheduled").copied().unwrap_or(0),
+        2,
+        "Should have 2 Scheduled jobs"
+    );
+}
+
+/// Verifies the tenants page aggregation handles both Waiting and Scheduled statuses.
+/// This is the exact query pattern used by the tenants_handler.
+#[silo::test]
+async fn cluster_query_tenants_page_counts_all_scheduled_statuses() {
+    let (_temps, factory, shard_map) = create_multi_shard_factory(1).await;
+    let now = now_ms();
+
+    let shard = get_shard(&factory, &shard_map, 0);
+
+    // Tenant A: 3 waiting + 2 future-scheduled + 1 running
+    for i in 0..3 {
+        shard
+            .enqueue(
+                "tenant-a",
+                Some(format!("a-wait-{}", i)),
+                10,
+                now - 5000,
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({})),
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+    }
+    for i in 0..2 {
+        shard
+            .enqueue(
+                "tenant-a",
+                Some(format!("a-future-{}", i)),
+                10,
+                now + 120_000,
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({})),
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+    }
+    // Dequeue one to make it Running
+    shard
+        .dequeue("worker", "default", 1)
+        .await
+        .expect("dequeue");
+
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
+        .await
+        .expect("create engine");
+
+    // This is the exact query the tenants_handler uses
+    let batches = query_collect(
+        &engine,
+        "SELECT tenant, status_kind, COUNT(*) as cnt FROM jobs GROUP BY tenant, status_kind",
+    )
+    .await;
+
+    // Simulate the tenants_handler aggregation logic
+    let mut scheduled_count: i64 = 0;
+    let mut running_count: i64 = 0;
+    let mut total_count: i64 = 0;
+
+    for batch in &batches {
+        let statuses = batch
+            .column_by_name("status_kind")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let counts = batch
+            .column_by_name("cnt")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            let count = counts.value(i);
+            total_count += count;
+            let status = if statuses.is_null(i) {
+                ""
+            } else {
+                statuses.value(i)
+            };
+            match status {
+                "Scheduled" | "Waiting" => scheduled_count += count,
+                "Running" => running_count += count,
+                _ => {}
+            }
+        }
+    }
+
+    assert_eq!(
+        total_count, 5,
+        "Should have 5 total jobs (3 waiting + 2 future)"
+    );
+    // 2 waiting (3 enqueued - 1 dequeued) + 2 future-scheduled = 4
+    assert_eq!(
+        scheduled_count, 4,
+        "Should count both Waiting and Scheduled as scheduled. Got {} scheduled out of {} total",
+        scheduled_count, total_count
+    );
+    assert_eq!(running_count, 1, "Should have 1 running job");
+
+    // Verify: total = scheduled + running (no terminal jobs, nothing missing)
+    assert_eq!(
+        total_count,
+        scheduled_count + running_count,
+        "All jobs should be accounted for: total={} but scheduled+running={}",
+        total_count,
+        scheduled_count + running_count
+    );
+}

@@ -708,12 +708,24 @@ fn build_status_index_batch(
                     .map(|(_, id, _, _)| id.as_str())
                     .collect::<Vec<_>>(),
             )),
-            "status_kind" => Arc::new(StringArray::from(
-                chunk
-                    .iter()
-                    .map(|(_, _, sk, _)| Some(sk.as_str()))
-                    .collect::<Vec<_>>(),
-            )),
+            "status_kind" => {
+                // Apply the same Waiting/Scheduled logic as display_status_kind.
+                // For Scheduled jobs, the index timestamp is next_attempt_starts_after_ms
+                // (see status_index_timestamp). If that time has passed, the job is Waiting.
+                let now_ms = crate::job_store_shard::helpers::now_epoch_ms();
+                Arc::new(StringArray::from(
+                    chunk
+                        .iter()
+                        .map(|(_, _, sk, ts)| {
+                            if sk == "Scheduled" && *ts <= now_ms {
+                                Some("Waiting")
+                            } else {
+                                Some(sk.as_str())
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                ))
+            }
             "status_changed_at_ms" => Arc::new(Int64Array::from(
                 chunk
                     .iter()
