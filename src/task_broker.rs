@@ -268,9 +268,10 @@ impl TaskBroker {
                 }
 
                 // Adjust backoff: stay aggressive when buffer needs filling
-                if broker.buffer.len() < broker.target_buffer / 2 {
-                    sleep_ms = min_sleep_ms;
-                } else if inserted == 0 {
+                // AND the scan actually found tasks to insert. If the scan
+                // found nothing, back off even if the buffer is low — the DB
+                // is empty and there's no point hammering it at 200 scans/s.
+                if inserted == 0 {
                     sleep_ms = (sleep_ms * 2).min(max_sleep_ms);
                 } else {
                     sleep_ms = min_sleep_ms;
@@ -288,6 +289,9 @@ impl TaskBroker {
                 tokio::select! {
                     biased;
                     _ = broker.notify.notified() => {
+                        // Reset backoff on explicit wakeup so the next scan
+                        // runs aggressively (e.g. after a dequeue claim).
+                        sleep_ms = min_sleep_ms;
                         debug!("broker woken by notification");
                     }
                     _ = &mut delay => {},
