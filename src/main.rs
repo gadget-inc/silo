@@ -2,6 +2,7 @@ use clap::Parser;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{error, info};
 
 use silo::coordination::{Coordinator, create_coordinator};
@@ -221,7 +222,26 @@ async fn main() -> anyhow::Result<()> {
 
     shutdown_signal.await;
     let _ = shutdown_tx.send(());
-    let _ = server.await?;
+
+    // Drain the gRPC server: tonic's serve_with_incoming_shutdown sends HTTP/2
+    // GOAWAY to all connections and waits for in-flight RPCs to complete. Since
+    // all silo RPCs are quick unary operations, this should finish in < 1 second.
+    //
+    // However, tonic has no built-in drain timeout (hyperium/tonic#1820). If
+    // clients don't close connections after GOAWAY (e.g., keepalive issues,
+    // client bugs), the drain blocks indefinitely. The timeout is a safety net
+    // for these pathological cases.
+    const SERVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+    if tokio::time::timeout(SERVER_DRAIN_TIMEOUT, server)
+        .await
+        .is_err()
+    {
+        error!(
+            timeout_secs = SERVER_DRAIN_TIMEOUT.as_secs(),
+            "gRPC server drain timed out, proceeding with shutdown"
+        );
+    }
+
     if let Some(handle) = webui_handle {
         let _ = handle.await;
     }
