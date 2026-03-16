@@ -136,6 +136,20 @@ pub struct HolderRecord {
     pub granted_at_ms: i64,
 }
 
+/// Stored representation for a standalone concurrency holder record (0x0D prefix).
+#[derive(Debug, Clone)]
+pub struct StandaloneHolderRecord {
+    pub granted_at_ms: i64,
+    pub metadata: Vec<u8>,
+    pub priority: u8,
+}
+
+/// Stored representation for a standalone concurrency request record (0x0C prefix).
+#[derive(Debug, Clone)]
+pub struct StandaloneRequestRecord {
+    pub metadata: Vec<u8>,
+}
+
 /// Action stored at requests/<queue>/<time>/<request-id>
 #[derive(Debug, Clone)]
 pub enum ConcurrencyAction {

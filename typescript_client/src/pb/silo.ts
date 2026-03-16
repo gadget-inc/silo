@@ -1568,6 +1568,258 @@ export interface ForceReleaseShardResponse {
     released: boolean; // True if the lease was released.
 }
 /**
+ * A participant that was promoted from the request queue to a holder.
+ *
+ * @generated from protobuf message silo.v1.StandalonePromotedParticipant
+ */
+export interface StandalonePromotedParticipant {
+    /**
+     * @generated from protobuf field: string participant_id = 1
+     */
+    participantId: string;
+    /**
+     * @generated from protobuf field: bytes metadata = 2
+     */
+    metadata: Uint8Array;
+}
+/**
+ * Request to acquire a standalone concurrency ticket.
+ *
+ * @generated from protobuf message silo.v1.StandaloneAcquireTicketRequest
+ */
+export interface StandaloneAcquireTicketRequest {
+    /**
+     * @generated from protobuf field: string shard = 1
+     */
+    shard: string;
+    /**
+     * @generated from protobuf field: optional string tenant = 2
+     */
+    tenant?: string;
+    /**
+     * @generated from protobuf field: string queue = 3
+     */
+    queue: string;
+    /**
+     * @generated from protobuf field: string participant_id = 4
+     */
+    participantId: string;
+    /**
+     * @generated from protobuf field: uint32 max_concurrency = 5
+     */
+    maxConcurrency: number;
+    /**
+     * @generated from protobuf field: uint32 priority = 6
+     */
+    priority: number; // 0-255. Lower = higher priority, same as jobs.
+    /**
+     * @generated from protobuf field: bytes metadata = 7
+     */
+    metadata: Uint8Array; // Opaque blob stored with holder/request.
+}
+/**
+ * Response after attempting to acquire a standalone concurrency ticket.
+ *
+ * @generated from protobuf message silo.v1.StandaloneAcquireTicketResponse
+ */
+export interface StandaloneAcquireTicketResponse {
+    /**
+     * @generated from protobuf field: bool acquired = 1
+     */
+    acquired: boolean; // Whether this participant was promoted to holder.
+    /**
+     * @generated from protobuf field: repeated silo.v1.StandalonePromotedParticipant promoted = 2
+     */
+    promoted: StandalonePromotedParticipant[]; // OTHER promoted participants (not self).
+}
+/**
+ * Request to release a standalone concurrency ticket.
+ *
+ * @generated from protobuf message silo.v1.StandaloneReleaseTicketRequest
+ */
+export interface StandaloneReleaseTicketRequest {
+    /**
+     * @generated from protobuf field: string shard = 1
+     */
+    shard: string;
+    /**
+     * @generated from protobuf field: optional string tenant = 2
+     */
+    tenant?: string;
+    /**
+     * @generated from protobuf field: string queue = 3
+     */
+    queue: string;
+    /**
+     * @generated from protobuf field: string participant_id = 4
+     */
+    participantId: string;
+    /**
+     * @generated from protobuf field: uint32 max_concurrency = 5
+     */
+    maxConcurrency: number;
+}
+/**
+ * Response after releasing a standalone concurrency ticket.
+ *
+ * @generated from protobuf message silo.v1.StandaloneReleaseTicketResponse
+ */
+export interface StandaloneReleaseTicketResponse {
+    /**
+     * @generated from protobuf field: bool was_held = 1
+     */
+    wasHeld: boolean; // Whether the participant was a holder (vs requester or not found).
+    /**
+     * @generated from protobuf field: repeated silo.v1.StandalonePromotedParticipant promoted = 2
+     */
+    promoted: StandalonePromotedParticipant[]; // Participants promoted after the release.
+}
+/**
+ * Request to list standalone concurrency holders.
+ *
+ * @generated from protobuf message silo.v1.StandaloneListHoldersRequest
+ */
+export interface StandaloneListHoldersRequest {
+    /**
+     * @generated from protobuf field: string shard = 1
+     */
+    shard: string;
+    /**
+     * @generated from protobuf field: optional string tenant = 2
+     */
+    tenant?: string;
+    /**
+     * @generated from protobuf field: string queue = 3
+     */
+    queue: string; // Optional: empty = all queues for tenant.
+    /**
+     * @generated from protobuf field: uint32 page_size = 4
+     */
+    pageSize: number;
+    /**
+     * @generated from protobuf field: bytes cursor = 5
+     */
+    cursor: Uint8Array;
+}
+/**
+ * A single standalone concurrency holder entry.
+ *
+ * @generated from protobuf message silo.v1.StandaloneHolder
+ */
+export interface StandaloneHolder {
+    /**
+     * @generated from protobuf field: string tenant = 1
+     */
+    tenant: string;
+    /**
+     * @generated from protobuf field: string queue = 2
+     */
+    queue: string;
+    /**
+     * @generated from protobuf field: string participant_id = 3
+     */
+    participantId: string;
+    /**
+     * @generated from protobuf field: bytes metadata = 4
+     */
+    metadata: Uint8Array;
+    /**
+     * @generated from protobuf field: int64 granted_at_ms = 5
+     */
+    grantedAtMs: bigint;
+    /**
+     * @generated from protobuf field: uint32 priority = 6
+     */
+    priority: number;
+}
+/**
+ * Response listing standalone concurrency holders.
+ *
+ * @generated from protobuf message silo.v1.StandaloneListHoldersResponse
+ */
+export interface StandaloneListHoldersResponse {
+    /**
+     * @generated from protobuf field: repeated silo.v1.StandaloneHolder holders = 1
+     */
+    holders: StandaloneHolder[];
+    /**
+     * @generated from protobuf field: bytes next_cursor = 2
+     */
+    nextCursor: Uint8Array; // Empty when exhausted.
+}
+/**
+ * Request to force-release a standalone concurrency ticket (admin/break-glass).
+ *
+ * @generated from protobuf message silo.v1.StandaloneForceReleaseTicketRequest
+ */
+export interface StandaloneForceReleaseTicketRequest {
+    /**
+     * @generated from protobuf field: string shard = 1
+     */
+    shard: string;
+    /**
+     * @generated from protobuf field: optional string tenant = 2
+     */
+    tenant?: string;
+    /**
+     * @generated from protobuf field: string queue = 3
+     */
+    queue: string;
+    /**
+     * @generated from protobuf field: string participant_id = 4
+     */
+    participantId: string;
+    /**
+     * @generated from protobuf field: uint32 max_concurrency = 5
+     */
+    maxConcurrency: number;
+}
+/**
+ * Response after force-releasing a standalone concurrency ticket.
+ *
+ * @generated from protobuf message silo.v1.StandaloneForceReleaseTicketResponse
+ */
+export interface StandaloneForceReleaseTicketResponse {
+    /**
+     * @generated from protobuf field: bool was_held = 1
+     */
+    wasHeld: boolean;
+    /**
+     * @generated from protobuf field: repeated silo.v1.StandalonePromotedParticipant promoted = 2
+     */
+    promoted: StandalonePromotedParticipant[];
+}
+/**
+ * Request to force-admit all pending requesters regardless of max_concurrency (break-glass).
+ *
+ * @generated from protobuf message silo.v1.StandaloneForceAdmitRequestersRequest
+ */
+export interface StandaloneForceAdmitRequestersRequest {
+    /**
+     * @generated from protobuf field: string shard = 1
+     */
+    shard: string;
+    /**
+     * @generated from protobuf field: optional string tenant = 2
+     */
+    tenant?: string;
+    /**
+     * @generated from protobuf field: string queue = 3
+     */
+    queue: string;
+}
+/**
+ * Response after force-admitting all pending requesters.
+ *
+ * @generated from protobuf message silo.v1.StandaloneForceAdmitRequestersResponse
+ */
+export interface StandaloneForceAdmitRequestersResponse {
+    /**
+     * @generated from protobuf field: repeated silo.v1.StandalonePromotedParticipant admitted = 1
+     */
+    admitted: StandalonePromotedParticipant[];
+}
+/**
  * Rate limiting algorithm for Gubernator-based limits.
  *
  * @generated from protobuf enum silo.v1.GubernatorAlgorithm
@@ -6449,6 +6701,805 @@ class ForceReleaseShardResponse$Type extends MessageType<ForceReleaseShardRespon
  * @generated MessageType for protobuf message silo.v1.ForceReleaseShardResponse
  */
 export const ForceReleaseShardResponse = new ForceReleaseShardResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class StandalonePromotedParticipant$Type extends MessageType<StandalonePromotedParticipant> {
+    constructor() {
+        super("silo.v1.StandalonePromotedParticipant", [
+            { no: 1, name: "participant_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "metadata", kind: "scalar", T: 12 /*ScalarType.BYTES*/ }
+        ]);
+    }
+    create(value?: PartialMessage<StandalonePromotedParticipant>): StandalonePromotedParticipant {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.participantId = "";
+        message.metadata = new Uint8Array(0);
+        if (value !== undefined)
+            reflectionMergePartial<StandalonePromotedParticipant>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: StandalonePromotedParticipant): StandalonePromotedParticipant {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string participant_id */ 1:
+                    message.participantId = reader.string();
+                    break;
+                case /* bytes metadata */ 2:
+                    message.metadata = reader.bytes();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: StandalonePromotedParticipant, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string participant_id = 1; */
+        if (message.participantId !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.participantId);
+        /* bytes metadata = 2; */
+        if (message.metadata.length)
+            writer.tag(2, WireType.LengthDelimited).bytes(message.metadata);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.StandalonePromotedParticipant
+ */
+export const StandalonePromotedParticipant = new StandalonePromotedParticipant$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class StandaloneAcquireTicketRequest$Type extends MessageType<StandaloneAcquireTicketRequest> {
+    constructor() {
+        super("silo.v1.StandaloneAcquireTicketRequest", [
+            { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
+            { no: 3, name: "queue", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 4, name: "participant_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 5, name: "max_concurrency", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
+            { no: 6, name: "priority", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
+            { no: 7, name: "metadata", kind: "scalar", T: 12 /*ScalarType.BYTES*/ }
+        ]);
+    }
+    create(value?: PartialMessage<StandaloneAcquireTicketRequest>): StandaloneAcquireTicketRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.shard = "";
+        message.queue = "";
+        message.participantId = "";
+        message.maxConcurrency = 0;
+        message.priority = 0;
+        message.metadata = new Uint8Array(0);
+        if (value !== undefined)
+            reflectionMergePartial<StandaloneAcquireTicketRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: StandaloneAcquireTicketRequest): StandaloneAcquireTicketRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string shard */ 1:
+                    message.shard = reader.string();
+                    break;
+                case /* optional string tenant */ 2:
+                    message.tenant = reader.string();
+                    break;
+                case /* string queue */ 3:
+                    message.queue = reader.string();
+                    break;
+                case /* string participant_id */ 4:
+                    message.participantId = reader.string();
+                    break;
+                case /* uint32 max_concurrency */ 5:
+                    message.maxConcurrency = reader.uint32();
+                    break;
+                case /* uint32 priority */ 6:
+                    message.priority = reader.uint32();
+                    break;
+                case /* bytes metadata */ 7:
+                    message.metadata = reader.bytes();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: StandaloneAcquireTicketRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string shard = 1; */
+        if (message.shard !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.shard);
+        /* optional string tenant = 2; */
+        if (message.tenant !== undefined)
+            writer.tag(2, WireType.LengthDelimited).string(message.tenant);
+        /* string queue = 3; */
+        if (message.queue !== "")
+            writer.tag(3, WireType.LengthDelimited).string(message.queue);
+        /* string participant_id = 4; */
+        if (message.participantId !== "")
+            writer.tag(4, WireType.LengthDelimited).string(message.participantId);
+        /* uint32 max_concurrency = 5; */
+        if (message.maxConcurrency !== 0)
+            writer.tag(5, WireType.Varint).uint32(message.maxConcurrency);
+        /* uint32 priority = 6; */
+        if (message.priority !== 0)
+            writer.tag(6, WireType.Varint).uint32(message.priority);
+        /* bytes metadata = 7; */
+        if (message.metadata.length)
+            writer.tag(7, WireType.LengthDelimited).bytes(message.metadata);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.StandaloneAcquireTicketRequest
+ */
+export const StandaloneAcquireTicketRequest = new StandaloneAcquireTicketRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class StandaloneAcquireTicketResponse$Type extends MessageType<StandaloneAcquireTicketResponse> {
+    constructor() {
+        super("silo.v1.StandaloneAcquireTicketResponse", [
+            { no: 1, name: "acquired", kind: "scalar", T: 8 /*ScalarType.BOOL*/ },
+            { no: 2, name: "promoted", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => StandalonePromotedParticipant }
+        ]);
+    }
+    create(value?: PartialMessage<StandaloneAcquireTicketResponse>): StandaloneAcquireTicketResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.acquired = false;
+        message.promoted = [];
+        if (value !== undefined)
+            reflectionMergePartial<StandaloneAcquireTicketResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: StandaloneAcquireTicketResponse): StandaloneAcquireTicketResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* bool acquired */ 1:
+                    message.acquired = reader.bool();
+                    break;
+                case /* repeated silo.v1.StandalonePromotedParticipant promoted */ 2:
+                    message.promoted.push(StandalonePromotedParticipant.internalBinaryRead(reader, reader.uint32(), options));
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: StandaloneAcquireTicketResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* bool acquired = 1; */
+        if (message.acquired !== false)
+            writer.tag(1, WireType.Varint).bool(message.acquired);
+        /* repeated silo.v1.StandalonePromotedParticipant promoted = 2; */
+        for (let i = 0; i < message.promoted.length; i++)
+            StandalonePromotedParticipant.internalBinaryWrite(message.promoted[i], writer.tag(2, WireType.LengthDelimited).fork(), options).join();
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.StandaloneAcquireTicketResponse
+ */
+export const StandaloneAcquireTicketResponse = new StandaloneAcquireTicketResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class StandaloneReleaseTicketRequest$Type extends MessageType<StandaloneReleaseTicketRequest> {
+    constructor() {
+        super("silo.v1.StandaloneReleaseTicketRequest", [
+            { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
+            { no: 3, name: "queue", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 4, name: "participant_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 5, name: "max_concurrency", kind: "scalar", T: 13 /*ScalarType.UINT32*/ }
+        ]);
+    }
+    create(value?: PartialMessage<StandaloneReleaseTicketRequest>): StandaloneReleaseTicketRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.shard = "";
+        message.queue = "";
+        message.participantId = "";
+        message.maxConcurrency = 0;
+        if (value !== undefined)
+            reflectionMergePartial<StandaloneReleaseTicketRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: StandaloneReleaseTicketRequest): StandaloneReleaseTicketRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string shard */ 1:
+                    message.shard = reader.string();
+                    break;
+                case /* optional string tenant */ 2:
+                    message.tenant = reader.string();
+                    break;
+                case /* string queue */ 3:
+                    message.queue = reader.string();
+                    break;
+                case /* string participant_id */ 4:
+                    message.participantId = reader.string();
+                    break;
+                case /* uint32 max_concurrency */ 5:
+                    message.maxConcurrency = reader.uint32();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: StandaloneReleaseTicketRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string shard = 1; */
+        if (message.shard !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.shard);
+        /* optional string tenant = 2; */
+        if (message.tenant !== undefined)
+            writer.tag(2, WireType.LengthDelimited).string(message.tenant);
+        /* string queue = 3; */
+        if (message.queue !== "")
+            writer.tag(3, WireType.LengthDelimited).string(message.queue);
+        /* string participant_id = 4; */
+        if (message.participantId !== "")
+            writer.tag(4, WireType.LengthDelimited).string(message.participantId);
+        /* uint32 max_concurrency = 5; */
+        if (message.maxConcurrency !== 0)
+            writer.tag(5, WireType.Varint).uint32(message.maxConcurrency);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.StandaloneReleaseTicketRequest
+ */
+export const StandaloneReleaseTicketRequest = new StandaloneReleaseTicketRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class StandaloneReleaseTicketResponse$Type extends MessageType<StandaloneReleaseTicketResponse> {
+    constructor() {
+        super("silo.v1.StandaloneReleaseTicketResponse", [
+            { no: 1, name: "was_held", kind: "scalar", T: 8 /*ScalarType.BOOL*/ },
+            { no: 2, name: "promoted", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => StandalonePromotedParticipant }
+        ]);
+    }
+    create(value?: PartialMessage<StandaloneReleaseTicketResponse>): StandaloneReleaseTicketResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.wasHeld = false;
+        message.promoted = [];
+        if (value !== undefined)
+            reflectionMergePartial<StandaloneReleaseTicketResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: StandaloneReleaseTicketResponse): StandaloneReleaseTicketResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* bool was_held */ 1:
+                    message.wasHeld = reader.bool();
+                    break;
+                case /* repeated silo.v1.StandalonePromotedParticipant promoted */ 2:
+                    message.promoted.push(StandalonePromotedParticipant.internalBinaryRead(reader, reader.uint32(), options));
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: StandaloneReleaseTicketResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* bool was_held = 1; */
+        if (message.wasHeld !== false)
+            writer.tag(1, WireType.Varint).bool(message.wasHeld);
+        /* repeated silo.v1.StandalonePromotedParticipant promoted = 2; */
+        for (let i = 0; i < message.promoted.length; i++)
+            StandalonePromotedParticipant.internalBinaryWrite(message.promoted[i], writer.tag(2, WireType.LengthDelimited).fork(), options).join();
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.StandaloneReleaseTicketResponse
+ */
+export const StandaloneReleaseTicketResponse = new StandaloneReleaseTicketResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class StandaloneListHoldersRequest$Type extends MessageType<StandaloneListHoldersRequest> {
+    constructor() {
+        super("silo.v1.StandaloneListHoldersRequest", [
+            { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
+            { no: 3, name: "queue", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 4, name: "page_size", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
+            { no: 5, name: "cursor", kind: "scalar", T: 12 /*ScalarType.BYTES*/ }
+        ]);
+    }
+    create(value?: PartialMessage<StandaloneListHoldersRequest>): StandaloneListHoldersRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.shard = "";
+        message.queue = "";
+        message.pageSize = 0;
+        message.cursor = new Uint8Array(0);
+        if (value !== undefined)
+            reflectionMergePartial<StandaloneListHoldersRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: StandaloneListHoldersRequest): StandaloneListHoldersRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string shard */ 1:
+                    message.shard = reader.string();
+                    break;
+                case /* optional string tenant */ 2:
+                    message.tenant = reader.string();
+                    break;
+                case /* string queue */ 3:
+                    message.queue = reader.string();
+                    break;
+                case /* uint32 page_size */ 4:
+                    message.pageSize = reader.uint32();
+                    break;
+                case /* bytes cursor */ 5:
+                    message.cursor = reader.bytes();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: StandaloneListHoldersRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string shard = 1; */
+        if (message.shard !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.shard);
+        /* optional string tenant = 2; */
+        if (message.tenant !== undefined)
+            writer.tag(2, WireType.LengthDelimited).string(message.tenant);
+        /* string queue = 3; */
+        if (message.queue !== "")
+            writer.tag(3, WireType.LengthDelimited).string(message.queue);
+        /* uint32 page_size = 4; */
+        if (message.pageSize !== 0)
+            writer.tag(4, WireType.Varint).uint32(message.pageSize);
+        /* bytes cursor = 5; */
+        if (message.cursor.length)
+            writer.tag(5, WireType.LengthDelimited).bytes(message.cursor);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.StandaloneListHoldersRequest
+ */
+export const StandaloneListHoldersRequest = new StandaloneListHoldersRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class StandaloneHolder$Type extends MessageType<StandaloneHolder> {
+    constructor() {
+        super("silo.v1.StandaloneHolder", [
+            { no: 1, name: "tenant", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "queue", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 3, name: "participant_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 4, name: "metadata", kind: "scalar", T: 12 /*ScalarType.BYTES*/ },
+            { no: 5, name: "granted_at_ms", kind: "scalar", T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 6, name: "priority", kind: "scalar", T: 13 /*ScalarType.UINT32*/ }
+        ]);
+    }
+    create(value?: PartialMessage<StandaloneHolder>): StandaloneHolder {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.tenant = "";
+        message.queue = "";
+        message.participantId = "";
+        message.metadata = new Uint8Array(0);
+        message.grantedAtMs = 0n;
+        message.priority = 0;
+        if (value !== undefined)
+            reflectionMergePartial<StandaloneHolder>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: StandaloneHolder): StandaloneHolder {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string tenant */ 1:
+                    message.tenant = reader.string();
+                    break;
+                case /* string queue */ 2:
+                    message.queue = reader.string();
+                    break;
+                case /* string participant_id */ 3:
+                    message.participantId = reader.string();
+                    break;
+                case /* bytes metadata */ 4:
+                    message.metadata = reader.bytes();
+                    break;
+                case /* int64 granted_at_ms */ 5:
+                    message.grantedAtMs = reader.int64().toBigInt();
+                    break;
+                case /* uint32 priority */ 6:
+                    message.priority = reader.uint32();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: StandaloneHolder, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string tenant = 1; */
+        if (message.tenant !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.tenant);
+        /* string queue = 2; */
+        if (message.queue !== "")
+            writer.tag(2, WireType.LengthDelimited).string(message.queue);
+        /* string participant_id = 3; */
+        if (message.participantId !== "")
+            writer.tag(3, WireType.LengthDelimited).string(message.participantId);
+        /* bytes metadata = 4; */
+        if (message.metadata.length)
+            writer.tag(4, WireType.LengthDelimited).bytes(message.metadata);
+        /* int64 granted_at_ms = 5; */
+        if (message.grantedAtMs !== 0n)
+            writer.tag(5, WireType.Varint).int64(message.grantedAtMs);
+        /* uint32 priority = 6; */
+        if (message.priority !== 0)
+            writer.tag(6, WireType.Varint).uint32(message.priority);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.StandaloneHolder
+ */
+export const StandaloneHolder = new StandaloneHolder$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class StandaloneListHoldersResponse$Type extends MessageType<StandaloneListHoldersResponse> {
+    constructor() {
+        super("silo.v1.StandaloneListHoldersResponse", [
+            { no: 1, name: "holders", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => StandaloneHolder },
+            { no: 2, name: "next_cursor", kind: "scalar", T: 12 /*ScalarType.BYTES*/ }
+        ]);
+    }
+    create(value?: PartialMessage<StandaloneListHoldersResponse>): StandaloneListHoldersResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.holders = [];
+        message.nextCursor = new Uint8Array(0);
+        if (value !== undefined)
+            reflectionMergePartial<StandaloneListHoldersResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: StandaloneListHoldersResponse): StandaloneListHoldersResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* repeated silo.v1.StandaloneHolder holders */ 1:
+                    message.holders.push(StandaloneHolder.internalBinaryRead(reader, reader.uint32(), options));
+                    break;
+                case /* bytes next_cursor */ 2:
+                    message.nextCursor = reader.bytes();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: StandaloneListHoldersResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* repeated silo.v1.StandaloneHolder holders = 1; */
+        for (let i = 0; i < message.holders.length; i++)
+            StandaloneHolder.internalBinaryWrite(message.holders[i], writer.tag(1, WireType.LengthDelimited).fork(), options).join();
+        /* bytes next_cursor = 2; */
+        if (message.nextCursor.length)
+            writer.tag(2, WireType.LengthDelimited).bytes(message.nextCursor);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.StandaloneListHoldersResponse
+ */
+export const StandaloneListHoldersResponse = new StandaloneListHoldersResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class StandaloneForceReleaseTicketRequest$Type extends MessageType<StandaloneForceReleaseTicketRequest> {
+    constructor() {
+        super("silo.v1.StandaloneForceReleaseTicketRequest", [
+            { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
+            { no: 3, name: "queue", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 4, name: "participant_id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 5, name: "max_concurrency", kind: "scalar", T: 13 /*ScalarType.UINT32*/ }
+        ]);
+    }
+    create(value?: PartialMessage<StandaloneForceReleaseTicketRequest>): StandaloneForceReleaseTicketRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.shard = "";
+        message.queue = "";
+        message.participantId = "";
+        message.maxConcurrency = 0;
+        if (value !== undefined)
+            reflectionMergePartial<StandaloneForceReleaseTicketRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: StandaloneForceReleaseTicketRequest): StandaloneForceReleaseTicketRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string shard */ 1:
+                    message.shard = reader.string();
+                    break;
+                case /* optional string tenant */ 2:
+                    message.tenant = reader.string();
+                    break;
+                case /* string queue */ 3:
+                    message.queue = reader.string();
+                    break;
+                case /* string participant_id */ 4:
+                    message.participantId = reader.string();
+                    break;
+                case /* uint32 max_concurrency */ 5:
+                    message.maxConcurrency = reader.uint32();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: StandaloneForceReleaseTicketRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string shard = 1; */
+        if (message.shard !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.shard);
+        /* optional string tenant = 2; */
+        if (message.tenant !== undefined)
+            writer.tag(2, WireType.LengthDelimited).string(message.tenant);
+        /* string queue = 3; */
+        if (message.queue !== "")
+            writer.tag(3, WireType.LengthDelimited).string(message.queue);
+        /* string participant_id = 4; */
+        if (message.participantId !== "")
+            writer.tag(4, WireType.LengthDelimited).string(message.participantId);
+        /* uint32 max_concurrency = 5; */
+        if (message.maxConcurrency !== 0)
+            writer.tag(5, WireType.Varint).uint32(message.maxConcurrency);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.StandaloneForceReleaseTicketRequest
+ */
+export const StandaloneForceReleaseTicketRequest = new StandaloneForceReleaseTicketRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class StandaloneForceReleaseTicketResponse$Type extends MessageType<StandaloneForceReleaseTicketResponse> {
+    constructor() {
+        super("silo.v1.StandaloneForceReleaseTicketResponse", [
+            { no: 1, name: "was_held", kind: "scalar", T: 8 /*ScalarType.BOOL*/ },
+            { no: 2, name: "promoted", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => StandalonePromotedParticipant }
+        ]);
+    }
+    create(value?: PartialMessage<StandaloneForceReleaseTicketResponse>): StandaloneForceReleaseTicketResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.wasHeld = false;
+        message.promoted = [];
+        if (value !== undefined)
+            reflectionMergePartial<StandaloneForceReleaseTicketResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: StandaloneForceReleaseTicketResponse): StandaloneForceReleaseTicketResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* bool was_held */ 1:
+                    message.wasHeld = reader.bool();
+                    break;
+                case /* repeated silo.v1.StandalonePromotedParticipant promoted */ 2:
+                    message.promoted.push(StandalonePromotedParticipant.internalBinaryRead(reader, reader.uint32(), options));
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: StandaloneForceReleaseTicketResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* bool was_held = 1; */
+        if (message.wasHeld !== false)
+            writer.tag(1, WireType.Varint).bool(message.wasHeld);
+        /* repeated silo.v1.StandalonePromotedParticipant promoted = 2; */
+        for (let i = 0; i < message.promoted.length; i++)
+            StandalonePromotedParticipant.internalBinaryWrite(message.promoted[i], writer.tag(2, WireType.LengthDelimited).fork(), options).join();
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.StandaloneForceReleaseTicketResponse
+ */
+export const StandaloneForceReleaseTicketResponse = new StandaloneForceReleaseTicketResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class StandaloneForceAdmitRequestersRequest$Type extends MessageType<StandaloneForceAdmitRequestersRequest> {
+    constructor() {
+        super("silo.v1.StandaloneForceAdmitRequestersRequest", [
+            { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
+            { no: 3, name: "queue", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value?: PartialMessage<StandaloneForceAdmitRequestersRequest>): StandaloneForceAdmitRequestersRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.shard = "";
+        message.queue = "";
+        if (value !== undefined)
+            reflectionMergePartial<StandaloneForceAdmitRequestersRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: StandaloneForceAdmitRequestersRequest): StandaloneForceAdmitRequestersRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string shard */ 1:
+                    message.shard = reader.string();
+                    break;
+                case /* optional string tenant */ 2:
+                    message.tenant = reader.string();
+                    break;
+                case /* string queue */ 3:
+                    message.queue = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: StandaloneForceAdmitRequestersRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string shard = 1; */
+        if (message.shard !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.shard);
+        /* optional string tenant = 2; */
+        if (message.tenant !== undefined)
+            writer.tag(2, WireType.LengthDelimited).string(message.tenant);
+        /* string queue = 3; */
+        if (message.queue !== "")
+            writer.tag(3, WireType.LengthDelimited).string(message.queue);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.StandaloneForceAdmitRequestersRequest
+ */
+export const StandaloneForceAdmitRequestersRequest = new StandaloneForceAdmitRequestersRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class StandaloneForceAdmitRequestersResponse$Type extends MessageType<StandaloneForceAdmitRequestersResponse> {
+    constructor() {
+        super("silo.v1.StandaloneForceAdmitRequestersResponse", [
+            { no: 1, name: "admitted", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => StandalonePromotedParticipant }
+        ]);
+    }
+    create(value?: PartialMessage<StandaloneForceAdmitRequestersResponse>): StandaloneForceAdmitRequestersResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.admitted = [];
+        if (value !== undefined)
+            reflectionMergePartial<StandaloneForceAdmitRequestersResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: StandaloneForceAdmitRequestersResponse): StandaloneForceAdmitRequestersResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* repeated silo.v1.StandalonePromotedParticipant admitted */ 1:
+                    message.admitted.push(StandalonePromotedParticipant.internalBinaryRead(reader, reader.uint32(), options));
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: StandaloneForceAdmitRequestersResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* repeated silo.v1.StandalonePromotedParticipant admitted = 1; */
+        for (let i = 0; i < message.admitted.length; i++)
+            StandalonePromotedParticipant.internalBinaryWrite(message.admitted[i], writer.tag(1, WireType.LengthDelimited).fork(), options).join();
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.StandaloneForceAdmitRequestersResponse
+ */
+export const StandaloneForceAdmitRequestersResponse = new StandaloneForceAdmitRequestersResponse$Type();
 /**
  * @generated ServiceType for protobuf service silo.v1.Silo
  */
@@ -6475,5 +7526,10 @@ export const Silo = new ServiceType("silo.v1.Silo", [
     { name: "ConfigureShard", options: {}, I: ConfigureShardRequest, O: ConfigureShardResponse },
     { name: "ImportJobs", options: {}, I: ImportJobsRequest, O: ImportJobsResponse },
     { name: "ResetShards", options: {}, I: ResetShardsRequest, O: ResetShardsResponse },
-    { name: "ForceReleaseShard", options: {}, I: ForceReleaseShardRequest, O: ForceReleaseShardResponse }
+    { name: "ForceReleaseShard", options: {}, I: ForceReleaseShardRequest, O: ForceReleaseShardResponse },
+    { name: "StandaloneAcquireTicket", options: {}, I: StandaloneAcquireTicketRequest, O: StandaloneAcquireTicketResponse },
+    { name: "StandaloneReleaseTicket", options: {}, I: StandaloneReleaseTicketRequest, O: StandaloneReleaseTicketResponse },
+    { name: "StandaloneListHolders", options: {}, I: StandaloneListHoldersRequest, O: StandaloneListHoldersResponse },
+    { name: "StandaloneForceReleaseTicket", options: {}, I: StandaloneForceReleaseTicketRequest, O: StandaloneForceReleaseTicketResponse },
+    { name: "StandaloneForceAdmitRequesters", options: {}, I: StandaloneForceAdmitRequestersRequest, O: StandaloneForceAdmitRequestersResponse }
 ]);

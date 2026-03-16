@@ -4,7 +4,10 @@ use flatbuffers::FlatBufferBuilder;
 use crate::fb::silo::fb;
 use crate::job::{FloatingLimitState, JobCancellation, JobInfo, JobStatus, JobStatusKind, Limit};
 use crate::job_attempt::{AttemptStatus, JobAttempt};
-use crate::task::{ConcurrencyAction, GubernatorRateLimitData, HolderRecord, LeaseRecord, Task};
+use crate::task::{
+    ConcurrencyAction, GubernatorRateLimitData, HolderRecord, LeaseRecord, StandaloneHolderRecord,
+    StandaloneRequestRecord, Task,
+};
 
 /// Error type for codec operations
 #[derive(Debug, Clone, thiserror::Error)]
@@ -457,6 +460,36 @@ pub fn encode_holder(holder: &HolderRecord) -> Vec<u8> {
         &mut builder,
         &fb::HolderRecordArgs {
             granted_at_ms: holder.granted_at_ms,
+        },
+    );
+    builder.finish(root, None);
+    builder.finished_data().to_vec()
+}
+
+#[inline]
+pub fn encode_standalone_holder(record: &StandaloneHolderRecord) -> Vec<u8> {
+    let mut builder = FlatBufferBuilder::with_capacity(64);
+    let metadata = builder.create_vector(&record.metadata);
+    let root = fb::StandaloneHolderRecord::create(
+        &mut builder,
+        &fb::StandaloneHolderRecordArgs {
+            granted_at_ms: record.granted_at_ms,
+            metadata: Some(metadata),
+            priority: record.priority,
+        },
+    );
+    builder.finish(root, None);
+    builder.finished_data().to_vec()
+}
+
+#[inline]
+pub fn encode_standalone_request(record: &StandaloneRequestRecord) -> Vec<u8> {
+    let mut builder = FlatBufferBuilder::with_capacity(64);
+    let metadata = builder.create_vector(&record.metadata);
+    let root = fb::StandaloneRequestRecord::create(
+        &mut builder,
+        &fb::StandaloneRequestRecordArgs {
+            metadata: Some(metadata),
         },
     );
     builder.finish(root, None);
@@ -978,6 +1011,34 @@ pub fn decode_holder_granted_at_ms(bytes: &[u8]) -> Result<i64, CodecError> {
     let h = flatbuffers::root::<fb::HolderRecord>(bytes)
         .map_err(|e| CodecError::Flatbuffer(e.to_string()))?;
     Ok(h.granted_at_ms())
+}
+
+// ---------------------------------------------------------------------------
+// Decode: StandaloneHolderRecord
+// ---------------------------------------------------------------------------
+
+#[inline]
+pub fn decode_standalone_holder(bytes: &[u8]) -> Result<StandaloneHolderRecord, CodecError> {
+    let h = flatbuffers::root::<fb::StandaloneHolderRecord>(bytes)
+        .map_err(|e| CodecError::Flatbuffer(e.to_string()))?;
+    Ok(StandaloneHolderRecord {
+        granted_at_ms: h.granted_at_ms(),
+        metadata: h.metadata().map(|v| v.iter().collect()).unwrap_or_default(),
+        priority: h.priority(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Decode: StandaloneRequestRecord
+// ---------------------------------------------------------------------------
+
+#[inline]
+pub fn decode_standalone_request(bytes: &[u8]) -> Result<StandaloneRequestRecord, CodecError> {
+    let r = flatbuffers::root::<fb::StandaloneRequestRecord>(bytes)
+        .map_err(|e| CodecError::Flatbuffer(e.to_string()))?;
+    Ok(StandaloneRequestRecord {
+        metadata: r.metadata().map(|v| v.iter().collect()).unwrap_or_default(),
+    })
 }
 
 // ---------------------------------------------------------------------------

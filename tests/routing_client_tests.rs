@@ -208,6 +208,41 @@ impl Silo for CountingClusterInfoService {
     ) -> Result<Response<ForceReleaseShardResponse>, Status> {
         Self::unimplemented("force_release_shard")
     }
+
+    async fn standalone_acquire_ticket(
+        &self,
+        _request: Request<StandaloneAcquireTicketRequest>,
+    ) -> Result<Response<StandaloneAcquireTicketResponse>, Status> {
+        Self::unimplemented("standalone_acquire_ticket")
+    }
+
+    async fn standalone_release_ticket(
+        &self,
+        _request: Request<StandaloneReleaseTicketRequest>,
+    ) -> Result<Response<StandaloneReleaseTicketResponse>, Status> {
+        Self::unimplemented("standalone_release_ticket")
+    }
+
+    async fn standalone_list_holders(
+        &self,
+        _request: Request<StandaloneListHoldersRequest>,
+    ) -> Result<Response<StandaloneListHoldersResponse>, Status> {
+        Self::unimplemented("standalone_list_holders")
+    }
+
+    async fn standalone_force_release_ticket(
+        &self,
+        _request: Request<StandaloneForceReleaseTicketRequest>,
+    ) -> Result<Response<StandaloneForceReleaseTicketResponse>, Status> {
+        Self::unimplemented("standalone_force_release_ticket")
+    }
+
+    async fn standalone_force_admit_requesters(
+        &self,
+        _request: Request<StandaloneForceAdmitRequestersRequest>,
+    ) -> Result<Response<StandaloneForceAdmitRequestersResponse>, Status> {
+        Self::unimplemented("standalone_force_admit_requesters")
+    }
 }
 
 async fn setup_counting_cluster_info_server(

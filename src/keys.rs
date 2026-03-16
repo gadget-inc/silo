@@ -31,7 +31,10 @@ pub(crate) mod prefix {
     pub const CLEANUP_STATUS: u8 = 0xF4;
     pub const SHARD_CREATED_AT: u8 = 0xF5;
     pub const CLEANUP_COMPLETED_AT: u8 = 0xF6;
+    pub const STANDALONE_CONCURRENCY_REQUEST: u8 = 0x0C;
+    pub const STANDALONE_CONCURRENCY_HOLDER: u8 = 0x0D;
     pub const COUNTER_CONCURRENCY_REQUESTERS: u8 = 0xF7;
+    pub const COUNTER_STANDALONE_CONCURRENCY_REQUESTERS: u8 = 0xF8;
 }
 
 /// Encode a key with its namespace prefix.
@@ -596,6 +599,157 @@ pub fn parse_concurrency_requester_counter_key(
 /// Uses storekey encoding for collision-safe (tenant, queue) pairing.
 pub fn concurrency_counts_key(tenant: &str, queue: &str) -> Vec<u8> {
     encode_vec(&(tenant, queue)).expect("storekey encoding should not fail")
+}
+
+// ---------------------------------------------------------------------------
+// Standalone concurrency request keys (0x0C)
+// ---------------------------------------------------------------------------
+
+/// Standalone concurrency request key.
+/// Ordered by priority (lower = higher priority), then request_time_ms (FIFO), then participant_id.
+pub fn standalone_concurrency_request_key(
+    tenant: &str,
+    queue: &str,
+    priority: u8,
+    request_time_ms: u64,
+    participant_id: &str,
+) -> Vec<u8> {
+    encode_with_prefix(
+        prefix::STANDALONE_CONCURRENCY_REQUEST,
+        &(tenant, queue, priority, request_time_ms, participant_id),
+    )
+}
+
+/// Prefix for scanning all standalone requests for a tenant/queue.
+pub fn standalone_concurrency_request_prefix(tenant: &str, queue: &str) -> Vec<u8> {
+    encode_with_prefix(prefix::STANDALONE_CONCURRENCY_REQUEST, &(tenant, queue))
+}
+
+/// Prefix for scanning all standalone requests for a tenant.
+pub fn standalone_concurrency_request_tenant_prefix(tenant: &str) -> Vec<u8> {
+    encode_with_prefix(prefix::STANDALONE_CONCURRENCY_REQUEST, &(tenant,))
+}
+
+/// Prefix for scanning all standalone requests (cross-tenant).
+pub fn standalone_concurrency_requests_all_prefix() -> Vec<u8> {
+    vec![prefix::STANDALONE_CONCURRENCY_REQUEST]
+}
+
+/// Parsed standalone concurrency request key components.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedStandaloneConcurrencyRequestKey {
+    pub tenant: String,
+    pub queue: String,
+    pub priority: u8,
+    pub request_time_ms: u64,
+    pub participant_id: String,
+}
+
+/// Parse a standalone concurrency request key back to its components.
+pub fn parse_standalone_concurrency_request_key(
+    key: &[u8],
+) -> Option<ParsedStandaloneConcurrencyRequestKey> {
+    if key.first() != Some(&prefix::STANDALONE_CONCURRENCY_REQUEST) {
+        return None;
+    }
+    let (tenant, queue, priority, request_time_ms, participant_id): (
+        String,
+        String,
+        u8,
+        u64,
+        String,
+    ) = decode(&key[1..]).ok()?;
+    Some(ParsedStandaloneConcurrencyRequestKey {
+        tenant,
+        queue,
+        priority,
+        request_time_ms,
+        participant_id,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Standalone concurrency holder keys (0x0D)
+// ---------------------------------------------------------------------------
+
+/// Standalone concurrency holder key.
+pub fn standalone_concurrency_holder_key(
+    tenant: &str,
+    queue: &str,
+    participant_id: &str,
+) -> Vec<u8> {
+    encode_with_prefix(
+        prefix::STANDALONE_CONCURRENCY_HOLDER,
+        &(tenant, queue, participant_id),
+    )
+}
+
+/// Prefix for scanning all standalone holders (cross-tenant).
+pub fn standalone_concurrency_holders_prefix() -> Vec<u8> {
+    vec![prefix::STANDALONE_CONCURRENCY_HOLDER]
+}
+
+/// Prefix for scanning all standalone holders for a tenant.
+pub fn standalone_concurrency_holders_tenant_prefix(tenant: &str) -> Vec<u8> {
+    encode_with_prefix(prefix::STANDALONE_CONCURRENCY_HOLDER, &(tenant,))
+}
+
+/// Prefix for scanning all standalone holders for a tenant/queue.
+pub fn standalone_concurrency_holders_queue_prefix(tenant: &str, queue: &str) -> Vec<u8> {
+    encode_with_prefix(prefix::STANDALONE_CONCURRENCY_HOLDER, &(tenant, queue))
+}
+
+/// Parsed standalone concurrency holder key components.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedStandaloneConcurrencyHolderKey {
+    pub tenant: String,
+    pub queue: String,
+    pub participant_id: String,
+}
+
+/// Parse a standalone concurrency holder key back to its components.
+pub fn parse_standalone_concurrency_holder_key(
+    key: &[u8],
+) -> Option<ParsedStandaloneConcurrencyHolderKey> {
+    if key.first() != Some(&prefix::STANDALONE_CONCURRENCY_HOLDER) {
+        return None;
+    }
+    let (tenant, queue, participant_id): (String, String, String) = decode(&key[1..]).ok()?;
+    Some(ParsedStandaloneConcurrencyHolderKey {
+        tenant,
+        queue,
+        participant_id,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Standalone concurrency requester counter (0xF8)
+// ---------------------------------------------------------------------------
+
+/// Key for the per-queue standalone concurrency requester counter.
+pub fn standalone_concurrency_requester_counter_key(tenant: &str, queue: &str) -> Vec<u8> {
+    encode_with_prefix(
+        prefix::COUNTER_STANDALONE_CONCURRENCY_REQUESTERS,
+        &(tenant, queue),
+    )
+}
+
+/// Parsed standalone concurrency requester counter key components.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedStandaloneConcurrencyRequesterCounterKey {
+    pub tenant: String,
+    pub queue: String,
+}
+
+/// Parse a standalone concurrency requester counter key back to its components.
+pub fn parse_standalone_concurrency_requester_counter_key(
+    key: &[u8],
+) -> Option<ParsedStandaloneConcurrencyRequesterCounterKey> {
+    if key.first() != Some(&prefix::COUNTER_STANDALONE_CONCURRENCY_REQUESTERS) {
+        return None;
+    }
+    let (tenant, queue): (String, String) = decode(&key[1..]).ok()?;
+    Some(ParsedStandaloneConcurrencyRequesterCounterKey { tenant, queue })
 }
 
 /// Create an exclusive end bound for range scanning.

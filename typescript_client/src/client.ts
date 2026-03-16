@@ -2370,6 +2370,245 @@ export class SiloGRPCClient {
       throwMappedRpcError(error, { operation: "resetShards" });
     }
   }
+
+  // ---------------------------------------------------------------------------
+  // Standalone concurrency tickets
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Acquire a standalone concurrency ticket.
+   * If capacity is available, the participant becomes a holder immediately (acquired=true).
+   * If at capacity, the participant is queued as a requester (acquired=false).
+   * Idempotent: re-acquiring an existing holder returns acquired=true.
+   */
+  public async standaloneAcquireTicket(options: {
+    queue: string;
+    participantId: string;
+    maxConcurrency: number;
+    priority?: number;
+    metadata?: Uint8Array;
+    tenant?: string;
+  }): Promise<{
+    acquired: boolean;
+    promoted: Array<{ participantId: string; metadata: Uint8Array }>;
+  }> {
+    try {
+      return await this._withShardRetry(
+        options.tenant,
+        async (client, shard) => {
+          const call = client.standaloneAcquireTicket(
+            {
+              shard,
+              tenant: options.tenant,
+              queue: options.queue,
+              participantId: options.participantId,
+              maxConcurrency: options.maxConcurrency,
+              priority: options.priority ?? 0,
+              metadata: options.metadata ?? new Uint8Array(),
+            },
+            this._rpcOptions(),
+          );
+          const response = await call.response;
+          return {
+            acquired: response.acquired,
+            promoted: response.promoted.map((p) => ({
+              participantId: p.participantId,
+              metadata: p.metadata,
+            })),
+          };
+        },
+      );
+    } catch (error) {
+      throwMappedRpcError(error, {
+        operation: "standaloneAcquireTicket",
+        tenant: options.tenant,
+      });
+    }
+  }
+
+  /**
+   * Release a standalone concurrency ticket.
+   * Removes the participant from holders or requesters.
+   * Promotes the next highest-priority requester if capacity opens up.
+   */
+  public async standaloneReleaseTicket(options: {
+    queue: string;
+    participantId: string;
+    maxConcurrency: number;
+    tenant?: string;
+  }): Promise<{
+    wasHeld: boolean;
+    promoted: Array<{ participantId: string; metadata: Uint8Array }>;
+  }> {
+    try {
+      return await this._withShardRetry(
+        options.tenant,
+        async (client, shard) => {
+          const call = client.standaloneReleaseTicket(
+            {
+              shard,
+              tenant: options.tenant,
+              queue: options.queue,
+              participantId: options.participantId,
+              maxConcurrency: options.maxConcurrency,
+            },
+            this._rpcOptions(),
+          );
+          const response = await call.response;
+          return {
+            wasHeld: response.wasHeld,
+            promoted: response.promoted.map((p) => ({
+              participantId: p.participantId,
+              metadata: p.metadata,
+            })),
+          };
+        },
+      );
+    } catch (error) {
+      throwMappedRpcError(error, {
+        operation: "standaloneReleaseTicket",
+        tenant: options.tenant,
+      });
+    }
+  }
+
+  /**
+   * List standalone concurrency holders with cursor-based pagination.
+   * Per-shard RPC; call for each shard to get a complete list.
+   */
+  public async standaloneListHolders(options: {
+    queue?: string;
+    pageSize?: number;
+    cursor?: Uint8Array;
+    tenant?: string;
+  }): Promise<{
+    holders: Array<{
+      tenant: string;
+      queue: string;
+      participantId: string;
+      metadata: Uint8Array;
+      grantedAtMs: bigint;
+      priority: number;
+    }>;
+    nextCursor: Uint8Array;
+  }> {
+    try {
+      return await this._withShardRetry(
+        options.tenant,
+        async (client, shard) => {
+          const call = client.standaloneListHolders(
+            {
+              shard,
+              tenant: options.tenant,
+              queue: options.queue ?? "",
+              pageSize: options.pageSize ?? 100,
+              cursor: options.cursor ?? new Uint8Array(),
+            },
+            this._rpcOptions(),
+          );
+          const response = await call.response;
+          return {
+            holders: response.holders.map((h) => ({
+              tenant: h.tenant,
+              queue: h.queue,
+              participantId: h.participantId,
+              metadata: h.metadata,
+              grantedAtMs: h.grantedAtMs,
+              priority: h.priority,
+            })),
+            nextCursor: response.nextCursor,
+          };
+        },
+      );
+    } catch (error) {
+      throwMappedRpcError(error, {
+        operation: "standaloneListHolders",
+        tenant: options.tenant,
+      });
+    }
+  }
+
+  /**
+   * Force-release a standalone concurrency ticket (admin/break-glass).
+   */
+  public async standaloneForceReleaseTicket(options: {
+    queue: string;
+    participantId: string;
+    maxConcurrency: number;
+    tenant?: string;
+  }): Promise<{
+    wasHeld: boolean;
+    promoted: Array<{ participantId: string; metadata: Uint8Array }>;
+  }> {
+    try {
+      return await this._withShardRetry(
+        options.tenant,
+        async (client, shard) => {
+          const call = client.standaloneForceReleaseTicket(
+            {
+              shard,
+              tenant: options.tenant,
+              queue: options.queue,
+              participantId: options.participantId,
+              maxConcurrency: options.maxConcurrency,
+            },
+            this._rpcOptions(),
+          );
+          const response = await call.response;
+          return {
+            wasHeld: response.wasHeld,
+            promoted: response.promoted.map((p) => ({
+              participantId: p.participantId,
+              metadata: p.metadata,
+            })),
+          };
+        },
+      );
+    } catch (error) {
+      throwMappedRpcError(error, {
+        operation: "standaloneForceReleaseTicket",
+        tenant: options.tenant,
+      });
+    }
+  }
+
+  /**
+   * Force-admit all pending standalone requesters regardless of max_concurrency (break-glass).
+   */
+  public async standaloneForceAdmitRequesters(options: {
+    queue: string;
+    tenant?: string;
+  }): Promise<{
+    admitted: Array<{ participantId: string; metadata: Uint8Array }>;
+  }> {
+    try {
+      return await this._withShardRetry(
+        options.tenant,
+        async (client, shard) => {
+          const call = client.standaloneForceAdmitRequesters(
+            {
+              shard,
+              tenant: options.tenant,
+              queue: options.queue,
+            },
+            this._rpcOptions(),
+          );
+          const response = await call.response;
+          return {
+            admitted: response.admitted.map((p) => ({
+              participantId: p.participantId,
+              metadata: p.metadata,
+            })),
+          };
+        },
+      );
+    } catch (error) {
+      throwMappedRpcError(error, {
+        operation: "standaloneForceAdmitRequesters",
+        tenant: options.tenant,
+      });
+    }
+  }
 }
 
 /**

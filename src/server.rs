@@ -1854,6 +1854,210 @@ impl Silo for SiloService {
             current_ring: current.unwrap_or_default(),
         }))
     }
+
+    async fn standalone_acquire_ticket(
+        &self,
+        req: Request<StandaloneAcquireTicketRequest>,
+    ) -> Result<Response<StandaloneAcquireTicketResponse>, Status> {
+        let r = req.into_inner();
+        let (shard, tenant) = self
+            .resolve_shard_and_tenant(&r.shard, r.tenant.as_deref())
+            .await?;
+
+        if r.queue.is_empty() {
+            return Err(Status::invalid_argument("queue is required"));
+        }
+        if r.participant_id.is_empty() {
+            return Err(Status::invalid_argument("participant_id is required"));
+        }
+        if r.max_concurrency == 0 {
+            return Err(Status::invalid_argument(
+                "max_concurrency must be greater than 0",
+            ));
+        }
+        if r.priority > 255 {
+            return Err(Status::invalid_argument("priority must be 0-255"));
+        }
+
+        let range = shard.broker.get_range();
+        let result = shard
+            .standalone_acquire_ticket(
+                &range,
+                &tenant,
+                &r.queue,
+                &r.participant_id,
+                r.max_concurrency,
+                r.priority as u8,
+                r.metadata,
+            )
+            .await
+            .map_err(map_err)?;
+
+        Ok(Response::new(StandaloneAcquireTicketResponse {
+            acquired: result.acquired,
+            promoted: result
+                .promoted
+                .into_iter()
+                .map(|p| StandalonePromotedParticipant {
+                    participant_id: p.participant_id,
+                    metadata: p.metadata,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn standalone_release_ticket(
+        &self,
+        req: Request<StandaloneReleaseTicketRequest>,
+    ) -> Result<Response<StandaloneReleaseTicketResponse>, Status> {
+        let r = req.into_inner();
+        let (shard, tenant) = self
+            .resolve_shard_and_tenant(&r.shard, r.tenant.as_deref())
+            .await?;
+
+        if r.queue.is_empty() {
+            return Err(Status::invalid_argument("queue is required"));
+        }
+        if r.participant_id.is_empty() {
+            return Err(Status::invalid_argument("participant_id is required"));
+        }
+        if r.max_concurrency == 0 {
+            return Err(Status::invalid_argument(
+                "max_concurrency must be greater than 0",
+            ));
+        }
+
+        let range = shard.broker.get_range();
+        let result = shard
+            .standalone_release_ticket(
+                &range,
+                &tenant,
+                &r.queue,
+                &r.participant_id,
+                r.max_concurrency,
+            )
+            .await
+            .map_err(map_err)?;
+
+        Ok(Response::new(StandaloneReleaseTicketResponse {
+            was_held: result.was_held,
+            promoted: result
+                .promoted
+                .into_iter()
+                .map(|p| StandalonePromotedParticipant {
+                    participant_id: p.participant_id,
+                    metadata: p.metadata,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn standalone_list_holders(
+        &self,
+        req: Request<StandaloneListHoldersRequest>,
+    ) -> Result<Response<StandaloneListHoldersResponse>, Status> {
+        let r = req.into_inner();
+        let (shard, tenant) = self
+            .resolve_shard_and_tenant(&r.shard, r.tenant.as_deref())
+            .await?;
+
+        let result = shard
+            .standalone_list_holders(&tenant, &r.queue, r.page_size, &r.cursor)
+            .await
+            .map_err(map_err)?;
+
+        Ok(Response::new(StandaloneListHoldersResponse {
+            holders: result
+                .holders
+                .into_iter()
+                .map(|h| StandaloneHolder {
+                    tenant: h.tenant,
+                    queue: h.queue,
+                    participant_id: h.participant_id,
+                    metadata: h.metadata,
+                    granted_at_ms: h.granted_at_ms,
+                    priority: h.priority as u32,
+                })
+                .collect(),
+            next_cursor: result.next_cursor,
+        }))
+    }
+
+    async fn standalone_force_release_ticket(
+        &self,
+        req: Request<StandaloneForceReleaseTicketRequest>,
+    ) -> Result<Response<StandaloneForceReleaseTicketResponse>, Status> {
+        let r = req.into_inner();
+        let (shard, tenant) = self
+            .resolve_shard_and_tenant(&r.shard, r.tenant.as_deref())
+            .await?;
+
+        if r.queue.is_empty() {
+            return Err(Status::invalid_argument("queue is required"));
+        }
+        if r.participant_id.is_empty() {
+            return Err(Status::invalid_argument("participant_id is required"));
+        }
+        if r.max_concurrency == 0 {
+            return Err(Status::invalid_argument(
+                "max_concurrency must be greater than 0",
+            ));
+        }
+
+        let range = shard.broker.get_range();
+        let result = shard
+            .standalone_force_release_ticket(
+                &range,
+                &tenant,
+                &r.queue,
+                &r.participant_id,
+                r.max_concurrency,
+            )
+            .await
+            .map_err(map_err)?;
+
+        Ok(Response::new(StandaloneForceReleaseTicketResponse {
+            was_held: result.was_held,
+            promoted: result
+                .promoted
+                .into_iter()
+                .map(|p| StandalonePromotedParticipant {
+                    participant_id: p.participant_id,
+                    metadata: p.metadata,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn standalone_force_admit_requesters(
+        &self,
+        req: Request<StandaloneForceAdmitRequestersRequest>,
+    ) -> Result<Response<StandaloneForceAdmitRequestersResponse>, Status> {
+        let r = req.into_inner();
+        let (shard, tenant) = self
+            .resolve_shard_and_tenant(&r.shard, r.tenant.as_deref())
+            .await?;
+
+        if r.queue.is_empty() {
+            return Err(Status::invalid_argument("queue is required"));
+        }
+
+        let range = shard.broker.get_range();
+        let result = shard
+            .standalone_force_admit_requesters(&range, &tenant, &r.queue)
+            .await
+            .map_err(map_err)?;
+
+        Ok(Response::new(StandaloneForceAdmitRequestersResponse {
+            admitted: result
+                .into_iter()
+                .map(|p| StandalonePromotedParticipant {
+                    participant_id: p.participant_id,
+                    metadata: p.metadata,
+                })
+                .collect(),
+        }))
+    }
 }
 
 /// Create an auth interceptor that validates Bearer tokens on incoming gRPC requests.

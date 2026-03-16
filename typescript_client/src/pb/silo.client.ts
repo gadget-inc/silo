@@ -4,6 +4,16 @@
 import type { RpcTransport } from "@protobuf-ts/runtime-rpc";
 import type { ServiceInfo } from "@protobuf-ts/runtime-rpc";
 import { Silo } from "./silo";
+import type { StandaloneForceAdmitRequestersResponse } from "./silo";
+import type { StandaloneForceAdmitRequestersRequest } from "./silo";
+import type { StandaloneForceReleaseTicketResponse } from "./silo";
+import type { StandaloneForceReleaseTicketRequest } from "./silo";
+import type { StandaloneListHoldersResponse } from "./silo";
+import type { StandaloneListHoldersRequest } from "./silo";
+import type { StandaloneReleaseTicketResponse } from "./silo";
+import type { StandaloneReleaseTicketRequest } from "./silo";
+import type { StandaloneAcquireTicketResponse } from "./silo";
+import type { StandaloneAcquireTicketRequest } from "./silo";
 import type { ForceReleaseShardResponse } from "./silo";
 import type { ForceReleaseShardRequest } from "./silo";
 import type { ResetShardsResponse } from "./silo";
@@ -240,6 +250,44 @@ export interface ISiloClient {
      * @generated from protobuf rpc: ForceReleaseShard
      */
     forceReleaseShard(input: ForceReleaseShardRequest, options?: RpcOptions): UnaryCall<ForceReleaseShardRequest, ForceReleaseShardResponse>;
+    /**
+     * Acquire a standalone concurrency ticket for a participant.
+     * If capacity is available, the participant becomes a holder immediately (acquired=true).
+     * If at capacity, the participant is queued as a requester (acquired=false).
+     * Idempotent: re-acquiring an existing holder returns acquired=true.
+     * Returns other promoted participants in the response for caller notification.
+     *
+     * @generated from protobuf rpc: StandaloneAcquireTicket
+     */
+    standaloneAcquireTicket(input: StandaloneAcquireTicketRequest, options?: RpcOptions): UnaryCall<StandaloneAcquireTicketRequest, StandaloneAcquireTicketResponse>;
+    /**
+     * Release a standalone concurrency ticket.
+     * Removes the participant from holders or requesters.
+     * Promotes the next highest-priority requester if capacity opens up.
+     *
+     * @generated from protobuf rpc: StandaloneReleaseTicket
+     */
+    standaloneReleaseTicket(input: StandaloneReleaseTicketRequest, options?: RpcOptions): UnaryCall<StandaloneReleaseTicketRequest, StandaloneReleaseTicketResponse>;
+    /**
+     * List standalone concurrency holders with cursor-based pagination.
+     * Per-shard RPC; client iterates shards using cluster info.
+     *
+     * @generated from protobuf rpc: StandaloneListHolders
+     */
+    standaloneListHolders(input: StandaloneListHoldersRequest, options?: RpcOptions): UnaryCall<StandaloneListHoldersRequest, StandaloneListHoldersResponse>;
+    /**
+     * Force-release a standalone concurrency ticket (admin/break-glass).
+     * Same as release but intended for administrative use.
+     *
+     * @generated from protobuf rpc: StandaloneForceReleaseTicket
+     */
+    standaloneForceReleaseTicket(input: StandaloneForceReleaseTicketRequest, options?: RpcOptions): UnaryCall<StandaloneForceReleaseTicketRequest, StandaloneForceReleaseTicketResponse>;
+    /**
+     * Force-admit all pending standalone requesters regardless of max_concurrency (break-glass).
+     *
+     * @generated from protobuf rpc: StandaloneForceAdmitRequesters
+     */
+    standaloneForceAdmitRequesters(input: StandaloneForceAdmitRequestersRequest, options?: RpcOptions): UnaryCall<StandaloneForceAdmitRequestersRequest, StandaloneForceAdmitRequestersResponse>;
 }
 /**
  * The Silo job queue service.
@@ -500,5 +548,58 @@ export class SiloClient implements ISiloClient, ServiceInfo {
     forceReleaseShard(input: ForceReleaseShardRequest, options?: RpcOptions): UnaryCall<ForceReleaseShardRequest, ForceReleaseShardResponse> {
         const method = this.methods[22], opt = this._transport.mergeOptions(options);
         return stackIntercept<ForceReleaseShardRequest, ForceReleaseShardResponse>("unary", this._transport, method, opt, input);
+    }
+    /**
+     * Acquire a standalone concurrency ticket for a participant.
+     * If capacity is available, the participant becomes a holder immediately (acquired=true).
+     * If at capacity, the participant is queued as a requester (acquired=false).
+     * Idempotent: re-acquiring an existing holder returns acquired=true.
+     * Returns other promoted participants in the response for caller notification.
+     *
+     * @generated from protobuf rpc: StandaloneAcquireTicket
+     */
+    standaloneAcquireTicket(input: StandaloneAcquireTicketRequest, options?: RpcOptions): UnaryCall<StandaloneAcquireTicketRequest, StandaloneAcquireTicketResponse> {
+        const method = this.methods[23], opt = this._transport.mergeOptions(options);
+        return stackIntercept<StandaloneAcquireTicketRequest, StandaloneAcquireTicketResponse>("unary", this._transport, method, opt, input);
+    }
+    /**
+     * Release a standalone concurrency ticket.
+     * Removes the participant from holders or requesters.
+     * Promotes the next highest-priority requester if capacity opens up.
+     *
+     * @generated from protobuf rpc: StandaloneReleaseTicket
+     */
+    standaloneReleaseTicket(input: StandaloneReleaseTicketRequest, options?: RpcOptions): UnaryCall<StandaloneReleaseTicketRequest, StandaloneReleaseTicketResponse> {
+        const method = this.methods[24], opt = this._transport.mergeOptions(options);
+        return stackIntercept<StandaloneReleaseTicketRequest, StandaloneReleaseTicketResponse>("unary", this._transport, method, opt, input);
+    }
+    /**
+     * List standalone concurrency holders with cursor-based pagination.
+     * Per-shard RPC; client iterates shards using cluster info.
+     *
+     * @generated from protobuf rpc: StandaloneListHolders
+     */
+    standaloneListHolders(input: StandaloneListHoldersRequest, options?: RpcOptions): UnaryCall<StandaloneListHoldersRequest, StandaloneListHoldersResponse> {
+        const method = this.methods[25], opt = this._transport.mergeOptions(options);
+        return stackIntercept<StandaloneListHoldersRequest, StandaloneListHoldersResponse>("unary", this._transport, method, opt, input);
+    }
+    /**
+     * Force-release a standalone concurrency ticket (admin/break-glass).
+     * Same as release but intended for administrative use.
+     *
+     * @generated from protobuf rpc: StandaloneForceReleaseTicket
+     */
+    standaloneForceReleaseTicket(input: StandaloneForceReleaseTicketRequest, options?: RpcOptions): UnaryCall<StandaloneForceReleaseTicketRequest, StandaloneForceReleaseTicketResponse> {
+        const method = this.methods[26], opt = this._transport.mergeOptions(options);
+        return stackIntercept<StandaloneForceReleaseTicketRequest, StandaloneForceReleaseTicketResponse>("unary", this._transport, method, opt, input);
+    }
+    /**
+     * Force-admit all pending standalone requesters regardless of max_concurrency (break-glass).
+     *
+     * @generated from protobuf rpc: StandaloneForceAdmitRequesters
+     */
+    standaloneForceAdmitRequesters(input: StandaloneForceAdmitRequestersRequest, options?: RpcOptions): UnaryCall<StandaloneForceAdmitRequestersRequest, StandaloneForceAdmitRequestersResponse> {
+        const method = this.methods[27], opt = this._transport.mergeOptions(options);
+        return stackIntercept<StandaloneForceAdmitRequestersRequest, StandaloneForceAdmitRequestersResponse>("unary", this._transport, method, opt, input);
     }
 }

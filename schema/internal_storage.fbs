@@ -256,6 +256,20 @@ table JobCancellation {
 }
 
 // ============================================================
+// Standalone concurrency records
+// ============================================================
+
+table StandaloneHolderRecord {
+  granted_at_ms: int64;
+  metadata: [ubyte];
+  priority: ubyte;
+}
+
+table StandaloneRequestRecord {
+  metadata: [ubyte];
+}
+
+// ============================================================
 // Floating limit state
 // ============================================================
 

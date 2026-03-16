@@ -13,6 +13,7 @@ mod lease_task;
 mod rate_limit;
 mod restart;
 mod scan;
+pub(crate) mod standalone_concurrency;
 
 pub use cleanup::{CleanupProgress, CleanupResult};
 
@@ -153,6 +154,9 @@ impl From<crate::concurrency::ConcurrencyError> for JobStoreShardError {
         match e {
             crate::concurrency::ConcurrencyError::Slate(e) => JobStoreShardError::Slate(e),
             crate::concurrency::ConcurrencyError::Encoding(s) => JobStoreShardError::Codec(s),
+            crate::concurrency::ConcurrencyError::QueueTypeConflict { .. } => {
+                JobStoreShardError::InvalidArgument(e.to_string())
+            }
         }
     }
 }
@@ -442,6 +446,12 @@ impl JobStoreShard {
     /// new child shards are created with new identities and ranges.
     pub fn get_range(&self) -> ShardRange {
         self.broker.get_range()
+    }
+
+    /// Get the current in-memory holder count for a concurrency queue.
+    /// Covers both job-system and standalone holders sharing the same pool.
+    pub fn concurrency_holder_count(&self, tenant: &str, queue: &str) -> usize {
+        self.concurrency.counts().holder_count(tenant, queue)
     }
 
     /// Run one pass of pending concurrency-request reconciliation.

@@ -1255,6 +1255,8 @@ struct QueueEntry {
     job_id: Option<String>,
     priority: Option<u8>,
     timestamp_ms: i64,
+    queue_type: String, // "jobs" or "standalone"
+    participant_id: Option<String>,
 }
 
 impl QueuesScanner {
@@ -1269,6 +1271,8 @@ impl QueuesScanner {
             Field::new("job_id", DataType::Utf8, true),
             Field::new("priority", DataType::UInt8, true),
             Field::new("timestamp_ms", DataType::Int64, false),
+            Field::new("queue_type", DataType::Utf8, false), // "jobs" or "standalone"
+            Field::new("participant_id", DataType::Utf8, true),
         ]))
     }
 }
@@ -1278,19 +1282,21 @@ impl Scan for QueuesScanner {
         let mut tenant = None;
         let mut queue = None;
         let mut entry_type = None;
+        let mut queue_type = None;
         for f in filters {
             if let Some((col, val)) = parse_eq_filter(f) {
                 match col.as_str() {
                     "tenant" => tenant = Some(val),
                     "queue_name" => queue = Some(val),
                     "entry_type" => entry_type = Some(val),
+                    "queue_type" => queue_type = Some(val),
                     _ => {}
                 }
             }
         }
         format!(
-            "queues[tenant={:?}, queue={:?}, entry_type={:?}], limit={:?}",
-            tenant, queue, entry_type, limit
+            "queues[tenant={:?}, queue={:?}, entry_type={:?}, queue_type={:?}], limit={:?}",
+            tenant, queue, entry_type, queue_type, limit
         )
     }
 
@@ -1301,16 +1307,18 @@ impl Scan for QueuesScanner {
         batch_size: usize,
         limit: Option<usize>,
     ) -> SendableRecordBatchStream {
-        // Parse filters for tenant, queue_name, and entry_type
+        // Parse filters for tenant, queue_name, entry_type, and queue_type
         let mut tenant_filter: Option<String> = None;
         let mut queue_filter: Option<String> = None;
         let mut entry_type_filter: Option<String> = None;
+        let mut queue_type_filter: Option<String> = None;
         for f in filters {
             if let Some((col, val)) = parse_eq_filter(f) {
                 match col.as_str() {
                     "tenant" => tenant_filter = Some(val),
                     "queue_name" => queue_filter = Some(val),
                     "entry_type" => entry_type_filter = Some(val),
+                    "queue_type" => queue_type_filter = Some(val),
                     _ => {}
                 }
             }
@@ -1437,72 +1445,171 @@ impl Scan for QueuesScanner {
             let db = shard.db();
             let mut entries: Vec<QueueEntry> = Vec::new();
 
-            // Scan holders using binary storekey prefix
-            let holders_start = match (&tenant_filter, &queue_filter) {
-                (Some(t), Some(q)) => crate::keys::concurrency_holders_queue_prefix(t, q),
-                (Some(t), None) => crate::keys::concurrency_holders_tenant_prefix(t),
-                (None, _) => crate::keys::concurrency_holders_prefix(),
-            };
-            let holders_end = crate::keys::end_bound(&holders_start);
+            // Scan job-system holders (0x09) unless filtered to standalone only
+            if queue_type_filter.as_deref() != Some("standalone") {
+                let holders_start = match (&tenant_filter, &queue_filter) {
+                    (Some(t), Some(q)) => crate::keys::concurrency_holders_queue_prefix(t, q),
+                    (Some(t), None) => crate::keys::concurrency_holders_tenant_prefix(t),
+                    (None, _) => crate::keys::concurrency_holders_prefix(),
+                };
+                let holders_end = crate::keys::end_bound(&holders_start);
 
-            if let Ok(mut iter) = db.scan::<Vec<u8>, _>(holders_start..=holders_end).await {
-                while let Ok(Some(kv)) = iter.next().await {
-                    if limit.is_some_and(|l| entries.len() >= l) {
-                        break;
-                    }
-                    if let Some(parsed) = crate::keys::parse_concurrency_holder_key(&kv.key) {
-                        // Filter by queue if specified
-                        if let Some(ref q) = queue_filter
-                            && parsed.queue != *q
-                        {
-                            continue;
+                if let Ok(mut iter) = db.scan::<Vec<u8>, _>(holders_start..=holders_end).await {
+                    while let Ok(Some(kv)) = iter.next().await {
+                        if limit.is_some_and(|l| entries.len() >= l) {
+                            break;
                         }
-                        let timestamp_ms = crate::codec::decode_holder_granted_at_ms(&kv.value)
-                            .unwrap_or_default();
-                        entries.push(QueueEntry {
-                            tenant: parsed.tenant,
-                            queue_name: parsed.queue,
-                            entry_type: "holder".to_string(),
-                            task_id: parsed.task_id,
-                            job_id: None,
-                            priority: None,
-                            timestamp_ms,
-                        });
+                        if let Some(parsed) = crate::keys::parse_concurrency_holder_key(&kv.key) {
+                            // Filter by queue if specified
+                            if let Some(ref q) = queue_filter
+                                && parsed.queue != *q
+                            {
+                                continue;
+                            }
+                            let timestamp_ms = crate::codec::decode_holder_granted_at_ms(&kv.value)
+                                .unwrap_or_default();
+                            entries.push(QueueEntry {
+                                tenant: parsed.tenant,
+                                queue_name: parsed.queue,
+                                entry_type: "holder".to_string(),
+                                task_id: parsed.task_id,
+                                job_id: None,
+                                priority: None,
+                                timestamp_ms,
+                                queue_type: "jobs".to_string(),
+                                participant_id: None,
+                            });
+                        }
                     }
                 }
-            }
 
-            // Scan requests using binary storekey prefix
-            let requests_start = match (&tenant_filter, &queue_filter) {
-                (Some(t), Some(q)) => crate::keys::concurrency_request_prefix(t, q),
-                (Some(t), None) => crate::keys::concurrency_request_tenant_prefix(t),
-                (None, _) => crate::keys::concurrency_requests_prefix(),
-            };
-            let requests_end = crate::keys::end_bound(&requests_start);
+                // Scan requests using binary storekey prefix
+                let requests_start = match (&tenant_filter, &queue_filter) {
+                    (Some(t), Some(q)) => crate::keys::concurrency_request_prefix(t, q),
+                    (Some(t), None) => crate::keys::concurrency_request_tenant_prefix(t),
+                    (None, _) => crate::keys::concurrency_requests_prefix(),
+                };
+                let requests_end = crate::keys::end_bound(&requests_start);
 
-            if let Ok(mut iter) = db.scan::<Vec<u8>, _>(requests_start..=requests_end).await {
-                while let Ok(Some(kv)) = iter.next().await {
-                    if limit.is_some_and(|l| entries.len() >= l) {
-                        break;
-                    }
-                    if let Some(parsed) = crate::keys::parse_concurrency_request_key(&kv.key) {
-                        // Filter by queue if specified
-                        if let Some(ref q) = queue_filter
-                            && parsed.queue != *q
-                        {
-                            continue;
+                if let Ok(mut iter) = db.scan::<Vec<u8>, _>(requests_start..=requests_end).await {
+                    while let Ok(Some(kv)) = iter.next().await {
+                        if limit.is_some_and(|l| entries.len() >= l) {
+                            break;
                         }
-                        let task_id = parsed.request_id();
-                        let job_id = Some(parsed.job_id.clone());
-                        entries.push(QueueEntry {
-                            tenant: parsed.tenant,
-                            queue_name: parsed.queue,
-                            entry_type: "requester".to_string(),
-                            task_id,
-                            job_id,
-                            priority: Some(parsed.priority),
-                            timestamp_ms: parsed.start_time_ms as i64,
-                        });
+                        if let Some(parsed) = crate::keys::parse_concurrency_request_key(&kv.key) {
+                            // Filter by queue if specified
+                            if let Some(ref q) = queue_filter
+                                && parsed.queue != *q
+                            {
+                                continue;
+                            }
+                            let task_id = parsed.request_id();
+                            let job_id = Some(parsed.job_id.clone());
+                            entries.push(QueueEntry {
+                                tenant: parsed.tenant,
+                                queue_name: parsed.queue,
+                                entry_type: "requester".to_string(),
+                                task_id,
+                                job_id,
+                                priority: Some(parsed.priority),
+                                timestamp_ms: parsed.start_time_ms as i64,
+                                queue_type: "jobs".to_string(),
+                                participant_id: None,
+                            });
+                        }
+                    }
+                }
+            } // end job-system queue_type guard
+
+            // Scan standalone holders (0x0D) unless filtered to jobs only
+            if queue_type_filter.as_deref() != Some("jobs") {
+                let sa_holders_start = match (&tenant_filter, &queue_filter) {
+                    (Some(t), Some(q)) => {
+                        crate::keys::standalone_concurrency_holders_queue_prefix(t, q)
+                    }
+                    (Some(t), None) => crate::keys::standalone_concurrency_holders_tenant_prefix(t),
+                    (None, _) => crate::keys::standalone_concurrency_holders_prefix(),
+                };
+                let sa_holders_end = crate::keys::end_bound(&sa_holders_start);
+
+                if let Ok(mut iter) = db
+                    .scan::<Vec<u8>, _>(sa_holders_start..=sa_holders_end)
+                    .await
+                {
+                    while let Ok(Some(kv)) = iter.next().await {
+                        if limit.is_some_and(|l| entries.len() >= l) {
+                            break;
+                        }
+                        if let Some(parsed) =
+                            crate::keys::parse_standalone_concurrency_holder_key(&kv.key)
+                        {
+                            if let Some(ref q) = queue_filter
+                                && parsed.queue != *q
+                            {
+                                continue;
+                            }
+                            let (timestamp_ms, priority, metadata) =
+                                crate::codec::decode_standalone_holder(&kv.value)
+                                    .map(|r| (r.granted_at_ms, Some(r.priority), r.metadata))
+                                    .unwrap_or((0, None, vec![]));
+                            let _ = metadata; // metadata not exposed in query table
+                            entries.push(QueueEntry {
+                                tenant: parsed.tenant,
+                                queue_name: parsed.queue,
+                                entry_type: "holder".to_string(),
+                                task_id: parsed.participant_id.clone(),
+                                job_id: None,
+                                priority,
+                                timestamp_ms,
+                                queue_type: "standalone".to_string(),
+                                participant_id: Some(parsed.participant_id),
+                            });
+                        }
+                    }
+                }
+
+                // Scan standalone requests (0x0C)
+                if entry_type_filter.as_deref() != Some("holder") {
+                    let sa_requests_start = match (&tenant_filter, &queue_filter) {
+                        (Some(t), Some(q)) => {
+                            crate::keys::standalone_concurrency_request_prefix(t, q)
+                        }
+                        (Some(t), None) => {
+                            crate::keys::standalone_concurrency_request_tenant_prefix(t)
+                        }
+                        (None, _) => crate::keys::standalone_concurrency_requests_all_prefix(),
+                    };
+                    let sa_requests_end = crate::keys::end_bound(&sa_requests_start);
+
+                    if let Ok(mut iter) = db
+                        .scan::<Vec<u8>, _>(sa_requests_start..=sa_requests_end)
+                        .await
+                    {
+                        while let Ok(Some(kv)) = iter.next().await {
+                            if limit.is_some_and(|l| entries.len() >= l) {
+                                break;
+                            }
+                            if let Some(parsed) =
+                                crate::keys::parse_standalone_concurrency_request_key(&kv.key)
+                            {
+                                if let Some(ref q) = queue_filter
+                                    && parsed.queue != *q
+                                {
+                                    continue;
+                                }
+                                entries.push(QueueEntry {
+                                    tenant: parsed.tenant,
+                                    queue_name: parsed.queue,
+                                    entry_type: "requester".to_string(),
+                                    task_id: parsed.participant_id.clone(),
+                                    job_id: None,
+                                    priority: Some(parsed.priority),
+                                    timestamp_ms: parsed.request_time_ms as i64,
+                                    queue_type: "standalone".to_string(),
+                                    participant_id: Some(parsed.participant_id),
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -1586,6 +1693,20 @@ impl Scan for QueuesScanner {
                                 batch_entries.iter().map(|e| e.timestamp_ms).collect();
                             cols.push(Arc::new(Int64Array::from(vals)));
                         }
+                        "queue_type" => {
+                            let vals: Vec<&str> = batch_entries
+                                .iter()
+                                .map(|e| e.queue_type.as_str())
+                                .collect();
+                            cols.push(Arc::new(StringArray::from(vals)));
+                        }
+                        "participant_id" => {
+                            let vals: Vec<Option<&str>> = batch_entries
+                                .iter()
+                                .map(|e| e.participant_id.as_deref())
+                                .collect();
+                            cols.push(Arc::new(StringArray::from(vals)));
+                        }
                         other => {
                             let _ = tx
                                 .send(Err(DataFusionError::Execution(format!(
@@ -1620,10 +1741,12 @@ impl Scan for QueuesScanner {
                     .iter()
                     .map(|f| -> ArrayRef {
                         match f.name().as_str() {
-                            "tenant" | "queue_name" | "entry_type" | "task_id" => {
+                            "tenant" | "queue_name" | "entry_type" | "task_id" | "queue_type" => {
                                 Arc::new(StringArray::from(Vec::<&str>::new()))
                             }
-                            "job_id" => Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
+                            "job_id" | "participant_id" => {
+                                Arc::new(StringArray::from(Vec::<Option<&str>>::new()))
+                            }
                             "priority" => Arc::new(UInt8Array::from(Vec::<Option<u8>>::new())),
                             "timestamp_ms" => Arc::new(Int64Array::from(Vec::<i64>::new())),
                             _ => Arc::new(StringArray::from(Vec::<&str>::new())),

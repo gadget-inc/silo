@@ -166,10 +166,31 @@ impl JobStoreShard {
                 vec![prefix::FLOATING_LIMIT],
                 Box::new(|key, _| parse_floating_limit_key(key).map(|p| p.tenant)),
             ),
+            // Standalone concurrency request keys (0x0C)
+            (
+                vec![prefix::STANDALONE_CONCURRENCY_REQUEST],
+                Box::new(|key, _| {
+                    keys::parse_standalone_concurrency_request_key(key).map(|p| p.tenant)
+                }),
+            ),
+            // Standalone concurrency holder keys (0x0D)
+            (
+                vec![prefix::STANDALONE_CONCURRENCY_HOLDER],
+                Box::new(|key, _| {
+                    keys::parse_standalone_concurrency_holder_key(key).map(|p| p.tenant)
+                }),
+            ),
             // Concurrency requester counter keys (0xF7)
             (
                 vec![prefix::COUNTER_CONCURRENCY_REQUESTERS],
                 Box::new(|key, _| parse_concurrency_requester_counter_key(key).map(|p| p.tenant)),
+            ),
+            // Standalone concurrency requester counter keys (0xF8)
+            (
+                vec![prefix::COUNTER_STANDALONE_CONCURRENCY_REQUESTERS],
+                Box::new(|key, _| {
+                    keys::parse_standalone_concurrency_requester_counter_key(key).map(|p| p.tenant)
+                }),
             ),
             // Task keys - tenant is in the value, not the key
             (

@@ -57,11 +57,24 @@ use crate::keys::{
     concurrency_counts_key, concurrency_holder_key, concurrency_holders_queue_prefix,
     concurrency_request_key, concurrency_request_prefix, concurrency_requester_counter_key,
     concurrency_requests_prefix, end_bound, floating_limit_state_key, job_status_key,
-    parse_concurrency_holder_key, parse_concurrency_request_key, task_key,
+    parse_concurrency_holder_key, parse_concurrency_request_key,
+    parse_standalone_concurrency_holder_key, standalone_concurrency_holders_queue_prefix, task_key,
 };
 use crate::shard_range::ShardRange;
 use crate::task::{ConcurrencyAction, HolderRecord, Task};
 use crate::task_broker::TaskBroker;
+
+/// Tracks the type of a concurrency queue (jobs vs standalone).
+/// Queue type is determined by first use and enforced as a hard boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueType {
+    /// Queue has no holders yet
+    Empty,
+    /// Queue is used by the job concurrency system (0x09 holders)
+    Jobs,
+    /// Queue is used by standalone concurrency tickets (0x0D holders)
+    Standalone,
+}
 
 /// Error type for concurrency operations that can fail due to storage or encoding errors.
 #[derive(Debug, thiserror::Error)]
@@ -70,6 +83,11 @@ pub enum ConcurrencyError {
     Slate(#[from] slatedb::Error),
     #[error("encoding error: {0}")]
     Encoding(String),
+    #[error("queue type conflict: queue is used by {existing} system, cannot use with {requested}")]
+    QueueTypeConflict {
+        existing: &'static str,
+        requested: &'static str,
+    },
 }
 
 impl From<String> for ConcurrencyError {
@@ -109,10 +127,12 @@ pub enum RequestTicketTaskOutcome {
 
 /// In-memory counts for concurrency holders
 pub struct ConcurrencyCounts {
-    // Composite key: storekey-encoded (tenant, queue) -> set of task ids holding tickets
+    // Composite key: storekey-encoded (tenant, queue) -> set of task ids / participant ids holding tickets
     holders: Mutex<HashMap<Vec<u8>, HashSet<String>>>,
     // Track which (tenant, queue) keys have been hydrated from durable storage
     hydrated_queues: Mutex<HashSet<Vec<u8>>>,
+    // Track queue types: Jobs vs Standalone, determined by first use
+    queue_types: Mutex<HashMap<Vec<u8>, QueueType>>,
 }
 
 impl Default for ConcurrencyCounts {
@@ -126,12 +146,17 @@ impl ConcurrencyCounts {
         Self {
             holders: Mutex::new(HashMap::new()),
             hydrated_queues: Mutex::new(HashSet::new()),
+            queue_types: Mutex::new(HashMap::new()),
         }
     }
 
     /// Hydrate a specific queue's concurrency holder state from durable storage.
     ///
-    /// Uses the per-queue prefix for efficient scanning of only the relevant holders. The `range` parameter filters holders to only load those for tenants within the shard's range. This is critical after shard splits - both child shards clone the same holder records, and without filtering, both would think they own the same concurrency tickets, leading to limit violations.
+    /// Scans both job-system holders (0x09) and standalone holders (0x0D) to ensure
+    /// shared capacity tracking. The `range` parameter filters holders to only load
+    /// those for tenants within the shard's range. This is critical after shard splits -
+    /// both child shards clone the same holder records, and without filtering, both would
+    /// think they own the same concurrency tickets, leading to limit violations.
     pub async fn hydrate_queue(
         &self,
         db: &Db,
@@ -141,34 +166,68 @@ impl ConcurrencyCounts {
     ) -> Result<(), slatedb::Error> {
         let key = concurrency_counts_key(tenant, queue);
 
-        // Scan holders for this specific tenant/queue using the queue prefix
-        let start = concurrency_holders_queue_prefix(tenant, queue);
-        let end = end_bound(&start);
-        let mut iter: DbIterator = db.scan::<Vec<u8>, _>(start..end).await?;
-
         let mut task_ids = Vec::new();
-        loop {
-            let maybe = iter.next().await?;
-            let Some(kv) = maybe else { break };
+        let mut has_job_holders = false;
+        let mut has_standalone_holders = false;
 
-            // Parse holder key to extract tenant, queue, task_id
-            let Some(parsed) = parse_concurrency_holder_key(&kv.key) else {
-                continue;
-            };
+        // Scan job-system holders (0x09) for this specific tenant/queue
+        {
+            let start = concurrency_holders_queue_prefix(tenant, queue);
+            let end = end_bound(&start);
+            let mut iter: DbIterator = db.scan::<Vec<u8>, _>(start..end).await?;
 
-            // Filter by shard range - only hydrate holders for tenants in this shard
-            if !range.contains_tenant(&parsed.tenant) {
-                tracing::debug!(
-                    tenant = %parsed.tenant,
-                    queue = %parsed.queue,
-                    task = %parsed.task_id,
-                    range = %range,
-                    "skipping holder outside shard range during queue hydration"
-                );
-                continue;
+            loop {
+                let maybe = iter.next().await?;
+                let Some(kv) = maybe else { break };
+
+                let Some(parsed) = parse_concurrency_holder_key(&kv.key) else {
+                    continue;
+                };
+
+                if !range.contains_tenant(&parsed.tenant) {
+                    tracing::debug!(
+                        tenant = %parsed.tenant,
+                        queue = %parsed.queue,
+                        task = %parsed.task_id,
+                        range = %range,
+                        "skipping holder outside shard range during queue hydration"
+                    );
+                    continue;
+                }
+
+                has_job_holders = true;
+                task_ids.push(parsed.task_id);
             }
+        }
 
-            task_ids.push(parsed.task_id);
+        // Scan standalone holders (0x0D) for this specific tenant/queue
+        {
+            let start = standalone_concurrency_holders_queue_prefix(tenant, queue);
+            let end = end_bound(&start);
+            let mut iter: DbIterator = db.scan::<Vec<u8>, _>(start..end).await?;
+
+            loop {
+                let maybe = iter.next().await?;
+                let Some(kv) = maybe else { break };
+
+                let Some(parsed) = parse_standalone_concurrency_holder_key(&kv.key) else {
+                    continue;
+                };
+
+                if !range.contains_tenant(&parsed.tenant) {
+                    tracing::debug!(
+                        tenant = %parsed.tenant,
+                        queue = %parsed.queue,
+                        participant = %parsed.participant_id,
+                        range = %range,
+                        "skipping standalone holder outside shard range during queue hydration"
+                    );
+                    continue;
+                }
+
+                has_standalone_holders = true;
+                task_ids.push(parsed.participant_id);
+            }
         }
 
         // Update holders map
@@ -178,6 +237,27 @@ impl ConcurrencyCounts {
             for task_id in task_ids {
                 set.insert(task_id);
             }
+        }
+
+        // Determine and set queue type
+        {
+            let queue_type = if has_job_holders && has_standalone_holders {
+                // Shouldn't happen, but if both exist, prefer jobs (existing system)
+                tracing::warn!(
+                    tenant = %tenant,
+                    queue = %queue,
+                    "queue has both job and standalone holders; treating as Jobs"
+                );
+                QueueType::Jobs
+            } else if has_job_holders {
+                QueueType::Jobs
+            } else if has_standalone_holders {
+                QueueType::Standalone
+            } else {
+                QueueType::Empty
+            };
+            let mut qt = self.queue_types.lock().unwrap();
+            qt.insert(key.clone(), queue_type);
         }
 
         // Mark queue as hydrated
@@ -213,12 +293,13 @@ impl ConcurrencyCounts {
         self.hydrate_queue(db, range, tenant, queue).await
     }
 
-    /// Atomically try to reserve a concurrency slot.
+    /// Atomically try to reserve a concurrency slot for the job system.
     /// Returns true if the slot was reserved, false if at capacity.
     /// This MUST be called before writing to the DB to prevent TOCTOU races.
     /// If the DB write fails, call `release_reservation` to roll back.
     ///
     /// This method lazily hydrates the queue from durable storage on first access.
+    /// Returns an error if the queue is in use by the standalone concurrency system.
     #[allow(clippy::too_many_arguments)]
     pub async fn try_reserve(
         &self,
@@ -229,9 +310,10 @@ impl ConcurrencyCounts {
         task_id: &str,
         limit: usize,
         job_id: &str,
-    ) -> Result<bool, slatedb::Error> {
+    ) -> Result<bool, ConcurrencyError> {
         // Ensure the queue is hydrated before checking capacity
         self.ensure_hydrated(db, range, tenant, queue).await?;
+        self.assert_queue_type(tenant, queue, QueueType::Jobs)?;
 
         Ok(self.try_reserve_internal(tenant, queue, task_id, limit, job_id))
     }
@@ -331,6 +413,98 @@ impl ConcurrencyCounts {
         let h = self.holders.lock().unwrap();
         let key = concurrency_counts_key(tenant, queue);
         h.get(&key).map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Get the queue type for a specific queue.
+    pub fn queue_type(&self, tenant: &str, queue: &str) -> QueueType {
+        let key = concurrency_counts_key(tenant, queue);
+        let qt = self.queue_types.lock().unwrap();
+        qt.get(&key).copied().unwrap_or(QueueType::Empty)
+    }
+
+    /// Assert that a queue is compatible with the requested type.
+    /// Returns an error if the queue is already in use by a different system.
+    /// Sets the queue type on first use.
+    fn assert_queue_type(
+        &self,
+        tenant: &str,
+        queue: &str,
+        requested: QueueType,
+    ) -> Result<(), ConcurrencyError> {
+        let key = concurrency_counts_key(tenant, queue);
+        let mut qt = self.queue_types.lock().unwrap();
+        let current = qt.get(&key).copied().unwrap_or(QueueType::Empty);
+        match current {
+            QueueType::Empty => {
+                qt.insert(key, requested);
+                Ok(())
+            }
+            t if t == requested => Ok(()),
+            QueueType::Jobs => Err(ConcurrencyError::QueueTypeConflict {
+                existing: "jobs",
+                requested: "standalone",
+            }),
+            QueueType::Standalone => Err(ConcurrencyError::QueueTypeConflict {
+                existing: "standalone",
+                requested: "jobs",
+            }),
+        }
+    }
+
+    /// Try to reserve a standalone concurrency slot.
+    /// Similar to try_reserve but enforces Standalone queue type.
+    pub async fn try_reserve_standalone(
+        &self,
+        db: &Db,
+        range: &ShardRange,
+        tenant: &str,
+        queue: &str,
+        participant_id: &str,
+        limit: usize,
+    ) -> Result<bool, ConcurrencyError> {
+        self.ensure_hydrated(db, range, tenant, queue).await?;
+        self.assert_queue_type(tenant, queue, QueueType::Standalone)?;
+        Ok(self.try_reserve_standalone_internal(tenant, queue, participant_id, limit))
+    }
+
+    /// Internal method for standalone reservation without hydration.
+    pub(crate) fn try_reserve_standalone_internal(
+        &self,
+        tenant: &str,
+        queue: &str,
+        participant_id: &str,
+        limit: usize,
+    ) -> bool {
+        let key = concurrency_counts_key(tenant, queue);
+        let mut h = self.holders.lock().unwrap();
+        let set = h.entry(key).or_default();
+
+        if set.len() >= limit {
+            return false;
+        }
+
+        set.insert(participant_id.to_string());
+        true
+    }
+
+    /// Check if a participant is currently a holder for a queue.
+    pub fn is_holder(&self, tenant: &str, queue: &str, id: &str) -> bool {
+        let key = concurrency_counts_key(tenant, queue);
+        let h = self.holders.lock().unwrap();
+        h.get(&key).is_some_and(|s| s.contains(id))
+    }
+
+    /// Reset queue type to Empty when a queue has no more holders.
+    /// Called after releasing all holders from a queue.
+    pub fn maybe_clear_queue_type(&self, tenant: &str, queue: &str) {
+        let key = concurrency_counts_key(tenant, queue);
+        let h = self.holders.lock().unwrap();
+        let is_empty = h.get(&key).is_none_or(|s| s.is_empty());
+        if is_empty {
+            drop(h);
+            let mut qt = self.queue_types.lock().unwrap();
+            qt.insert(key, QueueType::Empty);
+        }
     }
 }
 
