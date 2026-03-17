@@ -254,9 +254,7 @@ fn map_err(e: JobStoreShardError) -> Status {
             Status::failed_precondition("job is already in terminal state")
         }
         JobStoreShardError::JobNotRestartable(ref e) => Status::failed_precondition(e.to_string()),
-        JobStoreShardError::JobNotReimportable(ref e) => {
-            Status::failed_precondition(e.to_string())
-        }
+        JobStoreShardError::JobNotReimportable(ref e) => Status::failed_precondition(e.to_string()),
         JobStoreShardError::JobNotExpediteable(ref e) => Status::failed_precondition(e.to_string()),
         JobStoreShardError::JobNotLeaseable(ref e) => Status::failed_precondition(e.to_string()),
         JobStoreShardError::InvalidArgument(ref msg) => Status::invalid_argument(msg.clone()),

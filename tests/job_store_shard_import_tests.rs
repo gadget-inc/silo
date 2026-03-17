@@ -1356,10 +1356,7 @@ async fn reimport_running_job_in_batch_fails_entire_call() {
     // Import two jobs: one will be running, one will be idle
     let job_a = base_import_params("batch-run-a");
     let job_b = base_import_params("batch-run-b");
-    shard
-        .import_jobs("-", vec![job_a, job_b])
-        .await
-        .unwrap();
+    shard.import_jobs("-", vec![job_a, job_b]).await.unwrap();
 
     // Dequeue job_a to make it Running
     let dequeued = shard.dequeue("worker-1", "default", 1).await.unwrap();

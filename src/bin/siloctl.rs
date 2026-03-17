@@ -244,8 +244,14 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 attempts,
             } => siloctl::job_get(&opts, &mut stdout, shard, id, *attempts).await,
             JobAction::Result { shard, id, format } => {
-                siloctl::job_result(&opts, &mut stdout, shard, id, format.to_bytes_output_format())
-                    .await
+                siloctl::job_result(
+                    &opts,
+                    &mut stdout,
+                    shard,
+                    id,
+                    format.to_bytes_output_format(),
+                )
+                .await
             }
             JobAction::Cancel { shard, id } => {
                 siloctl::job_cancel(&opts, &mut stdout, shard, id).await
