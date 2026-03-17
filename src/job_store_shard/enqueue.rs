@@ -11,12 +11,14 @@ use crate::dst_events::{self, DstEvent};
 use crate::job::{JobInfo, JobStatus, Limit};
 use crate::job_store_shard::JobStoreShard;
 use crate::job_store_shard::JobStoreShardError;
+use crate::job_store_shard::counters::encode_counter;
 use crate::job_store_shard::helpers::{
     DbWriteBatcher, TxnWriter, WriteBatcher, decode_job_status_owned, now_epoch_ms, put_task,
     retry_on_txn_conflict,
 };
 use crate::keys::{
     idx_metadata_key, idx_status_time_key, job_info_key, job_status_key, status_index_timestamp,
+    tenant_status_counter_key,
 };
 use crate::retry::RetryPolicy;
 use crate::task::{GubernatorRateLimitData, Task};
@@ -604,6 +606,11 @@ impl JobStoreShard {
             let old_ts = status_index_timestamp(&old);
             let old_time = idx_status_time_key(tenant, old.kind.as_str(), old_ts, job_id);
             writer.delete(&old_time)?;
+            // Decrement old status counter
+            writer.merge(
+                tenant_status_counter_key(tenant, old.kind.as_str()),
+                encode_counter(-1),
+            )?;
         }
 
         Self::write_job_status_with_index(writer, tenant, job_id, new_status)
@@ -627,6 +634,13 @@ impl JobStoreShard {
         let ts = status_index_timestamp(&new_status);
         let timek = idx_status_time_key(tenant, new_kind.as_str(), ts, job_id);
         writer.put(&timek, [])?;
+
+        // Increment tenant status counter for the new status
+        writer.merge(
+            tenant_status_counter_key(tenant, new_kind.as_str()),
+            encode_counter(1),
+        )?;
+
         Ok(())
     }
 }

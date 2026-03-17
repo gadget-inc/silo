@@ -162,6 +162,41 @@ impl JobStoreShard {
         Ok(())
     }
 
+    /// Scan all tenant status counters for this shard.
+    ///
+    /// Returns a vec of (tenant, status_kind, count) tuples, filtered to only
+    /// include tenants that belong to this shard's range. Entries with count <= 0
+    /// are excluded.
+    pub async fn scan_tenant_status_counters(
+        &self,
+    ) -> Result<Vec<(String, String, i64)>, JobStoreShardError> {
+        use crate::keys::{
+            end_bound, parse_tenant_status_counter_key, tenant_status_counter_prefix,
+        };
+        use slatedb::DbIterator;
+
+        let prefix = tenant_status_counter_prefix();
+        let end = end_bound(&prefix);
+        let range = self.get_range();
+
+        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(prefix..end).await?;
+        let mut results = Vec::new();
+
+        while let Some(kv) = iter.next().await? {
+            if let Some(parsed) = parse_tenant_status_counter_key(&kv.key) {
+                if !range.contains_tenant(&parsed.tenant) {
+                    continue;
+                }
+                let count = decode_counter(&kv.value);
+                if count > 0 {
+                    results.push((parsed.tenant, parsed.status_kind, count));
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Get the current concurrency requester count for a specific tenant/queue.
     pub async fn get_concurrency_requester_count(
         &self,

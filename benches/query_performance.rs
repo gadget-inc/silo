@@ -92,6 +92,14 @@ async fn main() {
     .await;
     r.print();
 
+    let r = bench_query(
+        &engine,
+        "tenant_status_counts",
+        "SELECT tenant, status_kind, cnt FROM tenant_counts",
+    )
+    .await;
+    r.print();
+
     println!();
 
     // --- Per-Tenant Queries (Large Tenant) ---

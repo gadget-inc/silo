@@ -92,6 +92,17 @@ impl ShardQueryEngine {
         let queues_provider = Arc::new(SiloTableProvider::new(queues_schema, queues_scanner));
         ctx.register_table("queues", queues_provider)?;
 
+        // Register tenant_counts table for pre-computed per-tenant status counters
+        let tenant_counts_schema = TenantCountsScanner::base_schema();
+        let tenant_counts_scanner: ScannerRef = Arc::new(TenantCountsScanner {
+            shard: Arc::clone(&shard),
+        });
+        let tenant_counts_provider = Arc::new(SiloTableProvider::new(
+            tenant_counts_schema,
+            tenant_counts_scanner,
+        ));
+        ctx.register_table("tenant_counts", tenant_counts_provider)?;
+
         Ok(Self { ctx })
     }
 
@@ -1644,6 +1655,127 @@ impl Scan for QueuesScanner {
                     .collect();
                 if let Ok(batch) = RecordBatch::try_new(Arc::clone(&proj_for_stream), empty_cols) {
                     let _ = tx.send(Ok(batch)).await;
+                }
+            }
+        });
+
+        Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&projection),
+            ReceiverStream::new(rx).map(|r| r),
+        ))
+    }
+}
+
+/// Scanner for the tenant_counts table - reads pre-computed per-tenant, per-status counters.
+pub struct TenantCountsScanner {
+    pub(crate) shard: Arc<JobStoreShard>,
+}
+
+impl TenantCountsScanner {
+    /// Create a new TenantCountsScanner for the given shard
+    pub fn new(shard: Arc<JobStoreShard>) -> Self {
+        Self { shard }
+    }
+
+    /// Get the base schema for the tenant_counts table
+    pub fn base_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("shard_id", DataType::Utf8, false),
+            Field::new("tenant", DataType::Utf8, false),
+            Field::new("status_kind", DataType::Utf8, false),
+            Field::new("cnt", DataType::Int64, false),
+        ]))
+    }
+}
+
+impl std::fmt::Debug for TenantCountsScanner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TenantCountsScanner")
+    }
+}
+
+impl Scan for TenantCountsScanner {
+    fn describe(&self, _filters: &[Expr], _limit: Option<usize>) -> String {
+        "tenant_counts[]".to_string()
+    }
+
+    fn scan(
+        &self,
+        projection: SchemaRef,
+        _filters: &[Expr],
+        _batch_size: usize,
+        _limit: Option<usize>,
+    ) -> SendableRecordBatchStream {
+        let shard = Arc::clone(&self.shard);
+        let proj = Arc::clone(&projection);
+        let (tx, rx) = mpsc::channel::<DfResult<RecordBatch>>(2);
+
+        tokio::spawn(async move {
+            let entries = match shard.scan_tenant_status_counters().await {
+                Ok(e) => e,
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(DataFusionError::Execution(e.to_string())))
+                        .await;
+                    return;
+                }
+            };
+
+            let shard_id = shard.name().to_string();
+            let n = entries.len();
+
+            if proj.fields().is_empty() {
+                match make_empty_projection_batch(&proj, n) {
+                    Ok(batch) => {
+                        let _ = tx.send(Ok(batch)).await;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                    }
+                }
+                return;
+            }
+
+            let mut cols: Vec<ArrayRef> = Vec::with_capacity(proj.fields().len());
+            for f in proj.fields() {
+                let col: ArrayRef = match f.name().as_str() {
+                    "shard_id" => Arc::new(StringArray::from(vec![shard_id.as_str(); n])),
+                    "tenant" => Arc::new(StringArray::from(
+                        entries
+                            .iter()
+                            .map(|(t, _, _)| t.as_str())
+                            .collect::<Vec<_>>(),
+                    )),
+                    "status_kind" => Arc::new(StringArray::from(
+                        entries
+                            .iter()
+                            .map(|(_, s, _)| s.as_str())
+                            .collect::<Vec<_>>(),
+                    )),
+                    "cnt" => Arc::new(Int64Array::from(
+                        entries.iter().map(|(_, _, c)| *c).collect::<Vec<_>>(),
+                    )),
+                    other => {
+                        let _ = tx
+                            .send(Err(DataFusionError::Execution(format!(
+                                "unknown column {}",
+                                other
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+                cols.push(col);
+            }
+
+            match RecordBatch::try_new(proj, cols) {
+                Ok(batch) => {
+                    let _ = tx.send(Ok(batch)).await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(DataFusionError::Execution(e.to_string())))
+                        .await;
                 }
             }
         });

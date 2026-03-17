@@ -75,6 +75,10 @@ async fn main() {
             "SELECT tenant, COUNT(*) as cnt FROM jobs WHERE status_kind NOT IN ('Succeeded','Failed','Cancelled') GROUP BY tenant ORDER BY cnt DESC LIMIT 20",
         ),
         (
+            "tenant_status_counts",
+            "SELECT tenant, status_kind, cnt FROM tenant_counts",
+        ),
+        (
             "large_tenant_count",
             "SELECT COUNT(*) FROM jobs WHERE tenant = 'tenant_001'",
         ),

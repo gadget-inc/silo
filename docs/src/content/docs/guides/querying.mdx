@@ -80,7 +80,7 @@ Use `siloctl cluster info` to see all shards and their owners. If you know the t
 
 ## Tables
 
-Silo exposes two tables: `jobs` and `queues`.
+Silo exposes three tables: `jobs`, `queues`, and `tenant_counts`.
 
 ### `jobs` Table
 
@@ -115,6 +115,17 @@ Shows the current state of concurrency queues — which jobs hold concurrency ti
 | `job_id` | String (nullable) | Job ID (present for requesters) |
 | `priority` | UInt8 (nullable) | Job priority (present for requesters) |
 | `timestamp_ms` | Int64 | When the ticket was granted or the request was made |
+
+### `tenant_counts` Table
+
+Pre-computed per-tenant, per-status job counts. Backed by merge-operator counters maintained on every status transition, making this table very fast for tenant-level status aggregation (sub-millisecond vs full scan).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `shard_id` | String | UUID of the shard |
+| `tenant` | String | Tenant identifier |
+| `status_kind` | String | Job status kind (Scheduled, Running, Succeeded, etc.) |
+| `cnt` | Int64 | Number of jobs with this tenant and status |
 
 ## Status Values
 

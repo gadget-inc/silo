@@ -24,6 +24,7 @@ pub use restart::JobNotRestartableError;
 
 pub(crate) use enqueue::LimitTaskParams;
 use helpers::DbWriteBatcher;
+use helpers::WriteBatcher;
 pub use helpers::now_epoch_ms;
 
 use slatedb::Db;
@@ -664,9 +665,15 @@ impl JobStoreShard {
         // Update counters in the same batch
         let mut writer = DbWriteBatcher::new(&self.db, &mut batch);
         self.decrement_total_jobs_counter(&mut writer)?;
-        if status.is_some() {
+        if let Some(ref status) = status {
             // Job was in terminal state (we already checked it's terminal above)
             self.decrement_completed_jobs_counter(&mut writer)?;
+            // Decrement tenant status counter
+            let counter_key = crate::keys::tenant_status_counter_key(tenant, status.kind.as_str());
+            writer.merge(
+                &counter_key,
+                crate::job_store_shard::counters::encode_counter(-1),
+            )?;
         }
 
         self.db.write(batch).await?;
