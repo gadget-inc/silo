@@ -1363,21 +1363,35 @@ async fn reimport_running_job_in_batch_fails_entire_call() {
     assert_eq!(dequeued.tasks.len(), 1);
     assert_eq!(dequeued.tasks[0].job().id(), "batch-run-a");
 
-    // Try reimporting both — should error because job_a is Running
-    let mut reimport_a = base_import_params("batch-run-a");
-    reimport_a.attempts = vec![failed_attempt(1_700_000_001_000)];
-
+    // Try reimporting both — put the non-running job first so it gets committed
+    // in its own transaction before the running job causes the batch to error.
     let mut reimport_b = base_import_params("batch-run-b");
     reimport_b.attempts = vec![failed_attempt(1_700_000_001_000)];
 
+    let mut reimport_a = base_import_params("batch-run-a");
+    reimport_a.attempts = vec![failed_attempt(1_700_000_001_000)];
+
     let err = shard
-        .import_jobs("-", vec![reimport_a, reimport_b])
+        .import_jobs("-", vec![reimport_b, reimport_a])
         .await
         .expect_err("batch import should fail when any job is running");
     let err_msg = err.to_string();
     assert!(
         err_msg.contains("currently running"),
         "error should mention 'currently running', got: {err_msg}"
+    );
+
+    // job_b should have been successfully reimported before the error —
+    // each job is its own transaction, so committed work is not rolled back.
+    let status_b = shard
+        .get_job_status("-", "batch-run-b")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        status_b.kind,
+        JobStatusKind::Failed,
+        "batch-run-b should have been reimported to Failed before batch-run-a errored"
     );
 }
 
