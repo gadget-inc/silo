@@ -102,6 +102,14 @@ impl JobStoreShard {
                     error: None,
                     status,
                 }),
+                Err(
+                    e @ JobStoreShardError::JobNotReimportable(JobNotReimportableError {
+                        status: JobStatusKind::Running,
+                        ..
+                    }),
+                ) => {
+                    return Err(e);
+                }
                 Err(e) => results.push(ImportJobResult {
                     job_id,
                     success: false,

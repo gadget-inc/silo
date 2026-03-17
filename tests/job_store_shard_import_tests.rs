@@ -1334,18 +1334,53 @@ async fn reimport_running_job_fails() {
     let dequeued = shard.dequeue("worker-1", "default", 1).await.unwrap();
     assert_eq!(dequeued.tasks.len(), 1);
 
-    // Try reimport while Running
+    // Try reimport while Running — should return an error, not a per-job result
     let mut reimport = base_import_params("reimp-rej-run");
     reimport.attempts = vec![failed_attempt(1_700_000_001_000)];
 
-    let results = shard.import_jobs("-", vec![reimport]).await.unwrap();
-    assert!(!results[0].success);
+    let err = shard
+        .import_jobs("-", vec![reimport])
+        .await
+        .expect_err("import should fail when job is running");
+    let err_msg = err.to_string();
     assert!(
-        results[0]
-            .error
-            .as_ref()
-            .unwrap()
-            .contains("currently running")
+        err_msg.contains("currently running"),
+        "error should mention 'currently running', got: {err_msg}"
+    );
+}
+
+#[silo::test]
+async fn reimport_running_job_in_batch_fails_entire_call() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+
+    // Import two jobs: one will be running, one will be idle
+    let job_a = base_import_params("batch-run-a");
+    let job_b = base_import_params("batch-run-b");
+    shard
+        .import_jobs("-", vec![job_a, job_b])
+        .await
+        .unwrap();
+
+    // Dequeue job_a to make it Running
+    let dequeued = shard.dequeue("worker-1", "default", 1).await.unwrap();
+    assert_eq!(dequeued.tasks.len(), 1);
+    assert_eq!(dequeued.tasks[0].job().id(), "batch-run-a");
+
+    // Try reimporting both — should error because job_a is Running
+    let mut reimport_a = base_import_params("batch-run-a");
+    reimport_a.attempts = vec![failed_attempt(1_700_000_001_000)];
+
+    let mut reimport_b = base_import_params("batch-run-b");
+    reimport_b.attempts = vec![failed_attempt(1_700_000_001_000)];
+
+    let err = shard
+        .import_jobs("-", vec![reimport_a, reimport_b])
+        .await
+        .expect_err("batch import should fail when any job is running");
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("currently running"),
+        "error should mention 'currently running', got: {err_msg}"
     );
 }
 
