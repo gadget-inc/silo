@@ -1549,6 +1549,9 @@ export class SiloGRPCClient {
     ];
 
     for (const serverAddr of servers) {
+      // Track whether the connection existed before this attempt, so we
+      // only clean up connections that were freshly created on failure.
+      const hadConnectionBefore = this._connections.has(serverAddr);
       try {
         const conn = this._getOrCreateConnection(serverAddr);
 
@@ -1590,10 +1593,13 @@ export class SiloGRPCClient {
 
         // Close and remove connections to servers that are no longer in the
         // topology. This prevents stale connections (e.g. to old pod IPs
-        // after a StatefulSet restart) from accumulating and causing timeouts
-        // on subsequent refreshes.
+        // after a StatefulSet restart or scale-down) from accumulating and
+        // causing DNS resolution errors and timeouts on subsequent calls.
+        // Initial servers are also cleaned up — they are only needed for
+        // bootstrapping topology discovery, which has already succeeded at
+        // this point.
         for (const [addr, existingConn] of this._connections) {
-          if (!activeAddresses.has(addr) && !this._initialServers.includes(addr)) {
+          if (!activeAddresses.has(addr)) {
             existingConn.transport.close();
             this._connections.delete(addr);
           }
@@ -1606,6 +1612,16 @@ export class SiloGRPCClient {
 
         return; // Success
       } catch {
+        // If we freshly created a connection to an initial server that no
+        // longer resolves (e.g. scaled-down pod), clean it up so it isn't
+        // round-robined into for regular traffic.
+        if (!hadConnectionBefore) {
+          const failedConn = this._connections.get(serverAddr);
+          if (failedConn) {
+            failedConn.transport.close();
+            this._connections.delete(serverAddr);
+          }
+        }
         // Try next server
         continue;
       }

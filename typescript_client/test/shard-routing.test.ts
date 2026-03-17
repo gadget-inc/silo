@@ -488,13 +488,13 @@ describe("Shard Routing", () => {
 
       await client.refreshTopology();
 
-      // Should have connections to initial server + two discovered pod IPs
-      expect(connections.has("localhost:7450")).toBe(true);
+      // Should have connections to two discovered pod IPs
+      // Initial server (localhost:7450) is cleaned up since it's not in topology
+      expect(connections.has("localhost:7450")).toBe(false);
       expect(connections.has("10.0.0.1:7450")).toBe(true);
       expect(connections.has("10.0.0.2:7450")).toBe(true);
 
       // Now simulate pod restart: node-b gets new IP 10.0.0.3
-      // The response comes from the initial server (localhost:7450)
       const updatedMock = vi.fn().mockReturnValue({
         response: Promise.resolve({
           numShards: 2,
@@ -530,15 +530,16 @@ describe("Shard Routing", () => {
       expect(connections.has("10.0.0.2:7450")).toBe(false);
       // New pod IP should be present
       expect(connections.has("10.0.0.3:7450")).toBe(true);
-      // Initial server should be preserved (never cleaned up)
-      expect(connections.has("localhost:7450")).toBe(true);
+      // Initial server not in topology should be cleaned up to avoid
+      // DNS resolution errors when the pod is scaled down
+      expect(connections.has("localhost:7450")).toBe(false);
       // Still-active server should be preserved
       expect(connections.has("10.0.0.1:7450")).toBe(true);
     });
 
-    it("preserves initial server connections even when not in topology response", async () => {
-      // The initial DNS-based server might not appear in the topology
-      // (the topology response uses pod IPs), but we should keep it
+    it("cleans up initial server connections when not in topology response", async () => {
+      // After topology is discovered, initial servers not in the topology
+      // should be cleaned up to avoid DNS errors if those pods are scaled down
       const mockGetClusterInfo = vi.fn().mockReturnValue({
         response: Promise.resolve({
           numShards: 1,
@@ -562,9 +563,8 @@ describe("Shard Routing", () => {
 
       await client.refreshTopology();
 
-      // localhost:7450 is the initial server and should be kept even though
-      // the topology only references 10.0.0.1:7450
-      expect(connections.has("localhost:7450")).toBe(true);
+      // localhost:7450 is the initial server but not in topology — should be cleaned up
+      expect(connections.has("localhost:7450")).toBe(false);
       expect(connections.has("10.0.0.1:7450")).toBe(true);
     });
 
@@ -590,10 +590,10 @@ describe("Shard Routing", () => {
       const conn = connections.values().next().value;
       conn.client.getClusterInfo = mockGetClusterInfo;
 
-      // First refresh: discover 10.0.0.1
+      // First refresh: discover 10.0.0.1 (localhost:7450 is cleaned up since it's not in topology)
       await client.refreshTopology();
 
-      // Grab a reference to the old connection and spy on its transport.close
+      // Grab a reference to the connection and spy on its transport.close
       const oldConn = connections.get("10.0.0.1:7450");
       const closeSpy = vi.spyOn(oldConn.transport, "close");
 
@@ -615,9 +615,9 @@ describe("Shard Routing", () => {
         }),
       });
 
-      // Mock the initial server's getClusterInfo since it will be tried first
-      const initialConn = connections.get("localhost:7450");
-      initialConn.client.getClusterInfo = updatedMock;
+      // Mock the 10.0.0.1 connection's getClusterInfo since it will be tried first
+      // (it's the only one in _connections after the first refresh)
+      oldConn.client.getClusterInfo = updatedMock;
 
       await client.refreshTopology();
 
@@ -625,6 +625,204 @@ describe("Shard Routing", () => {
       expect(closeSpy).toHaveBeenCalled();
       expect(connections.has("10.0.0.1:7450")).toBe(false);
       expect(connections.has("10.0.0.2:7450")).toBe(true);
+    });
+
+    it("cleans up freshly-created connection when initial server fails during refresh", async () => {
+      // Simulate: after a successful topology refresh, the initial server
+      // (localhost:7450) is cleaned up from _connections. On the next refresh,
+      // all existing connections fail, so refreshTopology falls back to the
+      // initial server. But that server is also unreachable (e.g. scaled-down
+      // pod with unresolvable DNS). The freshly-created connection should be
+      // cleaned up rather than lingering in the connection pool.
+      const mockGetClusterInfo = vi.fn().mockReturnValue({
+        response: Promise.resolve({
+          numShards: 1,
+          shardOwners: [
+            {
+              shardId: "00000000-0000-0000-0000-000000000001",
+              grpcAddr: "10.0.0.1:7450",
+              nodeId: "node-a",
+              rangeStart: "",
+              rangeEnd: "",
+            },
+          ],
+          thisNodeId: "node-a",
+          thisGrpcAddr: "10.0.0.1:7450",
+        }),
+      });
+
+      const connections = (client as any)._connections as Map<string, any>;
+      const conn = connections.values().next().value;
+      conn.client.getClusterInfo = mockGetClusterInfo;
+
+      // First refresh succeeds, cleans up localhost:7450 initial server
+      await client.refreshTopology();
+      expect(connections.has("localhost:7450")).toBe(false);
+      expect(connections.has("10.0.0.1:7450")).toBe(true);
+
+      // Now make the discovered server fail
+      const discoveredConn = connections.get("10.0.0.1:7450");
+      discoveredConn.client.getClusterInfo = vi.fn().mockReturnValue({
+        response: Promise.reject(new Error("connection refused")),
+      });
+
+      // Intercept _getOrCreateConnection so the freshly-created localhost:7450
+      // connection also fails (simulating DNS resolution failure for scaled-down pod)
+      const originalGetOrCreate = (client as any)._getOrCreateConnection.bind(client);
+      (client as any)._getOrCreateConnection = (addr: string) => {
+        const c = originalGetOrCreate(addr);
+        if (addr === "localhost:7450") {
+          c.client.getClusterInfo = vi.fn().mockReturnValue({
+            response: Promise.reject(new Error("DNS resolution failed")),
+          });
+        }
+        return c;
+      };
+
+      // refreshTopology will:
+      // 1. Try 10.0.0.1:7450 (existing connection) — fails
+      // 2. Try localhost:7450 (initial server, freshly created) — fails
+      await expect(client.refreshTopology()).rejects.toThrow(
+        "Failed to refresh cluster topology from any server",
+      );
+
+      // The freshly-created connection to localhost:7450 should be cleaned up
+      expect(connections.has("localhost:7450")).toBe(false);
+      // The pre-existing connection to 10.0.0.1:7450 should NOT be cleaned up
+      // (it existed before the refresh attempt, so we don't remove it)
+      expect(connections.has("10.0.0.1:7450")).toBe(true);
+    });
+
+    it("does not remove pre-existing connections when they fail during refresh", async () => {
+      // When a connection that existed before refreshTopology fails, it should
+      // be kept — only freshly-created connections are cleaned up on failure.
+      const mockGetClusterInfo = vi.fn().mockReturnValue({
+        response: Promise.reject(new Error("temporary network error")),
+      });
+
+      const connections = (client as any)._connections as Map<string, any>;
+      const conn = connections.values().next().value;
+      conn.client.getClusterInfo = mockGetClusterInfo;
+
+      await expect(client.refreshTopology()).rejects.toThrow(
+        "Failed to refresh cluster topology from any server",
+      );
+
+      // The initial server connection should still be present since it
+      // existed before refreshTopology was called
+      expect(connections.has("localhost:7450")).toBe(true);
+    });
+
+    it("re-bootstraps from initial servers after all active connections are lost", async () => {
+      // Simulate scale-down: topology initially has 2 servers, then one is
+      // removed. On next refresh, the remaining server reports the new topology.
+      // Then that server also goes away, and we re-bootstrap from initial servers.
+      client.close();
+      client = new SiloGRPCClient({
+        servers: ["seed-1:7450", "seed-2:7450"],
+        useTls: false,
+        shardRouting: {
+          topologyRefreshIntervalMs: 0,
+        },
+      });
+
+      const connections = (client as any)._connections as Map<string, any>;
+
+      // Both seed servers respond with topology pointing to pod IPs
+      const twoNodeTopology = vi.fn().mockReturnValue({
+        response: Promise.resolve({
+          numShards: 2,
+          shardOwners: [
+            {
+              shardId: "00000000-0000-0000-0000-000000000001",
+              grpcAddr: "10.0.0.1:7450",
+              nodeId: "node-a",
+              rangeStart: "",
+              rangeEnd: "8000000000000000",
+            },
+            {
+              shardId: "00000000-0000-0000-0000-000000000002",
+              grpcAddr: "10.0.0.2:7450",
+              nodeId: "node-b",
+              rangeStart: "8000000000000000",
+              rangeEnd: "",
+            },
+          ],
+          thisNodeId: "node-a",
+          thisGrpcAddr: "10.0.0.1:7450",
+        }),
+      });
+
+      for (const [, c] of connections) {
+        c.client.getClusterInfo = twoNodeTopology;
+      }
+
+      await client.refreshTopology();
+
+      // Seed servers are cleaned up, only pod IPs remain
+      expect(connections.has("seed-1:7450")).toBe(false);
+      expect(connections.has("seed-2:7450")).toBe(false);
+      expect(connections.has("10.0.0.1:7450")).toBe(true);
+      expect(connections.has("10.0.0.2:7450")).toBe(true);
+
+      // Scale down to 1 node: both pod IP connections fail, but seed-1 still works
+      for (const [, c] of connections) {
+        c.client.getClusterInfo = vi.fn().mockReturnValue({
+          response: Promise.reject(new Error("connection refused")),
+        });
+      }
+
+      // This refresh will fail on pod IPs, then fall back to seed servers.
+      // We need seed-1 to succeed with the new single-node topology.
+      // _getOrCreateConnection will create new connections to the seed servers.
+      // We mock it after the connections are created by patching the client factory.
+      const originalGetOrCreate = (client as any)._getOrCreateConnection.bind(client);
+      const oneNodeTopology = vi.fn().mockReturnValue({
+        response: Promise.resolve({
+          numShards: 2,
+          shardOwners: [
+            {
+              shardId: "00000000-0000-0000-0000-000000000001",
+              grpcAddr: "10.0.0.1:7450",
+              nodeId: "node-a",
+              rangeStart: "",
+              rangeEnd: "8000000000000000",
+            },
+            {
+              shardId: "00000000-0000-0000-0000-000000000002",
+              grpcAddr: "10.0.0.1:7450",
+              nodeId: "node-a",
+              rangeStart: "8000000000000000",
+              rangeEnd: "",
+            },
+          ],
+          thisNodeId: "node-a",
+          thisGrpcAddr: "10.0.0.1:7450",
+        }),
+      });
+
+      // Intercept _getOrCreateConnection to mock seed server responses
+      (client as any)._getOrCreateConnection = (addr: string) => {
+        const conn = originalGetOrCreate(addr);
+        if (addr === "seed-1:7450") {
+          conn.client.getClusterInfo = oneNodeTopology;
+        } else if (addr === "seed-2:7450") {
+          conn.client.getClusterInfo = vi.fn().mockReturnValue({
+            response: Promise.reject(new Error("DNS resolution failed")),
+          });
+        }
+        return conn;
+      };
+
+      await client.refreshTopology();
+
+      // After successful re-bootstrap: only pod IP that's in topology remains
+      expect(connections.has("10.0.0.1:7450")).toBe(true);
+      expect(connections.has("10.0.0.2:7450")).toBe(false);
+      // Seed servers not in topology are cleaned up
+      expect(connections.has("seed-1:7450")).toBe(false);
+      // seed-2 failed so its freshly-created connection was already cleaned up
+      expect(connections.has("seed-2:7450")).toBe(false);
     });
   });
 
