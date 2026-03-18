@@ -87,11 +87,27 @@ pub struct ImportJobParams {
 impl JobStoreShard {
     /// Import a batch of jobs, returning per-job results.
     /// Each job is imported independently; failures don't affect other jobs in the batch.
+    /// Returns an error if any job in the batch already exists and is currently Running.
     pub async fn import_jobs(
         &self,
         tenant: &str,
         jobs: Vec<ImportJobParams>,
     ) -> Result<Vec<ImportJobResult>, JobStoreShardError> {
+        // Pre-check: reject the entire batch if any job is currently Running.
+        for params in &jobs {
+            if let Some(status) = self.get_job_status(tenant, &params.id).await? {
+                if status.kind == JobStatusKind::Running {
+                    return Err(JobStoreShardError::JobNotReimportable(
+                        JobNotReimportableError {
+                            job_id: params.id.clone(),
+                            status: JobStatusKind::Running,
+                            reason: "job is currently running".to_string(),
+                        },
+                    ));
+                }
+            }
+        }
+
         let mut results = Vec::with_capacity(jobs.len());
         for params in jobs {
             let job_id = params.id.clone();
@@ -102,14 +118,6 @@ impl JobStoreShard {
                     error: None,
                     status,
                 }),
-                Err(
-                    e @ JobStoreShardError::JobNotReimportable(JobNotReimportableError {
-                        status: JobStatusKind::Running,
-                        ..
-                    }),
-                ) => {
-                    return Err(e);
-                }
                 Err(e) => results.push(ImportJobResult {
                     job_id,
                     success: false,
