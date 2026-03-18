@@ -7,6 +7,7 @@
 //! - Track cleanup progress and status for crash recovery
 
 use crate::coordination::SplitCleanupStatus;
+use crate::job_store_shard::helpers::{DbWriteBatcher, decode_job_status_owned};
 use crate::keys::{
     self, end_bound, parse_attempt_key, parse_concurrency_holder_key,
     parse_concurrency_request_key, parse_concurrency_requester_counter_key,
@@ -248,6 +249,8 @@ impl JobStoreShard {
         F: Fn(&[u8], &[u8]) -> Option<String>,
     {
         let end = end_bound(&start);
+        let decrements_total_jobs = start.as_slice() == [prefix::JOB_INFO];
+        let decrements_completed_jobs = start.as_slice() == [prefix::JOB_STATUS];
 
         let mut batch = WriteBatch::new();
         let mut batch_count = 0;
@@ -261,6 +264,32 @@ impl JobStoreShard {
                 && !range.contains_tenant(&tenant)
             {
                 batch.delete(&kv.key);
+
+                if decrements_total_jobs || decrements_completed_jobs {
+                    let mut writer = DbWriteBatcher::new(&self.db, &mut batch);
+
+                    if decrements_total_jobs {
+                        self.decrement_total_jobs_counter(&mut writer)?;
+                    }
+
+                    if decrements_completed_jobs {
+                        match decode_job_status_owned(&kv.value) {
+                            Ok(status) if status.is_terminal() => {
+                                self.decrement_completed_jobs_counter(&mut writer)?;
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!(
+                                    shard = %self.name,
+                                    key = %hex::encode(&kv.key),
+                                    error = %e,
+                                    "cleanup: failed to decode job status for counter adjustment"
+                                );
+                            }
+                        }
+                    }
+                }
+
                 batch_count += 1;
                 progress.keys_deleted += 1;
             }

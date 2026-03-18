@@ -129,6 +129,69 @@ async fn cleanup_removes_status_and_index_keys() {
 }
 
 #[silo::test]
+async fn cleanup_updates_shard_counters_for_deleted_tenants() {
+    let (_tmp, shard) = open_temp_shard().await;
+
+    // zzz(6d85) is IN range [, 8000), aaa(ae01) is OUT
+    enqueue_jobs_for_tenants(&shard, &["aaa", "zzz"], 2).await;
+
+    let leased_aaa = shard
+        .lease_task("aaa", "aaa-job-0", "worker")
+        .await
+        .expect("lease aaa job");
+    shard
+        .report_attempt_outcome(
+            leased_aaa.attempt().task_id(),
+            silo::job_attempt::AttemptOutcome::Success { result: vec![] },
+        )
+        .await
+        .expect("complete aaa job");
+
+    let leased_zzz = shard
+        .lease_task("zzz", "zzz-job-0", "worker")
+        .await
+        .expect("lease zzz job");
+    shard
+        .report_attempt_outcome(
+            leased_zzz.attempt().task_id(),
+            silo::job_attempt::AttemptOutcome::Success { result: vec![] },
+        )
+        .await
+        .expect("complete zzz job");
+
+    shard.db().flush().await.unwrap();
+
+    let counters_before = shard
+        .get_counters()
+        .await
+        .expect("get counters before cleanup");
+    assert_eq!(counters_before.total_jobs, 4);
+    assert_eq!(counters_before.completed_jobs, 2);
+
+    let left_range = ShardRange::new("", RANGE_BOUNDARY);
+    let result = shard
+        .after_split_cleanup_defunct_data(&left_range, 10)
+        .await
+        .expect("cleanup should succeed");
+
+    assert!(result.complete);
+    shard.db().flush().await.unwrap();
+
+    let counters_after = shard
+        .get_counters()
+        .await
+        .expect("get counters after cleanup");
+    assert_eq!(
+        counters_after.total_jobs, 2,
+        "total_jobs should only count in-range jobs after cleanup"
+    );
+    assert_eq!(
+        counters_after.completed_jobs, 1,
+        "completed_jobs should only count in-range terminal jobs after cleanup"
+    );
+}
+
+#[silo::test]
 async fn cleanup_handles_right_child_range() {
     let (_tmp, shard) = open_temp_shard().await;
 
