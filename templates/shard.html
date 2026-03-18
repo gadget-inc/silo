@@ -10,21 +10,35 @@
             <h1 class="text-xl font-bold text-zinc-100">Shard Details</h1>
         </div>
     </div>
-    
+
     {% if let Some(msg) = split_message %}
     <div class="bg-emerald-900/30 border border-emerald-700 p-4">
         <div class="text-emerald-400 text-sm font-medium">Success</div>
         <pre class="text-emerald-300 text-xs mt-2 whitespace-pre-wrap">{{ msg }}</pre>
     </div>
     {% endif %}
-    
+
     {% if let Some(err) = split_error %}
     <div class="bg-red-900/30 border border-red-700 p-4">
         <div class="text-red-400 text-sm font-medium">Error</div>
         <pre class="text-red-300 text-xs mt-2 whitespace-pre-wrap">{{ err }}</pre>
     </div>
     {% endif %}
-    
+
+    {% if let Some(msg) = compact_message %}
+    <div class="bg-emerald-900/30 border border-emerald-700 p-4">
+        <div class="text-emerald-400 text-sm font-medium">Compaction</div>
+        <pre class="text-emerald-300 text-xs mt-2 whitespace-pre-wrap">{{ msg }}</pre>
+    </div>
+    {% endif %}
+
+    {% if let Some(err) = compact_error %}
+    <div class="bg-red-900/30 border border-red-700 p-4">
+        <div class="text-red-400 text-sm font-medium">Compaction Error</div>
+        <pre class="text-red-300 text-xs mt-2 whitespace-pre-wrap">{{ err }}</pre>
+    </div>
+    {% endif %}
+
     <!-- Shard Info -->
     <div class="bg-zinc-800 border border-zinc-700 overflow-hidden">
         <div class="bg-zinc-850 border-b border-zinc-700 px-4 py-2">
@@ -75,7 +89,88 @@
             </dl>
         </div>
     </div>
-    
+
+    <!-- LSM Tree State -->
+    {% if let Some(lsm) = lsm_state %}
+    <div class="bg-zinc-800 border border-zinc-700 overflow-hidden">
+        <div class="bg-zinc-850 border-b border-zinc-700 px-4 py-2 flex items-center justify-between">
+            <h2 class="text-sm font-semibold text-zinc-300">Storage (LSM Tree)</h2>
+            <span class="text-xs text-zinc-500">Total: {{ lsm.total_size }}</span>
+        </div>
+        <div class="p-4 space-y-4">
+            <!-- Summary -->
+            <dl class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <div>
+                    <dt class="text-xs text-zinc-500 uppercase tracking-wider">L0 SSTs</dt>
+                    <dd class="text-sm text-zinc-200 mt-1">{{ lsm.l0_sst_count }}</dd>
+                </div>
+                <div>
+                    <dt class="text-xs text-zinc-500 uppercase tracking-wider">L0 Size</dt>
+                    <dd class="text-sm text-zinc-200 mt-1">{{ lsm.total_l0_size }}</dd>
+                </div>
+                <div>
+                    <dt class="text-xs text-zinc-500 uppercase tracking-wider">Sorted Runs</dt>
+                    <dd class="text-sm text-zinc-200 mt-1">{{ lsm.sorted_run_count }}</dd>
+                </div>
+                <div>
+                    <dt class="text-xs text-zinc-500 uppercase tracking-wider">Sorted Run Size</dt>
+                    <dd class="text-sm text-zinc-200 mt-1">{{ lsm.total_sorted_run_size }}</dd>
+                </div>
+            </dl>
+
+            {% if !lsm.sorted_runs.is_empty() %}
+            <!-- Sorted Runs Table -->
+            <div>
+                <h3 class="text-xs text-zinc-500 uppercase tracking-wider mb-2">Sorted Runs</h3>
+                <table class="w-full text-sm">
+                    <thead>
+                        <tr class="text-left text-xs text-zinc-500 uppercase tracking-wider border-b border-zinc-700">
+                            <th class="pb-2 pr-4">Run ID</th>
+                            <th class="pb-2 pr-4">SSTs</th>
+                            <th class="pb-2">Size</th>
+                        </tr>
+                    </thead>
+                    <tbody class="text-zinc-300">
+                        {% for sr in lsm.sorted_runs %}
+                        <tr class="border-b border-zinc-700/50">
+                            <td class="py-1.5 pr-4 font-mono">{{ sr.id }}</td>
+                            <td class="py-1.5 pr-4">{{ sr.sst_count }}</td>
+                            <td class="py-1.5">{{ sr.estimated_size }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% endif %}
+
+            <!-- Compaction hints -->
+            {% if lsm.l0_sst_count > 4 || lsm.sorted_run_count > 1 %}
+            <div class="bg-amber-900/20 border border-amber-700/50 px-3 py-2 text-xs text-amber-300">
+                {% if lsm.l0_sst_count > 4 %}
+                High L0 SST count ({{ lsm.l0_sst_count }}) may indicate compaction lag.
+                {% endif %}
+                {% if lsm.sorted_run_count > 1 %}
+                Multiple sorted runs ({{ lsm.sorted_run_count }}) means read amplification; compaction will merge them.
+                {% endif %}
+            </div>
+            {% endif %}
+
+            <!-- Compact Button -->
+            <form action="/shard/{{ shard_id }}/compact" method="POST">
+                <button
+                    type="submit"
+                    class="px-4 py-2 bg-indigo-700 hover:bg-indigo-600 text-indigo-100 text-sm font-medium"
+                >
+                    Trigger Full Compaction
+                </button>
+                <p class="text-zinc-500 text-xs mt-1">
+                    Merges all L0 SSTs and sorted runs into a single sorted run. Runs in the background.
+                </p>
+            </form>
+        </div>
+    </div>
+    {% endif %}
+
     <!-- Split Shard Form -->
     {% if split_phase.is_none() %}
     <div class="bg-zinc-800 border border-zinc-700 overflow-hidden">
@@ -94,9 +189,9 @@
                         Split Point (Tenant ID)
                     </label>
                     <div class="flex gap-2">
-                        <input 
-                            type="text" 
-                            name="split_point" 
+                        <input
+                            type="text"
+                            name="split_point"
                             id="split_point"
                             placeholder="Enter tenant ID or leave empty for auto"
                             class="flex-1 bg-zinc-900 border border-zinc-700 text-zinc-200 text-sm px-3 py-2 font-mono focus:outline-none focus:border-emerald-500"
@@ -111,7 +206,7 @@
                     </p>
                 </div>
                 <div class="flex gap-2">
-                    <button 
+                    <button
                         type="submit"
                         class="px-4 py-2 bg-amber-700 hover:bg-amber-600 text-amber-100 text-sm font-medium"
                     >

@@ -146,6 +146,39 @@ pub enum JobStoreShardError {
     TransactionConflict(String),
 }
 
+/// Information about the LSM tree state of a shard's SlateDB instance.
+#[derive(Debug, Clone)]
+pub struct LsmState {
+    /// L0 SSTs (unflushed/uncompacted).
+    pub l0_ssts: Vec<LsmSstInfo>,
+    /// Sorted runs (compacted).
+    pub sorted_runs: Vec<LsmSortedRunInfo>,
+    /// Total estimated size of all L0 SSTs in bytes.
+    pub total_l0_size: u64,
+    /// Total estimated size of all sorted runs in bytes.
+    pub total_sorted_run_size: u64,
+}
+
+/// Information about a single SST file.
+#[derive(Debug, Clone)]
+pub struct LsmSstInfo {
+    /// SST identifier (debug format of SsTableId).
+    pub id: String,
+    /// Estimated size in bytes.
+    pub estimated_size: u64,
+}
+
+/// Information about a sorted run.
+#[derive(Debug, Clone)]
+pub struct LsmSortedRunInfo {
+    /// Sorted run identifier.
+    pub id: u32,
+    /// Number of SSTs in this sorted run.
+    pub sst_count: usize,
+    /// Estimated total size in bytes.
+    pub estimated_size: u64,
+}
+
 impl From<CodecError> for JobStoreShardError {
     fn from(e: CodecError) -> Self {
         JobStoreShardError::Codec(e.to_string())
@@ -440,6 +473,51 @@ impl JobStoreShard {
     /// Use this to collect storage-level statistics for observability.
     pub fn slatedb_stats(&self) -> std::sync::Arc<slatedb::stats::StatRegistry> {
         self.db.metrics()
+    }
+
+    /// Read LSM tree state from the SlateDB manifest.
+    ///
+    /// Returns information about L0 SSTs and sorted runs that helps operators
+    /// understand whether compaction is needed.
+    pub async fn read_lsm_state(&self) -> Result<LsmState, JobStoreShardError> {
+        use slatedb::admin::AdminBuilder;
+
+        let admin = AdminBuilder::new(self.db_path.as_str(), self.store.clone()).build();
+
+        let state = admin.read_compactor_state_view().await.map_err(|e| {
+            JobStoreShardError::Codec(format!("failed to read compactor state: {e}"))
+        })?;
+
+        let manifest = state.manifest();
+
+        let l0_ssts: Vec<LsmSstInfo> = manifest
+            .l0
+            .iter()
+            .map(|sst| LsmSstInfo {
+                id: format!("{:?}", sst.id),
+                estimated_size: sst.info.index_offset + sst.info.index_len,
+            })
+            .collect();
+
+        let sorted_runs: Vec<LsmSortedRunInfo> = manifest
+            .compacted
+            .iter()
+            .map(|sr| LsmSortedRunInfo {
+                id: sr.id,
+                sst_count: sr.ssts.len(),
+                estimated_size: sr.estimate_size(),
+            })
+            .collect();
+
+        let total_l0_size: u64 = l0_ssts.iter().map(|s| s.estimated_size).sum();
+        let total_sorted_run_size: u64 = sorted_runs.iter().map(|s| s.estimated_size).sum();
+
+        Ok(LsmState {
+            l0_ssts,
+            sorted_runs,
+            total_l0_size,
+            total_sorted_run_size,
+        })
     }
 
     /// Get the shard's tenant range.
