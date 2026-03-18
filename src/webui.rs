@@ -1309,7 +1309,7 @@ async fn tenant_handler(
     let mut errors: Vec<String> = Vec::new();
 
     let count_sql = format!(
-        "SELECT status_kind, COUNT(*) as cnt FROM jobs WHERE tenant = '{}' GROUP BY status_kind",
+        "SELECT status_kind, cnt FROM tenant_counts WHERE tenant = '{}'",
         tenant_escaped
     );
     match state.query_engine.sql(&count_sql).await {

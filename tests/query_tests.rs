@@ -3376,6 +3376,23 @@ async fn explain_tenant_counts() {
 }
 
 #[silo::test]
+async fn explain_tenant_counts_with_tenant_filter_uses_bounded_scan() {
+    let (_tmp, shard) = open_temp_shard().await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let plan = sql
+        .explain("SELECT status_kind, cnt FROM tenant_counts WHERE tenant = 'tenant-a'")
+        .await
+        .expect("explain");
+
+    assert!(
+        plan.contains("tenant=\"tenant-a\""),
+        "EXPLAIN should show the tenant-bounded tenant_counts scan, got: {}",
+        plan
+    );
+}
+
+#[silo::test]
 async fn sql_tenant_counts_returns_correct_data() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
@@ -3484,6 +3501,97 @@ async fn sql_tenant_counts_returns_correct_data() {
             results.contains(&("tenant-b".to_string(), "Scheduled".to_string(), 2)),
             "expected tenant-b/Scheduled=2, got: {:?}",
             results
+        );
+    });
+}
+
+#[silo::test]
+async fn sql_tenant_counts_filters_by_exact_tenant() {
+    with_timeout!(20000, {
+        let (_tmp, shard) = open_temp_shard().await;
+        let now = now_ms();
+
+        for id in ["tc-a1", "tc-a2", "tc-a3"] {
+            shard
+                .enqueue(
+                    "tenant-a",
+                    Some(id.to_string()),
+                    10u8,
+                    now,
+                    None,
+                    test_helpers::msgpack_payload(&serde_json::json!({})),
+                    vec![],
+                    None,
+                    "default",
+                )
+                .await
+                .expect("enqueue");
+        }
+        for id in ["tc-b1", "tc-b2"] {
+            shard
+                .enqueue(
+                    "tenant-b",
+                    Some(id.to_string()),
+                    10u8,
+                    now,
+                    None,
+                    test_helpers::msgpack_payload(&serde_json::json!({})),
+                    vec![],
+                    None,
+                    "default",
+                )
+                .await
+                .expect("enqueue");
+        }
+
+        let tasks = shard
+            .dequeue("w", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
+        assert_eq!(tasks.len(), 1);
+        let task_id = tasks[0].attempt().task_id().to_string();
+        shard
+            .report_attempt_outcome(
+                &task_id,
+                silo::job_attempt::AttemptOutcome::Success { result: vec![] },
+            )
+            .await
+            .expect("report success");
+
+        let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+        let batches = sql
+            .sql("SELECT status_kind, cnt FROM tenant_counts WHERE tenant = 'tenant-a' ORDER BY status_kind")
+            .await
+            .expect("sql")
+            .collect()
+            .await
+            .expect("collect");
+
+        let mut results: Vec<(String, i64)> = Vec::new();
+        for batch in batches {
+            let statuses = batch
+                .column_by_name("status_kind")
+                .expect("status_kind column")
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .expect("StringArray status_kind");
+            let counts = batch
+                .column_by_name("cnt")
+                .expect("cnt column")
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .expect("Int64Array cnt");
+
+            for i in 0..batch.num_rows() {
+                results.push((statuses.value(i).to_string(), counts.value(i)));
+            }
+        }
+
+        assert_eq!(
+            results,
+            vec![("Scheduled".to_string(), 2), ("Succeeded".to_string(), 1)],
+            "exact tenant query should only return tenant-a counters"
         );
     });
 }

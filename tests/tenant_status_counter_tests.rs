@@ -2,6 +2,7 @@ mod test_helpers;
 
 use silo::job::JobStatusKind;
 use silo::job_attempt::AttemptOutcome;
+use silo::job_store_shard::TenantStatusCounterScanRange;
 use silo::job_store_shard::import::{ImportJobParams, ImportedAttempt, ImportedAttemptStatus};
 use silo::retry::RetryPolicy;
 use silo::shard_range::ShardRange;
@@ -14,7 +15,7 @@ async fn get_status_counts(
     tenant: &str,
 ) -> std::collections::HashMap<String, i64> {
     let entries = shard
-        .scan_tenant_status_counters()
+        .scan_tenant_status_counters(None)
         .await
         .expect("scan_tenant_status_counters");
     entries
@@ -482,7 +483,7 @@ async fn counter_scan_filters_by_shard_range() {
         }
 
         // With full range, both tenants should be visible
-        let entries = shard.scan_tenant_status_counters().await.expect("scan");
+        let entries = shard.scan_tenant_status_counters(None).await.expect("scan");
         assert_eq!(entries.len(), 2, "full range should see both tenants");
 
         // Create a range that includes "alpha" but not "bravo" by hashing
@@ -528,7 +529,7 @@ async fn counter_scan_filters_by_shard_range() {
 
         // Only the in-range tenant should appear in the scan
         let entries = restricted_shard
-            .scan_tenant_status_counters()
+            .scan_tenant_status_counters(None)
             .await
             .expect("scan restricted");
         assert!(
@@ -542,5 +543,45 @@ async fn counter_scan_filters_by_shard_range() {
             1,
             "restricted range should only see one tenant"
         );
+    });
+}
+
+#[silo::test]
+async fn counter_scan_can_limit_to_exact_tenant() {
+    with_timeout!(20000, {
+        let (_tmp, shard) = open_temp_shard().await;
+
+        for tenant in ["alpha", "bravo"] {
+            for i in 0..2 {
+                shard
+                    .enqueue(
+                        tenant,
+                        Some(format!("{tenant}-job-{i}")),
+                        10u8,
+                        now_ms(),
+                        None,
+                        msgpack_payload(&serde_json::json!({"tenant": tenant})),
+                        vec![],
+                        None,
+                        "default",
+                    )
+                    .await
+                    .expect("enqueue");
+            }
+        }
+
+        let entries = shard
+            .scan_tenant_status_counters(Some(TenantStatusCounterScanRange::exact("alpha")))
+            .await
+            .expect("scan exact tenant");
+
+        assert_eq!(
+            entries.len(),
+            1,
+            "exact tenant scan should only emit one status row"
+        );
+        assert_eq!(entries[0].0, "alpha");
+        assert_eq!(entries[0].1, "Scheduled");
+        assert_eq!(entries[0].2, 2);
     });
 }

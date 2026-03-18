@@ -1270,4 +1270,8 @@ async fn test_tenant_detail_shows_upcoming_jobs_and_queues() {
         body.contains("detail-queue"),
         "tenant detail should show queue activity"
     );
+    assert!(
+        !body.contains("Tenant counts query failed"),
+        "tenant detail should render tenant status counts via tenant_counts"
+    );
 }

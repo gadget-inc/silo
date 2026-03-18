@@ -610,6 +610,11 @@ pub fn tenant_status_counter_prefix() -> Vec<u8> {
     vec![prefix::COUNTER_TENANT_STATUS]
 }
 
+/// Prefix for scanning all tenant status counters for a specific tenant.
+pub fn tenant_status_counter_tenant_prefix(tenant: &str) -> Vec<u8> {
+    encode_with_prefix(prefix::COUNTER_TENANT_STATUS, &(tenant,))
+}
+
 /// Parsed tenant status counter key components.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedTenantStatusCounterKey {

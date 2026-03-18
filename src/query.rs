@@ -27,7 +27,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::job::{JobStatus, JobView};
-use crate::job_store_shard::JobStoreShard;
+use crate::job_store_shard::{JobStoreShard, TenantStatusCounterScanRange};
 
 /// Shared utility to get the EXPLAIN plan for a query.
 /// Used by both ShardQueryEngine and ClusterQueryEngine.
@@ -1695,23 +1695,27 @@ impl std::fmt::Debug for TenantCountsScanner {
 }
 
 impl Scan for TenantCountsScanner {
-    fn describe(&self, _filters: &[Expr], _limit: Option<usize>) -> String {
-        "tenant_counts[]".to_string()
+    fn describe(&self, filters: &[Expr], limit: Option<usize>) -> String {
+        let tenant_range = parse_tenant_counts_scan_range(filters)
+            .map(|range| describe_tenant_status_counter_scan_range(&range))
+            .unwrap_or_else(|| "all".to_string());
+        format!("tenant_counts[{}], limit={:?}", tenant_range, limit)
     }
 
     fn scan(
         &self,
         projection: SchemaRef,
-        _filters: &[Expr],
+        filters: &[Expr],
         _batch_size: usize,
         _limit: Option<usize>,
     ) -> SendableRecordBatchStream {
         let shard = Arc::clone(&self.shard);
         let proj = Arc::clone(&projection);
+        let tenant_range = parse_tenant_counts_scan_range(filters);
         let (tx, rx) = mpsc::channel::<DfResult<RecordBatch>>(2);
 
         tokio::spawn(async move {
-            let entries = match shard.scan_tenant_status_counters().await {
+            let entries = match shard.scan_tenant_status_counters(tenant_range).await {
                 Ok(e) => e,
                 Err(e) => {
                     let _ = tx
@@ -1787,6 +1791,15 @@ impl Scan for TenantCountsScanner {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StringComparisonOp {
+    Eq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+}
+
 fn parse_eq_filter(expr: &Expr) -> Option<(String, String)> {
     // Match forms: col("x") = lit("v") or lit = col
     match expr {
@@ -1802,6 +1815,148 @@ fn parse_eq_filter(expr: &Expr) -> Option<(String, String)> {
             }
         }
         _ => None,
+    }
+}
+
+fn parse_string_comparison_filter(expr: &Expr) -> Option<(String, StringComparisonOp, String)> {
+    match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => match (&**left, &**right) {
+            (Expr::Column(c), Expr::Literal(s, _)) => string_comparison_op(op)
+                .zip(literal_to_string(s))
+                .map(|(cmp, value)| (c.flat_name().to_string(), cmp, value)),
+            (Expr::Literal(s, _), Expr::Column(c)) => inverted_string_comparison_op(op)
+                .zip(literal_to_string(s))
+                .map(|(cmp, value)| (c.flat_name().to_string(), cmp, value)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn string_comparison_op(op: &Operator) -> Option<StringComparisonOp> {
+    match op {
+        Operator::Eq => Some(StringComparisonOp::Eq),
+        Operator::Lt => Some(StringComparisonOp::Lt),
+        Operator::LtEq => Some(StringComparisonOp::LtEq),
+        Operator::Gt => Some(StringComparisonOp::Gt),
+        Operator::GtEq => Some(StringComparisonOp::GtEq),
+        _ => None,
+    }
+}
+
+fn inverted_string_comparison_op(op: &Operator) -> Option<StringComparisonOp> {
+    match op {
+        Operator::Eq => Some(StringComparisonOp::Eq),
+        Operator::Lt => Some(StringComparisonOp::Gt),
+        Operator::LtEq => Some(StringComparisonOp::GtEq),
+        Operator::Gt => Some(StringComparisonOp::Lt),
+        Operator::GtEq => Some(StringComparisonOp::LtEq),
+        _ => None,
+    }
+}
+
+fn parse_tenant_counts_scan_range(filters: &[Expr]) -> Option<TenantStatusCounterScanRange> {
+    let mut lower: Option<(String, bool)> = None;
+    let mut upper: Option<(String, bool)> = None;
+    let mut saw_tenant_filter = false;
+
+    for filter in filters {
+        let Some((col, op, value)) = parse_string_comparison_filter(filter) else {
+            continue;
+        };
+        if col != "tenant" {
+            continue;
+        }
+
+        saw_tenant_filter = true;
+        match op {
+            StringComparisonOp::Eq => {
+                update_lower_string_bound(&mut lower, value.clone(), true);
+                update_upper_string_bound(&mut upper, value, true);
+            }
+            StringComparisonOp::Gt => update_lower_string_bound(&mut lower, value, false),
+            StringComparisonOp::GtEq => update_lower_string_bound(&mut lower, value, true),
+            StringComparisonOp::Lt => update_upper_string_bound(&mut upper, value, false),
+            StringComparisonOp::LtEq => update_upper_string_bound(&mut upper, value, true),
+        }
+    }
+
+    saw_tenant_filter.then(|| TenantStatusCounterScanRange {
+        start_tenant: lower.as_ref().map(|(value, _)| value.clone()),
+        start_inclusive: lower
+            .as_ref()
+            .map(|(_, inclusive)| *inclusive)
+            .unwrap_or(true),
+        end_tenant: upper.as_ref().map(|(value, _)| value.clone()),
+        end_inclusive: upper
+            .as_ref()
+            .map(|(_, inclusive)| *inclusive)
+            .unwrap_or(true),
+    })
+}
+
+fn update_lower_string_bound(bound: &mut Option<(String, bool)>, value: String, inclusive: bool) {
+    match bound {
+        Some((current_value, current_inclusive)) => match value.cmp(current_value) {
+            std::cmp::Ordering::Greater => {
+                *bound = Some((value, inclusive));
+            }
+            std::cmp::Ordering::Equal => {
+                *current_inclusive &= inclusive;
+            }
+            std::cmp::Ordering::Less => {}
+        },
+        None => *bound = Some((value, inclusive)),
+    }
+}
+
+fn update_upper_string_bound(bound: &mut Option<(String, bool)>, value: String, inclusive: bool) {
+    match bound {
+        Some((current_value, current_inclusive)) => match value.cmp(current_value) {
+            std::cmp::Ordering::Less => {
+                *bound = Some((value, inclusive));
+            }
+            std::cmp::Ordering::Equal => {
+                *current_inclusive &= inclusive;
+            }
+            std::cmp::Ordering::Greater => {}
+        },
+        None => *bound = Some((value, inclusive)),
+    }
+}
+
+fn describe_tenant_status_counter_scan_range(range: &TenantStatusCounterScanRange) -> String {
+    if range.start_inclusive
+        && range.end_inclusive
+        && range.start_tenant.is_some()
+        && range.start_tenant == range.end_tenant
+        && let Some(tenant) = range.start_tenant.as_ref()
+    {
+        return format!("tenant={:?}", tenant);
+    }
+
+    let mut parts = Vec::new();
+
+    if let Some(tenant) = &range.start_tenant {
+        parts.push(if range.start_inclusive {
+            format!("tenant>={:?}", tenant)
+        } else {
+            format!("tenant>{:?}", tenant)
+        });
+    }
+
+    if let Some(tenant) = &range.end_tenant {
+        parts.push(if range.end_inclusive {
+            format!("tenant<={:?}", tenant)
+        } else {
+            format!("tenant<{:?}", tenant)
+        });
+    }
+
+    if parts.is_empty() {
+        "all".to_string()
+    } else {
+        parts.join(", ")
     }
 }
 

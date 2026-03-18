@@ -127,6 +127,10 @@ Pre-computed per-tenant, per-status job counts. Backed by merge-operator counter
 | `status_kind` | String | Job status kind (Scheduled, Running, Succeeded, etc.) |
 | `cnt` | Int64 | Number of jobs with this tenant and status |
 
+`tenant_counts` is a sparse aggregation. It returns one row per `(tenant, status_kind)` pair with a positive count. Statuses with zero jobs are omitted rather than returned as `cnt = 0`, so a missing row should be interpreted as zero.
+
+For example, if a tenant has 12 `Scheduled` jobs and no `Running` jobs, `tenant_counts` returns a `Scheduled` row and no `Running` row.
+
 ## Status Values
 
 The `status_kind` column has the following values:
@@ -222,6 +226,14 @@ SELECT task_group, AVG(CAST(priority AS DOUBLE)) as avg_priority
 FROM jobs
 WHERE tenant = 'customer-123'
 GROUP BY task_group
+```
+
+```sql
+-- Fast per-tenant status counts using the pre-computed sparse counter table
+SELECT status_kind, cnt
+FROM tenant_counts
+WHERE tenant = 'customer-123'
+ORDER BY status_kind
 ```
 
 ### Querying Metadata

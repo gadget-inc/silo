@@ -35,6 +35,54 @@ pub struct ShardCounters {
     pub completed_jobs: i64,
 }
 
+/// Optional lexicographic tenant bounds for scanning tenant status counters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantStatusCounterScanRange {
+    pub start_tenant: Option<String>,
+    pub start_inclusive: bool,
+    pub end_tenant: Option<String>,
+    pub end_inclusive: bool,
+}
+
+impl TenantStatusCounterScanRange {
+    pub fn exact(tenant: impl Into<String>) -> Self {
+        let tenant = tenant.into();
+        Self {
+            start_tenant: Some(tenant.clone()),
+            start_inclusive: true,
+            end_tenant: Some(tenant),
+            end_inclusive: true,
+        }
+    }
+
+    fn scan_bounds(&self) -> (Vec<u8>, Vec<u8>) {
+        let start = match &self.start_tenant {
+            Some(tenant) if self.start_inclusive => {
+                crate::keys::tenant_status_counter_tenant_prefix(tenant)
+            }
+            Some(tenant) => {
+                let prefix = crate::keys::tenant_status_counter_tenant_prefix(tenant);
+                crate::keys::end_bound(&prefix)
+            }
+            None => crate::keys::tenant_status_counter_prefix(),
+        };
+
+        let end = match &self.end_tenant {
+            Some(tenant) if self.end_inclusive => {
+                let prefix = crate::keys::tenant_status_counter_tenant_prefix(tenant);
+                crate::keys::end_bound(&prefix)
+            }
+            Some(tenant) => crate::keys::tenant_status_counter_tenant_prefix(tenant),
+            None => {
+                let prefix = crate::keys::tenant_status_counter_prefix();
+                crate::keys::end_bound(&prefix)
+            }
+        };
+
+        (start, end)
+    }
+}
+
 impl ShardCounters {
     /// Calculate the number of open (non-terminal) jobs.
     pub fn open_jobs(&self) -> i64 {
@@ -164,22 +212,34 @@ impl JobStoreShard {
 
     /// Scan all tenant status counters for this shard.
     ///
-    /// Returns a vec of (tenant, status_kind, count) tuples, filtered to only
-    /// include tenants that belong to this shard's range. Entries with count <= 0
-    /// are excluded.
+    /// Returns a vec of (tenant, status_kind, count) tuples, optionally limited
+    /// to a lexicographic tenant range, filtered to only include tenants that
+    /// belong to this shard's range. Entries with count <= 0 are excluded.
     pub async fn scan_tenant_status_counters(
         &self,
+        tenant_range: Option<TenantStatusCounterScanRange>,
     ) -> Result<Vec<(String, String, i64)>, JobStoreShardError> {
         use crate::keys::{
             end_bound, parse_tenant_status_counter_key, tenant_status_counter_prefix,
         };
         use slatedb::DbIterator;
 
-        let prefix = tenant_status_counter_prefix();
-        let end = end_bound(&prefix);
+        let (start, end) = tenant_range
+            .as_ref()
+            .map(TenantStatusCounterScanRange::scan_bounds)
+            .unwrap_or_else(|| {
+                let prefix = tenant_status_counter_prefix();
+                let end = end_bound(&prefix);
+                (prefix, end)
+            });
+
+        if start >= end {
+            return Ok(Vec::new());
+        }
+
         let range = self.get_range();
 
-        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(prefix..end).await?;
+        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..end).await?;
         let mut results = Vec::new();
 
         while let Some(kv) = iter.next().await? {

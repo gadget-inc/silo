@@ -16,7 +16,7 @@ mod scan;
 
 pub use cleanup::{CleanupProgress, CleanupResult};
 
-pub use counters::{ShardCounters, counter_merge_operator};
+pub use counters::{ShardCounters, TenantStatusCounterScanRange, counter_merge_operator};
 pub use expedite::JobNotExpediteableError;
 pub use import::JobNotReimportableError;
 pub use lease_task::JobNotLeaseableError;
