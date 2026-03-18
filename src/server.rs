@@ -1969,10 +1969,12 @@ where
     let reaper_metrics = metrics.clone();
     let reaper: JoinHandle<()> = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+        let mut tick_count: u64 = 0;
         loop {
             tokio::select! {
                 biased;
                 _ = interval.tick() => {
+                    tick_count += 1;
                     let instances = reaper_factory.instances();
 
                     // Update shards open metric
@@ -1988,6 +1990,31 @@ where
                         if let Some(ref m) = reaper_metrics {
                             let stats = shard.slatedb_stats();
                             m.update_slatedb_stats(&shard_id.to_string(), &stats);
+                        }
+                    }
+
+                    // Every ~5s (50 ticks at 100ms), read LSM state for compaction health metrics
+                    if tick_count % 50 == 0
+                        && let Some(ref m) = reaper_metrics
+                    {
+                        for (shard_id, shard) in instances.iter() {
+                            match shard.read_lsm_state().await {
+                                Ok(lsm) => {
+                                    m.update_compaction_health(
+                                        &shard_id.to_string(),
+                                        lsm.l0_ssts.len(),
+                                        lsm.sorted_runs.len(),
+                                        lsm.space_amplification_percent,
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::debug!(
+                                        shard = %shard_id,
+                                        error = %e,
+                                        "failed to read LSM state for compaction health metrics"
+                                    );
+                                }
+                            }
                         }
                     }
                 }
