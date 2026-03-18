@@ -88,6 +88,15 @@ function getMetricValue(allMetrics: Record<string, DataPoint<number>[]>, name: s
   return points[0].value;
 }
 
+function getMetricAttributes(
+  allMetrics: Record<string, DataPoint<number>[]>,
+  name: string,
+): Record<string, unknown> {
+  const points = allMetrics[name];
+  if (!points || points.length === 0) return {};
+  return points[0].attributes as Record<string, unknown>;
+}
+
 describe("SiloWorker metrics", () => {
   let meterProvider: MeterProvider;
   let metricReader: TestReader;
@@ -289,6 +298,43 @@ describe("SiloWorker metrics", () => {
 
     finishTask!();
     await worker.stop();
+  });
+
+  it("includes task_group label on all metrics", async () => {
+    let pollCount = 0;
+    const leaseTasks = vi.fn().mockImplementation(async () => {
+      pollCount++;
+      return tasksResult([]);
+    });
+    const client = createMockClient({ leaseTasks });
+    const handler: TaskHandler = async () => ({ type: "success", result: {} });
+    const meter = meterProvider.getMeter("test");
+
+    const worker = new SiloWorker({
+      client,
+      workerId: "test-worker",
+      taskGroup: "my-task-group",
+      handler,
+      pollIntervalMs: 10,
+      meter,
+    });
+
+    worker.start();
+    while (pollCount < 2) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    await worker.stop();
+
+    const allMetrics = await collectMetrics(metricReader);
+    expect(getMetricAttributes(allMetrics, "silo.worker.polls")).toEqual({
+      task_group: "my-task-group",
+    });
+    expect(getMetricAttributes(allMetrics, "silo.worker.polls.empty")).toEqual({
+      task_group: "my-task-group",
+    });
+    expect(getMetricAttributes(allMetrics, "silo.worker.available_task_slots")).toEqual({
+      task_group: "my-task-group",
+    });
   });
 
   it("uses global meter provider when no meter is specified", () => {
