@@ -283,7 +283,7 @@ export class SiloWorker<
 
     // Initialize metrics
     const meter = getWorkerMeter(options.meter);
-    this._metrics = new WorkerMetrics(meter, () => this.availableTaskSlots);
+    this._metrics = new WorkerMetrics(meter, this._taskGroup, () => this.availableTaskSlots);
   }
 
   /**
@@ -483,9 +483,9 @@ export class SiloWorker<
     );
 
     // Record poll metrics
-    this._metrics.pollCounter.add(1);
+    this._metrics.pollCounter.add(1, this._metrics.defaultAttributes);
     if (result.tasks.length === 0 && result.refreshTasks.length === 0) {
-      this._metrics.emptyPollCounter.add(1);
+      this._metrics.emptyPollCounter.add(1, this._metrics.defaultAttributes);
     }
 
     // Add regular job tasks to the queue

@@ -14,8 +14,12 @@ export class WorkerMetrics {
   readonly emptyPollCounter: Counter<Attributes>;
   /** Gauge reporting the number of available task slots (maxConcurrentTasks - active - queued). */
   readonly availableTaskSlots: ObservableGauge<Attributes>;
+  /** Default attributes applied to all metric recordings. */
+  readonly defaultAttributes: Attributes;
 
-  constructor(meter: Meter, availableSlotsFn: () => number) {
+  constructor(meter: Meter, taskGroup: string, availableSlotsFn: () => number) {
+    this.defaultAttributes = { task_group: taskGroup };
+
     this.pollCounter = meter.createCounter("silo.worker.polls", {
       description: "Total number of poll calls to leaseTasks",
     });
@@ -28,7 +32,7 @@ export class WorkerMetrics {
       description: "Number of available task slots",
     });
     this.availableTaskSlots.addCallback((result) => {
-      result.observe(availableSlotsFn());
+      result.observe(availableSlotsFn(), this.defaultAttributes);
     });
   }
 }
