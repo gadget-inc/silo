@@ -202,15 +202,18 @@ impl JobStoreShard {
 
             // Commit durable state — write_with_options with await_durable:true blocks
             // until the WAL is flushed to object storage, so no separate flush is needed.
-            if let Err(e) = self
-                .db
-                .write_with_options(
-                    state.batch,
-                    &WriteOptions {
-                        await_durable: true,
-                    },
-                )
-                .await
+            // Skip the write if the batch is empty (e.g. all tasks were released without
+            // modifications), since slatedb rejects empty write batches.
+            if !state.batch.is_empty()
+                && let Err(e) = self
+                    .db
+                    .write_with_options(
+                        state.batch,
+                        &WriteOptions {
+                            await_durable: true,
+                        },
+                    )
+                    .await
             {
                 dst_events::cancel_write(write_op);
                 // Rollback all grants made during this iteration
