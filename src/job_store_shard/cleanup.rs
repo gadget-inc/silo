@@ -319,24 +319,21 @@ impl JobStoreShard {
     /// After cleanup deletes defunct keys, this method triggers a full
     /// compaction to reclaim storage space from the deleted data.
     ///
-    /// This uses SlateDB's Admin API to request a full compaction.
+    /// This uses SlateDB's Admin API to request a full compaction that merges
+    /// all L0 SSTs and sorted runs into a single sorted run, removing tombstones.
     pub async fn run_full_compaction(&self) -> Result<(), JobStoreShardError> {
         info!(shard = %self.name, "starting full compaction");
 
-        // SlateDB doesn't expose direct compaction API on the Db handle.
-        // Instead, we flush to ensure all data is in SSTs, then SlateDB's
-        // background compaction will handle the rest.
-        //
-        // For explicit compaction, we'd need to use the Admin API which requires
-        // the object store path. For now, we flush and let background compaction
-        // handle the cleanup over time.
+        // Flush memtable to SSTs first so all data is on disk
         self.db
             .flush_with_options(slatedb::config::FlushOptions {
                 flush_type: slatedb::config::FlushType::MemTable,
             })
             .await?;
 
-        info!(shard = %self.name, "flush complete, background compaction will reclaim space");
+        self.submit_full_compaction().await?;
+
+        info!(shard = %self.name, "full compaction submitted");
 
         // Clear cleanup progress markers since we're done
         self.clear_cleanup_progress().await?;
@@ -344,6 +341,54 @@ impl JobStoreShard {
         // Set status to CompactionDone - cleanup is fully complete
         self.set_cleanup_status(SplitCleanupStatus::CompactionDone)
             .await?;
+
+        Ok(())
+    }
+
+    /// Submit a full compaction via the SlateDB Admin API.
+    ///
+    /// Reads the current manifest to discover all L0 SSTs and sorted runs,
+    /// then submits a compaction spec that merges everything into a single
+    /// sorted run. The background compactor will execute this asynchronously.
+    pub async fn submit_full_compaction(&self) -> Result<(), JobStoreShardError> {
+        use slatedb::admin::AdminBuilder;
+        use slatedb::compactor::{CompactionSpec, SourceId};
+
+        let admin = AdminBuilder::new(self.db_path.as_str(), self.store.clone()).build();
+
+        let state = admin.read_compactor_state_view().await.map_err(|e| {
+            JobStoreShardError::Codec(format!("failed to read compactor state: {e}"))
+        })?;
+
+        // Build a full compaction spec: merge all L0 SSTs and sorted runs into
+        // the lowest sorted run, which allows tombstones to be dropped.
+        let manifest = state.manifest();
+        let sources: Vec<SourceId> = manifest
+            .l0
+            .iter()
+            .map(|sst| SourceId::Sst(sst.id.unwrap_compacted_id()))
+            .chain(
+                manifest
+                    .compacted
+                    .iter()
+                    .map(|sr| SourceId::SortedRun(sr.id)),
+            )
+            .collect();
+
+        if sources.is_empty() {
+            info!(shard = %self.name, "no SSTs or sorted runs to compact");
+            return Ok(());
+        }
+
+        let destination = manifest.compacted.iter().map(|sr| sr.id).min().unwrap_or(0);
+        let spec = CompactionSpec::new(sources, destination);
+
+        admin
+            .submit_compaction(spec)
+            .await
+            .map_err(|e| JobStoreShardError::Codec(format!("failed to submit compaction: {e}")))?;
+
+        info!(shard = %self.name, "full compaction submitted to SlateDB");
 
         Ok(())
     }

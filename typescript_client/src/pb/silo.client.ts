@@ -4,6 +4,8 @@
 import type { RpcTransport } from "@protobuf-ts/runtime-rpc";
 import type { ServiceInfo } from "@protobuf-ts/runtime-rpc";
 import { Silo } from "./silo";
+import type { CompactShardResponse } from "./silo";
+import type { CompactShardRequest } from "./silo";
 import type { ForceReleaseShardResponse } from "./silo";
 import type { ForceReleaseShardRequest } from "./silo";
 import type { ResetShardsResponse } from "./silo";
@@ -240,6 +242,14 @@ export interface ISiloClient {
      * @generated from protobuf rpc: ForceReleaseShard
      */
     forceReleaseShard(input: ForceReleaseShardRequest, options?: RpcOptions): UnaryCall<ForceReleaseShardRequest, ForceReleaseShardResponse>;
+    /**
+     * Trigger a full compaction on a shard's SlateDB instance.
+     * Merges all L0 SSTs and sorted runs into a single sorted run, removing tombstones.
+     * This is useful for reclaiming space after bulk deletes or high job throughput.
+     *
+     * @generated from protobuf rpc: CompactShard
+     */
+    compactShard(input: CompactShardRequest, options?: RpcOptions): UnaryCall<CompactShardRequest, CompactShardResponse>;
 }
 /**
  * The Silo job queue service.
@@ -500,5 +510,16 @@ export class SiloClient implements ISiloClient, ServiceInfo {
     forceReleaseShard(input: ForceReleaseShardRequest, options?: RpcOptions): UnaryCall<ForceReleaseShardRequest, ForceReleaseShardResponse> {
         const method = this.methods[22], opt = this._transport.mergeOptions(options);
         return stackIntercept<ForceReleaseShardRequest, ForceReleaseShardResponse>("unary", this._transport, method, opt, input);
+    }
+    /**
+     * Trigger a full compaction on a shard's SlateDB instance.
+     * Merges all L0 SSTs and sorted runs into a single sorted run, removing tombstones.
+     * This is useful for reclaiming space after bulk deletes or high job throughput.
+     *
+     * @generated from protobuf rpc: CompactShard
+     */
+    compactShard(input: CompactShardRequest, options?: RpcOptions): UnaryCall<CompactShardRequest, CompactShardResponse> {
+        const method = this.methods[23], opt = this._transport.mergeOptions(options);
+        return stackIntercept<CompactShardRequest, CompactShardResponse>("unary", this._transport, method, opt, input);
     }
 }

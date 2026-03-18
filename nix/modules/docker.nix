@@ -62,6 +62,9 @@
             pkgs.jq
             # grpcurl for testing gRPC endpoints
             pkgs.grpcurl
+            # Archive tools
+            pkgs.gnutar
+            pkgs.gzip
           ];
           pathsToLink = [ "/bin" "/etc" "/share" ];
         };

@@ -98,6 +98,10 @@ pub struct JobStoreShard {
     /// Cancellation token for background tasks like cleanup.
     /// Signaled when the shard is closing.
     cancellation: CancellationToken,
+    /// Object store for the shard's SlateDB instance (needed for Admin API).
+    store: Arc<dyn slatedb::object_store::ObjectStore>,
+    /// Database path relative to the object store root (needed for Admin API).
+    db_path: String,
 }
 
 #[derive(Debug, Error)]
@@ -242,7 +246,7 @@ impl JobStoreShard {
             concurrency_reconcile_interval,
         } = options;
 
-        let mut db_builder = slatedb::DbBuilder::new(db_path, store)
+        let mut db_builder = slatedb::DbBuilder::new(db_path, store.clone())
             .with_merge_operator(counters::counter_merge_operator());
 
         // Configure separate WAL object store if provided
@@ -286,6 +290,8 @@ impl JobStoreShard {
             metrics,
             concurrency_reconcile_interval,
             cancellation: CancellationToken::new(),
+            store,
+            db_path: db_path.to_string(),
         });
 
         // Periodically reconcile pending concurrency requests to self-heal from

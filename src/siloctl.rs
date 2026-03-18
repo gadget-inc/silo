@@ -10,9 +10,9 @@ use std::path::Path;
 use crate::cluster_client::AuthInterceptor;
 use crate::pb::silo_client::SiloClient;
 use crate::pb::{
-    CancelJobRequest, ConfigureShardRequest, CpuProfileRequest, DeleteJobRequest,
-    ExpediteJobRequest, ForceReleaseShardRequest, GetClusterInfoRequest, GetJobRequest,
-    GetJobResultRequest, GetSplitStatusRequest, QueryRequest, RequestSplitRequest,
+    CancelJobRequest, CompactShardRequest, ConfigureShardRequest, CpuProfileRequest,
+    DeleteJobRequest, ExpediteJobRequest, ForceReleaseShardRequest, GetClusterInfoRequest,
+    GetJobRequest, GetJobResultRequest, GetSplitStatusRequest, QueryRequest, RequestSplitRequest,
     RestartJobRequest,
 };
 use flate2::Compression;
@@ -976,6 +976,43 @@ pub async fn shard_force_release<W: Write>(
         writeln!(out, "{}", serde_json::to_string_pretty(&json_output)?)?;
     } else {
         writeln!(out, "Force-released shard lease for {}", shard)?;
+    }
+
+    Ok(())
+}
+
+/// Trigger a full compaction on a shard to remove tombstones and reclaim space.
+///
+/// This merges all L0 SSTs and sorted runs into a single sorted run,
+/// physically removing tombstones from completed/deleted jobs.
+pub async fn shard_compact<W: Write>(
+    opts: &GlobalOptions,
+    out: &mut W,
+    shard: &str,
+) -> anyhow::Result<()> {
+    let mut client =
+        connect_to_shard_owner(&opts.address, shard, opts.auth_token.as_deref()).await?;
+
+    if !opts.json {
+        writeln!(out, "Submitting full compaction for shard {}...", shard)?;
+        out.flush()?;
+    }
+
+    let response = client
+        .compact_shard(CompactShardRequest {
+            shard: shard.to_string(),
+        })
+        .await?
+        .into_inner();
+
+    if opts.json {
+        let json_output = serde_json::json!({
+            "shard_id": shard,
+            "status": response.status,
+        });
+        writeln!(out, "{}", serde_json::to_string_pretty(&json_output)?)?;
+    } else {
+        writeln!(out, "{}", response.status)?;
     }
 
     Ok(())

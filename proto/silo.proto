@@ -574,6 +574,18 @@ message ForceReleaseShardRequest {
 message ForceReleaseShardResponse {
   bool released = 1; // True if the lease was released.
 }
+
+// Request to trigger a full compaction on a shard's SlateDB instance.
+// Merges all L0 SSTs and sorted runs into a single sorted run, removing tombstones.
+message CompactShardRequest {
+  string shard = 1; // The shard ID (UUID) to compact.
+}
+
+// Response after submitting a full compaction.
+message CompactShardResponse {
+  string status = 1; // Status message describing the compaction result.
+}
+
 // The Silo job queue service.
 service Silo {
   // Get cluster topology for client-side routing.
@@ -686,4 +698,9 @@ service Silo {
   // Operator escape hatch for recovering from permanently lost nodes.
   // After force-release, any live node that desires the shard can acquire it.
   rpc ForceReleaseShard(ForceReleaseShardRequest) returns (ForceReleaseShardResponse);
+
+  // Trigger a full compaction on a shard's SlateDB instance.
+  // Merges all L0 SSTs and sorted runs into a single sorted run, removing tombstones.
+  // This is useful for reclaiming space after bulk deletes or high job throughput.
+  rpc CompactShard(CompactShardRequest) returns (CompactShardResponse);
 }
