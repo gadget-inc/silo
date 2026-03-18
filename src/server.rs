@@ -254,6 +254,7 @@ fn map_err(e: JobStoreShardError) -> Status {
             Status::failed_precondition("job is already in terminal state")
         }
         JobStoreShardError::JobNotRestartable(ref e) => Status::failed_precondition(e.to_string()),
+        JobStoreShardError::JobNotReimportable(ref e) => Status::failed_precondition(e.to_string()),
         JobStoreShardError::JobNotExpediteable(ref e) => Status::failed_precondition(e.to_string()),
         JobStoreShardError::JobNotLeaseable(ref e) => Status::failed_precondition(e.to_string()),
         JobStoreShardError::InvalidArgument(ref msg) => Status::invalid_argument(msg.clone()),
@@ -1493,6 +1494,16 @@ impl Silo for SiloService {
                             status: job_status_kind_to_proto(result.status).into(),
                         });
                     }
+                }
+                Err(
+                    e @ JobStoreShardError::JobNotReimportable(
+                        crate::job_store_shard::import::JobNotReimportableError {
+                            status: crate::job::JobStatusKind::Running,
+                            ..
+                        },
+                    ),
+                ) => {
+                    return Err(map_err(e));
                 }
                 Err(e) => {
                     for idx in indices {
