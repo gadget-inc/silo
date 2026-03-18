@@ -5,8 +5,7 @@
 
 mod grpc_integration_helpers;
 
-use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use grpc_integration_helpers::{
     create_test_factory, setup_multi_shard_server, setup_test_server, shutdown_server,

@@ -1168,7 +1168,7 @@ async fn retry_must_wait_for_slot_when_another_job_was_granted() {
     let queue = "retry-wait-q".to_string();
 
     // Job A with retry
-    let job_a = shard
+    let _job_a = shard
         .enqueue(
             "-",
             None,
@@ -1197,7 +1197,7 @@ async fn retry_must_wait_for_slot_when_another_job_was_granted() {
     let task_a_id = tasks_a[0].attempt().task_id().to_string();
 
     // Enqueue B and C while A is running - they wait
-    let job_b = shard
+    let _job_b = shard
         .enqueue(
             "-",
             None,
@@ -1215,7 +1215,7 @@ async fn retry_must_wait_for_slot_when_another_job_was_granted() {
         .await
         .expect("enqueue B");
 
-    let job_c = shard
+    let _job_c = shard
         .enqueue(
             "-",
             None,

@@ -1185,7 +1185,7 @@ async fn concurrency_reap_expired_lease_releases_holder() {
     let queue = "reap-q".to_string();
 
     // Job 1 gets holder
-    let j1 = shard
+    let _j1 = shard
         .enqueue(
             "-",
             None,

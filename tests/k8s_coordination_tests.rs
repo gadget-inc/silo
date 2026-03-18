@@ -3365,7 +3365,7 @@ async fn k8s_sequential_splits_work_correctly() {
     let splitter = ShardSplitter::new(coord.clone());
 
     // First split: midpoint minus an offset (not exactly at the midpoint)
-    let shard_map = coord.get_shard_map().await.unwrap();
+    let _shard_map = coord.get_shard_map().await.unwrap();
     let mid1: u64 = u64::MAX / 2;
     let split_point1 = format!("{:016x}", mid1 - 0x0100000000000000);
 
