@@ -1637,7 +1637,10 @@ impl Silo for SiloService {
             .frequency(frequency as i32)
             .blocklist(&["libc", "libgcc", "pthread", "vdso"])
             .build()
-            .map_err(|e| Status::internal(format!("failed to start profiler: {}", e)))?;
+            .map_err(|e| {
+                tracing::error!(error = %e, error_debug = ?e, "failed to start CPU profiler");
+                Status::internal(format!("failed to start profiler: {:?}", e))
+            })?;
 
         // Profile for the requested duration
         tokio::time::sleep(std::time::Duration::from_secs(duration as u64)).await;
