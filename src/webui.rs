@@ -35,16 +35,6 @@ pub struct AppState {
 }
 
 #[derive(Clone)]
-pub struct JobRow {
-    pub id: String,
-    pub shard: String,
-    pub tenant: String,
-    pub status: String,
-    pub priority: u8,
-    pub scheduled_for: String,
-}
-
-#[derive(Clone)]
 pub struct QueueRow {
     pub name: String,
     pub shard: String,
@@ -140,16 +130,6 @@ pub struct MemberRow {
     pub hostname: Option<String>,
     /// Placement rings this member participates in (empty = default only)
     pub placement_rings: Vec<String>,
-}
-
-#[derive(Template)]
-#[template(path = "index.html")]
-struct IndexTemplate {
-    nav_active: &'static str,
-    tenancy_enabled: bool,
-    jobs: Vec<JobRow>,
-    shard_count: usize,
-    error: Option<String>,
 }
 
 #[derive(Template)]
@@ -463,99 +443,7 @@ struct TenantStatusCounts {
 }
 
 async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let mut all_jobs: Vec<JobRow> = Vec::new();
-    let mut error: Option<String> = None;
-
-    // Use cluster query engine for proper cross-shard aggregation
-    // Show all recent jobs, not just scheduled - jobs transition quickly through states
-    let sql = "SELECT shard_id, tenant, id, status_kind, enqueue_time_ms, priority FROM jobs ORDER BY enqueue_time_ms DESC LIMIT 100";
-
-    match state.query_engine.sql(sql).await {
-        Ok(df) => match df.collect().await {
-            Ok(batches) => {
-                for batch in batches {
-                    let shard_col = batch.column_by_name("shard_id").and_then(|c| {
-                        c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::StringArray>()
-                    });
-                    let tenant_col = batch.column_by_name("tenant").and_then(|c| {
-                        c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::StringArray>()
-                    });
-                    let id_col = batch.column_by_name("id").and_then(|c| {
-                        c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::StringArray>()
-                    });
-                    let status_col = batch.column_by_name("status_kind").and_then(|c| {
-                        c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::StringArray>()
-                    });
-                    let time_col = batch.column_by_name("enqueue_time_ms").and_then(|c| {
-                        c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::Int64Array>()
-                    });
-                    let priority_col = batch.column_by_name("priority").and_then(|c| {
-                        c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::UInt8Array>()
-                    });
-
-                    if let (
-                        Some(shards),
-                        Some(tenants),
-                        Some(ids),
-                        Some(statuses),
-                        Some(times),
-                        Some(priorities),
-                    ) = (
-                        shard_col,
-                        tenant_col,
-                        id_col,
-                        status_col,
-                        time_col,
-                        priority_col,
-                    ) {
-                        for i in 0..batch.num_rows() {
-                            all_jobs.push(JobRow {
-                                id: ids.value(i).to_string(),
-                                shard: shards.value(i).to_string(),
-                                tenant: tenants.value(i).to_string(),
-                                status: statuses.value(i).to_string(),
-                                priority: priorities.value(i),
-                                scheduled_for: format_timestamp(times.value(i)),
-                            });
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "failed to collect query results");
-                error = Some(format!("Query execution error: {}", e));
-            }
-        },
-        Err(e) => {
-            warn!(error = %e, "failed to query jobs from cluster");
-            error = Some(format!("Query error: {}", e));
-        }
-    }
-
-    // Already sorted by ORDER BY clause
-
-    // Get total shard count from coordinator
-    let shard_count = state.coordinator.num_shards().await;
-
-    let template = IndexTemplate {
-        nav_active: "index",
-        tenancy_enabled: state.config.tenancy.enabled,
-        jobs: all_jobs,
-        shard_count,
-        error,
-    };
-
-    Html(
-        template
-            .render()
-            .unwrap_or_else(|e| format!("Template error: {}", e)),
-    )
+    render_cluster_page(&state).await
 }
 
 /// Job data fetched from the cluster query engine
@@ -1518,7 +1406,7 @@ async fn tenant_handler(
     )
 }
 
-async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
+async fn render_cluster_page(state: &AppState) -> Html<String> {
     let mut shards: Vec<ShardRow> = Vec::new();
     let mut members: Vec<MemberRow> = Vec::new();
     let mut active_splits: Vec<ActiveSplitRow> = Vec::new();
@@ -1712,6 +1600,10 @@ async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
             .render()
             .unwrap_or_else(|e| format!("Template error: {}", e)),
     )
+}
+
+async fn cluster_handler(State(state): State<AppState>) -> impl IntoResponse {
+    render_cluster_page(&state).await
 }
 
 /// Maximum number of rows to return from SQL queries to avoid crashing the browser

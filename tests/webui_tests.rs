@@ -106,36 +106,27 @@ async fn test_index_page_renders() {
     let (status, body) = make_request(state, "GET", "/").await;
 
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("Jobs"), "body should contain 'Jobs'");
+    assert!(
+        body.contains("Cluster Overview"),
+        "body should contain cluster overview"
+    );
+    assert!(
+        body.contains("Shard Details"),
+        "body should contain shard details"
+    );
     assert!(body.contains("Silo"), "body should contain 'Silo'");
 }
 
 #[silo::test]
-async fn test_index_page_shows_scheduled_jobs() {
-    let (_tmp, state, shard_map) = setup_test_state().await;
+async fn test_index_page_matches_cluster_page() {
+    let (_tmp, state, _shard_map) = setup_test_state().await;
 
-    // Enqueue a job
-    let shard_id = shard_map.shards()[0].id;
-    let shard = state.factory.get(&shard_id).expect("shard 0");
-    let _job_id = shard
-        .enqueue(
-            "-",
-            Some("test-job-1".to_string()),
-            50,
-            test_helpers::now_ms() + 10000, // Future time
-            None,
-            test_helpers::msgpack_payload(&serde_json::json!({"foo": "bar"})),
-            vec![],
-            None,
-            "default",
-        )
-        .await
-        .expect("enqueue");
+    let (index_status, index_body) = make_request(state.clone(), "GET", "/").await;
+    let (cluster_status, cluster_body) = make_request(state, "GET", "/cluster").await;
 
-    let (status, body) = make_request(state, "GET", "/").await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("test-job-1"), "body should contain job id");
+    assert_eq!(index_status, StatusCode::OK);
+    assert_eq!(cluster_status, StatusCode::OK);
+    assert_eq!(index_body, cluster_body);
 }
 
 #[silo::test]
@@ -465,79 +456,23 @@ async fn setup_multi_shard_state_with_tenancy(
 }
 
 #[silo::test]
-async fn test_index_shows_jobs_from_all_shards() {
+async fn test_index_page_shows_all_shards() {
     // Create state with 3 shards
     let (_tmp, state, shard_map) = setup_multi_shard_state(3).await;
 
-    // Enqueue a job on each shard
-    let shard0_id = shard_map.shards()[0].id;
-    let shard0 = state.factory.get(&shard0_id).expect("shard 0");
-    let _job0 = shard0
-        .enqueue(
-            "-",
-            Some("job-on-shard-0".to_string()),
-            50,
-            test_helpers::now_ms() + 10000,
-            None,
-            test_helpers::msgpack_payload(&serde_json::json!({})),
-            vec![],
-            None,
-            "default",
-        )
-        .await
-        .expect("enqueue shard 0");
-
-    let shard1_id = shard_map.shards()[1].id;
-    let shard1 = state.factory.get(&shard1_id).expect("shard 1");
-    let _job1 = shard1
-        .enqueue(
-            "-",
-            Some("job-on-shard-1".to_string()),
-            50,
-            test_helpers::now_ms() + 10000,
-            None,
-            test_helpers::msgpack_payload(&serde_json::json!({})),
-            vec![],
-            None,
-            "default",
-        )
-        .await
-        .expect("enqueue shard 1");
-
-    let shard2_id = shard_map.shards()[2].id;
-    let shard2 = state.factory.get(&shard2_id).expect("shard 2");
-    let _job2 = shard2
-        .enqueue(
-            "-",
-            Some("job-on-shard-2".to_string()),
-            50,
-            test_helpers::now_ms() + 10000,
-            None,
-            test_helpers::msgpack_payload(&serde_json::json!({})),
-            vec![],
-            None,
-            "default",
-        )
-        .await
-        .expect("enqueue shard 2");
-
-    // Request the index page
+    // Request the landing page
     let (status, body) = make_request(state, "GET", "/").await;
 
     assert_eq!(status, StatusCode::OK);
-    // Verify jobs from ALL shards are displayed
-    assert!(
-        body.contains("job-on-shard-0"),
-        "index should show job from shard 0"
-    );
-    assert!(
-        body.contains("job-on-shard-1"),
-        "index should show job from shard 1"
-    );
-    assert!(
-        body.contains("job-on-shard-2"),
-        "index should show job from shard 2"
-    );
+    // Verify shard data from all shards is displayed on the landing page.
+    for shard_info in shard_map.shards() {
+        let shard_id_str = shard_info.id.to_string();
+        assert!(
+            body.contains(&shard_id_str),
+            "landing page should show shard {}",
+            shard_id_str
+        );
+    }
 }
 
 #[silo::test]
