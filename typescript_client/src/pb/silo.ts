@@ -1568,6 +1568,29 @@ export interface ForceReleaseShardResponse {
     released: boolean; // True if the lease was released.
 }
 /**
+ * Request to trigger a full compaction on a shard's SlateDB instance.
+ * Merges all L0 SSTs and sorted runs into a single sorted run, removing tombstones.
+ *
+ * @generated from protobuf message silo.v1.CompactShardRequest
+ */
+export interface CompactShardRequest {
+    /**
+     * @generated from protobuf field: string shard = 1
+     */
+    shard: string; // The shard ID (UUID) to compact.
+}
+/**
+ * Response after submitting a full compaction.
+ *
+ * @generated from protobuf message silo.v1.CompactShardResponse
+ */
+export interface CompactShardResponse {
+    /**
+     * @generated from protobuf field: string status = 1
+     */
+    status: string; // Status message describing the compaction result.
+}
+/**
  * Rate limiting algorithm for Gubernator-based limits.
  *
  * @generated from protobuf enum silo.v1.GubernatorAlgorithm
@@ -6449,6 +6472,100 @@ class ForceReleaseShardResponse$Type extends MessageType<ForceReleaseShardRespon
  * @generated MessageType for protobuf message silo.v1.ForceReleaseShardResponse
  */
 export const ForceReleaseShardResponse = new ForceReleaseShardResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class CompactShardRequest$Type extends MessageType<CompactShardRequest> {
+    constructor() {
+        super("silo.v1.CompactShardRequest", [
+            { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value?: PartialMessage<CompactShardRequest>): CompactShardRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.shard = "";
+        if (value !== undefined)
+            reflectionMergePartial<CompactShardRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: CompactShardRequest): CompactShardRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string shard */ 1:
+                    message.shard = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: CompactShardRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string shard = 1; */
+        if (message.shard !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.shard);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.CompactShardRequest
+ */
+export const CompactShardRequest = new CompactShardRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class CompactShardResponse$Type extends MessageType<CompactShardResponse> {
+    constructor() {
+        super("silo.v1.CompactShardResponse", [
+            { no: 1, name: "status", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value?: PartialMessage<CompactShardResponse>): CompactShardResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.status = "";
+        if (value !== undefined)
+            reflectionMergePartial<CompactShardResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: CompactShardResponse): CompactShardResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string status */ 1:
+                    message.status = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: CompactShardResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string status = 1; */
+        if (message.status !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.status);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.CompactShardResponse
+ */
+export const CompactShardResponse = new CompactShardResponse$Type();
 /**
  * @generated ServiceType for protobuf service silo.v1.Silo
  */
@@ -6475,5 +6592,6 @@ export const Silo = new ServiceType("silo.v1.Silo", [
     { name: "ConfigureShard", options: {}, I: ConfigureShardRequest, O: ConfigureShardResponse },
     { name: "ImportJobs", options: {}, I: ImportJobsRequest, O: ImportJobsResponse },
     { name: "ResetShards", options: {}, I: ResetShardsRequest, O: ResetShardsResponse },
-    { name: "ForceReleaseShard", options: {}, I: ForceReleaseShardRequest, O: ForceReleaseShardResponse }
+    { name: "ForceReleaseShard", options: {}, I: ForceReleaseShardRequest, O: ForceReleaseShardResponse },
+    { name: "CompactShard", options: {}, I: CompactShardRequest, O: CompactShardResponse }
 ]);
