@@ -257,8 +257,8 @@ fn test_member_in_ring_default() {
 }
 
 #[silo::test]
-fn test_select_owner_for_shard_default() {
-    use silo::coordination::select_owner_for_shard;
+fn test_single_shard_assignment_default_ring() {
+    use silo::coordination::compute_all_shard_assignments;
 
     // Create members: one default-only, one with gpu ring
     let members = vec![
@@ -278,15 +278,20 @@ fn test_select_owner_for_shard_default() {
         },
     ];
 
-    // Default shard (no ring) should be owned by default-node
-    let shard_id = ShardId::new();
-    let owner = select_owner_for_shard(&shard_id, None, &members);
-    assert_eq!(owner, Some("default-node".to_string()));
+    let shard = ShardInfo::new(ShardId::new(), ShardRange::new("", ""));
+    let shard_refs = vec![&shard];
+    let assignments = compute_all_shard_assignments(&shard_refs, &members);
+
+    // Default shard (no ring) should be owned by default-node.
+    assert_eq!(
+        assignments.get(&shard.id),
+        Some(&"default-node".to_string())
+    );
 }
 
 #[silo::test]
-fn test_select_owner_for_shard_specific() {
-    use silo::coordination::select_owner_for_shard;
+fn test_single_shard_assignment_specific_ring() {
+    use silo::coordination::compute_all_shard_assignments;
 
     // Create members: one default-only, one with gpu ring
     let members = vec![
@@ -306,15 +311,18 @@ fn test_select_owner_for_shard_specific() {
         },
     ];
 
-    // GPU shard should be owned by gpu-node
-    let shard_id = ShardId::new();
-    let owner = select_owner_for_shard(&shard_id, Some("gpu"), &members);
-    assert_eq!(owner, Some("gpu-node".to_string()));
+    let mut shard = ShardInfo::new(ShardId::new(), ShardRange::new("", ""));
+    shard.placement_ring = Some("gpu".to_string());
+    let shard_refs = vec![&shard];
+    let assignments = compute_all_shard_assignments(&shard_refs, &members);
+
+    // GPU shard should be owned by gpu-node.
+    assert_eq!(assignments.get(&shard.id), Some(&"gpu-node".to_string()));
 }
 
 #[silo::test]
 fn test_member_with_multiple_rings_can_own_multiple_shard_types() {
-    use silo::coordination::select_owner_for_shard;
+    use silo::coordination::compute_all_shard_assignments;
 
     // Create member with multiple rings
     let members = vec![MemberInfo {
@@ -325,24 +333,31 @@ fn test_member_with_multiple_rings_can_own_multiple_shard_types() {
         placement_rings: vec!["gpu".to_string(), "high-memory".to_string()],
     }];
 
-    let shard_id = ShardId::new();
+    let mut gpu_shard = ShardInfo::new(ShardId::new(), ShardRange::new("", ""));
+    gpu_shard.placement_ring = Some("gpu".to_string());
+    let mut high_memory_shard = ShardInfo::new(ShardId::new(), ShardRange::new("m", ""));
+    high_memory_shard.placement_ring = Some("high-memory".to_string());
+    let default_shard = ShardInfo::new(ShardId::new(), ShardRange::new("z", ""));
+    let shard_refs = vec![&gpu_shard, &high_memory_shard, &default_shard];
+    let assignments = compute_all_shard_assignments(&shard_refs, &members);
 
-    // GPU shard - should work
-    let owner = select_owner_for_shard(&shard_id, Some("gpu"), &members);
-    assert_eq!(owner, Some("multi-ring-node".to_string()));
+    // Named-ring shards should be assigned to the multi-ring node.
+    assert_eq!(
+        assignments.get(&gpu_shard.id),
+        Some(&"multi-ring-node".to_string())
+    );
+    assert_eq!(
+        assignments.get(&high_memory_shard.id),
+        Some(&"multi-ring-node".to_string())
+    );
 
-    // High-memory shard - should work
-    let owner = select_owner_for_shard(&shard_id, Some("high-memory"), &members);
-    assert_eq!(owner, Some("multi-ring-node".to_string()));
-
-    // Default shard - should NOT work (node doesn't participate in default)
-    let owner = select_owner_for_shard(&shard_id, None, &members);
-    assert_eq!(owner, None);
+    // Default shard should not be assigned because there is no default-ring member.
+    assert_eq!(assignments.get(&default_shard.id), None);
 }
 
 #[silo::test]
 fn test_no_eligible_owner_returns_none() {
-    use silo::coordination::select_owner_for_shard;
+    use silo::coordination::compute_all_shard_assignments;
 
     // Create only default members
     let members = vec![MemberInfo {
@@ -353,15 +368,18 @@ fn test_no_eligible_owner_returns_none() {
         placement_rings: vec![],
     }];
 
-    // GPU shard has no eligible owner
-    let shard_id = ShardId::new();
-    let owner = select_owner_for_shard(&shard_id, Some("gpu"), &members);
-    assert_eq!(owner, None);
+    let mut shard = ShardInfo::new(ShardId::new(), ShardRange::new("", ""));
+    shard.placement_ring = Some("gpu".to_string());
+    let shard_refs = vec![&shard];
+    let assignments = compute_all_shard_assignments(&shard_refs, &members);
+
+    // GPU shard has no eligible owner.
+    assert_eq!(assignments.get(&shard.id), None);
 }
 
 #[silo::test]
-fn test_rendezvous_hash_consistent_with_ring_filtering() {
-    use silo::coordination::select_owner_for_shard;
+fn test_single_shard_assignment_is_deterministic_within_ring() {
+    use silo::coordination::compute_all_shard_assignments;
 
     // Create multiple members in the same ring
     let members = vec![
@@ -388,16 +406,22 @@ fn test_rendezvous_hash_consistent_with_ring_filtering() {
         },
     ];
 
-    let shard_id = ShardId::new();
+    let mut shard = ShardInfo::new(ShardId::new(), ShardRange::new("", ""));
+    shard.placement_ring = Some("gpu".to_string());
+    let shard_refs = vec![&shard];
 
-    // Same shard always maps to same owner (consistent hashing)
-    let owner1 = select_owner_for_shard(&shard_id, Some("gpu"), &members);
-    let owner2 = select_owner_for_shard(&shard_id, Some("gpu"), &members);
+    // Same shard always maps to same owner.
+    let owner1 = compute_all_shard_assignments(&shard_refs, &members)
+        .get(&shard.id)
+        .cloned();
+    let owner2 = compute_all_shard_assignments(&shard_refs, &members)
+        .get(&shard.id)
+        .cloned();
     assert_eq!(owner1, owner2);
     assert!(owner1.is_some());
 
     // Owner must be one of the gpu nodes
-    let owner = owner1.unwrap();
+    let owner = owner1.expect("single eligible ring should produce an owner");
     assert!(owner.starts_with("gpu-"));
 }
 
@@ -439,4 +463,256 @@ fn test_compute_desired_shards_for_node() {
     let desired_gpu = compute_desired_shards_for_node(&shards, "gpu-node", &members);
     assert!(!desired_gpu.contains(&default_shard.id));
     assert!(desired_gpu.contains(&gpu_shard.id));
+}
+
+#[silo::test]
+fn test_bounded_load_balancing_even_distribution() {
+    use silo::coordination::compute_all_shard_assignments;
+
+    // Create 8 shards in the default ring, 3 nodes — should get 3/3/2 distribution
+    let shards: Vec<ShardInfo> = (0..8)
+        .map(|i| {
+            ShardInfo::new(
+                ShardId::new(),
+                ShardRange::new(&format!("{}", i), &format!("{}", i + 1)),
+            )
+        })
+        .collect();
+    let shard_refs: Vec<&ShardInfo> = shards.iter().collect();
+
+    let members = vec![
+        MemberInfo {
+            node_id: "node-0".to_string(),
+            grpc_addr: "http://node0:7450".to_string(),
+            startup_time_ms: Some(1000),
+            hostname: None,
+            placement_rings: vec![],
+        },
+        MemberInfo {
+            node_id: "node-1".to_string(),
+            grpc_addr: "http://node1:7450".to_string(),
+            startup_time_ms: Some(1000),
+            hostname: None,
+            placement_rings: vec![],
+        },
+        MemberInfo {
+            node_id: "node-2".to_string(),
+            grpc_addr: "http://node2:7450".to_string(),
+            startup_time_ms: Some(1000),
+            hostname: None,
+            placement_rings: vec![],
+        },
+    ];
+
+    let assignments = compute_all_shard_assignments(&shard_refs, &members);
+
+    // All shards should be assigned
+    assert_eq!(assignments.len(), 8);
+
+    // Count per node
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for owner in assignments.values() {
+        *counts.entry(owner.as_str()).or_insert(0) += 1;
+    }
+
+    // With 8 shards and 3 nodes, max per node = ceil(8/3) = 3
+    // So distribution must be some permutation of [3, 3, 2]
+    let mut count_values: Vec<usize> = counts.values().copied().collect();
+    count_values.sort();
+    assert_eq!(
+        count_values,
+        vec![2, 3, 3],
+        "Expected 3/3/2 distribution, got {:?}",
+        counts
+    );
+}
+
+#[silo::test]
+fn test_bounded_load_balancing_deterministic() {
+    use silo::coordination::compute_all_shard_assignments;
+
+    let shards: Vec<ShardInfo> = (0..6)
+        .map(|i| {
+            ShardInfo::new(
+                ShardId::new(),
+                ShardRange::new(&format!("{}", i), &format!("{}", i + 1)),
+            )
+        })
+        .collect();
+    let shard_refs: Vec<&ShardInfo> = shards.iter().collect();
+
+    let members = vec![
+        MemberInfo {
+            node_id: "a".to_string(),
+            grpc_addr: "http://a:7450".to_string(),
+            startup_time_ms: Some(1000),
+            hostname: None,
+            placement_rings: vec![],
+        },
+        MemberInfo {
+            node_id: "b".to_string(),
+            grpc_addr: "http://b:7450".to_string(),
+            startup_time_ms: Some(1000),
+            hostname: None,
+            placement_rings: vec![],
+        },
+    ];
+
+    // Same inputs must always produce same outputs
+    let a1 = compute_all_shard_assignments(&shard_refs, &members);
+    let a2 = compute_all_shard_assignments(&shard_refs, &members);
+    assert_eq!(a1, a2);
+
+    // 6 shards / 2 nodes = exactly 3 each
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for owner in a1.values() {
+        *counts.entry(owner.as_str()).or_insert(0) += 1;
+    }
+    assert_eq!(counts.get("a"), Some(&3));
+    assert_eq!(counts.get("b"), Some(&3));
+}
+
+#[silo::test]
+fn test_bounded_load_stability_on_node_add() {
+    use silo::coordination::compute_all_shard_assignments;
+
+    let shards: Vec<ShardInfo> = (0..12)
+        .map(|i| {
+            ShardInfo::new(
+                ShardId::new(),
+                ShardRange::new(&format!("{}", i), &format!("{}", i + 1)),
+            )
+        })
+        .collect();
+    let shard_refs: Vec<&ShardInfo> = shards.iter().collect();
+
+    let members_2 = vec![
+        MemberInfo {
+            node_id: "node-a".to_string(),
+            grpc_addr: "http://a:7450".to_string(),
+            startup_time_ms: Some(1000),
+            hostname: None,
+            placement_rings: vec![],
+        },
+        MemberInfo {
+            node_id: "node-b".to_string(),
+            grpc_addr: "http://b:7450".to_string(),
+            startup_time_ms: Some(1000),
+            hostname: None,
+            placement_rings: vec![],
+        },
+    ];
+
+    let mut members_3 = members_2.clone();
+    members_3.push(MemberInfo {
+        node_id: "node-c".to_string(),
+        grpc_addr: "http://c:7450".to_string(),
+        startup_time_ms: Some(1000),
+        hostname: None,
+        placement_rings: vec![],
+    });
+
+    let before = compute_all_shard_assignments(&shard_refs, &members_2);
+    let after = compute_all_shard_assignments(&shard_refs, &members_3);
+
+    // Count how many shards changed owner
+    let mut moved = 0;
+    for shard in &shards {
+        if before.get(&shard.id) != after.get(&shard.id) {
+            moved += 1;
+        }
+    }
+
+    // With 12 shards going from 2 to 3 nodes, ideally ~4 move (1/3 of total).
+    // Allow up to 6 (half) as a reasonable bound — the key property is that
+    // the majority of shards stay put.
+    assert!(
+        moved <= 6,
+        "Too many shards moved: {moved}/12. Before: {before:?}, After: {after:?}"
+    );
+    // At least some should move to the new node
+    let new_node_count = after.values().filter(|v| v.as_str() == "node-c").count();
+    assert!(
+        new_node_count >= 2,
+        "New node should get some shards, got {new_node_count}"
+    );
+}
+
+#[silo::test]
+fn test_bounded_load_per_ring() {
+    use silo::coordination::compute_all_shard_assignments;
+
+    // 4 default shards, 4 gpu shards, with different eligible nodes per ring
+    let mut shards: Vec<ShardInfo> = Vec::new();
+    for i in 0..4 {
+        shards.push(ShardInfo::new(
+            ShardId::new(),
+            ShardRange::new(&format!("d{}", i), &format!("d{}", i + 1)),
+        ));
+    }
+    for i in 0..4 {
+        let mut s = ShardInfo::new(
+            ShardId::new(),
+            ShardRange::new(&format!("g{}", i), &format!("g{}", i + 1)),
+        );
+        s.placement_ring = Some("gpu".to_string());
+        shards.push(s);
+    }
+    let shard_refs: Vec<&ShardInfo> = shards.iter().collect();
+
+    let members = vec![
+        MemberInfo {
+            node_id: "default-1".to_string(),
+            grpc_addr: "http://d1:7450".to_string(),
+            startup_time_ms: Some(1000),
+            hostname: None,
+            placement_rings: vec![],
+        },
+        MemberInfo {
+            node_id: "default-2".to_string(),
+            grpc_addr: "http://d2:7450".to_string(),
+            startup_time_ms: Some(1000),
+            hostname: None,
+            placement_rings: vec![],
+        },
+        MemberInfo {
+            node_id: "gpu-1".to_string(),
+            grpc_addr: "http://g1:7450".to_string(),
+            startup_time_ms: Some(1000),
+            hostname: None,
+            placement_rings: vec!["gpu".to_string()],
+        },
+        MemberInfo {
+            node_id: "gpu-2".to_string(),
+            grpc_addr: "http://g2:7450".to_string(),
+            startup_time_ms: Some(1000),
+            hostname: None,
+            placement_rings: vec!["gpu".to_string()],
+        },
+    ];
+
+    let assignments = compute_all_shard_assignments(&shard_refs, &members);
+    assert_eq!(assignments.len(), 8);
+
+    // Default shards: 2 each across default-1 and default-2
+    let default_counts: std::collections::HashMap<&str, usize> = shards[0..4]
+        .iter()
+        .filter_map(|s| assignments.get(&s.id).map(|o| o.as_str()))
+        .fold(std::collections::HashMap::new(), |mut m, o| {
+            *m.entry(o).or_insert(0) += 1;
+            m
+        });
+    assert_eq!(default_counts.get("default-1"), Some(&2));
+    assert_eq!(default_counts.get("default-2"), Some(&2));
+
+    // GPU shards: 2 each across gpu-1 and gpu-2
+    let gpu_counts: std::collections::HashMap<&str, usize> = shards[4..8]
+        .iter()
+        .filter_map(|s| assignments.get(&s.id).map(|o| o.as_str()))
+        .fold(std::collections::HashMap::new(), |mut m, o| {
+            *m.entry(o).or_insert(0) += 1;
+            m
+        });
+    assert_eq!(gpu_counts.get("gpu-1"), Some(&2));
+    assert_eq!(gpu_counts.get("gpu-2"), Some(&2));
 }
