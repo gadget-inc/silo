@@ -362,14 +362,14 @@ export interface ShardRoutingConfig {
   /**
    * Maximum number of retries when a request fails due to a wrong shard
    * routing or a connectivity error (UNAVAILABLE / DEADLINE_EXCEEDED).
-   * @default 5
+   * @default 8
    */
   maxRetries?: number;
 
   /**
    * Initial delay in ms before retrying a failed request.
    * Uses exponential backoff capped at 5 seconds.
-   * @default 100
+   * @default 250
    */
   retryDelayMs?: number;
 
@@ -1278,8 +1278,8 @@ export class SiloGRPCClient {
 
     // Shard routing configuration
 
-    this._maxRetries = options.shardRouting?.maxRetries ?? 5;
-    this._retryDelayMs = options.shardRouting?.retryDelayMs ?? 100;
+    this._maxRetries = options.shardRouting?.maxRetries ?? 8;
+    this._retryDelayMs = options.shardRouting?.retryDelayMs ?? 250;
     this._topologyRefreshTimeoutMs = options.shardRouting?.topologyRefreshTimeoutMs ?? 10_000;
 
     // Parse initial servers
