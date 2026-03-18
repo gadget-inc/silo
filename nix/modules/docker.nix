@@ -11,6 +11,12 @@
         pkgs.cacert
       ];
 
+      # pprof CPU profiler needs /tmp for temporary files during profile collection
+      fakeRootCommands = ''
+        mkdir -p ./tmp
+        chmod 1777 ./tmp
+      '';
+
       config = {
         Entrypoint = [ "${self'.packages.silo}/bin/silo" ];
         ExposedPorts = {
