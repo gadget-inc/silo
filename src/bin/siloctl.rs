@@ -141,6 +141,11 @@ enum ShardAction {
         /// Shard ID (UUID) to force-release
         shard: String,
     },
+    /// Trigger a full compaction on a shard to remove tombstones and reclaim space
+    Compact {
+        /// Shard ID (UUID) to compact
+        shard: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -281,6 +286,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
             }
             ShardAction::ForceRelease { shard } => {
                 siloctl::shard_force_release(&opts, &mut stdout, shard).await
+            }
+            ShardAction::Compact { shard } => {
+                siloctl::shard_compact(&opts, &mut stdout, shard).await
             }
         },
         Command::Tenant { action } => match action {

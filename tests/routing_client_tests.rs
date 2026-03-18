@@ -208,6 +208,13 @@ impl Silo for CountingClusterInfoService {
     ) -> Result<Response<ForceReleaseShardResponse>, Status> {
         Self::unimplemented("force_release_shard")
     }
+
+    async fn compact_shard(
+        &self,
+        _request: Request<CompactShardRequest>,
+    ) -> Result<Response<CompactShardResponse>, Status> {
+        Self::unimplemented("compact_shard")
+    }
 }
 
 async fn setup_counting_cluster_info_server(

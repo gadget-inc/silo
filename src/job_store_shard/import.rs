@@ -95,16 +95,16 @@ impl JobStoreShard {
     ) -> Result<Vec<ImportJobResult>, JobStoreShardError> {
         // Pre-check: reject the entire batch if any job is currently Running.
         for params in &jobs {
-            if let Some(status) = self.get_job_status(tenant, &params.id).await? {
-                if status.kind == JobStatusKind::Running {
-                    return Err(JobStoreShardError::JobNotReimportable(
-                        JobNotReimportableError {
-                            job_id: params.id.clone(),
-                            status: JobStatusKind::Running,
-                            reason: "job is currently running".to_string(),
-                        },
-                    ));
-                }
+            if let Some(status) = self.get_job_status(tenant, &params.id).await?
+                && status.kind == JobStatusKind::Running
+            {
+                return Err(JobStoreShardError::JobNotReimportable(
+                    JobNotReimportableError {
+                        job_id: params.id.clone(),
+                        status: JobStatusKind::Running,
+                        reason: "job is currently running".to_string(),
+                    },
+                ));
             }
         }
 

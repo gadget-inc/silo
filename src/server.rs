@@ -1868,6 +1868,27 @@ impl Silo for SiloService {
             current_ring: current.unwrap_or_default(),
         }))
     }
+
+    async fn compact_shard(
+        &self,
+        req: Request<CompactShardRequest>,
+    ) -> Result<Response<CompactShardResponse>, Status> {
+        let r = req.into_inner();
+        let shard_id = Self::parse_shard_id(&r.shard)?;
+
+        let shard = self.factory.get(&shard_id).ok_or_else(|| {
+            Status::not_found(format!("shard {} not found on this node", r.shard))
+        })?;
+
+        shard
+            .submit_full_compaction()
+            .await
+            .map_err(|e| Status::internal(format!("compaction failed: {}", e)))?;
+
+        Ok(Response::new(CompactShardResponse {
+            status: format!("full compaction submitted for shard {}", r.shard),
+        }))
+    }
 }
 
 /// Create an auth interceptor that validates Bearer tokens on incoming gRPC requests.
