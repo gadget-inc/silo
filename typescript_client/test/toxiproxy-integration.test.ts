@@ -1,12 +1,4 @@
-import {
-  describe,
-  it,
-  expect,
-  beforeAll,
-  beforeEach,
-  afterAll,
-  afterEach,
-} from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach } from "vitest";
 import { SiloGRPCClient } from "../src/client";
 import {
   Toxiproxy,
@@ -17,6 +9,7 @@ import {
   type Slicer,
   type Slowclose,
 } from "toxiproxy-node-client";
+import type { ResetPeer } from "toxiproxy-node-client/dist/Toxic";
 
 // Direct silo servers (for setup/verification)
 const SILO_SERVERS = (
@@ -30,11 +23,9 @@ const TOXIPROXY_SILO_SERVERS = (
   process.env.TOXIPROXY_SILO_SERVERS || "localhost:17450,localhost:17451"
 ).split(",");
 
-const TOXIPROXY_API_URL =
-  process.env.TOXIPROXY_API_URL || "http://127.0.0.1:8474";
+const TOXIPROXY_API_URL = process.env.TOXIPROXY_API_URL || "http://127.0.0.1:8474";
 
-const RUN_INTEGRATION =
-  process.env.RUN_INTEGRATION === "true" || process.env.CI === "true";
+const RUN_INTEGRATION = process.env.RUN_INTEGRATION === "true" || process.env.CI === "true";
 
 const DEFAULT_TASK_GROUP = "toxiproxy-test-group";
 
@@ -99,9 +90,7 @@ async function waitForClusterConvergence(
     }
 
     if (attempt === maxAttempts) {
-      throw new Error(
-        `Cluster did not converge after ${maxAttempts} attempts.`,
-      );
+      throw new Error(`Cluster did not converge after ${maxAttempts} attempts.`);
     }
 
     await new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -351,9 +340,7 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
       await toxic2.remove();
 
       // Retry until gRPC reconnects instead of a fixed sleep
-      const job = await retryUntilSuccess(() =>
-        proxyClient.getJob(handle.id, tenant),
-      );
+      const job = await retryUntilSuccess(() => proxyClient.getJob(handle.id, tenant));
       expect(job?.id).toBe(handle.id);
     });
   });
@@ -394,9 +381,7 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
       });
 
       // Retry until gRPC reconnects instead of a fixed sleep
-      const job = await retryUntilSuccess(() =>
-        proxyClient.getJob(handle.id, tenant),
-      );
+      const job = await retryUntilSuccess(() => proxyClient.getJob(handle.id, tenant));
       expect(job?.id).toBe(handle.id);
     });
   });
@@ -597,6 +582,133 @@ describe.skipIf(!RUN_INTEGRATION)("Toxiproxy gRPC client integration", () => {
         items: [1, 2, 3, 4, 5],
       });
     });
+  });
+
+  describe("high concurrency enqueue", () => {
+    it("handles many concurrent enqueues without losing requests", async () => {
+      // Simulate a burst of concurrent enqueues similar to the production
+      // incident where 99K+ enqueues overwhelmed a single connection.
+      // @grpc/grpc-js handles HTTP/2 stream multiplexing natively; this
+      // test verifies that all requests complete under concurrent load.
+      const concurrency = 200;
+      const tenant = `high-concurrency-${Date.now()}`;
+
+      const promises = Array.from({ length: concurrency }, (_, i) =>
+        proxyClient.enqueue({
+          tenant: `${tenant}-${i}`,
+          taskGroup: DEFAULT_TASK_GROUP,
+          payload: { index: i, test: "high-concurrency" },
+        }),
+      );
+
+      const results = await Promise.allSettled(promises);
+      const succeeded = results.filter((r) => r.status === "fulfilled");
+      const failed = results.filter((r) => r.status === "rejected");
+
+      // All requests should succeed under concurrent load.
+      expect(succeeded.length).toBe(concurrency);
+      expect(failed.length).toBe(0);
+    }, 30_000);
+  });
+
+  describe("connection reset recovery", () => {
+    it("recovers from connection reset during enqueue", async () => {
+      const tenant = `reset-recovery-${Date.now()}`;
+
+      // First enqueue should succeed
+      const handle1 = await proxyClient.enqueue({
+        tenant,
+        taskGroup: DEFAULT_TASK_GROUP,
+        payload: { phase: "before-reset" },
+      });
+      expect(handle1.id).toBeTruthy();
+
+      // Add a reset_peer toxic to simulate RST_STREAM-like behavior.
+      // This causes the proxy to reset connections, producing errors
+      // similar to what happens during HTTP/2 stream exhaustion.
+      const toxic1 = await silo1.addToxic<ResetPeer>({
+        name: "reset-peer",
+        type: "reset_peer",
+        stream: "downstream",
+        toxicity: 1.0,
+        attributes: { timeout: 100 },
+      });
+      const toxic2 = await silo2.addToxic<ResetPeer>({
+        name: "reset-peer",
+        type: "reset_peer",
+        stream: "downstream",
+        toxicity: 1.0,
+        attributes: { timeout: 100 },
+      });
+
+      // Operations during the toxic should fail
+      await expect(
+        proxyClient.enqueue({
+          tenant: `${tenant}-during`,
+          taskGroup: DEFAULT_TASK_GROUP,
+          payload: { phase: "during-reset" },
+        }),
+      ).rejects.toThrow();
+
+      // Remove the toxic
+      await toxic1.remove();
+      await toxic2.remove();
+
+      // After recovery, operations should succeed
+      const handle3 = await retryUntilSuccess(() =>
+        proxyClient.enqueue({
+          tenant: `${tenant}-after`,
+          taskGroup: DEFAULT_TASK_GROUP,
+          payload: { phase: "after-reset" },
+        }),
+      );
+      expect(handle3.id).toBeTruthy();
+    });
+
+    it("retries and recovers from intermittent connection resets", async () => {
+      // Use a low toxicity to simulate intermittent RST_STREAM errors
+      // (only a fraction of requests are affected). The client's retry
+      // logic should recover transparently.
+      await silo1.addToxic<ResetPeer>({
+        name: "intermittent-reset",
+        type: "reset_peer",
+        stream: "downstream",
+        toxicity: 0.3, // 30% of connections get reset
+        attributes: { timeout: 200 },
+      });
+      await silo2.addToxic<ResetPeer>({
+        name: "intermittent-reset",
+        type: "reset_peer",
+        stream: "downstream",
+        toxicity: 0.3,
+        attributes: { timeout: 200 },
+      });
+
+      // With retry logic, most operations should eventually succeed
+      const results: string[] = [];
+      const errors: Error[] = [];
+
+      for (let i = 0; i < 10; i++) {
+        try {
+          const handle = await retryUntilSuccess(
+            () =>
+              proxyClient.enqueue({
+                tenant: `intermittent-${Date.now()}-${i}`,
+                taskGroup: DEFAULT_TASK_GROUP,
+                payload: { index: i },
+              }),
+            10,
+            200,
+          );
+          results.push(handle.id);
+        } catch (e) {
+          errors.push(e as Error);
+        }
+      }
+
+      // Most should succeed thanks to retries
+      expect(results.length).toBeGreaterThanOrEqual(8);
+    }, 30_000);
   });
 
   describe("topology refresh under network issues", () => {
