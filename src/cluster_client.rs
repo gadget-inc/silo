@@ -226,6 +226,33 @@ pub async fn create_silo_client(
     uri: &str,
     config: &ClientConfig,
 ) -> Result<InterceptedSiloClient, ClusterClientError> {
+    let (channel, interceptor) = connect_with_retries(uri, config).await?;
+    Ok(SiloClient::with_interceptor(channel, interceptor)
+        .max_decoding_message_size(128 * 1024 * 1024)
+        .max_encoding_message_size(128 * 1024 * 1024))
+}
+
+/// Helper to create a SiloAdminClient with an eager connection and retry logic.
+///
+/// Mirrors [`create_silo_client`] but returns an admin service client.
+pub async fn create_silo_admin_client(
+    uri: &str,
+    config: &ClientConfig,
+) -> Result<InterceptedSiloAdminClient, ClusterClientError> {
+    let (channel, interceptor) = connect_with_retries(uri, config).await?;
+    Ok(SiloAdminClient::with_interceptor(channel, interceptor)
+        .max_decoding_message_size(128 * 1024 * 1024)
+        .max_encoding_message_size(128 * 1024 * 1024))
+}
+
+/// Establish a gRPC channel with retry logic and exponential backoff.
+///
+/// Returns the connected channel and an auth interceptor. Both
+/// [`create_silo_client`] and [`create_silo_admin_client`] delegate here.
+async fn connect_with_retries(
+    uri: &str,
+    config: &ClientConfig,
+) -> Result<(Channel, AuthInterceptor), ClusterClientError> {
     let full_uri = ensure_http_scheme(uri);
 
     let endpoint = config
@@ -243,9 +270,7 @@ pub async fn create_silo_client(
         match connect_result {
             Ok(Ok(channel)) => {
                 let interceptor = AuthInterceptor::new(config.auth_token.clone());
-                return Ok(SiloClient::with_interceptor(channel, interceptor)
-                    .max_decoding_message_size(128 * 1024 * 1024)
-                    .max_encoding_message_size(128 * 1024 * 1024));
+                return Ok((channel, interceptor));
             }
             Ok(Err(e)) => {
                 trace!(
@@ -264,65 +289,6 @@ pub async fn create_silo_client(
                     uri = %full_uri,
                     timeout_secs = ?attempt_timeout,
                     "connection attempt timed out, retrying"
-                );
-                last_error = Some(format!("connection timed out after {:?}", attempt_timeout));
-            }
-        }
-
-        if attempt + 1 < config.max_retries {
-            tokio::time::sleep(config.backoff_for_attempt(attempt)).await;
-        }
-    }
-
-    Err(ClusterClientError::ConnectionFailed(
-        full_uri,
-        last_error.unwrap_or_else(|| "no connection attempts made".into()),
-    ))
-}
-
-/// Helper to create a SiloAdminClient with an eager connection and retry logic.
-///
-/// Mirrors [`create_silo_client`] but returns an admin service client.
-pub async fn create_silo_admin_client(
-    uri: &str,
-    config: &ClientConfig,
-) -> Result<InterceptedSiloAdminClient, ClusterClientError> {
-    let full_uri = ensure_http_scheme(uri);
-
-    let endpoint = config
-        .configure_endpoint(&full_uri)
-        .map_err(|e| ClusterClientError::ConnectionFailed(full_uri.clone(), e.to_string()))?;
-
-    let attempt_timeout = config.connect_timeout + Duration::from_secs(1);
-
-    let mut last_error = None;
-    for attempt in 0..config.max_retries {
-        let connect_result = tokio::time::timeout(attempt_timeout, endpoint.connect()).await;
-
-        match connect_result {
-            Ok(Ok(channel)) => {
-                let interceptor = AuthInterceptor::new(config.auth_token.clone());
-                return Ok(SiloAdminClient::with_interceptor(channel, interceptor)
-                    .max_decoding_message_size(128 * 1024 * 1024)
-                    .max_encoding_message_size(128 * 1024 * 1024));
-            }
-            Ok(Err(e)) => {
-                trace!(
-                    attempt = attempt,
-                    max_retries = config.max_retries,
-                    error = %e,
-                    uri = %full_uri,
-                    "admin connection attempt failed, retrying"
-                );
-                last_error = Some(e.to_string());
-            }
-            Err(_elapsed) => {
-                trace!(
-                    attempt = attempt,
-                    max_retries = config.max_retries,
-                    uri = %full_uri,
-                    timeout_secs = ?attempt_timeout,
-                    "admin connection attempt timed out, retrying"
                 );
                 last_error = Some(format!("connection timed out after {:?}", attempt_timeout));
             }

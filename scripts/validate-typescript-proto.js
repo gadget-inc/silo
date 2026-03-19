@@ -25,12 +25,17 @@ function main() {
 
     const tsClientDir = path.join(projectRoot, "typescript_client");
     const pbDir = path.join(tsClientDir, "src", "pb");
-    const protoFile = path.join(projectRoot, "proto", "silo.proto");
+    const protoFiles = [
+        path.join(projectRoot, "proto", "silo.proto"),
+        path.join(projectRoot, "proto", "silo_admin.proto"),
+    ];
 
     // Verify required files exist
-    if (!fs.existsSync(protoFile)) {
-        console.error(`Error: Proto file not found at ${protoFile}`);
-        process.exit(1);
+    for (const protoFile of protoFiles) {
+        if (!fs.existsSync(protoFile)) {
+            console.error(`Error: Proto file not found at ${protoFile}`);
+            process.exit(1);
+        }
     }
     if (!fs.existsSync(pbDir)) {
         console.error(`Error: Generated proto directory not found at ${pbDir}`);
@@ -46,12 +51,12 @@ function main() {
         console.log("TypeScript Proto Validation");
         console.log("===========================\n");
 
-        console.log(`Proto source: proto/silo.proto`);
+        console.log(`Proto sources: proto/silo.proto, proto/silo_admin.proto`);
         console.log(`Generated files: typescript_client/src/pb/\n`);
 
         // Regenerate proto files to temp directory
         console.log("Regenerating proto files...\n");
-        const protocCmd = `pnpm exec protoc --ts_out=${tmpPbDir} --ts_opt=long_type_bigint --ts_opt=generate_dependencies --proto_path=${path.join(projectRoot, "proto")} ${protoFile}`;
+        const protocCmd = `pnpm exec protoc --ts_out=${tmpPbDir} --ts_opt=long_type_bigint --ts_opt=generate_dependencies --proto_path=${path.join(projectRoot, "proto")} ${protoFiles.join(" ")}`;
 
         try {
             execSync(protocCmd, { cwd: tsClientDir, stdio: "pipe" });
