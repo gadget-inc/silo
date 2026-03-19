@@ -6,6 +6,7 @@ use silo::job_attempt::AttemptOutcome;
 use silo::keys::concurrency_holder_key;
 use silo::retry::RetryPolicy;
 use silo::task::Task;
+use slatedb::{Db, DbIterator};
 use std::collections::HashSet;
 use std::sync::{
     Arc, Mutex,
@@ -13,6 +14,22 @@ use std::sync::{
 };
 
 use test_helpers::*;
+
+async fn count_non_cleanup_task_keys(db: &Db) -> usize {
+    let prefix = silo::keys::tasks_prefix();
+    let end = silo::keys::end_bound(&prefix);
+    let mut iter: DbIterator = db.scan::<Vec<u8>, _>(prefix..end).await.expect("scan");
+    let mut count = 0;
+
+    while let Some(kv) = iter.next().await.expect("next") {
+        let task = decode_task(&kv.value).expect("decode task");
+        if !matches!(task, Task::DeleteTerminalJob { .. }) {
+            count += 1;
+        }
+    }
+
+    count
+}
 
 /// Tests that jobs from different task groups can participate in the same concurrency queue.
 /// This is important because task groups are for routing work to different workers,
@@ -418,8 +435,9 @@ async fn concurrent_dequeue_many_workers_no_duplicates() {
         producer.await.unwrap();
 
         assert_eq!(processed.load(Ordering::Relaxed), total_jobs);
-        // No remaining tasks or leases
-        assert_eq!(count_task_keys(shard.db()).await, 0);
+        // No remaining worker/concurrency tasks or leases. Terminal retention cleanup tasks are
+        // expected to remain until their retention deadline.
+        assert_eq!(count_non_cleanup_task_keys(shard.db()).await, 0);
         assert_eq!(count_lease_keys(shard.db()).await, 0);
     });
 }
