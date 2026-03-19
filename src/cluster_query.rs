@@ -38,7 +38,9 @@ use crate::factory::ShardFactory;
 use crate::job_store_shard::JobStoreShard;
 use crate::pb::QueryArrowRequest;
 use crate::pb::silo_client::SiloClient;
-use crate::query::{JobsScanner, QueuesScanner, ScannerRef, explain_dataframe};
+use crate::query::{
+    JobsScanner, QueuesScanner, ScannerRef, TenantCountsScanner, explain_dataframe,
+};
 use crate::shard_range::ShardId;
 
 /// Cluster-wide SQL query engine using DataFusion.
@@ -99,12 +101,23 @@ impl ClusterQueryEngine {
         let queues_schema = QueuesScanner::base_schema();
         let queues_provider = Arc::new(ClusterTableProvider::new(
             queues_schema,
-            factory,
-            coordinator,
+            factory.clone(),
+            coordinator.clone(),
             TableKind::Queues,
-            auth_token,
+            auth_token.clone(),
         ));
         ctx.register_table("queues", queues_provider)?;
+
+        // Register cluster-wide tenant_counts table
+        let tenant_counts_schema = TenantCountsScanner::base_schema();
+        let tenant_counts_provider = Arc::new(ClusterTableProvider::new(
+            tenant_counts_schema,
+            factory,
+            coordinator,
+            TableKind::TenantCounts,
+            auth_token,
+        ));
+        ctx.register_table("tenant_counts", tenant_counts_provider)?;
 
         Ok(Self { ctx })
     }
@@ -188,6 +201,7 @@ impl ClusterQueryEngine {
 enum TableKind {
     Jobs,
     Queues,
+    TenantCounts,
 }
 
 /// A TableProvider that spans multiple shards in the cluster.
@@ -444,6 +458,9 @@ impl ExecutionPlan for ClusterExecutionPlan {
                     let scanner: ScannerRef = match table_kind {
                         TableKind::Jobs => Arc::new(JobsScanner::new(Arc::clone(&shard))),
                         TableKind::Queues => Arc::new(QueuesScanner::new(Arc::clone(&shard))),
+                        TableKind::TenantCounts => {
+                            Arc::new(TenantCountsScanner::new(Arc::clone(&shard)))
+                        }
                     };
 
                     // Execute the scan - scanner handles projection via schema
@@ -552,6 +569,7 @@ async fn query_remote_shard_batches(
     let table_name = match table_kind {
         TableKind::Jobs => "jobs",
         TableKind::Queues => "queues",
+        TableKind::TenantCounts => "tenant_counts",
     };
 
     let sql = build_sql_query(table_name, filters, limit);

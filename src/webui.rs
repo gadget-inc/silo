@@ -982,8 +982,7 @@ async fn tenants_handler(
     let mut queue_counts: HashMap<String, Vec<(String, usize)>> = HashMap::new();
     let mut errors: Vec<String> = Vec::new();
 
-    let jobs_sql =
-        "SELECT tenant, status_kind, COUNT(*) as cnt FROM jobs GROUP BY tenant, status_kind";
+    let jobs_sql = "SELECT tenant, status_kind, cnt FROM tenant_counts";
     match state.query_engine.sql(jobs_sql).await {
         Ok(df) => match df.collect().await {
             Ok(batches) => {
@@ -1198,7 +1197,7 @@ async fn tenant_handler(
     let mut errors: Vec<String> = Vec::new();
 
     let count_sql = format!(
-        "SELECT status_kind, COUNT(*) as cnt FROM jobs WHERE tenant = '{}' GROUP BY status_kind",
+        "SELECT status_kind, cnt FROM tenant_counts WHERE tenant = '{}'",
         tenant_escaped
     );
     match state.query_engine.sql(&count_sql).await {

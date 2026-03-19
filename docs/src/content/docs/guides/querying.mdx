@@ -80,7 +80,7 @@ Use `siloctl cluster info` to see all shards and their owners. If you know the t
 
 ## Tables
 
-Silo exposes two tables: `jobs` and `queues`.
+Silo exposes three tables: `jobs`, `queues`, and `tenant_counts`.
 
 ### `jobs` Table
 
@@ -115,6 +115,21 @@ Shows the current state of concurrency queues — which jobs hold concurrency ti
 | `job_id` | String (nullable) | Job ID (present for requesters) |
 | `priority` | UInt8 (nullable) | Job priority (present for requesters) |
 | `timestamp_ms` | Int64 | When the ticket was granted or the request was made |
+
+### `tenant_counts` Table
+
+Pre-computed per-tenant, per-status job counts. Backed by merge-operator counters maintained on every status transition, making this table very fast for tenant-level status aggregation (sub-millisecond vs full scan).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `shard_id` | String | UUID of the shard |
+| `tenant` | String | Tenant identifier |
+| `status_kind` | String | Job status kind (Scheduled, Running, Succeeded, etc.) |
+| `cnt` | Int64 | Number of jobs with this tenant and status |
+
+`tenant_counts` is a sparse aggregation. It returns one row per `(tenant, status_kind)` pair with a positive count. Statuses with zero jobs are omitted rather than returned as `cnt = 0`, so a missing row should be interpreted as zero.
+
+For example, if a tenant has 12 `Scheduled` jobs and no `Running` jobs, `tenant_counts` returns a `Scheduled` row and no `Running` row.
 
 ## Status Values
 
@@ -211,6 +226,14 @@ SELECT task_group, AVG(CAST(priority AS DOUBLE)) as avg_priority
 FROM jobs
 WHERE tenant = 'customer-123'
 GROUP BY task_group
+```
+
+```sql
+-- Fast per-tenant status counts using the pre-computed sparse counter table
+SELECT status_kind, cnt
+FROM tenant_counts
+WHERE tenant = 'customer-123'
+ORDER BY status_kind
 ```
 
 ### Querying Metadata

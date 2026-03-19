@@ -7,11 +7,13 @@
 //! - Track cleanup progress and status for crash recovery
 
 use crate::coordination::SplitCleanupStatus;
+use crate::job_store_shard::helpers::{DbWriteBatcher, decode_job_status_owned};
 use crate::keys::{
     self, end_bound, parse_attempt_key, parse_concurrency_holder_key,
     parse_concurrency_request_key, parse_concurrency_requester_counter_key,
     parse_floating_limit_key, parse_job_cancelled_key, parse_job_info_key, parse_job_status_key,
-    parse_metadata_index_key, parse_status_time_index_key, tasks_prefix,
+    parse_metadata_index_key, parse_status_time_index_key, parse_tenant_status_counter_key,
+    tasks_prefix,
 };
 use crate::shard_range::ShardRange;
 use slatedb::WriteBatch;
@@ -171,6 +173,11 @@ impl JobStoreShard {
                 vec![prefix::COUNTER_CONCURRENCY_REQUESTERS],
                 Box::new(|key, _| parse_concurrency_requester_counter_key(key).map(|p| p.tenant)),
             ),
+            // Tenant status counter keys (0xF8)
+            (
+                vec![prefix::COUNTER_TENANT_STATUS],
+                Box::new(|key, _| parse_tenant_status_counter_key(key).map(|p| p.tenant)),
+            ),
             // Task keys - tenant is in the value, not the key
             (
                 tasks_prefix(),
@@ -242,6 +249,8 @@ impl JobStoreShard {
         F: Fn(&[u8], &[u8]) -> Option<String>,
     {
         let end = end_bound(&start);
+        let decrements_total_jobs = start.as_slice() == [prefix::JOB_INFO];
+        let decrements_completed_jobs = start.as_slice() == [prefix::JOB_STATUS];
 
         let mut batch = WriteBatch::new();
         let mut batch_count = 0;
@@ -255,6 +264,32 @@ impl JobStoreShard {
                 && !range.contains_tenant(&tenant)
             {
                 batch.delete(&kv.key);
+
+                if decrements_total_jobs || decrements_completed_jobs {
+                    let mut writer = DbWriteBatcher::new(&self.db, &mut batch);
+
+                    if decrements_total_jobs {
+                        self.decrement_total_jobs_counter(&mut writer)?;
+                    }
+
+                    if decrements_completed_jobs {
+                        match decode_job_status_owned(&kv.value) {
+                            Ok(status) if status.is_terminal() => {
+                                self.decrement_completed_jobs_counter(&mut writer)?;
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!(
+                                    shard = %self.name,
+                                    key = %hex::encode(&kv.key),
+                                    error = %e,
+                                    "cleanup: failed to decode job status for counter adjustment"
+                                );
+                            }
+                        }
+                    }
+                }
+
                 batch_count += 1;
                 progress.keys_deleted += 1;
             }

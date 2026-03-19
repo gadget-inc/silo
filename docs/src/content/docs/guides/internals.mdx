@@ -45,7 +45,7 @@ Silo uses the [storekey](https://crates.io/crates/storekey) crate for binary key
 | 0x09 | Concurrency holder | Tasks holding concurrency slots: `(tenant, queue, task_id)` |
 | 0x0A | Job cancelled | Cancellation flags: `(tenant, job_id)` |
 | 0x0B | Floating limit | Dynamic concurrency limit state: `(tenant, queue_key)` |
-| 0xF0-0xFF | System | Internal counters, cleanup state, and metadata |
+| 0xF0-0xFF | System | Internal counters, cleanup state, and metadata. Includes per-shard total/completed job counters (`0xF0`, `0xF1`), cleanup progress (`0xF2`-`0xF6`), per-queue concurrency requester counters (`0xF7`), and per-tenant status counters (`0xF8`) maintained via merge operator on every status transition. |
 
 ## Clustering approach
 

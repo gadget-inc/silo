@@ -32,6 +32,7 @@ pub(crate) mod prefix {
     pub const SHARD_CREATED_AT: u8 = 0xF5;
     pub const CLEANUP_COMPLETED_AT: u8 = 0xF6;
     pub const COUNTER_CONCURRENCY_REQUESTERS: u8 = 0xF7;
+    pub const COUNTER_TENANT_STATUS: u8 = 0xF8;
 }
 
 /// Encode a key with its namespace prefix.
@@ -596,6 +597,41 @@ pub fn parse_concurrency_requester_counter_key(
 /// Uses storekey encoding for collision-safe (tenant, queue) pairing.
 pub fn concurrency_counts_key(tenant: &str, queue: &str) -> Vec<u8> {
     encode_vec(&(tenant, queue)).expect("storekey encoding should not fail")
+}
+
+/// Key for a per-tenant, per-status counter.
+/// Tracks the number of jobs for each (tenant, status_kind) combination.
+pub fn tenant_status_counter_key(tenant: &str, status_kind: &str) -> Vec<u8> {
+    encode_with_prefix(prefix::COUNTER_TENANT_STATUS, &(tenant, status_kind))
+}
+
+/// Prefix for scanning all tenant status counters.
+pub fn tenant_status_counter_prefix() -> Vec<u8> {
+    vec![prefix::COUNTER_TENANT_STATUS]
+}
+
+/// Prefix for scanning all tenant status counters for a specific tenant.
+pub fn tenant_status_counter_tenant_prefix(tenant: &str) -> Vec<u8> {
+    encode_with_prefix(prefix::COUNTER_TENANT_STATUS, &(tenant,))
+}
+
+/// Parsed tenant status counter key components.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedTenantStatusCounterKey {
+    pub tenant: String,
+    pub status_kind: String,
+}
+
+/// Parse a tenant status counter key back to its components.
+pub fn parse_tenant_status_counter_key(key: &[u8]) -> Option<ParsedTenantStatusCounterKey> {
+    if key.first() != Some(&prefix::COUNTER_TENANT_STATUS) {
+        return None;
+    }
+    let (tenant, status_kind): (String, String) = decode(&key[1..]).ok()?;
+    Some(ParsedTenantStatusCounterKey {
+        tenant,
+        status_kind,
+    })
 }
 
 /// Create an exclusive end bound for range scanning.
