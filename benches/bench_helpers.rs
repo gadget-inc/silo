@@ -16,6 +16,7 @@ use silo::job::ConcurrencyLimit;
 use silo::job::Limit;
 use silo::job_store_shard::import::{ImportJobParams, ImportedAttempt, ImportedAttemptStatus};
 use silo::job_store_shard::{JobStoreShard, OpenShardOptions};
+use silo::settings::DEFAULT_TERMINAL_RETENTION_S;
 use silo::shard_range::ShardRange;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -171,6 +172,7 @@ pub fn build_import_params(job_idx: usize, job_id: &str, now: i64) -> ImportJobP
         priority: 50,
         enqueue_time_ms,
         start_at_ms,
+        terminal_retention_s: None,
         retry_policy: None,
         payload: rmp_serde::to_vec(&serde_json::json!({"idx": job_idx})).unwrap(),
         limits: vec![],
@@ -341,6 +343,7 @@ async fn open_shard_at_path(path: &str, flush_interval_ms: u64) -> Arc<JobStoreS
         path: path.to_string(),
         wal: None,
         apply_wal_on_close: true,
+        default_terminal_retention_s: DEFAULT_TERMINAL_RETENTION_S,
         slatedb: Some(slatedb::config::Settings {
             flush_interval: Some(Duration::from_millis(flush_interval_ms)),
             ..Default::default()
@@ -610,6 +613,7 @@ pub async fn clone_golden_shard(
             concurrency_reconcile_interval: Duration::from_millis(
                 silo::settings::DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS,
             ),
+            default_terminal_retention_s: DEFAULT_TERMINAL_RETENTION_S,
         },
         ShardRange::full(),
     )

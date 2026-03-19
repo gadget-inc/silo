@@ -5,11 +5,12 @@ use slatedb::IsolationLevel;
 use slatedb::config::WriteOptions;
 
 use crate::job::{JobStatus, JobView};
+use crate::job_store_shard::counters::encode_counter;
 use crate::job_store_shard::helpers::{TxnWriter, WriteBatcher, retry_on_txn_conflict};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{
     attempt_prefix, end_bound, idx_metadata_key, idx_status_time_key, job_cancelled_key,
-    job_info_key, job_status_key, status_index_timestamp, task_key,
+    job_info_key, job_status_key, status_index_timestamp, task_key, tenant_status_counter_key,
 };
 use crate::task::Task;
 use crate::task_broker::BrokerTask;
@@ -146,6 +147,10 @@ impl JobStoreShard {
             job_id,
         );
         writer.delete(&status_index_key)?;
+        writer.merge(
+            tenant_status_counter_key(tenant, status.kind.as_str()),
+            encode_counter(-1),
+        )?;
 
         for (mk, mv) in job_view.metadata() {
             let metadata_key = idx_metadata_key(tenant, &mk, &mv, job_id);
