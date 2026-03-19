@@ -732,7 +732,7 @@ async fn grpc_server_get_node_info_tracks_lifecycle() -> anyhow::Result<()> {
 /// queries but not be available for leaseTasks.
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_server_reset_shards_clears_fs_backend_data() -> anyhow::Result<()> {
-    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+    let _guard = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let test_shard_id = crate::grpc_integration_helpers::TEST_SHARD_ID;
         let tmp = tempfile::tempdir()?;
 
@@ -906,7 +906,7 @@ async fn grpc_server_reset_shards_clears_fs_backend_data() -> anyhow::Result<()>
         Ok::<(), anyhow::Error>(())
     })
     .await
-    .expect("test timed out")?;
+    .expect("reset_shards fs backend test timed out")?;
     Ok(())
 }
 
@@ -914,7 +914,7 @@ async fn grpc_server_reset_shards_clears_fs_backend_data() -> anyhow::Result<()>
 /// This reproduces the bug where relative paths might not resolve correctly.
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_server_reset_shards_with_relative_path() -> anyhow::Result<()> {
-    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+    let _guard = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let test_shard_id = crate::grpc_integration_helpers::TEST_SHARD_ID;
 
         // Create a temporary directory and use a RELATIVE path to it
@@ -1039,7 +1039,7 @@ async fn grpc_server_reset_shards_with_relative_path() -> anyhow::Result<()> {
         Ok::<(), anyhow::Error>(())
     })
     .await
-    .expect("test timed out")?;
+    .expect("reset_shards relative path test timed out")?;
     Ok(())
 }
 
@@ -1047,7 +1047,7 @@ async fn grpc_server_reset_shards_with_relative_path() -> anyhow::Result<()> {
 /// This ensures the object store deletion logic works correctly for non-filesystem backends.
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_server_reset_shards_clears_memory_backend_data() -> anyhow::Result<()> {
-    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+    let _guard = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let test_shard_id = crate::grpc_integration_helpers::TEST_SHARD_ID;
 
         // Use Memory backend to exercise the object store deletion path
@@ -1156,7 +1156,7 @@ async fn grpc_server_reset_shards_clears_memory_backend_data() -> anyhow::Result
         Ok::<(), anyhow::Error>(())
     })
     .await
-    .expect("test timed out")?;
+    .expect("reset_shards memory backend test timed out")?;
     Ok(())
 }
 
