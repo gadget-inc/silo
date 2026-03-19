@@ -421,8 +421,9 @@ impl CoordinatorBase {
 
     /// Compute shard owner map from members (shared by both backends).
     ///
-    /// Uses ring-aware selection to determine shard ownership based on
-    /// each shard's placement ring and member ring participation.
+    /// Uses bounded-load, ring-aware rendezvous hashing to determine shard
+    /// ownership based on each shard's placement ring and member ring
+    /// participation.
     pub async fn compute_shard_owner_map(&self, members: &[MemberInfo]) -> ShardOwnerMap {
         let addr_map: HashMap<String, String> = members
             .iter()
@@ -433,14 +434,13 @@ impl CoordinatorBase {
         let mut shard_to_addr = HashMap::new();
         let mut shard_to_node = HashMap::new();
 
-        for shard_info in shard_map.shards() {
-            // Use ring-aware selection
-            if let Some(owner_node) =
-                select_owner_for_shard(&shard_info.id, shard_info.placement_ring(), members)
-                && let Some(addr) = addr_map.get(&owner_node)
-            {
-                shard_to_addr.insert(shard_info.id, addr.clone());
-                shard_to_node.insert(shard_info.id, owner_node);
+        let shards: Vec<&crate::shard_range::ShardInfo> = shard_map.shards().iter().collect();
+        let assignments = compute_all_shard_assignments(&shards, members);
+
+        for (shard_id, owner_node) in assignments {
+            if let Some(addr) = addr_map.get(&owner_node) {
+                shard_to_addr.insert(shard_id, addr.clone());
+                shard_to_node.insert(shard_id, owner_node);
             }
         }
 
@@ -734,64 +734,101 @@ pub fn member_in_ring(member: &MemberInfo, shard_ring: Option<&str>) -> bool {
     }
 }
 
-/// Deterministically select the owner node for a shard using rendezvous hashing, filtering by placement ring.
-///
-/// Uses the shard's UUID as input to the hash function, ensuring consistent distribution regardless of when shards were created.
-///
-/// Only members that participate in the shard's placement ring are considered.
-/// If no members participate in the ring, returns None.
-pub fn select_owner_for_shard(
-    shard_id: &ShardId,
-    shard_ring: Option<&str>,
-    members: &[MemberInfo],
-) -> Option<String> {
-    // Filter to members that participate in this ring
-    let eligible: Vec<&String> = members
-        .iter()
-        .filter(|m| member_in_ring(m, shard_ring))
-        .map(|m| &m.node_id)
-        .collect();
+/// Compute the rendezvous hash score for a (member, shard) pair.
+fn rendezvous_score(member_id: &str, shard_id: &ShardId) -> u64 {
+    let member_hash = fnv1a64(member_id.as_bytes());
+    let shard_hash = fnv1a64(shard_id.as_uuid().as_bytes());
+    mix64(member_hash ^ shard_hash)
+}
 
-    if eligible.is_empty() {
-        return None;
+/// Compute shard-to-node assignments for all shards using bounded-load rendezvous hashing.
+///
+/// Standard rendezvous hashing assigns each shard independently to its highest-scoring node,
+/// which can produce significant imbalance when the shard count is low relative to the node count.
+/// Bounded-load rendezvous hashing adds a capacity constraint: each node in a given placement ring
+/// can own at most `ceil(ring_shards / ring_nodes)` shards.
+///
+/// Algorithm:
+/// 1. Group shards by placement ring
+/// 2. For each ring, compute rendezvous scores for all (shard, eligible_node) pairs
+/// 3. Sort by score descending (highest-preference assignments first)
+/// 4. Greedily assign each shard to its preferred node, skipping nodes that are at capacity
+///
+/// This preserves the key properties of rendezvous hashing (deterministic, stable on resize)
+/// while guaranteeing that shard counts differ by at most 1 across nodes within each ring.
+pub fn compute_all_shard_assignments(
+    shards: &[&crate::shard_range::ShardInfo],
+    members: &[MemberInfo],
+) -> HashMap<ShardId, String> {
+    // Group shards by placement ring (None = default ring)
+    let mut ring_groups: HashMap<Option<&str>, Vec<&crate::shard_range::ShardInfo>> =
+        HashMap::new();
+    for shard in shards {
+        ring_groups
+            .entry(shard.placement_ring())
+            .or_default()
+            .push(shard);
     }
 
-    let mut best: Option<(u64, &String)> = None;
-    for m in &eligible {
-        let member_hash = fnv1a64(m.as_bytes());
-        // Use the UUID bytes for consistent hashing
-        let shard_hash = fnv1a64(shard_id.as_uuid().as_bytes());
-        let score = mix64(member_hash ^ shard_hash);
-        if let Some((cur, _)) = best {
-            if score > cur {
-                best = Some((score, m));
+    let mut assignments: HashMap<ShardId, String> = HashMap::new();
+
+    for (ring, ring_shards) in &ring_groups {
+        let eligible_nodes: Vec<&String> = members
+            .iter()
+            .filter(|m| member_in_ring(m, *ring))
+            .map(|m| &m.node_id)
+            .collect();
+
+        if eligible_nodes.is_empty() {
+            continue;
+        }
+
+        let max_per_node = ring_shards.len().div_ceil(eligible_nodes.len());
+
+        // Build all (score, shard_id, node_id) tuples and sort by score descending
+        let mut scored: Vec<(u64, ShardId, &String)> = Vec::new();
+        for shard in ring_shards {
+            for node in &eligible_nodes {
+                let score = rendezvous_score(node, &shard.id);
+                scored.push((score, shard.id, node));
             }
-        } else {
-            best = Some((score, m));
+        }
+        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+
+        // Greedily assign: take highest-score pairs, respecting capacity
+        let mut node_counts: HashMap<&String, usize> = HashMap::new();
+        let mut assigned: HashSet<ShardId> = HashSet::new();
+
+        for (_, shard_id, node_id) in &scored {
+            if assigned.contains(shard_id) {
+                continue;
+            }
+            let count = node_counts.entry(node_id).or_insert(0);
+            if *count < max_per_node {
+                *count += 1;
+                assigned.insert(*shard_id);
+                assignments.insert(*shard_id, (*node_id).clone());
+            }
         }
     }
-    best.map(|(_, m)| (*m).clone())
+
+    assignments
 }
 
 /// Compute the desired set of shard ids for a node given current membership and considering placement rings.
 ///
-/// A shard is desired by a node if:
-/// 1. The node participates in the shard's placement ring
-/// 2. The node is selected as owner by rendezvous hashing among eligible members
+/// Uses bounded-load rendezvous hashing to ensure even distribution: within each placement ring,
+/// no node will own more than `ceil(ring_shards / ring_nodes)` shards.
 pub fn compute_desired_shards_for_node(
     shards: &[&crate::shard_range::ShardInfo],
     node_id: &str,
     members: &[MemberInfo],
 ) -> HashSet<ShardId> {
-    let mut desired: HashSet<ShardId> = HashSet::new();
-    for shard in shards {
-        if let Some(owner) = select_owner_for_shard(&shard.id, shard.placement_ring(), members)
-            && owner == node_id
-        {
-            desired.insert(shard.id);
-        }
-    }
-    desired
+    compute_all_shard_assignments(shards, members)
+        .into_iter()
+        .filter(|(_, owner)| owner == node_id)
+        .map(|(shard_id, _)| shard_id)
+        .collect()
 }
 
 fn fnv1a64(data: &[u8]) -> u64 {
