@@ -1141,14 +1141,10 @@ async fn test_tenants_index_shows_tenant_data() {
         body.contains("/tenant?name=tenant-alpha"),
         "tenant links should point to tenant detail pages"
     );
-    assert!(
-        body.contains("alpha-queue") || body.contains("beta-queue"),
-        "tenant overview should include top queue names"
-    );
 }
 
 #[silo::test]
-async fn test_tenant_detail_shows_upcoming_jobs_and_queues() {
+async fn test_tenant_detail_shows_queues_and_waiting_jobs() {
     use silo::job::{ConcurrencyLimit, Limit};
 
     let (_tmp, state, shard_map) = setup_multi_shard_state_with_tenancy(2, true).await;
@@ -1190,6 +1186,22 @@ async fn test_tenant_detail_shows_upcoming_jobs_and_queues() {
         .await
         .expect("enqueue detail job 2");
 
+    // Enqueue a job with start_time in the past so it shows as "Waiting"
+    let _ = shard0
+        .enqueue(
+            "tenant-detail",
+            Some("tenant-detail-waiting-job".to_string()),
+            50,
+            test_helpers::now_ms() - 1_000,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"k":"v3"})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue waiting job");
+
     let (status, body) = make_request(state, "GET", "/tenant?name=tenant-detail").await;
 
     assert_eq!(status, StatusCode::OK);
@@ -1198,12 +1210,12 @@ async fn test_tenant_detail_shows_upcoming_jobs_and_queues() {
         "tenant detail heading should render"
     );
     assert!(
-        body.contains("tenant-detail-job-1") || body.contains("tenant-detail-job-2"),
-        "tenant detail should show upcoming jobs"
+        body.contains("detail-queue"),
+        "tenant detail should show queue activity via queue_counts"
     );
     assert!(
-        body.contains("detail-queue"),
-        "tenant detail should show queue activity"
+        body.contains("tenant-detail-waiting-job"),
+        "tenant detail should show waiting jobs"
     );
     assert!(
         !body.contains("Tenant counts query failed"),

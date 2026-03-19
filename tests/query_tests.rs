@@ -2707,6 +2707,44 @@ async fn explain_bench_count_waiting() {
     );
 }
 
+// Tenant detail page waiting jobs query → Status(Waiting) strategy with narrow projection
+// This is the query used by the /tenant webui page to show waiting jobs.
+// It must resolve to the Status(Waiting) strategy (bounded range scan) and avoid
+// projecting job_info columns (priority, enqueue_time_ms) which would trigger point lookups.
+#[silo::test]
+async fn explain_tenant_detail_waiting_jobs_query() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    enqueue_job(&shard, "j1", 10, now).await;
+
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let (explain, strategy) = explain_and_strategy(
+        &engine,
+        "SELECT shard_id, id FROM jobs WHERE tenant = '-' AND status_kind = 'Waiting' LIMIT 100",
+    )
+    .await;
+
+    let plan_line = extract_silo_plan_line(&explain);
+    assert!(
+        plan_line.contains("Status(tenant=Some(\"-\"), status=Waiting)"),
+        "Expected Status(Waiting) strategy, got: {}",
+        plan_line
+    );
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::Status {
+            tenant: Some("-".to_string()),
+            status: QueryStatusFilter::Waiting,
+        }
+    );
+    // Verify the plan includes a limit (DataFusion pushes LIMIT as fetch= on CoalesceBatchesExec)
+    assert!(
+        explain.contains("fetch=100"),
+        "Expected LIMIT 100 in plan, got:\n{}",
+        explain
+    );
+}
+
 // Benchmark query: SELECT COUNT(*) FROM jobs WHERE tenant = '{t}' AND status_kind = 'Succeeded'
 #[silo::test]
 async fn explain_bench_count_succeeded() {

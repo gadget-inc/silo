@@ -575,6 +575,11 @@ pub fn concurrency_requester_counter_key(tenant: &str, queue: &str) -> Vec<u8> {
     encode_with_prefix(prefix::COUNTER_CONCURRENCY_REQUESTERS, &(tenant, queue))
 }
 
+/// Prefix for scanning all concurrency requester counters for a specific tenant.
+pub fn concurrency_requester_counter_tenant_prefix(tenant: &str) -> Vec<u8> {
+    encode_with_prefix(prefix::COUNTER_CONCURRENCY_REQUESTERS, &(tenant,))
+}
+
 /// Parsed concurrency requester counter key components.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedConcurrencyRequesterCounterKey {
