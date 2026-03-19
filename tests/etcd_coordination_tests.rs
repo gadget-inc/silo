@@ -1962,7 +1962,7 @@ async fn etcd_crash_recovery_cloning_phase_abandons_split() {
 /// record but didn't call execute_split to drive it through all phases.
 #[silo::test(flavor = "multi_thread", worker_threads = 2)]
 async fn etcd_grpc_request_split_executes_to_completion() {
-    use silo::pb::silo_client::SiloClient;
+    use silo::pb::silo_admin_client::SiloAdminClient;
     use silo::server::run_server;
     use silo::settings::AppConfig;
     use std::net::SocketAddr;
@@ -2007,10 +2007,10 @@ async fn etcd_grpc_request_split_executes_to_completion() {
         .connect()
         .await
         .expect("connect");
-    let mut client = SiloClient::new(channel);
+    let mut admin_client = SiloAdminClient::new(channel);
 
     // Make gRPC request to split the shard
-    let response = client
+    let response = admin_client
         .request_split(silo::pb::RequestSplitRequest {
             shard_id: shard_id.to_string(),
             split_point: "8000000000000000".to_string(),
@@ -2032,7 +2032,7 @@ async fn etcd_grpc_request_split_executes_to_completion() {
             panic!("Split did not complete within timeout");
         }
 
-        let status = client
+        let status = admin_client
             .get_split_status(silo::pb::GetSplitStatusRequest {
                 shard_id: shard_id.to_string(),
             })

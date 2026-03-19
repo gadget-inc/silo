@@ -4,22 +4,6 @@
 import type { RpcTransport } from "@protobuf-ts/runtime-rpc";
 import type { ServiceInfo } from "@protobuf-ts/runtime-rpc";
 import { Silo } from "./silo";
-import type { CompactShardResponse } from "./silo";
-import type { CompactShardRequest } from "./silo";
-import type { ForceReleaseShardResponse } from "./silo";
-import type { ForceReleaseShardRequest } from "./silo";
-import type { ResetShardsResponse } from "./silo";
-import type { ResetShardsRequest } from "./silo";
-import type { ImportJobsResponse } from "./silo";
-import type { ImportJobsRequest } from "./silo";
-import type { ConfigureShardResponse } from "./silo";
-import type { ConfigureShardRequest } from "./silo";
-import type { GetSplitStatusResponse } from "./silo";
-import type { GetSplitStatusRequest } from "./silo";
-import type { RequestSplitResponse } from "./silo";
-import type { RequestSplitRequest } from "./silo";
-import type { CpuProfileResponse } from "./silo";
-import type { CpuProfileRequest } from "./silo";
 import type { ArrowIpcMessage } from "./silo";
 import type { QueryArrowRequest } from "./silo";
 import type { ServerStreamingCall } from "@protobuf-ts/runtime-rpc";
@@ -49,15 +33,14 @@ import type { GetJobResponse } from "./silo";
 import type { GetJobRequest } from "./silo";
 import type { EnqueueResponse } from "./silo";
 import type { EnqueueRequest } from "./silo";
-import type { GetNodeInfoResponse } from "./silo";
-import type { GetNodeInfoRequest } from "./silo";
 import { stackIntercept } from "@protobuf-ts/runtime-rpc";
 import type { GetClusterInfoResponse } from "./silo";
 import type { GetClusterInfoRequest } from "./silo";
 import type { UnaryCall } from "@protobuf-ts/runtime-rpc";
 import type { RpcOptions } from "@protobuf-ts/runtime-rpc";
 /**
- * The Silo job queue service.
+ * The core Silo job queue service.
+ * Used by workers and application clients for job management and task processing.
  *
  * @generated from protobuf service silo.v1.Silo
  */
@@ -69,12 +52,6 @@ export interface ISiloClient {
      * @generated from protobuf rpc: GetClusterInfo
      */
     getClusterInfo(input: GetClusterInfoRequest, options?: RpcOptions): UnaryCall<GetClusterInfoRequest, GetClusterInfoResponse>;
-    /**
-     * Get information about this node and all the shards it owns.
-     *
-     * @generated from protobuf rpc: GetNodeInfo
-     */
-    getNodeInfo(input: GetNodeInfoRequest, options?: RpcOptions): UnaryCall<GetNodeInfoRequest, GetNodeInfoResponse>;
     /**
      * Enqueue a new job for processing.
      * The job will be scheduled according to its start_at_ms and processed when limits allow.
@@ -182,77 +159,10 @@ export interface ISiloClient {
      * @generated from protobuf rpc: QueryArrow
      */
     queryArrow(input: QueryArrowRequest, options?: RpcOptions): ServerStreamingCall<QueryArrowRequest, ArrowIpcMessage>;
-    /**
-     * Capture a CPU profile from this node.
-     * Returns pprof protobuf data that can be analyzed with pprof or go tool pprof.
-     * The profile captures CPU usage for the specified duration.
-     *
-     * @generated from protobuf rpc: CpuProfile
-     */
-    cpuProfile(input: CpuProfileRequest, options?: RpcOptions): UnaryCall<CpuProfileRequest, CpuProfileResponse>;
-    /**
-     * Request a shard split operation.
-     * Initiates splitting a shard into two child shards at the specified split point.
-     * Returns FAILED_PRECONDITION if a split is already in progress.
-     * Returns NOT_FOUND if the shard doesn't exist on this node.
-     * Returns INVALID_ARGUMENT if the split point is outside the shard's range.
-     *
-     * @generated from protobuf rpc: RequestSplit
-     */
-    requestSplit(input: RequestSplitRequest, options?: RpcOptions): UnaryCall<RequestSplitRequest, RequestSplitResponse>;
-    /**
-     * Get the status of a shard split operation.
-     * Returns the current phase and child shard IDs if a split is in progress.
-     * If no split is in progress, returns with in_progress=false.
-     *
-     * @generated from protobuf rpc: GetSplitStatus
-     */
-    getSplitStatus(input: GetSplitStatusRequest, options?: RpcOptions): UnaryCall<GetSplitStatusRequest, GetSplitStatusResponse>;
-    /**
-     * Configure a shard's placement ring.
-     * Changes which placement ring the shard belongs to, affecting which nodes can own it.
-     * The shard will be handed off to a node that participates in the new ring.
-     * Returns the previous and current ring assignments.
-     *
-     * @generated from protobuf rpc: ConfigureShard
-     */
-    configureShard(input: ConfigureShardRequest, options?: RpcOptions): UnaryCall<ConfigureShardRequest, ConfigureShardResponse>;
-    /**
-     * Import jobs from another system with historical attempts.
-     * Unlike Enqueue, ImportJobs accepts completed attempt records and lets Silo
-     * take ownership going forward. Used for migrating workloads from other job queues.
-     * Each job is imported independently; per-job errors are returned in the response.
-     *
-     * @generated from protobuf rpc: ImportJobs
-     */
-    importJobs(input: ImportJobsRequest, options?: RpcOptions): UnaryCall<ImportJobsRequest, ImportJobsResponse>;
-    /**
-     * Reset all shards owned by this server.
-     * WARNING: Destructive operation. Only available in dev mode.
-     * Clears all jobs, tasks, queues, and other data.
-     *
-     * @generated from protobuf rpc: ResetShards
-     */
-    resetShards(input: ResetShardsRequest, options?: RpcOptions): UnaryCall<ResetShardsRequest, ResetShardsResponse>;
-    /**
-     * Force-release a shard lease regardless of the current holder.
-     * Operator escape hatch for recovering from permanently lost nodes.
-     * After force-release, any live node that desires the shard can acquire it.
-     *
-     * @generated from protobuf rpc: ForceReleaseShard
-     */
-    forceReleaseShard(input: ForceReleaseShardRequest, options?: RpcOptions): UnaryCall<ForceReleaseShardRequest, ForceReleaseShardResponse>;
-    /**
-     * Trigger a full compaction on a shard's SlateDB instance.
-     * Merges all L0 SSTs and sorted runs into a single sorted run, removing tombstones.
-     * This is useful for reclaiming space after bulk deletes or high job throughput.
-     *
-     * @generated from protobuf rpc: CompactShard
-     */
-    compactShard(input: CompactShardRequest, options?: RpcOptions): UnaryCall<CompactShardRequest, CompactShardResponse>;
 }
 /**
- * The Silo job queue service.
+ * The core Silo job queue service.
+ * Used by workers and application clients for job management and task processing.
  *
  * @generated from protobuf service silo.v1.Silo
  */
@@ -273,22 +183,13 @@ export class SiloClient implements ISiloClient, ServiceInfo {
         return stackIntercept<GetClusterInfoRequest, GetClusterInfoResponse>("unary", this._transport, method, opt, input);
     }
     /**
-     * Get information about this node and all the shards it owns.
-     *
-     * @generated from protobuf rpc: GetNodeInfo
-     */
-    getNodeInfo(input: GetNodeInfoRequest, options?: RpcOptions): UnaryCall<GetNodeInfoRequest, GetNodeInfoResponse> {
-        const method = this.methods[1], opt = this._transport.mergeOptions(options);
-        return stackIntercept<GetNodeInfoRequest, GetNodeInfoResponse>("unary", this._transport, method, opt, input);
-    }
-    /**
      * Enqueue a new job for processing.
      * The job will be scheduled according to its start_at_ms and processed when limits allow.
      *
      * @generated from protobuf rpc: Enqueue
      */
     enqueue(input: EnqueueRequest, options?: RpcOptions): UnaryCall<EnqueueRequest, EnqueueResponse> {
-        const method = this.methods[2], opt = this._transport.mergeOptions(options);
+        const method = this.methods[1], opt = this._transport.mergeOptions(options);
         return stackIntercept<EnqueueRequest, EnqueueResponse>("unary", this._transport, method, opt, input);
     }
     /**
@@ -297,7 +198,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: GetJob
      */
     getJob(input: GetJobRequest, options?: RpcOptions): UnaryCall<GetJobRequest, GetJobResponse> {
-        const method = this.methods[3], opt = this._transport.mergeOptions(options);
+        const method = this.methods[2], opt = this._transport.mergeOptions(options);
         return stackIntercept<GetJobRequest, GetJobResponse>("unary", this._transport, method, opt, input);
     }
     /**
@@ -308,7 +209,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: GetJobResult
      */
     getJobResult(input: GetJobResultRequest, options?: RpcOptions): UnaryCall<GetJobResultRequest, GetJobResultResponse> {
-        const method = this.methods[4], opt = this._transport.mergeOptions(options);
+        const method = this.methods[3], opt = this._transport.mergeOptions(options);
         return stackIntercept<GetJobResultRequest, GetJobResultResponse>("unary", this._transport, method, opt, input);
     }
     /**
@@ -318,7 +219,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: DeleteJob
      */
     deleteJob(input: DeleteJobRequest, options?: RpcOptions): UnaryCall<DeleteJobRequest, DeleteJobResponse> {
-        const method = this.methods[5], opt = this._transport.mergeOptions(options);
+        const method = this.methods[4], opt = this._transport.mergeOptions(options);
         return stackIntercept<DeleteJobRequest, DeleteJobResponse>("unary", this._transport, method, opt, input);
     }
     /**
@@ -328,7 +229,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: CancelJob
      */
     cancelJob(input: CancelJobRequest, options?: RpcOptions): UnaryCall<CancelJobRequest, CancelJobResponse> {
-        const method = this.methods[6], opt = this._transport.mergeOptions(options);
+        const method = this.methods[5], opt = this._transport.mergeOptions(options);
         return stackIntercept<CancelJobRequest, CancelJobResponse>("unary", this._transport, method, opt, input);
     }
     /**
@@ -339,7 +240,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: RestartJob
      */
     restartJob(input: RestartJobRequest, options?: RpcOptions): UnaryCall<RestartJobRequest, RestartJobResponse> {
-        const method = this.methods[7], opt = this._transport.mergeOptions(options);
+        const method = this.methods[6], opt = this._transport.mergeOptions(options);
         return stackIntercept<RestartJobRequest, RestartJobResponse>("unary", this._transport, method, opt, input);
     }
     /**
@@ -352,7 +253,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: ExpediteJob
      */
     expediteJob(input: ExpediteJobRequest, options?: RpcOptions): UnaryCall<ExpediteJobRequest, ExpediteJobResponse> {
-        const method = this.methods[8], opt = this._transport.mergeOptions(options);
+        const method = this.methods[7], opt = this._transport.mergeOptions(options);
         return stackIntercept<ExpediteJobRequest, ExpediteJobResponse>("unary", this._transport, method, opt, input);
     }
     /**
@@ -364,7 +265,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: LeaseTask
      */
     leaseTask(input: LeaseTaskRequest, options?: RpcOptions): UnaryCall<LeaseTaskRequest, LeaseTaskResponse> {
-        const method = this.methods[9], opt = this._transport.mergeOptions(options);
+        const method = this.methods[8], opt = this._transport.mergeOptions(options);
         return stackIntercept<LeaseTaskRequest, LeaseTaskResponse>("unary", this._transport, method, opt, input);
     }
     /**
@@ -375,7 +276,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: LeaseTasks
      */
     leaseTasks(input: LeaseTasksRequest, options?: RpcOptions): UnaryCall<LeaseTasksRequest, LeaseTasksResponse> {
-        const method = this.methods[10], opt = this._transport.mergeOptions(options);
+        const method = this.methods[9], opt = this._transport.mergeOptions(options);
         return stackIntercept<LeaseTasksRequest, LeaseTasksResponse>("unary", this._transport, method, opt, input);
     }
     /**
@@ -385,7 +286,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: ReportOutcome
      */
     reportOutcome(input: ReportOutcomeRequest, options?: RpcOptions): UnaryCall<ReportOutcomeRequest, ReportOutcomeResponse> {
-        const method = this.methods[11], opt = this._transport.mergeOptions(options);
+        const method = this.methods[10], opt = this._transport.mergeOptions(options);
         return stackIntercept<ReportOutcomeRequest, ReportOutcomeResponse>("unary", this._transport, method, opt, input);
     }
     /**
@@ -395,7 +296,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: ReportRefreshOutcome
      */
     reportRefreshOutcome(input: ReportRefreshOutcomeRequest, options?: RpcOptions): UnaryCall<ReportRefreshOutcomeRequest, ReportRefreshOutcomeResponse> {
-        const method = this.methods[12], opt = this._transport.mergeOptions(options);
+        const method = this.methods[11], opt = this._transport.mergeOptions(options);
         return stackIntercept<ReportRefreshOutcomeRequest, ReportRefreshOutcomeResponse>("unary", this._transport, method, opt, input);
     }
     /**
@@ -406,7 +307,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: Heartbeat
      */
     heartbeat(input: HeartbeatRequest, options?: RpcOptions): UnaryCall<HeartbeatRequest, HeartbeatResponse> {
-        const method = this.methods[13], opt = this._transport.mergeOptions(options);
+        const method = this.methods[12], opt = this._transport.mergeOptions(options);
         return stackIntercept<HeartbeatRequest, HeartbeatResponse>("unary", this._transport, method, opt, input);
     }
     /**
@@ -416,7 +317,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: Query
      */
     query(input: QueryRequest, options?: RpcOptions): UnaryCall<QueryRequest, QueryResponse> {
-        const method = this.methods[14], opt = this._transport.mergeOptions(options);
+        const method = this.methods[13], opt = this._transport.mergeOptions(options);
         return stackIntercept<QueryRequest, QueryResponse>("unary", this._transport, method, opt, input);
     }
     /**
@@ -427,99 +328,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: QueryArrow
      */
     queryArrow(input: QueryArrowRequest, options?: RpcOptions): ServerStreamingCall<QueryArrowRequest, ArrowIpcMessage> {
-        const method = this.methods[15], opt = this._transport.mergeOptions(options);
+        const method = this.methods[14], opt = this._transport.mergeOptions(options);
         return stackIntercept<QueryArrowRequest, ArrowIpcMessage>("serverStreaming", this._transport, method, opt, input);
-    }
-    /**
-     * Capture a CPU profile from this node.
-     * Returns pprof protobuf data that can be analyzed with pprof or go tool pprof.
-     * The profile captures CPU usage for the specified duration.
-     *
-     * @generated from protobuf rpc: CpuProfile
-     */
-    cpuProfile(input: CpuProfileRequest, options?: RpcOptions): UnaryCall<CpuProfileRequest, CpuProfileResponse> {
-        const method = this.methods[16], opt = this._transport.mergeOptions(options);
-        return stackIntercept<CpuProfileRequest, CpuProfileResponse>("unary", this._transport, method, opt, input);
-    }
-    /**
-     * Request a shard split operation.
-     * Initiates splitting a shard into two child shards at the specified split point.
-     * Returns FAILED_PRECONDITION if a split is already in progress.
-     * Returns NOT_FOUND if the shard doesn't exist on this node.
-     * Returns INVALID_ARGUMENT if the split point is outside the shard's range.
-     *
-     * @generated from protobuf rpc: RequestSplit
-     */
-    requestSplit(input: RequestSplitRequest, options?: RpcOptions): UnaryCall<RequestSplitRequest, RequestSplitResponse> {
-        const method = this.methods[17], opt = this._transport.mergeOptions(options);
-        return stackIntercept<RequestSplitRequest, RequestSplitResponse>("unary", this._transport, method, opt, input);
-    }
-    /**
-     * Get the status of a shard split operation.
-     * Returns the current phase and child shard IDs if a split is in progress.
-     * If no split is in progress, returns with in_progress=false.
-     *
-     * @generated from protobuf rpc: GetSplitStatus
-     */
-    getSplitStatus(input: GetSplitStatusRequest, options?: RpcOptions): UnaryCall<GetSplitStatusRequest, GetSplitStatusResponse> {
-        const method = this.methods[18], opt = this._transport.mergeOptions(options);
-        return stackIntercept<GetSplitStatusRequest, GetSplitStatusResponse>("unary", this._transport, method, opt, input);
-    }
-    /**
-     * Configure a shard's placement ring.
-     * Changes which placement ring the shard belongs to, affecting which nodes can own it.
-     * The shard will be handed off to a node that participates in the new ring.
-     * Returns the previous and current ring assignments.
-     *
-     * @generated from protobuf rpc: ConfigureShard
-     */
-    configureShard(input: ConfigureShardRequest, options?: RpcOptions): UnaryCall<ConfigureShardRequest, ConfigureShardResponse> {
-        const method = this.methods[19], opt = this._transport.mergeOptions(options);
-        return stackIntercept<ConfigureShardRequest, ConfigureShardResponse>("unary", this._transport, method, opt, input);
-    }
-    /**
-     * Import jobs from another system with historical attempts.
-     * Unlike Enqueue, ImportJobs accepts completed attempt records and lets Silo
-     * take ownership going forward. Used for migrating workloads from other job queues.
-     * Each job is imported independently; per-job errors are returned in the response.
-     *
-     * @generated from protobuf rpc: ImportJobs
-     */
-    importJobs(input: ImportJobsRequest, options?: RpcOptions): UnaryCall<ImportJobsRequest, ImportJobsResponse> {
-        const method = this.methods[20], opt = this._transport.mergeOptions(options);
-        return stackIntercept<ImportJobsRequest, ImportJobsResponse>("unary", this._transport, method, opt, input);
-    }
-    /**
-     * Reset all shards owned by this server.
-     * WARNING: Destructive operation. Only available in dev mode.
-     * Clears all jobs, tasks, queues, and other data.
-     *
-     * @generated from protobuf rpc: ResetShards
-     */
-    resetShards(input: ResetShardsRequest, options?: RpcOptions): UnaryCall<ResetShardsRequest, ResetShardsResponse> {
-        const method = this.methods[21], opt = this._transport.mergeOptions(options);
-        return stackIntercept<ResetShardsRequest, ResetShardsResponse>("unary", this._transport, method, opt, input);
-    }
-    /**
-     * Force-release a shard lease regardless of the current holder.
-     * Operator escape hatch for recovering from permanently lost nodes.
-     * After force-release, any live node that desires the shard can acquire it.
-     *
-     * @generated from protobuf rpc: ForceReleaseShard
-     */
-    forceReleaseShard(input: ForceReleaseShardRequest, options?: RpcOptions): UnaryCall<ForceReleaseShardRequest, ForceReleaseShardResponse> {
-        const method = this.methods[22], opt = this._transport.mergeOptions(options);
-        return stackIntercept<ForceReleaseShardRequest, ForceReleaseShardResponse>("unary", this._transport, method, opt, input);
-    }
-    /**
-     * Trigger a full compaction on a shard's SlateDB instance.
-     * Merges all L0 SSTs and sorted runs into a single sorted run, removing tombstones.
-     * This is useful for reclaiming space after bulk deletes or high job throughput.
-     *
-     * @generated from protobuf rpc: CompactShard
-     */
-    compactShard(input: CompactShardRequest, options?: RpcOptions): UnaryCall<CompactShardRequest, CompactShardResponse> {
-        const method = this.methods[23], opt = this._transport.mergeOptions(options);
-        return stackIntercept<CompactShardRequest, CompactShardResponse>("unary", this._transport, method, opt, input);
     }
 }

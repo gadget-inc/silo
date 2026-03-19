@@ -1931,32 +1931,28 @@ async fn shard_handler(
         }
     });
 
-    // Read LSM tree state for locally-owned shards
-    let lsm_state = if let Some(shard) = state.factory.get(&shard_id) {
-        match shard.read_lsm_state().await {
-            Ok(lsm) => Some(LsmStateView {
-                l0_sst_count: lsm.l0_ssts.len(),
-                total_l0_size: format_byte_size(lsm.total_l0_size),
-                sorted_run_count: lsm.sorted_runs.len(),
-                total_sorted_run_size: format_byte_size(lsm.total_sorted_run_size),
-                total_size: format_byte_size(lsm.total_l0_size + lsm.total_sorted_run_size),
-                sorted_runs: lsm
-                    .sorted_runs
-                    .iter()
-                    .map(|sr| SortedRunView {
-                        id: sr.id,
-                        sst_count: sr.sst_count,
-                        estimated_size: format_byte_size(sr.estimated_size),
-                    })
-                    .collect(),
-            }),
-            Err(e) => {
-                warn!(shard_id = %params.id, error = %e, "failed to read LSM state");
-                None
-            }
+    // Read LSM tree state from the owning node (local or remote)
+    let lsm_state = match state.cluster_client.read_lsm_state(&shard_id).await {
+        Ok(lsm) => Some(LsmStateView {
+            l0_sst_count: lsm.l0_ssts.len(),
+            total_l0_size: format_byte_size(lsm.total_l0_size),
+            sorted_run_count: lsm.sorted_runs.len(),
+            total_sorted_run_size: format_byte_size(lsm.total_sorted_run_size),
+            total_size: format_byte_size(lsm.total_l0_size + lsm.total_sorted_run_size),
+            sorted_runs: lsm
+                .sorted_runs
+                .iter()
+                .map(|sr| SortedRunView {
+                    id: sr.id,
+                    sst_count: sr.sst_count,
+                    estimated_size: format_byte_size(sr.estimated_size),
+                })
+                .collect(),
+        }),
+        Err(e) => {
+            warn!(shard_id = %params.id, error = %e, "failed to read LSM state");
+            None
         }
-    } else {
-        None
     };
 
     let template = ShardTemplate {
@@ -2072,16 +2068,8 @@ async fn shard_compact_handler(
         }
     };
 
-    let Some(shard) = state.factory.get(&parsed_shard_id) else {
-        return Redirect::to(&format!(
-            "/shard?id={}&compact_error={}",
-            shard_id,
-            urlencoding::encode("Shard not found on this node")
-        ));
-    };
-
-    match shard.submit_full_compaction().await {
-        Ok(()) => Redirect::to(&format!(
+    match state.cluster_client.compact_shard(&parsed_shard_id).await {
+        Ok(_) => Redirect::to(&format!(
             "/shard?id={}&compact_message={}",
             shard_id,
             urlencoding::encode(

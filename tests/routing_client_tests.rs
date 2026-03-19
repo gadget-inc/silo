@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use futures::future::join_all;
 use grpc_integration_helpers::{setup_multi_shard_server, shutdown_server};
+use silo::pb::silo_admin_server::{SiloAdmin, SiloAdminServer};
 use silo::pb::silo_server::{Silo, SiloServer};
 use silo::pb::*;
 use silo::routing_client::{ErrorAction, RoutingClient};
@@ -53,13 +54,6 @@ impl Silo for CountingClusterInfoService {
             this_grpc_addr: self.grpc_addr.clone(),
             members: vec![],
         }))
-    }
-
-    async fn get_node_info(
-        &self,
-        _request: Request<GetNodeInfoRequest>,
-    ) -> Result<Response<GetNodeInfoResponse>, Status> {
-        Self::unimplemented("get_node_info")
     }
 
     async fn enqueue(
@@ -159,6 +153,16 @@ impl Silo for CountingClusterInfoService {
     ) -> Result<Response<Self::QueryArrowStream>, Status> {
         Err(Status::unimplemented("query_arrow"))
     }
+}
+
+#[tonic::async_trait]
+impl SiloAdmin for CountingClusterInfoService {
+    async fn get_node_info(
+        &self,
+        _request: Request<GetNodeInfoRequest>,
+    ) -> Result<Response<GetNodeInfoResponse>, Status> {
+        Self::unimplemented("get_node_info")
+    }
 
     async fn cpu_profile(
         &self,
@@ -215,6 +219,13 @@ impl Silo for CountingClusterInfoService {
     ) -> Result<Response<CompactShardResponse>, Status> {
         Self::unimplemented("compact_shard")
     }
+
+    async fn read_lsm_state(
+        &self,
+        _request: Request<ReadLsmStateRequest>,
+    ) -> Result<Response<ReadLsmStateResponse>, Status> {
+        Self::unimplemented("read_lsm_state")
+    }
 }
 
 async fn setup_counting_cluster_info_server(
@@ -249,7 +260,8 @@ async fn setup_counting_cluster_info_server(
         };
 
         Server::builder()
-            .add_service(SiloServer::new(service))
+            .add_service(SiloServer::new(service.clone()))
+            .add_service(SiloAdminServer::new(service))
             .serve_with_incoming_shutdown(incoming, async move {
                 let _ = shutdown_rx.recv().await;
             })

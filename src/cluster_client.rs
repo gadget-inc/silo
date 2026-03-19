@@ -36,10 +36,13 @@ use tracing::{debug, trace, warn};
 
 use crate::coordination::{Coordinator, ShardOwnerMap, SplitCleanupStatus};
 use crate::factory::ShardFactory;
+use crate::job_store_shard::{LsmSortedRunInfo, LsmSstInfo, LsmState};
+use crate::pb::silo_admin_client::SiloAdminClient;
 use crate::pb::silo_client::SiloClient;
 use crate::pb::{
-    CancelJobRequest, ColumnInfo, GetJobRequest, GetJobResponse, GetNodeInfoRequest, JobStatus,
-    QueryRequest, RequestSplitRequest, RequestSplitResponse, SerializedBytes, serialized_bytes,
+    CancelJobRequest, ColumnInfo, CompactShardRequest, GetJobRequest, GetJobResponse,
+    GetNodeInfoRequest, JobStatus, QueryRequest, ReadLsmStateRequest, RequestSplitRequest,
+    RequestSplitResponse, SerializedBytes, serialized_bytes,
 };
 use crate::shard_range::ShardId;
 
@@ -172,6 +175,9 @@ impl tonic::service::Interceptor for AuthInterceptor {
 /// Type alias for a SiloClient with auth interceptor applied.
 pub type InterceptedSiloClient = SiloClient<InterceptedService<Channel, AuthInterceptor>>;
 
+/// Type alias for a SiloAdminClient with auth interceptor applied.
+pub type InterceptedSiloAdminClient = SiloAdminClient<InterceptedService<Channel, AuthInterceptor>>;
+
 /// Create a SiloClient with a lazy (non-blocking) connection.
 ///
 /// Returns a client immediately without establishing a TCP connection. The actual
@@ -258,6 +264,65 @@ pub async fn create_silo_client(
                     uri = %full_uri,
                     timeout_secs = ?attempt_timeout,
                     "connection attempt timed out, retrying"
+                );
+                last_error = Some(format!("connection timed out after {:?}", attempt_timeout));
+            }
+        }
+
+        if attempt + 1 < config.max_retries {
+            tokio::time::sleep(config.backoff_for_attempt(attempt)).await;
+        }
+    }
+
+    Err(ClusterClientError::ConnectionFailed(
+        full_uri,
+        last_error.unwrap_or_else(|| "no connection attempts made".into()),
+    ))
+}
+
+/// Helper to create a SiloAdminClient with an eager connection and retry logic.
+///
+/// Mirrors [`create_silo_client`] but returns an admin service client.
+pub async fn create_silo_admin_client(
+    uri: &str,
+    config: &ClientConfig,
+) -> Result<InterceptedSiloAdminClient, ClusterClientError> {
+    let full_uri = ensure_http_scheme(uri);
+
+    let endpoint = config
+        .configure_endpoint(&full_uri)
+        .map_err(|e| ClusterClientError::ConnectionFailed(full_uri.clone(), e.to_string()))?;
+
+    let attempt_timeout = config.connect_timeout + Duration::from_secs(1);
+
+    let mut last_error = None;
+    for attempt in 0..config.max_retries {
+        let connect_result = tokio::time::timeout(attempt_timeout, endpoint.connect()).await;
+
+        match connect_result {
+            Ok(Ok(channel)) => {
+                let interceptor = AuthInterceptor::new(config.auth_token.clone());
+                return Ok(SiloAdminClient::with_interceptor(channel, interceptor)
+                    .max_decoding_message_size(128 * 1024 * 1024)
+                    .max_encoding_message_size(128 * 1024 * 1024));
+            }
+            Ok(Err(e)) => {
+                trace!(
+                    attempt = attempt,
+                    max_retries = config.max_retries,
+                    error = %e,
+                    uri = %full_uri,
+                    "admin connection attempt failed, retrying"
+                );
+                last_error = Some(e.to_string());
+            }
+            Err(_elapsed) => {
+                trace!(
+                    attempt = attempt,
+                    max_retries = config.max_retries,
+                    uri = %full_uri,
+                    timeout_secs = ?attempt_timeout,
+                    "admin connection attempt timed out, retrying"
                 );
                 last_error = Some(format!("connection timed out after {:?}", attempt_timeout));
             }
@@ -382,8 +447,10 @@ pub struct ClusterClient {
     factory: Arc<ShardFactory>,
     /// Coordinator for getting shard ownership information
     coordinator: Option<Arc<dyn Coordinator>>,
-    /// Cache of gRPC client connections to peer nodes
+    /// Cache of gRPC client connections to peer nodes (core Silo service)
     connections: DashMap<String, InterceptedSiloClient>,
+    /// Cache of gRPC admin client connections to peer nodes (SiloAdmin service)
+    admin_connections: DashMap<String, InterceptedSiloAdminClient>,
     /// Client configuration for timeouts and connection behavior
     config: ClientConfig,
 }
@@ -404,6 +471,7 @@ impl ClusterClient {
             factory,
             coordinator,
             connections: DashMap::new(),
+            admin_connections: DashMap::new(),
             config,
         }
     }
@@ -427,12 +495,38 @@ impl ClusterClient {
         Ok(client)
     }
 
+    /// Get or create a gRPC admin client connection to a remote node
+    async fn get_admin_client(
+        &self,
+        addr: &str,
+    ) -> Result<InterceptedSiloAdminClient, ClusterClientError> {
+        let full_addr = ensure_http_scheme(addr);
+
+        // Check cache first
+        if let Some(client) = self.admin_connections.get(&full_addr) {
+            return Ok(client.clone());
+        }
+
+        // Create new connection with configured timeouts
+        debug!(addr = %full_addr, "connecting to remote node (admin)");
+        let client = create_silo_admin_client(&full_addr, &self.config).await?;
+
+        // Cache the connection - if another task raced us, use their connection
+        self.admin_connections
+            .insert(full_addr.clone(), client.clone());
+
+        Ok(client)
+    }
+
     /// Invalidate a cached connection (call after RPC failures to force reconnect)
     pub fn invalidate_connection(&self, addr: &str) {
         let full_addr = ensure_http_scheme(addr);
 
         if self.connections.remove(&full_addr).is_some() {
             debug!(addr = %full_addr, "invalidated cached connection");
+        }
+        if self.admin_connections.remove(&full_addr).is_some() {
+            debug!(addr = %full_addr, "invalidated cached admin connection");
         }
     }
 
@@ -621,6 +715,95 @@ impl ClusterClient {
             .get_addr(shard_id)
             .cloned()
             .ok_or(ClusterClientError::ShardNotFound(*shard_id))
+    }
+
+    /// Read the LSM tree state for a shard (local or remote).
+    pub async fn read_lsm_state(&self, shard_id: &ShardId) -> Result<LsmState, ClusterClientError> {
+        // Check if shard is local first
+        if let Some(shard) = self.factory.get(shard_id) {
+            return shard
+                .read_lsm_state()
+                .await
+                .map_err(|e| ClusterClientError::QueryFailed(e.to_string()));
+        }
+
+        // Route to remote node via admin service
+        let addr = self.get_shard_addr(shard_id).await?;
+        let mut client = self.get_admin_client(&addr).await?;
+
+        let response = match client
+            .read_lsm_state(ReadLsmStateRequest {
+                shard: shard_id.to_string(),
+            })
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                self.invalidate_connection(&addr);
+                return Err(ClusterClientError::RpcFailed(format!(
+                    "ReadLsmState failed: {}",
+                    e
+                )));
+            }
+        };
+
+        let resp = response.into_inner();
+
+        Ok(LsmState {
+            l0_ssts: resp
+                .l0_ssts
+                .into_iter()
+                .map(|s| LsmSstInfo {
+                    id: s.id,
+                    estimated_size: s.estimated_size,
+                })
+                .collect(),
+            sorted_runs: resp
+                .sorted_runs
+                .into_iter()
+                .map(|sr| LsmSortedRunInfo {
+                    id: sr.id,
+                    sst_count: sr.sst_count as usize,
+                    estimated_size: sr.estimated_size,
+                })
+                .collect(),
+            total_l0_size: resp.total_l0_size,
+            total_sorted_run_size: resp.total_sorted_run_size,
+        })
+    }
+
+    /// Trigger a full compaction on a shard (local or remote).
+    pub async fn compact_shard(&self, shard_id: &ShardId) -> Result<String, ClusterClientError> {
+        // Check if shard is local first
+        if let Some(shard) = self.factory.get(shard_id) {
+            shard
+                .submit_full_compaction()
+                .await
+                .map_err(|e| ClusterClientError::QueryFailed(e.to_string()))?;
+            return Ok(format!("full compaction submitted for shard {}", shard_id));
+        }
+
+        // Route to remote node via admin service
+        let addr = self.get_shard_addr(shard_id).await?;
+        let mut client = self.get_admin_client(&addr).await?;
+
+        let response = match client
+            .compact_shard(CompactShardRequest {
+                shard: shard_id.to_string(),
+            })
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                self.invalidate_connection(&addr);
+                return Err(ClusterClientError::RpcFailed(format!(
+                    "CompactShard failed: {}",
+                    e
+                )));
+            }
+        };
+
+        Ok(response.into_inner().status)
     }
 
     /// Get a job from any shard (local or remote)
@@ -818,7 +1001,7 @@ impl ClusterClient {
 
         debug!(shard_id = %shard_id, addr = %addr, split_point = %split_point, "requesting shard split");
 
-        let mut client = self.get_client(&addr).await?;
+        let mut client = self.get_admin_client(&addr).await?;
         let request = RequestSplitRequest {
             shard_id: shard_id.to_string(),
             split_point: split_point.to_string(),
@@ -940,9 +1123,9 @@ impl ClusterClient {
         })
     }
 
-    /// Get node information from a specific node via gRPC
+    /// Get node information from a specific node via gRPC (admin service)
     async fn get_node_info(&self, addr: &str) -> Result<NodeInfo, ClusterClientError> {
-        let mut client = self.get_client(addr).await?;
+        let mut client = self.get_admin_client(addr).await?;
 
         let request = GetNodeInfoRequest {};
         let response = match client.get_node_info(request).await {

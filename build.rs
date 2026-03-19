@@ -1,6 +1,7 @@
 fn main() {
     // Tell cargo to only rerun this build script if the proto files change
     println!("cargo:rerun-if-changed=proto/silo.proto");
+    println!("cargo:rerun-if-changed=proto/silo_admin.proto");
     println!("cargo:rerun-if-changed=proto/gubernator.proto");
 
     let protoc = protoc_bin_vendored::protoc_bin_path().expect("protoc not found");
@@ -13,7 +14,9 @@ fn main() {
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let descriptor_path = out_dir.join("silo_descriptor.bin");
 
-    // Compile silo.proto with file descriptor set for reflection
+    // Compile both silo.proto and silo_admin.proto together so they share the
+    // same package namespace and the admin proto can reference core types.
+    // A single tonic_build invocation produces one file descriptor set covering both.
     tonic_build::configure()
         .build_client(true)
         .build_server(true)
@@ -26,8 +29,8 @@ fn main() {
             ".silo.v1.RateLimitRetryPolicy",
             "#[derive(serde::Serialize, serde::Deserialize)]",
         )
-        .compile_protos(&["proto/silo.proto"], includes)
-        .expect("failed to compile silo.proto");
+        .compile_protos(&["proto/silo.proto", "proto/silo_admin.proto"], includes)
+        .expect("failed to compile silo protos");
 
     // Compile gubernator.proto for the rate limit client
     tonic_build::configure()

@@ -7,6 +7,7 @@ import type { RpcInterceptor, RpcOptions } from "@protobuf-ts/runtime-rpc";
 import { RpcError } from "@protobuf-ts/runtime-rpc";
 import { pack, unpack } from "msgpackr";
 import { SiloClient } from "./pb/silo.client";
+import { SiloAdminClient } from "./pb/silo_admin.client";
 import type {
   Limit,
   QueryParameter,
@@ -1114,6 +1115,7 @@ interface ServerConnection {
   address: string;
   transport: GrpcTransport;
   client: SiloClient;
+  adminClient: SiloAdminClient;
 }
 
 /**
@@ -1374,7 +1376,8 @@ export class SiloGRPCClient {
         ...(this._authInterceptor ? { interceptors: [this._authInterceptor] } : {}),
       });
       const client = new SiloClient(transport);
-      conn = { address, transport, client };
+      const adminClient = new SiloAdminClient(transport);
+      conn = { address, transport, client, adminClient };
       this._connections.set(address, conn);
     }
     return conn;
@@ -2329,7 +2332,7 @@ export class SiloGRPCClient {
       // If no shards known, try all configured servers
       if (servers.size === 0) {
         for (const conn of this._connections.values()) {
-          const call = conn.client.resetShards({}, this._rpcOptions());
+          const call = conn.adminClient.resetShards({}, this._rpcOptions());
           await call.response;
         }
         return;
@@ -2339,7 +2342,7 @@ export class SiloGRPCClient {
       // when nodes share the same underlying object storage
       for (const addr of servers) {
         const conn = this._getOrCreateConnection(addr);
-        const call = conn.client.resetShards({}, this._rpcOptions());
+        const call = conn.adminClient.resetShards({}, this._rpcOptions());
         await call.response;
       }
 

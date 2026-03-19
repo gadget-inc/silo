@@ -25,6 +25,7 @@ use crate::job::{GubernatorAlgorithm, GubernatorRateLimit, JobStatusKind, RateLi
 use crate::job_attempt::{AttemptOutcome, AttemptStatus as JobAttemptStatus};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::metrics::Metrics;
+use crate::pb::silo_admin_server::{SiloAdmin, SiloAdminServer};
 use crate::pb::silo_server::{Silo, SiloServer};
 use crate::pb::*;
 use crate::settings::AppConfig;
@@ -1421,7 +1422,10 @@ impl Silo for SiloService {
         let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         Ok(Response::new(Box::pin(stream)))
     }
+}
 
+#[tonic::async_trait]
+impl SiloAdmin for SiloService {
     async fn import_jobs(
         &self,
         req: Request<ImportJobsRequest>,
@@ -1889,6 +1893,45 @@ impl Silo for SiloService {
             status: format!("full compaction submitted for shard {}", r.shard),
         }))
     }
+
+    async fn read_lsm_state(
+        &self,
+        req: Request<ReadLsmStateRequest>,
+    ) -> Result<Response<ReadLsmStateResponse>, Status> {
+        let r = req.into_inner();
+        let shard_id = Self::parse_shard_id(&r.shard)?;
+
+        let shard = self.factory.get(&shard_id).ok_or_else(|| {
+            Status::not_found(format!("shard {} not found on this node", r.shard))
+        })?;
+
+        let lsm = shard
+            .read_lsm_state()
+            .await
+            .map_err(|e| Status::internal(format!("failed to read LSM state: {}", e)))?;
+
+        Ok(Response::new(ReadLsmStateResponse {
+            l0_ssts: lsm
+                .l0_ssts
+                .into_iter()
+                .map(|s| crate::pb::LsmSstInfo {
+                    id: s.id,
+                    estimated_size: s.estimated_size,
+                })
+                .collect(),
+            sorted_runs: lsm
+                .sorted_runs
+                .into_iter()
+                .map(|sr| crate::pb::LsmSortedRunInfo {
+                    id: sr.id,
+                    sst_count: sr.sst_count as u32,
+                    estimated_size: sr.estimated_size,
+                })
+                .collect(),
+            total_l0_size: lsm.total_l0_size,
+            total_sorted_run_size: lsm.total_sorted_run_size,
+        }))
+    }
 }
 
 /// Create an auth interceptor that validates Bearer tokens on incoming gRPC requests.
@@ -1951,10 +1994,16 @@ where
 {
     let svc = SiloService::new(factory.clone(), coordinator, cfg.clone(), metrics.clone());
     let interceptor = make_auth_interceptor(cfg.server.auth_token.clone());
-    let silo_server = SiloServer::new(svc)
+    let silo_server = SiloServer::new(svc.clone())
         .max_decoding_message_size(128 * 1024 * 1024)
         .max_encoding_message_size(128 * 1024 * 1024);
-    let server = tonic::service::interceptor::InterceptedService::new(silo_server, interceptor);
+    let silo_admin_server = SiloAdminServer::new(svc)
+        .max_decoding_message_size(128 * 1024 * 1024)
+        .max_encoding_message_size(128 * 1024 * 1024);
+    let server =
+        tonic::service::interceptor::InterceptedService::new(silo_server, interceptor.clone());
+    let admin_server =
+        tonic::service::interceptor::InterceptedService::new(silo_admin_server, interceptor);
 
     // Create health service for gRPC health probes
     let (mut health_reporter, health_service) = health_reporter();
@@ -2018,6 +2067,7 @@ where
         .add_service(health_service)
         .add_service(reflection_service)
         .add_service(server)
+        .add_service(admin_server)
         .serve_with_incoming_shutdown(incoming, async move {
             let _ = shutdown.recv().await;
             info!("graceful shutdown signal received");

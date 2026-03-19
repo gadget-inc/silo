@@ -8,6 +8,7 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::cluster_client::AuthInterceptor;
+use crate::pb::silo_admin_client::SiloAdminClient;
 use crate::pb::silo_client::SiloClient;
 use crate::pb::{
     CancelJobRequest, CompactShardRequest, ConfigureShardRequest, CpuProfileRequest,
@@ -54,12 +55,23 @@ fn ensure_http_scheme(addr: &str) -> String {
 }
 
 type AuthSiloClient = SiloClient<InterceptedService<Channel, AuthInterceptor>>;
+type AuthSiloAdminClient = SiloAdminClient<InterceptedService<Channel, AuthInterceptor>>;
 
 async fn connect(address: &str, auth_token: Option<&str>) -> anyhow::Result<AuthSiloClient> {
     let url = ensure_http_scheme(address);
     let channel = Channel::from_shared(url)?.connect().await?;
     let interceptor = AuthInterceptor::new(auth_token.map(|s| s.to_string()));
     Ok(SiloClient::with_interceptor(channel, interceptor))
+}
+
+async fn connect_admin(
+    address: &str,
+    auth_token: Option<&str>,
+) -> anyhow::Result<AuthSiloAdminClient> {
+    let url = ensure_http_scheme(address);
+    let channel = Channel::from_shared(url)?.connect().await?;
+    let interceptor = AuthInterceptor::new(auth_token.map(|s| s.to_string()));
+    Ok(SiloAdminClient::with_interceptor(channel, interceptor))
 }
 
 /// Connect to the node that owns a specific shard.
@@ -91,6 +103,34 @@ async fn connect_to_shard_owner(
 
     // Connect to the shard's owner
     connect(&owner.grpc_addr, auth_token).await
+}
+
+/// Connect to the admin service on the node that owns a specific shard.
+async fn connect_admin_to_shard_owner(
+    address: &str,
+    shard_id: &str,
+    auth_token: Option<&str>,
+) -> anyhow::Result<AuthSiloAdminClient> {
+    let mut client = connect(address, auth_token).await?;
+    let response = client
+        .get_cluster_info(GetClusterInfoRequest {})
+        .await?
+        .into_inner();
+
+    let owner = response
+        .shard_owners
+        .iter()
+        .find(|s| s.shard_id == shard_id)
+        .ok_or_else(|| anyhow::anyhow!("shard '{}' not found in cluster", shard_id))?;
+
+    // Connect to the shard's owner (or this node if local)
+    let target_addr = if owner.grpc_addr == response.this_grpc_addr {
+        address
+    } else {
+        &owner.grpc_addr
+    };
+
+    connect_admin(target_addr, auth_token).await
 }
 
 /// Convert job status enum to string
@@ -650,7 +690,7 @@ pub async fn profile<W: Write>(
     frequency: u32,
     output_path: Option<String>,
 ) -> anyhow::Result<()> {
-    let mut client = connect(&opts.address, opts.auth_token.as_deref()).await?;
+    let mut client = connect_admin(&opts.address, opts.auth_token.as_deref()).await?;
 
     if !opts.json {
         writeln!(
@@ -737,7 +777,7 @@ pub async fn shard_split<W: Write>(
     auto: bool,
     wait: bool,
 ) -> anyhow::Result<()> {
-    // Discover topology and connect to the shard's owner
+    // Discover topology via core service, then connect admin to the shard's owner
     let mut discovery_client = connect(&opts.address, opts.auth_token.as_deref()).await?;
     let cluster_info = discovery_client
         .get_cluster_info(GetClusterInfoRequest {})
@@ -750,12 +790,13 @@ pub async fn shard_split<W: Write>(
         .find(|s| s.shard_id == shard)
         .ok_or_else(|| anyhow::anyhow!("shard '{}' not found in cluster", shard))?;
 
-    // Connect to the shard's owner (reuse connection if same node)
-    let mut client = if shard_owner.grpc_addr == cluster_info.this_grpc_addr {
-        discovery_client
+    // Connect admin client to the shard's owner
+    let target_addr = if shard_owner.grpc_addr == cluster_info.this_grpc_addr {
+        opts.address.as_str()
     } else {
-        connect(&shard_owner.grpc_addr, opts.auth_token.as_deref()).await?
+        &shard_owner.grpc_addr
     };
+    let mut client = connect_admin(target_addr, opts.auth_token.as_deref()).await?;
 
     // Determine the split point
     let split_point = if let Some(point) = split_point {
@@ -857,7 +898,7 @@ pub async fn shard_split_status<W: Write>(
     shard: &str,
 ) -> anyhow::Result<()> {
     let mut client =
-        connect_to_shard_owner(&opts.address, shard, opts.auth_token.as_deref()).await?;
+        connect_admin_to_shard_owner(&opts.address, shard, opts.auth_token.as_deref()).await?;
 
     let response = client
         .get_split_status(GetSplitStatusRequest {
@@ -911,7 +952,7 @@ pub async fn shard_configure<W: Write>(
     ring: Option<String>,
 ) -> anyhow::Result<()> {
     let mut client =
-        connect_to_shard_owner(&opts.address, shard, opts.auth_token.as_deref()).await?;
+        connect_admin_to_shard_owner(&opts.address, shard, opts.auth_token.as_deref()).await?;
 
     let response = client
         .configure_shard(ConfigureShardRequest {
@@ -959,7 +1000,7 @@ pub async fn shard_force_release<W: Write>(
     shard: &str,
 ) -> anyhow::Result<()> {
     let mut client =
-        connect_to_shard_owner(&opts.address, shard, opts.auth_token.as_deref()).await?;
+        connect_admin_to_shard_owner(&opts.address, shard, opts.auth_token.as_deref()).await?;
 
     let response = client
         .force_release_shard(ForceReleaseShardRequest {
@@ -991,7 +1032,7 @@ pub async fn shard_compact<W: Write>(
     shard: &str,
 ) -> anyhow::Result<()> {
     let mut client =
-        connect_to_shard_owner(&opts.address, shard, opts.auth_token.as_deref()).await?;
+        connect_admin_to_shard_owner(&opts.address, shard, opts.auth_token.as_deref()).await?;
 
     if !opts.json {
         writeln!(out, "Submitting full compaction for shard {}...", shard)?;

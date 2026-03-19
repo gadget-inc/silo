@@ -1,0 +1,243 @@
+syntax = "proto3";
+
+package silo.v1;
+
+import "silo.proto";
+
+// Request to reset all shards owned by this server.
+// WARNING: Destructive operation. Only available in dev mode.
+message ResetShardsRequest {}
+
+// Response confirming shards were reset.
+message ResetShardsResponse {
+  uint32 shards_reset = 1; // Number of shards that were cleared.
+}
+
+// Request to capture a CPU profile from this node.
+// Used for production debugging and performance analysis.
+message CpuProfileRequest {
+  uint32 duration_seconds = 1;  // How long to profile (1-300 seconds). Default 30.
+  uint32 frequency = 2;         // Sampling frequency in Hz (1-1000). Default 100.
+}
+
+// CPU profile data in pprof protobuf format.
+// Can be analyzed with `pprof` or `go tool pprof`.
+message CpuProfileResponse {
+  bytes profile_data = 1;       // pprof protobuf bytes (not gzip compressed).
+  uint32 duration_seconds = 2;  // Actual duration profiled.
+  uint64 samples = 3;           // Number of samples collected.
+}
+
+// Request to initiate a shard split operation.
+message RequestSplitRequest {
+  string shard_id = 1;     // Shard ID (UUID) of the shard to split.
+  string split_point = 2;  // Tenant ID where to split the keyspace.
+}
+
+// Response after initiating a shard split.
+message RequestSplitResponse {
+  string left_child_id = 1;   // UUID of the left child shard [parent_start, split_point).
+  string right_child_id = 2;  // UUID of the right child shard [split_point, parent_end).
+  string phase = 3;           // Current split phase (e.g., "SplitRequested").
+}
+
+// Request to get the status of a shard split operation.
+message GetSplitStatusRequest {
+  string shard_id = 1;  // Parent shard ID (UUID) of the split operation.
+}
+
+// Response with the current split status.
+// Returns empty if no split is in progress for the shard.
+message GetSplitStatusResponse {
+  bool in_progress = 1;        // True if a split is in progress for this shard.
+  string phase = 2;            // Current split phase (empty if not in progress).
+  string left_child_id = 3;    // UUID of the left child shard (empty if not in progress).
+  string right_child_id = 4;   // UUID of the right child shard (empty if not in progress).
+  string split_point = 5;      // Tenant ID at which the split occurs (empty if not in progress).
+  string initiator_node_id = 6; // Node ID that initiated the split.
+  int64 requested_at_ms = 7;   // Unix timestamp (ms) when split was requested.
+}
+
+// Information about a shard owned by a node, including counters and cleanup status.
+message OwnedShardInfo {
+  string shard_id = 1;        // The shard ID (UUID).
+  int64 total_jobs = 2;       // Total number of jobs in the shard (not deleted).
+  int64 completed_jobs = 3;   // Number of jobs in terminal states (Succeeded, Failed, Cancelled).
+  string cleanup_status = 4;  // Cleanup status: "CompactionDone", "CleanupPending", "CleanupRunning", "CleanupDone".
+  int64 created_at_ms = 5;    // Unix timestamp (ms) when this shard was first created/initialized.
+  int64 cleanup_completed_at_ms = 6; // Unix timestamp (ms) when cleanup completed (0 if not applicable or not completed).
+}
+
+// Request to get node information including owned shards with their counters and cleanup status.
+message GetNodeInfoRequest {}
+
+// Response with node information and details for all shards owned by this node.
+message GetNodeInfoResponse {
+  string node_id = 1;                       // Unique identifier of this node.
+  repeated OwnedShardInfo owned_shards = 2; // Information for each shard owned by this node.
+  repeated string placement_rings = 3;      // Placement rings this node participates in.
+}
+
+// Request to configure a shard's placement ring.
+message ConfigureShardRequest {
+  string shard = 1;                   // The shard ID (UUID) to configure.
+  optional string placement_ring = 2; // The placement ring to assign (empty/null = default ring).
+  optional string tenant = 100;       // Optional tenant ID (for multi-tenant mode).
+}
+
+// Response after configuring a shard's placement ring.
+message ConfigureShardResponse {
+  string previous_ring = 1; // The placement ring before the change (empty = default ring).
+  string current_ring = 2;  // The placement ring after the change (empty = default ring).
+}
+
+// A historical attempt record for job import.
+// All attempts must be in terminal states (no Running).
+message ImportAttempt {
+  AttemptStatus status = 1;            // Must be terminal (SUCCEEDED, FAILED, or CANCELLED).
+  int64 started_at_ms = 2;            // When the attempt started (epoch ms).
+  int64 finished_at_ms = 3;           // When the attempt finished (epoch ms).
+  optional SerializedBytes result = 4; // Present if succeeded.
+  optional string error_code = 5;      // Present if failed.
+  optional SerializedBytes error_data = 6; // Present if failed.
+}
+
+// Request to import a single job from another system.
+// Unlike Enqueue, ImportJob accepts historical attempts and lets Silo take ownership going forward.
+message ImportJobRequest {
+  string shard = 1;                      // Shard ID (UUID) where the job should be stored.
+  string id = 2;                         // Required job ID (migration preserves IDs).
+  uint32 priority = 3;                   // Priority from 0-99. Lower is higher priority.
+  int64 enqueue_time_ms = 4;            // Original enqueue time from source system (0 = now).
+  int64 start_at_ms = 5;                // When the next attempt should start (0 = now, only for non-terminal).
+  optional RetryPolicy retry_policy = 6; // Retry configuration.
+  SerializedBytes payload = 7;           // Opaque serialized payload.
+  repeated Limit limits = 8;             // Ordered list of limits.
+  optional string tenant = 9;            // Tenant ID for multi-tenant deployments.
+  map<string, string> metadata = 10;     // Arbitrary key/value metadata.
+  string task_group = 11;               // Task group for organizing tasks.
+  repeated ImportAttempt attempts = 12;  // Historical attempts, all terminal.
+}
+
+// Batch request to import multiple jobs.
+message ImportJobsRequest {
+  repeated ImportJobRequest jobs = 1;
+}
+
+// Result of importing a single job.
+message ImportJobResult {
+  string id = 1;               // The job's ID.
+  bool success = 2;            // Whether the import succeeded.
+  optional string error = 3;   // Error message if import failed.
+  JobStatus status = 4;        // The determined status of the imported job.
+}
+
+// Response containing results for each imported job.
+message ImportJobsResponse {
+  repeated ImportJobResult results = 1;
+}
+
+// Request to force-release a shard's ownership lease.
+// Operator escape hatch for permanently lost nodes.
+message ForceReleaseShardRequest {
+  string shard = 1; // The shard ID (UUID) to force-release.
+}
+
+// Response after force-releasing a shard lease.
+message ForceReleaseShardResponse {
+  bool released = 1; // True if the lease was released.
+}
+
+// Request to trigger a full compaction on a shard's SlateDB instance.
+// Merges all L0 SSTs and sorted runs into a single sorted run, removing tombstones.
+message CompactShardRequest {
+  string shard = 1; // The shard ID (UUID) to compact.
+}
+
+// Response after submitting a full compaction.
+message CompactShardResponse {
+  string status = 1; // Status message describing the compaction result.
+}
+
+// Request to read the LSM tree state of a shard's SlateDB instance.
+message ReadLsmStateRequest {
+  string shard = 1; // The shard ID (UUID) to read LSM state for.
+}
+
+// Information about a single SST file in the L0 level.
+message LsmSstInfo {
+  string id = 1;             // SST identifier.
+  uint64 estimated_size = 2; // Estimated size in bytes.
+}
+
+// Information about a sorted run (compacted level).
+message LsmSortedRunInfo {
+  uint32 id = 1;             // Sorted run identifier.
+  uint32 sst_count = 2;     // Number of SSTs in this sorted run.
+  uint64 estimated_size = 3; // Estimated total size in bytes.
+}
+
+// Response with the LSM tree state of a shard.
+message ReadLsmStateResponse {
+  repeated LsmSstInfo l0_ssts = 1;          // L0 SSTs (unflushed/uncompacted).
+  repeated LsmSortedRunInfo sorted_runs = 2; // Sorted runs (compacted).
+  uint64 total_l0_size = 3;                 // Total estimated size of all L0 SSTs in bytes.
+  uint64 total_sorted_run_size = 4;         // Total estimated size of all sorted runs in bytes.
+}
+
+// Admin service for operator/management operations.
+// Used by the web UI, siloctl CLI, and monitoring tools.
+// These RPCs are not part of the worker-facing API.
+service SiloAdmin {
+  // Get information about this node and all the shards it owns.
+  rpc GetNodeInfo(GetNodeInfoRequest) returns (GetNodeInfoResponse);
+
+  // Capture a CPU profile from this node.
+  // Returns pprof protobuf data that can be analyzed with pprof or go tool pprof.
+  // The profile captures CPU usage for the specified duration.
+  rpc CpuProfile(CpuProfileRequest) returns (CpuProfileResponse);
+
+  // Request a shard split operation.
+  // Initiates splitting a shard into two child shards at the specified split point.
+  // Returns FAILED_PRECONDITION if a split is already in progress.
+  // Returns NOT_FOUND if the shard doesn't exist on this node.
+  // Returns INVALID_ARGUMENT if the split point is outside the shard's range.
+  rpc RequestSplit(RequestSplitRequest) returns (RequestSplitResponse);
+
+  // Get the status of a shard split operation.
+  // Returns the current phase and child shard IDs if a split is in progress.
+  // If no split is in progress, returns with in_progress=false.
+  rpc GetSplitStatus(GetSplitStatusRequest) returns (GetSplitStatusResponse);
+
+  // Configure a shard's placement ring.
+  // Changes which placement ring the shard belongs to, affecting which nodes can own it.
+  // The shard will be handed off to a node that participates in the new ring.
+  // Returns the previous and current ring assignments.
+  rpc ConfigureShard(ConfigureShardRequest) returns (ConfigureShardResponse);
+
+  // Import jobs from another system with historical attempts.
+  // Unlike Enqueue, ImportJobs accepts completed attempt records and lets Silo
+  // take ownership going forward. Used for migrating workloads from other job queues.
+  // Each job is imported independently; per-job errors are returned in the response.
+  rpc ImportJobs(ImportJobsRequest) returns (ImportJobsResponse);
+
+  // Reset all shards owned by this server.
+  // WARNING: Destructive operation. Only available in dev mode.
+  // Clears all jobs, tasks, queues, and other data.
+  rpc ResetShards(ResetShardsRequest) returns (ResetShardsResponse);
+
+  // Force-release a shard lease regardless of the current holder.
+  // Operator escape hatch for recovering from permanently lost nodes.
+  // After force-release, any live node that desires the shard can acquire it.
+  rpc ForceReleaseShard(ForceReleaseShardRequest) returns (ForceReleaseShardResponse);
+
+  // Trigger a full compaction on a shard's SlateDB instance.
+  // Merges all L0 SSTs and sorted runs into a single sorted run, removing tombstones.
+  // This is useful for reclaiming space after bulk deletes or high job throughput.
+  rpc CompactShard(CompactShardRequest) returns (CompactShardResponse);
+
+  // Read the LSM tree state of a shard's SlateDB instance.
+  // Returns information about L0 SSTs and sorted runs to help operators
+  // understand storage health and whether compaction is needed.
+  rpc ReadLsmState(ReadLsmStateRequest) returns (ReadLsmStateResponse);
+}

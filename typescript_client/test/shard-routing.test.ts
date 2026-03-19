@@ -1846,7 +1846,7 @@ describe("Shard Routing", () => {
       const connections = (client as any)._connections as Map<string, any>;
       const conn = connections.values().next().value;
       conn.client.enqueue = mockEnqueue;
-      conn.client.resetShards = mockResetShards;
+      conn.adminClient.resetShards = mockResetShards;
 
       // First, refresh topology and do an enqueue
       await client.refreshTopology();

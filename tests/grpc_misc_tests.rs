@@ -7,6 +7,7 @@ use grpc_integration_helpers::{create_test_factory, setup_test_server, shutdown_
 use silo::coordination::NoneCoordinator;
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
+use silo::pb::silo_admin_client::SiloAdminClient;
 use silo::pb::silo_client::SiloClient;
 use silo::pb::*;
 use silo::server::run_server;
@@ -351,11 +352,14 @@ async fn grpc_server_reset_shards_requires_dev_mode() -> anyhow::Result<()> {
         let mut cfg = AppConfig::load(None).unwrap();
         cfg.server.dev_mode = false;
 
-        let (mut client, shutdown_tx, server, _addr) =
-            setup_test_server(factory.clone(), cfg).await?;
+        let (_client, shutdown_tx, server, addr) = setup_test_server(factory.clone(), cfg).await?;
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint)?.connect().await?;
+        let mut admin_client = SiloAdminClient::new(channel);
 
         // reset_shards should fail in non-dev mode
-        let res = client.reset_shards(ResetShardsRequest {}).await;
+        let res = admin_client.reset_shards(ResetShardsRequest {}).await;
 
         match res {
             Ok(_) => panic!("expected permission denied error"),
@@ -386,8 +390,12 @@ async fn grpc_server_reset_shards_works_in_dev_mode() -> anyhow::Result<()> {
         let mut cfg = AppConfig::load(None).unwrap();
         cfg.server.dev_mode = true;
 
-        let (mut client, shutdown_tx, server, _addr) =
+        let (mut client, shutdown_tx, server, addr) =
             setup_test_server(factory.clone(), cfg).await?;
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint)?.connect().await?;
+        let mut admin_client = SiloAdminClient::new(channel);
 
         // First enqueue a job
         let _ = client
@@ -427,7 +435,7 @@ async fn grpc_server_reset_shards_works_in_dev_mode() -> anyhow::Result<()> {
         assert_eq!(count_row["count"], 1, "should have 1 job before reset");
 
         // Reset shards should succeed in dev mode
-        let res = client.reset_shards(ResetShardsRequest {}).await?;
+        let res = admin_client.reset_shards(ResetShardsRequest {}).await?;
         assert_eq!(res.into_inner().shards_reset, 1, "should reset 1 shard");
 
         // Verify job is gone after reset
@@ -534,11 +542,15 @@ async fn grpc_server_report_refresh_outcome_missing_outcome() -> anyhow::Result<
 async fn grpc_server_get_node_info_empty() -> anyhow::Result<()> {
     let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
         let (factory, _tmp) = create_test_factory().await?;
-        let (mut client, shutdown_tx, server, _addr) =
+        let (_client, shutdown_tx, server, addr) =
             setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
 
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint)?.connect().await?;
+        let mut admin_client = SiloAdminClient::new(channel);
+
         // Get node info
-        let resp = client
+        let resp = admin_client
             .get_node_info(GetNodeInfoRequest {})
             .await?
             .into_inner();
@@ -582,13 +594,17 @@ fn get_shard_counters_from_node_info(resp: &GetNodeInfoResponse, shard_id: &str)
 async fn grpc_server_get_node_info_tracks_lifecycle() -> anyhow::Result<()> {
     let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
         let (factory, _tmp) = create_test_factory().await?;
-        let (mut client, shutdown_tx, server, _addr) =
+        let (mut client, shutdown_tx, server, addr) =
             setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint)?.connect().await?;
+        let mut admin_client = SiloAdminClient::new(channel);
 
         let test_shard_id = crate::grpc_integration_helpers::TEST_SHARD_ID.to_string();
 
         // Initially empty
-        let resp = client
+        let resp = admin_client
             .get_node_info(GetNodeInfoRequest {})
             .await?
             .into_inner();
@@ -619,7 +635,7 @@ async fn grpc_server_get_node_info_tracks_lifecycle() -> anyhow::Result<()> {
         assert_eq!(enq_resp.id, "test-job-1");
 
         // Check counters after enqueue
-        let resp = client
+        let resp = admin_client
             .get_node_info(GetNodeInfoRequest {})
             .await?
             .into_inner();
@@ -651,7 +667,7 @@ async fn grpc_server_get_node_info_tracks_lifecycle() -> anyhow::Result<()> {
             .await?;
 
         // Check counters after second enqueue
-        let resp = client
+        let resp = admin_client
             .get_node_info(GetNodeInfoRequest {})
             .await?
             .into_inner();
@@ -686,7 +702,7 @@ async fn grpc_server_get_node_info_tracks_lifecycle() -> anyhow::Result<()> {
             .await?;
 
         // Check counters after completion
-        let resp = client
+        let resp = admin_client
             .get_node_info(GetNodeInfoRequest {})
             .await?
             .into_inner();
@@ -707,7 +723,7 @@ async fn grpc_server_get_node_info_tracks_lifecycle() -> anyhow::Result<()> {
             .await?;
 
         // Check counters after deletion
-        let resp = client
+        let resp = admin_client
             .get_node_info(GetNodeInfoRequest {})
             .await?
             .into_inner();
@@ -758,8 +774,12 @@ async fn grpc_server_reset_shards_clears_fs_backend_data() -> anyhow::Result<()>
         let mut cfg = AppConfig::load(None).unwrap();
         cfg.server.dev_mode = true;
 
-        let (mut client, shutdown_tx, server, _addr) =
+        let (mut client, shutdown_tx, server, addr) =
             setup_test_server(factory.clone(), cfg).await?;
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint)?.connect().await?;
+        let mut admin_client = SiloAdminClient::new(channel);
 
         // Enqueue a job
         let _ = client
@@ -867,7 +887,7 @@ async fn grpc_server_reset_shards_clears_fs_backend_data() -> anyhow::Result<()>
         assert_eq!(count_row["count"], 2, "should have 2 jobs before reset");
 
         // Reset shards
-        let res = client.reset_shards(ResetShardsRequest {}).await?;
+        let res = admin_client.reset_shards(ResetShardsRequest {}).await?;
         assert_eq!(res.into_inner().shards_reset, 1, "should reset 1 shard");
 
         // Verify jobs are gone after reset (query returns 0)
@@ -943,8 +963,12 @@ async fn grpc_server_reset_shards_with_relative_path() -> anyhow::Result<()> {
         let mut cfg = AppConfig::load(None).unwrap();
         cfg.server.dev_mode = true;
 
-        let (mut client, shutdown_tx, server, _addr) =
+        let (mut client, shutdown_tx, server, addr) =
             setup_test_server(factory.clone(), cfg).await?;
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint)?.connect().await?;
+        let mut admin_client = SiloAdminClient::new(channel);
 
         // Enqueue a job
         let _ = client
@@ -996,7 +1020,7 @@ async fn grpc_server_reset_shards_with_relative_path() -> anyhow::Result<()> {
         assert_eq!(lease_resp.tasks.len(), 1, "should have 1 task before reset");
 
         // Reset WITHOUT reporting outcome - simulates the "stale running job" scenario
-        let res = client.reset_shards(ResetShardsRequest {}).await?;
+        let res = admin_client.reset_shards(ResetShardsRequest {}).await?;
         assert_eq!(res.into_inner().shards_reset, 1, "should reset 1 shard");
 
         // Verify jobs are gone after reset
@@ -1072,8 +1096,12 @@ async fn grpc_server_reset_shards_clears_memory_backend_data() -> anyhow::Result
         let mut cfg = AppConfig::load(None).unwrap();
         cfg.server.dev_mode = true;
 
-        let (mut client, shutdown_tx, server, _addr) =
+        let (mut client, shutdown_tx, server, addr) =
             setup_test_server(factory.clone(), cfg).await?;
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint)?.connect().await?;
+        let mut admin_client = SiloAdminClient::new(channel);
 
         // Enqueue a job
         let _ = client
@@ -1113,7 +1141,7 @@ async fn grpc_server_reset_shards_clears_memory_backend_data() -> anyhow::Result
         assert_eq!(count_row["count"], 1, "should have 1 job before reset");
 
         // Reset shards
-        let res = client.reset_shards(ResetShardsRequest {}).await?;
+        let res = admin_client.reset_shards(ResetShardsRequest {}).await?;
         assert_eq!(res.into_inner().shards_reset, 1, "should reset 1 shard");
 
         // Verify jobs are gone after reset (query returns 0)
@@ -1168,6 +1196,7 @@ async fn setup_test_server_production_path(
     config: AppConfig,
 ) -> anyhow::Result<(
     SiloClient<tonic::transport::Channel>,
+    SiloAdminClient<tonic::transport::Channel>,
     tokio::sync::broadcast::Sender<()>,
     tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
     SocketAddr,
@@ -1214,10 +1243,22 @@ async fn setup_test_server_production_path(
     ));
 
     let endpoint = format!("http://{}", addr);
-    let channel = tonic::transport::Endpoint::new(endpoint)?.connect().await?;
+    let channel = tonic::transport::Endpoint::new(endpoint.clone())?
+        .connect()
+        .await?;
     let client = SiloClient::new(channel);
+    let admin_channel = tonic::transport::Endpoint::new(endpoint)?.connect().await?;
+    let admin_client = SiloAdminClient::new(admin_channel);
 
-    Ok((client, shutdown_tx, server, addr, factory, tmp))
+    Ok((
+        client,
+        admin_client,
+        shutdown_tx,
+        server,
+        addr,
+        factory,
+        tmp,
+    ))
 }
 
 /// Test that shards are immediately available after reset when using the production
@@ -1229,7 +1270,7 @@ async fn grpc_server_reset_shards_immediately_available_production_path() -> any
         let mut cfg = AppConfig::load(None).unwrap();
         cfg.server.dev_mode = true;
 
-        let (mut client, shutdown_tx, server, _addr, _factory, _tmp) =
+        let (mut client, mut admin_client, shutdown_tx, server, _addr, _factory, _tmp) =
             setup_test_server_production_path(1, cfg).await?;
 
         // Get cluster info to discover shard IDs (like a real client would)
@@ -1260,7 +1301,7 @@ async fn grpc_server_reset_shards_immediately_available_production_path() -> any
             .await?;
 
         // Reset shards
-        let res = client.reset_shards(ResetShardsRequest {}).await?;
+        let res = admin_client.reset_shards(ResetShardsRequest {}).await?;
         assert_eq!(res.into_inner().shards_reset, 1, "should reset 1 shard");
 
         // Immediately enqueue another job - this should succeed without retries
@@ -1322,7 +1363,7 @@ async fn grpc_server_reset_shards_multiple_resets_immediately_available() -> any
         let mut cfg = AppConfig::load(None).unwrap();
         cfg.server.dev_mode = true;
 
-        let (mut client, shutdown_tx, server, _addr, _factory, _tmp) =
+        let (mut client, mut admin_client, shutdown_tx, server, _addr, _factory, _tmp) =
             setup_test_server_production_path(1, cfg).await?;
 
         // Get cluster info to discover shard IDs
@@ -1356,7 +1397,7 @@ async fn grpc_server_reset_shards_multiple_resets_immediately_available() -> any
                 .unwrap_or_else(|e| panic!("enqueue should succeed in cycle {}: {:?}", i, e));
 
             // Reset
-            let res = client.reset_shards(ResetShardsRequest {}).await?;
+            let res = admin_client.reset_shards(ResetShardsRequest {}).await?;
             assert_eq!(res.into_inner().shards_reset, 1);
 
             // Immediately verify shard is available by enqueuing
@@ -1424,7 +1465,7 @@ async fn grpc_server_reset_shards_eight_shards_immediately_available() -> anyhow
         let mut cfg = AppConfig::load(None).unwrap();
         cfg.server.dev_mode = true;
 
-        let (mut client, shutdown_tx, server, _addr, _factory, _tmp) =
+        let (mut client, mut admin_client, shutdown_tx, server, _addr, _factory, _tmp) =
             setup_test_server_production_path(8, cfg).await?;
 
         // Get cluster info to discover all shard IDs
@@ -1463,7 +1504,7 @@ async fn grpc_server_reset_shards_eight_shards_immediately_available() -> anyhow
         }
 
         // Reset all shards
-        let res = client.reset_shards(ResetShardsRequest {}).await?;
+        let res = admin_client.reset_shards(ResetShardsRequest {}).await?;
         assert_eq!(
             res.into_inner().shards_reset,
             8,
@@ -1511,11 +1552,15 @@ async fn grpc_server_reset_shards_eight_shards_immediately_available() -> anyhow
 async fn grpc_force_release_shard_succeeds() -> anyhow::Result<()> {
     let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
         let (factory, _tmp) = create_test_factory().await?;
-        let (mut client, shutdown_tx, server, _addr) =
+        let (_client, shutdown_tx, server, addr) =
             setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
 
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint)?.connect().await?;
+        let mut admin_client = SiloAdminClient::new(channel);
+
         // Force-release the test shard (NoneCoordinator no-ops, but verifies gRPC plumbing)
-        let resp = client
+        let resp = admin_client
             .force_release_shard(ForceReleaseShardRequest {
                 shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
             })
@@ -1535,11 +1580,15 @@ async fn grpc_force_release_shard_succeeds() -> anyhow::Result<()> {
 async fn grpc_force_release_shard_invalid_id_returns_error() -> anyhow::Result<()> {
     let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
         let (factory, _tmp) = create_test_factory().await?;
-        let (mut client, shutdown_tx, server, _addr) =
+        let (_client, shutdown_tx, server, addr) =
             setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
 
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint)?.connect().await?;
+        let mut admin_client = SiloAdminClient::new(channel);
+
         // Force-release with an invalid shard ID (not a UUID)
-        let result = client
+        let result = admin_client
             .force_release_shard(ForceReleaseShardRequest {
                 shard: "not-a-valid-uuid".to_string(),
             })

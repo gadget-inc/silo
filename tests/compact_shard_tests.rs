@@ -2,6 +2,7 @@ mod grpc_integration_helpers;
 mod test_helpers;
 
 use grpc_integration_helpers::{create_test_factory, setup_test_server, shutdown_server};
+use silo::pb::silo_admin_client::SiloAdminClient;
 use silo::pb::*;
 use silo::settings::AppConfig;
 use test_helpers::{msgpack_payload, open_temp_shard};
@@ -68,10 +69,14 @@ async fn submit_full_compaction_empty_shard() {
 async fn grpc_compact_shard_succeeds() -> anyhow::Result<()> {
     let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
         let (factory, _tmp) = create_test_factory().await?;
-        let (mut client, shutdown_tx, server, _addr) =
+        let (_client, shutdown_tx, server, addr) =
             setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
 
-        let resp = client
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint)?.connect().await?;
+        let mut admin_client = SiloAdminClient::new(channel);
+
+        let resp = admin_client
             .compact_shard(CompactShardRequest {
                 shard: grpc_integration_helpers::TEST_SHARD_ID.to_string(),
             })
@@ -97,10 +102,14 @@ async fn grpc_compact_shard_succeeds() -> anyhow::Result<()> {
 async fn grpc_compact_shard_invalid_id() -> anyhow::Result<()> {
     let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
         let (factory, _tmp) = create_test_factory().await?;
-        let (mut client, shutdown_tx, server, _addr) =
+        let (_client, shutdown_tx, server, addr) =
             setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
 
-        let result = client
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint)?.connect().await?;
+        let mut admin_client = SiloAdminClient::new(channel);
+
+        let result = admin_client
             .compact_shard(CompactShardRequest {
                 shard: "not-a-valid-uuid".to_string(),
             })
@@ -127,11 +136,15 @@ async fn grpc_compact_shard_invalid_id() -> anyhow::Result<()> {
 async fn grpc_compact_shard_not_found() -> anyhow::Result<()> {
     let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
         let (factory, _tmp) = create_test_factory().await?;
-        let (mut client, shutdown_tx, server, _addr) =
+        let (_client, shutdown_tx, server, addr) =
             setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
 
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint)?.connect().await?;
+        let mut admin_client = SiloAdminClient::new(channel);
+
         // Use a valid UUID that doesn't correspond to any shard on this node
-        let result = client
+        let result = admin_client
             .compact_shard(CompactShardRequest {
                 shard: "11111111-1111-1111-1111-111111111111".to_string(),
             })
@@ -198,10 +211,14 @@ async fn grpc_compact_shard_with_tombstones() -> anyhow::Result<()> {
         shard.db().flush().await.unwrap();
 
         // Now compact via gRPC
-        let (mut client, shutdown_tx, server, _addr) =
+        let (_client, shutdown_tx, server, addr) =
             setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
 
-        let resp = client
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic::transport::Endpoint::new(endpoint)?.connect().await?;
+        let mut admin_client = SiloAdminClient::new(channel);
+
+        let resp = admin_client
             .compact_shard(CompactShardRequest {
                 shard: grpc_integration_helpers::TEST_SHARD_ID.to_string(),
             })

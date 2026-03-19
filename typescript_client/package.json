@@ -15,7 +15,7 @@
     "src"
   ],
   "scripts": {
-    "proto:generate": "pnpm exec protoc --ts_out=src/pb --ts_opt=long_type_bigint --ts_opt=generate_dependencies --proto_path=../proto ../proto/silo.proto",
+    "proto:generate": "pnpm exec protoc --ts_out=src/pb --ts_opt=long_type_bigint --ts_opt=generate_dependencies --proto_path=../proto ../proto/silo.proto ../proto/silo_admin.proto",
     "build": "pnpm run proto:generate && tsc",
     "test": "vitest run",
     "lint": "oxlint --type-aware",
