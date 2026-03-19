@@ -80,6 +80,7 @@
           watchexec # Auto-reload for development
           grpcurl # For health checking gRPC servers
           toxiproxy # Network fault injection proxy for testing
+          sccache # Shared compilation cache across worktrees
         ]);
 
         # Set the project root for the dev script
@@ -88,6 +89,11 @@
           export SILO_PROJECT_ROOT="$(pwd)"
           export RUSTFLAGS="-C force-frame-pointers=yes"
           export TOXIPROXY_CONFIG="${toxiproxyConfig}"
+          # Only use sccache locally -- in CI it has no warm cache and adds overhead
+          if [ -z "''${CI:-}" ]; then
+            export RUSTC_WRAPPER="${pkgs.sccache}/bin/sccache"
+            export SCCACHE_DIR="$HOME/.cache/sccache-silo"
+          fi
         '';
       };
     };
