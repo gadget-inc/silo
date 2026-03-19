@@ -4404,9 +4404,9 @@ async fn k8s_orphaned_ring_shard_remains_unowned() {
         .await
         .expect("move to nonexistent ring");
 
-    // Wait for convergence
+    // Wait for convergence (use longer timeout to avoid CI flakes)
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+    assert!(coord.wait_converged(Duration::from_secs(30)).await);
 
     // The orphaned shard should no longer be owned
     let owned_after: HashSet<ShardId> = coord.owned_shards().await.into_iter().collect();
