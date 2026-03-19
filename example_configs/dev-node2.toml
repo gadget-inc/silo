@@ -26,3 +26,20 @@ backend = "fs"
 # use the same data path as the other node to simulate prod-like usage of object storage and compute/storage separation
 # NOTE: %shard% must be at a directory boundary (after /) for split/clone to work correctly
 path = "./tmp/silo-data/%shard%"
+
+# Garbage collection — disabled by default in SlateDB!
+[database.slatedb.garbage_collector_options.manifest_options]
+interval = "300s"
+min_age = "86400s"
+
+[database.slatedb.garbage_collector_options.wal_options]
+interval = "300s"
+min_age = "1800s"
+
+[database.slatedb.garbage_collector_options.compacted_options]
+interval = "300s"
+min_age = "86400s"
+
+[database.slatedb.garbage_collector_options.compactions_options]
+interval = "300s"
+min_age = "86400s"

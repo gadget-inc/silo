@@ -95,6 +95,34 @@ All other options use SlateDB's sensible defaults when omitted. See the [Server 
 
 The cache directory does not need to be durable — if it is lost, reads will simply fall back to object storage and the cache will be rebuilt over time. This makes it a good fit for ephemeral local disks or instance storage.
 
+## Garbage collection
+
+**SlateDB does not garbage collect old files by default.** Without explicit configuration, old WAL files, compacted SSTs, manifest versions, and compaction job state will accumulate in storage indefinitely. For production deployments, you should always enable garbage collection.
+
+Add the following to your Silo config to enable GC for all file categories:
+
+```toml
+[database.slatedb.garbage_collector_options.manifest_options]
+interval = "300s"
+min_age = "86400s"
+
+[database.slatedb.garbage_collector_options.wal_options]
+interval = "300s"
+min_age = "1800s"
+
+[database.slatedb.garbage_collector_options.compacted_options]
+interval = "300s"
+min_age = "86400s"
+
+[database.slatedb.garbage_collector_options.compactions_options]
+interval = "300s"
+min_age = "86400s"
+```
+
+The `interval` controls how often the GC scans for old files, and `min_age` is the minimum age before a file is eligible for deletion. The WAL `min_age` can be shorter (30 minutes) because WAL files are superseded quickly by L0 SSTs, while manifests and compacted SSTs use a longer `min_age` (24 hours) as a safety margin to avoid deleting files that might still be referenced by active readers or checkpoints.
+
+See the [Server Configuration reference](/silo/reference/server-configuration/#garbage-collector-options) for full details on all GC options.
+
 ## Using etcd for cluster membership
 
 To run multiple Silo instances as a cluster, you need a coordination backend that handles node discovery, shard assignment, and ownership. etcd is one of the supported backends.

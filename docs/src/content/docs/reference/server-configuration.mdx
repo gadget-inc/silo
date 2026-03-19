@@ -208,17 +208,48 @@ Configure compaction behavior via `[database.slatedb.compactor_options]`:
 
 #### Garbage Collector Options
 
-Configure garbage collection via `[database.slatedb.garbage_collector_options]`:
+<Aside type="caution">
+**Garbage collection is disabled by default in SlateDB.** Without enabling it, old WAL files, compacted SSTs, manifest versions, and compaction job state will accumulate in object storage indefinitely. You should always configure garbage collection for production deployments.
+</Aside>
+
+Configure garbage collection via `[database.slatedb.garbage_collector_options]`. There are four categories of files that can be garbage collected, each with their own `interval` (how often the GC runs) and `min_age` (how old a file must be before it can be deleted):
+
+| Category | TOML Section | What it cleans up |
+|----------|-------------|-------------------|
+| `manifest_options` | `garbage_collector_options.manifest_options` | Old manifest versions |
+| `wal_options` | `garbage_collector_options.wal_options` | Old WAL (write-ahead log) files |
+| `compacted_options` | `garbage_collector_options.compacted_options` | Old compacted SST files replaced by newer compactions |
+| `compactions_options` | `garbage_collector_options.compactions_options` | Old compactor job state (`.compactions` files) |
+
+Each category accepts:
+
+| Option | Type | Default (when enabled) | Description |
+|--------|------|----------------------|-------------|
+| `interval` | duration | `"300s"` | How often to scan for garbage in this category |
+| `min_age` | duration | `"1800s"` | Minimum age before a file is eligible for deletion |
+
+Here is a recommended configuration that enables GC for all categories:
 
 ```toml
+# Enable garbage collection — without this, old files accumulate forever
 [database.slatedb.garbage_collector_options.manifest_options]
 interval = "300s"
 min_age = "86400s"
 
 [database.slatedb.garbage_collector_options.wal_options]
-interval = "60s"
-min_age = "60s"
+interval = "300s"
+min_age = "1800s"
+
+[database.slatedb.garbage_collector_options.compacted_options]
+interval = "300s"
+min_age = "86400s"
+
+[database.slatedb.garbage_collector_options.compactions_options]
+interval = "300s"
+min_age = "86400s"
 ```
+
+Setting any category to an empty table (e.g. `[database.slatedb.garbage_collector_options.wal_options]` with no keys) will enable it with the default `interval` of 300s and `min_age` of 1800s.
 
 <Aside>
 Duration values use human-readable strings like `"100ms"`, `"5s"`, `"1m"`, `"1h"`. This format is provided by SlateDB's configuration system.
@@ -229,7 +260,7 @@ Most SlateDB options use sensible defaults tuned for general workloads. Only adj
 </Aside>
 
 <Aside type="tip">
-If the `[database.slatedb]` section is omitted entirely, Silo uses SlateDB's sensible defaults. This is the recommended approach for most deployments. Only add this section if you need to tune specific storage engine parameters.
+For most other SlateDB settings, omitting the `[database.slatedb]` section entirely uses sensible defaults. However, garbage collection is the exception — it must be explicitly enabled. We recommend always including the `garbage_collector_options` section in production configs.
 </Aside>
 
 #### Partial Configuration

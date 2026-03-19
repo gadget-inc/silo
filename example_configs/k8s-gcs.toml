@@ -54,3 +54,21 @@ path = "gs://my-bucket/silo/%shard%"
 [database.wal]
 backend = "fs"
 path = "/var/lib/silo/wal/%shard%"
+
+# Garbage collection — disabled by default in SlateDB!
+# Without this, old WAL files, SSTs, and manifests accumulate in object storage forever.
+[database.slatedb.garbage_collector_options.manifest_options]
+interval = "300s"
+min_age = "86400s"
+
+[database.slatedb.garbage_collector_options.wal_options]
+interval = "300s"
+min_age = "1800s"
+
+[database.slatedb.garbage_collector_options.compacted_options]
+interval = "300s"
+min_age = "86400s"
+
+[database.slatedb.garbage_collector_options.compactions_options]
+interval = "300s"
+min_age = "86400s"

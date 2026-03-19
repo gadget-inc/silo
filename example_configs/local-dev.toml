@@ -28,3 +28,21 @@ backend = "fs"
 path = "/var/lib/silo/%shard%"
 # Optional: periodic self-healing scan for pending concurrency requests (default: 5000)
 # concurrency_reconcile_interval_ms = 5000
+
+# Garbage collection — disabled by default in SlateDB!
+# Without this, old WAL files, SSTs, and manifests accumulate forever.
+[database.slatedb.garbage_collector_options.manifest_options]
+interval = "300s"
+min_age = "86400s"
+
+[database.slatedb.garbage_collector_options.wal_options]
+interval = "300s"
+min_age = "1800s"
+
+[database.slatedb.garbage_collector_options.compacted_options]
+interval = "300s"
+min_age = "86400s"
+
+[database.slatedb.garbage_collector_options.compactions_options]
+interval = "300s"
+min_age = "86400s"
