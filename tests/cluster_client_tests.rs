@@ -25,6 +25,7 @@ fn make_test_factory_with_shards(num_shards: u32) -> (Arc<ShardFactory>, ShardMa
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
             slatedb: None,
         },
         MockGubernatorClient::new_arc(),
@@ -782,6 +783,7 @@ fn make_test_app_config(tmp: &tempfile::TempDir) -> AppConfig {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
             slatedb: None,
         },
     }

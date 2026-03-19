@@ -161,35 +161,45 @@ impl JobStoreShard {
         match &outcome {
             // [SILO-SUCC-3] If success: mark job succeeded now (pure write)
             AttemptOutcome::Success { .. } => {
-                let job_status = JobStatus::succeeded(now_ms);
-                self.set_job_status_with_index(
-                    &mut DbWriteBatcher::new(&self.db, &mut batch),
-                    &tenant,
-                    &job_id,
-                    job_status,
-                )
-                .await?;
-                // Job reached terminal state - include counter in batch
-                self.increment_completed_jobs_counter(&mut DbWriteBatcher::new(
-                    &self.db, &mut batch,
-                ))?;
-                new_job_status_for_dst = Some("Succeeded".to_string());
+                let job_info_key = job_info_key(&tenant, &job_id);
+                if let Some(jbytes) = self.db.get(&job_info_key).await? {
+                    let view = JobView::new(jbytes)?;
+                    let job_status = JobStatus::succeeded(now_ms);
+                    let mut writer = DbWriteBatcher::new(&self.db, &mut batch);
+                    self.set_job_status_with_index(
+                        &mut writer,
+                        &tenant,
+                        &job_id,
+                        job_status.clone(),
+                    )
+                    .await?;
+                    self.increment_completed_jobs_counter(&mut writer)?;
+                    self.schedule_terminal_cleanup_task(&mut writer, &tenant, &view, &job_status)?;
+                    new_job_status_for_dst = Some("Succeeded".to_string());
+                } else {
+                    job_missing_error = Some(JobStoreShardError::JobNotFound(job_id.clone()));
+                }
             }
             // Worker acknowledges cancellation - set job status to Cancelled
             AttemptOutcome::Cancelled => {
-                let job_status = JobStatus::cancelled(now_ms);
-                self.set_job_status_with_index(
-                    &mut DbWriteBatcher::new(&self.db, &mut batch),
-                    &tenant,
-                    &job_id,
-                    job_status,
-                )
-                .await?;
-                // Job reached terminal state - include counter in batch
-                self.increment_completed_jobs_counter(&mut DbWriteBatcher::new(
-                    &self.db, &mut batch,
-                ))?;
-                new_job_status_for_dst = Some("Cancelled".to_string());
+                let job_info_key = job_info_key(&tenant, &job_id);
+                if let Some(jbytes) = self.db.get(&job_info_key).await? {
+                    let view = JobView::new(jbytes)?;
+                    let job_status = JobStatus::cancelled(now_ms);
+                    let mut writer = DbWriteBatcher::new(&self.db, &mut batch);
+                    self.set_job_status_with_index(
+                        &mut writer,
+                        &tenant,
+                        &job_id,
+                        job_status.clone(),
+                    )
+                    .await?;
+                    self.increment_completed_jobs_counter(&mut writer)?;
+                    self.schedule_terminal_cleanup_task(&mut writer, &tenant, &view, &job_status)?;
+                    new_job_status_for_dst = Some("Cancelled".to_string());
+                } else {
+                    job_missing_error = Some(JobStoreShardError::JobNotFound(job_id.clone()));
+                }
             }
             // Error: maybe enqueue next attempt; otherwise mark job failed
             AttemptOutcome::Error { .. } => {
@@ -260,17 +270,21 @@ impl JobStoreShard {
                     // [SILO-FAIL-3] If no follow-up scheduled, mark job as failed (pure write)
                     if !scheduled_followup {
                         let job_status = JobStatus::failed(now_ms);
+                        let mut writer = DbWriteBatcher::new(&self.db, &mut batch);
                         self.set_job_status_with_index(
-                            &mut DbWriteBatcher::new(&self.db, &mut batch),
+                            &mut writer,
                             &tenant,
                             &job_id,
-                            job_status,
+                            job_status.clone(),
                         )
                         .await?;
-                        // Job reached terminal state (failed permanently) - include counter in batch
-                        self.increment_completed_jobs_counter(&mut DbWriteBatcher::new(
-                            &self.db, &mut batch,
-                        ))?;
+                        self.increment_completed_jobs_counter(&mut writer)?;
+                        self.schedule_terminal_cleanup_task(
+                            &mut writer,
+                            &tenant,
+                            &view,
+                            &job_status,
+                        )?;
                         new_job_status_for_dst = Some("Failed".to_string());
                     }
                 } else {

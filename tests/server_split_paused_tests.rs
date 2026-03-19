@@ -186,6 +186,7 @@ async fn create_test_service(paused: bool) -> (SiloService, Arc<MockPausedCoordi
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
             slatedb: None,
         },
         MockGubernatorClient::new_arc(),
@@ -225,6 +226,7 @@ async fn enqueue_returns_unavailable_when_shard_paused() {
         limits: vec![],
         metadata: HashMap::new(),
         task_group: "default".to_string(),
+        terminal_retention_s: None,
     });
 
     let result = svc.enqueue(req).await;
@@ -249,6 +251,7 @@ async fn enqueue_returns_unavailable_when_shard_paused() {
         limits: vec![],
         metadata: HashMap::new(),
         task_group: "default".to_string(),
+        terminal_retention_s: None,
     });
 
     let result = svc.enqueue(req).await;
@@ -287,6 +290,7 @@ async fn get_job_returns_unavailable_when_shard_paused() {
         limits: vec![],
         metadata: HashMap::new(),
         task_group: "default".to_string(),
+        terminal_retention_s: None,
     });
     svc.enqueue(enqueue_req).await.expect("enqueue should work");
 
@@ -342,6 +346,7 @@ async fn cancel_job_returns_unavailable_when_shard_paused() {
         limits: vec![],
         metadata: HashMap::new(),
         task_group: "default".to_string(),
+        terminal_retention_s: None,
     });
     svc.enqueue(enqueue_req).await.expect("enqueue should work");
 
@@ -423,6 +428,7 @@ async fn requests_succeed_after_split_completes() {
         limits: vec![],
         metadata: HashMap::new(),
         task_group: "default".to_string(),
+        terminal_retention_s: None,
     });
     let result = svc.enqueue(req).await;
     assert!(result.is_err());
@@ -447,6 +453,7 @@ async fn requests_succeed_after_split_completes() {
         limits: vec![],
         metadata: HashMap::new(),
         task_group: "default".to_string(),
+        terminal_retention_s: None,
     });
     let result = svc.enqueue(req).await;
     assert!(result.is_ok(), "should succeed after split completes");

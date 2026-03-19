@@ -48,6 +48,7 @@ async fn open_shard_with_gubernator()
         path: tmp.path().to_string_lossy().to_string(),
         wal: None,
         apply_wal_on_close: true,
+        default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
         slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
     };
     let shard = JobStoreShard::open(&cfg, gubernator.clone(), None, ShardRange::full())

@@ -101,8 +101,13 @@ impl JobStoreShard {
                 status.next_attempt_starts_after_ms,
                 status.current_attempt,
             );
-            self.set_job_status_with_index(&mut TxnWriter(&txn), tenant, id, cancelled_status)
-                .await?;
+            self.set_job_status_with_index(
+                &mut TxnWriter(&txn),
+                tenant,
+                id,
+                cancelled_status.clone(),
+            )
+            .await?;
 
             // Read job info to get task_group, priority, and limits for task key reconstruction
             let job_key = job_info_key(tenant, id);
@@ -111,6 +116,13 @@ impl JobStoreShard {
                 let task_group = job_view.task_group().to_string();
                 let priority = job_view.priority();
                 let limits = job_view.limits();
+
+                self.schedule_terminal_cleanup_task(
+                    &mut TxnWriter(&txn),
+                    tenant,
+                    &job_view,
+                    &cancelled_status,
+                )?;
 
                 // Try O(1) task key reconstruction from status fields
                 let attempt_number = status.current_attempt.unwrap_or(1);

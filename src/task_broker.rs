@@ -11,6 +11,7 @@ use slatedb::{Db, WriteBatch};
 use tokio::sync::Notify;
 
 use crate::codec::{DecodedTask, decode_task_validated};
+use crate::fb::silo::fb;
 use crate::keys::{end_bound, parse_task_key, tasks_prefix};
 use crate::metrics::Metrics;
 use crate::shard_range::ShardRange;
@@ -37,6 +38,8 @@ pub struct TaskBroker {
     db: Arc<Db>,
     // The buffer of tasks read out of the DB and ready to be claimed by a dequeue-ing worker
     buffer: Arc<SkipMap<Vec<u8>, BrokerTask>>,
+    // Internal delete tasks discovered via the normal broker scan but handled off the worker path.
+    cleanup_buffer: Arc<SkipMap<Vec<u8>, BrokerTask>>,
     // The set of tasks already read out of the DB and claimed by a worker but not yet durably leased. Required so that the scanner doesn't re-add tasks that are in the middle of being dequeued to the buffer.
     inflight: Arc<Mutex<HashSet<Vec<u8>>>>,
     // Tombstones for task keys that were durably acked, keyed by the most recent
@@ -77,6 +80,7 @@ impl TaskBroker {
         Arc::new(Self {
             db,
             buffer: Arc::new(SkipMap::new()),
+            cleanup_buffer: Arc::new(SkipMap::new()),
             inflight: Arc::new(Mutex::new(HashSet::new())),
             ack_tombstones: Arc::new(Mutex::new(HashMap::new())),
             scan_generation_started: Arc::new(AtomicU64::new(0)),
@@ -101,8 +105,16 @@ impl TaskBroker {
         self.buffer.len()
     }
 
+    pub fn cleanup_buffer_len(&self) -> usize {
+        self.cleanup_buffer.len()
+    }
+
     pub fn inflight_len(&self) -> usize {
         self.inflight.lock().unwrap().len()
+    }
+
+    fn total_buffer_len(&self) -> usize {
+        self.buffer.len() + self.cleanup_buffer.len()
     }
 
     fn begin_scan_generation(&self) -> u64 {
@@ -133,7 +145,7 @@ impl TaskBroker {
         let mut defunct_keys: Vec<Vec<u8>> = Vec::new();
 
         let mut inserted = 0;
-        while inserted < self.scan_batch && self.buffer.len() < self.target_buffer {
+        while inserted < self.scan_batch && self.total_buffer_len() < self.target_buffer {
             let Ok(Some(kv)) = iter.next().await else {
                 break;
             };
@@ -196,9 +208,14 @@ impl TaskBroker {
                 decoded,
             };
 
-            // [SILO-SCAN-2] Insert into buffer if not already present
-            if self.buffer.get(&key_bytes).is_none() {
-                self.buffer.insert(key_bytes, entry);
+            // [SILO-SCAN-2] Insert into the appropriate ready buffer if not already present
+            let target = if entry.decoded.variant_type() == fb::TaskVariant::DeleteTerminalJob {
+                &self.cleanup_buffer
+            } else {
+                &self.buffer
+            };
+            if target.get(&key_bytes).is_none() {
+                target.insert(key_bytes, entry);
                 inserted += 1;
 
                 // Yield periodically to avoid starving other tasks
@@ -249,7 +266,7 @@ impl TaskBroker {
                 }
 
                 // Wait if buffer is full
-                if broker.buffer.len() >= broker.target_buffer {
+                if broker.total_buffer_len() >= broker.target_buffer {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 }
@@ -346,6 +363,37 @@ impl TaskBroker {
         claimed
     }
 
+    /// Claim up to `max` ready internal cleanup tasks.
+    pub fn claim_cleanup_ready(&self, max: usize) -> Vec<BrokerTask> {
+        let candidate_keys: Vec<Vec<u8>> = {
+            let mut inflight = self.inflight.lock().unwrap();
+            let mut keys = Vec::with_capacity(max);
+            for entry in self.cleanup_buffer.iter() {
+                if keys.len() >= max {
+                    break;
+                }
+                let key = entry.key();
+                if inflight.contains(key) {
+                    continue;
+                }
+                inflight.insert(key.clone());
+                keys.push(key.clone());
+            }
+            keys
+        };
+
+        let mut claimed = Vec::with_capacity(candidate_keys.len());
+        for key in candidate_keys {
+            if let Some(entry) = self.cleanup_buffer.remove(&key) {
+                claimed.push(entry.value().clone());
+            } else {
+                self.inflight.lock().unwrap().remove(&key);
+            }
+        }
+
+        claimed
+    }
+
     /// Try to claim tasks for a task_group. If none available, wait briefly for scanner to populate.
     pub async fn claim_ready_or_nudge(&self, task_group: &str, max: usize) -> Vec<BrokerTask> {
         // Try fast path first
@@ -367,6 +415,25 @@ impl TaskBroker {
         Vec::new()
     }
 
+    /// Try to claim internal cleanup tasks. If none are available, wait briefly for scanner to populate.
+    pub async fn claim_cleanup_ready_or_nudge(&self, max: usize) -> Vec<BrokerTask> {
+        let claimed = self.claim_cleanup_ready(max);
+        if !claimed.is_empty() {
+            return claimed;
+        }
+
+        self.wakeup();
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let claimed = self.claim_cleanup_ready(max);
+            if !claimed.is_empty() {
+                return claimed;
+            }
+        }
+
+        Vec::new()
+    }
+
     /// Requeue tasks back into the buffer after a failed durable write.
     pub fn requeue(&self, tasks: Vec<BrokerTask>) {
         let mut inflight = self.inflight.lock().unwrap();
@@ -375,6 +442,17 @@ impl TaskBroker {
             inflight.remove(&entry.key);
             tombstones.remove(&entry.key);
             self.buffer.insert(entry.key.clone(), entry);
+        }
+    }
+
+    /// Requeue internal cleanup tasks after a failed write.
+    pub fn requeue_cleanup(&self, tasks: Vec<BrokerTask>) {
+        let mut inflight = self.inflight.lock().unwrap();
+        let mut tombstones = self.ack_tombstones.lock().unwrap();
+        for entry in tasks {
+            inflight.remove(&entry.key);
+            tombstones.remove(&entry.key);
+            self.cleanup_buffer.insert(entry.key.clone(), entry);
         }
     }
 
@@ -398,6 +476,7 @@ impl TaskBroker {
     pub fn evict_keys(&self, keys: &[Vec<u8>]) {
         for k in keys {
             self.buffer.remove(k);
+            self.cleanup_buffer.remove(k);
         }
     }
 

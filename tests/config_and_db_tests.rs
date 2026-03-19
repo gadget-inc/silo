@@ -35,6 +35,7 @@ async fn open_fs_db_from_config() {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
             slatedb: None,
         },
     };
@@ -80,6 +81,7 @@ async fn shard_with_local_wal_has_wal_close_config() {
             path: wal_dir.path().to_string_lossy().to_string(),
         }),
         apply_wal_on_close: true,
+        default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
         slatedb: Some(fast_flush_slatedb_settings()),
     };
 
@@ -112,6 +114,7 @@ async fn shard_without_local_wal_has_no_wal_close_config() {
         path: data_dir.path().to_string_lossy().to_string(),
         wal: None,
         apply_wal_on_close: true,
+        default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
         slatedb: Some(fast_flush_slatedb_settings()),
     };
 
@@ -142,6 +145,7 @@ async fn close_with_flush_wal_removes_local_wal_directory() {
             path: wal_dir.path().to_string_lossy().to_string(),
         }),
         apply_wal_on_close: true,
+        default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
         slatedb: Some(fast_flush_slatedb_settings()),
     };
 
@@ -189,6 +193,7 @@ async fn close_without_flush_wal_preserves_local_wal_directory() {
             path: wal_dir.path().to_string_lossy().to_string(),
         }),
         apply_wal_on_close: false, // Disable apply on close
+        default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
         slatedb: Some(fast_flush_slatedb_settings()),
     };
 
@@ -235,6 +240,7 @@ async fn data_persists_after_close_with_flush_and_reopen() {
                 path: wal_dir.path().to_string_lossy().to_string(),
             }),
             apply_wal_on_close: true,
+            default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
             slatedb: Some(fast_flush_slatedb_settings()),
         };
 
@@ -267,6 +273,7 @@ async fn data_persists_after_close_with_flush_and_reopen() {
                 path: new_wal_dir.path().to_string_lossy().to_string(),
             }),
             apply_wal_on_close: true,
+            default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
             slatedb: Some(fast_flush_slatedb_settings()),
         };
 
@@ -305,6 +312,7 @@ async fn factory_close_all_flushes_all_shards_wal() {
         }),
         apply_wal_on_close: true,
         concurrency_reconcile_interval_ms: 5000,
+        default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
         slatedb: None,
     };
 
@@ -706,6 +714,7 @@ async fn factory_passes_slatedb_settings_to_shards() {
         wal: None,
         apply_wal_on_close: true,
         concurrency_reconcile_interval_ms: 5000,
+        default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
         slatedb: Some(slatedb::config::Settings {
             flush_interval: Some(std::time::Duration::from_millis(25)),
             l0_sst_size_bytes: 16777216, // 16MB

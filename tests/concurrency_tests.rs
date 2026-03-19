@@ -114,6 +114,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
             Task::RequestTicket { .. } => {}
             Task::CheckRateLimit { .. } => {}
             Task::RefreshFloatingLimit { .. } => {}
+            Task::DeleteTerminalJob { .. } => {}
         }
     }
 
@@ -604,6 +605,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
             Task::RequestTicket { .. } => {}
             Task::CheckRateLimit { .. } => {}
             Task::RefreshFloatingLimit { .. } => {}
+            Task::DeleteTerminalJob { .. } => {}
         }
     }
 
@@ -708,6 +710,9 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         }
         Task::RefreshFloatingLimit { .. } => {
             panic!("unexpected RefreshFloatingLimit in tasks/ for this test")
+        }
+        Task::DeleteTerminalJob { .. } => {
+            panic!("unexpected DeleteTerminalJob in tasks/ for this test")
         }
     };
     assert_eq!(attempt2, 2);
@@ -1580,6 +1585,7 @@ async fn concurrency_lazy_hydration_on_shard_reopen() {
         path: tmp.path().to_string_lossy().to_string(),
         wal: None,
         apply_wal_on_close: true,
+        default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
         slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
     };
     let rate_limiter = MockGubernatorClient::new_arc();
@@ -1714,6 +1720,7 @@ async fn concurrency_no_overgrant_with_lazy_hydration() {
         path: tmp.path().to_string_lossy().to_string(),
         wal: None,
         apply_wal_on_close: true,
+        default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
         slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
     };
     let rate_limiter = MockGubernatorClient::new_arc();

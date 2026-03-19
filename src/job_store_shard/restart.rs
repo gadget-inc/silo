@@ -120,6 +120,8 @@ impl JobStoreShard {
         let job_view = load_job_view(&TxnWriter(&txn), tenant, id).await?;
         let priority = job_view.priority();
         let start_at_ms = job_view.enqueue_time_ms().max(now_ms);
+        let cleared_cleanup_task_key =
+            self.clear_terminal_cleanup_task(&mut TxnWriter(&txn), &job_view, &status)?;
 
         // Find the maximum attempt number from existing attempts
         // We scan the attempts prefix to find the highest attempt number
@@ -195,6 +197,9 @@ impl JobStoreShard {
         // Wake the broker to pick up the new task promptly
         if start_at_ms <= now_epoch_ms() {
             self.broker.wakeup();
+        }
+        if let Some(key) = cleared_cleanup_task_key {
+            self.broker.evict_keys(std::slice::from_ref(&key));
         }
 
         Ok(())

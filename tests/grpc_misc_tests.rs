@@ -74,6 +74,7 @@ async fn grpc_server_lease_tasks_multi_shard() -> anyhow::Result<()> {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
             slatedb: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
@@ -107,6 +108,7 @@ async fn grpc_server_lease_tasks_multi_shard() -> anyhow::Result<()> {
                     tenant: None,
                     metadata: std::collections::HashMap::new(),
                     task_group: "default".to_string(),
+                    terminal_retention_s: None,
                 };
                 let _ = client.enqueue(enq).await?;
             }
@@ -187,6 +189,7 @@ async fn grpc_server_tenant_validation_when_enabled() -> anyhow::Result<()> {
                 tenant: None, // Missing!
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
+                terminal_retention_s: None,
             })
             .await;
 
@@ -219,6 +222,7 @@ async fn grpc_server_tenant_validation_when_enabled() -> anyhow::Result<()> {
                 tenant: Some("".to_string()), // Empty!
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
+                terminal_retention_s: None,
             })
             .await;
 
@@ -246,6 +250,7 @@ async fn grpc_server_tenant_validation_when_enabled() -> anyhow::Result<()> {
                 tenant: Some("x".repeat(65)), // Too long!
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
+                terminal_retention_s: None,
             })
             .await;
 
@@ -278,6 +283,7 @@ async fn grpc_server_tenant_validation_when_enabled() -> anyhow::Result<()> {
                 tenant: Some("my-tenant".to_string()),
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
+                terminal_retention_s: None,
             })
             .await;
 
@@ -320,6 +326,7 @@ async fn grpc_enqueue_rejects_tenant_when_tenancy_disabled() -> anyhow::Result<(
             tenant: Some("test-tenant-1".to_string()),
             metadata: std::collections::HashMap::new(),
             task_group: "default".to_string(),
+            terminal_retention_s: None,
         };
 
         let err = client
@@ -406,6 +413,7 @@ async fn grpc_server_reset_shards_works_in_dev_mode() -> anyhow::Result<()> {
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
+                terminal_retention_s: None,
             })
             .await?;
 
@@ -613,6 +621,7 @@ async fn grpc_server_get_node_info_tracks_lifecycle() -> anyhow::Result<()> {
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
+                terminal_retention_s: None,
             })
             .await?
             .into_inner();
@@ -647,6 +656,7 @@ async fn grpc_server_get_node_info_tracks_lifecycle() -> anyhow::Result<()> {
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
+                terminal_retention_s: None,
             })
             .await?;
 
@@ -743,6 +753,7 @@ async fn grpc_server_reset_shards_clears_fs_backend_data() -> anyhow::Result<()>
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
             slatedb: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
@@ -778,6 +789,7 @@ async fn grpc_server_reset_shards_clears_fs_backend_data() -> anyhow::Result<()>
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
+                terminal_retention_s: None,
             })
             .await?;
 
@@ -846,6 +858,7 @@ async fn grpc_server_reset_shards_clears_fs_backend_data() -> anyhow::Result<()>
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
+                terminal_retention_s: None,
             })
             .await?;
 
@@ -930,6 +943,7 @@ async fn grpc_server_reset_shards_with_relative_path() -> anyhow::Result<()> {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
             slatedb: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
@@ -963,6 +977,7 @@ async fn grpc_server_reset_shards_with_relative_path() -> anyhow::Result<()> {
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
+                terminal_retention_s: None,
             })
             .await?;
 
@@ -1057,6 +1072,7 @@ async fn grpc_server_reset_shards_clears_memory_backend_data() -> anyhow::Result
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
             slatedb: None,
         };
         let rate_limiter = MockGubernatorClient::new_arc();
@@ -1092,6 +1108,7 @@ async fn grpc_server_reset_shards_clears_memory_backend_data() -> anyhow::Result
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
+                terminal_retention_s: None,
             })
             .await?;
 
@@ -1181,6 +1198,7 @@ async fn setup_test_server_production_path(
         wal: None,
         apply_wal_on_close: true,
         concurrency_reconcile_interval_ms: 5000,
+        default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
         slatedb: None,
     };
     let rate_limiter = MockGubernatorClient::new_arc();
@@ -1256,6 +1274,7 @@ async fn grpc_server_reset_shards_immediately_available_production_path() -> any
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
+                terminal_retention_s: None,
             })
             .await?;
 
@@ -1280,6 +1299,7 @@ async fn grpc_server_reset_shards_immediately_available_production_path() -> any
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
+                terminal_retention_s: None,
             })
             .await;
 
@@ -1351,6 +1371,7 @@ async fn grpc_server_reset_shards_multiple_resets_immediately_available() -> any
                     tenant: None,
                     metadata: std::collections::HashMap::new(),
                     task_group: "default".to_string(),
+                    terminal_retention_s: None,
                 })
                 .await
                 .unwrap_or_else(|e| panic!("enqueue should succeed in cycle {}: {:?}", i, e));
@@ -1376,6 +1397,7 @@ async fn grpc_server_reset_shards_multiple_resets_immediately_available() -> any
                     tenant: None,
                     metadata: std::collections::HashMap::new(),
                     task_group: "default".to_string(),
+                    terminal_retention_s: None,
                 })
                 .await;
 
@@ -1458,6 +1480,7 @@ async fn grpc_server_reset_shards_eight_shards_immediately_available() -> anyhow
                     tenant: None,
                     metadata: std::collections::HashMap::new(),
                     task_group: "default".to_string(),
+                    terminal_retention_s: None,
                 })
                 .await?;
         }
@@ -1488,6 +1511,7 @@ async fn grpc_server_reset_shards_eight_shards_immediately_available() -> anyhow
                     tenant: None,
                     metadata: std::collections::HashMap::new(),
                     task_group: "default".to_string(),
+                    terminal_retention_s: None,
                 })
                 .await;
 
@@ -1681,6 +1705,7 @@ async fn grpc_worker_rpcs_skip_tenant_validation_when_tenancy_disabled() -> anyh
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
+                terminal_retention_s: None,
             })
             .await?;
 
@@ -1767,6 +1792,7 @@ async fn grpc_worker_rpcs_accept_valid_tenant_when_tenancy_enabled() -> anyhow::
                 tenant: Some(tenant.to_string()),
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
+                terminal_retention_s: None,
             })
             .await?;
 

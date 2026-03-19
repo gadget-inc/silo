@@ -115,11 +115,19 @@ table RefreshFloatingLimit {
   task_group: string;
 }
 
+table DeleteTerminalJob {
+  tenant: string;
+  job_id: string;
+  terminal_status_changed_at_ms: int64;
+  task_group: string;
+}
+
 union TaskVariant {
   RunAttempt,
   RequestTicket,
   CheckRateLimit,
   RefreshFloatingLimit,
+  DeleteTerminalJob,
 }
 
 table Task {
@@ -200,6 +208,7 @@ table JobInfo {
   id: string;
   priority: ubyte;
   enqueue_time_ms: int64;
+  terminal_retention_s: int64 = null;
   payload: [ubyte];
   retry_policy: RetryPolicy;
   metadata: [KeyValuePair];

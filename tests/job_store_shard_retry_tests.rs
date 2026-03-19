@@ -189,6 +189,9 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
             Task::RefreshFloatingLimit { .. } => {
                 panic!("unexpected RefreshFloatingLimit in tasks/ for this test")
             }
+            Task::DeleteTerminalJob { .. } => {
+                panic!("unexpected DeleteTerminalJob in tasks/ for this test")
+            }
         };
         assert_eq!(attempt, 2);
 
@@ -223,6 +226,9 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
             }
             Task::RefreshFloatingLimit { .. } => {
                 panic!("unexpected RefreshFloatingLimit in tasks/ for this test")
+            }
+            Task::DeleteTerminalJob { .. } => {
+                panic!("unexpected DeleteTerminalJob in tasks/ for this test")
             }
         };
         assert_eq!(attempt3, 3);
@@ -463,6 +469,9 @@ async fn retry_count_one_boundary_enqueues_attempt2_then_stops_on_second_error()
         Task::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in tasks/ for this test"),
         Task::RefreshFloatingLimit { .. } => {
             panic!("unexpected RefreshFloatingLimit in tasks/ for this test")
+        }
+        Task::DeleteTerminalJob { .. } => {
+            panic!("unexpected DeleteTerminalJob in tasks/ for this test")
         }
     };
     assert_eq!(attempt2, 2);
@@ -1055,6 +1064,9 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         Task::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in tasks/ for this test"),
         Task::RefreshFloatingLimit { .. } => {
             panic!("unexpected RefreshFloatingLimit in tasks/ for this test")
+        }
+        Task::DeleteTerminalJob { .. } => {
+            panic!("unexpected DeleteTerminalJob in tasks/ for this test")
         }
     };
     assert_eq!(attempt2, 2);

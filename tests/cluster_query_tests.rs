@@ -31,6 +31,7 @@ async fn create_multi_shard_factory(
         wal: None,
         apply_wal_on_close: true,
         concurrency_reconcile_interval_ms: 5000,
+        default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
         slatedb: None,
     };
 

@@ -41,6 +41,7 @@ fn make_test_factory(prefix: &str, node_id: &str) -> Arc<ShardFactory> {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
             slatedb: None,
         },
         MockGubernatorClient::new_arc(),
@@ -85,6 +86,7 @@ async fn enqueue_job(
             tenant: tenant.map(|s| s.to_string()),
             metadata: HashMap::new(),
             task_group: "default".to_string(),
+            terminal_retention_s: None,
         };
 
         match client.enqueue(request).await {

@@ -8,7 +8,7 @@ use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::pb::silo_client::SiloClient;
 use silo::server::run_server;
-use silo::settings::{AppConfig, Backend, DatabaseTemplate};
+use silo::settings::{AppConfig, Backend, DEFAULT_TERMINAL_RETENTION_S, DatabaseTemplate};
 use silo::shard_range::ShardRange;
 use tokio::net::TcpListener;
 
@@ -64,6 +64,7 @@ pub async fn create_test_factory() -> anyhow::Result<(Arc<ShardFactory>, tempfil
         wal: None,
         apply_wal_on_close: true,
         concurrency_reconcile_interval_ms: 5000,
+        default_terminal_retention_s: DEFAULT_TERMINAL_RETENTION_S,
         slatedb: None,
     };
     let rate_limiter = MockGubernatorClient::new_arc();
@@ -103,6 +104,7 @@ pub async fn setup_multi_shard_server(
         wal: None,
         apply_wal_on_close: true,
         concurrency_reconcile_interval_ms: 5000,
+        default_terminal_retention_s: DEFAULT_TERMINAL_RETENTION_S,
         slatedb: None,
     };
     let rate_limiter = MockGubernatorClient::new_arc();

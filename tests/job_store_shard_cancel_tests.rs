@@ -1,10 +1,10 @@
 mod test_helpers;
 
-use silo::codec::{decode_lease, encode_lease};
+use silo::codec::{decode_lease, decode_task, encode_lease};
 use silo::job::JobStatusKind;
 use silo::job_attempt::{AttemptOutcome, AttemptStatus};
 use silo::job_store_shard::JobStoreShardError;
-use silo::task::LeaseRecord;
+use silo::task::{LeaseRecord, Task};
 
 use test_helpers::*;
 
@@ -77,11 +77,13 @@ async fn cancel_scheduled_job_sets_cancelled_and_removes_task() {
             "job should be marked as cancelled"
         );
 
-        // Task should be eagerly removed from DB queue by cancel (not lazily on dequeue)
-        let none_left = first_task_kv(shard.db()).await;
+        // The worker-facing task should be removed immediately, but terminal cancellation now
+        // schedules a future internal cleanup task.
+        let (_task_key, task_raw) = first_task_kv(shard.db()).await.expect("cleanup task");
+        let task = decode_task(&task_raw).expect("decode task");
         assert!(
-            none_left.is_none(),
-            "task should be removed from queue immediately by cancel"
+            matches!(task, Task::DeleteTerminalJob { job_id: ref task_job_id, .. } if task_job_id == &job_id),
+            "expected terminal cleanup task for cancelled job, got {task:?}"
         );
 
         // Dequeue should return empty (no tasks remain)
@@ -954,8 +956,9 @@ async fn cancel_eagerly_removes_run_attempt_tasks() {
         // Cancel j1 - should eagerly remove its task
         shard.cancel_job("-", &j1).await.expect("cancel j1");
 
-        // Only j2's task should remain
-        assert_eq!(count_task_keys(shard.db()).await, 1);
+        // j1's worker task should be removed, but its terminal cleanup task remains queued
+        // alongside j2's runnable task.
+        assert_eq!(count_task_keys(shard.db()).await, 2);
 
         // Dequeue returns j2 only
         let tasks = shard

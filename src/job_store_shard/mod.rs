@@ -12,6 +12,7 @@ mod lease;
 mod lease_task;
 mod rate_limit;
 mod restart;
+mod retention;
 mod scan;
 
 pub use cleanup::{CleanupProgress, CleanupResult};
@@ -23,11 +24,11 @@ pub use lease_task::JobNotLeaseableError;
 pub use restart::JobNotRestartableError;
 
 pub(crate) use enqueue::LimitTaskParams;
-use helpers::DbWriteBatcher;
-use helpers::WriteBatcher;
 pub use helpers::now_epoch_ms;
+use helpers::retry_on_txn_conflict;
 
-use slatedb::Db;
+use slatedb::config::WriteOptions;
+use slatedb::{Db, IsolationLevel};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use thiserror::Error;
@@ -73,6 +74,8 @@ pub struct OpenShardOptions {
     pub metrics: Option<Metrics>,
     /// Interval for periodic concurrency request reconciliation.
     pub concurrency_reconcile_interval: Duration,
+    /// Default terminal retention in seconds for newly created jobs.
+    pub default_terminal_retention_s: i64,
 }
 
 /// Result of a dequeue operation - contains both job tasks and floating limit refresh tasks
@@ -96,6 +99,8 @@ pub struct JobStoreShard {
     pub(crate) metrics: Option<Metrics>,
     /// Interval for periodic concurrency request reconciliation.
     concurrency_reconcile_interval: Duration,
+    /// Default terminal retention in seconds for newly created jobs.
+    pub(crate) default_terminal_retention_s: i64,
     /// Cancellation token for background tasks like cleanup.
     /// Signaled when the shard is closing.
     cancellation: CancellationToken,
@@ -240,9 +245,8 @@ impl JobStoreShard {
                 slatedb_settings,
                 rate_limiter,
                 metrics,
-                concurrency_reconcile_interval: Duration::from_millis(
-                    crate::settings::DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS.max(1),
-                ),
+                concurrency_reconcile_interval: Duration::from_millis(5_000),
+                default_terminal_retention_s: cfg.default_terminal_retention_s,
             },
             range,
         )
@@ -278,6 +282,7 @@ impl JobStoreShard {
             rate_limiter,
             metrics,
             concurrency_reconcile_interval,
+            default_terminal_retention_s,
         } = options;
 
         let mut db_builder = slatedb::DbBuilder::new(db_path, store.clone())
@@ -323,6 +328,7 @@ impl JobStoreShard {
             wal_close_config,
             metrics,
             concurrency_reconcile_interval,
+            default_terminal_retention_s,
             cancellation: CancellationToken::new(),
             store,
             db_path: db_path.to_string(),
@@ -331,6 +337,7 @@ impl JobStoreShard {
         // Periodically reconcile pending concurrency requests to self-heal from
         // missed in-memory notifications or transient scanner failures.
         shard.spawn_concurrency_reconcile_task(range.clone());
+        shard.spawn_terminal_cleanup_task();
 
         // Set the shard creation timestamp if this is the first time opening
         shard.set_created_at_ms_if_unset().await?;
@@ -703,64 +710,62 @@ impl JobStoreShard {
     ///
     /// Returns an error if the job is currently running (has active leases/holders) or has pending tasks/requests. Jobs must finish or permanently fail before deletion.
     pub async fn delete_job(&self, tenant: &str, id: &str) -> Result<(), JobStoreShardError> {
-        use crate::keys::idx_metadata_key;
-        use slatedb::WriteBatch;
+        retry_on_txn_conflict("delete_job", || self.delete_job_inner(tenant, id)).await
+    }
 
-        // Check if job is running or has pending state
-        let status = self.get_job_status(tenant, id).await?;
-        if let Some(ref status) = status
-            && !status.is_terminal()
-        {
+    async fn delete_job_inner(&self, tenant: &str, id: &str) -> Result<(), JobStoreShardError> {
+        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let info_key = job_info_key(tenant, id);
+        let status_key = job_status_key(tenant, id);
+
+        let maybe_job_raw = txn.get(&info_key).await?;
+        let maybe_status_raw = txn.get(&status_key).await?;
+
+        let (job_raw, status_raw) = match (maybe_job_raw, maybe_status_raw) {
+            (Some(job_raw), Some(status_raw)) => (job_raw, status_raw),
+            (None, None) => return Ok(()),
+            _ => {
+                return Err(JobStoreShardError::Codec(format!(
+                    "job {} has inconsistent stored state",
+                    id
+                )));
+            }
+        };
+
+        let job_view = JobView::new(job_raw)?;
+        let status = crate::job_store_shard::helpers::decode_job_status_owned(&status_raw)?;
+        if !status.is_terminal() {
             return Err(JobStoreShardError::JobInProgress(id.to_string()));
         }
 
-        // Check if job even exists (status.is_none() means job doesn't exist)
-        // If job doesn't exist, just return Ok (idempotent delete)
-        let job_info_key_bytes = job_info_key(tenant, id);
-        if status.is_none() && self.db.get(&job_info_key_bytes).await?.is_none() {
-            return Ok(());
-        }
-
-        let job_status_key_bytes = job_status_key(tenant, id);
-        let mut batch = WriteBatch::new();
-        // Clean up secondary index entries if present
-        if let Some(ref status) = status {
-            let timek = crate::keys::idx_status_time_key(
-                tenant,
-                status.kind.as_str(),
+        let cleanup_task_key = match job_view.terminal_retention_s() {
+            Some(retention_s) => Some(Self::terminal_cleanup_task_key(
+                job_view.task_group(),
+                job_view.id(),
                 status.changed_at_ms,
-                id,
-            );
-            batch.delete(&timek);
-        }
-        // Clean up metadata index entries (load job info to enumerate metadata)
-        if let Some(raw) = self.db.get(&job_info_key_bytes).await? {
-            let view = JobView::new(raw)?;
-            for (mk, mv) in view.metadata().into_iter() {
-                let mkey = idx_metadata_key(tenant, &mk, &mv, id);
-                batch.delete(&mkey);
-            }
-        }
-        batch.delete(&job_info_key_bytes);
-        batch.delete(&job_status_key_bytes);
-        // Also delete cancellation record if present
-        batch.delete(crate::keys::job_cancelled_key(tenant, id));
+                retention_s,
+            )?),
+            None => None,
+        };
 
-        // Update counters in the same batch
-        let mut writer = DbWriteBatcher::new(&self.db, &mut batch);
-        self.decrement_total_jobs_counter(&mut writer)?;
-        if let Some(ref status) = status {
-            // Job was in terminal state (we already checked it's terminal above)
-            self.decrement_completed_jobs_counter(&mut writer)?;
-            // Decrement tenant status counter
-            let counter_key = crate::keys::tenant_status_counter_key(tenant, status.kind.as_str());
-            writer.merge(
-                &counter_key,
-                crate::job_store_shard::counters::encode_counter(-1),
-            )?;
-        }
+        self.delete_job_records_in_txn(
+            &txn,
+            tenant,
+            id,
+            &job_view,
+            &status,
+            cleanup_task_key.as_deref(),
+        )
+        .await?;
 
-        self.db.write(batch).await?;
+        txn.commit_with_options(&WriteOptions {
+            await_durable: true,
+        })
+        .await?;
+
+        if let Some(key) = cleanup_task_key {
+            self.broker.evict_keys(std::slice::from_ref(&key));
+        }
 
         Ok(())
     }

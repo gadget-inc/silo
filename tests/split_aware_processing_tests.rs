@@ -419,6 +419,7 @@ async fn create_shard_with_uncleaned_data(
         path: tmp.path().to_string_lossy().to_string(),
         wal: None,
         apply_wal_on_close: true,
+        default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
         slatedb: Some(fast_flush_slatedb_settings()),
     };
 
@@ -618,6 +619,7 @@ async fn concurrency_hydration_ignores_uncleaned_holders() {
         path: tmp.path().to_string_lossy().to_string(),
         wal: None,
         apply_wal_on_close: true,
+        default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
         slatedb: Some(fast_flush_slatedb_settings()),
     };
 

@@ -580,6 +580,7 @@ async fn reopening_shard_after_cleanup_preserves_status() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
             slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
         };
 
@@ -627,6 +628,7 @@ async fn reopening_shard_after_cleanup_preserves_status() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
             slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
         };
 
@@ -703,6 +705,7 @@ async fn shard_created_at_preserved_across_reopen() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
             slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
         };
 
@@ -730,6 +733,7 @@ async fn shard_created_at_preserved_across_reopen() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
             slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
         };
 

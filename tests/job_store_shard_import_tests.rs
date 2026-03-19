@@ -13,6 +13,8 @@ use silo::task::{ConcurrencyAction, GubernatorRateLimitData, Task};
 use slatedb::WriteBatch;
 use std::sync::Arc;
 
+const TEST_TERMINAL_RETENTION_S: i64 = 10 * 365 * 24 * 60 * 60;
+
 fn default_retry_policy() -> RetryPolicy {
     RetryPolicy {
         retry_count: 3,
@@ -58,6 +60,7 @@ fn base_import_params(id: &str) -> ImportJobParams {
         priority: 50,
         enqueue_time_ms: 1_700_000_000_000,
         start_at_ms: 0,
+        terminal_retention_s: Some(TEST_TERMINAL_RETENTION_S),
         retry_policy: None,
         payload: test_helpers::msgpack_payload(&serde_json::json!({"imported": true})),
         limits: vec![],
@@ -1107,10 +1110,10 @@ async fn do_reimport(
             "expected at least 1 task after non-terminal reimport, got {tasks_after}"
         );
     } else {
-        // Terminal reimport: old task removed, no new task created
+        // Terminal reimport: old scheduling task removed, terminal cleanup task created.
         assert_eq!(
-            tasks_after, 0,
-            "expected 0 tasks after terminal reimport, got {tasks_after}"
+            tasks_after, 1,
+            "expected 1 cleanup task after terminal reimport, got {tasks_after}"
         );
     }
 
@@ -1918,7 +1921,10 @@ async fn verify_reimport_invariants_inner(
                 "{ctx} should have exactly 1 task key when Scheduled"
             );
         } else {
-            assert_eq!(task_count, 0, "{ctx} should have 0 task keys when terminal");
+            assert_eq!(
+                task_count, 1,
+                "{ctx} should have exactly 1 cleanup task key when terminal"
+            );
         }
     }
 
@@ -1995,6 +2001,7 @@ fn build_reimport_params(
         priority: 50,
         enqueue_time_ms: 1_700_000_000_000,
         start_at_ms: 0,
+        terminal_retention_s: Some(TEST_TERMINAL_RETENTION_S),
         retry_policy: Some(RetryPolicy {
             retry_count: 10, // generous to always allow retries when non-terminal
             initial_interval_ms: 10,

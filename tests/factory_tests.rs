@@ -16,6 +16,7 @@ fn make_fs_factory(tmp: &tempfile::TempDir) -> Arc<ShardFactory> {
         wal: None,
         apply_wal_on_close: true,
         concurrency_reconcile_interval_ms: 5000,
+        default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
         slatedb: None,
     };
     Arc::new(ShardFactory::new(
@@ -43,6 +44,7 @@ fn make_fs_factory_with_wal(
         }),
         apply_wal_on_close: true,
         concurrency_reconcile_interval_ms: 5000,
+        default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
         slatedb: None,
     };
     Arc::new(ShardFactory::new(
@@ -282,6 +284,7 @@ async fn open_invalid_template_no_placeholder() {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
             slatedb: None,
         },
         MockGubernatorClient::new_arc(),
@@ -309,6 +312,7 @@ async fn open_invalid_template_bad_boundary() {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
             slatedb: None,
         },
         MockGubernatorClient::new_arc(),

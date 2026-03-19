@@ -654,6 +654,7 @@ async fn counters_survive_close_and_reopen() {
                 path: config.wal_dir.path().to_string_lossy().to_string(),
             }),
             apply_wal_on_close: true,
+            default_terminal_retention_s: silo::settings::DEFAULT_TERMINAL_RETENTION_S,
             slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
         };
 

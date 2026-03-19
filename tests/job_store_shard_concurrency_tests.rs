@@ -621,6 +621,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
             Task::RequestTicket { .. } => {}
             Task::CheckRateLimit { .. } => {}
             Task::RefreshFloatingLimit { .. } => {}
+            Task::DeleteTerminalJob { .. } => {}
         }
     }
 
@@ -969,6 +970,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
             Task::RequestTicket { .. } => {}
             Task::CheckRateLimit { .. } => {}
             Task::RefreshFloatingLimit { .. } => {}
+            Task::DeleteTerminalJob { .. } => {}
         }
     }
 

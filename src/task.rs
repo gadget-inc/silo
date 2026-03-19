@@ -72,6 +72,13 @@ pub enum Task {
         metadata: Vec<(String, String)>,
         task_group: String,
     },
+    /// Internal: delete a terminal job after its retention period elapses
+    DeleteTerminalJob {
+        tenant: String,
+        job_id: String,
+        terminal_status_changed_at_ms: i64,
+        task_group: String,
+    },
 }
 
 impl Task {
@@ -82,6 +89,7 @@ impl Task {
             Task::RequestTicket { tenant, .. } => tenant,
             Task::CheckRateLimit { tenant, .. } => tenant,
             Task::RefreshFloatingLimit { tenant, .. } => tenant,
+            Task::DeleteTerminalJob { tenant, .. } => tenant,
         }
     }
 }

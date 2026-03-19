@@ -76,6 +76,7 @@ pub struct ImportJobParams {
     pub priority: u8,
     pub enqueue_time_ms: i64,
     pub start_at_ms: i64,
+    pub terminal_retention_s: Option<i64>,
     pub retry_policy: Option<RetryPolicy>,
     pub payload: Vec<u8>,
     pub limits: Vec<Limit>,
@@ -164,6 +165,8 @@ impl JobStoreShard {
         } else {
             params.start_at_ms
         };
+        let effective_terminal_retention_s =
+            self.effective_terminal_retention_s(params.terminal_retention_s)?;
 
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
 
@@ -186,6 +189,7 @@ impl JobStoreShard {
             id: job_id.to_string(),
             priority: params.priority,
             enqueue_time_ms: effective_enqueue_time_ms,
+            terminal_retention_s: Some(effective_terminal_retention_s),
             payload: params.payload.clone(),
             retry_policy: params.retry_policy.clone(),
             metadata: params.metadata.clone().unwrap_or_default(),
@@ -193,6 +197,7 @@ impl JobStoreShard {
             task_group: params.task_group.clone(),
         };
         let job_value = encode_job_info(&job);
+        let job_view = JobView::new(job_value.clone())?;
         txn.put(&info_key, &job_value)?;
 
         // Write metadata secondary index
@@ -241,7 +246,10 @@ impl JobStoreShard {
 
         // Write status + index
         let mut writer = TxnWriter(&txn);
-        Self::write_job_status_with_index(&mut writer, tenant, job_id, job_status)?;
+        Self::write_job_status_with_index(&mut writer, tenant, job_id, job_status.clone())?;
+        if is_terminal {
+            self.schedule_terminal_cleanup_task(&mut writer, tenant, &job_view, &job_status)?;
+        }
 
         // [SILO-IMP-5] Terminal status set by determine_import_status (Succeeded/Failed/Cancelled)
         // [SILO-IMP-6] Scheduled status set by determine_import_status when retries remain
@@ -523,6 +531,7 @@ impl JobStoreShard {
             id: existing_job.id().to_string(),
             priority: existing_job.priority(),
             enqueue_time_ms: existing_job.enqueue_time_ms(),
+            terminal_retention_s: existing_job.terminal_retention_s(),
             payload: existing_job.payload_bytes().to_vec(),
             retry_policy: params.retry_policy.clone(),
             metadata: existing_job.metadata(),
@@ -541,6 +550,13 @@ impl JobStoreShard {
         let stored_limits = existing_job.limits();
         let mut matched_task_keys: Vec<Vec<u8>> = Vec::new();
         let mut released_holders: Vec<(String, Vec<String>)> = Vec::new();
+
+        if old_status.is_terminal()
+            && let Some(cleanup_key) =
+                self.clear_terminal_cleanup_task(&mut TxnWriter(&txn), &existing_job, &old_status)?
+        {
+            matched_task_keys.push(cleanup_key);
+        }
 
         if old_status.kind == JobStatusKind::Scheduled {
             // O(1) task key reconstruction from status fields (same pattern as cancel/expedite/lease)
@@ -617,8 +633,16 @@ impl JobStoreShard {
         // === Update status, scheduling state, and counters ===
         let mut writer = TxnWriter(&txn);
 
-        self.set_job_status_with_index(&mut writer, tenant, job_id, new_job_status)
+        self.set_job_status_with_index(&mut writer, tenant, job_id, new_job_status.clone())
             .await?;
+        if is_terminal {
+            self.schedule_terminal_cleanup_task(
+                &mut writer,
+                tenant,
+                &existing_job,
+                &new_job_status,
+            )?;
+        }
 
         // Clean up cancelled key: cancel_job writes a separate cancelled key that blocks
         // lease creation. The marker can outlive Cancelled status (for example when a

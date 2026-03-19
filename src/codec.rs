@@ -206,6 +206,26 @@ fn build_task_union<'a, A: flatbuffers::Allocator + 'a>(
             );
             (fb::TaskVariant::RefreshFloatingLimit, rfl.as_union_value())
         }
+        Task::DeleteTerminalJob {
+            tenant,
+            job_id,
+            terminal_status_changed_at_ms,
+            task_group,
+        } => {
+            let tenant = builder.create_string(tenant);
+            let job_id = builder.create_string(job_id);
+            let task_group = builder.create_string(task_group);
+            let dtj = fb::DeleteTerminalJob::create(
+                builder,
+                &fb::DeleteTerminalJobArgs {
+                    tenant: Some(tenant),
+                    job_id: Some(job_id),
+                    terminal_status_changed_at_ms: *terminal_status_changed_at_ms,
+                    task_group: Some(task_group),
+                },
+            );
+            (fb::TaskVariant::DeleteTerminalJob, dtj.as_union_value())
+        }
     }
 }
 
@@ -416,6 +436,7 @@ pub fn encode_job_info(job: &JobInfo) -> Vec<u8> {
             id: Some(id),
             priority: job.priority,
             enqueue_time_ms: job.enqueue_time_ms,
+            terminal_retention_s: job.terminal_retention_s,
             payload: Some(payload),
             retry_policy,
             metadata: Some(metadata),
@@ -640,6 +661,15 @@ fn task_from_fb_variant(
                 task_group: rfl.task_group().unwrap_or_default().to_string(),
             })
         }
+        fb::TaskVariant::DeleteTerminalJob => {
+            let dtj = unsafe { fb::DeleteTerminalJob::init_from_table(table) };
+            Ok(Task::DeleteTerminalJob {
+                tenant: dtj.tenant().unwrap_or_default().to_string(),
+                job_id: dtj.job_id().unwrap_or_default().to_string(),
+                terminal_status_changed_at_ms: dtj.terminal_status_changed_at_ms(),
+                task_group: dtj.task_group().unwrap_or_default().to_string(),
+            })
+        }
         _ => Err(CodecError::Flatbuffer(format!(
             "unknown task variant type: {:?}",
             vtype
@@ -759,6 +789,7 @@ impl DecodedTask {
             RequestTicket => variant_as_request_ticket,
             CheckRateLimit => variant_as_check_rate_limit,
             RefreshFloatingLimit => variant_as_refresh_floating_limit,
+            DeleteTerminalJob => variant_as_delete_terminal_job,
         )
     }
 
@@ -768,6 +799,7 @@ impl DecodedTask {
             RequestTicket => variant_as_request_ticket,
             CheckRateLimit => variant_as_check_rate_limit,
             RefreshFloatingLimit => variant_as_refresh_floating_limit,
+            DeleteTerminalJob => variant_as_delete_terminal_job,
         )
     }
 
@@ -785,6 +817,10 @@ impl DecodedTask {
 
     pub fn as_refresh_floating_limit(&self) -> Option<fb::RefreshFloatingLimit<'_>> {
         self.fb().variant_as_refresh_floating_limit()
+    }
+
+    pub fn as_delete_terminal_job(&self) -> Option<fb::DeleteTerminalJob<'_>> {
+        self.fb().variant_as_delete_terminal_job()
     }
 
     /// Materialize a fully-owned Task from the FlatBuffer data.

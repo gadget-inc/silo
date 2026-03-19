@@ -494,6 +494,7 @@ impl JobsScanner {
             Field::new("id", DataType::Utf8, false),
             Field::new("priority", DataType::UInt8, false),
             Field::new("enqueue_time_ms", DataType::Int64, false),
+            Field::new("terminal_retention_s", DataType::Int64, true),
             Field::new("payload", DataType::Utf8, true),
             Field::new("status_kind", DataType::Utf8, true),
             Field::new("status_changed_at_ms", DataType::Int64, true),
@@ -524,7 +525,7 @@ impl JobsScanner {
 /// Captures what columns the DataFusion projection requires, so we can pick
 /// the most efficient scan path and skip fetches we don't need.
 struct ProjectionNeeds {
-    /// Needs fields only in job_info: priority, enqueue_time_ms, payload, task_group, metadata
+    /// Needs fields only in job_info: priority, enqueue_time_ms, terminal_retention_s, payload, task_group, metadata
     need_job_info: bool,
     /// Needs fields available from the status/time index key: status_kind, status_changed_at_ms
     need_status_index_fields: bool,
@@ -546,7 +547,12 @@ fn analyze_projection(projection: &SchemaRef, strategy: &JobsScanStrategy) -> Pr
     let need_job_info = projection.fields().iter().any(|f| {
         matches!(
             f.name().as_str(),
-            "priority" | "enqueue_time_ms" | "payload" | "task_group" | "metadata"
+            "priority"
+                | "enqueue_time_ms"
+                | "terminal_retention_s"
+                | "payload"
+                | "task_group"
+                | "metadata"
         )
     });
     // status_kind and status_changed_at_ms are encoded in the status/time index key, so
@@ -1072,6 +1078,12 @@ fn build_job_pairs_batch(
                     .iter()
                     .map(|p| jobs_map.get(&p.1).map_or(0, |v| v.enqueue_time_ms()))
                     .collect::<Vec<i64>>(),
+            )),
+            "terminal_retention_s" => Arc::new(Int64Array::from(
+                pairs
+                    .iter()
+                    .map(|p| jobs_map.get(&p.1).and_then(|v| v.terminal_retention_s()))
+                    .collect::<Vec<Option<i64>>>(),
             )),
             "payload" => Arc::new(StringArray::from(
                 pairs

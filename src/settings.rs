@@ -161,9 +161,14 @@ fn default_apply_wal_on_close() -> bool {
 }
 
 pub const DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS: u64 = 5000;
+pub const DEFAULT_TERMINAL_RETENTION_S: i64 = 7 * 24 * 60 * 60;
 
 fn default_concurrency_reconcile_interval_ms() -> u64 {
     DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS
+}
+
+fn default_terminal_retention_s() -> i64 {
+    DEFAULT_TERMINAL_RETENTION_S
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -190,6 +195,9 @@ pub struct DatabaseTemplate {
     /// to self-heal from missed in-memory notifications.
     #[serde(default = "default_concurrency_reconcile_interval_ms")]
     pub concurrency_reconcile_interval_ms: u64,
+    /// Default retention in seconds for jobs after they reach a terminal state.
+    #[serde(default = "default_terminal_retention_s")]
+    pub default_terminal_retention_s: i64,
     /// Optional SlateDB-specific settings for tuning database performance.
     /// If not specified, SlateDB defaults are used. When partially specified,
     /// unspecified fields use SlateDB defaults.
@@ -424,6 +432,9 @@ pub struct DatabaseConfig {
     /// Defaults to true when WAL is configured.
     #[serde(default = "default_apply_wal_on_close")]
     pub apply_wal_on_close: bool,
+    /// Default retention in seconds for jobs after they reach a terminal state.
+    #[serde(default = "default_terminal_retention_s")]
+    pub default_terminal_retention_s: i64,
     /// Optional SlateDB-specific settings for tuning database performance.
     /// If not specified, SlateDB defaults are used. When partially specified,
     /// unspecified fields use SlateDB defaults.
@@ -544,6 +555,7 @@ impl AppConfig {
                 wal: None,
                 apply_wal_on_close: true,
                 concurrency_reconcile_interval_ms: default_concurrency_reconcile_interval_ms(),
+                default_terminal_retention_s: default_terminal_retention_s(),
                 slatedb: None,
             },
         };
