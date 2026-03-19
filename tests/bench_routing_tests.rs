@@ -89,6 +89,7 @@ async fn bench_tenant_routing_with_shard_ranges() -> anyhow::Result<()> {
                     tenant: Some(tenant.to_string()),
                     metadata: std::collections::HashMap::new(),
                     task_group: "default".to_string(),
+                    terminal_retention_s: None,
                 })
                 .await;
 
@@ -134,6 +135,7 @@ async fn bench_tenant_routing_with_shard_ranges() -> anyhow::Result<()> {
                     tenant: Some(wrong_tenant.to_string()),
                     metadata: std::collections::HashMap::new(),
                     task_group: "default".to_string(),
+                    terminal_retention_s: None,
                 })
                 .await;
 

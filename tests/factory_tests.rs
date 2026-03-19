@@ -1,5 +1,7 @@
 //! Tests for ShardFactory: close, reset, clone, and template path validation.
 
+use std::time::Duration;
+
 mod test_helpers;
 
 use silo::factory::ShardFactory;
@@ -16,6 +18,8 @@ fn make_fs_factory(tmp: &tempfile::TempDir) -> Arc<ShardFactory> {
         wal: None,
         apply_wal_on_close: true,
         concurrency_reconcile_interval_ms: 5000,
+        default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+        retention_scan_interval: Duration::from_secs(86400),
         slatedb: None,
         memory_cache: None,
     };
@@ -44,6 +48,8 @@ fn make_fs_factory_with_wal(
         }),
         apply_wal_on_close: true,
         concurrency_reconcile_interval_ms: 5000,
+        default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+        retention_scan_interval: Duration::from_secs(86400),
         slatedb: None,
         memory_cache: None,
     };
@@ -284,6 +290,8 @@ async fn open_invalid_template_no_placeholder() {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
             slatedb: None,
             memory_cache: None,
         },
@@ -312,6 +320,8 @@ async fn open_invalid_template_bad_boundary() {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
             slatedb: None,
             memory_cache: None,
         },

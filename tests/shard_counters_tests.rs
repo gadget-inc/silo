@@ -1,3 +1,4 @@
+use std::time::Duration;
 mod test_helpers;
 
 use silo::job::JobStatusKind;
@@ -654,6 +655,8 @@ async fn counters_survive_close_and_reopen() {
                 path: config.wal_dir.path().to_string_lossy().to_string(),
             }),
             apply_wal_on_close: true,
+            default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
             slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
             memory_cache: None,
         };

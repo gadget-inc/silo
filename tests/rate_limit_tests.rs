@@ -3,6 +3,8 @@
 //! These tests require a real Gubernator server running at localhost:9992.
 //! Run with: `process-compose up` to start the required services.
 
+use std::time::Duration;
+
 mod test_helpers;
 
 use std::sync::Arc;
@@ -48,6 +50,8 @@ async fn open_shard_with_gubernator()
         path: tmp.path().to_string_lossy().to_string(),
         wal: None,
         apply_wal_on_close: true,
+        default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+        retention_scan_interval: Duration::from_secs(86400),
         slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
         memory_cache: None,
     };

@@ -29,6 +29,7 @@ async fn lease_task_grpc_basic() -> anyhow::Result<()> {
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
+                terminal_retention_s: None,
             })
             .await?
             .into_inner();
@@ -153,6 +154,7 @@ async fn lease_task_grpc_already_running() -> anyhow::Result<()> {
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
+                terminal_retention_s: None,
             })
             .await?
             .into_inner();

@@ -2021,6 +2021,7 @@ version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f88959de2d447fd3eddcf1909d1f19fe084e27a056a6904203dc5d8b9e771c1e"
 dependencies = [
+ "chrono",
  "rust_decimal",
  "serde",
  "thiserror 2.0.16",
@@ -5394,6 +5395,7 @@ dependencies = [
  "dashmap",
  "datafusion",
  "datafusion-sql",
+ "duration-str",
  "etcd-client",
  "fastrand",
  "flatbuffers",
