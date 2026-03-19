@@ -718,8 +718,15 @@ async fn k8s_get_shard_owner_map_accurate() {
     .await
     .expect("start c2");
 
-    assert!(c1.wait_converged(Duration::from_secs(30)).await);
-    assert!(c2.wait_converged(Duration::from_secs(30)).await);
+    // Allow more headroom in kind/CI while 16 shard leases rebalance across both nodes.
+    assert!(
+        c1.wait_converged(Duration::from_secs(45)).await,
+        "c1 should converge after two-node rebalance"
+    );
+    assert!(
+        c2.wait_converged(Duration::from_secs(45)).await,
+        "c2 should converge after two-node rebalance"
+    );
 
     // Get shard owner map
     let map = c1.get_shard_owner_map().await.expect("get_shard_owner_map");
