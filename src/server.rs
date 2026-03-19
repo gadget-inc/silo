@@ -2003,6 +2003,18 @@ where
         .expect("failed to build reflection service");
 
     let serve = tonic::transport::Server::builder()
+        // Increase HTTP/2 flow-control windows to improve throughput under
+        // high concurrency. The defaults (64 KiB stream, 1 MiB connection)
+        // can bottleneck when many streams are active simultaneously.
+        .initial_connection_window_size(Some(4 * 1024 * 1024)) // 4 MiB
+        .initial_stream_window_size(Some(2 * 1024 * 1024)) // 2 MiB
+        // Increase the number of reset streams the h2 layer remembers.
+        // When a stream is reset (e.g. due to "shard not ready" errors),
+        // h2 tracks it to correctly handle late-arriving frames. The
+        // default (20) is too low for burst traffic — when exceeded,
+        // evicted streams cause RST_STREAM with code 5 (STREAM_CLOSED)
+        // on late frames, which surfaces as gRPC INTERNAL errors.
+        .http2_max_pending_accept_reset_streams(Some(1000))
         .add_service(health_service)
         .add_service(reflection_service)
         .add_service(server)

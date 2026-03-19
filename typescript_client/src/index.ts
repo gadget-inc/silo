@@ -16,6 +16,7 @@ export {
   SiloResourceExhaustedError,
   SiloUnavailableError,
   SiloDeadlineExceededError,
+  isConnectivityError,
   initHasher,
   hashTenant,
   shardForTenant,
