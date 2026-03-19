@@ -942,11 +942,24 @@ function isWrongShardError(error: unknown): boolean {
 /**
  * Check if an error indicates a connectivity problem that may be resolved
  * by refreshing topology and retrying on a different server.
- * @internal
+ *
+ * Matches UNAVAILABLE, DEADLINE_EXCEEDED, and INTERNAL errors caused by
+ * HTTP/2 stream failures (e.g. RST_STREAM with code 5 when the h2 layer
+ * evicts a reset stream from memory and late-arriving frames trigger
+ * STREAM_CLOSED). These transport-level INTERNAL errors are transient
+ * and safe to retry with topology refresh.
  */
-function isConnectivityError(error: unknown): boolean {
+export function isConnectivityError(error: unknown): boolean {
   if (error instanceof RpcError) {
-    return error.code === "UNAVAILABLE" || error.code === "DEADLINE_EXCEEDED";
+    if (error.code === "UNAVAILABLE" || error.code === "DEADLINE_EXCEEDED") {
+      return true;
+    }
+    // RST_STREAM errors surface as INTERNAL with a message like
+    // "Received RST_STREAM with code <N>". These are transport-level
+    // failures (e.g. stream exhaustion) and should be retried.
+    if (error.code === "INTERNAL" && error.message.includes("RST_STREAM")) {
+      return true;
+    }
   }
   return false;
 }
@@ -1240,10 +1253,18 @@ export class SiloGRPCClient {
 
     // Default gRPC service config with retry policy for transient failures.
     // Only RESOURCE_EXHAUSTED is retried at the gRPC level (server-side
-    // backpressure on a live connection). UNAVAILABLE is NOT retried here
-    // because our application-level retry (_withShardRetry) handles it with
-    // topology refresh, allowing re-routing to a different server instead of
-    // repeatedly hitting the same dead connection.
+    // backpressure on a live connection).
+    // INTERNAL is NOT retried here because the silo server uses
+    // Status::internal() for deterministic errors (query failures, storage
+    // errors, codec errors) that would fail on every retry. Transport-level
+    // INTERNAL errors like RST_STREAM are instead handled by our
+    // application-level retry (isConnectivityError + _withShardRetry),
+    // which can match on the error message to distinguish transient
+    // RST_STREAM failures from permanent server errors.
+    // UNAVAILABLE is NOT retried here because our application-level retry
+    // (_withShardRetry) handles it with topology refresh, allowing
+    // re-routing to a different server instead of repeatedly hitting the
+    // same dead connection.
     const defaultServiceConfig = {
       methodConfig: [
         {
