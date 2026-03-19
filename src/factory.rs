@@ -93,6 +93,8 @@ impl ShardFactory {
                 wal: None,
                 apply_wal_on_close: false,
                 concurrency_reconcile_interval_ms: 5000,
+                default_terminal_retention: crate::settings::DEFAULT_TERMINAL_RETENTION,
+                retention_scan_interval: crate::settings::DEFAULT_RETENTION_SCAN_INTERVAL,
                 slatedb: None,
                 memory_cache: None,
             },
@@ -196,6 +198,8 @@ impl ShardFactory {
                         concurrency_reconcile_interval: Duration::from_millis(
                             template.concurrency_reconcile_interval_ms.max(1),
                         ),
+                        default_terminal_retention: template.default_terminal_retention,
+                        retention_scan_interval: template.retention_scan_interval,
                     },
                     range.clone(),
                 )

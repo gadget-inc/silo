@@ -200,6 +200,7 @@ table JobInfo {
   id: string;
   priority: ubyte;
   enqueue_time_ms: int64;
+  terminal_retention_s: int64 = null;
   payload: [ubyte];
   retry_policy: RetryPolicy;
   metadata: [KeyValuePair];

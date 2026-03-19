@@ -111,6 +111,7 @@ async fn siloctl_job_get() -> anyhow::Result<()> {
                     .into_iter()
                     .collect(),
                 task_group: "default".to_string(),
+                terminal_retention_s: None,
             })
             .await?;
 
@@ -241,6 +242,7 @@ async fn siloctl_job_cancel() -> anyhow::Result<()> {
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
+                terminal_retention_s: None,
             })
             .await?;
 
@@ -312,6 +314,7 @@ async fn siloctl_job_restart() -> anyhow::Result<()> {
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
+                terminal_retention_s: None,
             })
             .await?;
 
@@ -391,6 +394,7 @@ async fn siloctl_job_expedite() -> anyhow::Result<()> {
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
+                terminal_retention_s: None,
             })
             .await?;
 
@@ -484,6 +488,7 @@ async fn siloctl_job_delete() -> anyhow::Result<()> {
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
+                terminal_retention_s: None,
             })
             .await?;
 
@@ -564,6 +569,7 @@ async fn siloctl_query() -> anyhow::Result<()> {
                     tenant: None,
                     metadata: std::collections::HashMap::new(),
                     task_group: "default".to_string(),
+                    terminal_retention_s: None,
                 })
                 .await?;
         }
@@ -644,6 +650,7 @@ async fn siloctl_job_get_with_attempts() -> anyhow::Result<()> {
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
+                terminal_retention_s: None,
             })
             .await?;
 
@@ -1147,6 +1154,7 @@ async fn siloctl_auto_routes_job_commands_multi_shard() -> anyhow::Result<()> {
                     tenant: None,
                     metadata: std::collections::HashMap::new(),
                     task_group: "default".to_string(),
+                    terminal_retention_s: None,
                 })
                 .await?;
         }
@@ -1348,6 +1356,7 @@ async fn enqueue_and_complete_job(
             tenant: None,
             metadata: std::collections::HashMap::new(),
             task_group: "default".to_string(),
+            terminal_retention_s: None,
         })
         .await?;
 
@@ -1406,6 +1415,7 @@ async fn enqueue_and_fail_job(
             tenant: None,
             metadata: std::collections::HashMap::new(),
             task_group: "default".to_string(),
+            terminal_retention_s: None,
         })
         .await?;
 
@@ -1717,6 +1727,7 @@ async fn siloctl_job_result_not_terminal() -> anyhow::Result<()> {
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
+                terminal_retention_s: None,
             })
             .await?;
 

@@ -248,6 +248,10 @@ export interface EnqueueRequest {
      * @generated from protobuf field: string task_group = 10
      */
     taskGroup: string; // Task group for organizing tasks. Required. Tasks are enqueued into this group.
+    /**
+     * @generated from protobuf field: optional int64 terminal_retention_s = 11
+     */
+    terminalRetentionS?: bigint; // How long to retain the job after it reaches a terminal state.
 }
 /**
  * Response after successfully enqueueing a job.
@@ -386,6 +390,10 @@ export interface GetJobResponse {
      * @generated from protobuf field: optional silo.v1.SerializedBytes result = 13
      */
     result?: SerializedBytes; // Result data from the last attempt, if the job succeeded.
+    /**
+     * @generated from protobuf field: optional int64 terminal_retention_s = 14
+     */
+    terminalRetentionS?: bigint; // Stored terminal retention for this job, if set.
 }
 /**
  * Request to get the result of a completed job.
@@ -1498,6 +1506,10 @@ export interface ImportJobRequest {
      * @generated from protobuf field: repeated silo.v1.ImportAttempt attempts = 12
      */
     attempts: ImportAttempt[]; // Historical attempts, all terminal.
+    /**
+     * @generated from protobuf field: optional int64 terminal_retention_s = 13
+     */
+    terminalRetentionS?: bigint; // How long to retain the job after it reaches a terminal state.
 }
 /**
  * Batch request to import multiple jobs.
@@ -2247,7 +2259,8 @@ class EnqueueRequest$Type extends MessageType<EnqueueRequest> {
             { no: 7, name: "limits", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => Limit },
             { no: 8, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
             { no: 9, name: "metadata", kind: "map", K: 9 /*ScalarType.STRING*/, V: { kind: "scalar", T: 9 /*ScalarType.STRING*/ } },
-            { no: 10, name: "task_group", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+            { no: 10, name: "task_group", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 11, name: "terminal_retention_s", kind: "scalar", opt: true, T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ }
         ]);
     }
     create(value?: PartialMessage<EnqueueRequest>): EnqueueRequest {
@@ -2297,6 +2310,9 @@ class EnqueueRequest$Type extends MessageType<EnqueueRequest> {
                     break;
                 case /* string task_group */ 10:
                     message.taskGroup = reader.string();
+                    break;
+                case /* optional int64 terminal_retention_s */ 11:
+                    message.terminalRetentionS = reader.int64().toBigInt();
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -2356,6 +2372,9 @@ class EnqueueRequest$Type extends MessageType<EnqueueRequest> {
         /* string task_group = 10; */
         if (message.taskGroup !== "")
             writer.tag(10, WireType.LengthDelimited).string(message.taskGroup);
+        /* optional int64 terminal_retention_s = 11; */
+        if (message.terminalRetentionS !== undefined)
+            writer.tag(11, WireType.Varint).int64(message.terminalRetentionS);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -2606,7 +2625,8 @@ class GetJobResponse$Type extends MessageType<GetJobResponse> {
             { no: 10, name: "attempts", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => JobAttempt },
             { no: 11, name: "next_attempt_starts_after_ms", kind: "scalar", opt: true, T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
             { no: 12, name: "task_group", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
-            { no: 13, name: "result", kind: "message", T: () => SerializedBytes }
+            { no: 13, name: "result", kind: "message", T: () => SerializedBytes },
+            { no: 14, name: "terminal_retention_s", kind: "scalar", opt: true, T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ }
         ]);
     }
     create(value?: PartialMessage<GetJobResponse>): GetJobResponse {
@@ -2667,6 +2687,9 @@ class GetJobResponse$Type extends MessageType<GetJobResponse> {
                     break;
                 case /* optional silo.v1.SerializedBytes result */ 13:
                     message.result = SerializedBytes.internalBinaryRead(reader, reader.uint32(), options, message.result);
+                    break;
+                case /* optional int64 terminal_retention_s */ 14:
+                    message.terminalRetentionS = reader.int64().toBigInt();
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -2735,6 +2758,9 @@ class GetJobResponse$Type extends MessageType<GetJobResponse> {
         /* optional silo.v1.SerializedBytes result = 13; */
         if (message.result)
             SerializedBytes.internalBinaryWrite(message.result, writer.tag(13, WireType.LengthDelimited).fork(), options).join();
+        /* optional int64 terminal_retention_s = 14; */
+        if (message.terminalRetentionS !== undefined)
+            writer.tag(14, WireType.Varint).int64(message.terminalRetentionS);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -6081,7 +6107,8 @@ class ImportJobRequest$Type extends MessageType<ImportJobRequest> {
             { no: 9, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
             { no: 10, name: "metadata", kind: "map", K: 9 /*ScalarType.STRING*/, V: { kind: "scalar", T: 9 /*ScalarType.STRING*/ } },
             { no: 11, name: "task_group", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
-            { no: 12, name: "attempts", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => ImportAttempt }
+            { no: 12, name: "attempts", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => ImportAttempt },
+            { no: 13, name: "terminal_retention_s", kind: "scalar", opt: true, T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ }
         ]);
     }
     create(value?: PartialMessage<ImportJobRequest>): ImportJobRequest {
@@ -6139,6 +6166,9 @@ class ImportJobRequest$Type extends MessageType<ImportJobRequest> {
                     break;
                 case /* repeated silo.v1.ImportAttempt attempts */ 12:
                     message.attempts.push(ImportAttempt.internalBinaryRead(reader, reader.uint32(), options));
+                    break;
+                case /* optional int64 terminal_retention_s */ 13:
+                    message.terminalRetentionS = reader.int64().toBigInt();
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -6204,6 +6234,9 @@ class ImportJobRequest$Type extends MessageType<ImportJobRequest> {
         /* repeated silo.v1.ImportAttempt attempts = 12; */
         for (let i = 0; i < message.attempts.length; i++)
             ImportAttempt.internalBinaryWrite(message.attempts[i], writer.tag(12, WireType.LengthDelimited).fork(), options).join();
+        /* optional int64 terminal_retention_s = 13; */
+        if (message.terminalRetentionS !== undefined)
+            writer.tag(13, WireType.Varint).int64(message.terminalRetentionS);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);

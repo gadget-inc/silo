@@ -76,6 +76,7 @@ pub struct ImportJobParams {
     pub priority: u8,
     pub enqueue_time_ms: i64,
     pub start_at_ms: i64,
+    pub terminal_retention_s: Option<i64>,
     pub retry_policy: Option<RetryPolicy>,
     pub payload: Vec<u8>,
     pub limits: Vec<Limit>,
@@ -164,6 +165,8 @@ impl JobStoreShard {
         } else {
             params.start_at_ms
         };
+        let effective_terminal_retention_s =
+            self.effective_terminal_retention_s(params.terminal_retention_s)?;
 
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
 
@@ -186,6 +189,7 @@ impl JobStoreShard {
             id: job_id.to_string(),
             priority: params.priority,
             enqueue_time_ms: effective_enqueue_time_ms,
+            terminal_retention_s: Some(effective_terminal_retention_s),
             payload: params.payload.clone(),
             retry_policy: params.retry_policy.clone(),
             metadata: params.metadata.clone().unwrap_or_default(),
@@ -523,6 +527,7 @@ impl JobStoreShard {
             id: existing_job.id().to_string(),
             priority: existing_job.priority(),
             enqueue_time_ms: existing_job.enqueue_time_ms(),
+            terminal_retention_s: existing_job.terminal_retention_s(),
             payload: existing_job.payload_bytes().to_vec(),
             retry_policy: params.retry_policy.clone(),
             metadata: existing_job.metadata(),

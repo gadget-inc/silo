@@ -151,6 +151,8 @@ You can only delete jobs that have finished processing. Jobs must be in one of t
 Attempting to delete a Scheduled or Running job will throw an error.
 </Aside>
 
+Terminal jobs can also be deleted automatically by retention. By default, Silo keeps terminal jobs for 7 days before removing them, and you can override that per job with `terminal_retention_s`.
+
 ### Deletion Errors
 
 | Error | Condition |
@@ -177,6 +179,8 @@ if (status === JobStatus.Cancelled) {
 ## Restarting Jobs
 
 Restarting allows you to re-run a job that has stopped—either because it was cancelled or because it failed after exhausting its retries. The job is re-queued with a fresh retry counter, giving it another set of chances to successfully complete.
+
+If the job had a pending retention-based auto-delete scheduled from its previous terminal state, restart clears that pending delete.
 
 ### When to Restart
 

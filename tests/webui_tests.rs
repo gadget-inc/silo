@@ -1,3 +1,4 @@
+use std::time::Duration;
 mod test_helpers;
 
 use axum::{
@@ -35,6 +36,8 @@ async fn setup_test_state_with_tenancy(
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
             slatedb: None,
             memory_cache: None,
         },
@@ -410,6 +413,8 @@ async fn setup_multi_shard_state_with_tenancy(
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
             slatedb: None,
             memory_cache: None,
         },

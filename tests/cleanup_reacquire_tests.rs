@@ -5,6 +5,8 @@
 //! 2. When a shard is closed mid-cleanup, the cleanup is gracefully aborted and progress is saved
 //! 3. Cleanup can be resumed from where it left off after re-acquisition
 
+use std::time::Duration;
+
 mod test_helpers;
 use test_helpers::{
     count_job_info_keys, count_job_info_keys_for_tenant, fast_flush_slatedb_settings,
@@ -64,6 +66,8 @@ async fn background_cleanup_spawns_when_cleanup_pending() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
             slatedb: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
         };
@@ -98,6 +102,8 @@ async fn background_cleanup_spawns_when_cleanup_pending() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
             slatedb: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
         };
@@ -148,6 +154,8 @@ async fn background_cleanup_resumes_when_cleanup_was_running() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
             slatedb: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
         };
@@ -177,6 +185,8 @@ async fn background_cleanup_resumes_when_cleanup_was_running() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
             slatedb: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
         };
@@ -219,6 +229,8 @@ async fn background_cleanup_runs_compaction_when_cleanup_done() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
             slatedb: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
         };
@@ -244,6 +256,8 @@ async fn background_cleanup_runs_compaction_when_cleanup_done() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
             slatedb: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
         };
@@ -286,6 +300,8 @@ async fn no_cleanup_when_already_complete() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
             slatedb: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
         };
@@ -314,6 +330,8 @@ async fn no_cleanup_when_already_complete() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
             slatedb: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
         };
@@ -355,6 +373,8 @@ async fn cleanup_cancelled_on_shard_close() {
         path: path.clone(),
         wal: None,
         apply_wal_on_close: true,
+        default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+        retention_scan_interval: Duration::from_secs(86400),
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
     };
@@ -415,6 +435,8 @@ async fn cleanup_progress_saved_on_cancellation() {
         path: path.clone(),
         wal: None,
         apply_wal_on_close: true,
+        default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+        retention_scan_interval: Duration::from_secs(86400),
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
     };
@@ -509,6 +531,8 @@ async fn cleanup_result_indicates_cancellation() {
         path: path.clone(),
         wal: None,
         apply_wal_on_close: true,
+        default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+        retention_scan_interval: Duration::from_secs(86400),
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
     };
@@ -575,6 +599,8 @@ async fn cleanup_handles_multiple_close_calls() {
         path: path.clone(),
         wal: None,
         apply_wal_on_close: true,
+        default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+        retention_scan_interval: Duration::from_secs(86400),
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
     };
@@ -617,6 +643,8 @@ async fn full_reacquisition_cycle_triggers_cleanup() {
         path: path.clone(),
         wal: None,
         apply_wal_on_close: true,
+        default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+        retention_scan_interval: Duration::from_secs(86400),
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
     };
@@ -714,6 +742,8 @@ async fn interrupted_cleanup_resumes_on_reacquisition() {
         path: path.clone(),
         wal: None,
         apply_wal_on_close: true,
+        default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+        retention_scan_interval: Duration::from_secs(86400),
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
     };

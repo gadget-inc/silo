@@ -7,6 +7,8 @@
 //! - Dequeue respects the shard's range for tasks within range
 //! - Shards opened with specific ranges work correctly
 
+use std::time::Duration;
+
 mod test_helpers;
 use test_helpers::{
     count_concurrency_holders_for_tenant, count_job_info_keys, count_job_info_keys_for_tenant,
@@ -419,6 +421,8 @@ async fn create_shard_with_uncleaned_data(
         path: tmp.path().to_string_lossy().to_string(),
         wal: None,
         apply_wal_on_close: true,
+        default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+        retention_scan_interval: Duration::from_secs(86400),
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
     };
@@ -619,6 +623,8 @@ async fn concurrency_hydration_ignores_uncleaned_holders() {
         path: tmp.path().to_string_lossy().to_string(),
         wal: None,
         apply_wal_on_close: true,
+        default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+        retention_scan_interval: Duration::from_secs(86400),
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
     };

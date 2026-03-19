@@ -1570,8 +1570,9 @@ async fn cannot_delete_job_with_pending_request() {
 #[silo::test]
 async fn concurrency_lazy_hydration_on_shard_reopen() {
     use silo::gubernator::MockGubernatorClient;
-    use silo::settings::{Backend, DatabaseConfig};
+    use silo::settings::{Backend, DEFAULT_TERMINAL_RETENTION, DatabaseConfig};
     use silo::shard_range::ShardRange;
+    use std::time::Duration;
 
     let tmp = tempfile::tempdir().unwrap();
     let cfg = DatabaseConfig {
@@ -1580,6 +1581,8 @@ async fn concurrency_lazy_hydration_on_shard_reopen() {
         path: tmp.path().to_string_lossy().to_string(),
         wal: None,
         apply_wal_on_close: true,
+        default_terminal_retention: DEFAULT_TERMINAL_RETENTION,
+        retention_scan_interval: Duration::from_secs(86400),
         slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
         memory_cache: None,
     };
@@ -1705,8 +1708,9 @@ async fn concurrency_lazy_hydration_on_shard_reopen() {
 #[silo::test]
 async fn concurrency_no_overgrant_with_lazy_hydration() {
     use silo::gubernator::MockGubernatorClient;
-    use silo::settings::{Backend, DatabaseConfig};
+    use silo::settings::{Backend, DEFAULT_TERMINAL_RETENTION, DatabaseConfig};
     use silo::shard_range::ShardRange;
+    use std::time::Duration;
 
     let tmp = tempfile::tempdir().unwrap();
     let cfg = DatabaseConfig {
@@ -1715,6 +1719,8 @@ async fn concurrency_no_overgrant_with_lazy_hydration() {
         path: tmp.path().to_string_lossy().to_string(),
         wal: None,
         apply_wal_on_close: true,
+        default_terminal_retention: DEFAULT_TERMINAL_RETENTION,
+        retention_scan_interval: Duration::from_secs(86400),
         slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
         memory_cache: None,
     };
