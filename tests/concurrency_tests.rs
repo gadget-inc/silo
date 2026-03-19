@@ -6,9 +6,25 @@ use silo::job_attempt::{AttemptOutcome, AttemptStatus};
 use silo::keys::{concurrency_holder_key, concurrency_request_key};
 use silo::retry::RetryPolicy;
 use silo::task::{ConcurrencyAction, LeaseRecord, Task};
-use slatedb::{DbIterator, WriteBatch};
+use slatedb::{Db, DbIterator, WriteBatch};
 
 use test_helpers::*;
+
+async fn count_request_ticket_tasks(db: &Db) -> usize {
+    let prefix = silo::keys::tasks_prefix();
+    let end = silo::keys::end_bound(&prefix);
+    let mut iter: DbIterator = db.scan::<Vec<u8>, _>(prefix..end).await.expect("scan");
+    let mut count = 0;
+
+    while let Some(kv) = iter.next().await.expect("next") {
+        let task = decode_task(&kv.value).expect("decode task");
+        if matches!(task, Task::RequestTicket { .. }) {
+            count += 1;
+        }
+    }
+
+    count
+}
 
 #[silo::test]
 async fn concurrency_immediate_grant_enqueues_task_and_writes_holder() {
@@ -981,7 +997,7 @@ async fn concurrency_future_request_waits_until_ready() {
         .expect("enqueue2");
 
     // RequestTicket task should exist
-    let tasks_before = count_task_keys(shard.db()).await;
+    let tasks_before = count_request_ticket_tasks(shard.db()).await;
     assert_eq!(tasks_before, 1, "should have 1 RequestTicket task");
 
     // Complete job 1 BEFORE job 2 is ready -> should NOT grant yet
@@ -991,7 +1007,7 @@ async fn concurrency_future_request_waits_until_ready() {
         .expect("report1");
 
     // RequestTicket task should still exist (not granted because start_time_ms > now)
-    let tasks_after = count_task_keys(shard.db()).await;
+    let tasks_after = count_request_ticket_tasks(shard.db()).await;
     assert_eq!(
         tasks_after, 1,
         "RequestTicket task should remain until start time reached"
@@ -1334,7 +1350,7 @@ async fn concurrency_future_request_granted_after_time_passes() {
 
     // Should have created a RequestTicket task scheduled at future time
     // (peek_tasks filters out future tasks, so check DB directly)
-    let tasks_in_db = count_task_keys(shard.db()).await;
+    let tasks_in_db = count_request_ticket_tasks(shard.db()).await;
     assert_eq!(
         tasks_in_db, 1,
         "should have 1 RequestTicket task in DB (future)"
@@ -1351,7 +1367,7 @@ async fn concurrency_future_request_granted_after_time_passes() {
     assert_eq!(holders_after_release, 0, "holder released");
 
     // RequestTicket task should still be there (future)
-    let tasks_still_future = count_task_keys(shard.db()).await;
+    let tasks_still_future = count_request_ticket_tasks(shard.db()).await;
     assert_eq!(tasks_still_future, 1, "RequestTicket task still present");
 
     // Simulate time passing: wait for future time + broker scan delay
@@ -1423,7 +1439,7 @@ async fn cannot_delete_job_with_future_request_ticket() {
         .expect("enqueue2");
 
     // Verify RequestTicket task exists and job status is Scheduled
-    let tasks_before = count_task_keys(shard.db()).await;
+    let tasks_before = count_request_ticket_tasks(shard.db()).await;
     assert_eq!(tasks_before, 1, "should have 1 RequestTicket task");
 
     let status = shard
