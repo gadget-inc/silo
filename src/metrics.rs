@@ -99,6 +99,11 @@ pub struct Metrics {
     slatedb_running_compactions: GaugeVec,
     slatedb_last_compaction_ts_sec: GaugeVec,
 
+    // Compaction health gauges (per-shard, updated periodically)
+    shard_l0_sst_count: GaugeVec,
+    shard_sorted_run_count: GaugeVec,
+    shard_space_amplification_percent: GaugeVec,
+
     /// Tracks previous SlateDB counter values per (stat_name, shard) for delta computation.
     /// SlateDB exposes counters as absolute values via `stat.get()`, but Prometheus counters
     /// only support `inc_by(delta)`, so we compute deltas between polls.
@@ -215,6 +220,25 @@ impl Metrics {
     /// Record a concurrency ticket being granted.
     pub fn record_concurrency_ticket_granted(&self) {
         self.concurrency_tickets_granted.inc();
+    }
+
+    /// Update compaction health metrics for a shard.
+    pub fn update_compaction_health(
+        &self,
+        shard: &str,
+        l0_count: usize,
+        sr_count: usize,
+        space_amp_percent: f64,
+    ) {
+        self.shard_l0_sst_count
+            .with_label_values(&[shard])
+            .set(l0_count as f64);
+        self.shard_sorted_run_count
+            .with_label_values(&[shard])
+            .set(sr_count as f64);
+        self.shard_space_amplification_percent
+            .with_label_values(&[shard])
+            .set(space_amp_percent);
     }
 
     /// Update SlateDB storage metrics from a shard's StatRegistry.
@@ -628,6 +652,40 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    // Compaction health gauges
+    let shard_l0_sst_count = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_shard_l0_sst_count",
+                "Number of L0 SSTs in the shard's LSM tree",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let shard_sorted_run_count = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_shard_sorted_run_count",
+                "Number of sorted runs in the shard's LSM tree",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let shard_space_amplification_percent = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_shard_space_amplification_percent",
+                "Space amplification percentage (non-bottom / bottom run size * 100)",
+            ),
+            &["shard"],
+        )?,
+    );
+
     Ok(Metrics {
         registry: Arc::new(registry),
         jobs_enqueued,
@@ -659,6 +717,9 @@ pub fn init() -> anyhow::Result<Metrics> {
         slatedb_wal_buffer_estimated_bytes,
         slatedb_running_compactions,
         slatedb_last_compaction_ts_sec,
+        shard_l0_sst_count,
+        shard_sorted_run_count,
+        shard_space_amplification_percent,
         slatedb_prev_values: Arc::new(Mutex::new(HashMap::new())),
     })
 }

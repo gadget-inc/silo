@@ -158,6 +158,8 @@ pub struct LsmState {
     pub total_l0_size: u64,
     /// Total estimated size of all sorted runs in bytes.
     pub total_sorted_run_size: u64,
+    /// Space amplification percentage: (non-bottom-run size / bottom-run size) * 100.
+    pub space_amplification_percent: f64,
 }
 
 /// Information about a single SST file.
@@ -294,6 +296,12 @@ impl JobStoreShard {
         if let Some(settings) = slatedb_settings {
             db_builder = db_builder.with_settings(settings);
         }
+
+        // Use Silo's custom compaction scheduler with space amplification trigger
+        // to aggressively clean up tombstones from high-churn job lifecycle
+        db_builder = db_builder.with_compaction_scheduler_supplier(Arc::new(
+            crate::compaction::SiloCompactionSchedulerSupplier,
+        ));
 
         let db = db_builder.build().await?;
         let db = Arc::new(db);
@@ -512,12 +520,19 @@ impl JobStoreShard {
 
         let total_l0_size: u64 = l0_ssts.iter().map(|s| s.estimated_size).sum();
         let total_sorted_run_size: u64 = sorted_runs.iter().map(|s| s.estimated_size).sum();
+        let sr_sizes: Vec<u64> = sorted_runs.iter().map(|s| s.estimated_size).collect();
+        let space_amplification_percent =
+            crate::compaction::compute_space_amplification_percent_from_sizes(
+                total_l0_size,
+                &sr_sizes,
+            );
 
         Ok(LsmState {
             l0_ssts,
             sorted_runs,
             total_l0_size,
             total_sorted_run_size,
+            space_amplification_percent,
         })
     }
 

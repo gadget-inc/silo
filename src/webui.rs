@@ -266,6 +266,7 @@ struct LsmStateView {
     total_sorted_run_size: String,
     total_size: String,
     sorted_runs: Vec<SortedRunView>,
+    space_amplification_percent: f64,
 }
 
 struct SortedRunView {
@@ -1949,6 +1950,7 @@ async fn shard_handler(
                         estimated_size: format_byte_size(sr.estimated_size),
                     })
                     .collect(),
+                space_amplification_percent: lsm.space_amplification_percent,
             }),
             Err(e) => {
                 warn!(shard_id = %params.id, error = %e, "failed to read LSM state");

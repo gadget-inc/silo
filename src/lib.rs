@@ -2,6 +2,7 @@ pub mod arrow_ipc;
 pub mod cluster_client;
 pub mod cluster_query;
 pub mod codec;
+pub mod compaction;
 pub mod concurrency;
 pub mod coordination;
 pub mod dst_events;
