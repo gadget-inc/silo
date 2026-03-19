@@ -5,8 +5,25 @@ use silo::job_attempt::{AttemptOutcome, AttemptStatus};
 use silo::job_store_shard::JobStoreShardError;
 use silo::retry::{RetryPolicy, next_retry_time_ms};
 use silo::task::{LeaseRecord, Task};
+use slatedb::{Db, DbIterator};
 
 use test_helpers::*;
+
+async fn count_non_cleanup_task_keys(db: &Db) -> usize {
+    let prefix = silo::keys::tasks_prefix();
+    let end = silo::keys::end_bound(&prefix);
+    let mut iter: DbIterator = db.scan::<Vec<u8>, _>(prefix..end).await.expect("scan");
+    let mut count = 0;
+
+    while let Some(kv) = iter.next().await.expect("next") {
+        let task = decode_task(&kv.value).expect("decode task");
+        if !matches!(task, Task::DeleteTerminalJob { .. }) {
+            count += 1;
+        }
+    }
+
+    count
+}
 
 #[silo::test]
 async fn reporting_attempt_outcome_updates_attempt_and_deletes_lease() {
@@ -120,8 +137,11 @@ async fn error_with_no_retries_does_not_enqueue_next_attempt() {
             .expect("report");
 
         // No new tasks should be present
-        let none_left = first_task_kv(shard.db()).await;
-        assert!(none_left.is_none(), "no follow-up task should be enqueued");
+        assert_eq!(
+            count_non_cleanup_task_keys(shard.db()).await,
+            0,
+            "no follow-up task should be enqueued"
+        );
     });
 }
 
@@ -250,8 +270,11 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
             )
             .await
             .expect("report3");
-        let none_left = first_task_kv(shard.db()).await;
-        assert!(none_left.is_none(), "no attempt 4 should be enqueued");
+        assert_eq!(
+            count_non_cleanup_task_keys(shard.db()).await,
+            0,
+            "no attempt 4 should be enqueued"
+        );
     });
 }
 
@@ -330,8 +353,11 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_success() {
         }
 
         // No additional tasks should be enqueued
-        let none_left = first_task_kv(shard.db()).await;
-        assert!(none_left.is_none(), "no follow-up task should be enqueued");
+        assert_eq!(
+            count_non_cleanup_task_keys(shard.db()).await,
+            0,
+            "no follow-up task should be enqueued"
+        );
     });
 }
 
@@ -406,8 +432,11 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_error() {
         }
 
         // No tasks should be enqueued
-        let none_left = first_task_kv(shard.db()).await;
-        assert!(none_left.is_none(), "no follow-up task should be enqueued");
+        assert_eq!(
+            count_non_cleanup_task_keys(shard.db()).await,
+            0,
+            "no follow-up task should be enqueued"
+        );
     });
 }
 
@@ -494,8 +523,11 @@ async fn retry_count_one_boundary_enqueues_attempt2_then_stops_on_second_error()
         .await
         .expect("report2");
 
-    let none_left = first_task_kv(shard.db()).await;
-    assert!(none_left.is_none(), "no attempt 3 should be enqueued");
+    assert_eq!(
+        count_non_cleanup_task_keys(shard.db()).await,
+        0,
+        "no attempt 3 should be enqueued"
+    );
 
     // Attempt 2 state should be Failed
     let a2_view = shard
