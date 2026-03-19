@@ -251,6 +251,27 @@ struct ShardTemplate {
     split_phase: Option<String>,
     split_message: Option<String>,
     split_error: Option<String>,
+    /// LSM tree state (only available for locally-owned shards).
+    lsm_state: Option<LsmStateView>,
+    /// Success/error messages for compact operations.
+    compact_message: Option<String>,
+    compact_error: Option<String>,
+}
+
+/// View model for LSM tree state displayed in the shard detail page.
+struct LsmStateView {
+    l0_sst_count: usize,
+    total_l0_size: String,
+    sorted_run_count: usize,
+    total_sorted_run_size: String,
+    total_size: String,
+    sorted_runs: Vec<SortedRunView>,
+}
+
+struct SortedRunView {
+    id: u32,
+    sst_count: usize,
+    estimated_size: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -337,6 +358,12 @@ pub struct ShardParams {
     /// Optional error message to display
     #[serde(default)]
     error: Option<String>,
+    /// Optional compact success message
+    #[serde(default)]
+    compact_message: Option<String>,
+    /// Optional compact error message
+    #[serde(default)]
+    compact_error: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -347,6 +374,22 @@ pub struct SplitFormParams {
     /// Auto-compute midpoint
     #[serde(default)]
     auto: bool,
+}
+
+fn format_byte_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.2} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.2} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 fn format_uptime(startup_time_ms: Option<i64>) -> String {
@@ -1888,6 +1931,34 @@ async fn shard_handler(
         }
     });
 
+    // Read LSM tree state for locally-owned shards
+    let lsm_state = if let Some(shard) = state.factory.get(&shard_id) {
+        match shard.read_lsm_state().await {
+            Ok(lsm) => Some(LsmStateView {
+                l0_sst_count: lsm.l0_ssts.len(),
+                total_l0_size: format_byte_size(lsm.total_l0_size),
+                sorted_run_count: lsm.sorted_runs.len(),
+                total_sorted_run_size: format_byte_size(lsm.total_sorted_run_size),
+                total_size: format_byte_size(lsm.total_l0_size + lsm.total_sorted_run_size),
+                sorted_runs: lsm
+                    .sorted_runs
+                    .iter()
+                    .map(|sr| SortedRunView {
+                        id: sr.id,
+                        sst_count: sr.sst_count,
+                        estimated_size: format_byte_size(sr.estimated_size),
+                    })
+                    .collect(),
+            }),
+            Err(e) => {
+                warn!(shard_id = %params.id, error = %e, "failed to read LSM state");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let template = ShardTemplate {
         nav_active: "cluster",
         tenancy_enabled: state.config.tenancy.enabled,
@@ -1909,6 +1980,9 @@ async fn shard_handler(
         split_phase,
         split_message: params.message,
         split_error: params.error,
+        lsm_state,
+        compact_message: params.compact_message,
+        compact_error: params.compact_error,
     };
 
     Html(
@@ -1983,6 +2057,45 @@ async fn shard_split_handler(
     }
 }
 
+async fn shard_compact_handler(
+    State(state): State<AppState>,
+    Path(shard_id): Path<String>,
+) -> impl IntoResponse {
+    let parsed_shard_id = match crate::shard_range::ShardId::parse(&shard_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return Redirect::to(&format!(
+                "/shard?id={}&compact_error={}",
+                shard_id,
+                urlencoding::encode("Invalid shard ID")
+            ));
+        }
+    };
+
+    let Some(shard) = state.factory.get(&parsed_shard_id) else {
+        return Redirect::to(&format!(
+            "/shard?id={}&compact_error={}",
+            shard_id,
+            urlencoding::encode("Shard not found on this node")
+        ));
+    };
+
+    match shard.submit_full_compaction().await {
+        Ok(()) => Redirect::to(&format!(
+            "/shard?id={}&compact_message={}",
+            shard_id,
+            urlencoding::encode(
+                "Full compaction submitted successfully. The compactor will process it in the background."
+            )
+        )),
+        Err(e) => Redirect::to(&format!(
+            "/shard?id={}&compact_error={}",
+            shard_id,
+            urlencoding::encode(&format!("Compaction failed: {}", e))
+        )),
+    }
+}
+
 async fn not_found_handler(State(state): State<AppState>) -> impl IntoResponse {
     Html(
         ErrorTemplate {
@@ -2009,6 +2122,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/cluster", get(cluster_handler))
         .route("/shard", get(shard_handler))
         .route("/shard/:id/split", post(shard_split_handler))
+        .route("/shard/:id/compact", post(shard_compact_handler))
         .route("/sql", get(sql_handler))
         .route("/sql/execute", get(sql_execute_handler))
         .route("/config", get(config_handler))
