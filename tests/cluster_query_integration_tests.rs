@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tonic::transport::Channel;
+use tracing::warn;
 use uuid::Uuid;
 
 const NUM_SHARDS: u32 = 16;
@@ -46,6 +47,53 @@ fn make_test_factory(prefix: &str, node_id: &str) -> Arc<ShardFactory> {
         MockGubernatorClient::new_arc(),
         None,
     ))
+}
+
+/// Start an EtcdCoordinator with retries for transient connectivity issues.
+/// etcd can occasionally be briefly unavailable in CI environments.
+async fn start_coordinator_with_retry(
+    endpoints: &[String],
+    prefix: &str,
+    node_id: &str,
+    addr: &str,
+    num_shards: u32,
+    ttl_secs: i64,
+    factory: Arc<ShardFactory>,
+) -> (EtcdCoordinator, tokio::task::JoinHandle<()>) {
+    let max_retries = 5;
+    let mut last_error = None;
+
+    for attempt in 0..max_retries {
+        match EtcdCoordinator::start(
+            endpoints,
+            prefix,
+            node_id,
+            addr,
+            num_shards,
+            ttl_secs,
+            factory.clone(),
+            Vec::new(),
+        )
+        .await
+        {
+            Ok(result) => return result,
+            Err(e) => {
+                warn!(
+                    attempt,
+                    max_retries,
+                    error = %e,
+                    "failed to start coordinator, retrying"
+                );
+                last_error = Some(e);
+                tokio::time::sleep(Duration::from_millis(500 * (attempt as u64 + 1))).await;
+            }
+        }
+    }
+
+    panic!(
+        "failed to start coordinator {} after {} retries: {:?}",
+        node_id, max_retries, last_error
+    );
 }
 
 /// Get a gRPC client for a node
@@ -190,7 +238,7 @@ async fn cluster_two_nodes_basic_query() {
     let addr2 = listener2.local_addr().unwrap().to_string();
 
     // Start node 1 with the actual address
-    let (coordinator1, h1) = EtcdCoordinator::start(
+    let (coordinator1, h1) = start_coordinator_with_retry(
         &cfg.coordination.etcd_endpoints,
         &prefix,
         "n1",
@@ -198,14 +246,11 @@ async fn cluster_two_nodes_basic_query() {
         NUM_SHARDS,
         10,
         factory1.clone(),
-        Vec::new(),
     )
-    .await
-    .expect("start coordinator 1");
+    .await;
     let coordinator1 = Arc::new(coordinator1);
 
-    // Start node 2 with the actual address
-    let (coordinator2, h2) = EtcdCoordinator::start(
+    let (coordinator2, h2) = start_coordinator_with_retry(
         &cfg.coordination.etcd_endpoints,
         &prefix,
         "n2",
@@ -213,10 +258,8 @@ async fn cluster_two_nodes_basic_query() {
         NUM_SHARDS,
         10,
         factory2.clone(),
-        Vec::new(),
     )
-    .await
-    .expect("start coordinator 2");
+    .await;
     let coordinator2 = Arc::new(coordinator2);
 
     // Wait for cluster to converge
@@ -315,8 +358,7 @@ async fn cluster_two_nodes_status_filter_query() {
     let addr1 = listener1.local_addr().unwrap().to_string();
     let addr2 = listener2.local_addr().unwrap().to_string();
 
-    // Start nodes with the actual addresses
-    let (coordinator1, h1) = EtcdCoordinator::start(
+    let (coordinator1, h1) = start_coordinator_with_retry(
         &cfg.coordination.etcd_endpoints,
         &prefix,
         "n1",
@@ -324,13 +366,11 @@ async fn cluster_two_nodes_status_filter_query() {
         NUM_SHARDS,
         10,
         factory1.clone(),
-        Vec::new(),
     )
-    .await
-    .expect("start coordinator 1");
+    .await;
     let coordinator1 = Arc::new(coordinator1);
 
-    let (coordinator2, h2) = EtcdCoordinator::start(
+    let (coordinator2, h2) = start_coordinator_with_retry(
         &cfg.coordination.etcd_endpoints,
         &prefix,
         "n2",
@@ -338,10 +378,8 @@ async fn cluster_two_nodes_status_filter_query() {
         NUM_SHARDS,
         10,
         factory2.clone(),
-        Vec::new(),
     )
-    .await
-    .expect("start coordinator 2");
+    .await;
     let coordinator2 = Arc::new(coordinator2);
 
     assert!(coordinator1.wait_converged(Duration::from_secs(30)).await);
@@ -440,8 +478,7 @@ async fn cluster_two_nodes_count_across_shards() {
     let addr1 = listener1.local_addr().unwrap().to_string();
     let addr2 = listener2.local_addr().unwrap().to_string();
 
-    // Start nodes with the actual addresses
-    let (coordinator1, h1) = EtcdCoordinator::start(
+    let (coordinator1, h1) = start_coordinator_with_retry(
         &cfg.coordination.etcd_endpoints,
         &prefix,
         "n1",
@@ -449,13 +486,11 @@ async fn cluster_two_nodes_count_across_shards() {
         NUM_SHARDS,
         10,
         factory1.clone(),
-        Vec::new(),
     )
-    .await
-    .expect("start coordinator 1");
+    .await;
     let coordinator1 = Arc::new(coordinator1);
 
-    let (coordinator2, h2) = EtcdCoordinator::start(
+    let (coordinator2, h2) = start_coordinator_with_retry(
         &cfg.coordination.etcd_endpoints,
         &prefix,
         "n2",
@@ -463,10 +498,8 @@ async fn cluster_two_nodes_count_across_shards() {
         NUM_SHARDS,
         10,
         factory2.clone(),
-        Vec::new(),
     )
-    .await
-    .expect("start coordinator 2");
+    .await;
     let coordinator2 = Arc::new(coordinator2);
 
     assert!(coordinator1.wait_converged(Duration::from_secs(30)).await);
@@ -563,8 +596,7 @@ async fn cluster_two_nodes_queues_table() {
     let addr1 = listener1.local_addr().unwrap().to_string();
     let addr2 = listener2.local_addr().unwrap().to_string();
 
-    // Start nodes with the actual addresses
-    let (coordinator1, h1) = EtcdCoordinator::start(
+    let (coordinator1, h1) = start_coordinator_with_retry(
         &cfg.coordination.etcd_endpoints,
         &prefix,
         "n1",
@@ -572,13 +604,11 @@ async fn cluster_two_nodes_queues_table() {
         NUM_SHARDS,
         10,
         factory1.clone(),
-        Vec::new(),
     )
-    .await
-    .expect("start coordinator 1");
+    .await;
     let coordinator1 = Arc::new(coordinator1);
 
-    let (coordinator2, h2) = EtcdCoordinator::start(
+    let (coordinator2, h2) = start_coordinator_with_retry(
         &cfg.coordination.etcd_endpoints,
         &prefix,
         "n2",
@@ -586,10 +616,8 @@ async fn cluster_two_nodes_queues_table() {
         NUM_SHARDS,
         10,
         factory2.clone(),
-        Vec::new(),
     )
-    .await
-    .expect("start coordinator 2");
+    .await;
     let coordinator2 = Arc::new(coordinator2);
 
     assert!(coordinator1.wait_converged(Duration::from_secs(30)).await);
@@ -662,8 +690,7 @@ async fn cluster_two_nodes_projection_remote_shards() {
     let addr1 = listener1.local_addr().unwrap().to_string();
     let addr2 = listener2.local_addr().unwrap().to_string();
 
-    // Start nodes with the actual addresses
-    let (coordinator1, h1) = EtcdCoordinator::start(
+    let (coordinator1, h1) = start_coordinator_with_retry(
         &cfg.coordination.etcd_endpoints,
         &prefix,
         "n1",
@@ -671,13 +698,11 @@ async fn cluster_two_nodes_projection_remote_shards() {
         NUM_SHARDS,
         10,
         factory1.clone(),
-        Vec::new(),
     )
-    .await
-    .expect("start coordinator 1");
+    .await;
     let coordinator1 = Arc::new(coordinator1);
 
-    let (coordinator2, h2) = EtcdCoordinator::start(
+    let (coordinator2, h2) = start_coordinator_with_retry(
         &cfg.coordination.etcd_endpoints,
         &prefix,
         "n2",
@@ -685,10 +710,8 @@ async fn cluster_two_nodes_projection_remote_shards() {
         NUM_SHARDS,
         10,
         factory2.clone(),
-        Vec::new(),
     )
-    .await
-    .expect("start coordinator 2");
+    .await;
     let coordinator2 = Arc::new(coordinator2);
 
     assert!(coordinator1.wait_converged(Duration::from_secs(30)).await);
