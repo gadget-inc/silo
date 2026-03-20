@@ -243,6 +243,31 @@ async fn run_tenant_queries(engine: &ShardQueryEngine, tenant: &str) {
     .await;
     r.print();
 
+    // This is the exact query used by the tenant view page to list waiting jobs.
+    // It only projects shard_id and id to avoid expensive job_info lookups.
+    let r = bench_query(
+        engine,
+        "list_waiting_jobs_tenant_view",
+        &format!(
+            "SELECT shard_id, id FROM jobs WHERE tenant = '{}' AND status_kind = 'Waiting' LIMIT 100",
+            tenant
+        ),
+    )
+    .await;
+    r.print();
+
+    // SELECT * variant - what remote shards receive from cluster query engine.
+    let r = bench_query(
+        engine,
+        "list_waiting_select_star",
+        &format!(
+            "SELECT * FROM jobs WHERE tenant = '{}' AND status_kind = 'Waiting' LIMIT 100",
+            tenant
+        ),
+    )
+    .await;
+    r.print();
+
     let r = bench_query(
         engine,
         "count_succeeded",

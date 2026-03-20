@@ -2805,9 +2805,7 @@ async fn explain_bench_count_scheduled() {
 
 // Benchmark query: SELECT * FROM jobs WHERE tenant = '{t}' AND status_kind = 'Failed' LIMIT 20
 // Status filter with limit → Status(Failed) strategy.
-// NOTE: DataFusion does NOT push LIMIT down because our filters are Inexact
-// (DataFusion adds FilterExec above, and LIMIT can't be pushed through a filter).
-// This means we scan ALL matching rows from the status index, then DataFusion truncates.
+// Tenant and status_kind filters are Exact, so DataFusion pushes LIMIT into the scan.
 #[silo::test]
 async fn explain_bench_first_page_failed() {
     let (_tmp, shard) = open_temp_shard().await;
@@ -2827,17 +2825,11 @@ async fn explain_bench_first_page_failed() {
         "Expected Status(Failed) strategy, got: {}",
         plan_line
     );
-    // Limit is NOT pushed down because Inexact filters cause FilterExec above our scan
+    // Limit IS pushed down because tenant+status_kind filters are Exact (no FilterExec blocking)
     assert!(
-        plan_line.contains("limit=None"),
-        "Expected limit=None (not pushed through FilterExec), got: {}",
+        plan_line.contains("limit=Some(20)"),
+        "Expected limit=Some(20) pushed into scan, got: {}",
         plan_line
-    );
-    // DataFusion handles limit above our scan (Limit in logical plan, GlobalLimitExec in physical)
-    assert!(
-        explain.contains("Limit") || explain.contains("GlobalLimitExec"),
-        "Expected limit handling in plan:\n{}",
-        explain
     );
     assert_eq!(
         strategy,
@@ -2849,8 +2841,7 @@ async fn explain_bench_first_page_failed() {
 }
 
 // Benchmark query: SELECT * FROM jobs WHERE tenant = '{t}' AND status_kind = 'Failed' LIMIT 20 OFFSET 180
-// Same as first_page: limit is NOT pushed down because of Inexact filters.
-// DataFusion handles both OFFSET and LIMIT with GlobalLimitExec.
+// With Exact filters, DataFusion pushes LIMIT+OFFSET (fetch=200) into the scan.
 #[silo::test]
 async fn explain_bench_10th_page_failed() {
     let (_tmp, shard) = open_temp_shard().await;
@@ -2870,17 +2861,11 @@ async fn explain_bench_10th_page_failed() {
         "Expected Status(Failed) strategy, got: {}",
         plan_line
     );
-    // Limit is NOT pushed through FilterExec
+    // Limit IS pushed down (OFFSET 180 + LIMIT 20 = fetch 200)
     assert!(
-        plan_line.contains("limit=None"),
-        "Expected limit=None (not pushed through FilterExec), got: {}",
+        plan_line.contains("limit=Some(200)"),
+        "Expected limit=Some(200) pushed into scan, got: {}",
         plan_line
-    );
-    // DataFusion handles offset+limit above our scan (Limit in logical plan, GlobalLimitExec in physical)
-    assert!(
-        explain.contains("Limit") || explain.contains("GlobalLimitExec"),
-        "Expected limit/offset handling in plan:\n{}",
-        explain
     );
     assert_eq!(
         strategy,
