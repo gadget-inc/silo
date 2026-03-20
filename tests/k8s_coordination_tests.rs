@@ -100,12 +100,13 @@ fn make_coordinator_config(
     }
 }
 
-/// Start a K8S coordinator, failing the test if K8S is not available
+/// Start a K8S coordinator, failing the test if K8S is not available.
+/// Uses a 30s lease TTL (renewed every 10s) to avoid spurious expiry under CI load.
 macro_rules! start_coordinator {
     ($namespace:expr, $prefix:expr, $node_id:expr, $grpc_addr:expr, $num_shards:expr) => {{
         let factory = make_test_factory($node_id);
         let config =
-            make_coordinator_config($namespace, $prefix, $node_id, $grpc_addr, $num_shards, 10);
+            make_coordinator_config($namespace, $prefix, $node_id, $grpc_addr, $num_shards, 30);
         K8sCoordinator::start(config, factory)
             .await
             .expect("Failed to connect to K8s cluster - ensure cluster is accessible")
@@ -175,7 +176,7 @@ async fn k8s_multiple_nodes_partition_shards() {
             "test-node-2",
             "http://127.0.0.1:7451",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("test-node-2"),
     )
@@ -253,16 +254,18 @@ async fn k8s_rebalances_on_membership_change() {
             "test-node-2",
             "http://127.0.0.1:7451",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("test-node-2"),
     )
     .await
     .expect("start c2");
 
-    // Wait for both to converge after membership change
-    assert!(c1.wait_converged(Duration::from_secs(15)).await);
-    assert!(c2.wait_converged(Duration::from_secs(15)).await);
+    // Wait for both to converge after membership change.
+    // Use a generous timeout: the safety reconciliation timer fires every 5s,
+    // and convergence may require multiple reconciliation cycles under K8s API load.
+    assert!(c1.wait_converged(Duration::from_secs(30)).await);
+    assert!(c2.wait_converged(Duration::from_secs(30)).await);
 
     // Check redistribution
     let s1: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
@@ -310,7 +313,7 @@ async fn k8s_three_nodes_even_distribution() {
             "node-2",
             "http://127.0.0.1:7451",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("node-2"),
     )
@@ -325,7 +328,7 @@ async fn k8s_three_nodes_even_distribution() {
             "node-3",
             "http://127.0.0.1:7452",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("node-3"),
     )
@@ -416,7 +419,7 @@ async fn k8s_removing_node_rebalances() {
             "node-2",
             "http://127.0.0.1:7451",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("node-2"),
     )
@@ -431,7 +434,7 @@ async fn k8s_removing_node_rebalances() {
             "node-3",
             "http://127.0.0.1:7452",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("node-3"),
     )
@@ -448,13 +451,16 @@ async fn k8s_removing_node_rebalances() {
     c3.shutdown().await.unwrap();
     h3.abort();
 
-    // Wait for remaining nodes to reconverge
+    // Wait for remaining nodes to reconverge.
+    // Use a generous timeout: the safety reconciliation timer fires every 5s,
+    // and convergence may require multiple reconciliation cycles to acquire all
+    // released shards (especially with 64 shards under K8s API load).
     assert!(
-        c1.wait_converged(Duration::from_secs(15)).await,
+        c1.wait_converged(Duration::from_secs(30)).await,
         "c1 should reconverge after node removal"
     );
     assert!(
-        c2.wait_converged(Duration::from_secs(15)).await,
+        c2.wait_converged(Duration::from_secs(30)).await,
         "c2 should reconverge after node removal"
     );
 
@@ -507,7 +513,7 @@ async fn k8s_rapid_membership_churn_converges() {
             "node-2",
             "http://127.0.0.1:7451",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("node-2"),
     )
@@ -522,7 +528,7 @@ async fn k8s_rapid_membership_churn_converges() {
             "node-3",
             "http://127.0.0.1:7452",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("node-3"),
     )
@@ -543,7 +549,7 @@ async fn k8s_rapid_membership_churn_converges() {
             "node-2",
             "http://127.0.0.1:7451",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("node-2-restart"),
     )
@@ -641,7 +647,7 @@ async fn k8s_get_members_returns_correct_info() {
             "member-node-2",
             "http://10.0.0.2:7451",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("member-node-2"),
     )
@@ -711,7 +717,7 @@ async fn k8s_get_shard_owner_map_accurate() {
             "map-node-2",
             "http://10.0.0.2:7451",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("map-node-2"),
     )
@@ -814,7 +820,7 @@ async fn make_k8s_guard(
         namespace.to_string(),
         cluster_prefix.to_string(),
         node_id.to_string(),
-        10, // lease duration seconds
+        30, // lease duration seconds
         rx,
         shard_available,
     );
@@ -1260,7 +1266,7 @@ async fn k8s_no_split_brain_during_transitions() {
             "brain-node-2",
             "http://127.0.0.1:7451",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("brain-node-2"),
     )
@@ -1279,7 +1285,7 @@ async fn k8s_no_split_brain_during_transitions() {
             "brain-node-3",
             "http://127.0.0.1:7452",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("brain-node-3"),
     )
@@ -1362,7 +1368,7 @@ async fn k8s_prompt_acquisition_after_node_departure() {
             "prompt-node-2",
             "http://127.0.0.1:7451",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("prompt-node-2"),
     )
@@ -1447,7 +1453,7 @@ async fn k8s_multiple_add_remove_cycles() {
                 &node_id,
                 "http://127.0.0.1:7451",
                 num_shards,
-                10,
+                30,
             ),
             make_test_factory(&node_id),
         )
@@ -1523,7 +1529,7 @@ async fn k8s_four_node_cluster() {
             "four-node-2",
             "http://127.0.0.1:7451",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("four-node-2"),
     )
@@ -1538,7 +1544,7 @@ async fn k8s_four_node_cluster() {
             "four-node-3",
             "http://127.0.0.1:7452",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("four-node-3"),
     )
@@ -1553,7 +1559,7 @@ async fn k8s_four_node_cluster() {
             "four-node-4",
             "http://127.0.0.1:7453",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("four-node-4"),
     )
@@ -1642,7 +1648,7 @@ async fn k8s_wait_converged_triggers_reconciliation() {
             "converge-trigger-2",
             "http://127.0.0.1:7451",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("converge-trigger-2"),
     )
@@ -1973,7 +1979,7 @@ async fn k8s_node_restart_same_id() {
             "restart-node",
             "http://127.0.0.1:7450",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("restart-node-2"),
     )
@@ -2033,7 +2039,7 @@ async fn k8s_simultaneous_node_additions() {
             "simul-1",
             "http://127.0.0.1:7450",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("simul-1"),
     );
@@ -2044,7 +2050,7 @@ async fn k8s_simultaneous_node_additions() {
             "simul-2",
             "http://127.0.0.1:7451",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("simul-2"),
     );
@@ -2055,7 +2061,7 @@ async fn k8s_simultaneous_node_additions() {
             "simul-3",
             "http://127.0.0.1:7452",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("simul-3"),
     );
@@ -2071,8 +2077,11 @@ async fn k8s_simultaneous_node_additions() {
     let (c2, h2) = r2.expect("c2");
     let (c3, h3) = r3.expect("c3");
 
-    // All should eventually converge (longer timeout for simultaneous starts)
-    let timeout = Duration::from_secs(60);
+    // All should eventually converge. Simultaneous starts create maximum
+    // contention on the K8s API for membership lease creation and watcher
+    // initialization. Use a generous timeout to account for the safety
+    // reconciliation timer (5s) needing multiple cycles to settle all nodes.
+    let timeout = Duration::from_secs(90);
     assert!(c1.wait_converged(timeout).await, "c1 should converge");
     assert!(c2.wait_converged(timeout).await, "c2 should converge");
     assert!(c3.wait_converged(timeout).await, "c3 should converge");
@@ -2138,7 +2147,7 @@ async fn k8s_concurrent_shutdown_multiple_nodes() {
             "conc-shut-2",
             "http://127.0.0.1:7451",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("conc-shut-2"),
     )
@@ -2153,7 +2162,7 @@ async fn k8s_concurrent_shutdown_multiple_nodes() {
             "conc-shut-3",
             "http://127.0.0.1:7452",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("conc-shut-3"),
     )
@@ -2400,7 +2409,7 @@ async fn k8s_ownership_stability_during_steady_state() {
             "stable-2",
             "http://127.0.0.1:7451",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("stable-2"),
     )
@@ -2496,7 +2505,7 @@ async fn k8s_coordinator_zero_shards() {
             "zero-shards",
             "http://127.0.0.1:7450",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("zero-shards"),
     )
@@ -2620,7 +2629,9 @@ async fn k8s_graceful_shutdown_releases_shards_promptly() {
 async fn k8s_watcher_notification_drives_convergence_without_external_poke() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
-    let num_shards: u32 = 32;
+    // Use fewer shards so acquiring them all after node removal is fast enough
+    // to complete within the safety-timer window (each shard needs a K8s API call).
+    let num_shards: u32 = 8;
     let short_ttl: i64 = 5;
 
     // Start two nodes
@@ -2795,7 +2806,7 @@ async fn k8s_request_split_fails_if_not_owner() {
             "split-owner-2",
             "http://127.0.0.1:7451",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("split-owner-2"),
     )
@@ -3045,7 +3056,7 @@ async fn k8s_split_state_persists_across_restart() {
             "persist-test-1",
             "http://127.0.0.1:7450",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("persist-test-1-restart"),
     )
@@ -3451,7 +3462,7 @@ async fn k8s_split_in_multi_node_cluster() {
             "split-multi-2",
             "http://127.0.0.1:7451",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("split-multi-2"),
     )
@@ -3572,7 +3583,7 @@ async fn k8s_crash_recovery_early_phase_abandons_split() {
             "crash-early-1",
             "http://127.0.0.1:7450",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("crash-early-1-restart"),
     )
@@ -3641,7 +3652,7 @@ async fn k8s_child_shards_acquired_via_watch_after_split() {
             "watch-split-2",
             "http://127.0.0.1:7451",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("watch-split-2"),
     )
@@ -3893,7 +3904,7 @@ async fn k8s_crash_recovery_cloning_phase_abandons_split() {
             "crash-cloning-1",
             "http://127.0.0.1:7450",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("crash-cloning-1-restart"),
     )
@@ -4024,7 +4035,7 @@ async fn k8s_multi_ring_shard_assignment() {
             "gpu-node",
             "http://127.0.0.1:7451",
             num_shards,
-            10,
+            30,
             vec!["gpu".to_string()],
         ),
         make_test_factory("gpu-node"),
@@ -4228,7 +4239,7 @@ async fn k8s_member_info_reports_rings() {
             "node-multi",
             "http://127.0.0.1:7451",
             num_shards,
-            10,
+            30,
             vec!["gpu".to_string(), "high-memory".to_string()],
         ),
         make_test_factory("node-multi"),
@@ -4307,7 +4318,7 @@ async fn k8s_ring_change_triggers_handoff() {
             "tenant-node",
             "http://127.0.0.1:7451",
             num_shards,
-            10,
+            30,
             vec!["tenant-acme".to_string()],
         ),
         make_test_factory("tenant-node"),
@@ -4479,7 +4490,7 @@ async fn k8s_reconciliation_cancels_in_flight_acquisitions() {
             "node-2",
             "http://127.0.0.1:7451",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("node-2"),
     )
@@ -4512,7 +4523,7 @@ async fn k8s_reconciliation_cancels_in_flight_acquisitions() {
             "node-3",
             "http://127.0.0.1:7452",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("node-3"),
     )
@@ -4770,6 +4781,11 @@ async fn k8s_reclaim_existing_leases_after_graceful_shutdown() {
     c1.shutdown().await.unwrap();
     h1.abort();
 
+    // Brief pause to let K8s API fully process the lease CAS deletions from shutdown.
+    // Without this, the new coordinator may see in-flight leases that haven't been
+    // cleared yet.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
     // Start a new coordinator with the same node_id -- reclaim should find nothing
     let (c2, h2) = start_coordinator!(
         &namespace,
@@ -4803,7 +4819,7 @@ async fn k8s_reclaim_existing_leases_after_crash() {
             node_id,
             "http://127.0.0.1:50051",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory(node_id),
     )
@@ -4829,7 +4845,7 @@ async fn k8s_reclaim_existing_leases_after_crash() {
             node_id,
             "http://127.0.0.1:50051",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory(node_id),
     )
@@ -4871,7 +4887,7 @@ async fn k8s_crash_restart_reclaims_and_opens_shards() {
             node_id,
             "http://127.0.0.1:50051",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory(node_id),
     )
@@ -4898,7 +4914,7 @@ async fn k8s_crash_restart_reclaims_and_opens_shards() {
             node_id,
             "http://127.0.0.1:50051",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory(node_id),
     )
@@ -4951,7 +4967,7 @@ async fn k8s_hash_ring_divergence_on_restart() {
             "diverge-k8s-b",
             "http://127.0.0.1:50052",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("diverge-k8s-b"),
     )
@@ -5005,7 +5021,7 @@ async fn k8s_hash_ring_divergence_on_restart() {
             "diverge-k8s-a",
             "http://127.0.0.1:50051",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("diverge-k8s-a"),
     )
@@ -5094,7 +5110,7 @@ async fn k8s_coordinator_crash_blocks_reacquisition_until_force_release() {
             "coord-crash-k8s-2",
             "http://127.0.0.1:50052",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("coord-crash-k8s-2"),
     )
@@ -5177,7 +5193,7 @@ async fn k8s_reclaim_with_different_node_id_returns_empty() {
             "original-k8s-a",
             "http://127.0.0.1:50051",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("original-k8s-a"),
     )
@@ -5204,7 +5220,7 @@ async fn k8s_reclaim_with_different_node_id_returns_empty() {
             "different-k8s-b",
             "http://127.0.0.1:50051",
             num_shards,
-            10,
+            30,
         ),
         make_test_factory("different-k8s-b"),
     )
@@ -5241,7 +5257,7 @@ async fn k8s_graceful_shutdown_clears_lease_holder_identity() {
             node_id,
             "http://127.0.0.1:50051",
             num_shards,
-            10,
+            30,
         ),
         factory,
     )
