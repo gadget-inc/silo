@@ -87,3 +87,57 @@ jobs:
           path: |
             test-debug.log
             process-compose.log
+
+  grind-k8s-tests:
+    name: "K8s Tests (worker ${{ matrix.worker }})"
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: ${{ fromJson(format('[{0}]', inputs.workers == '1' && '1' || inputs.workers == '2' && '1,2' || inputs.workers == '3' && '1,2,3' || inputs.workers == '4' && '1,2,3,4' || inputs.workers == '5' && '1,2,3,4,5' || inputs.workers == '6' && '1,2,3,4,5,6' || inputs.workers == '7' && '1,2,3,4,5,6,7' || inputs.workers == '8' && '1,2,3,4,5,6,7,8' || inputs.workers == '9' && '1,2,3,4,5,6,7,8,9' || '1,2,3,4,5,6,7,8,9,10')) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-test-env
+        with:
+          cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: silo-test
+      - name: Verify cluster
+        run: kubectl cluster-info
+      - name: Grind K8s tests (${{ inputs.iterations }} iterations)
+        shell: bash
+        env:
+          SILO_DEBUG_LOG_FILE: k8s-test-debug.log
+        run: |
+          failed=0
+          for i in $(seq 1 ${{ inputs.iterations }}); do
+            echo ""
+            echo "=========================================="
+            echo "  K8s Iteration $i / ${{ inputs.iterations }} (worker ${{ matrix.worker }})"
+            echo "=========================================="
+            echo ""
+
+            if ! cargo test --test k8s_coordination_tests -- --test-threads=1 2>&1; then
+              echo "FAIL: k8s_coordination_tests failed on iteration $i"
+              failed=$((failed + 1))
+            fi
+          done
+
+          echo ""
+          echo "=========================================="
+          echo "  K8s grind complete: $failed failure(s) across ${{ inputs.iterations }} iterations"
+          echo "=========================================="
+
+          if [ $failed -gt 0 ]; then
+            exit 1
+          fi
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k8s-grind-logs-worker-${{ matrix.worker }}
+          path: k8s-test-debug.log
