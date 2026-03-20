@@ -1,0 +1,89 @@
+name: Test Grind
+
+on:
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: "Number of test iterations per worker"
+        required: true
+        default: "10"
+        type: string
+      workers:
+        description: "Number of parallel workers"
+        required: true
+        default: "5"
+        type: string
+
+jobs:
+  grind-tests:
+    name: "Tests (worker ${{ matrix.worker }})"
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: ${{ fromJson(format('[{0}]', inputs.workers == '1' && '1' || inputs.workers == '2' && '1,2' || inputs.workers == '3' && '1,2,3' || inputs.workers == '4' && '1,2,3,4' || inputs.workers == '5' && '1,2,3,4,5' || inputs.workers == '6' && '1,2,3,4,5,6' || inputs.workers == '7' && '1,2,3,4,5,6,7' || inputs.workers == '8' && '1,2,3,4,5,6,7,8' || inputs.workers == '9' && '1,2,3,4,5,6,7,8,9' || '1,2,3,4,5,6,7,8,9,10')) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-test-env
+        with:
+          cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Run background processes
+        shell: bash
+        run: |
+          process-compose up --tui=false gubernator etcd > process-compose.log 2>&1 &
+          sleep 2
+      - name: Grind tests (${{ inputs.iterations }} iterations)
+        shell: bash
+        env:
+          SILO_DEBUG_LOG_FILE: test-debug.log
+        run: |
+          failed=0
+          for i in $(seq 1 ${{ inputs.iterations }}); do
+            echo ""
+            echo "=========================================="
+            echo "  Iteration $i / ${{ inputs.iterations }} (worker ${{ matrix.worker }})"
+            echo "=========================================="
+            echo ""
+
+            echo "--- Main tests ---"
+            if ! cargo test -- --skip k8s_ --skip etcd_ --skip coordination_split_tests --skip cluster_two_nodes 2>&1; then
+              echo "FAIL: Main tests failed on iteration $i"
+              failed=$((failed + 1))
+            fi
+
+            echo ""
+            echo "--- etcd coordination tests ---"
+            if ! cargo test --test etcd_coordination_tests -- --test-threads=1 2>&1; then
+              echo "FAIL: etcd_coordination_tests failed on iteration $i"
+              failed=$((failed + 1))
+            fi
+
+            if ! cargo test --test coordination_split_tests -- --test-threads=1 2>&1; then
+              echo "FAIL: coordination_split_tests failed on iteration $i"
+              failed=$((failed + 1))
+            fi
+
+            if ! cargo test --test cluster_query_integration_tests 2>&1; then
+              echo "FAIL: cluster_query_integration_tests failed on iteration $i"
+              failed=$((failed + 1))
+            fi
+          done
+
+          echo ""
+          echo "=========================================="
+          echo "  Grind complete: $failed failure(s) across ${{ inputs.iterations }} iterations"
+          echo "=========================================="
+
+          if [ $failed -gt 0 ]; then
+            exit 1
+          fi
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grind-logs-worker-${{ matrix.worker }}
+          path: |
+            test-debug.log
+            process-compose.log
