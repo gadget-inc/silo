@@ -5312,6 +5312,9 @@ async fn k8s_graceful_shutdown_clears_lease_holder_identity() {
     c1.shutdown().await.unwrap();
     h1.abort();
 
+    // Brief pause to let K8s API process the lease CAS releases from shutdown
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
     // Verify leases have holderIdentity cleared after shutdown
     for shard_id in &shard_ids {
         let lease_name = silo::coordination::keys::k8s_shard_lease_name(&prefix, shard_id);
