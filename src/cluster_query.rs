@@ -40,7 +40,7 @@ use crate::pb::QueryArrowRequest;
 use crate::pb::silo_client::SiloClient;
 use crate::query::{
     JobsScanner, QueueCountsScanner, QueuesScanner, ScannerRef, TenantCountsScanner,
-    explain_dataframe,
+    classify_jobs_filters, explain_dataframe,
 };
 use crate::shard_range::ShardId;
 
@@ -318,8 +318,12 @@ impl TableProvider for ClusterTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
-        // Pass all filters through - we'll push them down to each shard
-        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+        // For Jobs table, use the jobs-specific filter classification to enable
+        // LIMIT pushdown by marking handled filters as Exact.
+        match self.table_kind {
+            TableKind::Jobs => Ok(classify_jobs_filters(filters)),
+            _ => Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()]),
+        }
     }
 }
 

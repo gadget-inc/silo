@@ -197,6 +197,14 @@ pub trait Scan: std::fmt::Debug + Send + Sync + 'static {
     fn describe(&self, _filters: &[Expr], _limit: Option<usize>) -> String {
         "CustomScan".to_string()
     }
+
+    /// Classify each filter as Exact (fully handled by the scan) or Inexact.
+    /// Returning Exact prevents DataFusion from adding a post-filter FilterExec,
+    /// which enables LIMIT pushdown into the scan.
+    /// Default: all Inexact (safe fallback).
+    fn classify_filters(&self, _filters: &[&Expr]) -> Vec<TableProviderFilterPushDown> {
+        vec![TableProviderFilterPushDown::Inexact; _filters.len()]
+    }
 }
 
 /// Reference to a scanner implementing the Scan trait
@@ -251,16 +259,11 @@ impl TableProvider for SiloTableProvider {
         )))
     }
 
-    // Tell data fusion we support all filter pushdowns, but that it still needs to filter on its side after we've scanned.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
-        // All filters are Inexact - we use them for scan optimization (index lookups)
-        // but DataFusion still applies them as post-filters for correctness.
-        // This is important because our scan only handles one metadata filter at a time,
-        // and DataFusion may call this method multiple times with different filter subsets.
-        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+        Ok(self.scanner.classify_filters(filters))
     }
 
     fn statistics(&self) -> Option<Statistics> {
@@ -423,6 +426,77 @@ impl std::fmt::Display for JobsScanStrategy {
 
 /// Parse DataFusion filter expressions into a scan strategy.
 /// This determines which index-backed scan path will be used.
+/// Classify jobs table filters for use by both ShardQueryEngine and ClusterQueryEngine.
+pub fn classify_jobs_filters(filters: &[&Expr]) -> Vec<TableProviderFilterPushDown> {
+    // Strip table qualifiers from filter expressions before parsing the strategy,
+    // because supports_filters_pushdown receives qualified names (e.g. "jobs.tenant")
+    // while parse_jobs_scan_strategy expects unqualified names ("tenant").
+    let unqualified_filters: Vec<Expr> = filters.iter().map(|f| unqualify_expr(f)).collect();
+    let strategy = parse_jobs_scan_strategy(&unqualified_filters);
+
+    filters
+        .iter()
+        .map(|f| {
+            if let Some((col, _)) = parse_eq_filter(f) {
+                let col_name = col.rsplit('.').next().unwrap_or(&col);
+                classify_filter_pushdown(col_name, &strategy)
+            } else {
+                TableProviderFilterPushDown::Inexact
+            }
+        })
+        .collect()
+}
+
+/// Strip table qualifiers from column references in an expression.
+/// Converts e.g. `jobs.tenant = 'X'` to `tenant = 'X'`.
+fn unqualify_expr(expr: &Expr) -> Expr {
+    match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(unqualify_expr(left)),
+            op: *op,
+            right: Box::new(unqualify_expr(right)),
+        }),
+        Expr::Column(col) => Expr::Column(datafusion::common::Column::new_unqualified(&col.name)),
+        other => other.clone(),
+    }
+}
+
+/// Determine if a specific filter column is Exact (fully handled) for the given strategy.
+/// A filter is Exact when the scan guarantees correct results without post-filtering.
+fn classify_filter_pushdown(
+    col_name: &str,
+    strategy: &JobsScanStrategy,
+) -> TableProviderFilterPushDown {
+    match strategy {
+        // ExactId with tenant: both filters are handled exactly (direct pair construction).
+        // ExactId without tenant: the scan falls back to scan_all_jobs + in-memory filter,
+        // so neither filter is exact (limit pushdown would truncate before filtering).
+        JobsScanStrategy::ExactId { tenant, .. } => match col_name {
+            "id" if tenant.is_some() => TableProviderFilterPushDown::Exact,
+            "tenant" if tenant.is_some() => TableProviderFilterPushDown::Exact,
+            _ => TableProviderFilterPushDown::Inexact,
+        },
+        // Status: tenant scopes the scan, status_kind selects the index range.
+        JobsScanStrategy::Status { tenant, .. } => match col_name {
+            "status_kind" => TableProviderFilterPushDown::Exact,
+            "tenant" if tenant.is_some() => TableProviderFilterPushDown::Exact,
+            _ => TableProviderFilterPushDown::Inexact,
+        },
+        // Metadata strategies: tenant is handled, but status_kind is NOT filtered
+        // by the metadata index scan, so it must remain Inexact.
+        JobsScanStrategy::MetadataExact { tenant, .. }
+        | JobsScanStrategy::MetadataPrefix { tenant, .. } => match col_name {
+            "tenant" if tenant.is_some() => TableProviderFilterPushDown::Exact,
+            _ => TableProviderFilterPushDown::Inexact,
+        },
+        // FullScan: tenant scopes the scan range but no other filters are handled.
+        JobsScanStrategy::FullScan { tenant } => match col_name {
+            "tenant" if tenant.is_some() => TableProviderFilterPushDown::Exact,
+            _ => TableProviderFilterPushDown::Inexact,
+        },
+    }
+}
+
 pub fn parse_jobs_scan_strategy(filters: &[Expr]) -> JobsScanStrategy {
     let mut tenant_filter: Option<String> = None;
     let mut status_filter: Option<QueryStatusFilter> = None;
@@ -601,6 +675,10 @@ impl Scan for JobsScanner {
     fn describe(&self, filters: &[Expr], limit: Option<usize>) -> String {
         let strategy = parse_jobs_scan_strategy(filters);
         format!("jobs[{}], limit={:?}", strategy, limit)
+    }
+
+    fn classify_filters(&self, filters: &[&Expr]) -> Vec<TableProviderFilterPushDown> {
+        classify_jobs_filters(filters)
     }
 
     fn scan(

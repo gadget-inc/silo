@@ -2805,9 +2805,7 @@ async fn explain_bench_count_scheduled() {
 
 // Benchmark query: SELECT * FROM jobs WHERE tenant = '{t}' AND status_kind = 'Failed' LIMIT 20
 // Status filter with limit → Status(Failed) strategy.
-// NOTE: DataFusion does NOT push LIMIT down because our filters are Inexact
-// (DataFusion adds FilterExec above, and LIMIT can't be pushed through a filter).
-// This means we scan ALL matching rows from the status index, then DataFusion truncates.
+// Tenant and status_kind filters are Exact, so DataFusion pushes LIMIT into the scan.
 #[silo::test]
 async fn explain_bench_first_page_failed() {
     let (_tmp, shard) = open_temp_shard().await;
@@ -2827,17 +2825,11 @@ async fn explain_bench_first_page_failed() {
         "Expected Status(Failed) strategy, got: {}",
         plan_line
     );
-    // Limit is NOT pushed down because Inexact filters cause FilterExec above our scan
+    // Limit IS pushed down because tenant+status_kind filters are Exact (no FilterExec blocking)
     assert!(
-        plan_line.contains("limit=None"),
-        "Expected limit=None (not pushed through FilterExec), got: {}",
+        plan_line.contains("limit=Some(20)"),
+        "Expected limit=Some(20) pushed into scan, got: {}",
         plan_line
-    );
-    // DataFusion handles limit above our scan (Limit in logical plan, GlobalLimitExec in physical)
-    assert!(
-        explain.contains("Limit") || explain.contains("GlobalLimitExec"),
-        "Expected limit handling in plan:\n{}",
-        explain
     );
     assert_eq!(
         strategy,
@@ -2849,8 +2841,7 @@ async fn explain_bench_first_page_failed() {
 }
 
 // Benchmark query: SELECT * FROM jobs WHERE tenant = '{t}' AND status_kind = 'Failed' LIMIT 20 OFFSET 180
-// Same as first_page: limit is NOT pushed down because of Inexact filters.
-// DataFusion handles both OFFSET and LIMIT with GlobalLimitExec.
+// With Exact filters, DataFusion pushes LIMIT+OFFSET (fetch=200) into the scan.
 #[silo::test]
 async fn explain_bench_10th_page_failed() {
     let (_tmp, shard) = open_temp_shard().await;
@@ -2870,17 +2861,11 @@ async fn explain_bench_10th_page_failed() {
         "Expected Status(Failed) strategy, got: {}",
         plan_line
     );
-    // Limit is NOT pushed through FilterExec
+    // Limit IS pushed down (OFFSET 180 + LIMIT 20 = fetch 200)
     assert!(
-        plan_line.contains("limit=None"),
-        "Expected limit=None (not pushed through FilterExec), got: {}",
+        plan_line.contains("limit=Some(200)"),
+        "Expected limit=Some(200) pushed into scan, got: {}",
         plan_line
-    );
-    // DataFusion handles offset+limit above our scan (Limit in logical plan, GlobalLimitExec in physical)
-    assert!(
-        explain.contains("Limit") || explain.contains("GlobalLimitExec"),
-        "Expected limit/offset handling in plan:\n{}",
-        explain
     );
     assert_eq!(
         strategy,
@@ -2944,6 +2929,77 @@ async fn explain_bench_exact_id_no_tenant() {
             tenant: None,
             id: "target-00000000".to_string(),
         }
+    );
+}
+
+// ExactId WITH tenant gets limit pushed down (both tenant and id are Exact).
+#[silo::test]
+async fn exact_id_with_tenant_pushes_limit() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    enqueue_job(&shard, "j1", 10, now).await;
+
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let (explain, _) = explain_and_strategy(
+        &engine,
+        "SELECT * FROM jobs WHERE tenant = '-' AND id = 'j1' LIMIT 1",
+    )
+    .await;
+
+    let plan_line = extract_silo_plan_line(&explain);
+    assert!(
+        plan_line.contains("limit=Some(1)"),
+        "ExactId with tenant should push limit into scan, got: {}",
+        plan_line
+    );
+}
+
+// ExactId WITHOUT tenant must NOT push limit down — the scan falls back to
+// scan_all_jobs(limit) then filters by id in memory, so limit pushdown would
+// truncate before the filter and silently drop matching jobs.
+#[silo::test]
+async fn exact_id_without_tenant_does_not_push_limit() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    enqueue_job(&shard, "j1", 10, now).await;
+
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let (explain, _) =
+        explain_and_strategy(&engine, "SELECT * FROM jobs WHERE id = 'j1' LIMIT 1").await;
+
+    let plan_line = extract_silo_plan_line(&explain);
+    assert!(
+        plan_line.contains("limit=None"),
+        "ExactId without tenant must NOT push limit (would truncate before id filter), got: {}",
+        plan_line
+    );
+}
+
+// Correctness: ExactId without tenant + LIMIT must still find a job that isn't
+// first in scan order. This guards against the bug where limit pushdown would
+// cause scan_all_jobs(limit=1) to return only the first job, missing the target.
+#[silo::test]
+async fn exact_id_without_tenant_limit_returns_correct_job() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    // Enqueue several jobs — "target" won't be first in lexicographic scan order
+    enqueue_job(&shard, "aaa-first", 10, now).await;
+    enqueue_job(&shard, "bbb-second", 10, now).await;
+    enqueue_job(&shard, "zzz-target", 10, now).await;
+
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let df = engine
+        .sql("SELECT id FROM jobs WHERE id = 'zzz-target' LIMIT 1")
+        .await
+        .expect("sql");
+    let batches = df.collect().await.expect("collect");
+
+    let ids = extract_string_column(&batches, 0);
+    assert_eq!(
+        ids,
+        vec!["zzz-target"],
+        "ExactId without tenant + LIMIT should still find the correct job"
     );
 }
 
