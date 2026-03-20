@@ -476,7 +476,10 @@ async fn cannot_delete_scheduled_job() {
 async fn priority_ordering_when_start_times_equal() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
-        let now = now_ms();
+        // Use a timestamp in the past so that both tasks are immediately eligible
+        // regardless of when the broker scanner runs (avoids a race where the first
+        // enqueue triggers a scan that completes before the second enqueue).
+        let past = now_ms() - 1000;
 
         // Enqueue two jobs with identical start_at_ms but different priorities
         let job_hi = shard
@@ -484,7 +487,7 @@ async fn priority_ordering_when_start_times_equal() {
                 "-",
                 None,
                 1u8, // higher priority
-                now,
+                past,
                 None,
                 test_helpers::msgpack_payload(&serde_json::json!({"j": "hi"})),
                 vec![],
@@ -498,7 +501,7 @@ async fn priority_ordering_when_start_times_equal() {
                 "-",
                 None,
                 50u8, // lower priority
-                now,
+                past,
                 None,
                 test_helpers::msgpack_payload(&serde_json::json!({"j": "lo"})),
                 vec![],
@@ -507,6 +510,11 @@ async fn priority_ordering_when_start_times_equal() {
             )
             .await
             .expect("enqueue lo");
+
+        // Allow the broker scanner to pick up both tasks before dequeuing.
+        // The first enqueue wakes the scanner which may complete before the second
+        // enqueue; this sleep ensures a subsequent scan sees both tasks in the DB.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Dequeue two tasks; with equal times, lower priority number should come first
         let tasks = shard

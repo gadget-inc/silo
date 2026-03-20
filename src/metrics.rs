@@ -74,6 +74,10 @@ pub struct Metrics {
     broker_inflight_size: GaugeVec,
     broker_scan_duration: HistogramVec,
 
+    // Poll metrics
+    polls_total: CounterVec,
+    poll_duration: HistogramVec,
+
     // Lease metrics
     task_leases_active: GaugeVec,
     ready_to_start_latency_ms: HistogramVec,
@@ -187,6 +191,18 @@ impl Metrics {
     /// Record broker scan duration in seconds.
     pub fn record_broker_scan_duration(&self, shard: &str, duration_secs: f64) {
         self.broker_scan_duration
+            .with_label_values(&[shard])
+            .observe(duration_secs);
+    }
+
+    /// Record a poll (lease_tasks call) for a shard.
+    pub fn record_poll(&self, shard: &str) {
+        self.polls_total.with_label_values(&[shard]).inc();
+    }
+
+    /// Record poll duration (time to service a lease_tasks call for a shard) in seconds.
+    pub fn record_poll_duration(&self, shard: &str, duration_secs: f64) {
+        self.poll_duration
             .with_label_values(&[shard])
             .observe(duration_secs);
     }
@@ -439,6 +455,30 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    // Poll metrics
+    let polls_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_polls_total",
+                "Total number of lease_tasks polls received per shard",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let poll_duration = register(
+        &registry,
+        HistogramVec::new(
+            HistogramOpts::new(
+                "silo_poll_duration_seconds",
+                "Duration of lease_tasks poll per shard in seconds",
+            )
+            .buckets(LATENCY_BUCKETS.to_vec()),
+            &["shard"],
+        )?,
+    );
+
     // Lease metrics
     let task_leases_active = register(
         &registry,
@@ -642,6 +682,8 @@ pub fn init() -> anyhow::Result<Metrics> {
         broker_buffer_size,
         broker_inflight_size,
         broker_scan_duration,
+        polls_total,
+        poll_duration,
         task_leases_active,
         ready_to_start_latency_ms,
         concurrency_tickets_granted,
