@@ -88,6 +88,8 @@ async fn main() -> anyhow::Result<()> {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
             slatedb: None,
             memory_cache: None,
         },
@@ -105,6 +107,8 @@ async fn main() -> anyhow::Result<()> {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
             slatedb: None,
             memory_cache: None,
         },
@@ -156,6 +160,8 @@ async fn main() -> anyhow::Result<()> {
                 .to_string(),
             wal: None,
             apply_wal_on_close: true,
+            default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
             // Fast flushes for simulation
             slatedb: Some(slatedb::config::Settings {
                 flush_interval: Some(Duration::from_millis(10)),
@@ -220,6 +226,7 @@ async fn main() -> anyhow::Result<()> {
                             key: q_name.clone(),
                             max_concurrency: *q_limit,
                         })],
+                        None,
                         None,
                         "default",
                     )
@@ -321,6 +328,8 @@ async fn main() -> anyhow::Result<()> {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
             slatedb: None,
             memory_cache: None,
         },

@@ -91,6 +91,8 @@ path = "gs://my-bucket/silo/%shard%"
 apply_wal_on_close = true
 # Optional: periodic self-healing scan for pending concurrency requests
 # concurrency_reconcile_interval_ms = 5000
+# Optional: default retention for terminal jobs (7 days)
+# default_terminal_retention = "7d"
 
 # Optional: separate WAL storage
 [database.wal]
@@ -106,6 +108,7 @@ path = "/var/lib/silo/wal/%shard%"
 | `path` | string | `"/tmp/silo/%shard%"` | Path or URL for data storage. Use `%shard%` as a placeholder for the shard number. |
 | `apply_wal_on_close` | bool | `true` | Flush WAL to object storage before closing shards (recommended for durability) |
 | `concurrency_reconcile_interval_ms` | number | `5000` | Optional interval for periodic pending-request reconciliation in the concurrency manager |
+| `default_terminal_retention` | duration | `"7d"` | Default retention for jobs after they reach a terminal state. Per-job `terminal_retention_ms` overrides this. |
 
 <Aside type="caution">
 The `%shard%` placeholder must be an independent directory segment—it cannot have a prefix or suffix within the same path component.
@@ -115,6 +118,15 @@ The `%shard%` placeholder must be an independent directory segment—it cannot h
 </Aside>
 
 ### Storage Backends
+
+### `default_terminal_retention`
+
+Controls how long terminal jobs are retained before Silo automatically deletes them.
+
+- Applies to `Succeeded`, `Failed`, and `Cancelled` jobs
+- The effective value is stored on the job when it is created
+- Can be overridden per job with `terminal_retention_ms`
+- `"0s"` means delete immediately after the job reaches a terminal state
 
 | Backend | Description | Path Format |
 |---------|-------------|-------------|

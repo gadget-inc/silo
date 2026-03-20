@@ -25,6 +25,7 @@ async fn expedite_future_scheduled_job() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -119,6 +120,7 @@ async fn expedite_mid_retry_job() {
                 Some(retry_policy),
                 payload,
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -243,6 +245,7 @@ async fn expedite_succeeded_job_returns_error() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -310,6 +313,7 @@ async fn expedite_failed_job_returns_error() {
                 None,
                 payload,
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -381,6 +385,7 @@ async fn expedite_cancelled_job_returns_error() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -432,6 +437,7 @@ async fn expedite_already_ready_job_returns_error() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -475,6 +481,7 @@ async fn expedite_running_job_returns_error() {
                 None,
                 payload,
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -547,6 +554,7 @@ async fn expedite_job_no_pending_task_returns_error() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -607,6 +615,7 @@ async fn double_expedite_fails_second_time() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -656,6 +665,7 @@ async fn enqueue_sets_current_attempt_in_status() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -698,6 +708,7 @@ async fn dequeue_clears_current_attempt_in_status() {
                 None,
                 payload,
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -776,6 +787,7 @@ async fn retry_updates_current_attempt_in_status() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -846,6 +858,7 @@ async fn expedite_updates_status_start_time() {
                 None,
                 payload,
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -926,6 +939,7 @@ async fn expedite_retry_job_uses_o1_lookup() {
                 Some(retry_policy),
                 payload,
                 vec![],
+                None,
                 None,
                 "default",
             )

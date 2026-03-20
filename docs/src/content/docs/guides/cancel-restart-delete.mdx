@@ -151,6 +151,8 @@ You can only delete jobs that have finished processing. Jobs must be in one of t
 Attempting to delete a Scheduled or Running job will throw an error.
 </Aside>
 
+Terminal jobs can also be deleted automatically by retention. By default, Silo keeps terminal jobs for 7 days before removing them, and you can override that per job with `terminal_retention_ms`.
+
 ### Deletion Errors
 
 | Error | Condition |

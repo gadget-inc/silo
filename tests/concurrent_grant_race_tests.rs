@@ -76,6 +76,7 @@ async fn concurrent_release_and_grant_does_not_double_grant() {
                     max_concurrency: limit,
                 })],
                 None,
+                None,
                 "default",
             )
             .await
@@ -181,6 +182,7 @@ async fn concurrent_release_and_grant_mutex_queue() {
                     key: queue.clone(),
                     max_concurrency: 1,
                 })],
+                None,
                 None,
                 "default",
             )

@@ -56,6 +56,7 @@ async fn enqueue_job(shard: &JobStoreShard, id: &str, priority: u8, start_at_ms:
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -79,6 +80,7 @@ async fn enqueue_job_for_tenant(
             None,
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
+            None,
             None,
             "default",
         )
@@ -752,6 +754,7 @@ async fn sql_current_attempt_differentiates_new_vs_retried() {
             Some(retry_policy),
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
+            None,
             None,
             "default",
         )

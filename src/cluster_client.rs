@@ -722,6 +722,7 @@ impl ClusterClient {
                 attempts,
                 next_attempt_starts_after_ms: job_status.next_attempt_starts_after_ms,
                 task_group: job_view.task_group().to_string(),
+                terminal_retention_ms: job_view.terminal_retention_ms(),
                 result,
             });
         }

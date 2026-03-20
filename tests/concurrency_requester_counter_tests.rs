@@ -31,6 +31,7 @@ async fn requester_counter_tracks_enqueue_and_grant() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -60,6 +61,7 @@ async fn requester_counter_tracks_enqueue_and_grant() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -84,6 +86,7 @@ async fn requester_counter_tracks_enqueue_and_grant() {
                 key: queue.clone(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
@@ -137,6 +140,7 @@ async fn requester_counter_tracks_cancel() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -157,6 +161,7 @@ async fn requester_counter_tracks_cancel() {
                 key: queue.clone(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
@@ -202,6 +207,7 @@ async fn query_count_requesters_uses_counter() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -222,6 +228,7 @@ async fn query_count_requesters_uses_counter() {
                     key: queue.clone(),
                     max_concurrency: 1,
                 })],
+                None,
                 None,
                 "default",
             )
@@ -346,6 +353,7 @@ async fn requester_counter_decrements_on_stale_request_missing_status() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -416,6 +424,7 @@ async fn requester_counter_decrements_on_stale_request_wrong_status() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -437,6 +446,7 @@ async fn requester_counter_decrements_on_stale_request_wrong_status() {
                 key: queue.clone(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
@@ -527,6 +537,7 @@ async fn requester_counter_decrements_for_multiple_stale_requests() {
                 key: queue.clone(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )

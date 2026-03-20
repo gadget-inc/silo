@@ -2,7 +2,7 @@
 
 use silo::gubernator::{MockGubernatorClient, RateLimitClient};
 use silo::job_store_shard::{JobStoreShard, OpenShardOptions};
-use silo::settings::{Backend, DatabaseConfig};
+use silo::settings::{Backend, DEFAULT_TERMINAL_RETENTION, DatabaseConfig};
 use silo::shard_range::ShardRange;
 use silo::storage::resolve_object_store;
 use slatedb::{Db, DbIterator};
@@ -58,6 +58,26 @@ pub async fn open_temp_shard() -> (tempfile::TempDir, std::sync::Arc<JobStoreSha
 pub async fn open_temp_shard_with_reconcile_interval_ms(
     interval_ms: u64,
 ) -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>) {
+    open_temp_shard_with_options(
+        interval_ms,
+        DEFAULT_TERMINAL_RETENTION,
+        Duration::from_secs(86400),
+    )
+    .await
+}
+
+/// Open a temp shard with a custom default terminal retention and fast retention scanning.
+pub async fn open_temp_shard_with_default_terminal_retention(
+    retention: Duration,
+) -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>) {
+    open_temp_shard_with_options(5_000, retention, Duration::from_millis(100)).await
+}
+
+async fn open_temp_shard_with_options(
+    interval_ms: u64,
+    default_terminal_retention: Duration,
+    retention_scan_interval: Duration,
+) -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>) {
     let rate_limiter = MockGubernatorClient::new_arc();
     let tmp = tempfile::tempdir().unwrap();
     let resolved = resolve_object_store(&Backend::Fs, tmp.path().to_string_lossy().as_ref())
@@ -74,6 +94,8 @@ pub async fn open_temp_shard_with_reconcile_interval_ms(
             rate_limiter,
             metrics: None,
             concurrency_reconcile_interval: Duration::from_millis(interval_ms.max(1)),
+            default_terminal_retention,
+            retention_scan_interval,
         },
         ShardRange::full(),
     )
@@ -94,6 +116,8 @@ pub async fn open_temp_shard_with_range(
         path: tmp.path().to_string_lossy().to_string(),
         wal: None,
         apply_wal_on_close: true,
+        default_terminal_retention: DEFAULT_TERMINAL_RETENTION,
+        retention_scan_interval: Duration::from_secs(86400),
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
     };
@@ -114,6 +138,8 @@ pub async fn open_temp_shard_with_rate_limiter(
         path: tmp.path().to_string_lossy().to_string(),
         wal: None,
         apply_wal_on_close: true,
+        default_terminal_retention: DEFAULT_TERMINAL_RETENTION,
+        retention_scan_interval: Duration::from_secs(86400),
         // Use fast flush interval for tests to speed them up
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
@@ -158,6 +184,8 @@ pub async fn open_temp_shard_with_local_wal_and_rate_limiter(
             path: wal_dir.path().to_string_lossy().to_string(),
         }),
         apply_wal_on_close: flush_on_close,
+        default_terminal_retention: DEFAULT_TERMINAL_RETENTION,
+        retention_scan_interval: Duration::from_secs(86400),
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
     };

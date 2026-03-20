@@ -99,6 +99,7 @@ message EnqueueRequest {
   optional string tenant = 8;            // Tenant ID for multi-tenant deployments. Optional.
   map<string, string> metadata = 9;      // Arbitrary key/value metadata stored with the job.
   string task_group = 10;                // Task group for organizing tasks. Required. Tasks are enqueued into this group.
+  optional int64 terminal_retention_ms = 11; // How long in milliseconds to retain the job after it reaches a terminal state.
 }
 
 // Response after successfully enqueueing a job.
@@ -159,6 +160,7 @@ message GetJobResponse {
   optional int64 next_attempt_starts_after_ms = 11; // Unix timestamp (ms) when the next attempt will start. Present for scheduled jobs, absent for running or terminal jobs.
   string task_group = 12;                // Task group this job's tasks are enqueued into.
   optional SerializedBytes result = 13;  // Result data from the last attempt, if the job succeeded.
+  optional int64 terminal_retention_ms = 14; // Stored terminal retention in milliseconds for this job, if set.
 }
 
 // Request to get the result of a completed job.
@@ -544,6 +546,7 @@ message ImportJobRequest {
   map<string, string> metadata = 10;     // Arbitrary key/value metadata.
   string task_group = 11;               // Task group for organizing tasks.
   repeated ImportAttempt attempts = 12;  // Historical attempts, all terminal.
+  optional int64 terminal_retention_ms = 13; // How long in milliseconds to retain the job after it reaches a terminal state.
 }
 
 // Batch request to import multiple jobs.

@@ -23,6 +23,7 @@ async fn tallows_same_job_id_used_among_different_tenants() {
             test_helpers::msgpack_payload(&serde_json::json!({"tenant": "A"})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -38,6 +39,7 @@ async fn tallows_same_job_id_used_among_different_tenants() {
             None,
             test_helpers::msgpack_payload(&serde_json::json!({"tenant": "B"})),
             vec![],
+            None,
             None,
             "default",
         )

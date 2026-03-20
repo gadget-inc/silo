@@ -25,6 +25,8 @@ fn make_test_factory_with_shards(num_shards: u32) -> (Arc<ShardFactory>, ShardMa
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
             slatedb: None,
             memory_cache: None,
         },
@@ -89,6 +91,7 @@ async fn cluster_client_query_local_shard() {
             None,
             test_helpers::msgpack_payload(&serde_json::json!({"test": "data"})),
             vec![],
+            None,
             None,
             "default",
         )
@@ -159,6 +162,7 @@ async fn cluster_client_query_all_local_shards() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -174,6 +178,7 @@ async fn cluster_client_query_all_local_shards() {
             None,
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
+            None,
             None,
             "default",
         )
@@ -243,6 +248,7 @@ async fn cluster_client_get_job_local() {
             test_helpers::msgpack_payload(&serde_json::json!({"foo": "bar"})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -306,6 +312,7 @@ async fn cluster_client_cancel_job_local() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -361,6 +368,7 @@ async fn cluster_client_json_serialization_preserves_data() {
                 "nested": {"key": "value"}
             })),
             vec![],
+            None,
             None,
             "default",
         )
@@ -584,6 +592,7 @@ async fn cluster_client_query_all_local_shards_with_mixed_results() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -599,6 +608,7 @@ async fn cluster_client_query_all_local_shards_with_mixed_results() {
             None,
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
+            None,
             None,
             "default",
         )
@@ -783,6 +793,8 @@ fn make_test_app_config(tmp: &tempfile::TempDir) -> AppConfig {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
             slatedb: None,
             memory_cache: None,
         },
@@ -816,6 +828,7 @@ async fn cluster_client_remote_query_shard() {
             None,
             test_helpers::msgpack_payload(&serde_json::json!({"remote": true})),
             vec![],
+            None,
             None,
             "default",
         )
@@ -876,6 +889,7 @@ async fn cluster_client_remote_get_job() {
             None,
             test_helpers::msgpack_payload(&serde_json::json!({"data": "hello"})),
             vec![],
+            None,
             None,
             "default",
         )
@@ -973,6 +987,7 @@ async fn cluster_client_remote_cancel_job() {
             None,
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
+            None,
             None,
             "default",
         )

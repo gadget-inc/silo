@@ -2,13 +2,14 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use silo::coordination::NoneCoordinator;
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::pb::silo_client::SiloClient;
 use silo::server::run_server;
-use silo::settings::{AppConfig, Backend, DatabaseTemplate};
+use silo::settings::{AppConfig, Backend, DEFAULT_TERMINAL_RETENTION, DatabaseTemplate};
 use silo::shard_range::ShardRange;
 use tokio::net::TcpListener;
 
@@ -64,6 +65,8 @@ pub async fn create_test_factory() -> anyhow::Result<(Arc<ShardFactory>, tempfil
         wal: None,
         apply_wal_on_close: true,
         concurrency_reconcile_interval_ms: 5000,
+        default_terminal_retention: DEFAULT_TERMINAL_RETENTION,
+        retention_scan_interval: Duration::from_secs(86400),
         slatedb: None,
         memory_cache: None,
     };
@@ -104,6 +107,8 @@ pub async fn setup_multi_shard_server(
         wal: None,
         apply_wal_on_close: true,
         concurrency_reconcile_interval_ms: 5000,
+        default_terminal_retention: DEFAULT_TERMINAL_RETENTION,
+        retention_scan_interval: Duration::from_secs(86400),
         slatedb: None,
         memory_cache: None,
     };

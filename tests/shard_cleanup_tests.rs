@@ -1,3 +1,4 @@
+use std::time::Duration;
 mod test_helpers;
 use test_helpers::{
     count_job_info_keys, count_job_info_keys_for_tenant, count_job_status_keys,
@@ -27,6 +28,7 @@ async fn enqueue_jobs_for_tenants(
                     None,
                     payload,
                     vec![],
+                    None,
                     None,
                     "default",
                 )
@@ -413,6 +415,7 @@ async fn cleanup_handles_escaped_tenant_ids() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -580,6 +583,8 @@ async fn reopening_shard_after_cleanup_preserves_status() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
             slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
             memory_cache: None,
         };
@@ -628,6 +633,8 @@ async fn reopening_shard_after_cleanup_preserves_status() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
             slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
             memory_cache: None,
         };
@@ -705,6 +712,8 @@ async fn shard_created_at_preserved_across_reopen() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
             slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
             memory_cache: None,
         };
@@ -733,6 +742,8 @@ async fn shard_created_at_preserved_across_reopen() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
             slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
             memory_cache: None,
         };

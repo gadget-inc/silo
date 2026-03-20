@@ -1,4 +1,4 @@
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::borrow::Cow;
 use std::fs;
 use std::path::Path;
@@ -161,9 +161,33 @@ fn default_apply_wal_on_close() -> bool {
 }
 
 pub const DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS: u64 = 5000;
+pub const DEFAULT_TERMINAL_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+pub const DEFAULT_RETENTION_SCAN_INTERVAL: Duration = Duration::from_secs(43200);
 
 fn default_concurrency_reconcile_interval_ms() -> u64 {
     DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS
+}
+
+fn default_terminal_retention() -> Duration {
+    DEFAULT_TERMINAL_RETENTION
+}
+
+fn default_retention_scan_interval() -> Duration {
+    DEFAULT_RETENTION_SCAN_INTERVAL
+}
+
+/// Serialize a Duration as a human-readable string (e.g. "300s", "500ms").
+/// Uses whole seconds when possible, otherwise total milliseconds.
+fn serialize_duration<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let duration_str = if duration.subsec_millis() == 0 {
+        format!("{}s", duration.as_secs())
+    } else {
+        format!("{}ms", duration.as_millis())
+    };
+    serializer.serialize_str(&duration_str)
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -190,6 +214,16 @@ pub struct DatabaseTemplate {
     /// to self-heal from missed in-memory notifications.
     #[serde(default = "default_concurrency_reconcile_interval_ms")]
     pub concurrency_reconcile_interval_ms: u64,
+    /// Default retention for jobs after they reach a terminal state (e.g. "7d", "3600s").
+    #[serde(default = "default_terminal_retention")]
+    #[serde(deserialize_with = "duration_str::deserialize_duration")]
+    #[serde(serialize_with = "serialize_duration")]
+    pub default_terminal_retention: Duration,
+    /// Interval between periodic retention scans that delete expired terminal jobs (e.g. "12h", "43200s").
+    #[serde(default = "default_retention_scan_interval")]
+    #[serde(deserialize_with = "duration_str::deserialize_duration")]
+    #[serde(serialize_with = "serialize_duration")]
+    pub retention_scan_interval: Duration,
     /// Optional SlateDB-specific settings for tuning database performance.
     /// If not specified, SlateDB defaults are used. When partially specified,
     /// unspecified fields use SlateDB defaults.
@@ -447,6 +481,16 @@ pub struct DatabaseConfig {
     /// Defaults to true when WAL is configured.
     #[serde(default = "default_apply_wal_on_close")]
     pub apply_wal_on_close: bool,
+    /// Default retention for jobs after they reach a terminal state (e.g. "7d", "3600s").
+    #[serde(default = "default_terminal_retention")]
+    #[serde(deserialize_with = "duration_str::deserialize_duration")]
+    #[serde(serialize_with = "serialize_duration")]
+    pub default_terminal_retention: Duration,
+    /// Interval between periodic retention scans that delete expired terminal jobs (e.g. "12h", "43200s").
+    #[serde(default = "default_retention_scan_interval")]
+    #[serde(deserialize_with = "duration_str::deserialize_duration")]
+    #[serde(serialize_with = "serialize_duration")]
+    pub retention_scan_interval: Duration,
     /// Optional SlateDB-specific settings for tuning database performance.
     /// If not specified, SlateDB defaults are used. When partially specified,
     /// unspecified fields use SlateDB defaults.
@@ -573,6 +617,8 @@ impl AppConfig {
                 wal: None,
                 apply_wal_on_close: true,
                 concurrency_reconcile_interval_ms: default_concurrency_reconcile_interval_ms(),
+                default_terminal_retention: default_terminal_retention(),
+                retention_scan_interval: default_retention_scan_interval(),
                 slatedb: None,
                 memory_cache: None,
             },

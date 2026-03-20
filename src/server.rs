@@ -569,6 +569,13 @@ impl SiloService {
                 "priority must be between 0 and 99",
             ));
         }
+        if let Some(terminal_retention_ms) = job_req.terminal_retention_ms
+            && terminal_retention_ms < 0
+        {
+            return Err(Status::invalid_argument(
+                "terminal_retention_ms must be >= 0",
+            ));
+        }
 
         Self::validate_metadata(&job_req.metadata)?;
 
@@ -633,6 +640,7 @@ impl SiloService {
             priority: job_req.priority as u8,
             enqueue_time_ms: job_req.enqueue_time_ms,
             start_at_ms: job_req.start_at_ms,
+            terminal_retention_ms: job_req.terminal_retention_ms,
             retry_policy: retry,
             payload: payload_bytes,
             limits,
@@ -833,6 +841,13 @@ impl Silo for SiloService {
                 "priority must be between 0 and 99",
             ));
         }
+        if let Some(terminal_retention_ms) = r.terminal_retention_ms
+            && terminal_retention_ms < 0
+        {
+            return Err(Status::invalid_argument(
+                "terminal_retention_ms must be >= 0",
+            ));
+        }
 
         let payload_bytes = extract_payload_bytes(&r.payload);
         let retry = r.retry_policy.map(proto_retry_to_domain);
@@ -866,6 +881,7 @@ impl Silo for SiloService {
                 payload_bytes,
                 limits,
                 metadata,
+                r.terminal_retention_ms,
                 &r.task_group,
             )
             .await
@@ -966,6 +982,7 @@ impl Silo for SiloService {
             attempts,
             next_attempt_starts_after_ms: job_status.next_attempt_starts_after_ms,
             task_group: view.task_group().to_string(),
+            terminal_retention_ms: view.terminal_retention_ms(),
             result,
         };
         Ok(Response::new(resp))

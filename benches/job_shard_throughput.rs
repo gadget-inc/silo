@@ -1,6 +1,6 @@
 use silo::gubernator::NullGubernatorClient;
 use silo::job_store_shard::JobStoreShard;
-use silo::settings::{Backend, DatabaseConfig};
+use silo::settings::{Backend, DEFAULT_TERMINAL_RETENTION, DatabaseConfig};
 use silo::shard_range::ShardRange;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,6 +13,8 @@ async fn open_temp_shard(flush_interval_ms: u64) -> (tempfile::TempDir, Arc<JobS
         path: tmp.path().to_string_lossy().to_string(),
         wal: None,
         apply_wal_on_close: true,
+        default_terminal_retention: DEFAULT_TERMINAL_RETENTION,
+        retention_scan_interval: Duration::from_secs(86400),
         slatedb: Some(slatedb::config::Settings {
             flush_interval: Some(Duration::from_millis(flush_interval_ms)),
             ..Default::default()
@@ -53,7 +55,7 @@ async fn measure_enqueue_throughput(
                     rmp_serde::to_vec(&serde_json::json!({"producer": producer_id, "i": i}))
                         .expect("serialize payload");
                 shard
-                    .enqueue("-", None, 50, now_ms, None, payload, vec![], None, "")
+                    .enqueue("-", None, 50, now_ms, None, payload, vec![], None, None, "")
                     .await
                     .expect("enqueue");
             }
@@ -88,7 +90,7 @@ async fn measure_dequeue_throughput(
     for i in 0..total_jobs {
         let payload = rmp_serde::to_vec(&serde_json::json!({"i": i})).expect("serialize payload");
         shard
-            .enqueue("-", None, 50, now_ms, None, payload, vec![], None, "")
+            .enqueue("-", None, 50, now_ms, None, payload, vec![], None, None, "")
             .await
             .expect("enqueue");
     }

@@ -28,6 +28,7 @@ async fn grpc_get_job_includes_status() -> anyhow::Result<()> {
             tenant: None,
             metadata: std::collections::HashMap::new(),
             task_group: "default".to_string(),
+            terminal_retention_ms: None,
         };
         let _ = client.enqueue(enq).await?;
 
@@ -164,6 +165,7 @@ async fn grpc_get_job_result_not_terminal() -> anyhow::Result<()> {
             tenant: None,
             metadata: std::collections::HashMap::new(),
             task_group: "default".to_string(),
+            terminal_retention_ms: None,
         };
         let _ = client.enqueue(enq).await?;
 
@@ -238,6 +240,7 @@ async fn grpc_get_job_result_success() -> anyhow::Result<()> {
             tenant: None,
             metadata: std::collections::HashMap::new(),
             task_group: "default".to_string(),
+            terminal_retention_ms: None,
         };
         let _ = client.enqueue(enq).await?;
 
@@ -329,6 +332,7 @@ async fn grpc_get_job_result_failure() -> anyhow::Result<()> {
             tenant: None,
             metadata: std::collections::HashMap::new(),
             task_group: "default".to_string(),
+            terminal_retention_ms: None,
         };
         let _ = client.enqueue(enq).await?;
 
@@ -422,6 +426,7 @@ async fn grpc_get_job_result_cancelled() -> anyhow::Result<()> {
             tenant: None,
             metadata: std::collections::HashMap::new(),
             task_group: "default".to_string(),
+            terminal_retention_ms: None,
         };
         let _ = client.enqueue(enq).await?;
 
@@ -487,6 +492,7 @@ async fn grpc_get_job_result_cancelled_while_running() -> anyhow::Result<()> {
             tenant: None,
             metadata: std::collections::HashMap::new(),
             task_group: "default".to_string(),
+            terminal_retention_ms: None,
         };
         let _ = client.enqueue(enq).await?;
 
@@ -575,6 +581,7 @@ async fn grpc_server_get_job_result_for_non_terminal_job() -> anyhow::Result<()>
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
+                terminal_retention_ms: None,
             })
             .await?;
 
@@ -636,6 +643,7 @@ async fn grpc_get_job_next_attempt_starts_after() -> anyhow::Result<()> {
             tenant: None,
             metadata: std::collections::HashMap::new(),
             task_group: "default".to_string(),
+            terminal_retention_ms: None,
         };
         let _ = client.enqueue(enq).await?;
 
@@ -678,6 +686,7 @@ async fn grpc_get_job_next_attempt_starts_after() -> anyhow::Result<()> {
             tenant: None,
             metadata: std::collections::HashMap::new(),
             task_group: "default".to_string(),
+            terminal_retention_ms: None,
         };
         let _ = client.enqueue(enq_future).await?;
 
@@ -801,6 +810,7 @@ async fn grpc_get_job_next_attempt_after_retry() -> anyhow::Result<()> {
             tenant: None,
             metadata: std::collections::HashMap::new(),
             task_group: "default".to_string(),
+            terminal_retention_ms: None,
         };
         let _ = client.enqueue(enq).await?;
 
@@ -889,6 +899,7 @@ async fn grpc_get_job_next_attempt_cancelled() -> anyhow::Result<()> {
             tenant: None,
             metadata: std::collections::HashMap::new(),
             task_group: "default".to_string(),
+            terminal_retention_ms: None,
         };
         let _ = client.enqueue(enq).await?;
 
@@ -990,6 +1001,7 @@ async fn grpc_lease_tasks_includes_limits() -> anyhow::Result<()> {
             tenant: None,
             metadata: std::collections::HashMap::new(),
             task_group: "default".to_string(),
+            terminal_retention_ms: None,
         };
         let _ = client.enqueue(enq).await?;
 
@@ -1088,6 +1100,7 @@ async fn grpc_lease_tasks_includes_floating_concurrency_limit() -> anyhow::Resul
             tenant: None,
             metadata: std::collections::HashMap::new(),
             task_group: "default".to_string(),
+            terminal_retention_ms: None,
         };
         let _ = client.enqueue(enq).await?;
 
@@ -1159,6 +1172,7 @@ async fn grpc_lease_tasks_empty_limits() -> anyhow::Result<()> {
             tenant: None,
             metadata: std::collections::HashMap::new(),
             task_group: "default".to_string(),
+            terminal_retention_ms: None,
         };
         let _ = client.enqueue(enq).await?;
 
@@ -1217,6 +1231,7 @@ async fn grpc_get_job_result_field_without_attempts() -> anyhow::Result<()> {
             tenant: None,
             metadata: std::collections::HashMap::new(),
             task_group: "default".to_string(),
+            terminal_retention_ms: None,
         };
         let _ = client.enqueue(enq).await?;
 
@@ -1308,6 +1323,7 @@ async fn grpc_get_job_result_field_with_attempts() -> anyhow::Result<()> {
             tenant: None,
             metadata: std::collections::HashMap::new(),
             task_group: "default".to_string(),
+            terminal_retention_ms: None,
         };
         let _ = client.enqueue(enq).await?;
 
@@ -1401,6 +1417,7 @@ async fn grpc_get_job_result_field_none_for_failed() -> anyhow::Result<()> {
             tenant: None,
             metadata: std::collections::HashMap::new(),
             task_group: "default".to_string(),
+            terminal_retention_ms: None,
         };
         let _ = client.enqueue(enq).await?;
 

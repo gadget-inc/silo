@@ -57,6 +57,8 @@ fn make_test_factory(node_id: &str) -> Arc<ShardFactory> {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
             slatedb: None,
             memory_cache: None,
         },
@@ -3777,7 +3779,8 @@ async fn k8s_child_shards_usable_after_split() {
                 None,   // no retry policy
                 vec![], // empty payload
                 vec![], // no limits
-                None,   // no metadata
+                None,
+                None, // no metadata
                 "default",
             )
             .await
@@ -5474,6 +5477,8 @@ async fn k8s_shard_close_failure_keeps_lease() {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
             slatedb: None,
             memory_cache: None,
         },
@@ -5548,6 +5553,8 @@ async fn k8s_shard_close_failure_during_shutdown_keeps_lease() {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
             slatedb: None,
             memory_cache: None,
         },

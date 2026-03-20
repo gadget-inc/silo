@@ -42,6 +42,7 @@ async fn floating_limit_shared_across_task_groups() {
                 },
             )],
             None,
+            None,
             "alpha",
         )
         .await
@@ -70,6 +71,7 @@ async fn floating_limit_shared_across_task_groups() {
                     metadata: vec![],
                 },
             )],
+            None,
             None,
             "beta",
         )
@@ -135,6 +137,7 @@ async fn floating_limit_state_shared_across_task_groups() {
                 },
             )],
             None,
+            None,
             "alpha",
         )
         .await
@@ -169,6 +172,7 @@ async fn floating_limit_state_shared_across_task_groups() {
                     metadata: vec![("source".to_string(), "beta".to_string())],
                 },
             )],
+            None,
             None,
             "beta",
         )
@@ -218,6 +222,7 @@ async fn floating_limit_refresh_applies_to_all_task_groups() {
                 },
             )],
             None,
+            None,
             "alpha",
         )
         .await
@@ -243,6 +248,7 @@ async fn floating_limit_refresh_applies_to_all_task_groups() {
                     metadata: vec![],
                 },
             )],
+            None,
             None,
             "beta",
         )
@@ -320,6 +326,7 @@ async fn floating_limit_queues_jobs_from_multiple_task_groups() {
                 },
             )],
             None,
+            None,
             "group-x",
         )
         .await
@@ -342,6 +349,7 @@ async fn floating_limit_queues_jobs_from_multiple_task_groups() {
                 },
             )],
             None,
+            None,
             "group-y",
         )
         .await
@@ -363,6 +371,7 @@ async fn floating_limit_queues_jobs_from_multiple_task_groups() {
                     metadata: vec![],
                 },
             )],
+            None,
             None,
             "group-z",
         )
@@ -423,6 +432,7 @@ async fn floating_concurrency_limit_creates_state_on_enqueue() {
                 },
             )],
             None,
+            None,
             "default",
         )
         .await
@@ -480,6 +490,7 @@ async fn floating_concurrency_limit_schedules_refresh_when_stale() {
                 },
             )],
             None,
+            None,
             "default",
         )
         .await
@@ -506,6 +517,7 @@ async fn floating_concurrency_limit_schedules_refresh_when_stale() {
                     metadata: vec![],
                 },
             )],
+            None,
             None,
             "default",
         )
@@ -551,6 +563,7 @@ async fn floating_concurrency_limit_schedules_refresh_when_stale_with_waiters_ab
                     },
                 )],
                 None,
+                None,
                 "default",
             )
             .await
@@ -576,6 +589,7 @@ async fn floating_concurrency_limit_schedules_refresh_when_stale_with_waiters_ab
                     metadata: vec![],
                 },
             )],
+            None,
             None,
             "default",
         )
@@ -626,6 +640,7 @@ async fn floating_concurrency_limit_skips_refresh_without_waiters() {
                 },
             )],
             None,
+            None,
             "default",
         )
         .await
@@ -651,6 +666,7 @@ async fn floating_concurrency_limit_skips_refresh_without_waiters() {
                     metadata: vec![],
                 },
             )],
+            None,
             None,
             "default",
         )
@@ -700,6 +716,7 @@ async fn floating_limit_allows_multiple_concurrent_grants() {
                 },
             )],
             None,
+            None,
             "default",
         )
         .await
@@ -721,6 +738,7 @@ async fn floating_limit_allows_multiple_concurrent_grants() {
                     metadata: vec![],
                 },
             )],
+            None,
             None,
             "default",
         )
@@ -765,6 +783,7 @@ async fn floating_limit_scanner_grants_waiter_while_one_holder_remains() {
                 },
             )],
             None,
+            None,
             "default",
         )
         .await
@@ -787,6 +806,7 @@ async fn floating_limit_scanner_grants_waiter_while_one_holder_remains() {
                 },
             )],
             None,
+            None,
             "default",
         )
         .await
@@ -808,6 +828,7 @@ async fn floating_limit_scanner_grants_waiter_while_one_holder_remains() {
                     metadata: vec![],
                 },
             )],
+            None,
             None,
             "default",
         )
@@ -885,6 +906,7 @@ async fn floating_concurrency_limit_dequeue_returns_refresh_tasks() {
                 },
             )],
             None,
+            None,
             "default",
         )
         .await
@@ -910,6 +932,7 @@ async fn floating_concurrency_limit_dequeue_returns_refresh_tasks() {
                     metadata: vec![("key".to_string(), "value".to_string())],
                 },
             )],
+            None,
             None,
             "default",
         )
@@ -964,6 +987,7 @@ async fn floating_limit_refresh_success_updates_state() {
                 },
             )],
             None,
+            None,
             "default",
         )
         .await
@@ -989,6 +1013,7 @@ async fn floating_limit_refresh_success_updates_state() {
                     metadata: vec![],
                 },
             )],
+            None,
             None,
             "default",
         )
@@ -1061,6 +1086,7 @@ async fn floating_limit_refresh_failure_triggers_backoff() {
                 },
             )],
             None,
+            None,
             "default",
         )
         .await
@@ -1086,6 +1112,7 @@ async fn floating_limit_refresh_failure_triggers_backoff() {
                     metadata: vec![],
                 },
             )],
+            None,
             None,
             "default",
         )
@@ -1164,6 +1191,7 @@ async fn floating_limit_refresh_failure_skips_retry_without_waiters() {
                 },
             )],
             None,
+            None,
             "default",
         )
         .await
@@ -1187,6 +1215,7 @@ async fn floating_limit_refresh_failure_skips_retry_without_waiters() {
                     metadata: vec![],
                 },
             )],
+            None,
             None,
             "default",
         )
@@ -1269,6 +1298,7 @@ async fn floating_limit_concurrent_enqueues_no_duplicate_refresh() {
                 },
             )],
             None,
+            None,
             "default",
         )
         .await
@@ -1297,6 +1327,7 @@ async fn floating_limit_concurrent_enqueues_no_duplicate_refresh() {
                         metadata: vec![],
                     },
                 )],
+                None,
                 None,
                 "default",
             )
@@ -1348,6 +1379,7 @@ async fn floating_limit_uses_dynamic_max_concurrency() {
                 },
             )],
             None,
+            None,
             "default",
         )
         .await
@@ -1370,6 +1402,7 @@ async fn floating_limit_uses_dynamic_max_concurrency() {
                     metadata: vec![],
                 },
             )],
+            None,
             None,
             "default",
         )
@@ -1455,6 +1488,7 @@ async fn floating_limit_job_persists_limit_type() {
                 },
             )],
             None,
+            None,
             "default",
         )
         .await
@@ -1515,6 +1549,7 @@ async fn floating_limit_multiple_retries_increase_backoff() {
                 },
             )],
             None,
+            None,
             "default",
         )
         .await
@@ -1540,6 +1575,7 @@ async fn floating_limit_multiple_retries_increase_backoff() {
                     metadata: vec![],
                 },
             )],
+            None,
             None,
             "default",
         )
@@ -1630,6 +1666,7 @@ async fn floating_limit_successful_refresh_resets_backoff() {
                 },
             )],
             None,
+            None,
             "default",
         )
         .await
@@ -1655,6 +1692,7 @@ async fn floating_limit_successful_refresh_resets_backoff() {
                     metadata: vec![],
                 },
             )],
+            None,
             None,
             "default",
         )
@@ -1736,6 +1774,7 @@ async fn floating_limit_refresh_task_lease_expiry_allows_rescheduling() {
                 },
             )],
             None,
+            None,
             "default",
         )
         .await
@@ -1761,6 +1800,7 @@ async fn floating_limit_refresh_task_lease_expiry_allows_rescheduling() {
                     metadata: vec![],
                 },
             )],
+            None,
             None,
             "default",
         )
@@ -1858,6 +1898,7 @@ async fn floating_limit_refresh_task_lease_expiry_allows_rescheduling() {
                 },
             )],
             None,
+            None,
             "default",
         )
         .await
@@ -1909,6 +1950,7 @@ async fn floating_limit_refresh_task_lease_expiry_preserves_state() {
                 },
             )],
             None,
+            None,
             "default",
         )
         .await
@@ -1937,6 +1979,7 @@ async fn floating_limit_refresh_task_lease_expiry_preserves_state() {
                     ],
                 },
             )],
+            None,
             None,
             "default",
         )

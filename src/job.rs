@@ -269,7 +269,8 @@ pub struct JobInfo {
     pub id: String,
     pub priority: u8,         // 0..=99, 0 is highest priority and will run first
     pub enqueue_time_ms: i64, // epoch millis
-    pub payload: Vec<u8>,     // MessagePack bytes (opaque to codec)
+    pub terminal_retention_ms: Option<i64>,
+    pub payload: Vec<u8>, // MessagePack bytes (opaque to codec)
     pub retry_policy: Option<RetryPolicy>,
     pub metadata: Vec<(String, String)>,
     pub limits: Vec<Limit>, // Ordered list of limits to check before execution
@@ -296,6 +297,9 @@ impl JobView {
     }
     pub fn enqueue_time_ms(&self) -> i64 {
         self.fb().enqueue_time_ms()
+    }
+    pub fn terminal_retention_ms(&self) -> Option<i64> {
+        self.fb().terminal_retention_ms()
     }
     pub fn payload_bytes(&self) -> &[u8] {
         self.fb().payload().map(|v| v.bytes()).unwrap_or_default()

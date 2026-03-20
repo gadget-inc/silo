@@ -205,6 +205,7 @@ table JobInfo {
   metadata: [KeyValuePair];
   limits: [LimitEntry];
   task_group: string;
+  terminal_retention_ms: int64 = null;
 }
 
 // ============================================================

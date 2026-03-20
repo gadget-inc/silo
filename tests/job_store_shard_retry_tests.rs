@@ -27,6 +27,7 @@ async fn reporting_attempt_outcome_updates_attempt_and_deletes_lease() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -96,6 +97,7 @@ async fn error_with_no_retries_does_not_enqueue_next_attempt() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -151,6 +153,7 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
                 Some(policy),
                 payload,
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -268,6 +271,7 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_success() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -347,6 +351,7 @@ async fn double_reporting_same_attempt_is_idempotent_success_then_error() {
                 None,
                 payload,
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -428,6 +433,7 @@ async fn retry_count_one_boundary_enqueues_attempt2_then_stops_on_second_error()
             Some(policy.clone()),
             payload,
             vec![],
+            None,
             None,
             "default",
         )
@@ -524,6 +530,7 @@ async fn next_retry_time_matches_scheduled_time_smoke() {
                 payload.clone(),
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -590,6 +597,7 @@ async fn duplicate_reporting_error_then_error_is_rejected_and_no_extra_tasks() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -650,6 +658,7 @@ async fn duplicate_reporting_error_then_success_is_rejected_and_state_persists()
                 None,
                 payload,
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -721,6 +730,7 @@ async fn attempt_records_exist_across_retries_and_task_ids_distinct() {
                 Some(policy),
                 payload,
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -800,6 +810,7 @@ async fn outcome_payload_edge_cases_empty_vectors_round_trip() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -836,6 +847,7 @@ async fn outcome_payload_edge_cases_empty_vectors_round_trip() {
                 None,
                 test_helpers::msgpack_payload(&serde_json::json!({"k": "v2"})),
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -888,6 +900,7 @@ async fn large_outcome_payloads_round_trip() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -929,6 +942,7 @@ async fn large_outcome_payloads_round_trip() {
                 None,
                 test_helpers::msgpack_payload(&serde_json::json!({"k": "v2"})),
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -987,6 +1001,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
             Some(policy),
             payload,
             vec![],
+            None,
             None,
             "default",
         )

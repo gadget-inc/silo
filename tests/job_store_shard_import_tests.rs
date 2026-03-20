@@ -13,6 +13,8 @@ use silo::task::{ConcurrencyAction, GubernatorRateLimitData, Task};
 use slatedb::WriteBatch;
 use std::sync::Arc;
 
+const TEST_TERMINAL_RETENTION_S: i64 = 10 * 365 * 24 * 60 * 60;
+
 fn default_retry_policy() -> RetryPolicy {
     RetryPolicy {
         retry_count: 3,
@@ -58,6 +60,7 @@ fn base_import_params(id: &str) -> ImportJobParams {
         priority: 50,
         enqueue_time_ms: 1_700_000_000_000,
         start_at_ms: 0,
+        terminal_retention_ms: Some(TEST_TERMINAL_RETENTION_S),
         retry_policy: None,
         payload: test_helpers::msgpack_payload(&serde_json::json!({"imported": true})),
         limits: vec![],
@@ -534,6 +537,7 @@ async fn import_non_terminal_with_concurrency_at_capacity() {
                 key: "limited-queue".to_string(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
@@ -1995,6 +1999,7 @@ fn build_reimport_params(
         priority: 50,
         enqueue_time_ms: 1_700_000_000_000,
         start_at_ms: 0,
+        terminal_retention_ms: Some(TEST_TERMINAL_RETENTION_S),
         retry_policy: Some(RetryPolicy {
             retry_count: 10, // generous to always allow retries when non-terminal
             initial_interval_ms: 10,
@@ -2564,6 +2569,7 @@ async fn setup_scheduled_with_concurrency_request(shard: &Arc<JobStoreShard>, jo
                 key: "sys-limited-queue".to_string(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
