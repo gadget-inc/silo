@@ -1473,6 +1473,9 @@ async fn retry_with_concurrent_jobs_respects_limit() {
         .await
         .expect("enqueue B");
 
+    // Give the task broker scanner time to pick up both tasks from the DB
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
     // Dequeue both A and B (max_concurrency=2 allows both)
     let tasks = shard
         .dequeue("w", "default", 10)
