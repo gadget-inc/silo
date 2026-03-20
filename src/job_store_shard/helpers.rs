@@ -164,6 +164,12 @@ pub(crate) fn put_task<W: WriteBatcher>(
 ///
 /// Encapsulates the MAX_RETRIES=5 loop with exponential backoff and
 /// `TransactionConflict` error return on exhaustion.
+///
+/// Also retries on SlateDB `InvalidClockTick` errors, which occur under heavy
+/// concurrent write load due to a TOCTOU race in SlateDB's MonotonicClock: one
+/// thread reads the wall-clock, gets preempted, another thread commits a later
+/// tick, then the first thread's earlier tick is rejected. These are transient
+/// and resolve on retry once the clock advances.
 pub(crate) async fn retry_on_txn_conflict<T, F, Fut>(
     operation_name: &str,
     mut f: F,
@@ -178,7 +184,7 @@ where
         match f().await {
             Ok(val) => return Ok(val),
             Err(JobStoreShardError::Slate(ref e))
-                if e.kind() == slatedb::ErrorKind::Transaction =>
+                if e.kind() == slatedb::ErrorKind::Transaction || is_clock_tick_error(e) =>
             {
                 if attempt + 1 < MAX_RETRIES {
                     let delay_ms = 10 * (1 << attempt); // 10ms, 20ms, 40ms, 80ms
@@ -198,6 +204,14 @@ where
     Err(JobStoreShardError::TransactionConflict(
         operation_name.to_string(),
     ))
+}
+
+/// Check if a SlateDB error is an InvalidClockTick error.
+///
+/// SlateDB maps InvalidClockTick to ErrorKind::Invalid (a broad category), so we
+/// check the error message to identify this specific transient error.
+fn is_clock_tick_error(e: &slatedb::Error) -> bool {
+    e.kind() == slatedb::ErrorKind::Invalid && e.to_string().contains("invalid clock tick")
 }
 
 /// Load a `JobView` for the given tenant/job from a transaction or DB reader.
