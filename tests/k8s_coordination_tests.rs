@@ -2629,9 +2629,9 @@ async fn k8s_graceful_shutdown_releases_shards_promptly() {
 async fn k8s_watcher_notification_drives_convergence_without_external_poke() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
-    // Use fewer shards so acquiring them all after node removal is fast enough
+    // Use very few shards so acquiring them all after node removal is fast enough
     // to complete within the safety-timer window (each shard needs a K8s API call).
-    let num_shards: u32 = 8;
+    let num_shards: u32 = 4;
     let short_ttl: i64 = 5;
 
     // Start two nodes
