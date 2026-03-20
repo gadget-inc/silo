@@ -63,7 +63,7 @@ pub use k8s_backend::{
 pub use none::NoneCoordinator;
 
 /// Information about a cluster member
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MemberInfo {
     pub node_id: String,
     pub grpc_addr: String,

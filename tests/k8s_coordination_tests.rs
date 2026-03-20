@@ -5583,3 +5583,81 @@ async fn k8s_shard_close_failure_during_shutdown_keeps_lease() {
     handle.abort();
     let _ = std::fs::remove_dir_all(&tmpdir);
 }
+
+/// Test that lease renewals don't trigger spurious membership change notifications.
+///
+/// Regression test: previously, every K8s lease renewal (which updates renewTime)
+/// fired a MODIFIED watch event that was unconditionally forwarded to the
+/// coordination loop as a membership change. With short TTLs this caused ~180
+/// no-op reconciliations per minute per node.
+///
+/// The fix deduplicates by comparing the actual member list before notifying.
+/// This test verifies that during steady state with frequent lease renewals,
+/// the membership_notify_count stays at 1 (from initialization only).
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_lease_renewals_do_not_trigger_membership_notifications() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 4;
+    // Short TTL = renewals every ~1.67s, so in 10s we get ~6 renewals
+    let short_ttl: i64 = 5;
+
+    let (c1, h1) = match K8sCoordinator::start(
+        make_coordinator_config(
+            &namespace,
+            &prefix,
+            "renew-dedup-1",
+            "http://127.0.0.1:7450",
+            num_shards,
+            short_ttl,
+        ),
+        make_test_factory("renew-dedup-1"),
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Skipping lease renewal dedup test: {}", e);
+            return;
+        }
+    };
+
+    // Wait for initial convergence (triggers 1 membership notification from InitDone)
+    assert!(
+        c1.wait_converged(Duration::from_secs(15)).await,
+        "should converge"
+    );
+
+    // Record notification count after convergence
+    let count_after_convergence = c1.membership_notify_count();
+    assert!(
+        count_after_convergence >= 1,
+        "should have at least 1 notification from initial membership discovery"
+    );
+
+    // Wait long enough for multiple lease renewals to occur.
+    // With TTL=5s, renewals happen every ~1.67s, so 10s = ~6 renewals.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    // The notification count should not have increased — all those lease renewals
+    // should have been deduplicated since the member list didn't change.
+    let count_after_renewals = c1.membership_notify_count();
+    assert_eq!(
+        count_after_convergence, count_after_renewals,
+        "lease renewals should not trigger additional membership notifications \
+         (before={}, after={})",
+        count_after_convergence, count_after_renewals
+    );
+
+    // Sanity check: ownership should also be stable
+    let owned: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
+    assert_eq!(
+        owned.len(),
+        num_shards as usize,
+        "single node should own all shards"
+    );
+
+    // Cleanup
+    c1.shutdown().await.unwrap();
+    h1.abort();
+}
