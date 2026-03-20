@@ -462,7 +462,9 @@ impl TaskBrokerRegistry {
 
     /// Try to claim tasks for a task group. If none available, wait briefly for scanner to populate.
     pub async fn claim_ready_or_nudge(&self, task_group: &str, max: usize) -> Vec<BrokerTask> {
-        self.get_or_create(task_group).claim_ready_or_nudge(max).await
+        self.get_or_create(task_group)
+            .claim_ready_or_nudge(max)
+            .await
     }
 
     /// Wake the scanner for a specific task group.

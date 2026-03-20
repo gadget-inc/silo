@@ -193,7 +193,8 @@ impl JobStoreShard {
         }
         dst_events::confirm_write(write_op);
 
-        self.finish_enqueue(job_id, task_group, start_at_ms, &grants).await
+        self.finish_enqueue(job_id, task_group, start_at_ms, &grants)
+            .await
     }
 
     /// Transaction-path enqueue for user-provided job IDs that need deduplication.
@@ -294,7 +295,8 @@ impl JobStoreShard {
         }
         dst_events::confirm_write(write_op);
 
-        self.finish_enqueue(job_id, task_group, start_at_ms, &grants).await
+        self.finish_enqueue(job_id, task_group, start_at_ms, &grants)
+            .await
     }
 
     /// Write all enqueue data (job info, metadata, status, limit tasks) to the writer.
