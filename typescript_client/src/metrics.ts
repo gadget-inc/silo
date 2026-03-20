@@ -12,6 +12,8 @@ export class WorkerMetrics {
   readonly pollCounter: Counter<Attributes>;
   /** Counter incremented when a poll returns zero tasks. */
   readonly emptyPollCounter: Counter<Attributes>;
+  /** Counter tracking the total number of tasks returned from polls. */
+  readonly pollTasksReturnedCounter: Counter<Attributes>;
   /** Gauge reporting the number of available task slots (maxConcurrentTasks - active - queued). */
   readonly availableTaskSlots: ObservableGauge<Attributes>;
   /** Default attributes applied to all metric recordings. */
@@ -26,6 +28,10 @@ export class WorkerMetrics {
 
     this.emptyPollCounter = meter.createCounter("silo.worker.polls.empty", {
       description: "Number of polls that returned zero tasks",
+    });
+
+    this.pollTasksReturnedCounter = meter.createCounter("silo.worker.polls.tasks_returned", {
+      description: "Total number of tasks returned from polls",
     });
 
     this.availableTaskSlots = meter.createObservableGauge("silo.worker.available_task_slots", {

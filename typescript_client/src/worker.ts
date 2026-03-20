@@ -484,8 +484,11 @@ export class SiloWorker<
 
     // Record poll metrics
     this._metrics.pollCounter.add(1, this._metrics.defaultAttributes);
-    if (result.tasks.length === 0 && result.refreshTasks.length === 0) {
+    const totalTasksReturned = result.tasks.length + result.refreshTasks.length;
+    if (totalTasksReturned === 0) {
       this._metrics.emptyPollCounter.add(1, this._metrics.defaultAttributes);
+    } else {
+      this._metrics.pollTasksReturnedCounter.add(totalTasksReturned, this._metrics.defaultAttributes);
     }
 
     // Add regular job tasks to the queue
