@@ -251,7 +251,7 @@ export interface EnqueueRequest {
     /**
      * @generated from protobuf field: optional int64 terminal_retention_ms = 11
      */
-    terminalRetentionMs?: bigint; // How long to retain the job after it reaches a terminal state.
+    terminalRetentionMs?: bigint; // How long in milliseconds to retain the job after it reaches a terminal state.
 }
 /**
  * Response after successfully enqueueing a job.
@@ -393,7 +393,7 @@ export interface GetJobResponse {
     /**
      * @generated from protobuf field: optional int64 terminal_retention_ms = 14
      */
-    terminalRetentionMs?: bigint; // Stored terminal retention for this job, if set.
+    terminalRetentionMs?: bigint; // Stored terminal retention in milliseconds for this job, if set.
 }
 /**
  * Request to get the result of a completed job.
@@ -1509,7 +1509,7 @@ export interface ImportJobRequest {
     /**
      * @generated from protobuf field: optional int64 terminal_retention_ms = 13
      */
-    terminalRetentionMs?: bigint; // How long to retain the job after it reaches a terminal state.
+    terminalRetentionMs?: bigint; // How long in milliseconds to retain the job after it reaches a terminal state.
 }
 /**
  * Batch request to import multiple jobs.

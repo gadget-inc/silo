@@ -85,7 +85,18 @@ impl JobStoreShard {
         let shard_name = self.name.clone();
         let scan_interval = self.retention_scan_interval;
 
+        if scan_interval.is_zero() {
+            debug!(
+                shard = %shard_name,
+                "retention scanner disabled (scan interval is zero)"
+            );
+            return;
+        }
+
         tokio::spawn(async move {
+            // Sleep first to avoid expensive scan during shard acquisition.
+            tokio::time::sleep(scan_interval).await;
+
             let mut interval = tokio::time::interval(scan_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
