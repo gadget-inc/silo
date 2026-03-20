@@ -27,6 +27,7 @@ async fn cancel_scheduled_job_sets_cancelled_and_removes_task() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -119,6 +120,7 @@ async fn cancel_preserves_scheduling_fields_in_status() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -176,6 +178,7 @@ async fn cancel_running_job_sets_flag_status_stays_running() {
                 None,
                 payload,
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -245,6 +248,7 @@ async fn heartbeat_returns_cancelled_flag() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -305,6 +309,7 @@ async fn worker_reports_cancelled_outcome() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -362,7 +367,18 @@ async fn reap_expired_lease_cancelled_job_sets_cancelled_status() {
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let now = now_ms();
         let job_id = shard
-            .enqueue("-", None, 10u8, now, None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now,
+                None,
+                payload,
+                vec![],
+                None,
+                None,
+                "default",
+            )
             .await
             .expect("enqueue");
 
@@ -444,6 +460,7 @@ async fn cancel_already_cancelled_job_returns_error() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -485,6 +502,7 @@ async fn cancel_succeeded_job_returns_error() {
                 None,
                 payload,
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -548,6 +566,7 @@ async fn cancel_failed_job_returns_error() {
                 None,
                 payload,
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -619,6 +638,7 @@ async fn cancellation_preserved_through_stale_dequeue() {
                 None,
                 payload,
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -726,6 +746,7 @@ async fn delete_cancelled_job_succeeds() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -777,6 +798,7 @@ async fn cancel_scheduled_job_with_concurrency_removes_request() {
                     max_concurrency: 1,
                 })],
                 None,
+                None,
                 "default",
             )
             .await
@@ -797,6 +819,7 @@ async fn cancel_scheduled_job_with_concurrency_removes_request() {
                     key: queue.clone(),
                     max_concurrency: 1,
                 })],
+                None,
                 None,
                 "default",
             )
@@ -855,6 +878,7 @@ async fn cancel_concurrency_request_with_zero_start_time() {
                     max_concurrency: 1,
                 })],
                 None,
+                None,
                 "default",
             )
             .await
@@ -875,6 +899,7 @@ async fn cancel_concurrency_request_with_zero_start_time() {
                     key: queue.clone(),
                     max_concurrency: 1,
                 })],
+                None,
                 None,
                 "default",
             )
@@ -928,6 +953,7 @@ async fn cancel_eagerly_removes_run_attempt_tasks() {
                 test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -942,6 +968,7 @@ async fn cancel_eagerly_removes_run_attempt_tasks() {
                 None,
                 test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -997,6 +1024,7 @@ async fn cancel_eagerly_removes_request_ticket_tasks() {
                     max_concurrency: 1,
                 })],
                 None,
+                None,
                 "default",
             )
             .await
@@ -1020,6 +1048,7 @@ async fn cancel_eagerly_removes_request_ticket_tasks() {
                     max_concurrency: 1,
                 })],
                 None,
+                None,
                 "default",
             )
             .await
@@ -1037,6 +1066,7 @@ async fn cancel_eagerly_removes_request_ticket_tasks() {
                     key: queue.clone(),
                     max_concurrency: 1,
                 })],
+                None,
                 None,
                 "default",
             )
@@ -1094,6 +1124,7 @@ async fn grant_on_release_skips_multiple_cancelled_requests() {
                     max_concurrency: 1,
                 })],
                 None,
+                None,
                 "default",
             )
             .await
@@ -1116,6 +1147,7 @@ async fn grant_on_release_skips_multiple_cancelled_requests() {
                     max_concurrency: 1,
                 })],
                 None,
+                None,
                 "default",
             )
             .await
@@ -1134,6 +1166,7 @@ async fn grant_on_release_skips_multiple_cancelled_requests() {
                     max_concurrency: 1,
                 })],
                 None,
+                None,
                 "default",
             )
             .await
@@ -1151,6 +1184,7 @@ async fn grant_on_release_skips_multiple_cancelled_requests() {
                     key: queue.clone(),
                     max_concurrency: 1,
                 })],
+                None,
                 None,
                 "default",
             )
@@ -1219,6 +1253,7 @@ async fn dequeue_works_normally_without_cancellation() {
                     test_helpers::msgpack_payload(&serde_json::json!({"j": i})),
                     vec![],
                     None,
+                    None,
                     "default",
                 )
                 .await
@@ -1272,6 +1307,7 @@ async fn cancel_eagerly_cleans_up_concurrency_requests() {
                     max_concurrency: 1,
                 })],
                 None,
+                None,
                 "default",
             )
             .await
@@ -1293,6 +1329,7 @@ async fn cancel_eagerly_cleans_up_concurrency_requests() {
                     key: queue.clone(),
                     max_concurrency: 1,
                 })],
+                None,
                 None,
                 "default",
             )

@@ -3779,7 +3779,8 @@ async fn k8s_child_shards_usable_after_split() {
                 None,   // no retry policy
                 vec![], // empty payload
                 vec![], // no limits
-                None,   // no metadata
+                None,
+                None, // no metadata
                 "default",
             )
             .await

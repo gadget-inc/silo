@@ -172,7 +172,7 @@ pub fn build_import_params(job_idx: usize, job_id: &str, now: i64) -> ImportJobP
         priority: 50,
         enqueue_time_ms,
         start_at_ms,
-        terminal_retention_s: None,
+        terminal_retention_ms: None,
         retry_policy: None,
         payload: rmp_serde::to_vec(&serde_json::json!({"idx": job_idx})).unwrap(),
         limits: vec![],
@@ -455,6 +455,7 @@ async fn create_expedite_jobs(shard: &Arc<JobStoreShard>, now: i64) -> Vec<Strin
                 rmp_serde::to_vec(&serde_json::json!({"bench": "expedite"})).unwrap(),
                 vec![],
                 None,
+                None,
                 "",
             )
             .await
@@ -493,6 +494,7 @@ async fn create_deep_concurrency_queue(
                 rmp_serde::to_vec(&serde_json::json!({"bench": "deep-queue-holder"})).unwrap(),
                 vec![concurrency_limit.clone()],
                 None,
+                None,
                 "",
             )
             .await
@@ -527,6 +529,7 @@ async fn create_deep_concurrency_queue(
                 None,
                 rmp_serde::to_vec(&serde_json::json!({"bench": "deep-queue-waiter"})).unwrap(),
                 vec![concurrency_limit.clone()],
+                None,
                 None,
                 "",
             )
@@ -711,6 +714,7 @@ pub async fn enqueue_and_dequeue_jobs(
                 None,
                 vec![1, 2, 3],
                 vec![],
+                None,
                 None,
                 "",
             )

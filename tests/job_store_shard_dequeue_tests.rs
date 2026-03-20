@@ -28,6 +28,7 @@ async fn dequeue_moves_tasks_to_leased_with_uuid() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -103,6 +104,7 @@ async fn heartbeat_renews_lease_when_worker_matches() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -161,6 +163,7 @@ async fn heartbeat_rejects_mismatched_worker() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -211,6 +214,7 @@ async fn heartbeat_after_outcome_returns_lease_not_found() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -248,7 +252,18 @@ async fn reap_ignores_unexpired_leases() {
     let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
     let now = now_ms();
     let job_id = shard
-        .enqueue("-", None, 10u8, now, None, payload, vec![], None, "default")
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            payload,
+            vec![],
+            None,
+            None,
+            "default",
+        )
         .await
         .expect("enqueue");
 
@@ -298,6 +313,7 @@ async fn delete_job_before_dequeue_skips_task_and_no_lease_created() {
             None,
             payload,
             vec![],
+            None,
             None,
             "default",
         )
@@ -354,6 +370,7 @@ async fn dequeue_gracefully_handles_missing_job_info() {
             None,
             payload,
             vec![],
+            None,
             None,
             "default",
         )
@@ -427,6 +444,7 @@ async fn enqueue_with_start_at_ms_zero_is_immediately_leasable() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -490,6 +508,7 @@ async fn enqueue_with_tenant_and_start_at_ms_zero_is_leasable() {
                 payload,
                 vec![],
                 None,
+                None,
                 task_group,
             )
             .await
@@ -532,7 +551,18 @@ async fn peek_tasks_finds_start_at_ms_zero() {
         let payload = msgpack_payload(&serde_json::json!({"test": true}));
 
         shard
-            .enqueue("-", None, 1, 0, None, payload, vec![], None, "default")
+            .enqueue(
+                "-",
+                None,
+                1,
+                0,
+                None,
+                payload,
+                vec![],
+                None,
+                None,
+                "default",
+            )
             .await
             .expect("enqueue should succeed");
 
@@ -569,6 +599,7 @@ async fn enqueue_with_start_at_ms_now_is_leasable() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -601,6 +632,7 @@ async fn dequeue_ignores_recently_acked_task_keys() {
                 None,
                 payload,
                 vec![],
+                None,
                 None,
                 "default",
             )

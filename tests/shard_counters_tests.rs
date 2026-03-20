@@ -43,6 +43,7 @@ async fn enqueue_increments_total_jobs() {
             msgpack_payload(&serde_json::json!({"test": "enqueue"})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -70,6 +71,7 @@ async fn enqueue_increments_total_jobs() {
             None,
             msgpack_payload(&serde_json::json!({"test": "enqueue2"})),
             vec![],
+            None,
             None,
             "default",
         )
@@ -104,6 +106,7 @@ async fn success_outcome_increments_completed_jobs() {
                 None,
                 msgpack_payload(&serde_json::json!({"test": "success"})),
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -162,6 +165,7 @@ async fn failed_outcome_without_retry_increments_completed_jobs() {
                 None,
                 msgpack_payload(&serde_json::json!({"test": "fail"})),
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -237,6 +241,7 @@ async fn failed_outcome_with_retry_does_not_increment_completed_jobs() {
                 msgpack_payload(&serde_json::json!({"test": "retry"})),
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -295,6 +300,7 @@ async fn cancel_scheduled_job_increments_completed_jobs() {
                 msgpack_payload(&serde_json::json!({"test": "cancel"})),
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -341,6 +347,7 @@ async fn cancel_running_job_increments_completed_on_worker_report() {
                 None,
                 msgpack_payload(&serde_json::json!({"test": "cancel_running"})),
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -408,6 +415,7 @@ async fn restart_decrements_completed_jobs() {
                 msgpack_payload(&serde_json::json!({"test": "restart"})),
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -474,6 +482,7 @@ async fn delete_decrements_total_and_completed() {
                 msgpack_payload(&serde_json::json!({"test": "delete"})),
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -529,6 +538,7 @@ async fn multiple_jobs_counter_tracking() {
                     None,
                     msgpack_payload(&serde_json::json!({"job": i})),
                     vec![],
+                    None,
                     None,
                     "default",
                 )
@@ -601,6 +611,7 @@ async fn counters_survive_close_and_reopen() {
                 msgpack_payload(&serde_json::json!({"j": 1})),
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -615,6 +626,7 @@ async fn counters_survive_close_and_reopen() {
                 None,
                 msgpack_payload(&serde_json::json!({"j": 2})),
                 vec![],
+                None,
                 None,
                 "default",
             )

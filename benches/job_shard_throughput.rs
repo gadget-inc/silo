@@ -55,7 +55,7 @@ async fn measure_enqueue_throughput(
                     rmp_serde::to_vec(&serde_json::json!({"producer": producer_id, "i": i}))
                         .expect("serialize payload");
                 shard
-                    .enqueue("-", None, 50, now_ms, None, payload, vec![], None, "")
+                    .enqueue("-", None, 50, now_ms, None, payload, vec![], None, None, "")
                     .await
                     .expect("enqueue");
             }
@@ -90,7 +90,7 @@ async fn measure_dequeue_throughput(
     for i in 0..total_jobs {
         let payload = rmp_serde::to_vec(&serde_json::json!({"i": i})).expect("serialize payload");
         shard
-            .enqueue("-", None, 50, now_ms, None, payload, vec![], None, "")
+            .enqueue("-", None, 50, now_ms, None, payload, vec![], None, None, "")
             .await
             .expect("enqueue");
     }

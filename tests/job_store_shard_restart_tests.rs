@@ -24,6 +24,7 @@ async fn restart_cancelled_scheduled_job() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -128,6 +129,7 @@ async fn restart_failed_job() {
                 None,
                 payload,
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -241,6 +243,7 @@ async fn restart_succeeded_job_returns_error() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -305,6 +308,7 @@ async fn restart_running_job_returns_error() {
                 None,
                 payload,
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -373,6 +377,7 @@ async fn restart_scheduled_job_returns_error() {
                 None,
                 payload,
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -448,6 +453,7 @@ async fn restart_failed_job_with_retry_policy_resets_retries() {
                 Some(retry_policy),
                 payload,
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -570,6 +576,7 @@ async fn restart_cancelled_running_job_after_acknowledgement() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -672,6 +679,7 @@ async fn multiple_restarts_of_same_job() {
                 None,
                 payload,
                 vec![],
+                None,
                 None,
                 "default",
             )

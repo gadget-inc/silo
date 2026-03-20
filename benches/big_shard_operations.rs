@@ -118,6 +118,7 @@ async fn bench_enqueue_no_limit(metadata: &GoldenShardMetadata) {
                     vec![1, 2, 3],
                     vec![],
                     None,
+                    None,
                     "",
                 )
                 .await
@@ -161,6 +162,7 @@ async fn bench_enqueue_empty_concurrency(metadata: &GoldenShardMetadata) {
                         None,
                         vec![1, 2, 3],
                         vec![limit],
+                        None,
                         None,
                         "",
                     )
@@ -206,6 +208,7 @@ async fn bench_enqueue_heavy_concurrency(metadata: &GoldenShardMetadata) {
                         None,
                         vec![1, 2, 3],
                         vec![limit],
+                        None,
                         None,
                         "",
                     )

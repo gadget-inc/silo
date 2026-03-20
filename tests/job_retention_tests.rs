@@ -65,6 +65,7 @@ async fn enqueue_stores_default_terminal_retention() {
             msgpack_bytes(&serde_json::json!({"hello": "world"})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -76,8 +77,8 @@ async fn enqueue_stores_default_terminal_retention() {
         .expect("get_job")
         .expect("job exists");
     assert_eq!(
-        job.terminal_retention_s(),
-        Some(DEFAULT_TERMINAL_RETENTION.as_secs() as i64)
+        job.terminal_retention_ms(),
+        Some(DEFAULT_TERMINAL_RETENTION.as_millis() as i64)
     );
 }
 
@@ -86,7 +87,7 @@ async fn enqueue_override_stores_terminal_retention() {
     let (_tmp, shard) = test_helpers::open_temp_shard().await;
 
     let job_id = shard
-        .enqueue_with_retention(
+        .enqueue(
             "-",
             Some("job-custom-retention".to_string()),
             50,
@@ -106,7 +107,7 @@ async fn enqueue_override_stores_terminal_retention() {
         .await
         .expect("get_job")
         .expect("job exists");
-    assert_eq!(job.terminal_retention_s(), Some(42));
+    assert_eq!(job.terminal_retention_ms(), Some(42));
 }
 
 #[silo::test]
@@ -134,7 +135,7 @@ async fn grpc_get_job_returns_terminal_retention() {
             tenant: None,
             metadata: HashMap::new(),
             task_group: "default".to_string(),
-            terminal_retention_s: Some(123),
+            terminal_retention_ms: Some(123),
         }))
         .await
         .expect("enqueue");
@@ -150,7 +151,7 @@ async fn grpc_get_job_returns_terminal_retention() {
         .expect("get job")
         .into_inner();
 
-    assert_eq!(job.terminal_retention_s, Some(123));
+    assert_eq!(job.terminal_retention_ms, Some(123));
 
     shutdown_server(shutdown_tx, server)
         .await
@@ -171,6 +172,7 @@ async fn success_cleanup_deletes_job_and_attempts() {
             None,
             msgpack_bytes(&serde_json::json!({"ok": true})),
             vec![],
+            None,
             None,
             "default",
         )
@@ -224,6 +226,7 @@ async fn failed_cleanup_deletes_job() {
             msgpack_bytes(&serde_json::json!({"ok": false})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -265,6 +268,7 @@ async fn scheduled_cancel_cleanup_deletes_job() {
             msgpack_bytes(&serde_json::json!({"cancel": "scheduled"})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -297,6 +301,7 @@ async fn running_cancel_only_cleans_after_worker_reports_cancelled() {
             None,
             msgpack_bytes(&serde_json::json!({"cancel": "running"})),
             vec![],
+            None,
             None,
             "default",
         )
@@ -345,6 +350,7 @@ async fn restart_prevents_retention_deletion() {
             None,
             msgpack_bytes(&serde_json::json!({"restart": true})),
             vec![],
+            None,
             None,
             "default",
         )
@@ -406,6 +412,7 @@ async fn explicit_delete_removes_terminal_job_before_retention_elapses() {
             msgpack_bytes(&serde_json::json!({"delete": true})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -458,7 +465,7 @@ async fn importing_terminal_job_respects_retention_cleanup() {
         priority: 50,
         enqueue_time_ms: 1_700_000_000_000,
         start_at_ms: 0,
-        terminal_retention_s: Some(0),
+        terminal_retention_ms: Some(0),
         retry_policy: None,
         payload: msgpack_bytes(&serde_json::json!({"imported": true})),
         limits: vec![],

@@ -119,6 +119,7 @@ async fn reset_shard_after_enqueue() {
             test_helpers::msgpack_payload(&serde_json::json!({"key": "value"})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -183,6 +184,7 @@ async fn reset_with_wal_config() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -226,6 +228,7 @@ async fn clone_closed_shard_creates_copies() {
             None,
             test_helpers::msgpack_payload(&serde_json::json!({"cloned": true})),
             vec![],
+            None,
             None,
             "default",
         )

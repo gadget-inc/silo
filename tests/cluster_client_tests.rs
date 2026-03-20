@@ -92,6 +92,7 @@ async fn cluster_client_query_local_shard() {
             test_helpers::msgpack_payload(&serde_json::json!({"test": "data"})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -161,6 +162,7 @@ async fn cluster_client_query_all_local_shards() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -176,6 +178,7 @@ async fn cluster_client_query_all_local_shards() {
             None,
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
+            None,
             None,
             "default",
         )
@@ -245,6 +248,7 @@ async fn cluster_client_get_job_local() {
             test_helpers::msgpack_payload(&serde_json::json!({"foo": "bar"})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -308,6 +312,7 @@ async fn cluster_client_cancel_job_local() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -363,6 +368,7 @@ async fn cluster_client_json_serialization_preserves_data() {
                 "nested": {"key": "value"}
             })),
             vec![],
+            None,
             None,
             "default",
         )
@@ -586,6 +592,7 @@ async fn cluster_client_query_all_local_shards_with_mixed_results() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -601,6 +608,7 @@ async fn cluster_client_query_all_local_shards_with_mixed_results() {
             None,
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
+            None,
             None,
             "default",
         )
@@ -821,6 +829,7 @@ async fn cluster_client_remote_query_shard() {
             test_helpers::msgpack_payload(&serde_json::json!({"remote": true})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -880,6 +889,7 @@ async fn cluster_client_remote_get_job() {
             None,
             test_helpers::msgpack_payload(&serde_json::json!({"data": "hello"})),
             vec![],
+            None,
             None,
             "default",
         )
@@ -977,6 +987,7 @@ async fn cluster_client_remote_cancel_job() {
             None,
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
+            None,
             None,
             "default",
         )

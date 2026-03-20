@@ -94,6 +94,10 @@ pub struct Metrics {
     // Concurrency metrics
     concurrency_tickets_granted: Counter,
 
+    // Retention metrics
+    retention_scans_total: CounterVec,
+    retention_jobs_deleted_total: CounterVec,
+
     // SlateDB storage counters (per-shard, monotonically increasing in SlateDB)
     slatedb_get_requests: CounterVec,
     slatedb_scan_requests: CounterVec,
@@ -251,6 +255,16 @@ impl Metrics {
     /// Record a concurrency ticket being granted.
     pub fn record_concurrency_ticket_granted(&self) {
         self.concurrency_tickets_granted.inc();
+    }
+
+    /// Record a completed retention scan for a shard.
+    pub fn record_retention_scan(&self, shard: &str, deleted_count: u64) {
+        self.retention_scans_total.with_label_values(&[shard]).inc();
+        if deleted_count > 0 {
+            self.retention_jobs_deleted_total
+                .with_label_values(&[shard])
+                .inc_by(deleted_count as f64);
+        }
     }
 
     /// Update SlateDB storage metrics from a shard's StatRegistry.
@@ -566,6 +580,28 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    // Retention metrics
+    let retention_scans_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_retention_scans_total",
+                "Total number of retention scans completed",
+            ),
+            &["shard"],
+        )?,
+    );
+    let retention_jobs_deleted_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_retention_jobs_deleted_total",
+                "Total number of jobs deleted by the retention scanner",
+            ),
+            &["shard"],
+        )?,
+    );
+
     // SlateDB storage counters (monotonically increasing in SlateDB)
     let slatedb_get_requests = register(
         &registry,
@@ -744,6 +780,8 @@ pub fn init() -> anyhow::Result<Metrics> {
         lease_reaper_duration,
         lease_reaper_scans_total,
         concurrency_tickets_granted,
+        retention_scans_total,
+        retention_jobs_deleted_total,
         slatedb_get_requests,
         slatedb_scan_requests,
         slatedb_write_ops,

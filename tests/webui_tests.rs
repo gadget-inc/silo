@@ -150,6 +150,7 @@ async fn test_job_view_renders() {
             test_helpers::msgpack_payload(&serde_json::json!({"test": "payload"})),
             vec![],
             Some(vec![("key1".to_string(), "value1".to_string())]),
+            None,
             "default",
         )
         .await
@@ -203,6 +204,7 @@ async fn test_job_view_without_shard_param() {
             test_helpers::msgpack_payload(&serde_json::json!({"test": "value"})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -240,6 +242,7 @@ async fn test_job_cancel() {
             None,
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
+            None,
             None,
             "default",
         )
@@ -328,6 +331,7 @@ async fn test_cancel_already_terminal_job_is_noop() {
             None,
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
+            None,
             None,
             "default",
         )
@@ -520,6 +524,7 @@ async fn test_job_detail_from_non_zero_shard() {
             test_helpers::msgpack_payload(&serde_json::json!({"shard": 1})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -564,6 +569,7 @@ async fn test_queues_page_shows_queues_from_all_shards() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -584,6 +590,7 @@ async fn test_queues_page_shows_queues_from_all_shards() {
                 key: "queue-on-shard-1".to_string(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
@@ -622,6 +629,7 @@ async fn test_job_view_with_correct_shard_and_tenant_hint() {
             None,
             test_helpers::msgpack_payload(&serde_json::json!({"test": "value"})),
             vec![],
+            None,
             None,
             "default",
         )
@@ -663,6 +671,7 @@ async fn test_job_view_with_wrong_shard_returns_not_found() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -701,6 +710,7 @@ async fn test_cancel_job_with_correct_shard_and_tenant() {
             None,
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
+            None,
             None,
             "default",
         )
@@ -776,6 +786,7 @@ async fn test_sql_execute_returns_results() {
             None,
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
+            None,
             None,
             "default",
         )
@@ -982,6 +993,7 @@ async fn test_shard_detail_shows_job_count() {
                 test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -1090,6 +1102,7 @@ async fn test_tenants_index_shows_tenant_data() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -1106,6 +1119,7 @@ async fn test_tenants_index_shows_tenant_data() {
                 key: "alpha-queue".to_string(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
@@ -1126,6 +1140,7 @@ async fn test_tenants_index_shows_tenant_data() {
                 key: "beta-queue".to_string(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
@@ -1171,6 +1186,7 @@ async fn test_tenant_detail_shows_queues_and_waiting_jobs() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -1188,6 +1204,7 @@ async fn test_tenant_detail_shows_queues_and_waiting_jobs() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -1203,6 +1220,7 @@ async fn test_tenant_detail_shows_queues_and_waiting_jobs() {
             None,
             test_helpers::msgpack_payload(&serde_json::json!({"k":"v3"})),
             vec![],
+            None,
             None,
             "default",
         )

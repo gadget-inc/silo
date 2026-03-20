@@ -70,6 +70,7 @@ async fn enqueue_job(shard: &JobStoreShard, id: &str, priority: u8, now: i64) ->
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -94,6 +95,7 @@ async fn enqueue_job_with_metadata(
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             Some(metadata),
+            None,
             "default",
         )
         .await
@@ -660,6 +662,7 @@ async fn sql_filter_scheduled_status() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -740,6 +743,7 @@ async fn sql_filter_failed_status() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -793,7 +797,7 @@ async fn sql_select_all_columns() {
         .expect("collect");
 
     assert!(!batches.is_empty());
-    // Should have all 13 columns, including terminal_retention_s.
+    // Should have all 13 columns, including terminal_retention_ms.
     assert_eq!(batches[0].num_columns(), 13);
     assert_eq!(batches[0].num_rows(), 1);
 }
@@ -1077,6 +1081,7 @@ async fn sql_tenant_isolation() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -1090,6 +1095,7 @@ async fn sql_tenant_isolation() {
             None,
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
+            None,
             None,
             "default",
         )
@@ -1133,6 +1139,7 @@ async fn sql_default_tenant() {
             None,
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
+            None,
             None,
             "default",
         )
@@ -1400,6 +1407,7 @@ async fn queues_table_shows_holders() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -1447,6 +1455,7 @@ async fn queues_table_shows_requesters() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -1464,6 +1473,7 @@ async fn queues_table_shows_requesters() {
                 key: "limited-queue".to_string(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
@@ -1522,6 +1532,7 @@ async fn queues_table_filter_by_queue_name() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -1539,6 +1550,7 @@ async fn queues_table_filter_by_queue_name() {
                 key: "queue-beta".to_string(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
@@ -1580,6 +1592,7 @@ async fn queues_table_all_columns() {
                 key: "my-queue".to_string(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
@@ -1633,6 +1646,7 @@ async fn queues_table_empty_when_no_concurrency() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![], // No limits
             None,
+            None,
             "default",
         )
         .await
@@ -1674,6 +1688,7 @@ async fn queues_table_count_aggregate() {
                     key: "shared-queue".to_string(),
                     max_concurrency: 10, // High limit so all get holders
                 })],
+                None,
                 None,
                 "default",
             )
@@ -1763,6 +1778,7 @@ async fn queues_table_tenant_isolation() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -1780,6 +1796,7 @@ async fn queues_table_tenant_isolation() {
                 key: "queue-y".to_string(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
@@ -3167,6 +3184,7 @@ async fn count_via_status_index_stable_through_lifecycle() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -3180,6 +3198,7 @@ async fn count_via_status_index_stable_through_lifecycle() {
             None,
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
+            None,
             None,
             "default",
         )
@@ -3285,6 +3304,7 @@ async fn status_index_id_scan_returns_complete_set_across_status_buckets() {
                 test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -3370,6 +3390,7 @@ async fn fullscan_range_correctly_pairs_info_and_status() {
                 None,
                 test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -3504,6 +3525,7 @@ async fn sql_tenant_counts_returns_correct_data() {
                     test_helpers::msgpack_payload(&serde_json::json!({})),
                     vec![],
                     None,
+                    None,
                     "default",
                 )
                 .await
@@ -3519,6 +3541,7 @@ async fn sql_tenant_counts_returns_correct_data() {
                     None,
                     test_helpers::msgpack_payload(&serde_json::json!({})),
                     vec![],
+                    None,
                     None,
                     "default",
                 )
@@ -3616,6 +3639,7 @@ async fn sql_tenant_counts_filters_by_exact_tenant() {
                     test_helpers::msgpack_payload(&serde_json::json!({})),
                     vec![],
                     None,
+                    None,
                     "default",
                 )
                 .await
@@ -3631,6 +3655,7 @@ async fn sql_tenant_counts_filters_by_exact_tenant() {
                     None,
                     test_helpers::msgpack_payload(&serde_json::json!({})),
                     vec![],
+                    None,
                     None,
                     "default",
                 )
@@ -3707,6 +3732,7 @@ async fn sql_tenant_counts_count_star_preserves_row_count() {
                     test_helpers::msgpack_payload(&serde_json::json!({})),
                     vec![],
                     None,
+                    None,
                     "default",
                 )
                 .await
@@ -3722,6 +3748,7 @@ async fn sql_tenant_counts_count_star_preserves_row_count() {
                     None,
                     test_helpers::msgpack_payload(&serde_json::json!({})),
                     vec![],
+                    None,
                     None,
                     "default",
                 )

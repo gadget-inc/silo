@@ -23,6 +23,7 @@ async fn lease_task_scheduled_job() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -86,6 +87,7 @@ async fn lease_task_future_scheduled_job() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -133,6 +135,7 @@ async fn lease_task_running_job_returns_error() {
                 None,
                 payload,
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -204,6 +207,7 @@ async fn lease_task_terminal_job_returns_error() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -272,6 +276,7 @@ async fn lease_task_cancelled_job_returns_error() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -336,6 +341,7 @@ async fn lease_task_then_report_outcome() {
                 None,
                 payload,
                 vec![],
+                None,
                 None,
                 "default",
             )

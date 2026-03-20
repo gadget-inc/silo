@@ -416,7 +416,7 @@ pub fn encode_job_info(job: &JobInfo) -> Vec<u8> {
             id: Some(id),
             priority: job.priority,
             enqueue_time_ms: job.enqueue_time_ms,
-            terminal_retention_s: job.terminal_retention_s,
+            terminal_retention_ms: job.terminal_retention_ms,
             payload: Some(payload),
             retry_policy,
             metadata: Some(metadata),

@@ -29,6 +29,7 @@ async fn enqueue_jobs_for_tenants(
                     payload,
                     vec![],
                     None,
+                    None,
                     "default",
                 )
                 .await
@@ -413,6 +414,7 @@ async fn cleanup_handles_escaped_tenant_ids() {
                 None,
                 payload,
                 vec![],
+                None,
                 None,
                 "default",
             )

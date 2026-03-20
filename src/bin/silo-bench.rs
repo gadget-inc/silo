@@ -352,7 +352,7 @@ async fn enqueuer_loop(
                 tenant: Some(tenant.clone()),
                 metadata: Default::default(),
                 task_group: "default".to_string(),
-                terminal_retention_s: None,
+                terminal_retention_ms: None,
             };
 
             match silo_client.enqueue(request).await {

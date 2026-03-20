@@ -15,21 +15,21 @@ use crate::keys::{
 use tracing::{debug, info, warn};
 
 impl JobStoreShard {
-    /// Resolve the effective terminal retention in seconds for a job.
+    /// Resolve the effective terminal retention in milliseconds for a job.
     ///
-    /// If the job specifies `terminal_retention_s`, that value is used. Otherwise
-    /// the shard-level default is used. Returns seconds for storage in FlatBuffer job info.
-    pub(crate) fn effective_terminal_retention_s(
+    /// If the job specifies `terminal_retention_ms`, that value is used. Otherwise
+    /// the shard-level default is used.
+    pub(crate) fn effective_terminal_retention_ms(
         &self,
         requested: Option<i64>,
     ) -> Result<i64, JobStoreShardError> {
-        let retention_s = requested.unwrap_or(self.default_terminal_retention_s);
-        if retention_s < 0 {
+        let retention_ms = requested.unwrap_or(self.default_terminal_retention_ms);
+        if retention_ms < 0 {
             return Err(JobStoreShardError::InvalidArgument(
-                "terminal_retention_s must be >= 0".to_string(),
+                "terminal_retention_ms must be >= 0".to_string(),
             ));
         }
-        Ok(retention_s)
+        Ok(retention_ms)
     }
 
     pub(crate) async fn delete_job_records_in_txn(
@@ -178,10 +178,9 @@ impl JobStoreShard {
                     continue;
                 }
             };
-            let retention_s = job_view
-                .terminal_retention_s()
-                .unwrap_or(self.default_terminal_retention_s);
-            let retention_ms = retention_s.saturating_mul(1000);
+            let retention_ms = job_view
+                .terminal_retention_ms()
+                .unwrap_or(self.default_terminal_retention_ms);
 
             // Check if retention has elapsed
             let expiry_ms = changed_at_ms.saturating_add(retention_ms);
@@ -202,6 +201,10 @@ impl JobStoreShard {
             }
 
             deleted_count += 1;
+        }
+
+        if let Some(metrics) = &self.metrics {
+            metrics.record_retention_scan(&self.name, deleted_count);
         }
 
         if deleted_count > 0 {
@@ -260,7 +263,7 @@ impl JobStoreShard {
             }
 
             txn.commit_with_options(&WriteOptions {
-                await_durable: true,
+                await_durable: false,
             })
             .await?;
             Ok(())

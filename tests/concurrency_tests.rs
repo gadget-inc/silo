@@ -6,9 +6,25 @@ use silo::job_attempt::{AttemptOutcome, AttemptStatus};
 use silo::keys::{concurrency_holder_key, concurrency_request_key};
 use silo::retry::RetryPolicy;
 use silo::task::{ConcurrencyAction, LeaseRecord, Task};
-use slatedb::{DbIterator, WriteBatch};
+use slatedb::{Db, DbIterator, WriteBatch};
 
 use test_helpers::*;
+
+/// Count only RequestTicket tasks in the DB, ignoring any background scanner tasks.
+async fn count_request_ticket_tasks(db: &Db) -> usize {
+    let prefix = silo::keys::tasks_prefix();
+    let end = silo::keys::end_bound(&prefix);
+    let mut iter: DbIterator = db.scan::<Vec<u8>, _>(prefix..end).await.expect("scan");
+    let mut count = 0;
+    while let Some(kv) = iter.next().await.expect("iter") {
+        if let Ok(task) = decode_task(&kv.value) {
+            if matches!(task, Task::RequestTicket { .. }) {
+                count += 1;
+            }
+        }
+    }
+    count
+}
 
 #[silo::test]
 async fn concurrency_immediate_grant_enqueues_task_and_writes_holder() {
@@ -29,6 +45,7 @@ async fn concurrency_immediate_grant_enqueues_task_and_writes_holder() {
                 key: queue.clone(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
@@ -77,6 +94,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -98,6 +116,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
                 key: queue.clone(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
@@ -147,6 +166,7 @@ async fn periodic_reconcile_grants_pending_request_without_signal() {
             None,
             test_helpers::msgpack_payload(&serde_json::json!({"reconcile": true})),
             vec![],
+            None,
             None,
             "default",
         )
@@ -235,6 +255,7 @@ async fn concurrency_held_queues_propagate_across_retries_and_release_on_finish(
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -293,6 +314,7 @@ async fn concurrency_tickets_are_tenant_scoped() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -317,6 +339,7 @@ async fn concurrency_tickets_are_tenant_scoped() {
                 key: queue.clone(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
@@ -359,6 +382,7 @@ async fn concurrency_retry_releases_original_holder() {
                 key: queue.clone(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
@@ -419,6 +443,7 @@ async fn concurrency_no_overgrant_after_release() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -445,6 +470,7 @@ async fn concurrency_no_overgrant_after_release() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -470,6 +496,7 @@ async fn concurrency_no_overgrant_after_release() {
                 key: queue.clone(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
@@ -506,6 +533,7 @@ async fn stress_single_queue_no_double_grant() {
                     key: queue.clone(),
                     max_concurrency: 1,
                 })],
+                None,
                 None,
                 "default",
             )
@@ -563,6 +591,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -590,6 +619,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
                     key: queue.clone(),
                     max_concurrency: 1,
                 })],
+                None,
                 None,
                 "default",
             )
@@ -638,6 +668,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
             Some(policy),
             payload,
             vec![],
+            None,
             None,
             "default",
         )
@@ -720,7 +751,18 @@ async fn reap_ignores_unexpired_leases() {
     let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
     let now = now_ms();
     let job_id = shard
-        .enqueue("-", None, 10u8, now, None, payload, vec![], None, "default")
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            payload,
+            vec![],
+            None,
+            None,
+            "default",
+        )
         .await
         .expect("enqueue");
 
@@ -774,6 +816,7 @@ async fn concurrency_multiple_holders_max_greater_than_one() {
                     key: queue.clone(),
                     max_concurrency: 3,
                 })],
+                None,
                 None,
                 "default",
             )
@@ -878,6 +921,7 @@ async fn concurrency_multiple_queues_per_job() {
                 }),
             ],
             None,
+            None,
             "default",
         )
         .await
@@ -949,6 +993,7 @@ async fn concurrency_future_request_waits_until_ready() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -970,13 +1015,14 @@ async fn concurrency_future_request_waits_until_ready() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
         .expect("enqueue2");
 
     // RequestTicket task should exist
-    let tasks_before = count_task_keys(shard.db()).await;
+    let tasks_before = count_request_ticket_tasks(shard.db()).await;
     assert_eq!(tasks_before, 1, "should have 1 RequestTicket task");
 
     // Complete job 1 BEFORE job 2 is ready -> should NOT grant yet
@@ -986,7 +1032,7 @@ async fn concurrency_future_request_waits_until_ready() {
         .expect("report1");
 
     // RequestTicket task should still exist (not granted because start_time_ms > now)
-    let tasks_after = count_task_keys(shard.db()).await;
+    let tasks_after = count_request_ticket_tasks(shard.db()).await;
     assert_eq!(
         tasks_after, 1,
         "RequestTicket task should remain until start time reached"
@@ -1028,6 +1074,7 @@ async fn concurrency_request_priority_ordering() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -1049,6 +1096,7 @@ async fn concurrency_request_priority_ordering() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -1067,6 +1115,7 @@ async fn concurrency_request_priority_ordering() {
                 key: queue.clone(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
@@ -1123,6 +1172,7 @@ async fn concurrency_permanent_failure_releases_holder() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -1143,6 +1193,7 @@ async fn concurrency_permanent_failure_releases_holder() {
                 key: queue.clone(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
@@ -1204,6 +1255,7 @@ async fn concurrency_reap_expired_lease_releases_holder() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -1224,6 +1276,7 @@ async fn concurrency_reap_expired_lease_releases_holder() {
                 key: queue.clone(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
@@ -1298,6 +1351,7 @@ async fn concurrency_future_request_granted_after_time_passes() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -1322,6 +1376,7 @@ async fn concurrency_future_request_granted_after_time_passes() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -1329,7 +1384,7 @@ async fn concurrency_future_request_granted_after_time_passes() {
 
     // Should have created a RequestTicket task scheduled at future time
     // (peek_tasks filters out future tasks, so check DB directly)
-    let tasks_in_db = count_task_keys(shard.db()).await;
+    let tasks_in_db = count_request_ticket_tasks(shard.db()).await;
     assert_eq!(
         tasks_in_db, 1,
         "should have 1 RequestTicket task in DB (future)"
@@ -1346,7 +1401,7 @@ async fn concurrency_future_request_granted_after_time_passes() {
     assert_eq!(holders_after_release, 0, "holder released");
 
     // RequestTicket task should still be there (future)
-    let tasks_still_future = count_task_keys(shard.db()).await;
+    let tasks_still_future = count_request_ticket_tasks(shard.db()).await;
     assert_eq!(tasks_still_future, 1, "RequestTicket task still present");
 
     // Simulate time passing: wait for future time + broker scan delay
@@ -1391,6 +1446,7 @@ async fn cannot_delete_job_with_future_request_ticket() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -1412,13 +1468,14 @@ async fn cannot_delete_job_with_future_request_ticket() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
         .expect("enqueue2");
 
     // Verify RequestTicket task exists and job status is Scheduled
-    let tasks_before = count_task_keys(shard.db()).await;
+    let tasks_before = count_request_ticket_tasks(shard.db()).await;
     assert_eq!(tasks_before, 1, "should have 1 RequestTicket task");
 
     let status = shard
@@ -1474,6 +1531,7 @@ async fn cannot_delete_job_with_pending_request() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -1494,6 +1552,7 @@ async fn cannot_delete_job_with_pending_request() {
                 key: queue.clone(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
@@ -1613,6 +1672,7 @@ async fn concurrency_lazy_hydration_on_shard_reopen() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -1662,6 +1722,7 @@ async fn concurrency_lazy_hydration_on_shard_reopen() {
                 key: queue.clone(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
@@ -1754,6 +1815,7 @@ async fn concurrency_no_overgrant_with_lazy_hydration() {
                     max_concurrency: 2,
                 })],
                 None,
+                None,
                 "default",
             )
             .await
@@ -1790,6 +1852,7 @@ async fn concurrency_no_overgrant_with_lazy_hydration() {
                 key: queue.clone(),
                 max_concurrency: 2,
             })],
+            None,
             None,
             "default",
         )

@@ -29,7 +29,7 @@ async fn grpc_server_enqueue_and_workflow() -> anyhow::Result<()> {
             tenant: None,
             metadata: md,
             task_group: "default".to_string(),
-            terminal_retention_s: None,
+            terminal_retention_ms: None,
         };
         let enq_resp = client.enqueue(enq).await?.into_inner();
         let job_id = enq_resp.id;
@@ -151,7 +151,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
                 tenant: None,
                 metadata: md,
                 task_group: "default".to_string(),
-                terminal_retention_s: None,
+                terminal_retention_ms: None,
             };
             expect_invalid_arg(&mut client, req, "too many entries").await;
         }
@@ -176,7 +176,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
                 tenant: None,
                 metadata: md,
                 task_group: "default".to_string(),
-                terminal_retention_s: None,
+                terminal_retention_ms: None,
             };
             expect_invalid_arg(&mut client, req, "key too long").await;
         }
@@ -204,7 +204,7 @@ async fn grpc_server_metadata_validation_errors() -> anyhow::Result<()> {
                 tenant: None,
                 metadata: md,
                 task_group: "default".to_string(),
-                terminal_retention_s: None,
+                terminal_retention_ms: None,
             };
             expect_invalid_arg(&mut client, req, "value too long").await;
         }
@@ -257,7 +257,7 @@ async fn grpc_server_enqueue_with_rate_limit() -> anyhow::Result<()> {
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
-                terminal_retention_s: None,
+                terminal_retention_ms: None,
             })
             .await?
             .into_inner();
@@ -322,7 +322,7 @@ async fn grpc_enqueue_requires_tenant_when_tenancy_enabled() -> anyhow::Result<(
             tenant: None,
             metadata: std::collections::HashMap::new(),
             task_group: "default".to_string(),
-            terminal_retention_s: None,
+            terminal_retention_ms: None,
         };
         let res = client.enqueue(req).await;
         match res {
@@ -353,7 +353,7 @@ async fn grpc_enqueue_requires_tenant_when_tenancy_enabled() -> anyhow::Result<(
             tenant: Some("".to_string()),
             metadata: std::collections::HashMap::new(),
             task_group: "default".to_string(),
-            terminal_retention_s: None,
+            terminal_retention_ms: None,
         };
         let res = client.enqueue(req).await;
         match res {
@@ -384,7 +384,7 @@ async fn grpc_enqueue_requires_tenant_when_tenancy_enabled() -> anyhow::Result<(
             tenant: Some("my-tenant".to_string()),
             metadata: std::collections::HashMap::new(),
             task_group: "default".to_string(),
-            terminal_retention_s: None,
+            terminal_retention_ms: None,
         };
         let res = client.enqueue(req).await;
         assert!(res.is_ok(), "enqueue with valid tenant should succeed");
