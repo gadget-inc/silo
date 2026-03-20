@@ -25,6 +25,7 @@ async fn submit_full_compaction_with_data() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -175,6 +176,7 @@ async fn grpc_compact_shard_with_tombstones() -> anyhow::Result<()> {
                     None,
                     payload,
                     vec![],
+                    None,
                     None,
                     "default",
                 )

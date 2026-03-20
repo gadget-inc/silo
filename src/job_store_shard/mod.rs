@@ -103,8 +103,8 @@ pub struct JobStoreShard {
     pub(crate) metrics: Option<Metrics>,
     /// Interval for periodic concurrency request reconciliation.
     concurrency_reconcile_interval: Duration,
-    /// Default terminal retention for newly created jobs, in seconds.
-    pub(crate) default_terminal_retention_s: i64,
+    /// Default terminal retention for newly created jobs, in milliseconds.
+    pub(crate) default_terminal_retention_ms: i64,
     /// Interval between periodic retention scans.
     pub(crate) retention_scan_interval: Duration,
     /// Cancellation token for background tasks like cleanup.
@@ -369,7 +369,7 @@ impl JobStoreShard {
             wal_close_config,
             metrics,
             concurrency_reconcile_interval,
-            default_terminal_retention_s: default_terminal_retention.as_secs() as i64,
+            default_terminal_retention_ms: default_terminal_retention.as_millis() as i64,
             retention_scan_interval,
             cancellation: CancellationToken::new(),
             store,
@@ -753,42 +753,41 @@ impl JobStoreShard {
     ///
     /// Returns an error if the job is currently running (has active leases/holders) or has pending tasks/requests. Jobs must finish or permanently fail before deletion.
     pub async fn delete_job(&self, tenant: &str, id: &str) -> Result<(), JobStoreShardError> {
-        retry_on_txn_conflict("delete_job", || self.delete_job_inner(tenant, id)).await
-    }
+        retry_on_txn_conflict("delete_job", || async {
+            let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+            let info_key = job_info_key(tenant, id);
+            let status_key = job_status_key(tenant, id);
 
-    async fn delete_job_inner(&self, tenant: &str, id: &str) -> Result<(), JobStoreShardError> {
-        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
-        let info_key = job_info_key(tenant, id);
-        let status_key = job_status_key(tenant, id);
+            let maybe_job_raw = txn.get(&info_key).await?;
+            let maybe_status_raw = txn.get(&status_key).await?;
 
-        let maybe_job_raw = txn.get(&info_key).await?;
-        let maybe_status_raw = txn.get(&status_key).await?;
+            let (job_raw, status_raw) = match (maybe_job_raw, maybe_status_raw) {
+                (Some(job_raw), Some(status_raw)) => (job_raw, status_raw),
+                (None, None) => return Ok(()),
+                _ => {
+                    return Err(JobStoreShardError::Codec(format!(
+                        "job {} has inconsistent stored state",
+                        id
+                    )));
+                }
+            };
 
-        let (job_raw, status_raw) = match (maybe_job_raw, maybe_status_raw) {
-            (Some(job_raw), Some(status_raw)) => (job_raw, status_raw),
-            (None, None) => return Ok(()),
-            _ => {
-                return Err(JobStoreShardError::Codec(format!(
-                    "job {} has inconsistent stored state",
-                    id
-                )));
+            let job_view = JobView::new(job_raw)?;
+            let status = crate::job_store_shard::helpers::decode_job_status_owned(&status_raw)?;
+            if !status.is_terminal() {
+                return Err(JobStoreShardError::JobInProgress(id.to_string()));
             }
-        };
 
-        let job_view = JobView::new(job_raw)?;
-        let status = crate::job_store_shard::helpers::decode_job_status_owned(&status_raw)?;
-        if !status.is_terminal() {
-            return Err(JobStoreShardError::JobInProgress(id.to_string()));
-        }
+            self.delete_job_records_in_txn(&txn, tenant, id, &job_view, &status)
+                .await?;
 
-        self.delete_job_records_in_txn(&txn, tenant, id, &job_view, &status)
+            txn.commit_with_options(&WriteOptions {
+                await_durable: true,
+            })
             .await?;
 
-        txn.commit_with_options(&WriteOptions {
-            await_durable: true,
+            Ok(())
         })
-        .await?;
-
-        Ok(())
+        .await
     }
 }

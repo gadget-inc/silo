@@ -88,6 +88,19 @@ These metrics track distributed shard ownership across the cluster.
 - Discrepancies indicate shard acquisition/release in progress
 - Use for capacity planning: total shards / nodes = shards per node
 
+### Retention Metrics
+
+These metrics track the background retention scanner that automatically deletes expired terminal jobs.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `silo_retention_scans_total` | Counter | `shard` | Total number of retention scans completed |
+| `silo_retention_jobs_deleted_total` | Counter | `shard` | Total number of jobs deleted by the retention scanner |
+
+**Key insights:**
+- A steady rate of `silo_retention_jobs_deleted_total` indicates the scanner is keeping up with expired jobs
+- If `silo_retention_scans_total` stops incrementing, the scanner may have stalled
+
 ### Concurrency Metrics
 
 Concurrency limits control how many jobs with the same concurrency key can run simultaneously.

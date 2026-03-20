@@ -536,7 +536,7 @@ export interface Job<Payload = unknown, Result = unknown> {
   /** Timestamp when the job was enqueued (epoch ms) */
   enqueueTimeMs: bigint;
   /** How long to retain the job after it reaches a terminal state, in seconds */
-  terminalRetentionS?: bigint;
+  terminalRetentionMs?: bigint;
   /** The job payload as MessagePack bytes */
   payload: Payload;
   /** Retry policy if configured */
@@ -784,7 +784,7 @@ export interface EnqueueJobOptions {
   /** Optional retry policy */
   retryPolicy?: RetryPolicy;
   /** Optional retention in seconds after the job reaches a terminal state */
-  terminalRetentionS?: bigint;
+  terminalRetentionMs?: bigint;
   /** Optional limits (concurrency limits and/or rate limits) */
   limits?: JobLimit[];
   /** Tenant ID for routing to the correct shard. Uses default tenant if not provided. */
@@ -1696,7 +1696,7 @@ export class SiloGRPCClient {
             tenant: options.tenant,
             metadata: options.metadata ?? {},
             taskGroup: options.taskGroup,
-            terminalRetentionS: options.terminalRetentionS,
+            terminalRetentionMs: options.terminalRetentionMs,
           },
           this._rpcOptions(),
         );
@@ -1748,7 +1748,7 @@ export class SiloGRPCClient {
             "payload",
           ),
           retryPolicy: response.retryPolicy,
-          terminalRetentionS: response.terminalRetentionS,
+          terminalRetentionMs: response.terminalRetentionMs,
           limits: response.limits.map(fromProtoLimit).filter((l): l is JobLimit => l !== undefined),
           metadata: response.metadata,
           status: protoJobStatusToPublic(response.status),

@@ -88,6 +88,9 @@ impl JobStoreShard {
     /// concurrency control to atomically check for duplicates and write the job.
     /// When no ID is provided (auto-generated UUID), uses a faster WriteBatch path
     /// since UUID collisions are not a concern.
+    ///
+    /// Pass `terminal_retention_ms: Some(n)` to override the shard-level default retention
+    /// for this job's terminal state. Pass `None` to use the shard default.
     #[allow(clippy::too_many_arguments)]
     pub async fn enqueue(
         &self,
@@ -99,36 +102,7 @@ impl JobStoreShard {
         payload: Vec<u8>,
         limits: Vec<Limit>,
         metadata: Option<Vec<(String, String)>>,
-        task_group: &str,
-    ) -> Result<String, JobStoreShardError> {
-        self.enqueue_with_retention(
-            tenant,
-            id,
-            priority,
-            start_at_ms,
-            retry_policy,
-            payload,
-            limits,
-            metadata,
-            None,
-            task_group,
-        )
-        .await
-    }
-
-    /// Enqueue a new job, optionally overriding terminal retention for this job.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn enqueue_with_retention(
-        &self,
-        tenant: &str,
-        id: Option<String>,
-        priority: u8,
-        start_at_ms: i64,
-        retry_policy: Option<RetryPolicy>,
-        payload: Vec<u8>,
-        limits: Vec<Limit>,
-        metadata: Option<Vec<(String, String)>>,
-        terminal_retention_s: Option<i64>,
+        terminal_retention_ms: Option<i64>,
         task_group: &str,
     ) -> Result<String, JobStoreShardError> {
         if let Some(user_id) = id {
@@ -141,7 +115,7 @@ impl JobStoreShard {
                 payload,
                 limits,
                 metadata,
-                terminal_retention_s,
+                terminal_retention_ms,
                 task_group,
             )
             .await
@@ -156,7 +130,7 @@ impl JobStoreShard {
                 payload,
                 limits,
                 metadata,
-                terminal_retention_s,
+                terminal_retention_ms,
                 task_group,
             )
             .await?;
@@ -177,7 +151,7 @@ impl JobStoreShard {
         payload: Vec<u8>,
         limits: Vec<Limit>,
         metadata: Option<Vec<(String, String)>>,
-        terminal_retention_s: Option<i64>,
+        terminal_retention_ms: Option<i64>,
         task_group: &str,
     ) -> Result<(), JobStoreShardError> {
         let mut batch = WriteBatch::new();
@@ -192,7 +166,7 @@ impl JobStoreShard {
                 payload,
                 limits,
                 metadata,
-                terminal_retention_s,
+                terminal_retention_ms,
                 task_group,
             )
             .await?;
@@ -244,7 +218,7 @@ impl JobStoreShard {
         payload: Vec<u8>,
         limits: Vec<Limit>,
         metadata: Option<Vec<(String, String)>>,
-        terminal_retention_s: Option<i64>,
+        terminal_retention_ms: Option<i64>,
         task_group: &str,
     ) -> Result<String, JobStoreShardError> {
         retry_on_txn_conflict("enqueue", || {
@@ -257,7 +231,7 @@ impl JobStoreShard {
                 payload.clone(),
                 limits.clone(),
                 metadata.clone(),
-                terminal_retention_s,
+                terminal_retention_ms,
                 task_group,
             )
         })
@@ -277,7 +251,7 @@ impl JobStoreShard {
         payload: Vec<u8>,
         limits: Vec<Limit>,
         metadata: Option<Vec<(String, String)>>,
-        terminal_retention_s: Option<i64>,
+        terminal_retention_ms: Option<i64>,
         task_group: &str,
     ) -> Result<(), JobStoreShardError> {
         // Start a transaction with SerializableSnapshot isolation for conflict detection
@@ -300,7 +274,7 @@ impl JobStoreShard {
                 payload,
                 limits,
                 metadata,
-                terminal_retention_s,
+                terminal_retention_ms,
                 task_group,
             )
             .await?;
@@ -351,18 +325,18 @@ impl JobStoreShard {
         payload: Vec<u8>,
         limits: Vec<Limit>,
         metadata: Option<Vec<(String, String)>>,
-        terminal_retention_s: Option<i64>,
+        terminal_retention_ms: Option<i64>,
         task_group: &str,
     ) -> Result<Vec<(String, String)>, JobStoreShardError> {
         let now_ms = now_epoch_ms();
-        let effective_terminal_retention_s =
-            self.effective_terminal_retention_s(terminal_retention_s)?;
+        let effective_terminal_retention_ms =
+            self.effective_terminal_retention_ms(terminal_retention_ms)?;
 
         let job = JobInfo {
             id: job_id.to_string(),
             priority,
             enqueue_time_ms: start_at_ms,
-            terminal_retention_s: Some(effective_terminal_retention_s),
+            terminal_retention_ms: Some(effective_terminal_retention_ms),
             payload,
             retry_policy,
             metadata: metadata.unwrap_or_default(),

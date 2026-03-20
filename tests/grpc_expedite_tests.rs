@@ -35,7 +35,7 @@ async fn grpc_expedite_future_scheduled_job() -> anyhow::Result<()> {
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
-                terminal_retention_s: None,
+                terminal_retention_ms: None,
             })
             .await?
             .into_inner();
@@ -182,7 +182,7 @@ async fn grpc_expedite_running_job_fails() -> anyhow::Result<()> {
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
-                terminal_retention_s: None,
+                terminal_retention_ms: None,
             })
             .await?
             .into_inner();
@@ -287,7 +287,7 @@ async fn grpc_expedite_cancelled_job_fails() -> anyhow::Result<()> {
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
-                terminal_retention_s: None,
+                terminal_retention_ms: None,
             })
             .await?
             .into_inner();

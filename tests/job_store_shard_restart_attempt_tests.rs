@@ -33,6 +33,7 @@ async fn attempt_numbers_are_monotonic_across_restarts() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -204,6 +205,7 @@ async fn retry_schedule_resets_after_restart() {
                 payload,
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -328,6 +330,7 @@ async fn relative_attempt_number_resets_after_restart() {
                 Some(retry_policy),
                 payload,
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -480,6 +483,7 @@ async fn no_attempt_key_collisions_after_restart() {
                 None, // No retry policy - single attempt per run
                 payload,
                 vec![],
+                None,
                 None,
                 "default",
             )

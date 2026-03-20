@@ -58,19 +58,25 @@ pub async fn open_temp_shard() -> (tempfile::TempDir, std::sync::Arc<JobStoreSha
 pub async fn open_temp_shard_with_reconcile_interval_ms(
     interval_ms: u64,
 ) -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>) {
-    open_temp_shard_with_options(interval_ms, DEFAULT_TERMINAL_RETENTION).await
+    open_temp_shard_with_options(
+        interval_ms,
+        DEFAULT_TERMINAL_RETENTION,
+        Duration::from_secs(86400),
+    )
+    .await
 }
 
-/// Open a temp shard with a custom default terminal retention.
+/// Open a temp shard with a custom default terminal retention and fast retention scanning.
 pub async fn open_temp_shard_with_default_terminal_retention(
     retention: Duration,
 ) -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>) {
-    open_temp_shard_with_options(5_000, retention).await
+    open_temp_shard_with_options(5_000, retention, Duration::from_millis(100)).await
 }
 
 async fn open_temp_shard_with_options(
     interval_ms: u64,
     default_terminal_retention: Duration,
+    retention_scan_interval: Duration,
 ) -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>) {
     let rate_limiter = MockGubernatorClient::new_arc();
     let tmp = tempfile::tempdir().unwrap();
@@ -89,7 +95,7 @@ async fn open_temp_shard_with_options(
             metrics: None,
             concurrency_reconcile_interval: Duration::from_millis(interval_ms.max(1)),
             default_terminal_retention,
-            retention_scan_interval: Duration::from_millis(100),
+            retention_scan_interval,
         },
         ShardRange::full(),
     )

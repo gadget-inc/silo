@@ -41,6 +41,7 @@ async fn enqueue_jobs_for_tenants(
                     payload,
                     vec![],
                     None,
+                    None,
                     task_group,
                 )
                 .await
@@ -445,6 +446,7 @@ async fn create_shard_with_uncleaned_data(
                     payload,
                     vec![],
                     None,
+                    None,
                     "default",
                 )
                 .await
@@ -541,6 +543,7 @@ async fn enqueue_works_with_uncleaned_data_present() {
             None,
             payload,
             vec![],
+            None,
             None,
             "default",
         )
@@ -652,6 +655,7 @@ async fn concurrency_hydration_ignores_uncleaned_holders() {
                     None,
                     payload,
                     limits,
+                    None,
                     None,
                     "default",
                 )

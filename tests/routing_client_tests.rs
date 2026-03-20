@@ -403,7 +403,7 @@ async fn routing_client_enqueue_correct_shard() -> anyhow::Result<()> {
                     tenant: Some(tenant.to_string()),
                     metadata: std::collections::HashMap::new(),
                     task_group: "default".to_string(),
-                    terminal_retention_s: None,
+                    terminal_retention_ms: None,
                 })
                 .await;
 
@@ -475,7 +475,7 @@ async fn routing_client_handles_failed_precondition_with_refresh() -> anyhow::Re
                 tenant: Some(wrong_tenant.to_string()),
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
-                terminal_retention_s: None,
+                terminal_retention_ms: None,
             })
             .await;
 
@@ -516,7 +516,7 @@ async fn routing_client_handles_failed_precondition_with_refresh() -> anyhow::Re
                 tenant: Some(wrong_tenant.to_string()),
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
-                terminal_retention_s: None,
+                terminal_retention_ms: None,
             })
             .await;
 

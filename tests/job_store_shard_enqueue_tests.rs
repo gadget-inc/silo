@@ -34,6 +34,7 @@ async fn enqueue_round_trip_with_explicit_id() {
             payload_bytes,
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -95,6 +96,7 @@ async fn enqueue_with_metadata_round_trips_in_job_view() {
             payload_bytes,
             vec![],
             Some(md.clone()),
+            None,
             "default",
         )
         .await
@@ -136,6 +138,7 @@ async fn enqueue_generates_uuid_when_none_provided() {
             None,
             payload_bytes,
             vec![],
+            None,
             None,
             "default",
         )
@@ -183,6 +186,7 @@ async fn delete_job_removes_key_and_is_idempotent() {
             None,
             payload_bytes,
             vec![],
+            None,
             None,
             "default",
         )
@@ -262,6 +266,7 @@ async fn peek_omits_future_scheduled_tasks() {
             payload_bytes,
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -292,6 +297,7 @@ async fn enqueue_fails_when_id_already_exists_and_db_unchanged() {
             payload1_bytes,
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -317,6 +323,7 @@ async fn enqueue_fails_when_id_already_exists_and_db_unchanged() {
             None,
             payload2_bytes,
             vec![],
+            None,
             None,
             "default",
         )
@@ -362,6 +369,7 @@ async fn cannot_delete_running_job() {
                 None,
                 payload_bytes,
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -423,6 +431,7 @@ async fn cannot_delete_scheduled_job() {
                 None,
                 payload_bytes,
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -492,6 +501,7 @@ async fn priority_ordering_when_start_times_equal() {
                 test_helpers::msgpack_payload(&serde_json::json!({"j": "hi"})),
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -505,6 +515,7 @@ async fn priority_ordering_when_start_times_equal() {
                 None,
                 test_helpers::msgpack_payload(&serde_json::json!({"j": "lo"})),
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -559,6 +570,7 @@ async fn concurrent_enqueue_with_same_id_only_one_succeeds() {
                         None,
                         payload_bytes,
                         vec![],
+                        None,
                         None,
                         "default",
                     )
@@ -639,6 +651,7 @@ async fn high_concurrency_enqueue_with_different_ids_all_succeed() {
                         None,
                         payload_bytes,
                         vec![],
+                        None,
                         None,
                         "default",
                     )

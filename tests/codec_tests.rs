@@ -295,7 +295,7 @@ fn test_job_info_roundtrip() {
         id: "job-info-1".to_string(),
         priority: 42,
         enqueue_time_ms: 1700000000000,
-        terminal_retention_s: None,
+        terminal_retention_ms: None,
         payload: vec![1, 2, 3, 4],
         retry_policy: None,
         metadata: vec![("env".to_string(), "prod".to_string())],

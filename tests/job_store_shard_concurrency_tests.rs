@@ -37,6 +37,7 @@ async fn concurrency_shared_across_task_groups() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "alpha", // task_group alpha
         )
         .await
@@ -65,6 +66,7 @@ async fn concurrency_shared_across_task_groups() {
                 key: queue.clone(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "beta", // task_group beta
         )
@@ -127,6 +129,7 @@ async fn concurrency_queues_jobs_from_multiple_task_groups() {
                         max_concurrency: 1,
                     })],
                     None,
+                    None,
                     "group-a",
                 )
                 .await
@@ -147,6 +150,7 @@ async fn concurrency_queues_jobs_from_multiple_task_groups() {
                         max_concurrency: 1,
                     })],
                     None,
+                    None,
                     "group-b",
                 )
                 .await
@@ -166,6 +170,7 @@ async fn concurrency_queues_jobs_from_multiple_task_groups() {
                         key: queue.clone(),
                         max_concurrency: 1,
                     })],
+                    None,
                     None,
                     "group-c",
                 )
@@ -240,6 +245,7 @@ async fn concurrency_allows_multiple_slots_across_task_groups() {
                 max_concurrency: 2,
             })],
             None,
+            None,
             "workers-a",
         )
         .await
@@ -257,6 +263,7 @@ async fn concurrency_allows_multiple_slots_across_task_groups() {
                 key: queue.clone(),
                 max_concurrency: 2,
             })],
+            None,
             None,
             "workers-b",
         )
@@ -276,6 +283,7 @@ async fn concurrency_allows_multiple_slots_across_task_groups() {
                 max_concurrency: 2,
             })],
             None,
+            None,
             "workers-a",
         )
         .await
@@ -293,6 +301,7 @@ async fn concurrency_allows_multiple_slots_across_task_groups() {
                 key: queue.clone(),
                 max_concurrency: 2,
             })],
+            None,
             None,
             "workers-b",
         )
@@ -401,6 +410,7 @@ async fn concurrent_dequeue_many_workers_no_duplicates() {
                         payload,
                         vec![],
                         None,
+                        None,
                         "default",
                     )
                     .await
@@ -447,6 +457,7 @@ async fn future_tasks_are_not_dequeued_under_concurrency() {
                     test_helpers::msgpack_payload(&serde_json::json!({"r": i})),
                     vec![],
                     None,
+                    None,
                     "default",
                 )
                 .await
@@ -463,6 +474,7 @@ async fn future_tasks_are_not_dequeued_under_concurrency() {
                     None,
                     test_helpers::msgpack_payload(&serde_json::json!({"f": i})),
                     vec![],
+                    None,
                     None,
                     "default",
                 )
@@ -537,6 +549,7 @@ async fn concurrency_immediate_grant_enqueues_task_and_writes_holder() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -584,6 +597,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -605,6 +619,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
                 key: queue.clone(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
@@ -660,6 +675,7 @@ async fn concurrency_held_queues_propagate_across_retries_and_release_on_finish(
                 key: queue.clone(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
@@ -725,6 +741,7 @@ async fn concurrency_retry_releases_original_holder() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -784,6 +801,7 @@ async fn concurrency_no_overgrant_after_release() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -810,6 +828,7 @@ async fn concurrency_no_overgrant_after_release() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -835,6 +854,7 @@ async fn concurrency_no_overgrant_after_release() {
                 key: queue.clone(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
@@ -871,6 +891,7 @@ async fn stress_single_queue_no_double_grant() {
                     key: queue.clone(),
                     max_concurrency: 1,
                 })],
+                None,
                 None,
                 "default",
             )
@@ -928,6 +949,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -955,6 +977,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
                     key: queue.clone(),
                     max_concurrency: 1,
                 })],
+                None,
                 None,
                 "default",
             )
@@ -1017,6 +1040,7 @@ async fn retry_with_concurrency_must_reacquire_slot_not_claim_released_slot() {
                 max_concurrency: 1, // Mutex - only 1 job at a time
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -1053,6 +1077,7 @@ async fn retry_with_concurrency_must_reacquire_slot_not_claim_released_slot() {
                 key: queue.clone(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
@@ -1187,6 +1212,7 @@ async fn retry_must_wait_for_slot_when_another_job_was_granted() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -1210,6 +1236,7 @@ async fn retry_must_wait_for_slot_when_another_job_was_granted() {
                 max_concurrency: 1,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -1227,6 +1254,7 @@ async fn retry_must_wait_for_slot_when_another_job_was_granted() {
                 key: queue.clone(),
                 max_concurrency: 1,
             })],
+            None,
             None,
             "default",
         )
@@ -1304,6 +1332,7 @@ async fn retry_with_spare_concurrency_goes_through_request_queue() {
                 key: queue.clone(),
                 max_concurrency: 3,
             })],
+            None,
             None,
             "default",
         )
@@ -1449,6 +1478,7 @@ async fn retry_with_concurrent_jobs_respects_limit() {
                 max_concurrency: 2,
             })],
             None,
+            None,
             "default",
         )
         .await
@@ -1467,6 +1497,7 @@ async fn retry_with_concurrent_jobs_respects_limit() {
                 key: queue.clone(),
                 max_concurrency: 2,
             })],
+            None,
             None,
             "default",
         )

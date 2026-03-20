@@ -85,7 +85,7 @@ pub fn run() {
                         tenant: None,
                         metadata: HashMap::new(),
                         task_group: "default".to_string(),
-                        terminal_retention_s: None,
+                        terminal_retention_ms: None,
                     }))
                     .await
                 {
@@ -152,7 +152,7 @@ pub fn run() {
                         tenant: None,
                         metadata: HashMap::new(),
                         task_group: "default".to_string(),
-                        terminal_retention_s: None,
+                        terminal_retention_ms: None,
                     }))
                     .await
                 {

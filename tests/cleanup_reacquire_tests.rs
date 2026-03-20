@@ -42,6 +42,7 @@ async fn enqueue_jobs_for_tenants(shard: &JobStoreShard, tenants: &[&str], jobs_
                     payload,
                     vec![],
                     None,
+                    None,
                     "default",
                 )
                 .await

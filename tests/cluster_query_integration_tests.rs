@@ -136,7 +136,7 @@ async fn enqueue_job(
             tenant: tenant.map(|s| s.to_string()),
             metadata: HashMap::new(),
             task_group: "default".to_string(),
-            terminal_retention_s: None,
+            terminal_retention_ms: None,
         };
 
         match client.enqueue(request).await {

@@ -41,6 +41,7 @@ async fn counter_increments_on_enqueue() {
                 msgpack_payload(&serde_json::json!({"i": i})),
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -66,6 +67,7 @@ async fn counter_transitions_through_lifecycle() {
                 None,
                 msgpack_payload(&serde_json::json!({"test": "lifecycle"})),
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -131,6 +133,7 @@ async fn counter_handles_cancel() {
                 msgpack_payload(&serde_json::json!({"test": "cancel"})),
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -170,6 +173,7 @@ async fn counter_handles_restart() {
                 None,
                 msgpack_payload(&serde_json::json!({"test": "restart"})),
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -220,6 +224,7 @@ async fn counter_handles_retry() {
                 }),
                 msgpack_payload(&serde_json::json!({"test": "retry"})),
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -279,6 +284,7 @@ async fn counter_handles_delete() {
                 msgpack_payload(&serde_json::json!({"test": "delete"})),
                 vec![],
                 None,
+                None,
                 "default",
             )
             .await
@@ -326,7 +332,7 @@ async fn counter_handles_import() {
                         priority: 10,
                         enqueue_time_ms: now,
                         start_at_ms: now,
-                        terminal_retention_s: None,
+                        terminal_retention_ms: None,
                         retry_policy: None,
                         payload: msgpack_payload(&serde_json::json!({"test": "import1"})),
                         limits: vec![],
@@ -343,7 +349,7 @@ async fn counter_handles_import() {
                         priority: 10,
                         enqueue_time_ms: now,
                         start_at_ms: now,
-                        terminal_retention_s: None,
+                        terminal_retention_ms: None,
                         retry_policy: None,
                         payload: msgpack_payload(&serde_json::json!({"test": "import2"})),
                         limits: vec![],
@@ -386,7 +392,7 @@ async fn counter_handles_reimport() {
                     priority: 10,
                     enqueue_time_ms: now,
                     start_at_ms: now,
-                    terminal_retention_s: None,
+                    terminal_retention_ms: None,
                     retry_policy: None,
                     payload: msgpack_payload(&serde_json::json!({"test": "reimport"})),
                     limits: vec![],
@@ -419,7 +425,7 @@ async fn counter_handles_reimport() {
                     priority: 10,
                     enqueue_time_ms: now,
                     start_at_ms: now,
-                    terminal_retention_s: None,
+                    terminal_retention_ms: None,
                     retry_policy: None,
                     payload: msgpack_payload(&serde_json::json!({"test": "reimport"})),
                     limits: vec![],
@@ -480,6 +486,7 @@ async fn counter_scan_filters_by_shard_range() {
                     msgpack_payload(&serde_json::json!({"tenant": tenant})),
                     vec![],
                     None,
+                    None,
                     "default",
                 )
                 .await
@@ -525,6 +532,7 @@ async fn counter_scan_filters_by_shard_range() {
                     msgpack_payload(&serde_json::json!({"tenant": tenant})),
                     vec![],
                     None,
+                    None,
                     "default",
                 )
                 .await
@@ -566,6 +574,7 @@ async fn counter_scan_can_limit_to_exact_tenant() {
                         None,
                         msgpack_payload(&serde_json::json!({"tenant": tenant})),
                         vec![],
+                        None,
                         None,
                         "default",
                     )

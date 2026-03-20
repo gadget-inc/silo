@@ -42,7 +42,7 @@ async fn enqueue_jobs_for_heavy_query(
             tenant: None,
             metadata: std::collections::HashMap::new(),
             task_group: "default".to_string(),
-            terminal_retention_s: None,
+            terminal_retention_ms: None,
         };
         let _ = client.enqueue(enq).await?;
     }
@@ -75,7 +75,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
                 tenant: None,
                 metadata: md,
                 task_group: "default".to_string(),
-                terminal_retention_s: None,
+                terminal_retention_ms: None,
             };
             let _ = client.enqueue(enq).await?;
         }
@@ -352,7 +352,7 @@ async fn grpc_server_query_bind_parameters_positional() -> anyhow::Result<()> {
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
-                terminal_retention_s: None,
+                terminal_retention_ms: None,
             };
             let _ = client.enqueue(enq).await?;
         }
@@ -478,7 +478,7 @@ async fn grpc_server_query_empty_results() -> anyhow::Result<()> {
             tenant: None,
             metadata: std::collections::HashMap::new(),
             task_group: "default".to_string(),
-            terminal_retention_s: None,
+            terminal_retention_ms: None,
         };
         let _ = client.enqueue(enq).await?;
 
@@ -537,7 +537,7 @@ async fn grpc_server_query_typescript_friendly() -> anyhow::Result<()> {
             tenant: None,
             metadata: md,
             task_group: "default".to_string(),
-            terminal_retention_s: None,
+            terminal_retention_ms: None,
         };
         let _ = client.enqueue(enq).await?;
 
@@ -620,7 +620,7 @@ async fn grpc_server_query_without_tenant() -> anyhow::Result<()> {
                 tenant: None, // Will use default tenant
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
-                terminal_retention_s: None,
+                terminal_retention_ms: None,
             };
             let _ = client.enqueue(enq).await?;
         }
@@ -692,7 +692,7 @@ async fn grpc_server_query_msgpack_data_types() -> anyhow::Result<()> {
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
-                terminal_retention_s: None,
+                terminal_retention_ms: None,
             };
             let _ = client.enqueue(enq).await?;
         }
@@ -831,7 +831,7 @@ async fn grpc_server_query_arrow_with_bind_parameters() -> anyhow::Result<()> {
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
-                terminal_retention_s: None,
+                terminal_retention_ms: None,
             };
             let _ = client.enqueue(enq).await?;
         }
@@ -891,7 +891,7 @@ async fn grpc_server_query_arrow_without_tenant() -> anyhow::Result<()> {
                 tenant: None,
                 metadata: std::collections::HashMap::new(),
                 task_group: "default".to_string(),
-                terminal_retention_s: None,
+                terminal_retention_ms: None,
             };
             let _ = client.enqueue(enq).await?;
         }

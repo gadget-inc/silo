@@ -131,6 +131,7 @@ async fn rate_limit_single_dequeue_returns_task() {
             test_helpers::msgpack_payload(&serde_json::json!({"task": "rate_limited"})),
             vec![Limit::RateLimit(rate_limit)],
             None,
+            None,
             "default",
         )
         .await
@@ -171,6 +172,7 @@ async fn rate_limit_passes_and_job_becomes_runnable() {
             None,
             test_helpers::msgpack_payload(&serde_json::json!({"task": "rate_limited"})),
             vec![Limit::RateLimit(rate_limit)],
+            None,
             None,
             "default",
         )
@@ -239,6 +241,7 @@ async fn rate_limit_exceeded_then_passes_after_window() {
             test_helpers::msgpack_payload(&serde_json::json!({"task": "rate_limited_retry"})),
             vec![Limit::RateLimit(rate_limit)],
             None,
+            None,
             "default",
         )
         .await
@@ -290,6 +293,7 @@ async fn multiple_rate_limits_acquired_in_order() {
             test_helpers::msgpack_payload(&serde_json::json!({"task": "multi_rate_limit"})),
             vec![Limit::RateLimit(rate_limit1), Limit::RateLimit(rate_limit2)],
             None,
+            None,
             "default",
         )
         .await
@@ -330,6 +334,7 @@ async fn concurrency_then_rate_limit_acquired_in_order() {
                 Limit::Concurrency(concurrency),
                 Limit::RateLimit(rate_limit),
             ],
+            None,
             None,
             "default",
         )
@@ -378,6 +383,7 @@ async fn rate_limit_then_concurrency_acquired_in_order() {
                 Limit::RateLimit(rate_limit),
                 Limit::Concurrency(concurrency),
             ],
+            None,
             None,
             "default",
         )
@@ -428,6 +434,7 @@ async fn concurrency_blocked_with_rate_limit_pending() {
                 Limit::RateLimit(rate_limit.clone()),
             ],
             None,
+            None,
             "default",
         )
         .await
@@ -446,6 +453,7 @@ async fn concurrency_blocked_with_rate_limit_pending() {
                 Limit::Concurrency(concurrency.clone()),
                 Limit::RateLimit(rate_limit.clone()),
             ],
+            None,
             None,
             "default",
         )
@@ -507,6 +515,7 @@ async fn three_limits_concurrency_rate_concurrency() {
                 Limit::Concurrency(conc2),
             ],
             None,
+            None,
             "default",
         )
         .await
@@ -558,6 +567,7 @@ async fn rate_limit_counts_hits_correctly() {
                 None,
                 test_helpers::msgpack_payload(&serde_json::json!({"job": i})),
                 vec![Limit::RateLimit(rate_limit.clone())],
+                None,
                 None,
                 "default",
             )

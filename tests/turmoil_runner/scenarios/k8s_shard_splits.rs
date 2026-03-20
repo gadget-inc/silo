@@ -949,7 +949,7 @@ pub fn run() {
                         tenant: Some(tenant.clone()),
                         metadata: HashMap::new(),
                         task_group: "default".to_string(),
-                    terminal_retention_s: None,
+                    terminal_retention_ms: None,
                     }))
                     .await
                 {

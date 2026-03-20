@@ -13,7 +13,18 @@ async fn status_index_scheduled_then_running_then_succeeded() {
     let payload = test_helpers::msgpack_payload(&serde_json::json!({"k":"v"}));
 
     let job_id = shard
-        .enqueue("-", None, 10u8, now, None, payload, vec![], None, "default")
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            payload,
+            vec![],
+            None,
+            None,
+            "default",
+        )
         .await
         .expect("enqueue");
 
@@ -68,6 +79,7 @@ async fn status_index_failed_and_scheduled_then_order_newest_first() {
             test_helpers::msgpack_payload(&serde_json::json!({"a":1})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -107,6 +119,7 @@ async fn status_index_failed_and_scheduled_then_order_newest_first() {
             Some(policy),
             test_helpers::msgpack_payload(&serde_json::json!({"b":2})),
             vec![],
+            None,
             None,
             "default",
         )
@@ -161,6 +174,7 @@ async fn retry_flow_running_to_scheduled_to_running_to_succeeded() {
             Some(policy),
             test_helpers::msgpack_payload(&serde_json::json!({"j":1})),
             vec![],
+            None,
             None,
             "default",
         )
@@ -229,6 +243,7 @@ async fn reaper_without_retries_marks_failed_in_index() {
             test_helpers::msgpack_payload(&serde_json::json!({"x":1})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -281,6 +296,7 @@ async fn reaper_with_retries_moves_to_scheduled_in_index() {
             test_helpers::msgpack_payload(&serde_json::json!({"y":2})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -325,6 +341,7 @@ async fn delete_removes_from_index() {
             test_helpers::msgpack_payload(&serde_json::json!({"z":3})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -367,6 +384,7 @@ async fn cross_tenant_isolation_in_scans() {
             test_helpers::msgpack_payload(&serde_json::json!({"t":"A"})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -380,6 +398,7 @@ async fn cross_tenant_isolation_in_scans() {
             None,
             test_helpers::msgpack_payload(&serde_json::json!({"t":"B"})),
             vec![],
+            None,
             None,
             "default",
         )
@@ -409,6 +428,7 @@ async fn pagination_and_ordering_newest_first() {
                 None,
                 test_helpers::msgpack_payload(&serde_json::json!({"i": i})),
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -446,6 +466,7 @@ async fn future_enqueue_is_in_scheduled_scan() {
             test_helpers::msgpack_payload(&serde_json::json!({"f":1})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -476,6 +497,7 @@ async fn metadata_index_basic_and_delete_cleanup() {
                 ("k".to_string(), "v".to_string()),
                 ("x".to_string(), "y".to_string()),
             ]),
+            None,
             "default",
         )
         .await
@@ -490,6 +512,7 @@ async fn metadata_index_basic_and_delete_cleanup() {
             test_helpers::msgpack_payload(&serde_json::json!({"b":2})),
             vec![],
             Some(vec![("k".to_string(), "v".to_string())]),
+            None,
             "default",
         )
         .await
@@ -504,6 +527,7 @@ async fn metadata_index_basic_and_delete_cleanup() {
             test_helpers::msgpack_payload(&serde_json::json!({"c":3})),
             vec![],
             Some(vec![("k".to_string(), "w".to_string())]),
+            None,
             "default",
         )
         .await
@@ -570,6 +594,7 @@ async fn metadata_scan_cross_tenant_isolation() {
             test_helpers::msgpack_payload(&serde_json::json!({"t":"A"})),
             vec![],
             Some(vec![("k".to_string(), "v".to_string())]),
+            None,
             "default",
         )
         .await
@@ -584,6 +609,7 @@ async fn metadata_scan_cross_tenant_isolation() {
             test_helpers::msgpack_payload(&serde_json::json!({"t":"B"})),
             vec![],
             Some(vec![("k".to_string(), "v".to_string())]),
+            None,
             "default",
         )
         .await
@@ -625,6 +651,7 @@ async fn scan_jobs_unfiltered_basic_and_ordering() {
                 None,
                 test_helpers::msgpack_payload(&serde_json::json!({})),
                 vec![],
+                None,
                 None,
                 "default",
             )
@@ -668,6 +695,7 @@ async fn scan_jobs_is_tenant_isolated_and_limit_zero_empty() {
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
             None,
+            None,
             "default",
         )
         .await
@@ -681,6 +709,7 @@ async fn scan_jobs_is_tenant_isolated_and_limit_zero_empty() {
             None,
             test_helpers::msgpack_payload(&serde_json::json!({})),
             vec![],
+            None,
             None,
             "default",
         )

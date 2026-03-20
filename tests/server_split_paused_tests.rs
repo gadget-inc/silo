@@ -230,7 +230,7 @@ async fn enqueue_returns_unavailable_when_shard_paused() {
         limits: vec![],
         metadata: HashMap::new(),
         task_group: "default".to_string(),
-        terminal_retention_s: None,
+        terminal_retention_ms: None,
     });
 
     let result = svc.enqueue(req).await;
@@ -255,7 +255,7 @@ async fn enqueue_returns_unavailable_when_shard_paused() {
         limits: vec![],
         metadata: HashMap::new(),
         task_group: "default".to_string(),
-        terminal_retention_s: None,
+        terminal_retention_ms: None,
     });
 
     let result = svc.enqueue(req).await;
@@ -294,7 +294,7 @@ async fn get_job_returns_unavailable_when_shard_paused() {
         limits: vec![],
         metadata: HashMap::new(),
         task_group: "default".to_string(),
-        terminal_retention_s: None,
+        terminal_retention_ms: None,
     });
     svc.enqueue(enqueue_req).await.expect("enqueue should work");
 
@@ -350,7 +350,7 @@ async fn cancel_job_returns_unavailable_when_shard_paused() {
         limits: vec![],
         metadata: HashMap::new(),
         task_group: "default".to_string(),
-        terminal_retention_s: None,
+        terminal_retention_ms: None,
     });
     svc.enqueue(enqueue_req).await.expect("enqueue should work");
 
@@ -432,7 +432,7 @@ async fn requests_succeed_after_split_completes() {
         limits: vec![],
         metadata: HashMap::new(),
         task_group: "default".to_string(),
-        terminal_retention_s: None,
+        terminal_retention_ms: None,
     });
     let result = svc.enqueue(req).await;
     assert!(result.is_err());
@@ -457,7 +457,7 @@ async fn requests_succeed_after_split_completes() {
         limits: vec![],
         metadata: HashMap::new(),
         task_group: "default".to_string(),
-        terminal_retention_s: None,
+        terminal_retention_ms: None,
     });
     let result = svc.enqueue(req).await;
     assert!(result.is_ok(), "should succeed after split completes");
