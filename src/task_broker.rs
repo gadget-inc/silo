@@ -7,11 +7,12 @@ use std::sync::{
 use std::time::Duration;
 
 use crossbeam_skiplist::SkipMap;
+use dashmap::DashMap;
 use slatedb::{Db, WriteBatch};
 use tokio::sync::Notify;
 
 use crate::codec::{DecodedTask, decode_task_validated};
-use crate::keys::{end_bound, parse_task_key, tasks_prefix};
+use crate::keys::{end_bound, parse_task_key, task_group_prefix};
 use crate::metrics::Metrics;
 use crate::shard_range::ShardRange;
 use tracing::debug;
@@ -27,12 +28,14 @@ pub struct BrokerTask {
     pub decoded: DecodedTask,
 }
 
-/// Lock-free in-memory task broker backed by SlateDB.
+/// A single per-task-group broker that scans only its own key range.
 ///
 /// - Maintains a sorted buffer of ready tasks using a skiplist keyed by the task key bytes.
 /// - Populates from SlateDB in the background with exponential backoff when no work is found.
 /// - Ensures tasks claimed but not yet durably leased are tracked as in-flight and not reinserted.
 pub struct TaskBroker {
+    // The task group this broker is responsible for
+    task_group: String,
     // The SlateDB database to read tasks from
     db: Arc<Db>,
     // The buffer of tasks read out of the DB and ready to be claimed by a dequeue-ing worker
@@ -68,13 +71,15 @@ impl TaskBroker {
     // refresh the tombstone generation whenever a stale key is observed again.
     const ACK_TOMBSTONE_RETAIN_GENERATIONS: u64 = 64;
 
-    pub fn new(
+    fn new(
+        task_group: String,
         db: Arc<Db>,
         shard_name: String,
         metrics: Option<Metrics>,
         range: ShardRange,
     ) -> Arc<Self> {
         Arc::new(Self {
+            task_group,
             db,
             buffer: Arc::new(SkipMap::new()),
             inflight: Arc::new(Mutex::new(HashSet::new())),
@@ -90,11 +95,6 @@ impl TaskBroker {
             metrics,
             range,
         })
-    }
-
-    /// Get the shard's tenant range.
-    pub fn get_range(&self) -> ShardRange {
-        self.range.clone()
     }
 
     pub fn buffer_len(&self) -> usize {
@@ -121,8 +121,8 @@ impl TaskBroker {
 
     /// Scan tasks from DB and insert into buffer, skipping future tasks and inflight ones.
     async fn scan_tasks(&self, now_ms: i64, generation: u64) -> usize {
-        // [SILO-SCAN-1] Tasks use binary storekey encoding with prefix byte
-        let start = tasks_prefix();
+        // [SILO-SCAN-1] Scan only this task group's key range
+        let start = task_group_prefix(&self.task_group);
         let end = end_bound(&start);
 
         let Ok(mut iter) = self.db.scan::<Vec<u8>, _>(start..end).await else {
@@ -228,17 +228,13 @@ impl TaskBroker {
     }
 
     /// Start the background scanning loop.
-    pub fn start(self: &Arc<Self>) {
+    fn start(self: &Arc<Self>) {
         if self.running.swap(true, Ordering::SeqCst) {
             return;
         }
 
         let broker = Arc::clone(self);
         tokio::spawn(async move {
-            // Note: Concurrency holders are hydrated synchronously in
-            // JobStoreShard::open_with_resolved_store() before this broker starts.
-            // This ensures concurrent limits are enforced correctly from the first request.
-
             let min_sleep_ms = 5;
             let max_sleep_ms = 1000;
             let mut sleep_ms = min_sleep_ms;
@@ -292,7 +288,7 @@ impl TaskBroker {
                         // Reset backoff on explicit wakeup so the next scan
                         // runs aggressively (e.g. after a dequeue claim).
                         sleep_ms = min_sleep_ms;
-                        debug!("broker woken by notification");
+                        debug!(task_group = %broker.task_group, "broker woken by notification");
                     }
                     _ = &mut delay => {},
                 }
@@ -301,17 +297,15 @@ impl TaskBroker {
     }
 
     /// Stop the background loop.
-    pub fn stop(&self) {
+    fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
+        self.notify.notify_one();
     }
 
-    /// Claim up to `max` ready tasks from the head of the buffer for a specific task_group.
-    pub fn claim_ready(&self, task_group: &str, max: usize) -> Vec<BrokerTask> {
-        use crate::keys::task_group_prefix;
-        let prefix = task_group_prefix(task_group);
-
-        // Collect candidate keys in a single scan while holding the inflight lock once.
-        // This avoids O(N*M) repeated full scans from the beginning and reduces mutex acquisitions.
+    /// Claim up to `max` ready tasks from the buffer.
+    ///
+    /// Since each broker is scoped to a single task group, no prefix filtering is needed.
+    fn claim_ready(&self, max: usize) -> Vec<BrokerTask> {
         let candidate_keys: Vec<Vec<u8>> = {
             let mut inflight = self.inflight.lock().unwrap();
             let mut keys = Vec::with_capacity(max);
@@ -320,9 +314,6 @@ impl TaskBroker {
                     break;
                 }
                 let key = entry.key();
-                if !key.starts_with(&prefix) {
-                    continue;
-                }
                 if inflight.contains(key) {
                     continue;
                 }
@@ -346,10 +337,10 @@ impl TaskBroker {
         claimed
     }
 
-    /// Try to claim tasks for a task_group. If none available, wait briefly for scanner to populate.
-    pub async fn claim_ready_or_nudge(&self, task_group: &str, max: usize) -> Vec<BrokerTask> {
+    /// Try to claim tasks. If none available, wait briefly for scanner to populate.
+    async fn claim_ready_or_nudge(&self, max: usize) -> Vec<BrokerTask> {
         // Try fast path first
-        let claimed = self.claim_ready(task_group, max);
+        let claimed = self.claim_ready(max);
         if !claimed.is_empty() {
             return claimed;
         }
@@ -358,7 +349,7 @@ impl TaskBroker {
         self.wakeup();
         for _ in 0..5 {
             tokio::time::sleep(Duration::from_millis(5)).await;
-            let claimed = self.claim_ready(task_group, max);
+            let claimed = self.claim_ready(max);
             if !claimed.is_empty() {
                 return claimed;
             }
@@ -368,7 +359,7 @@ impl TaskBroker {
     }
 
     /// Requeue tasks back into the buffer after a failed durable write.
-    pub fn requeue(&self, tasks: Vec<BrokerTask>) {
+    fn requeue(&self, tasks: Vec<BrokerTask>) {
         let mut inflight = self.inflight.lock().unwrap();
         let mut tombstones = self.ack_tombstones.lock().unwrap();
         for entry in tasks {
@@ -382,7 +373,7 @@ impl TaskBroker {
     /// - `release_keys`: keys to release from in-flight tracking.
     /// - `tombstone_keys`: subset of keys that were durably deleted and should be
     ///   protected from stale-scan re-inserts.
-    pub fn ack_durable(&self, release_keys: &[Vec<u8>], tombstone_keys: &[Vec<u8>]) {
+    fn ack_durable(&self, release_keys: &[Vec<u8>], tombstone_keys: &[Vec<u8>]) {
         let mut inflight = self.inflight.lock().unwrap();
         let mut tombstones = self.ack_tombstones.lock().unwrap();
         let generation = self.scan_generation_started.load(Ordering::SeqCst);
@@ -395,14 +386,14 @@ impl TaskBroker {
     }
 
     /// Remove any buffered entries that match the provided keys.
-    pub fn evict_keys(&self, keys: &[Vec<u8>]) {
+    fn evict_keys(&self, keys: &[Vec<u8>]) {
         for k in keys {
             self.buffer.remove(k);
         }
     }
 
     /// Wake the scanner to refill promptly.
-    pub fn wakeup(&self) {
+    fn wakeup(&self) {
         self.scan_requested.store(true, Ordering::SeqCst);
         self.notify.notify_one();
     }
@@ -411,5 +402,151 @@ impl TaskBroker {
 impl Drop for TaskBroker {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// Registry of per-task-group brokers. Lazily creates a broker for each task group
+/// on first access, scoping each broker's DB scan to its task group's key range.
+pub struct TaskBrokerRegistry {
+    db: Arc<Db>,
+    shard_name: String,
+    metrics: Option<Metrics>,
+    range: ShardRange,
+    brokers: DashMap<String, Arc<TaskBroker>>,
+}
+
+impl TaskBrokerRegistry {
+    pub fn new(
+        db: Arc<Db>,
+        shard_name: String,
+        metrics: Option<Metrics>,
+        range: ShardRange,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            db,
+            shard_name,
+            metrics,
+            range,
+            brokers: DashMap::new(),
+        })
+    }
+
+    /// Get or create a broker for the given task group.
+    fn get_or_create(&self, task_group: &str) -> Arc<TaskBroker> {
+        if let Some(broker) = self.brokers.get(task_group) {
+            return Arc::clone(broker.value());
+        }
+
+        // Use entry API to avoid race between check and insert
+        let broker = self
+            .brokers
+            .entry(task_group.to_string())
+            .or_insert_with(|| {
+                let b = TaskBroker::new(
+                    task_group.to_string(),
+                    Arc::clone(&self.db),
+                    self.shard_name.clone(),
+                    self.metrics.clone(),
+                    self.range.clone(),
+                );
+                b.start();
+                b
+            });
+        Arc::clone(broker.value())
+    }
+
+    /// Claim up to `max` ready tasks for a task group.
+    pub fn claim_ready(&self, task_group: &str, max: usize) -> Vec<BrokerTask> {
+        self.get_or_create(task_group).claim_ready(max)
+    }
+
+    /// Try to claim tasks for a task group. If none available, wait briefly for scanner to populate.
+    pub async fn claim_ready_or_nudge(&self, task_group: &str, max: usize) -> Vec<BrokerTask> {
+        self.get_or_create(task_group).claim_ready_or_nudge(max).await
+    }
+
+    /// Wake the scanner for a specific task group.
+    /// Creates the broker if it doesn't exist, since a wakeup implies tasks were just written.
+    pub fn wakeup(&self, task_group: &str) {
+        self.get_or_create(task_group).wakeup();
+    }
+
+    /// Wake specific task group brokers that already exist.
+    /// Does not create brokers — only wakes groups that have an active scanner.
+    pub fn wakeup_groups(&self, task_groups: &[String]) {
+        for group in task_groups {
+            if let Some(broker) = self.brokers.get(group.as_str()) {
+                broker.wakeup();
+            }
+        }
+    }
+
+    /// Requeue tasks back into the appropriate broker's buffer after a failed durable write.
+    pub fn requeue(&self, tasks: Vec<BrokerTask>) {
+        // Group tasks by task group to batch requeue into the right broker
+        let mut by_group: HashMap<String, Vec<BrokerTask>> = HashMap::new();
+        for task in tasks {
+            let group = task.decoded.task_group().to_string();
+            by_group.entry(group).or_default().push(task);
+        }
+        for (group, group_tasks) in by_group {
+            self.get_or_create(&group).requeue(group_tasks);
+        }
+    }
+
+    /// Acknowledge durable dequeue outcomes for a specific task group.
+    pub fn ack_durable(
+        &self,
+        task_group: &str,
+        release_keys: &[Vec<u8>],
+        tombstone_keys: &[Vec<u8>],
+    ) {
+        self.get_or_create(task_group)
+            .ack_durable(release_keys, tombstone_keys);
+    }
+
+    /// Remove any buffered entries that match the provided keys.
+    /// Keys may belong to different task groups; only evicts from brokers that already exist.
+    pub fn evict_keys(&self, keys: &[Vec<u8>]) {
+        for k in keys {
+            if let Some(parsed) = parse_task_key(k) {
+                if let Some(broker) = self.brokers.get(&parsed.task_group) {
+                    broker.evict_keys(std::slice::from_ref(k));
+                }
+            }
+        }
+    }
+
+    /// Get the total buffer length across all brokers.
+    pub fn buffer_len(&self) -> usize {
+        self.brokers.iter().map(|e| e.value().buffer_len()).sum()
+    }
+
+    /// Get the total inflight count across all brokers.
+    pub fn inflight_len(&self) -> usize {
+        self.brokers.iter().map(|e| e.value().inflight_len()).sum()
+    }
+
+    /// Get the buffer length for a specific task group.
+    pub fn group_buffer_len(&self, task_group: &str) -> usize {
+        self.brokers
+            .get(task_group)
+            .map(|e| e.value().buffer_len())
+            .unwrap_or(0)
+    }
+
+    /// Get the inflight count for a specific task group.
+    pub fn group_inflight_len(&self, task_group: &str) -> usize {
+        self.brokers
+            .get(task_group)
+            .map(|e| e.value().inflight_len())
+            .unwrap_or(0)
+    }
+
+    /// Stop all brokers.
+    pub fn stop(&self) {
+        for entry in self.brokers.iter() {
+            entry.value().stop();
+        }
     }
 }

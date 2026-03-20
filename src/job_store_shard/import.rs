@@ -316,7 +316,7 @@ impl JobStoreShard {
 
         // For non-terminal, finish enqueue (flush + broker wakeup)
         if !is_terminal {
-            self.finish_enqueue(job_id, effective_start_at_ms, &grants)
+            self.finish_enqueue(job_id, &params.task_group, effective_start_at_ms, &grants)
                 .await?;
         }
 
@@ -702,7 +702,7 @@ impl JobStoreShard {
 
         // [SILO-REIMP-6] Remove buffered tasks for this job.
         // Must happen after commit so the scanner cannot re-buffer old tasks from DB.
-        self.broker.evict_keys(&matched_task_keys);
+        self.brokers.evict_keys(&matched_task_keys);
 
         // Release in-memory holders and immediately request grant scanning.
         // This avoids waiting for periodic reconciliation when slots free up.
@@ -717,7 +717,7 @@ impl JobStoreShard {
 
         // For non-terminal, finish enqueue (flush + broker wakeup)
         if !is_terminal {
-            self.finish_enqueue(job_id, effective_start_at_ms, &grants)
+            self.finish_enqueue(job_id, &task_group, effective_start_at_ms, &grants)
                 .await?;
         }
 

@@ -174,7 +174,7 @@ impl JobStoreShard {
         txn.commit().await?;
 
         // Wake the broker to pick up the expedited task promptly
-        self.broker.wakeup();
+        self.brokers.wakeup(&task_group);
 
         Ok(())
     }

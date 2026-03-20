@@ -61,7 +61,7 @@ use crate::keys::{
 };
 use crate::shard_range::ShardRange;
 use crate::task::{ConcurrencyAction, HolderRecord, Task};
-use crate::task_broker::TaskBroker;
+use crate::task_broker::TaskBrokerRegistry;
 
 /// Error type for concurrency operations that can fail due to storage or encoding errors.
 #[derive(Debug, thiserror::Error)]
@@ -577,7 +577,7 @@ impl ConcurrencyManager {
     pub fn start_grant_scanner(
         self: &Arc<Self>,
         db: Arc<Db>,
-        broker: Arc<TaskBroker>,
+        brokers: Arc<TaskBrokerRegistry>,
         range: ShardRange,
     ) {
         self.grant_running.store(true, Ordering::SeqCst);
@@ -602,19 +602,17 @@ impl ConcurrencyManager {
                         break;
                     }
 
-                    let mut any_granted = false;
+                    let mut granted_groups: Vec<String> = Vec::new();
                     for (_key, (tenant, queue, count)) in work {
-                        let granted = mgr
+                        let groups = mgr
                             .process_grants(&db, &range, &tenant, &queue, count)
                             .await;
-                        if granted {
-                            any_granted = true;
-                        }
+                        granted_groups.extend(groups);
                     }
 
-                    // Wake broker if any grants were made (new tasks in DB)
-                    if any_granted {
-                        broker.wakeup();
+                    // Wake only the brokers whose task groups received grants
+                    if !granted_groups.is_empty() {
+                        brokers.wakeup_groups(&granted_groups);
                     }
                 }
             }
@@ -685,6 +683,8 @@ impl ConcurrencyManager {
     /// Process pending grant requests for a single (tenant, queue).
     /// Scans up to `count` pending requests and grants those for which capacity exists.
     /// Returns true if any grants were made.
+    /// Process pending grant requests for a single (tenant, queue).
+    /// Returns the task groups that received grants.
     async fn process_grants(
         &self,
         db: &Db,
@@ -692,7 +692,7 @@ impl ConcurrencyManager {
         tenant: &str,
         queue: &str,
         count: u32,
-    ) -> bool {
+    ) -> Vec<String> {
         if let Err(e) = self.counts.ensure_hydrated(db, range, tenant, queue).await {
             tracing::warn!(
                 error = %e,
@@ -700,7 +700,7 @@ impl ConcurrencyManager {
                 queue = %queue,
                 "grant scanner: failed to hydrate queue"
             );
-            return false;
+            return Vec::new();
         }
 
         let now_ms = crate::job_store_shard::now_epoch_ms();
@@ -711,11 +711,12 @@ impl ConcurrencyManager {
             Ok(i) => i,
             Err(e) => {
                 tracing::warn!(error = %e, "grant scanner: failed to scan requests");
-                return false;
+                return Vec::new();
             }
         };
 
         let mut granted_count = 0u32;
+        let mut granted_task_groups: Vec<String> = Vec::new();
         let mut max_concurrency: Option<usize> = None;
 
         while granted_count < count {
@@ -924,13 +925,15 @@ impl ConcurrencyManager {
                 queue = %queue,
                 request_id = %request_id,
                 job_id = %job_id_str,
+                task_group = %task_group_str,
                 "grant scanner: granted concurrency ticket"
             );
 
+            granted_task_groups.push(task_group_str.to_string());
             granted_count += 1;
         }
 
-        granted_count > 0
+        granted_task_groups
     }
 }
 

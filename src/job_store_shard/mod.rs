@@ -45,7 +45,7 @@ use crate::settings::DatabaseConfig;
 use crate::shard_range::ShardRange;
 use crate::storage::resolve_object_store;
 use crate::task::{LeasedRefreshTask, LeasedTask};
-use crate::task_broker::TaskBroker;
+use crate::task_broker::TaskBrokerRegistry;
 
 /// Configuration for WAL cleanup during shard close
 #[derive(Debug, Clone)]
@@ -88,7 +88,7 @@ pub struct DequeueResult {
 pub struct JobStoreShard {
     pub(crate) name: String,
     pub(crate) db: Arc<Db>,
-    pub(crate) broker: Arc<TaskBroker>,
+    pub(crate) brokers: Arc<TaskBrokerRegistry>,
     pub(crate) concurrency: Arc<ConcurrencyManager>,
     query_engine: OnceLock<ShardQueryEngine>,
     pub(crate) rate_limiter: Arc<dyn RateLimitClient>,
@@ -105,6 +105,8 @@ pub struct JobStoreShard {
     store: Arc<dyn slatedb::object_store::ObjectStore>,
     /// Database path relative to the object store root (needed for Admin API).
     db_path: String,
+    /// The shard's tenant range, immutable after opening.
+    range: ShardRange,
 }
 
 #[derive(Debug, Error)]
@@ -334,21 +336,20 @@ impl JobStoreShard {
         // Note: concurrency counts are hydrated lazily on first access to each queue.
         // This avoids blocking shard startup while scanning potentially large holder sets.
 
-        let broker = TaskBroker::new(
+        let brokers = TaskBrokerRegistry::new(
             Arc::clone(&db),
             name.clone(),
             metrics.clone(),
             range.clone(),
         );
-        broker.start();
 
-        // Start the grant scanner after both ConcurrencyManager and TaskBroker are ready
-        concurrency.start_grant_scanner(Arc::clone(&db), Arc::clone(&broker), range.clone());
+        // Start the grant scanner after both ConcurrencyManager and TaskBrokerRegistry are ready
+        concurrency.start_grant_scanner(Arc::clone(&db), Arc::clone(&brokers), range.clone());
 
         let shard = Arc::new(Self {
             name,
             db,
-            broker,
+            brokers,
             concurrency,
             query_engine: OnceLock::new(),
             rate_limiter,
@@ -358,11 +359,12 @@ impl JobStoreShard {
             cancellation: CancellationToken::new(),
             store,
             db_path: db_path.to_string(),
+            range: range.clone(),
         });
 
         // Periodically reconcile pending concurrency requests to self-heal from
         // missed in-memory notifications or transient scanner failures.
-        shard.spawn_concurrency_reconcile_task(range.clone());
+        shard.spawn_concurrency_reconcile_task(range);
 
         // Set the shard creation timestamp if this is the first time opening
         shard.set_created_at_ms_if_unset().await?;
@@ -391,7 +393,7 @@ impl JobStoreShard {
     /// allowing the shard to be safely reopened elsewhere (e.g., on a different node).
     pub async fn close(&self) -> Result<(), JobStoreShardError> {
         self.cancellation.cancel();
-        self.broker.stop();
+        self.brokers.stop();
         self.concurrency.stop_grant_scanner();
 
         // If we have a local WAL with flush_on_close enabled, flush memtable to SSTs first
@@ -558,7 +560,7 @@ impl JobStoreShard {
     /// The range is immutable after the shard is opened. When shards split,
     /// new child shards are created with new identities and ranges.
     pub fn get_range(&self) -> ShardRange {
-        self.broker.get_range()
+        self.range.clone()
     }
 
     /// Run one pass of pending concurrency-request reconciliation.
