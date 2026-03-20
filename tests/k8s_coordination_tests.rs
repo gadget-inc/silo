@@ -5077,15 +5077,25 @@ async fn k8s_coordinator_crash_blocks_reacquisition_until_force_release() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
     let num_shards: u32 = 4;
+    // Use a short TTL so the crashed node's membership lease expires quickly,
+    // allowing the surviving node to see itself as the sole member and acquire
+    // all shards after force-release.
+    let crash_ttl: i64 = 10;
 
     // Start node 1, let it own all shards
-    let (c1, h1) = start_coordinator!(
-        &namespace,
-        &prefix,
-        "coord-crash-k8s-1",
-        "http://127.0.0.1:50051",
-        num_shards
-    );
+    let (c1, h1) = K8sCoordinator::start(
+        make_coordinator_config(
+            &namespace,
+            &prefix,
+            "coord-crash-k8s-1",
+            "http://127.0.0.1:50051",
+            num_shards,
+            crash_ttl,
+        ),
+        make_test_factory("coord-crash-k8s-1"),
+    )
+    .await
+    .expect("start c1");
     assert!(c1.wait_converged(Duration::from_secs(15)).await);
     let all_shards: HashSet<ShardId> = c1
         .get_shard_map()
@@ -5110,7 +5120,7 @@ async fn k8s_coordinator_crash_blocks_reacquisition_until_force_release() {
             "coord-crash-k8s-2",
             "http://127.0.0.1:50052",
             num_shards,
-            30,
+            crash_ttl,
         ),
         make_test_factory("coord-crash-k8s-2"),
     )
@@ -5132,8 +5142,9 @@ async fn k8s_coordinator_crash_blocks_reacquisition_until_force_release() {
             .expect("force-release should succeed");
     }
 
-    // Now c2 should be able to acquire all shards
-    let all_acquired = wait_until(Duration::from_secs(15), || async {
+    // Wait for c1's membership lease to expire so c2 sees itself as sole member,
+    // then c2 should acquire all shards.
+    let all_acquired = wait_until(Duration::from_secs(30), || async {
         let owned: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
         owned == all_shards
     })
