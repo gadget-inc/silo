@@ -176,20 +176,16 @@ fn default_retention_scan_interval() -> Duration {
     DEFAULT_RETENTION_SCAN_INTERVAL
 }
 
-/// Serialize a Duration as a human-readable string (e.g. "300s", "7d").
-/// Follows the same pattern as slatedb's config serialization.
+/// Serialize a Duration as a human-readable string (e.g. "300s", "500ms").
+/// Uses whole seconds when possible, otherwise total milliseconds.
 fn serialize_duration<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
-    let secs = duration.as_secs();
-    let millis = duration.subsec_millis();
-    let duration_str = if secs > 0 && millis > 0 {
-        format!("{secs}s+{millis:03}ms")
-    } else if millis > 0 {
-        format!("{millis}ms")
+    let duration_str = if duration.subsec_millis() == 0 {
+        format!("{}s", duration.as_secs())
     } else {
-        format!("{secs}s")
+        format!("{}ms", duration.as_millis())
     };
     serializer.serialize_str(&duration_str)
 }

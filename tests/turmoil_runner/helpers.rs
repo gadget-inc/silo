@@ -297,7 +297,7 @@ pub fn dst_turmoilfs_database_template(
         apply_wal_on_close: true,
         concurrency_reconcile_interval_ms: 5000,
         default_terminal_retention: silo::settings::DEFAULT_TERMINAL_RETENTION,
-            retention_scan_interval: Duration::from_secs(86400),
+        retention_scan_interval: Duration::from_secs(86400),
         slatedb: Some(dst_slatedb_settings()),
         memory_cache: None,
     }

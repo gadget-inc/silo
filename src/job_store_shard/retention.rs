@@ -95,7 +95,14 @@ impl JobStoreShard {
 
         tokio::spawn(async move {
             // Sleep first to avoid expensive scan during shard acquisition.
-            tokio::time::sleep(scan_interval).await;
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    debug!(shard = %shard_name, "retention scanner cancelled during initial delay");
+                    return;
+                }
+                _ = tokio::time::sleep(scan_interval) => {}
+            }
 
             let mut interval = tokio::time::interval(scan_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -189,9 +196,20 @@ impl JobStoreShard {
                     continue;
                 }
             };
-            let retention_ms = job_view
-                .terminal_retention_ms()
-                .unwrap_or(self.default_terminal_retention_ms);
+            let retention_ms =
+                match self.effective_terminal_retention_ms(job_view.terminal_retention_ms()) {
+                    Ok(retention_ms) => retention_ms,
+                    Err(e) => {
+                        warn!(
+                            shard = %self.name,
+                            tenant = %tenant,
+                            job_id = %job_id,
+                            error = %e,
+                            "invalid terminal retention on stored job info, skipping"
+                        );
+                        continue;
+                    }
+                };
 
             // Check if retention has elapsed
             let expiry_ms = changed_at_ms.saturating_add(retention_ms);
@@ -274,11 +292,150 @@ impl JobStoreShard {
             }
 
             txn.commit_with_options(&WriteOptions {
-                await_durable: false,
+                await_durable: true,
             })
             .await?;
             Ok(())
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use slatedb::config::{DurabilityLevel, ReadOptions};
+
+    use super::*;
+    use crate::gubernator::MockGubernatorClient;
+    use crate::job_attempt::AttemptOutcome;
+    use crate::keys::{job_info_key, job_status_key};
+    use crate::settings::{Backend, DEFAULT_TERMINAL_RETENTION, DatabaseConfig};
+    use crate::shard_range::ShardRange;
+
+    #[tokio::test]
+    async fn delete_expired_job_waits_for_remote_durability() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let data_path = data_dir.path().to_string_lossy().to_string();
+        let job_id = "retention-delete-durable";
+
+        let initial_cfg = DatabaseConfig {
+            name: "test".to_string(),
+            backend: Backend::Fs,
+            path: data_path.clone(),
+            wal: None,
+            apply_wal_on_close: true,
+            default_terminal_retention: DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
+            slatedb: Some(slatedb::config::Settings {
+                flush_interval: Some(Duration::from_millis(10)),
+                ..Default::default()
+            }),
+            memory_cache: None,
+        };
+        let initial_shard = JobStoreShard::open(
+            &initial_cfg,
+            MockGubernatorClient::new_arc(),
+            None,
+            ShardRange::full(),
+        )
+        .await
+        .expect("open initial shard");
+
+        initial_shard
+            .enqueue(
+                "-",
+                Some(job_id.to_string()),
+                50,
+                0,
+                None,
+                vec![1],
+                vec![],
+                None,
+                Some(0),
+                "default",
+            )
+            .await
+            .expect("enqueue");
+
+        let task = initial_shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks
+            .pop()
+            .expect("task");
+        initial_shard
+            .report_attempt_outcome(
+                task.attempt().task_id(),
+                AttemptOutcome::Success { result: vec![9] },
+            )
+            .await
+            .expect("report outcome");
+        let terminal_status = initial_shard
+            .get_job_status("-", job_id)
+            .await
+            .expect("get status")
+            .expect("job exists");
+
+        initial_shard.close().await.expect("close initial shard");
+
+        let delete_cfg = DatabaseConfig {
+            name: "test".to_string(),
+            backend: Backend::Fs,
+            path: data_path,
+            wal: None,
+            apply_wal_on_close: true,
+            default_terminal_retention: DEFAULT_TERMINAL_RETENTION,
+            retention_scan_interval: Duration::from_secs(86400),
+            slatedb: Some(slatedb::config::Settings {
+                flush_interval: Some(Duration::from_secs(1)),
+                ..Default::default()
+            }),
+            memory_cache: None,
+        };
+        let shard = JobStoreShard::open(
+            &delete_cfg,
+            MockGubernatorClient::new_arc(),
+            None,
+            ShardRange::full(),
+        )
+        .await
+        .expect("open delete shard");
+
+        let remote_read = ReadOptions::new().with_durability_filter(DurabilityLevel::Remote);
+        assert!(
+            shard
+                .db
+                .get_with_options(&job_info_key("-", job_id), &remote_read)
+                .await
+                .expect("remote get before delete")
+                .is_some(),
+            "terminal job should already be visible at the remote durability boundary"
+        );
+
+        shard
+            .delete_expired_job("-", job_id, terminal_status.changed_at_ms)
+            .await
+            .expect("delete expired job");
+
+        assert!(
+            shard
+                .db
+                .get_with_options(&job_info_key("-", job_id), &remote_read)
+                .await
+                .expect("remote get job info after delete")
+                .is_none(),
+            "delete_expired_job should not return before the delete is durable"
+        );
+        assert!(
+            shard
+                .db
+                .get_with_options(&job_status_key("-", job_id), &remote_read)
+                .await
+                .expect("remote get job status after delete")
+                .is_none()
+        );
     }
 }
