@@ -56,6 +56,19 @@ Silo partitions data across **shards**. Each shard owns a range of the 64-bit ha
 4. The worker **reports the outcome** (success with optional result, or failure) back to Silo.
 5. On failure, Silo automatically retries according to the job's retry policy.
 
+## Acknowledgements
+
+Silo's design and implementation have been influenced by several projects and papers:
+
+- [SlateDB](https://slatedb.io) — Silo's storage engine, providing LSM-tree storage on top of object storage
+- [Temporal](https://temporal.io) — inspiration for durable execution semantics and workflow reliability patterns
+- [BullMQ](https://bullmq.io) — a mature Node.js job queue whose API and feature set informed Silo's developer experience
+- [Resque](https://github.com/resque/resque) — the original Redis-backed background job system for Ruby, a foundational influence on job queue design
+- [Que](https://github.com/que-rb/que) — a Ruby job queue using PostgreSQL advisory locks, demonstrating that durable storage can back a high-performance queue
+- [QuiCK](https://www.foundationdb.org/files/QuiCK.pdf) — Apple's Queues in FoundationDB paper, which influenced Silo's approach to building a queue on top of an ordered key-value store
+- [Bigtable](https://research.google/pubs/bigtable-a-distributed-storage-system-for-structured-data/) — Google's distributed storage system, which influenced Silo's approach to hash-based sharding and tablet-style data partitioning
+- [Redis](https://redis.io) — inspiration for executing small business logic scripts close to the data, akin to Redis server-side Lua scripting
+
 ## Next Steps
 
 - [Enqueueing Jobs](/silo/guides/enqueueing) — learn how to create jobs with payloads, priorities, scheduling, and limits
