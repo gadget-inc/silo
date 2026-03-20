@@ -1974,7 +1974,7 @@ where
     let reaper_factory = factory.clone();
     let reaper_metrics = metrics.clone();
     let reaper: JoinHandle<()> = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
         loop {
             tokio::select! {
                 biased;
@@ -1988,7 +1988,14 @@ where
 
                     // Use default tenant "-" for system-level reaping
                     for (shard_id, shard) in instances.iter() {
+                        let reap_start = std::time::Instant::now();
                         let _ = shard.reap_expired_leases("-").await;
+                        if let Some(ref m) = reaper_metrics {
+                            m.record_lease_reaper_duration(
+                                &shard_id.to_string(),
+                                reap_start.elapsed().as_secs_f64(),
+                            );
+                        }
 
                         // Collect SlateDB storage metrics for this shard
                         if let Some(ref m) = reaper_metrics {

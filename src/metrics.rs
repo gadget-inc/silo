@@ -40,6 +40,12 @@ const LATENCY_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
+/// Histogram buckets for background scan operations (broker scan, lease reaper) in seconds.
+/// Concentrated at low values since these typically complete in milliseconds.
+const SCAN_DURATION_BUCKETS: &[f64] = &[
+    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+];
+
 /// Histogram buckets for job wait times (in seconds) - wider range for queue latency
 const WAIT_TIME_BUCKETS: &[f64] = &[
     0.001, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0, 600.0, 1800.0, 3600.0,
@@ -73,6 +79,7 @@ pub struct Metrics {
     broker_buffer_size: GaugeVec,
     broker_inflight_size: GaugeVec,
     broker_scan_duration: HistogramVec,
+    broker_scans_total: CounterVec,
 
     // Poll metrics
     polls_total: CounterVec,
@@ -81,6 +88,8 @@ pub struct Metrics {
     // Lease metrics
     task_leases_active: GaugeVec,
     ready_to_start_latency_ms: HistogramVec,
+    lease_reaper_duration: HistogramVec,
+    lease_reaper_scans_total: CounterVec,
 
     // Concurrency metrics
     concurrency_tickets_granted: Counter,
@@ -193,6 +202,7 @@ impl Metrics {
         self.broker_scan_duration
             .with_label_values(&[shard])
             .observe(duration_secs);
+        self.broker_scans_total.with_label_values(&[shard]).inc();
     }
 
     /// Record a poll (lease_tasks call) for a shard.
@@ -226,6 +236,16 @@ impl Metrics {
         self.ready_to_start_latency_ms
             .with_label_values(&[shard, task_group])
             .observe(latency_ms);
+    }
+
+    /// Record lease reaper duration in seconds.
+    pub fn record_lease_reaper_duration(&self, shard: &str, duration_secs: f64) {
+        self.lease_reaper_duration
+            .with_label_values(&[shard])
+            .observe(duration_secs);
+        self.lease_reaper_scans_total
+            .with_label_values(&[shard])
+            .inc();
     }
 
     /// Record a concurrency ticket being granted.
@@ -450,7 +470,18 @@ pub fn init() -> anyhow::Result<Metrics> {
                 "silo_broker_scan_duration_seconds",
                 "Duration of broker task scanning operations",
             )
-            .buckets(LATENCY_BUCKETS.to_vec()),
+            .buckets(SCAN_DURATION_BUCKETS.to_vec()),
+            &["shard"],
+        )?,
+    );
+
+    let broker_scans_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_broker_scans_total",
+                "Total number of broker task scan operations",
+            ),
             &["shard"],
         )?,
     );
@@ -500,6 +531,29 @@ pub fn init() -> anyhow::Result<Metrics> {
             )
             .buckets(READY_TO_START_LATENCY_MS_BUCKETS.to_vec()),
             &["shard", "task_group"],
+        )?,
+    );
+
+    let lease_reaper_duration = register(
+        &registry,
+        HistogramVec::new(
+            HistogramOpts::new(
+                "silo_lease_reaper_duration_seconds",
+                "Duration of expired lease reaper scan operations",
+            )
+            .buckets(SCAN_DURATION_BUCKETS.to_vec()),
+            &["shard"],
+        )?,
+    );
+
+    let lease_reaper_scans_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_lease_reaper_scans_total",
+                "Total number of expired lease reaper scan operations",
+            ),
+            &["shard"],
         )?,
     );
 
@@ -682,10 +736,13 @@ pub fn init() -> anyhow::Result<Metrics> {
         broker_buffer_size,
         broker_inflight_size,
         broker_scan_duration,
+        broker_scans_total,
         polls_total,
         poll_duration,
         task_leases_active,
         ready_to_start_latency_ms,
+        lease_reaper_duration,
+        lease_reaper_scans_total,
         concurrency_tickets_granted,
         slatedb_get_requests,
         slatedb_scan_requests,
