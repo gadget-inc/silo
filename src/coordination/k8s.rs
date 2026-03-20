@@ -5,6 +5,7 @@ use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, watch};
 use tokio_stream::StreamExt;
@@ -61,6 +62,12 @@ pub struct K8sCoordinator<B: K8sBackend> {
     membership_changed: Arc<Notify>,
     /// Notifier for shard map changes (from watcher)
     shard_map_changed: Arc<Notify>,
+    /// Last member list that triggered a membership_changed notification.
+    /// Used to deduplicate — lease renewals fire watch events but don't change membership.
+    last_notified_members: Arc<Mutex<Vec<MemberInfo>>>,
+    /// Counter for how many times the membership watcher actually notified a change.
+    /// Used in tests to verify deduplication is working.
+    membership_notify_count: Arc<AtomicU64>,
     /// Per-shard notifiers for when a shard lease becomes available (holder released).
     /// Guards waiting to acquire a shard can subscribe to these instead of blind retrying.
     shard_available_notifiers: Arc<Mutex<HashMap<ShardId, Arc<Notify>>>>,
@@ -167,6 +174,8 @@ impl<B: K8sBackend> K8sCoordinator<B> {
             members_cache,
             membership_changed,
             shard_map_changed,
+            last_notified_members: Arc::new(Mutex::new(Vec::new())),
+            membership_notify_count: Arc::new(AtomicU64::new(0)),
             shard_available_notifiers,
         };
 
@@ -349,14 +358,10 @@ impl<B: K8sBackend> K8sCoordinator<B> {
                                 LeaseWatchEvent::Applied(lease) => {
                                     let lease_name = lease.metadata.name.as_deref().unwrap_or("unknown");
                                     debug!(node_id = %self.base.node_id, lease = %lease_name, "membership lease changed");
-                                    // Refresh the full member list from cache
                                     if let Err(e) = self.refresh_members_cache().await {
                                         warn!(node_id = %self.base.node_id, error = %e, "failed to refresh members cache");
                                     }
-                                    // Use notify_one (not notify_waiters) so the permit is stored
-                                    // if the coordination loop is busy. notify_waiters drops the
-                                    // notification when no task is currently awaiting .notified().
-                                    self.membership_changed.notify_one();
+                                    self.notify_if_members_changed().await;
                                 }
                                 LeaseWatchEvent::Deleted(lease) => {
                                     let lease_name = lease.metadata.name.as_deref().unwrap_or("unknown");
@@ -364,7 +369,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
                                     if let Err(e) = self.refresh_members_cache().await {
                                         warn!(node_id = %self.base.node_id, error = %e, "failed to refresh members cache");
                                     }
-                                    self.membership_changed.notify_one();
+                                    self.notify_if_members_changed().await;
                                 }
                                 LeaseWatchEvent::Init => {
                                     debug!(node_id = %self.base.node_id, "membership watcher initialized");
@@ -374,7 +379,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
                                     if let Err(e) = self.refresh_members_cache().await {
                                         warn!(node_id = %self.base.node_id, error = %e, "failed to refresh members cache on init");
                                     }
-                                    self.membership_changed.notify_one();
+                                    self.notify_if_members_changed().await;
                                 }
                             }
                         }
@@ -455,6 +460,12 @@ impl<B: K8sBackend> K8sCoordinator<B> {
                 }
             }
         }
+    }
+
+    /// Number of times the membership watcher detected an actual membership change
+    /// (as opposed to a lease renewal with no membership change).
+    pub fn membership_notify_count(&self) -> u64 {
+        self.membership_notify_count.load(Ordering::Relaxed)
     }
 
     /// Get or create a notifier for when a specific shard lease becomes available.
@@ -636,6 +647,24 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         let mut cache = self.members_cache.lock().await;
         *cache = members;
         Ok(())
+    }
+
+    /// Only notify the coordination loop if the member list actually changed.
+    /// This prevents lease renewals (which update renewTime but not membership)
+    /// from triggering unnecessary reconciliation cycles.
+    async fn notify_if_members_changed(&self) {
+        let current_members = self.members_cache.lock().await.clone();
+        let mut last = self.last_notified_members.lock().await;
+        if *last != current_members {
+            *last = current_members;
+            self.membership_notify_count.fetch_add(1, Ordering::Relaxed);
+            // Use notify_one (not notify_waiters) so the permit is stored
+            // if the coordination loop is busy. notify_waiters drops the
+            // notification when no task is currently awaiting .notified().
+            self.membership_changed.notify_one();
+        } else {
+            debug!(node_id = %self.base.node_id, "membership lease renewed but member list unchanged, skipping reconciliation");
+        }
     }
 
     /// List all active (non-expired) members from K8s
