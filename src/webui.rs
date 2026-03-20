@@ -67,7 +67,12 @@ pub struct TenantSummaryRow {
     pub scheduled_count: usize,
     pub running_count: usize,
     pub terminal_count: usize,
-    pub top_queues: String,
+}
+
+#[derive(Clone)]
+pub struct TenantWaitingJobRow {
+    pub id: String,
+    pub shard: String,
 }
 
 #[derive(Clone)]
@@ -76,15 +81,6 @@ pub struct TenantQueueRow {
     pub holders: usize,
     pub requesters: usize,
     pub total: usize,
-}
-
-#[derive(Clone)]
-pub struct TenantUpcomingJobRow {
-    pub id: String,
-    pub shard: String,
-    pub status: String,
-    pub priority: u8,
-    pub enqueue_time: String,
 }
 
 #[derive(Clone)]
@@ -316,7 +312,7 @@ struct TenantTemplate {
     running_count: usize,
     terminal_count: usize,
     top_queues: Vec<TenantQueueRow>,
-    upcoming_jobs: Vec<TenantUpcomingJobRow>,
+    waiting_jobs: Vec<TenantWaitingJobRow>,
     error: Option<String>,
 }
 
@@ -1022,7 +1018,6 @@ async fn tenants_handler(
     }
 
     let mut status_by_tenant: HashMap<String, TenantStatusCounts> = HashMap::new();
-    let mut queue_counts: HashMap<String, Vec<(String, usize)>> = HashMap::new();
     let mut errors: Vec<String> = Vec::new();
 
     let jobs_sql = "SELECT tenant, status_kind, cnt FROM tenant_counts";
@@ -1081,59 +1076,8 @@ async fn tenants_handler(
         }
     }
 
-    let queues_sql =
-        "SELECT tenant, queue_name, COUNT(*) as cnt FROM queues GROUP BY tenant, queue_name";
-    match state.query_engine.sql(queues_sql).await {
-        Ok(df) => match df.collect().await {
-            Ok(batches) => {
-                for batch in batches {
-                    let tenant_col = batch.column_by_name("tenant").and_then(|c| {
-                        c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::StringArray>()
-                    });
-                    let queue_col = batch.column_by_name("queue_name").and_then(|c| {
-                        c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::StringArray>()
-                    });
-                    let count_col = batch.column_by_name("cnt").and_then(|c| {
-                        c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::Int64Array>()
-                    });
-
-                    if let (Some(tenants), Some(queues), Some(counts)) =
-                        (tenant_col, queue_col, count_col)
-                    {
-                        for i in 0..batch.num_rows() {
-                            if tenants.is_null(i) || queues.is_null(i) {
-                                continue;
-                            }
-                            let tenant = tenants.value(i).to_string();
-                            let queue = queues.value(i).to_string();
-                            let count = counts.value(i).max(0) as usize;
-                            if queue.is_empty() {
-                                continue;
-                            }
-                            queue_counts.entry(tenant).or_default().push((queue, count));
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "failed to collect tenant queue query results");
-                errors.push(format!("Queue aggregation failed: {}", e));
-            }
-        },
-        Err(e) => {
-            warn!(error = %e, "failed to query tenant queue aggregates");
-            errors.push(format!("Queue query failed: {}", e));
-        }
-    }
-
     let mut tenant_names = std::collections::BTreeSet::new();
     for tenant in status_by_tenant.keys() {
-        tenant_names.insert(tenant.clone());
-    }
-    for tenant in queue_counts.keys() {
         tenant_names.insert(tenant.clone());
     }
 
@@ -1141,19 +1085,6 @@ async fn tenants_handler(
     let mut tenants: Vec<TenantSummaryRow> = Vec::with_capacity(tenant_names.len());
     for tenant in tenant_names {
         let counts = status_by_tenant.get(&tenant).cloned().unwrap_or_default();
-        let mut queues = queue_counts.remove(&tenant).unwrap_or_default();
-        queues.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-
-        let top_queues = if queues.is_empty() {
-            "-".to_string()
-        } else {
-            queues
-                .iter()
-                .take(3)
-                .map(|(name, count)| format!("{} ({})", name, count))
-                .collect::<Vec<String>>()
-                .join(", ")
-        };
 
         tenants.push(TenantSummaryRow {
             name: tenant.clone(),
@@ -1162,7 +1093,6 @@ async fn tenants_handler(
             scheduled_count: counts.scheduled,
             running_count: counts.running,
             terminal_count: counts.terminal,
-            top_queues,
         });
     }
 
@@ -1236,7 +1166,6 @@ async fn tenant_handler(
     let tenant_escaped = sql_string_literal(&params.name);
     let mut counts = TenantStatusCounts::default();
     let mut top_queues: Vec<TenantQueueRow> = Vec::new();
-    let mut upcoming_jobs: Vec<TenantUpcomingJobRow> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
     let count_sql = format!(
@@ -1287,77 +1216,70 @@ async fn tenant_handler(
     }
 
     let queue_sql = format!(
-        "SELECT queue_name, entry_type, COUNT(*) as cnt FROM queues WHERE tenant = '{}' GROUP BY queue_name, entry_type",
+        "SELECT queue_name, SUM(holders) as holders, SUM(requesters) as requesters FROM queue_counts WHERE tenant = '{}' GROUP BY queue_name",
         tenant_escaped
     );
     match state.query_engine.sql(&queue_sql).await {
         Ok(df) => match df.collect().await {
             Ok(batches) => {
-                let mut queue_map: HashMap<String, (usize, usize)> = HashMap::new();
                 for batch in batches {
                     let name_col = batch.column_by_name("queue_name").and_then(|c| {
                         c.as_any()
                             .downcast_ref::<datafusion::arrow::array::StringArray>()
                     });
-                    let type_col = batch.column_by_name("entry_type").and_then(|c| {
+                    let holders_col = batch.column_by_name("holders").and_then(|c| {
                         c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::StringArray>()
+                            .downcast_ref::<datafusion::arrow::array::Int64Array>()
                     });
-                    let count_col = batch.column_by_name("cnt").and_then(|c| {
+                    let requesters_col = batch.column_by_name("requesters").and_then(|c| {
                         c.as_any()
                             .downcast_ref::<datafusion::arrow::array::Int64Array>()
                     });
 
-                    if let (Some(names), Some(types), Some(counts_col)) =
-                        (name_col, type_col, count_col)
+                    if let (Some(names), Some(holders), Some(requesters)) =
+                        (name_col, holders_col, requesters_col)
                     {
                         for i in 0..batch.num_rows() {
-                            if names.is_null(i) || types.is_null(i) {
+                            if names.is_null(i) {
                                 continue;
                             }
                             let queue_name = names.value(i).to_string();
                             if queue_name.is_empty() {
                                 continue;
                             }
-                            let entry_type = types.value(i);
-                            let count = counts_col.value(i).max(0) as usize;
-                            let entry = queue_map.entry(queue_name).or_insert((0, 0));
-                            match entry_type {
-                                "holder" => entry.0 += count,
-                                "requester" => entry.1 += count,
-                                _ => {}
-                            }
+                            let h = holders.value(i).max(0) as usize;
+                            let r = requesters.value(i).max(0) as usize;
+                            top_queues.push(TenantQueueRow {
+                                name: queue_name,
+                                holders: h,
+                                requesters: r,
+                                total: h + r,
+                            });
                         }
                     }
                 }
-
-                top_queues = queue_map
-                    .into_iter()
-                    .map(|(name, (holders, requesters))| TenantQueueRow {
-                        name,
-                        holders,
-                        requesters,
-                        total: holders + requesters,
-                    })
-                    .collect();
                 top_queues.sort_by(|a, b| b.total.cmp(&a.total).then_with(|| a.name.cmp(&b.name)));
             }
             Err(e) => {
-                warn!(error = %e, tenant = %params.name, "failed to collect tenant queue results");
-                errors.push(format!("Tenant queue query failed: {}", e));
+                warn!(error = %e, tenant = %params.name, "failed to collect queue counts results");
+                errors.push(format!("Queue counts query failed: {}", e));
             }
         },
         Err(e) => {
-            warn!(error = %e, tenant = %params.name, "failed to query tenant queues");
-            errors.push(format!("Tenant queue query failed: {}", e));
+            warn!(error = %e, tenant = %params.name, "failed to query queue counts");
+            errors.push(format!("Queue counts query failed: {}", e));
         }
     }
 
-    let upcoming_sql = format!(
-        "SELECT shard_id, id, status_kind, priority, enqueue_time_ms FROM jobs WHERE tenant = '{}' AND (status_kind = 'Scheduled' OR status_kind = 'Waiting') ORDER BY enqueue_time_ms ASC LIMIT 100",
+    // Query waiting jobs (ready to run) using the status index fast path.
+    // Uses status_kind = 'Waiting' (single eq filter) so the scanner uses the bounded
+    // scan_jobs_waiting range scan. Only projects shard_id and id to avoid job_info lookups.
+    let mut waiting_jobs: Vec<TenantWaitingJobRow> = Vec::new();
+    let waiting_sql = format!(
+        "SELECT shard_id, id FROM jobs WHERE tenant = '{}' AND status_kind = 'Waiting' LIMIT 100",
         tenant_escaped
     );
-    match state.query_engine.sql(&upcoming_sql).await {
+    match state.query_engine.sql(&waiting_sql).await {
         Ok(df) => match df.collect().await {
             Ok(batches) => {
                 for batch in batches {
@@ -1369,54 +1291,28 @@ async fn tenant_handler(
                         c.as_any()
                             .downcast_ref::<datafusion::arrow::array::StringArray>()
                     });
-                    let status_col = batch.column_by_name("status_kind").and_then(|c| {
-                        c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::StringArray>()
-                    });
-                    let priority_col = batch.column_by_name("priority").and_then(|c| {
-                        c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::UInt8Array>()
-                    });
-                    let time_col = batch.column_by_name("enqueue_time_ms").and_then(|c| {
-                        c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::Int64Array>()
-                    });
 
-                    if let (
-                        Some(shards),
-                        Some(ids),
-                        Some(statuses),
-                        Some(priorities),
-                        Some(times),
-                    ) = (shard_col, id_col, status_col, priority_col, time_col)
-                    {
+                    if let (Some(shards), Some(ids)) = (shard_col, id_col) {
                         for i in 0..batch.num_rows() {
-                            if ids.is_null(i) || shards.is_null(i) || priorities.is_null(i) {
+                            if ids.is_null(i) || shards.is_null(i) {
                                 continue;
                             }
-                            upcoming_jobs.push(TenantUpcomingJobRow {
+                            waiting_jobs.push(TenantWaitingJobRow {
                                 id: ids.value(i).to_string(),
                                 shard: shards.value(i).to_string(),
-                                status: if statuses.is_null(i) {
-                                    "Scheduled".to_string()
-                                } else {
-                                    statuses.value(i).to_string()
-                                },
-                                priority: priorities.value(i),
-                                enqueue_time: format_timestamp(times.value(i)),
                             });
                         }
                     }
                 }
             }
             Err(e) => {
-                warn!(error = %e, tenant = %params.name, "failed to collect upcoming jobs");
-                errors.push(format!("Upcoming jobs query failed: {}", e));
+                warn!(error = %e, tenant = %params.name, "failed to collect waiting jobs");
+                errors.push(format!("Waiting jobs query failed: {}", e));
             }
         },
         Err(e) => {
-            warn!(error = %e, tenant = %params.name, "failed to query upcoming jobs");
-            errors.push(format!("Upcoming jobs query failed: {}", e));
+            warn!(error = %e, tenant = %params.name, "failed to query waiting jobs");
+            errors.push(format!("Waiting jobs query failed: {}", e));
         }
     }
 
@@ -1437,7 +1333,7 @@ async fn tenant_handler(
         running_count: counts.running,
         terminal_count: counts.terminal,
         top_queues,
-        upcoming_jobs,
+        waiting_jobs,
         error,
     };
 

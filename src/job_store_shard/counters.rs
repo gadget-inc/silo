@@ -22,7 +22,8 @@ use slatedb::{MergeOperator, MergeOperatorError};
 use crate::job_store_shard::helpers::WriteBatcher;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{
-    concurrency_requester_counter_key, shard_completed_jobs_counter_key,
+    concurrency_requester_counter_key, concurrency_requester_counter_tenant_prefix, end_bound,
+    parse_concurrency_requester_counter_key, shard_completed_jobs_counter_key,
     shard_total_jobs_counter_key,
 };
 
@@ -268,5 +269,58 @@ impl JobStoreShard {
             Some(bytes) => Ok(decode_counter(&bytes)),
             None => Ok(0),
         }
+    }
+
+    /// Scan all concurrency requester counters for a specific tenant.
+    /// Returns a list of (queue_name, count) pairs.
+    pub async fn scan_concurrency_requester_counters(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<(String, i64)>, JobStoreShardError> {
+        let prefix = concurrency_requester_counter_tenant_prefix(tenant);
+        let end = end_bound(&prefix);
+        let mut iter = self.db.scan::<Vec<u8>, _>(prefix..end).await?;
+        let mut results = Vec::new();
+        loop {
+            match iter.next().await {
+                Ok(Some(kv)) => {
+                    if let Some(parsed) = parse_concurrency_requester_counter_key(&kv.key) {
+                        let count = decode_counter(&kv.value);
+                        if count > 0 {
+                            results.push((parsed.queue, count));
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => return Err(JobStoreShardError::Slate(e)),
+            }
+        }
+        Ok(results)
+    }
+
+    /// Scan all concurrency requester counters across all tenants.
+    /// Returns a list of (tenant, queue_name, count) tuples.
+    pub async fn scan_all_concurrency_requester_counters(
+        &self,
+    ) -> Result<Vec<(String, String, i64)>, JobStoreShardError> {
+        let prefix = vec![crate::keys::prefix::COUNTER_CONCURRENCY_REQUESTERS];
+        let end = end_bound(&prefix);
+        let mut iter = self.db.scan::<Vec<u8>, _>(prefix..end).await?;
+        let mut results = Vec::new();
+        loop {
+            match iter.next().await {
+                Ok(Some(kv)) => {
+                    if let Some(parsed) = parse_concurrency_requester_counter_key(&kv.key) {
+                        let count = decode_counter(&kv.value);
+                        if count > 0 {
+                            results.push((parsed.tenant, parsed.queue, count));
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => return Err(JobStoreShardError::Slate(e)),
+            }
+        }
+        Ok(results)
     }
 }

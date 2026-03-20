@@ -33,7 +33,6 @@
                             <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Scheduled</th>
                             <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Running</th>
                             <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Terminal</th>
-                            <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Top Queues</th>
                         </tr>
                     </thead>
                     <tbody class="divide-y divide-zinc-700">
@@ -46,7 +45,6 @@
                             <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">{{ tenant.scheduled_count }}</td>
                             <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">{{ tenant.running_count }}</td>
                             <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">{{ tenant.terminal_count }}</td>
-                            <td class="px-3 py-2 text-sm text-zinc-400">{{ tenant.top_queues }}</td>
                         </tr>
                         {% endfor %}
                     </tbody>

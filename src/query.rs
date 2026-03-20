@@ -103,6 +103,17 @@ impl ShardQueryEngine {
         ));
         ctx.register_table("tenant_counts", tenant_counts_provider)?;
 
+        // Register queue_counts table for pre-computed per-queue concurrency counters
+        let queue_counts_schema = QueueCountsScanner::base_schema();
+        let queue_counts_scanner: ScannerRef = Arc::new(QueueCountsScanner {
+            shard: Arc::clone(&shard),
+        });
+        let queue_counts_provider = Arc::new(SiloTableProvider::new(
+            queue_counts_schema,
+            queue_counts_scanner,
+        ));
+        ctx.register_table("queue_counts", queue_counts_provider)?;
+
         Ok(Self { ctx })
     }
 
@@ -1787,6 +1798,211 @@ impl Scan for TenantCountsScanner {
         Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&projection),
             ReceiverStream::new(rx).map(|r| r),
+        ))
+    }
+}
+
+/// Scanner for the queue_counts table - reads pre-computed per-queue concurrency requester
+/// counters and scans holder entries (which are bounded by concurrency limits and thus fast).
+pub struct QueueCountsScanner {
+    pub(crate) shard: Arc<JobStoreShard>,
+}
+
+impl QueueCountsScanner {
+    pub fn new(shard: Arc<JobStoreShard>) -> Self {
+        Self { shard }
+    }
+
+    pub fn base_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("shard_id", DataType::Utf8, false),
+            Field::new("tenant", DataType::Utf8, false),
+            Field::new("queue_name", DataType::Utf8, false),
+            Field::new("holders", DataType::Int64, false),
+            Field::new("requesters", DataType::Int64, false),
+        ]))
+    }
+}
+
+impl std::fmt::Debug for QueueCountsScanner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("QueueCountsScanner")
+    }
+}
+
+impl Scan for QueueCountsScanner {
+    fn describe(&self, filters: &[Expr], limit: Option<usize>) -> String {
+        let mut tenant = None;
+        for f in filters {
+            if let Some((col, val)) = parse_eq_filter(f)
+                && col == "tenant"
+            {
+                tenant = Some(val);
+            }
+        }
+        format!("queue_counts[tenant={:?}], limit={:?}", tenant, limit)
+    }
+
+    fn scan(
+        &self,
+        projection: SchemaRef,
+        filters: &[Expr],
+        _batch_size: usize,
+        _limit: Option<usize>,
+    ) -> SendableRecordBatchStream {
+        let mut tenant_filter: Option<String> = None;
+        for f in filters {
+            if let Some((col, val)) = parse_eq_filter(f)
+                && col == "tenant"
+            {
+                tenant_filter = Some(val);
+            }
+        }
+
+        let shard = Arc::clone(&self.shard);
+        let proj = Arc::clone(&projection);
+        let (tx, rx) = mpsc::channel::<DfResult<RecordBatch>>(2);
+
+        tokio::spawn(async move {
+            // Collect requester counts from pre-computed counters (fast)
+            // and holder counts by scanning holder entries (bounded by concurrency limits)
+            let mut queue_data: HashMap<(String, String), (i64, i64)> = HashMap::new();
+
+            // Scan requester counters
+            let requester_results = if let Some(ref tenant) = tenant_filter {
+                shard
+                    .scan_concurrency_requester_counters(tenant)
+                    .await
+                    .map(|entries| {
+                        entries
+                            .into_iter()
+                            .map(|(queue, count)| (tenant.clone(), queue, count))
+                            .collect::<Vec<_>>()
+                    })
+            } else {
+                shard.scan_all_concurrency_requester_counters().await
+            };
+
+            match requester_results {
+                Ok(entries) => {
+                    for (tenant, queue, count) in entries {
+                        queue_data.entry((tenant, queue)).or_insert((0, 0)).1 = count;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(DataFusionError::Execution(e.to_string())))
+                        .await;
+                    return;
+                }
+            }
+
+            // Scan holder entries (bounded by concurrency limits, so fast)
+            let holders_start = match &tenant_filter {
+                Some(t) => crate::keys::concurrency_holders_tenant_prefix(t),
+                None => crate::keys::concurrency_holders_prefix(),
+            };
+            let holders_end = crate::keys::end_bound(&holders_start);
+
+            match shard
+                .db()
+                .scan::<Vec<u8>, _>(holders_start..holders_end)
+                .await
+            {
+                Ok(mut iter) => loop {
+                    match iter.next().await {
+                        Ok(Some(kv)) => {
+                            if let Some(parsed) = crate::keys::parse_concurrency_holder_key(&kv.key)
+                            {
+                                queue_data
+                                    .entry((parsed.tenant, parsed.queue))
+                                    .or_insert((0, 0))
+                                    .0 += 1;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(DataFusionError::Execution(e.to_string())))
+                                .await;
+                            return;
+                        }
+                    }
+                },
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(DataFusionError::Execution(e.to_string())))
+                        .await;
+                    return;
+                }
+            }
+
+            let shard_id = shard.name().to_string();
+            let entries: Vec<_> = queue_data.into_iter().collect();
+            let n = entries.len();
+
+            if proj.fields().is_empty() {
+                match make_empty_projection_batch(&proj, n) {
+                    Ok(batch) => {
+                        let _ = tx.send(Ok(batch)).await;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                    }
+                }
+                return;
+            }
+
+            let mut cols: Vec<ArrayRef> = Vec::with_capacity(proj.fields().len());
+            for f in proj.fields() {
+                let col: ArrayRef = match f.name().as_str() {
+                    "shard_id" => Arc::new(StringArray::from(vec![shard_id.as_str(); n])),
+                    "tenant" => Arc::new(StringArray::from(
+                        entries
+                            .iter()
+                            .map(|((t, _), _)| t.as_str())
+                            .collect::<Vec<_>>(),
+                    )),
+                    "queue_name" => Arc::new(StringArray::from(
+                        entries
+                            .iter()
+                            .map(|((_, q), _)| q.as_str())
+                            .collect::<Vec<_>>(),
+                    )),
+                    "holders" => Arc::new(Int64Array::from(
+                        entries.iter().map(|(_, (h, _))| *h).collect::<Vec<_>>(),
+                    )),
+                    "requesters" => Arc::new(Int64Array::from(
+                        entries.iter().map(|(_, (_, r))| *r).collect::<Vec<_>>(),
+                    )),
+                    other => {
+                        let _ = tx
+                            .send(Err(DataFusionError::Execution(format!(
+                                "unknown column {}",
+                                other
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+                cols.push(col);
+            }
+
+            match RecordBatch::try_new(proj, cols) {
+                Ok(batch) => {
+                    let _ = tx.send(Ok(batch)).await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(DataFusionError::Execution(e.to_string())))
+                        .await;
+                }
+            }
+        });
+
+        Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&projection),
+            ReceiverStream::new(rx),
         ))
     }
 }
