@@ -468,9 +468,11 @@ fn classify_filter_pushdown(
     strategy: &JobsScanStrategy,
 ) -> TableProviderFilterPushDown {
     match strategy {
-        // ExactId: tenant and id are both used to look up the exact record.
+        // ExactId with tenant: both filters are handled exactly (direct pair construction).
+        // ExactId without tenant: the scan falls back to scan_all_jobs + in-memory filter,
+        // so neither filter is exact (limit pushdown would truncate before filtering).
         JobsScanStrategy::ExactId { tenant, .. } => match col_name {
-            "id" => TableProviderFilterPushDown::Exact,
+            "id" if tenant.is_some() => TableProviderFilterPushDown::Exact,
             "tenant" if tenant.is_some() => TableProviderFilterPushDown::Exact,
             _ => TableProviderFilterPushDown::Inexact,
         },
