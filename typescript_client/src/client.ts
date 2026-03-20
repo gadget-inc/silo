@@ -790,6 +790,60 @@ export interface EnqueueJobOptions {
   metadata?: Record<string, string>;
 }
 
+/** A historical attempt record for job import. All attempts must be in terminal states. */
+export interface ImportJobAttempt {
+  /** The status of this attempt. Must be terminal (succeeded, failed, or cancelled). */
+  status: AttemptStatus.Succeeded | AttemptStatus.Failed | AttemptStatus.Cancelled;
+  /** Unix timestamp (ms) when the attempt started. */
+  startedAtMs: bigint;
+  /** Unix timestamp (ms) when the attempt finished. */
+  finishedAtMs: bigint;
+  /** Result data if the attempt succeeded. */
+  result?: unknown;
+  /** Error code if the attempt failed. */
+  errorCode?: string;
+  /** Error data if the attempt failed. */
+  errorData?: unknown;
+}
+
+/** Options for importing a single job from another system. */
+export interface ImportJobOptions {
+  /** Required job ID (migration preserves IDs). */
+  id: string;
+  /** The JSON-serializable payload for the job. */
+  payload: unknown;
+  /** Task group for organizing tasks. Required. */
+  taskGroup: string;
+  /** Priority 0-99, where 0 is highest priority. Defaults to 50. */
+  priority?: number;
+  /** Original enqueue time from source system (epoch ms). 0 = now. */
+  enqueueTimeMs?: bigint;
+  /** When the next attempt should start (epoch ms, 0 = now, only for non-terminal jobs). */
+  startAtMs?: bigint;
+  /** Optional retry policy. */
+  retryPolicy?: RetryPolicy;
+  /** Optional limits (concurrency limits and/or rate limits). */
+  limits?: JobLimit[];
+  /** Tenant ID for routing to the correct shard. Uses default tenant if not provided. */
+  tenant?: string;
+  /** Optional key/value metadata stored with the job. */
+  metadata?: Record<string, string>;
+  /** Historical attempts, all in terminal states. */
+  attempts?: ImportJobAttempt[];
+}
+
+/** Result of importing a single job. */
+export interface ImportJobResult {
+  /** The job ID. */
+  id: string;
+  /** Whether the import succeeded. */
+  success: boolean;
+  /** Error message if import failed. */
+  error?: string;
+  /** The determined status of the imported job. */
+  status: JobStatus;
+}
+
 /** Options for leasing a specific job's task directly */
 export interface LeaseTaskOptions {
   /** The job ID to lease */
@@ -1087,6 +1141,23 @@ function protoAttemptStatusToPublic(status: ProtoAttemptStatus): AttemptStatus {
 }
 
 /**
+ * Convert public AttemptStatus to proto AttemptStatus enum.
+ * @internal
+ */
+function publicAttemptStatusToProto(status: AttemptStatus): ProtoAttemptStatus {
+  switch (status) {
+    case AttemptStatus.Running:
+      return ProtoAttemptStatus.RUNNING;
+    case AttemptStatus.Succeeded:
+      return ProtoAttemptStatus.SUCCEEDED;
+    case AttemptStatus.Failed:
+      return ProtoAttemptStatus.FAILED;
+    case AttemptStatus.Cancelled:
+      return ProtoAttemptStatus.CANCELLED;
+  }
+}
+
+/**
  * Convert proto JobAttempt to public JobAttempt.
  * @internal
  */
@@ -1099,12 +1170,14 @@ function protoAttemptToPublic(attempt: ProtoJobAttempt): JobAttempt {
     startedAtMs: attempt.startedAtMs,
     finishedAtMs: attempt.finishedAtMs,
     result:
-      attempt.result?.encoding.oneofKind === "msgpack"
+      attempt.result?.encoding.oneofKind === "msgpack" &&
+      attempt.result.encoding.msgpack.length > 0
         ? decodeBytes(attempt.result.encoding.msgpack, "result")
         : undefined,
     errorCode: attempt.errorCode,
     errorData:
-      attempt.errorData?.encoding.oneofKind === "msgpack"
+      attempt.errorData?.encoding.oneofKind === "msgpack" &&
+      attempt.errorData.encoding.msgpack.length > 0
         ? decodeBytes(attempt.errorData.encoding.msgpack, "errorData")
         : undefined,
   };
@@ -1415,6 +1488,27 @@ export class SiloGRPCClient {
 
     // Fallback to any available connection
     return this._getAnyClient();
+  }
+
+  /**
+   * Get the admin client for a specific shard.
+   * @internal
+   */
+  private _getAdminClientForShard(shardId: string): SiloAdminClient {
+    const serverAddr = this._shardToServer.get(shardId);
+    if (serverAddr) {
+      const conn = this._connections.get(serverAddr);
+      if (conn) {
+        return conn.adminClient;
+      }
+    }
+
+    // Fallback to any available connection
+    const connections = Array.from(this._connections.values());
+    if (connections.length === 0) {
+      throw new Error("No server connections available");
+    }
+    return connections[0].adminClient;
   }
 
   /**
@@ -2312,6 +2406,86 @@ export class SiloGRPCClient {
       shardToServer: new Map(this._shardToServer),
       shards: [...this._shards],
     };
+  }
+
+  /**
+   * Import jobs from another system with historical attempts.
+   *
+   * Unlike {@link enqueue}, importJobs accepts completed attempt records and lets Silo
+   * take ownership going forward. Used for migrating workloads from other job queues.
+   *
+   * All jobs in a single call must belong to the same tenant (and therefore the same shard).
+   * To import jobs for multiple tenants, call this method once per tenant.
+   *
+   * @param jobs The jobs to import.
+   * @returns Results for each imported job (in the same order as the input).
+   */
+  public async importJobs(jobs: ImportJobOptions[]): Promise<ImportJobResult[]> {
+    if (jobs.length === 0) {
+      return [];
+    }
+
+    // All jobs must share the same tenant for shard routing
+    const tenant = jobs[0].tenant;
+
+    try {
+      await this._ensureTopology();
+      const shardId = this._resolveShard(tenant);
+      const adminClient = this._getAdminClientForShard(shardId);
+
+      const protoJobs = jobs.map((job) => ({
+        shard: shardId,
+        id: job.id,
+        priority: job.priority ?? 50,
+        enqueueTimeMs: job.enqueueTimeMs ?? BigInt(0),
+        startAtMs: job.startAtMs ?? BigInt(0),
+        retryPolicy: job.retryPolicy,
+        payload: {
+          encoding: {
+            oneofKind: "msgpack" as const,
+            msgpack: encodeBytes(job.payload),
+          },
+        },
+        limits: job.limits?.map(toProtoLimit) ?? [],
+        tenant: job.tenant,
+        metadata: job.metadata ?? {},
+        taskGroup: job.taskGroup,
+        attempts: (job.attempts ?? []).map((attempt) => ({
+          status: publicAttemptStatusToProto(attempt.status),
+          startedAtMs: attempt.startedAtMs,
+          finishedAtMs: attempt.finishedAtMs,
+          result: attempt.result !== undefined
+            ? {
+                encoding: {
+                  oneofKind: "msgpack" as const,
+                  msgpack: encodeBytes(attempt.result),
+                },
+              }
+            : undefined,
+          errorCode: attempt.errorCode,
+          errorData: attempt.errorData !== undefined
+            ? {
+                encoding: {
+                  oneofKind: "msgpack" as const,
+                  msgpack: encodeBytes(attempt.errorData),
+                },
+              }
+            : undefined,
+        })),
+      }));
+
+      const call = adminClient.importJobs({ jobs: protoJobs }, this._rpcOptions());
+      const response = await call.response;
+
+      return response.results.map((r) => ({
+        id: r.id,
+        success: r.success,
+        error: r.error,
+        status: protoJobStatusToPublic(r.status),
+      }));
+    } catch (error) {
+      throwMappedRpcError(error, { operation: "importJobs" });
+    }
   }
 
   /**

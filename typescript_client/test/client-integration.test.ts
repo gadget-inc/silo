@@ -2,9 +2,11 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import {
   SiloGRPCClient,
   JobStatus,
+  AttemptStatus,
   decodeBytes,
   GubernatorAlgorithm,
 } from "../src/client";
+import type { ImportJobOptions } from "../src/client";
 
 // Support comma-separated list of servers for multi-node testing
 const SILO_SERVERS = (
@@ -1551,6 +1553,123 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         expect(regularLimit.key).toBe(regularKey);
         expect(regularLimit.maxConcurrency).toBe(3);
       }
+    });
+  });
+
+  describe("importJobs", () => {
+    const IMPORT_TENANT = "import-test-tenant";
+    const IMPORT_TASK_GROUP = "import-test-group";
+
+    it("imports a scheduled job with no attempts", async () => {
+      const jobId = `import-scheduled-${Date.now()}`;
+      const results = await client.importJobs([
+        {
+          id: jobId,
+          payload: { source: "legacy-system" },
+          taskGroup: IMPORT_TASK_GROUP,
+          tenant: IMPORT_TENANT,
+          priority: 10,
+        },
+      ]);
+
+      expect(results).toHaveLength(1);
+      expect(results[0].id).toBe(jobId);
+      expect(results[0].success).toBe(true);
+      expect(results[0].status).toBe(JobStatus.Scheduled);
+
+      // Verify the job was actually created
+      const job = await client.getJob(jobId, IMPORT_TENANT);
+      expect(job.id).toBe(jobId);
+      expect(job.status).toBe(JobStatus.Scheduled);
+      expect(job.priority).toBe(10);
+      expect(job.taskGroup).toBe(IMPORT_TASK_GROUP);
+      expect(job.payload).toEqual({ source: "legacy-system" });
+    });
+
+    it("imports a succeeded job with historical attempts", async () => {
+      const jobId = `import-succeeded-${Date.now()}`;
+      const now = BigInt(Date.now());
+
+      const results = await client.importJobs([
+        {
+          id: jobId,
+          payload: { source: "migration" },
+          taskGroup: IMPORT_TASK_GROUP,
+          tenant: IMPORT_TENANT,
+          enqueueTimeMs: now - BigInt(60000),
+          attempts: [
+            {
+              status: AttemptStatus.Failed,
+              startedAtMs: now - BigInt(50000),
+              finishedAtMs: now - BigInt(45000),
+              errorCode: "TIMEOUT",
+            },
+            {
+              status: AttemptStatus.Succeeded,
+              startedAtMs: now - BigInt(40000),
+              finishedAtMs: now - BigInt(35000),
+              result: { output: "done" },
+            },
+          ],
+        },
+      ]);
+
+      expect(results).toHaveLength(1);
+      expect(results[0].id).toBe(jobId);
+      expect(results[0].success).toBe(true);
+      expect(results[0].status).toBe(JobStatus.Succeeded);
+
+      // Verify the job and its attempts
+      const job = await client.getJob(jobId, IMPORT_TENANT, {
+        includeAttempts: true,
+      });
+      expect(job.status).toBe(JobStatus.Succeeded);
+      expect(job.attempts).toHaveLength(2);
+      expect(job.attempts![0].status).toBe(AttemptStatus.Failed);
+      expect(job.attempts![1].status).toBe(AttemptStatus.Succeeded);
+    });
+
+    it("imports multiple jobs in a single batch", async () => {
+      const prefix = `import-batch-${Date.now()}`;
+      const jobs: ImportJobOptions[] = Array.from({ length: 5 }, (_, i) => ({
+        id: `${prefix}-${i}`,
+        payload: { index: i },
+        taskGroup: IMPORT_TASK_GROUP,
+        tenant: IMPORT_TENANT,
+      }));
+
+      const results = await client.importJobs(jobs);
+
+      expect(results).toHaveLength(5);
+      for (let i = 0; i < 5; i++) {
+        expect(results[i].id).toBe(`${prefix}-${i}`);
+        expect(results[i].success).toBe(true);
+      }
+    });
+
+    it("returns empty array for empty input", async () => {
+      const results = await client.importJobs([]);
+      expect(results).toEqual([]);
+    });
+
+    it("imports a job with metadata and limits", async () => {
+      const jobId = `import-meta-${Date.now()}`;
+      const results = await client.importJobs([
+        {
+          id: jobId,
+          payload: { data: "with-metadata" },
+          taskGroup: IMPORT_TASK_GROUP,
+          tenant: IMPORT_TENANT,
+          metadata: { source: "old-system", version: "1.0" },
+          limits: [{ type: "concurrency", key: "import-test", maxConcurrency: 5 }],
+        },
+      ]);
+
+      expect(results).toHaveLength(1);
+      expect(results[0].success).toBe(true);
+
+      const job = await client.getJob(jobId, IMPORT_TENANT);
+      expect(job.metadata).toEqual({ source: "old-system", version: "1.0" });
     });
   });
 });

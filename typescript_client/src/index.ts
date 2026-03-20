@@ -53,6 +53,9 @@ export {
   type QueryResult,
   type QueryColumnInfo,
   type QueryBindParameter,
+  type ImportJobOptions,
+  type ImportJobAttempt,
+  type ImportJobResult,
 } from "./client";
 export {
   SiloWorker,
