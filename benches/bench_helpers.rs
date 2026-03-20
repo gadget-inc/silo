@@ -345,6 +345,7 @@ async fn open_shard_at_path(path: &str, flush_interval_ms: u64) -> Arc<JobStoreS
             flush_interval: Some(Duration::from_millis(flush_interval_ms)),
             ..Default::default()
         }),
+        memory_cache: None,
     };
     JobStoreShard::open(&cfg, NullGubernatorClient::new(), None, ShardRange::full())
         .await
@@ -605,6 +606,7 @@ pub async fn clone_golden_shard(
                 flush_interval: Some(Duration::from_millis(1)),
                 ..Default::default()
             }),
+            memory_cache: None,
             rate_limiter: NullGubernatorClient::new(),
             metrics: None,
             concurrency_reconcile_interval: Duration::from_millis(

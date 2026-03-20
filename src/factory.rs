@@ -94,6 +94,7 @@ impl ShardFactory {
                 apply_wal_on_close: false,
                 concurrency_reconcile_interval_ms: 5000,
                 slatedb: None,
+                memory_cache: None,
             },
             rate_limiter: NullGubernatorClient::new(),
             metrics: None,
@@ -189,6 +190,7 @@ impl ShardFactory {
                         wal_store,
                         wal_close_config,
                         slatedb_settings: template.slatedb.clone(),
+                        memory_cache: template.memory_cache.clone(),
                         rate_limiter,
                         metrics,
                         concurrency_reconcile_interval: Duration::from_millis(

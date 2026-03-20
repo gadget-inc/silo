@@ -278,6 +278,23 @@ cache_puts = true
 
 All other SlateDB settings (like `l0_sst_size_bytes`, `manifest_poll_interval`, etc.) will automatically use their default values. This allows you to tune specific parameters without needing to specify the entire configuration.
 
+#### In-Memory Cache Configuration
+
+SlateDB maintains two in-memory caches per shard. Configure their sizes via `[database.memory_cache]`:
+
+```toml
+[database.memory_cache]
+block_cache_bytes = 536870912   # 512 MB (default)
+meta_cache_bytes = 268435456    # 256 MB (default is 128 MB)
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `block_cache_bytes` | integer | `536870912` (512 MB) | Size of the in-memory block cache (data blocks from SST files) |
+| `meta_cache_bytes` | integer | `134217728` (128 MB) | Size of the in-memory meta cache (SST indexes and bloom filters) |
+
+Both fields are optional — omitting a field uses the SlateDB default. The `[database.memory_cache]` section itself is optional; if omitted entirely, SlateDB defaults are used for both caches.
+
 ---
 
 ## Coordination Configuration

@@ -89,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
             slatedb: None,
+            memory_cache: None,
         },
         rate_limiter.clone(),
         None,
@@ -105,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
             slatedb: None,
+            memory_cache: None,
         },
         rate_limiter.clone(),
         None,
@@ -159,6 +161,7 @@ async fn main() -> anyhow::Result<()> {
                 flush_interval: Some(Duration::from_millis(10)),
                 ..Default::default()
             }),
+            memory_cache: None,
         };
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, range).await?;
         shards.insert(*shard_id, shard);
@@ -319,6 +322,7 @@ async fn main() -> anyhow::Result<()> {
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
             slatedb: None,
+            memory_cache: None,
         },
         rate_limiter.clone(),
         None,

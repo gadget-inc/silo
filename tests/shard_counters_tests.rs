@@ -655,6 +655,7 @@ async fn counters_survive_close_and_reopen() {
             }),
             apply_wal_on_close: true,
             slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
+            memory_cache: None,
         };
 
         let shard2 = silo::job_store_shard::JobStoreShard::open(

@@ -70,6 +70,7 @@ pub async fn open_temp_shard_with_reconcile_interval_ms(
             wal_store: None,
             wal_close_config: None,
             slatedb_settings: Some(fast_flush_slatedb_settings()),
+            memory_cache: None,
             rate_limiter,
             metrics: None,
             concurrency_reconcile_interval: Duration::from_millis(interval_ms.max(1)),
@@ -94,6 +95,7 @@ pub async fn open_temp_shard_with_range(
         wal: None,
         apply_wal_on_close: true,
         slatedb: Some(fast_flush_slatedb_settings()),
+        memory_cache: None,
     };
     let shard = JobStoreShard::open(&cfg, rate_limiter, None, range)
         .await
@@ -114,6 +116,7 @@ pub async fn open_temp_shard_with_rate_limiter(
         apply_wal_on_close: true,
         // Use fast flush interval for tests to speed them up
         slatedb: Some(fast_flush_slatedb_settings()),
+        memory_cache: None,
     };
     let shard = JobStoreShard::open(&cfg, rate_limiter, None, ShardRange::full())
         .await
@@ -156,6 +159,7 @@ pub async fn open_temp_shard_with_local_wal_and_rate_limiter(
         }),
         apply_wal_on_close: flush_on_close,
         slatedb: Some(fast_flush_slatedb_settings()),
+        memory_cache: None,
     };
 
     let shard = JobStoreShard::open(&cfg, rate_limiter, None, ShardRange::full())

@@ -43,6 +43,7 @@ fn make_test_factory(prefix: &str, node_id: &str) -> Arc<ShardFactory> {
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
             slatedb: None,
+            memory_cache: None,
         },
         MockGubernatorClient::new_arc(),
         None,

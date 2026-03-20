@@ -65,6 +65,7 @@ pub async fn create_test_factory() -> anyhow::Result<(Arc<ShardFactory>, tempfil
         apply_wal_on_close: true,
         concurrency_reconcile_interval_ms: 5000,
         slatedb: None,
+        memory_cache: None,
     };
     let rate_limiter = MockGubernatorClient::new_arc();
     let factory = ShardFactory::new(template, rate_limiter, None);
@@ -104,6 +105,7 @@ pub async fn setup_multi_shard_server(
         apply_wal_on_close: true,
         concurrency_reconcile_interval_ms: 5000,
         slatedb: None,
+        memory_cache: None,
     };
     let rate_limiter = MockGubernatorClient::new_arc();
     let factory = Arc::new(ShardFactory::new(template, rate_limiter, None));

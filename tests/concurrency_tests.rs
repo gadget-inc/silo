@@ -1581,6 +1581,7 @@ async fn concurrency_lazy_hydration_on_shard_reopen() {
         wal: None,
         apply_wal_on_close: true,
         slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
+        memory_cache: None,
     };
     let rate_limiter = MockGubernatorClient::new_arc();
     let queue = "lazy_q".to_string();
@@ -1715,6 +1716,7 @@ async fn concurrency_no_overgrant_with_lazy_hydration() {
         wal: None,
         apply_wal_on_close: true,
         slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
+        memory_cache: None,
     };
     let rate_limiter = MockGubernatorClient::new_arc();
     let queue = "overgrant_q".to_string();

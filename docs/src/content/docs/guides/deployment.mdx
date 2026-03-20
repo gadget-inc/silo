@@ -95,6 +95,23 @@ All other options use SlateDB's sensible defaults when omitted. See the [Server 
 
 The cache directory does not need to be durable — if it is lost, reads will simply fall back to object storage and the cache will be rebuilt over time. This makes it a good fit for ephemeral local disks or instance storage.
 
+### In-Memory Cache Sizing
+
+SlateDB maintains two in-memory caches per shard to avoid re-reading data from disk or object storage:
+
+- **Block cache**: Caches data blocks read from SST files. Reduces I/O for point lookups and scans.
+- **Meta cache**: Caches SST index blocks and bloom filters. Avoids re-parsing SST indexes on each scan, which can be a significant CPU cost for scan-heavy workloads.
+
+By default, SlateDB allocates 512 MB for the block cache and 128 MB for the meta cache per shard. For workloads with high scan rates (many background scans, large numbers of SST files), increasing the meta cache can reduce CPU spent on SST index deserialization:
+
+```toml
+[database.memory_cache]
+block_cache_bytes = 536870912   # 512 MB (default)
+meta_cache_bytes = 268435456    # 256 MB (doubled from 128 MB default)
+```
+
+To determine if the meta cache is undersized, look for high CPU usage in SST index parsing (visible in CPU profiles as `SsTableIndexOwned::new` or `TableStore::read_index`). Increasing the meta cache keeps more parsed indexes in memory and avoids repeated flatbuffer deserialization and CRC verification on cache misses.
+
 ## Garbage collection
 
 **SlateDB does not garbage collect old files by default.** Without explicit configuration, old WAL files, compacted SSTs, manifest versions, and compaction job state will accumulate in storage indefinitely. For production deployments, you should always enable garbage collection.

@@ -581,6 +581,7 @@ async fn reopening_shard_after_cleanup_preserves_status() {
             wal: None,
             apply_wal_on_close: true,
             slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
+            memory_cache: None,
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, ShardRange::full())
@@ -628,6 +629,7 @@ async fn reopening_shard_after_cleanup_preserves_status() {
             wal: None,
             apply_wal_on_close: true,
             slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
+            memory_cache: None,
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, ShardRange::full())
@@ -704,6 +706,7 @@ async fn shard_created_at_preserved_across_reopen() {
             wal: None,
             apply_wal_on_close: true,
             slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
+            memory_cache: None,
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, ShardRange::full())
@@ -731,6 +734,7 @@ async fn shard_created_at_preserved_across_reopen() {
             wal: None,
             apply_wal_on_close: true,
             slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
+            memory_cache: None,
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, ShardRange::full())
