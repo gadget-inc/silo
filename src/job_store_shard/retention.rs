@@ -95,7 +95,14 @@ impl JobStoreShard {
 
         tokio::spawn(async move {
             // Sleep first to avoid expensive scan during shard acquisition.
-            tokio::time::sleep(scan_interval).await;
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    debug!(shard = %shard_name, "retention scanner cancelled during initial delay");
+                    return;
+                }
+                _ = tokio::time::sleep(scan_interval) => {}
+            }
 
             let mut interval = tokio::time::interval(scan_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
