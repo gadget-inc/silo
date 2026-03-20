@@ -653,6 +653,8 @@ async fn concurrency_hydration_ignores_uncleaned_holders() {
                 .unwrap();
         }
         shard.db().flush().await.unwrap();
+        // Give the task broker scanner time to pick up both tasks from the DB
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Dequeue to create holders
         let result = shard.dequeue("worker-1", "default", 10).await.unwrap();

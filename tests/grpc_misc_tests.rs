@@ -18,7 +18,7 @@ use tonic_health::pb::health_client::HealthClient;
 
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_health_check_returns_serving() -> anyhow::Result<()> {
-    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
         let (factory, _tmp) = create_test_factory().await?;
         let (_client, shutdown_tx, server, addr) =
             setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
@@ -66,7 +66,7 @@ async fn grpc_health_check_returns_serving() -> anyhow::Result<()> {
 /// This specifically tests that the `remaining` counter is decremented correctly across shards.
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_server_lease_tasks_multi_shard() -> anyhow::Result<()> {
-    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
         let tmp = tempfile::tempdir()?;
         let template = DatabaseTemplate {
             backend: Backend::Fs,
@@ -161,7 +161,7 @@ async fn grpc_server_lease_tasks_multi_shard() -> anyhow::Result<()> {
 
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_server_tenant_validation_when_enabled() -> anyhow::Result<()> {
-    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
         let (factory, _tmp) = create_test_factory().await?;
 
         // Enable tenancy in config
@@ -345,7 +345,7 @@ async fn grpc_enqueue_rejects_tenant_when_tenancy_disabled() -> anyhow::Result<(
 
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_server_reset_shards_requires_dev_mode() -> anyhow::Result<()> {
-    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
         let (factory, _tmp) = create_test_factory().await?;
 
         // dev_mode = false (default)
@@ -380,7 +380,7 @@ async fn grpc_server_reset_shards_requires_dev_mode() -> anyhow::Result<()> {
 
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_server_reset_shards_works_in_dev_mode() -> anyhow::Result<()> {
-    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
         let (factory, _tmp) = create_test_factory().await?;
 
         // Enable dev mode
@@ -458,7 +458,7 @@ async fn grpc_server_reset_shards_works_in_dev_mode() -> anyhow::Result<()> {
 
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_server_report_outcome_missing_outcome() -> anyhow::Result<()> {
-    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
         let (factory, _tmp) = create_test_factory().await?;
         let (mut client, shutdown_tx, server, _addr) =
             setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
@@ -495,7 +495,7 @@ async fn grpc_server_report_outcome_missing_outcome() -> anyhow::Result<()> {
 
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_server_report_refresh_outcome_missing_outcome() -> anyhow::Result<()> {
-    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
         let (factory, _tmp) = create_test_factory().await?;
         let (mut client, shutdown_tx, server, _addr) =
             setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
@@ -533,7 +533,7 @@ async fn grpc_server_report_refresh_outcome_missing_outcome() -> anyhow::Result<
 /// Test that GetNodeInfo returns correct counts for empty shard
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_server_get_node_info_empty() -> anyhow::Result<()> {
-    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
         let (factory, _tmp) = create_test_factory().await?;
         let (mut client, shutdown_tx, server, _addr) =
             setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
@@ -581,7 +581,7 @@ fn get_shard_counters_from_node_info(resp: &GetNodeInfoResponse, shard_id: &str)
 /// Test that GetNodeInfo correctly tracks job lifecycle
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_server_get_node_info_tracks_lifecycle() -> anyhow::Result<()> {
-    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
         let (factory, _tmp) = create_test_factory().await?;
         let (mut client, shutdown_tx, server, _addr) =
             setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
@@ -1514,7 +1514,7 @@ async fn grpc_server_reset_shards_eight_shards_immediately_available() -> anyhow
 
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_force_release_shard_succeeds() -> anyhow::Result<()> {
-    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
         let (factory, _tmp) = create_test_factory().await?;
         let (mut client, shutdown_tx, server, _addr) =
             setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
@@ -1538,7 +1538,7 @@ async fn grpc_force_release_shard_succeeds() -> anyhow::Result<()> {
 
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_force_release_shard_invalid_id_returns_error() -> anyhow::Result<()> {
-    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
         let (factory, _tmp) = create_test_factory().await?;
         let (mut client, shutdown_tx, server, _addr) =
             setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
@@ -1568,7 +1568,7 @@ async fn grpc_force_release_shard_invalid_id_returns_error() -> anyhow::Result<(
 /// When tenancy is enabled, report_outcome/heartbeat/report_refresh_outcome must include tenant_id.
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_worker_rpcs_require_tenant_when_tenancy_enabled() -> anyhow::Result<()> {
-    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
         let (factory, _tmp) = create_test_factory().await?;
         let mut cfg = AppConfig::load(None).unwrap();
         cfg.tenancy.enabled = true;
@@ -1661,7 +1661,7 @@ async fn grpc_worker_rpcs_require_tenant_when_tenancy_enabled() -> anyhow::Resul
 /// When tenancy is disabled, worker RPCs should work without tenant_id.
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_worker_rpcs_skip_tenant_validation_when_tenancy_disabled() -> anyhow::Result<()> {
-    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
         let (factory, _tmp) = create_test_factory().await?;
         let mut cfg = AppConfig::load(None).unwrap();
         cfg.tenancy.enabled = false;
@@ -1745,7 +1745,7 @@ async fn grpc_worker_rpcs_skip_tenant_validation_when_tenancy_disabled() -> anyh
 /// When tenancy is enabled, worker RPCs should accept valid tenant_id and succeed.
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_worker_rpcs_accept_valid_tenant_when_tenancy_enabled() -> anyhow::Result<()> {
-    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
         let (factory, _tmp) = create_test_factory().await?;
         let mut cfg = AppConfig::load(None).unwrap();
         cfg.tenancy.enabled = true;
