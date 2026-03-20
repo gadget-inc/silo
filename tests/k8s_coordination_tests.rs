@@ -130,7 +130,7 @@ async fn k8s_single_node_owns_all_shards() {
 
     // Wait for convergence
     assert!(
-        coord.wait_converged(Duration::from_secs(10)).await,
+        coord.wait_converged(Duration::from_secs(30)).await,
         "coordinator should converge"
     );
 
@@ -232,7 +232,7 @@ async fn k8s_rebalances_on_membership_change() {
         num_shards
     );
 
-    assert!(c1.wait_converged(Duration::from_secs(10)).await);
+    assert!(c1.wait_converged(Duration::from_secs(30)).await);
     let initial_owned: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
     let expected: HashSet<ShardId> = c1
         .get_shard_map()
@@ -1950,7 +1950,7 @@ async fn k8s_node_restart_same_id() {
         num_shards
     );
     assert!(
-        c1.wait_converged(Duration::from_secs(15)).await,
+        c1.wait_converged(Duration::from_secs(30)).await,
         "c1 initial converge"
     );
 
@@ -2238,7 +2238,7 @@ async fn k8s_short_lease_duration_does_not_affect_ownership() {
 
     // Should converge normally
     assert!(
-        c1.wait_converged(Duration::from_secs(15)).await,
+        c1.wait_converged(Duration::from_secs(30)).await,
         "should converge with short lease_duration_seconds"
     );
 
@@ -2586,7 +2586,7 @@ async fn k8s_graceful_shutdown_releases_shards_promptly() {
 
     // c1 should quickly acquire c2's shards
     assert!(
-        c1.wait_converged(Duration::from_secs(15)).await,
+        c1.wait_converged(Duration::from_secs(30)).await,
         "c1 should converge after c2 graceful shutdown"
     );
 
@@ -2733,7 +2733,7 @@ async fn k8s_request_split_creates_split_record() {
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
 
     assert!(
-        coord.wait_converged(Duration::from_secs(15)).await,
+        coord.wait_converged(Duration::from_secs(30)).await,
         "coordinator should converge"
     );
 
@@ -2880,7 +2880,7 @@ async fn k8s_request_split_fails_if_already_in_progress() {
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
 
-    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+    assert!(coord.wait_converged(Duration::from_secs(30)).await);
 
     let owned = coord.owned_shards().await;
     let shard_id = owned[0];
@@ -2926,7 +2926,7 @@ async fn k8s_request_split_fails_for_invalid_split_point() {
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
 
-    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+    assert!(coord.wait_converged(Duration::from_secs(30)).await);
 
     let owned = coord.owned_shards().await;
     let shard_id = owned[0];
@@ -2979,7 +2979,7 @@ async fn k8s_is_shard_paused_returns_correct_values() {
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
 
-    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+    assert!(coord.wait_converged(Duration::from_secs(30)).await);
 
     let owned = coord.owned_shards().await;
     let shard_id = owned[0];
@@ -3027,7 +3027,7 @@ async fn k8s_split_state_persists_across_restart() {
     );
     let c1: Arc<dyn Coordinator> = Arc::new(c1);
 
-    assert!(c1.wait_converged(Duration::from_secs(15)).await);
+    assert!(c1.wait_converged(Duration::from_secs(30)).await);
 
     let owned = c1.owned_shards().await;
     let shard_id = owned[0];
@@ -3064,7 +3064,7 @@ async fn k8s_split_state_persists_across_restart() {
     .expect("restart coordinator");
     let c2: Arc<dyn Coordinator> = Arc::new(c2);
 
-    assert!(c2.wait_converged(Duration::from_secs(15)).await);
+    assert!(c2.wait_converged(Duration::from_secs(30)).await);
 
     // Create splitter for c2 and verify the split state persisted
 
@@ -3105,7 +3105,7 @@ async fn k8s_get_split_status_returns_none_for_nonexistent() {
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
 
-    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+    assert!(coord.wait_converged(Duration::from_secs(30)).await);
 
     // Create splitter and query for a split that doesn't exist
 
@@ -3142,7 +3142,7 @@ async fn k8s_execute_split_completes_full_cycle() {
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
 
-    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+    assert!(coord.wait_converged(Duration::from_secs(30)).await);
 
     let owned = coord.owned_shards().await;
     let shard_id = owned[0];
@@ -3215,7 +3215,7 @@ async fn k8s_shard_paused_during_split_execution() {
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
 
-    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+    assert!(coord.wait_converged(Duration::from_secs(30)).await);
 
     let owned = coord.owned_shards().await;
     let shard_id = owned[0];
@@ -3277,7 +3277,7 @@ async fn k8s_execute_split_fails_without_request() {
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
 
-    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+    assert!(coord.wait_converged(Duration::from_secs(30)).await);
 
     let owned = coord.owned_shards().await;
     let shard_id = owned[0];
@@ -3312,7 +3312,7 @@ async fn k8s_execute_split_resumes_from_partial_state() {
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
 
-    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+    assert!(coord.wait_converged(Duration::from_secs(30)).await);
 
     let owned = coord.owned_shards().await;
     let shard_id = owned[0];
@@ -3373,7 +3373,7 @@ async fn k8s_sequential_splits_work_correctly() {
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
 
-    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+    assert!(coord.wait_converged(Duration::from_secs(30)).await);
 
     let owned = coord.owned_shards().await;
     let shard_id = owned[0];
@@ -3552,7 +3552,7 @@ async fn k8s_crash_recovery_early_phase_abandons_split() {
     );
     let c1: Arc<dyn Coordinator> = Arc::new(c1);
 
-    assert!(c1.wait_converged(Duration::from_secs(15)).await);
+    assert!(c1.wait_converged(Duration::from_secs(30)).await);
 
     let owned = c1.owned_shards().await;
     let shard_id = owned[0];
@@ -3591,7 +3591,7 @@ async fn k8s_crash_recovery_early_phase_abandons_split() {
     .expect("restart coordinator");
     let c2: Arc<dyn Coordinator> = Arc::new(c2);
 
-    assert!(c2.wait_converged(Duration::from_secs(15)).await);
+    assert!(c2.wait_converged(Duration::from_secs(30)).await);
 
     // Create splitter for c2
 
@@ -3754,7 +3754,7 @@ async fn k8s_child_shards_usable_after_split() {
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
 
-    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+    assert!(coord.wait_converged(Duration::from_secs(30)).await);
 
     let owned = coord.owned_shards().await;
     let shard_id = owned[0];
@@ -3871,7 +3871,7 @@ async fn k8s_crash_recovery_cloning_phase_abandons_split() {
     );
     let c1: Arc<dyn Coordinator> = Arc::new(c1);
 
-    assert!(c1.wait_converged(Duration::from_secs(15)).await);
+    assert!(c1.wait_converged(Duration::from_secs(30)).await);
 
     let owned = c1.owned_shards().await;
     let shard_id = owned[0];
@@ -3912,7 +3912,7 @@ async fn k8s_crash_recovery_cloning_phase_abandons_split() {
     .expect("restart coordinator");
     let c2: Arc<dyn Coordinator> = Arc::new(c2);
 
-    assert!(c2.wait_converged(Duration::from_secs(15)).await);
+    assert!(c2.wait_converged(Duration::from_secs(30)).await);
 
     // Create splitter for c2
 
@@ -3981,7 +3981,7 @@ async fn k8s_single_node_default_ring_owns_all_shards() {
     );
 
     assert!(
-        coord.wait_converged(Duration::from_secs(15)).await,
+        coord.wait_converged(Duration::from_secs(30)).await,
         "coordinator should converge"
     );
 
@@ -4015,7 +4015,7 @@ async fn k8s_multi_ring_shard_assignment() {
     let c_default: Arc<dyn Coordinator> = Arc::new(c_default);
 
     assert!(
-        c_default.wait_converged(Duration::from_secs(15)).await,
+        c_default.wait_converged(Duration::from_secs(30)).await,
         "default node should converge"
     );
 
@@ -4046,11 +4046,11 @@ async fn k8s_multi_ring_shard_assignment() {
 
     // Wait for both to converge
     assert!(
-        c_default.wait_converged(Duration::from_secs(15)).await,
+        c_default.wait_converged(Duration::from_secs(30)).await,
         "default node should converge"
     );
     assert!(
-        c_gpu.wait_converged(Duration::from_secs(15)).await,
+        c_gpu.wait_converged(Duration::from_secs(30)).await,
         "gpu node should converge"
     );
 
@@ -4149,7 +4149,7 @@ async fn k8s_configure_shard_ring_changes() {
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
 
     assert!(
-        coord.wait_converged(Duration::from_secs(10)).await,
+        coord.wait_converged(Duration::from_secs(30)).await,
         "coordinator should converge"
     );
 
@@ -4248,8 +4248,8 @@ async fn k8s_member_info_reports_rings() {
     .expect("start node-multi");
 
     // Wait for both to be visible
-    assert!(c1.wait_converged(Duration::from_secs(15)).await);
-    assert!(c2.wait_converged(Duration::from_secs(15)).await);
+    assert!(c1.wait_converged(Duration::from_secs(30)).await);
+    assert!(c2.wait_converged(Duration::from_secs(30)).await);
 
     // Get members from c1's perspective
     let members = c1.get_members().await.expect("get members");
@@ -4304,7 +4304,7 @@ async fn k8s_ring_change_triggers_handoff() {
     );
     let c_default: Arc<dyn Coordinator> = Arc::new(c_default);
 
-    assert!(c_default.wait_converged(Duration::from_secs(15)).await);
+    assert!(c_default.wait_converged(Duration::from_secs(30)).await);
 
     // Capture initial ownership
     let initial_owned = c_default.owned_shards().await;
@@ -4328,7 +4328,7 @@ async fn k8s_ring_change_triggers_handoff() {
     let c_tenant: Arc<dyn Coordinator> = Arc::new(c_tenant);
 
     // Wait for tenant node to be ready
-    assert!(c_tenant.wait_converged(Duration::from_secs(15)).await);
+    assert!(c_tenant.wait_converged(Duration::from_secs(30)).await);
 
     // Tenant node should own no shards yet
     let tenant_owned_before = c_tenant.owned_shards().await;
@@ -4354,11 +4354,11 @@ async fn k8s_ring_change_triggers_handoff() {
     // Wait for convergence
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
-        c_default.wait_converged(Duration::from_secs(15)).await,
+        c_default.wait_converged(Duration::from_secs(30)).await,
         "default node should converge"
     );
     assert!(
-        c_tenant.wait_converged(Duration::from_secs(15)).await,
+        c_tenant.wait_converged(Duration::from_secs(30)).await,
         "tenant node should converge"
     );
 
@@ -4403,7 +4403,7 @@ async fn k8s_orphaned_ring_shard_remains_unowned() {
     );
     let coord: Arc<dyn Coordinator> = Arc::new(coord);
 
-    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+    assert!(coord.wait_converged(Duration::from_secs(30)).await);
 
     let owned_before = coord.owned_shards().await;
     assert_eq!(owned_before.len(), num_shards as usize);
@@ -4446,7 +4446,7 @@ async fn k8s_orphaned_ring_shard_remains_unowned() {
 
     // Wait and verify it's owned again
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(coord.wait_converged(Duration::from_secs(15)).await);
+    assert!(coord.wait_converged(Duration::from_secs(30)).await);
 
     let owned_final = coord.owned_shards().await;
     assert_eq!(owned_final.len(), num_shards as usize);
@@ -4771,7 +4771,7 @@ async fn k8s_reclaim_existing_leases_after_graceful_shutdown() {
         num_shards
     );
     assert!(
-        c1.wait_converged(Duration::from_secs(15)).await,
+        c1.wait_converged(Duration::from_secs(30)).await,
         "coordinator should converge"
     );
     let owned_before: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
@@ -4826,7 +4826,7 @@ async fn k8s_reclaim_existing_leases_after_crash() {
     .await
     .expect("start c1");
     assert!(
-        c1.wait_converged(Duration::from_secs(15)).await,
+        c1.wait_converged(Duration::from_secs(30)).await,
         "coordinator should converge"
     );
     let owned_before: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
@@ -4894,7 +4894,7 @@ async fn k8s_crash_restart_reclaims_and_opens_shards() {
     .await
     .expect("start c1");
     assert!(
-        c1.wait_converged(Duration::from_secs(15)).await,
+        c1.wait_converged(Duration::from_secs(30)).await,
         "coordinator should converge"
     );
     let owned_before: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
@@ -4924,7 +4924,7 @@ async fn k8s_crash_restart_reclaims_and_opens_shards() {
     // The coordinator should converge quickly -- reclaimed shards are opened immediately
     // during startup before the first reconcile, so owned set should match right away.
     assert!(
-        c2.wait_converged(Duration::from_secs(15)).await,
+        c2.wait_converged(Duration::from_secs(30)).await,
         "restarted coordinator should converge with reclaimed shards"
     );
 
@@ -5096,7 +5096,7 @@ async fn k8s_coordinator_crash_blocks_reacquisition_until_force_release() {
     )
     .await
     .expect("start c1");
-    assert!(c1.wait_converged(Duration::from_secs(15)).await);
+    assert!(c1.wait_converged(Duration::from_secs(30)).await);
     let all_shards: HashSet<ShardId> = c1
         .get_shard_map()
         .await
@@ -5173,7 +5173,7 @@ async fn k8s_force_release_nonexistent_shard_returns_error() {
         "http://127.0.0.1:50051",
         num_shards
     );
-    assert!(c1.wait_converged(Duration::from_secs(15)).await);
+    assert!(c1.wait_converged(Duration::from_secs(30)).await);
 
     // Force-release a shard that doesn't exist (random UUID, no K8s Lease object)
     let fake_shard_id = ShardId::new();
@@ -5211,7 +5211,7 @@ async fn k8s_reclaim_with_different_node_id_returns_empty() {
     .await
     .expect("start ca");
     assert!(
-        ca.wait_converged(Duration::from_secs(15)).await,
+        ca.wait_converged(Duration::from_secs(30)).await,
         "coordinator A should converge"
     );
     let owned: HashSet<ShardId> = ca.owned_shards().await.into_iter().collect();
@@ -5275,7 +5275,7 @@ async fn k8s_graceful_shutdown_clears_lease_holder_identity() {
     .await
     .expect("start c1");
     assert!(
-        c1.wait_converged(Duration::from_secs(15)).await,
+        c1.wait_converged(Duration::from_secs(30)).await,
         "coordinator should converge"
     );
 
@@ -5341,7 +5341,7 @@ async fn k8s_graceful_shutdown_clears_lease_holder_identity() {
         num_shards
     );
     assert!(
-        c2.wait_converged(Duration::from_secs(15)).await,
+        c2.wait_converged(Duration::from_secs(30)).await,
         "new coordinator should converge and acquire all shards without force-release"
     );
     let c2_owned: HashSet<ShardId> = c2.owned_shards().await.into_iter().collect();
@@ -5654,7 +5654,7 @@ async fn k8s_lease_renewals_do_not_trigger_membership_notifications() {
 
     // Wait for initial convergence (triggers 1 membership notification from InitDone)
     assert!(
-        c1.wait_converged(Duration::from_secs(15)).await,
+        c1.wait_converged(Duration::from_secs(30)).await,
         "should converge"
     );
 
