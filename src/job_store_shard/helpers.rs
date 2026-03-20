@@ -184,8 +184,7 @@ where
         match f().await {
             Ok(val) => return Ok(val),
             Err(JobStoreShardError::Slate(ref e))
-                if e.kind() == slatedb::ErrorKind::Transaction
-                    || is_clock_tick_error(e) =>
+                if e.kind() == slatedb::ErrorKind::Transaction || is_clock_tick_error(e) =>
             {
                 if attempt + 1 < MAX_RETRIES {
                     let delay_ms = 10 * (1 << attempt); // 10ms, 20ms, 40ms, 80ms
