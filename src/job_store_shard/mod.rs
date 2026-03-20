@@ -67,6 +67,8 @@ pub struct OpenShardOptions {
     /// Optional SlateDB settings for tuning database performance.
     /// The `merge_operator` field will be overridden with Silo's counter merge operator.
     pub slatedb_settings: Option<slatedb::config::Settings>,
+    /// Optional in-memory cache size configuration.
+    pub memory_cache: Option<crate::settings::MemoryCacheConfig>,
     /// Rate limiter client for this shard
     pub rate_limiter: Arc<dyn RateLimitClient>,
     /// Optional metrics collector
@@ -238,6 +240,7 @@ impl JobStoreShard {
                 wal_store,
                 wal_close_config,
                 slatedb_settings,
+                memory_cache: cfg.memory_cache.clone(),
                 rate_limiter,
                 metrics,
                 concurrency_reconcile_interval: Duration::from_millis(
@@ -275,6 +278,7 @@ impl JobStoreShard {
             wal_store,
             wal_close_config,
             slatedb_settings,
+            memory_cache,
             rate_limiter,
             metrics,
             concurrency_reconcile_interval,
@@ -293,6 +297,34 @@ impl JobStoreShard {
         // set it above via with_merge_operator() for counter support
         if let Some(settings) = slatedb_settings {
             db_builder = db_builder.with_settings(settings);
+        }
+
+        // Apply custom in-memory cache sizes if specified
+        if let Some(cache_cfg) = memory_cache {
+            use slatedb::db_cache::{
+                DEFAULT_BLOCK_CACHE_CAPACITY, DEFAULT_META_CACHE_CAPACITY, SplitCache,
+                foyer::{FoyerCache, FoyerCacheOptions},
+            };
+
+            let block_cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
+                max_capacity: cache_cfg
+                    .block_cache_bytes
+                    .unwrap_or(DEFAULT_BLOCK_CACHE_CAPACITY),
+                ..Default::default()
+            }));
+            let meta_cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
+                max_capacity: cache_cfg
+                    .meta_cache_bytes
+                    .unwrap_or(DEFAULT_META_CACHE_CAPACITY),
+                ..Default::default()
+            }));
+
+            let cache = SplitCache::new()
+                .with_block_cache(Some(block_cache))
+                .with_meta_cache(Some(meta_cache))
+                .build();
+
+            db_builder = db_builder.with_memory_cache(Arc::new(cache));
         }
 
         let db = db_builder.build().await?;

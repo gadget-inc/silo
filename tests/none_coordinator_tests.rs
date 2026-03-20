@@ -15,6 +15,7 @@ fn make_test_factory() -> Arc<ShardFactory> {
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
             slatedb: None,
+            memory_cache: None,
         },
         MockGubernatorClient::new_arc(),
         None,

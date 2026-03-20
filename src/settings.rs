@@ -196,6 +196,29 @@ pub struct DatabaseTemplate {
     /// See <https://docs.rs/slatedb/latest/slatedb/config/struct.Settings.html> for all options.
     #[serde(default, deserialize_with = "deserialize_slatedb_settings")]
     pub slatedb: Option<slatedb::config::Settings>,
+    /// Optional in-memory cache size configuration for SlateDB.
+    /// Controls the sizes of the block cache (data blocks) and meta cache
+    /// (SST indexes and bloom filters). If not specified, SlateDB defaults are used
+    /// (512 MB for block cache, 128 MB for meta cache).
+    #[serde(default)]
+    pub memory_cache: Option<MemoryCacheConfig>,
+}
+
+/// Configuration for SlateDB's in-memory caches.
+///
+/// SlateDB maintains two separate in-memory caches:
+/// - **block_cache**: Caches data blocks read from SST files. Larger values reduce
+///   I/O for point lookups and scans over recently-accessed data.
+/// - **meta_cache**: Caches SST index blocks and bloom filters. Larger values avoid
+///   re-reading and re-parsing SST indexes on each scan, which can be a significant
+///   CPU cost for scan-heavy workloads.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct MemoryCacheConfig {
+    /// Size of the block cache in bytes. Defaults to 536870912 (512 MB).
+    pub block_cache_bytes: Option<u64>,
+    /// Size of the meta cache (SST indexes and bloom filters) in bytes.
+    /// Defaults to 134217728 (128 MB).
+    pub meta_cache_bytes: Option<u64>,
 }
 
 /// Configuration for a separate WAL object store
@@ -430,6 +453,12 @@ pub struct DatabaseConfig {
     /// See <https://docs.rs/slatedb/latest/slatedb/config/struct.Settings.html> for all options.
     #[serde(default, deserialize_with = "deserialize_slatedb_settings")]
     pub slatedb: Option<slatedb::config::Settings>,
+    /// Optional in-memory cache size configuration for SlateDB.
+    /// Controls the sizes of the block cache (data blocks) and meta cache
+    /// (SST indexes and bloom filters). If not specified, SlateDB defaults are used
+    /// (512 MB for block cache, 128 MB for meta cache).
+    #[serde(default)]
+    pub memory_cache: Option<MemoryCacheConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -545,6 +574,7 @@ impl AppConfig {
                 apply_wal_on_close: true,
                 concurrency_reconcile_interval_ms: default_concurrency_reconcile_interval_ms(),
                 slatedb: None,
+                memory_cache: None,
             },
         };
 
