@@ -348,6 +348,8 @@ impl JobStoreShard {
         } else {
             params.start_at_ms
         };
+        let effective_terminal_retention_ms =
+            self.effective_terminal_retention_ms(params.terminal_retention_ms)?;
 
         // === Validate preconditions ===
 
@@ -527,7 +529,7 @@ impl JobStoreShard {
             id: existing_job.id().to_string(),
             priority: existing_job.priority(),
             enqueue_time_ms: existing_job.enqueue_time_ms(),
-            terminal_retention_ms: existing_job.terminal_retention_ms(),
+            terminal_retention_ms: Some(effective_terminal_retention_ms),
             payload: existing_job.payload_bytes().to_vec(),
             retry_policy: params.retry_policy.clone(),
             metadata: existing_job.metadata(),
