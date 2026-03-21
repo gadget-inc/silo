@@ -89,7 +89,7 @@ impl TaskBroker {
             running: Arc::new(AtomicBool::new(false)),
             notify: Arc::new(Notify::new()),
             scan_requested: Arc::new(AtomicBool::new(false)),
-            target_buffer: 4096,
+            target_buffer: 8192,
             scan_batch: 1024,
             shard_name,
             metrics,
@@ -235,18 +235,28 @@ impl TaskBroker {
 
         let broker = Arc::clone(self);
         tokio::spawn(async move {
-            let min_sleep_ms = 5;
-            let max_sleep_ms = 1000;
+            let min_sleep_ms = 50;
+            let max_sleep_ms = 2000;
             let mut sleep_ms = min_sleep_ms;
+            let scan_low_watermark = broker.target_buffer / 2;
+            let mut scanning = false;
 
             loop {
                 if !broker.running.load(Ordering::SeqCst) {
                     break;
                 }
 
-                // Wait if buffer is full
-                if broker.buffer.len() >= broker.target_buffer {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                // Hysteresis: start scanning when buffer drops below low
+                // watermark, keep scanning until it reaches target_buffer.
+                let buf_len = broker.buffer.len();
+                if buf_len < scan_low_watermark {
+                    scanning = true;
+                } else if buf_len >= broker.target_buffer {
+                    scanning = false;
+                }
+
+                if !scanning {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
 
@@ -285,9 +295,10 @@ impl TaskBroker {
                 tokio::select! {
                     biased;
                     _ = broker.notify.notified() => {
-                        // Reset backoff on explicit wakeup so the next scan
-                        // runs aggressively (e.g. after a dequeue claim).
-                        sleep_ms = min_sleep_ms;
+                        // Halve backoff on explicit wakeup instead of
+                        // resetting to min — keeps scan rate reasonable
+                        // while still responding to demand.
+                        sleep_ms = (sleep_ms / 2).max(min_sleep_ms);
                         debug!(task_group = %broker.task_group, "broker woken by notification");
                     }
                     _ = &mut delay => {},
