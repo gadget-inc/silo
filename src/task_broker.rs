@@ -239,15 +239,23 @@ impl TaskBroker {
             let max_sleep_ms = 2000;
             let mut sleep_ms = min_sleep_ms;
             let scan_low_watermark = broker.target_buffer / 2;
+            let mut scanning = false;
 
             loop {
                 if !broker.running.load(Ordering::SeqCst) {
                     break;
                 }
 
-                // Only scan when buffer drops below low watermark to avoid
-                // hammering SlateDB with repeated SST index reads.
-                if broker.buffer.len() >= scan_low_watermark {
+                // Hysteresis: start scanning when buffer drops below low
+                // watermark, keep scanning until it reaches target_buffer.
+                let buf_len = broker.buffer.len();
+                if buf_len < scan_low_watermark {
+                    scanning = true;
+                } else if buf_len >= broker.target_buffer {
+                    scanning = false;
+                }
+
+                if !scanning {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
