@@ -218,8 +218,8 @@ impl JobStoreShard {
         .await?;
 
         // Post-commit: evict old task key from broker buffer and wake broker
-        self.broker.evict_keys(&[old_task_key]);
-        self.broker.wakeup();
+        self.brokers.evict_keys(&[old_task_key]);
+        self.brokers.wakeup(&task_group);
 
         // Build and return the LeasedTask
         let attempt_view = JobAttemptView::new(attempt_val)?;

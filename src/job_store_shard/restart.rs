@@ -194,7 +194,7 @@ impl JobStoreShard {
 
         // Wake the broker to pick up the new task promptly
         if start_at_ms <= now_epoch_ms() {
-            self.broker.wakeup();
+            self.brokers.wakeup(&task_group);
         }
 
         Ok(())

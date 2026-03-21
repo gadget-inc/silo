@@ -95,7 +95,7 @@ impl JobStoreShard {
 
             // [SILO-DEQ-1] Claim from the broker buffer for the specified task_group
             let claimed: Vec<BrokerTask> = self
-                .broker
+                .brokers
                 .claim_ready_or_nudge(task_group, remaining)
                 .await;
 
@@ -218,7 +218,7 @@ impl JobStoreShard {
                     self.concurrency.rollback_grant(tenant, queue, task_id);
                 }
                 // Put back all claimed entries since we didn't lease them durably
-                self.broker.requeue(claimed);
+                self.brokers.requeue(claimed);
                 return Err(JobStoreShardError::Slate(e));
             }
             dst_events::confirm_write(write_op);
@@ -232,15 +232,15 @@ impl JobStoreShard {
             // [SILO-DEQ-3] Ack durable and evict from buffer.
             // TaskBroker tracks all release keys for inflight cleanup, but only
             // installs tombstones for keys that were durably deleted.
-            self.broker
-                .ack_durable(&state.release_keys, &state.tombstone_keys);
-            self.broker.evict_keys(&state.release_keys);
+            self.brokers
+                .ack_durable(task_group, &state.release_keys, &state.tombstone_keys);
+            self.brokers.evict_keys(&state.release_keys);
             tracing::debug!(
                 release_keys = state.release_keys.len(),
                 tombstone_keys = state.tombstone_keys.len(),
                 pending_attempts = pending_attempts.len(),
-                buffer_size = self.broker.buffer_len(),
-                inflight = self.broker.inflight_len(),
+                buffer_size = self.brokers.group_buffer_len(task_group),
+                inflight = self.brokers.group_inflight_len(task_group),
                 processed_internal = state.processed_internal,
                 "dequeue: acked and evicted keys"
             );

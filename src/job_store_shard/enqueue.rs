@@ -193,7 +193,8 @@ impl JobStoreShard {
         }
         dst_events::confirm_write(write_op);
 
-        self.finish_enqueue(job_id, start_at_ms, &grants).await
+        self.finish_enqueue(job_id, task_group, start_at_ms, &grants)
+            .await
     }
 
     /// Transaction-path enqueue for user-provided job IDs that need deduplication.
@@ -294,7 +295,8 @@ impl JobStoreShard {
         }
         dst_events::confirm_write(write_op);
 
-        self.finish_enqueue(job_id, start_at_ms, &grants).await
+        self.finish_enqueue(job_id, task_group, start_at_ms, &grants)
+            .await
     }
 
     /// Write all enqueue data (job info, metadata, status, limit tasks) to the writer.
@@ -369,10 +371,11 @@ impl JobStoreShard {
     }
 
     /// Complete an enqueue after successful write/commit and DST event emission.
-    /// Logs grants and wakes up the broker.
+    /// Logs grants and wakes up the broker for the given task group.
     pub(crate) async fn finish_enqueue(
         &self,
         job_id: &str,
+        task_group: &str,
         start_at_ms: i64,
         grants: &[(String, String)],
     ) -> Result<(), JobStoreShardError> {
@@ -383,7 +386,7 @@ impl JobStoreShard {
         }
 
         if start_at_ms <= now_epoch_ms() {
-            self.broker.wakeup();
+            self.brokers.wakeup(task_group);
         }
 
         Ok(())
@@ -463,7 +466,7 @@ impl JobStoreShard {
                         .concurrency
                         .handle_enqueue(
                             &self.db,
-                            &self.broker.get_range(),
+                            &self.get_range(),
                             writer,
                             tenant,
                             &current_task_id,
@@ -511,7 +514,7 @@ impl JobStoreShard {
                         .concurrency
                         .handle_enqueue(
                             &self.db,
-                            &self.broker.get_range(),
+                            &self.get_range(),
                             writer,
                             tenant,
                             &current_task_id,

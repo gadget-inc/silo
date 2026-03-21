@@ -191,7 +191,7 @@ impl JobStoreShard {
 
         // Evict the deleted task from the broker buffer
         if let Some(ref key) = deleted_task_key {
-            self.broker.evict_keys(std::slice::from_ref(key));
+            self.brokers.evict_keys(std::slice::from_ref(key));
         }
 
         // Release concurrency holders from in-memory counts and signal grant scanner

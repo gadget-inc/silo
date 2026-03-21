@@ -348,7 +348,7 @@ impl JobStoreShard {
         if let Some(nt) = followup_next_time
             && nt <= now_epoch_ms()
         {
-            self.broker.wakeup();
+            self.brokers.wakeup(&task_group);
         }
         if let Some(err) = job_missing_error {
             return Err(err);
