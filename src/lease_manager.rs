@@ -86,6 +86,7 @@ impl LeaseManager {
     }
 
     /// Populate the tracker from a DB scan. Called once during shard startup.
+    /// Retries on failure with backoff to ensure pre-existing leases are not lost.
     pub async fn hydrate_from_db(
         self: &Arc<Self>,
         db: &slatedb::Db,
@@ -100,32 +101,70 @@ impl LeaseManager {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            while !self.is_hydrated() {
-                self.hydration_notify.notified().await;
+            // Another task is already hydrating — wait for it to finish.
+            // Create the Notified future BEFORE checking the condition to
+            // avoid a TOCTOU race where the notification fires between the
+            // check and the await.
+            loop {
+                let notified = self.hydration_notify.notified();
+                if self.is_hydrated() {
+                    return;
+                }
+                notified.await;
             }
-            return;
         }
 
+        const MAX_RETRIES: usize = 5;
+        let mut attempt = 0;
+
+        loop {
+            match self.try_hydrate(db, range).await {
+                Ok(count) => {
+                    self.finish_hydration();
+                    debug!(count, "lease manager: hydration complete");
+                    return;
+                }
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= MAX_RETRIES {
+                        tracing::error!(
+                            error = %e,
+                            attempts = attempt,
+                            "lease manager: hydration failed after max retries, \
+                             pre-existing leases may not be tracked"
+                        );
+                        self.finish_hydration();
+                        return;
+                    }
+                    let backoff_ms = 100 * (1 << attempt.min(4));
+                    tracing::warn!(
+                        error = %e,
+                        attempt,
+                        backoff_ms,
+                        "lease manager: hydration scan failed, retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                }
+            }
+        }
+    }
+
+    /// Attempt a single hydration scan. Returns the number of leases loaded.
+    async fn try_hydrate(
+        &self,
+        db: &slatedb::Db,
+        range: &crate::shard_range::ShardRange,
+    ) -> Result<usize, slatedb::Error> {
         let start = crate::keys::leases_prefix();
         let end = crate::keys::end_bound(&start);
-        let mut iter = match db.scan::<Vec<u8>, _>(start..end).await {
-            Ok(i) => i,
-            Err(e) => {
-                tracing::warn!(error = %e, "lease tracker: failed to scan leases for hydration");
-                self.finish_hydration();
-                return;
-            }
-        };
+        let mut iter = db.scan::<Vec<u8>, _>(start..end).await?;
 
         let mut count = 0usize;
         loop {
             let kv = match iter.next().await {
                 Ok(Some(kv)) => kv,
                 Ok(None) => break,
-                Err(e) => {
-                    tracing::warn!(error = %e, "lease tracker: hydration scan iteration error");
-                    break;
-                }
+                Err(e) => return Err(e),
             };
 
             let decoded = match crate::codec::decode_lease(kv.value.clone()) {
@@ -142,15 +181,13 @@ impl LeaseManager {
                 self.leases.insert(task_id.to_string(), decoded.expiry_ms());
                 count += 1;
             } else if decoded.refresh_floating_limit_info().is_some() {
-                // Track floating limit refresh leases too
                 let (task_id, _) = decoded.refresh_floating_limit_info().unwrap();
                 self.leases.insert(task_id.to_string(), decoded.expiry_ms());
                 count += 1;
             }
         }
 
-        self.finish_hydration();
-        debug!(count, "lease tracker: hydration complete");
+        Ok(count)
     }
 
     fn finish_hydration(&self) {
